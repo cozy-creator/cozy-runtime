@@ -202,6 +202,12 @@ class Executor:
             slots=binding.get("slots", 16),
             readers=binding.get("readers", 16),
             inflight=binding.get("inflight", 8),
+            # cr-006: the per-device qualification suite persists here, first-writer-wins.
+            # It is a DEVICE fact, not a store or artifact fact, so it lives under
+            # cozy_home rather than beside a checkpoint; a worker landing on a tuple this
+            # rig has already probed skips the suite entirely.
+            probe_cache=binding.get("probe_cache"),
+            release=binding["release"],
         )
         # A STAGING generation re-reads the store after construction, so its GC-safe hold
         # must outlive the first commit. `resident_budget` is what makes a parked component

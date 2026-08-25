@@ -52,6 +52,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, census
+from cozy_runtime.internal.encoding import (
+    Capabilities,
+    DeviceFacts,
+    Encoded,
+    EncodingRefusal,
+    RolePart,
+    Selection,
+    Selector,
+    launch_providers,
+    measure_device,
+)
 
 # ------------------------------------------------------------------------- refusals
 
@@ -80,6 +91,12 @@ REFUSALS = frozenset(
         "lease_live",  # a staging slot reused before its completion event
         "not_ready",  # the generation was read before the fence fired
         "derived_unmaterialized",  # a non-persistent buffer the fill plane cannot supply
+        # cr-006's three, spoken in the SAME vocabulary because the supervisor, the
+        # journal and the CLI all read one refusal table. `encoding.py` owns their
+        # meaning; this line is what keeps a new code from appearing unnoticed.
+        "unknown_encoding",  # the header cites a spec digest no provider claims
+        "encoding_unqualified",  # a claimed encoding, unqualified on THIS device
+        "role_mismatch",  # the stored roles are not the roles the decoder accounts for
     }
 )
 
@@ -105,9 +122,12 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
 
 #: The byte classes this plane owns. `vram` is the device destinations; `pinned` is the
 #: page-locked ring (REGISTERED, kernel-unreclaimable); `staging` is the host bytes
-#: actually in flight inside that ring (CHARGED). §3.2 keeps allocated and registered as
-#: two distinct numbers on purpose, so the ledger carries both.
-CLASSES = ("vram", "pinned", "staging")
+#: actually in flight inside that ring (CHARGED); `decode` is cr-006's transient device
+#: scratch holding STORED role bytes until they become a logical tensor. §3.2 keeps
+#: allocated and registered as distinct numbers on purpose, and it names decode scratch
+#: separately from materialized weights for the same reason: they peak at different
+#: moments and a plan that prices them as one number prices neither.
+CLASSES = ("vram", "pinned", "staging", "decode")
 
 
 @dataclass(slots=True)
@@ -241,10 +261,20 @@ class PlanRow:
     """The HEADER's key for the same tensor, unqualified, e.g. `conv_in.weight`."""
     component: str
     dtype: str
+    """The LOGICAL dtype: what the destination is and what a decode targets."""
     shape: tuple[int, ...]
     nbytes: int
-    what: str
-    """TensorFS's own destination name, `<component>/<name>#<part>`."""
+    """The LOGICAL byte count. For an encoded tensor this is NOT what is stored."""
+    encoded: Encoded
+    """The per-tensor encoding assignment, from the header's own citation (cr-006)."""
+
+    def role_what(self, role: str) -> str:
+        """TensorFS's own name for one stored role, `<component>/<name>#<role>`."""
+        return f"{self.component}/{self.name}#{role}"
+
+    @property
+    def stored_nbytes(self) -> int:
+        return self.encoded.stored_nbytes
 
 
 class Checkpoint:
@@ -269,7 +299,21 @@ class Checkpoint:
             self.store = tensorfs.Store.open(self.root)
             snapshot = self.store.snapshot(snapshot_id)
             self.header_bytes: bytes = snapshot["header"]
-            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes)
+            # THE HEADER IS PARSED AGAINST ITS OWN ENCODING CLOSURE (cr-006). The header
+            # cites a spec digest per tensor and lists those spec objects; reading them
+            # back out of the CAS and re-validating is how "the decode targets come from
+            # the header's cited specs" stops being a claim. It is also law 18: a
+            # coordinator's authority is not worker safety, so the worker re-checks that
+            # each tensor's stored ROLES are the roles its cited spec declares — which is
+            # TensorFS's fact, asked of TensorFS rather than reimplemented here.
+            closure = tensorfs.Closure()
+            for ref in tensorfs.parse_header(self.header_bytes)["encodings"]:
+                closure.insert(self.store.document(str(ref["sha256"])))
+            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes, closure)
+            self.specs: tuple[str, ...] = tuple(closure.digests())
+        from cozy_runtime.internal.encoding import aliases
+
+        self._aliases = aliases()
 
     def rows(self, component: str) -> list[PlanRow]:
         """The header's table for one component, in the header's own key order."""
@@ -321,10 +365,34 @@ class Checkpoint:
                     dtype=dtype,
                     shape=shape,
                     nbytes=nbytes,
-                    what=f"{component}/{key}#value",
+                    encoded=self._encoded(f"{component}.{key}", entry),
                 )
             )
         return out
+
+    def _encoded(self, key: str, entry: Mapping[str, Any]) -> Encoded:
+        """The tensor's encoding assignment and stored roles, verbatim from the header.
+
+        `plain/1` is a real entry here, not an absent form: the selection path has one
+        branch and the verbatim provider is what it selects for unencoded bytes.
+        """
+        parts: list[RolePart] = []
+        for role, part in entry["parts"].items():
+            shape = tuple(int(n) for n in part["shape"])
+            width = self.tensorfs.DTYPES.get(str(part["dtype"]))
+            if width is None:
+                raise _refuse(
+                    "dtype_mismatch",
+                    f"{key}: role {role!r} is stored as {part['dtype']!r}, which this "
+                    "build of TensorFS does not know",
+                    [key],
+                )
+            nbytes = width
+            for extent in shape:
+                nbytes *= extent
+            parts.append(RolePart(str(role), str(part["dtype"]), shape, nbytes))
+        digest = str(entry["encoding"])
+        return Encoded(digest, self._aliases.get(digest, "unregistered"), tuple(parts))
 
     def read_plan(self, traversal: Sequence[tuple[str, str]], window_bytes: int) -> Any:
         """The store's own read plan over the traversal THIS PLANE asks for.
@@ -343,9 +411,16 @@ class Checkpoint:
 
 
 def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
-    """The checkpoint topology table the loader matches the code against."""
+    """The checkpoint topology table the loader matches the code against.
+
+    The spec's `encoding` carries the tensor's real ALIAS rather than a constant `plain`:
+    the match itself is over logical shape (an encoding rung changes no topology — every
+    rung of one model shares its `topology_digest`), but a table that lied about the
+    encoding would be the only place in the runtime that did.
+    """
     return {
-        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes) for row in rows
+        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), row.encoded.alias, row.nbytes)
+        for row in rows
     }
 
 
@@ -488,6 +563,9 @@ class StreamingFillBackend:
         ledger: ResourceLedger | None = None,
         fence: bool = True,
         on_position: Callable[[int], None] | None = None,
+        probe_cache: str | Path | None = None,
+        decode_scratch_bytes: int = 512 << 20,
+        release: str = "cozy-runtime/0.0.1",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -549,6 +627,31 @@ class StreamingFillBackend:
         #: is where measured free VRAM decides things (cr-008b).
         self.resident_budget = 0
         self.stats: dict[str, Any] = {"windows": 0, "waits": 0}
+        # cr-006. The device is measured once and the qualification suite runs once per
+        # tuple (persisted, first-writer-wins), both at PREPARE time — §3.2's cost
+        # placement: the request path runs neither. Selection itself is an O(1) dict
+        # lookup per key inside `fill`.
+        from cozy_runtime.internal.probe import qualify
+
+        self.device_facts: DeviceFacts = measure_device(self.torch, self.device.index or 0)
+        self.providers = launch_providers()
+        self.capabilities: Capabilities
+        self.capabilities, self.probe = qualify(
+            self.torch,
+            self.providers,
+            self.device_facts,
+            sorted({_dtype_name(row.dtype) for row in rows}),
+            release=release,
+            cache=Path(probe_cache) if probe_cache else None,
+        )
+        self.selector = Selector(self.providers, self.capabilities, self.device_facts)
+        #: The provider chosen for each destination, resolved in `fill` before a byte moves.
+        self.selected: dict[str, Selection] = {}
+        #: Transient device buffers holding STORED role bytes. They exist between the
+        #: stream and the decode and never outlive one component's fill.
+        self.scratch: dict[str, dict[str, Any]] = {}
+        self.decode_scratch_bytes = int(decode_scratch_bytes)
+        self.decoded: dict[str, Any] = {"tensors": 0, "bytes": 0, "flushes": 0, "ms": 0}
 
     # -- reservation -------------------------------------------------------------
 
@@ -683,11 +786,20 @@ class StreamingFillBackend:
         if _dtype_name(tensor.dtype) != _dtype_name(row.dtype):
             raise _refuse(
                 "dtype_mismatch",
-                f"{key}: stored as {row.dtype}, the destination is "
-                f"{_dtype_name(tensor.dtype)} — this plane executes the ENCODING CONTRACT "
-                "only; a dtype change is a decode and decoders are cr-006's",
+                f"{key}: the checkpoint's LOGICAL dtype is {row.dtype} and the destination "
+                f"is {_dtype_name(tensor.dtype)} — a decoder targets the logical dtype the "
+                "border assigned, it does not choose a different one (cr-006). A "
+                "destination that wants another dtype is a different construction",
                 [key],
             )
+        # SELECTION, before a byte moves. The provider comes from this tensor's own
+        # encoding digest and the device's qualification record; an unregistered encoding,
+        # an unqualified device or a role set no decoder accounts for all refuse HERE,
+        # where the generation has nothing to undo.
+        try:
+            self.selected[key] = self.selector.select(key, row.encoded, _dtype_name(row.dtype))
+        except EncodingRefusal as exc:
+            raise _refuse(exc.code, str(exc), exc.fields) from exc
         if str(getattr(tensor, "device", "")) != self.device_str:
             raise _refuse(
                 "destination_absent",
@@ -772,6 +884,7 @@ class StreamingFillBackend:
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
         # for — comparing a number that includes it would flatter neither side honestly.
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
+        self.stats["decode"] = dict(self.decoded)
         self.enqueued.clear()
 
     def release_lease(self) -> None:
@@ -906,6 +1019,7 @@ class StreamingFillBackend:
         self.hold_lease = False
         self.release_lease()
         with placing():
+            self._drop_scratch()
             self._free_storages(self.enqueued.values())
             self.enqueued.clear()
             for name, member in list(self.components.items()):
@@ -932,6 +1046,51 @@ class StreamingFillBackend:
             seen.add(token)
             freed += storage.nbytes()
             storage.resize_(0)
+        return freed
+
+    # -- the decode leg (cr-006) --------------------------------------------------
+
+    def _decode(self, pending: list[PlanRow]) -> int:
+        """Turn every landed role set into its logical tensor, then free the scratch.
+
+        Called only behind `ring.drain(0)`, so every H2D for these roles has completed.
+        The provider writes into the destination the census reserved and the ledger already
+        charged — which is exactly what makes staged and JIT accounting enforceable later:
+        there is no moment where a decoded tensor exists outside the ledger.
+
+        Returns the scratch bytes released, so the caller's rolling window stays exact.
+        """
+        if not pending:
+            return 0
+        started = time.perf_counter_ns()
+        freed = 0
+        for row in pending:
+            selection = self.selected[row.key]
+            parts = self.scratch.pop(row.key, {})
+            missing = sorted(selection.provider.required - set(parts))
+            if missing:
+                raise _refuse(
+                    "incomplete_fill",
+                    f"{row.key}: role(s) {missing} never arrived, so the decoder has no "
+                    "complete role set — a partially delivered encoded tensor is rolled "
+                    "back, never decoded from what happened to land",
+                    missing[:6],
+                )
+            selection.provider.decode(self.torch, parts, self.enqueued[row.key])
+            freed += self._free_storages(parts.values())
+            self.decoded["tensors"] += 1
+            self.decoded["bytes"] += row.stored_nbytes
+        pending.clear()
+        self.decoded["flushes"] += 1
+        self.decoded["ms"] += (time.perf_counter_ns() - started) // 1_000_000
+        return freed
+
+    def _drop_scratch(self) -> int:
+        """Give back every scratch buffer a failed stream left behind. Positive act."""
+        freed = 0
+        for parts in self.scratch.values():
+            freed += self._free_storages(parts.values())
+        self.scratch.clear()
         return freed
 
     # -- the unload/release path -------------------------------------------------
@@ -984,6 +1143,13 @@ class StreamingFillBackend:
         third time from a third language. What tfs-007 added is that COPIES IN FLIGHT share
         the ring with readers, so the caller sizes both or reads at the depth the leftovers
         allow.
+
+        cr-006 widened the destination of one hop and nothing else. A VERBATIM role still
+        lands directly in the module's parameter; an ENCODED tensor's roles land in
+        transient device scratch, and the provider turns them into the same parameter once
+        the copies have fenced. The scratch is allocated ON FIRST TOUCH and freed as soon
+        as its tensor decodes, so the decode envelope is a bounded rolling window rather
+        than a second whole copy of the component.
         """
         rows = [self.plan[key] for key in self.order if key in self.enqueued]
         if not rows:
@@ -1000,6 +1166,38 @@ class StreamingFillBackend:
         torch = self.torch
         flat: dict[str, Any] = {}
         base: dict[str, int] = {}
+        owner: dict[str, PlanRow] = {}
+        remaining: dict[str, int] = {}
+        pending: list[PlanRow] = []
+        held = [0]
+
+        def slot_for(what: str) -> Any:
+            """The uint8 view one role's bytes land in, allocated on first touch.
+
+            For a verbatim role that is the destination itself — the cr-005 path, byte for
+            byte. For an encoded role it is a fresh device buffer of exactly the role's
+            declared dtype and shape, so `view(uint8)` is aligned by construction rather
+            than by an offset that happened to come out even.
+            """
+            view = flat.get(what)
+            if view is not None:
+                return view
+            row = owner[what]
+            role = what.rsplit("#", 1)[1]
+            if self.selected[row.key].provider.route == "verbatim":
+                view = self.enqueued[row.key].view(-1).view(torch.uint8)
+            else:
+                part = row.encoded.part(role)
+                buffer = torch.empty(
+                    part.numel,
+                    dtype=getattr(torch, TORCH_DTYPES[part.dtype]),
+                    device=self.device,
+                ).reshape(part.shape)
+                self.scratch.setdefault(row.key, {})[role] = buffer
+                held[0] += part.nbytes
+                view = buffer.view(-1).view(torch.uint8)
+            flat[what] = view
+            return view
 
         def on_batch(batch: Any) -> None:
             """Splice one filled slot across the destinations it covers.
@@ -1011,15 +1209,23 @@ class StreamingFillBackend:
             the store handed over; none of it is re-derived from a naming rule.
             """
             start = cursor[0]
+            done: list[PlanRow] = []
             with torch.cuda.stream(ring.stream):
                 for item in batch.items():
                     what = str(item["what"])
                     source = int(item["off"])
                     length = int(item["len"])
                     target = start + source - base[what]
-                    flat[what][target : target + length].copy_(
+                    slot_for(what)[target : target + length].copy_(
                         ring.buffers[batch.slot][source : source + length], non_blocking=True
                     )
+                    remaining[what] -= length
+                    if remaining[what] == 0:
+                        row = owner[what]
+                        if self.selected[row.key].provider.route != "verbatim" and all(
+                            remaining[row.role_what(p.role)] == 0 for p in row.encoded.parts
+                        ):
+                            done.append(row)
                 event = torch.cuda.Event()
                 event.record(ring.stream)
             cursor[0] = start + int(batch.nbytes)
@@ -1029,48 +1235,75 @@ class StreamingFillBackend:
                 self.on_position((moved[0] + cursor[0]) >> 20)
             # A slot whose H2D has not completed is NOT free. Query first, block last.
             ring.drain(ring.keep)
+            pending.extend(done)
+            if held[0] >= self.decode_scratch_bytes:
+                # The rolling flush. Decoding needs the copies LANDED, so this fences the
+                # whole ring — which is why it is triggered by a byte budget and not per
+                # tensor: 743 fences would cost more than the scratch it saves.
+                ring.drain(0)
+                held[0] -= self._decode(pending)
 
         started = time.perf_counter_ns()
         stats: dict[str, Any] = {}
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
             plan = self.checkpoints[component].read_plan(traversal, self.window_bytes)
-            expect = sum(row.nbytes for row in group)
+            expect = sum(row.stored_nbytes for row in group)
             if int(plan.bytes) != expect:
                 raise _refuse(
                     "length_mismatch",
                     f"{component}: the store's read plan carries {plan.bytes} B for a "
-                    f"traversal this contract prices at {expect} B",
+                    f"traversal this contract prices at {expect} STORED B",
                 )
-            flat = {r.what: self.enqueued[r.key].view(-1).view(torch.uint8) for r in group}
+            flat = {}
+            owner = {r.role_what(p.role): r for r in group for p in r.encoded.parts}
+            remaining = {r.role_what(p.role): p.nbytes for r in group for p in r.encoded.parts}
             base = {}
             for item in plan.items():
                 base.setdefault(str(item["what"]), int(item["dest_off"]))
-            missing = sorted(set(flat) - set(base))
+            missing = sorted(set(owner) - set(base))
             if missing:
                 raise _refuse(
                     "incomplete_fill",
-                    f"{len(missing)} enqueued destination(s) of {component!r} are absent "
+                    f"{len(missing)} stored role(s) of {component!r} are absent "
                     f"from the store's read plan ({', '.join(missing[:4])})",
                     missing[:6],
                 )
+            # THE DECODE ENVELOPE, granted once (§3.2: no incremental acquisition under
+            # pressure). The rolling flush keeps live scratch under the budget, and one
+            # tensor may exceed it on its own — so the envelope is the budget plus the
+            # largest single tensor, which is the true high-water mark of the walk.
+            encoded = [r for r in group if self.selected[r.key].provider.route != "verbatim"]
+            envelope = 0
+            if encoded:
+                envelope = min(
+                    sum(r.stored_nbytes for r in encoded), self.decode_scratch_bytes
+                ) + max(r.stored_nbytes for r in encoded)
+                self.ledger.grant({"decode": envelope}, f"decode scratch for {component!r}")
             # The cursor is per COMPONENT because each component gets its own read plan,
             # and `dest_off` is an offset inside that plan's own logical stream.
             moved[0] += cursor[0]
             cursor[0] = 0
-            with store_refusals(f"streaming {component}"):
-                one = self._acquire(component).stream(
-                    plan, ring.views, on_batch, readers=self.readers
-                )
-            # FENCE BETWEEN COMPONENTS. `stream` returns with up to `keep` slots still
-            # DMA-live, and the next component's stream starts by taking the whole ring as
-            # free — so the store's reader threads overwrite slots whose H2D has not landed,
-            # and the corruption is SILENT. Measured before the fence: 12 of
-            # `text_encoder_2`'s 517 tensors differed from the safetensors source in a
-            # four-component fill, while the same component filled alone was byte-perfect.
-            # A slot is the store's to hand out only when the ring owns it, and the ring's
-            # ownership has to be whole again before a new stream begins.
-            ring.drain(0)
+            try:
+                with store_refusals(f"streaming {component}"):
+                    one = self._acquire(component).stream(
+                        plan, ring.views, on_batch, readers=self.readers
+                    )
+                # FENCE BETWEEN COMPONENTS. `stream` returns with up to `keep` slots still
+                # DMA-live, and the next component's stream starts by taking the whole ring
+                # as free — so the store's reader threads overwrite slots whose H2D has not
+                # landed, and the corruption is SILENT. Measured before the fence: 12 of
+                # `text_encoder_2`'s 517 tensors differed from the safetensors source in a
+                # four-component fill, while the same component filled alone was
+                # byte-perfect. A slot is the store's to hand out only when the ring owns
+                # it, and the ring's ownership has to be whole again before a new stream
+                # begins. It is ALSO the decode's fence: a provider reading scratch whose
+                # H2D has not completed reads whatever the allocator last left there.
+                ring.drain(0)
+                held[0] -= self._decode(pending)
+            finally:
+                self._drop_scratch()
+                self.ledger.release({"decode": envelope})
             for key, value in dict(one).items():
                 stats[key] = stats.get(key, 0) + value if isinstance(value, int) else value
         self.stats["read_ns"] = time.perf_counter_ns() - started

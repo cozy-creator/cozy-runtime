@@ -490,6 +490,10 @@ class Supervisor:
                         "variant": first.variant,
                         "custody": first.custody,
                         "strict_keys": first.strict_keys,
+                        # cr-006's persisted probe fact: a DEVICE property, so it is keyed
+                        # by the device tuple under cozy_home and shared across every
+                        # binding this rig serves.
+                        "probe_cache": str(self.config.cozy_home / "probe"),
                     },
                     "budgets": {
                         "vram": first.vram_bytes,

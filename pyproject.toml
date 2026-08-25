@@ -69,7 +69,17 @@ ignore_missing_imports = true
 # `huggingface_hub` is a CORPUS-venv dependency the fixture staging reaches for once, to
 # fetch a tokenizer merges file the bench download skipped. Not a runtime dependency and
 # not present in the checking venv.
-module = ["huggingface_hub", "diffusers", "diffusers.*", "safetensors", "safetensors.*"]
+# `PIL` joins them for cr-006: the fp8-vs-fp16 image comparison reads two PNGs the real
+# endpoint wrote and computes PSNR, in the corpus venv where Pillow already lives.
+module = [
+    "huggingface_hub",
+    "diffusers",
+    "diffusers.*",
+    "safetensors",
+    "safetensors.*",
+    "PIL",
+    "PIL.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
