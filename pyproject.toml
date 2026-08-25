@@ -5,9 +5,33 @@ description = "Cozy v2 worker runtime: author surface, supervisor, executor"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+cozy-runtime = "cozy_runtime.cli.main:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cozy_runtime"]
+
+[tool.uv]
+package = true
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "scripts"]
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+implicit_reexport = false
+
+[tool.ruff]
+line-length = 100
+src = ["src", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -5,6 +5,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m pip install --quiet -e .
-      - run: python3 -c "import cozy_runtime, cozy_runtime.author, cozy_runtime.internal; print(cozy_runtime.__version__)"
-      - run: python3 scripts/fence.py
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run --with ruff ruff check .
+      - run: uv run --with mypy mypy
+      - run: uv run python scripts/fence.py
+      - run: uv run python scripts/redarm.py
+      - run: uv run cozy-runtime version
