@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from cozy_runtime.internal import child_env
 from cozy_runtime.internal.exits import Exit
 
 COZY_HOME_DEFAULT = "~/.cozy"
@@ -66,6 +67,41 @@ class RuntimeConfig:
 
     cozy_home: Path
     credentials: Credentials
+    child_base_env: tuple[tuple[str, str], ...] = ()
+    """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal).
+
+    The erase happens here because this is the one module permitted to read the process
+    environment: `internal/spawn.py` imposes the reviewed allowlist on top of this frozen
+    base and hands the result to `posix_spawn`, so the child inherits nothing implicitly and
+    no other module ever needs to look at `os.environ` to build it.
+    """
+
+
+def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The device-child SEAL names as this process actually received them (cr-007).
+
+    A second, deliberately repeatable environment read, and it lives here for the same
+    reason the first one does: this module is the only environment authority. The executor
+    snapshots the seal before CUDA init and compares it after, which is how a late
+    imposition is CAUGHT rather than silently ignored (the allocator reads its environment
+    once). It exposes exactly the reviewed allowlist names — credentials are not among
+    them, because the ERASE pass removed them from any child environment.
+    """
+    env = os.environ if environ is None else environ
+    return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
+
+
+def impose_late(name: str, value: str) -> None:
+    """Impose an environment value AFTER process start — always wrong, kept to prove it.
+
+    No ordinary runtime path calls this. It exists because the late-imposition defect
+    (pgw#1640) has to be OBSERVABLE: the CUDA allocator and the driver read their
+    environment once, at init, so a value imposed afterwards changes nothing about the
+    running process while looking exactly like configuration. cr-007's red arm calls this
+    after CUDA init, measures that device visibility did not move, and then observes the
+    typed `env_seal_broken` refusal that `seal_snapshot` makes possible.
+    """
+    os.environ[name] = value
 
 
 _read: bool = False
@@ -103,4 +139,10 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         **{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV}
     )
     _read = True
-    return RuntimeConfig(cozy_home=home, credentials=creds)
+    return RuntimeConfig(
+        cozy_home=home,
+        credentials=creds,
+        child_base_env=tuple(
+            sorted((k, v) for k, v in env.items() if not child_env.erased(k))
+        ),
+    )
