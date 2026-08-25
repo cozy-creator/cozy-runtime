@@ -224,14 +224,19 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(spec["workspace"])
     home = workspace / "home"
     home.mkdir(parents=True, exist_ok=True)
-    config = read_config(
-        {
-            "PATH": os.environ["PATH"],
-            "HOME": os.environ["HOME"],
-            "COZY_HOME": str(home),
-            "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
-        }
-    )
+    # The runtime reads the environment ONCE, here, and everything not erased becomes the
+    # device child's base env. The throttle has to be in this dict or it stops at the
+    # supervisor — and the supervisor does not read weights, the executor does.
+    environ = {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ["HOME"],
+        "COZY_HOME": str(home),
+        "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
+    }
+    for name in ("LD_PRELOAD", "IO_THROTTLE_BPS", "IO_THROTTLE_MMAP_MIN"):
+        if os.environ.get(name):
+            environ[name] = os.environ[name]
+    config = read_config(environ)
     outcome = run_slice(
         config,
         LocalRequest(
@@ -300,7 +305,13 @@ def took_the_card(outcome: dict[str, Any]) -> bool:
     about the arm being exercised. Retrying is honest; reporting it as a failure would not
     be, and neither would hiding it.
     """
-    message = str((outcome.get("terminal") or {}).get("safe_message", "")).lower()
+    # A neighbour that takes the card BEFORE readiness never produces a terminal at all —
+    # the boot's prepare refuses and the run ends `worker_error` with an empty terminal, so
+    # reading only the terminal reports the neighbour as a failed arm. The fault list is
+    # where that shape says what happened.
+    parts = [str((outcome.get("terminal") or {}).get("safe_message", ""))]
+    parts += [f"{f.get('reason', '')} {f.get('detail', '')}" for f in outcome.get("faults") or ()]
+    message = " ".join(parts).lower()
     return "device_shortfall" in message or "out of memory" in message
 
 
@@ -344,6 +355,10 @@ def drop_page_cache(root: Path) -> dict[str, int]:
     import ctypes
 
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    # `off_t`/`size_t` are 64-bit and ctypes defaults to c_int: without this a file larger
+    # than 2 GiB has its length TRUNCATED and only its first bytes are evicted, which
+    # would make a "cold" run of a single 4.78 GiB safetensors mostly warm.
+    libc.posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int]
     files = 0
     nbytes = 0
     for path in sorted(root.rglob("*")):
@@ -879,7 +894,7 @@ def section_fillbw(args: argparse.Namespace) -> None:
         evicted = drop_page_cache(STORE)
         env = dict(os.environ, COZY_FILL_CHILD="1", PYTHONPATH=f"{ROOT}:{ROOT / 'src'}")
         if cap:
-            env.update(LD_PRELOAD=str(shim), COZY_THROTTLE_BPS=str(cap))
+            env.update(LD_PRELOAD=str(shim), IO_THROTTLE_BPS=str(cap))
         out = subprocess.run(
             [
                 sys.executable,
@@ -968,68 +983,138 @@ def fill_once(component: str) -> dict[str, Any]:
     }
 
 
+def ladder_row(outcome: dict[str, Any], label: str, wall: float) -> dict[str, Any]:
+    """ONE cold-to-first-image run, attributed per leg. The ladder's unit of evidence."""
+    stages = stages_of(outcome)
+    ledger = ledger_of(outcome)
+    timings = outcome["timings"]
+    boot = (outcome.get("triage") or {}).get("posture", {}).get("boot_steps", [])
+    fill: dict[str, Any] = next((s for s in boot if s.get("step") == "load"), {})
+    attribution = (outcome.get("triage") or {}).get("measurements", {}).get("attribution") or {}
+    step_track = (attribution.get("steps") or {}).get("denoise", {})
+    rows = residency_of(outcome)
+    return {
+        "cap": label,
+        "ok": outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        "ttfi_s": round(timings["wall_ms"] / 1000, 2),
+        "harness_wall_s": round(wall, 2),
+        "boot_to_ready_s": round(timings.get("register_to_ready_ms", 0) / 1000, 2),
+        "fill_ms": fill.get("fill_ms", 0),
+        "fill_MiBps": round(fill.get("bytes", 0) / MIB / (fill.get("fill_ms", 1) / 1000), 1)
+        if fill.get("fill_ms")
+        else 0,
+        "tokenize_ms": round(stages.get("tokenize", 0), 1),
+        "encode_ms": round(stages.get("encode", 0), 1),
+        "denoise_ms": round(stages.get("denoise", 0), 1),
+        "decode_ms": round(stages.get("decode", 0), 1),
+        "png_ms": round(stages.get("encode_png", 0), 1),
+        "staged_ms": rows.get("staged_ms", 0),
+        "steps_per_s": round(1000 / step_track["mean_ms"], 3) if step_track.get("mean_ms") else 0,
+        "peak_vram_mib": round(
+            outcome.get("terminal", {}).get("metrics", {}).get("peak_vram_bytes", 0) / MIB, 1
+        ),
+        "rss_executor_mib": round(ledger.get("rss_executor", 0) / MIB, 1),
+        "rss_run_mib": round(ledger.get("rss_supervisor", 0) / MIB, 1),
+        "digest": (outcome.get("result") or {}).get("digest", "")[:16],
+    }
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    half = len(ordered) // 2
+    if not ordered:
+        return 0.0
+    return ordered[half] if len(ordered) % 2 else (ordered[half - 1] + ordered[half]) / 2
+
+
 def section_bandwidth(args: argparse.Namespace) -> None:
-    """Cold time-to-first-image at CAPPED disk read bandwidth. The product's real curve."""
+    """Cold time-to-first-image at CAPPED disk read bandwidth, plus the WARM pass.
+
+    THE BAR's cozy half (ROADMAP.md): the full cold->first-image ladder at each disk
+    allotment with the legs visible, so the fill-vs-denoise crossover is a measurement
+    rather than a composition of two curves.
+    """
     require_quiet_card()
     shim = build_throttle()
     head("cold time-to-first-image against a bandwidth-capped disk")
-    print(f"  throttle: {shim} (LD_PRELOAD token bucket over pread/read, BELOW the reader)")
+    print(f"  throttle: {shim} (LD_PRELOAD deadline bucket over pread/read, BELOW the reader)")
+    print(f"  {args.repeat} cold run(s) per allotment, page cache dropped before each")
     table: list[dict[str, Any]] = []
     for rate in [0, *args.rates]:
-        drop_page_cache(STORE)
-        env = {} if rate == 0 else {"LD_PRELOAD": str(shim), "COZY_THROTTLE_BPS": str(rate)}
-        started = time.perf_counter()
-        outcome = spawn(
+        label = "uncapped" if rate == 0 else f"{rate // 1_000_000} MB/s"
+        env = {} if rate == 0 else {"LD_PRELOAD": str(shim), "IO_THROTTLE_BPS": str(rate)}
+        for index in range(args.repeat):
+            evicted = drop_page_cache(STORE)
+            started = time.perf_counter()
+            outcome = drive(
+                f"the {label} run",
+                lambda rate=rate, index=index, env=env: spawn(
+                    {
+                        "workspace": f"{args.tmp}/bw-{rate}-{index}",
+                        "payload": {
+                            "prompt": args.prompt,
+                            "steps": args.steps,
+                            "size": args.size,
+                            "seed": 1005,
+                        },
+                        "request_id": f"pipe-bw-{rate}-{index}",
+                        "binding": {"resident_budget_bytes": args.budget},
+                    },
+                    env=env,
+                ),
+            )
+            row = ladder_row(outcome, label, time.perf_counter() - started)
+            row["run"] = index
+            row["resident_pages_before"] = evicted["resident_pages"]
+            table.append(row)
+            print(f"  {json.dumps(row)}", flush=True)
+
+    head("the same request, WARM page cache (nothing evicted)")
+    started = time.perf_counter()
+    warm = drive(
+        "the warm run",
+        lambda: spawn(
             {
-                "workspace": f"{args.tmp}/bw-{rate}",
+                "workspace": f"{args.tmp}/bw-warm",
                 "payload": {
                     "prompt": args.prompt,
                     "steps": args.steps,
                     "size": args.size,
                     "seed": 1005,
                 },
-                "request_id": f"pipe-bw-{rate}",
+                "request_id": "pipe-bw-warm",
                 "binding": {"resident_budget_bytes": args.budget},
-            },
-            env=env,
-        )
-        wall = time.perf_counter() - started
-        stages = stages_of(outcome)
-        boot = (outcome.get("triage") or {}).get("posture", {}).get("boot_steps", [])
-        fill: dict[str, Any] = next((s for s in boot if s.get("step") == "load"), {})
-        row = {
-            "cap": "uncapped" if rate == 0 else f"{rate / 1_000_000:.0f} MB/s",
-            "ok": outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
-            "time_to_first_image_s": round(outcome["timings"]["wall_ms"] / 1000, 2),
-            "harness_wall_s": round(wall, 2),
-            "fill_ms": fill.get("fill_ms", 0),
-            "fill_MiBps": round(fill.get("bytes", 0) / MIB / (fill.get("fill_ms", 1) / 1000), 1)
-            if fill.get("fill_ms")
-            else 0,
-            "denoise_ms": stages.get("denoise", 0),
-            "decode_ms": stages.get("decode", 0),
-            "digest": (outcome.get("result") or {}).get("digest", "")[:16],
-        }
-        table.append(row)
-        print(f"  {json.dumps(row)}", flush=True)
+            }
+        ),
+    )
+    warm_row = ladder_row(warm, "warm", time.perf_counter() - started)
+    print(f"  {json.dumps(warm_row)}", flush=True)
+
     check("every capped run still produced an image", all(r["ok"] for r in table))
-    digests = {r["digest"] for r in table if r["ok"]}
+    digests = {r["digest"] for r in table if r["ok"]} | {warm_row["digest"]}
     check(
-        "and the SAME image at every disk speed — bandwidth is not a correctness input",
+        "the SAME image at every disk speed and warm — bandwidth is not a correctness input",
         len(digests) == 1,
         f"{digests}",
     )
-    baseline = next((r for r in table if r["cap"] == "uncapped"), None)
-    if baseline:
-        print("\n  the curve, against the uncapped run:")
-        for row in table:
-            factor = row["time_to_first_image_s"] / max(baseline["time_to_first_image_s"], 1e-9)
-            fill_share = row["fill_ms"] / max(row["time_to_first_image_s"] * 1000, 1e-9)
-            print(
-                f"    {row['cap']:>12}  {row['time_to_first_image_s']:7.2f} s  "
-                f"{factor:5.2f}x  fill is {fill_share * 100:5.1f}% of it "
-                f"({row['fill_MiBps']:.0f} MiB/s measured)"
-            )
+    caps = [r["cap"] for r in table]
+    ordered = list(dict.fromkeys(caps))
+    base = median([r["ttfi_s"] for r in table if r["cap"] == "uncapped"]) or 1e-9
+    print("\n  cap            ttfi_s   vs uncapped   fill_ms   fill_MiBps   fill share")
+    for cap in ordered:
+        group = [r for r in table if r["cap"] == cap]
+        ttfi = median([r["ttfi_s"] for r in group])
+        fill_ms = median([float(r["fill_ms"]) for r in group])
+        rate = median([float(r["fill_MiBps"]) for r in group])
+        print(
+            f"  {cap:>12}  {ttfi:7.2f}  {ttfi / base:10.2f}x  {fill_ms:9.0f}  {rate:10.0f}  "
+            f"{fill_ms / max(ttfi * 1000, 1e-9) * 100:9.1f}%"
+        )
+    print(f"  {'warm':>12}  {warm_row['ttfi_s']:7.2f}  {warm_row['ttfi_s'] / base:10.2f}x")
+    Path(args.tmp, "cozy-ladder.json").write_text(
+        json.dumps({"cold": table, "warm": warm_row}, indent=2)
+    )
+    print(f"  banked: {Path(args.tmp, 'cozy-ladder.json')}")
 
 
 THROTTLE_C = r"""
@@ -1040,7 +1125,7 @@ THROTTLE_C = r"""
  * misses and everything else in the process are capped identically and none of them know.
  * It is deliberately NOT a sleep in runtime code — the runtime is unmodified and unaware.
  *
- * Rate comes from COZY_THROTTLE_BPS. The bucket refills at that rate in real time and a read
+ * Rate comes from IO_THROTTLE_BPS. The bucket refills at that rate in real time and a read
  * that outruns it sleeps for exactly the deficit.
  */
 #define _GNU_SOURCE
@@ -1050,12 +1135,15 @@ THROTTLE_C = r"""
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 
 static double rate_bps = 0.0;
 static double next_free = 0.0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static ssize_t (*real_read)(int, void *, size_t) = 0;
 static ssize_t (*real_pread)(int, void *, size_t, off_t) = 0;
+static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = 0;
+static long mmap_min = 0;   /* 0 disables the mmap arm entirely */
 
 static double now_s(void) {
     struct timespec t;
@@ -1064,23 +1152,38 @@ static double now_s(void) {
 }
 
 static void setup(void) {
-    const char *value = getenv("COZY_THROTTLE_BPS");
+    /* IO_ rather than COZY_: the supervisor's ERASE pass strips every COZY_-prefixed name
+     * from the device child's environment, and the fill happens in that child — a cap named
+     * COZY_THROTTLE_BPS reaches the supervisor and silently does not reach the reader. */
+    const char *value = getenv("IO_THROTTLE_BPS");
+    if (!value) value = getenv("COZY_THROTTLE_BPS");
     rate_bps = value ? atof(value) : 0.0;
+    const char *mm = getenv("IO_THROTTLE_MMAP_MIN");
+    if (!mm) mm = getenv("COZY_THROTTLE_MMAP_MIN");
+    mmap_min = mm ? atol(mm) : 0;
     next_free = now_s();
     real_read = dlsym(RTLD_NEXT, "read");
     real_pread = dlsym(RTLD_NEXT, "pread64");
     if (!real_pread) real_pread = dlsym(RTLD_NEXT, "pread");
+    real_mmap = dlsym(RTLD_NEXT, "mmap");
 }
 
 /* A DEADLINE bucket, not a per-thread deficit. The first version had each thread sleep for
  * its own share of a shared negative balance, and sixteen reader threads then slept in
  * PARALLEL — so a 1000 MB/s cap measured 1591 MB/s. Reserving a slot on one shared timeline
- * and sleeping until it is exact regardless of how many threads are reading. */
-static void spend(size_t n) {
+ * and sleeping until it is exact regardless of how many threads are reading.
+ *
+ * The slot is charged from when the read STARTED, so a read's own service time counts
+ * against its allotment instead of adding to it. Charging from completion made the two
+ * serial — a single-threaded reader at a 250 MB/s cap measured 139 MB/s, which is
+ * 1/(1/250 + 1/330), the cap composed with the disk rather than imposed on it. Sixteen
+ * parallel readers hid the error because their service times overlapped; a one-threaded
+ * mmap loader does not, and both engines have to meet the same cap.
+ */
+static void spend(size_t n, double began) {
     if (rate_bps <= 0.0) return;
     pthread_mutex_lock(&lock);
-    double now = now_s();
-    if (next_free < now) next_free = now;
+    if (next_free < began) next_free = began;
     next_free += (double)n / rate_bps;
     double target = next_free;
     pthread_mutex_unlock(&lock);
@@ -1093,19 +1196,61 @@ static void spend(size_t n) {
 
 ssize_t read(int fd, void *buf, size_t n) {
     if (!real_read) setup();
+    double began = now_s();
     ssize_t got = real_read(fd, buf, n);
-    if (got > 0) spend((size_t)got);
+    if (got > 0) spend((size_t)got, began);
     return got;
 }
 
 ssize_t pread(int fd, void *buf, size_t n, off_t off) {
     if (!real_pread) setup();
+    double began = now_s();
     ssize_t got = real_pread(fd, buf, n, off);
-    if (got > 0) spend((size_t)got);
+    if (got > 0) spend((size_t)got, began);
     return got;
 }
 
 ssize_t pread64(int fd, void *buf, size_t n, off_t off) { return pread(fd, buf, n, off); }
+
+/* The MMAP arm, off unless COZY_THROTTLE_MMAP_MIN is set.
+ *
+ * A read/pread bucket caps a reader that issues read syscalls; it does not touch a reader
+ * that mmaps the file and lets page FAULTS bring the bytes in. safetensors does exactly
+ * that, so ComfyUI's whole weight load is invisible to the bucket above and a ladder run
+ * against it would measure nothing. This turns a large read-only private file mapping into
+ * an anonymous mapping populated through the SAME throttled pread path, so both engines
+ * meet one constraint. It is deliberately narrow — MAP_PRIVATE, PROT_READ with no write or
+ * exec bit, a real fd, and at least COZY_THROTTLE_MMAP_MIN bytes — so libraries, the
+ * loader's own mappings, and every small mapping keep the kernel's behavior.
+ *
+ * The cost it charges honestly: the bytes become anonymous RSS instead of evictable page
+ * cache, so RSS under this arm is not the RSS of an unthrottled run.
+ */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    if (!real_mmap) setup();
+    int eligible = mmap_min > 0 && fd >= 0 && len >= (size_t)mmap_min &&
+                   (flags & MAP_PRIVATE) && (prot & PROT_READ) &&
+                   !(prot & PROT_WRITE) && !(prot & PROT_EXEC) && !(flags & MAP_ANONYMOUS);
+    if (!eligible) return real_mmap(addr, len, prot, flags, fd, off);
+    void *anon = real_mmap(0, len, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (anon == MAP_FAILED) return real_mmap(addr, len, prot, flags, fd, off);
+    size_t done = 0;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > (size_t)(8 << 20)) want = 8 << 20;
+        double began = now_s();
+        ssize_t got = real_pread(fd, (char *)anon + done, want, off + (off_t)done);
+        if (got <= 0) break;
+        spend((size_t)got, began);
+        done += (size_t)got;
+    }
+    return anon;
+}
+
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    return mmap(addr, len, prot, flags, fd, off);
+}
 """
 
 
@@ -1150,6 +1295,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--budget", type=int, default=0)
+    parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--component", default="text_encoder_2")
     parser.add_argument(
         "--rates",
