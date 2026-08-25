@@ -99,11 +99,10 @@ class ComponentResidency:
         """Make the declared set resident BEFORE the method body runs, or refuse typed."""
         self.admissions += 1
         # Under a staged rung, admission first frees ROOM FOR THE WORK, not just room for
-        # the weights. This is the difference between a rung that exists and one that
-        # helps: a 1024px VAE decode next to 6.46 GiB of resident weights runs out of
-        # memory INSIDE the kernel, where there is nothing left to decide. Freeing the LRU
-        # component the method does not declare, down to the plan's activation envelope,
-        # is the decision — made before entry, where it is still a decision.
+        # the weights: every evictable component this method does not declare goes, so the
+        # scope gets the whole card minus its own set. That is the difference between a
+        # rung that exists and one that helps — a 1024px VAE decode next to 6.46 GiB of
+        # resident weights runs out of memory INSIDE the kernel, where nothing can decide.
         self._make_headroom(components)
         for name in components:
             lease = self.leases.setdefault(name, Lease(name))
@@ -117,14 +116,15 @@ class ComponentResidency:
             try:
                 self.backend.stage(name)
             except FillRefusal as exc:
-                lease.held = 0
+                # `held` is deliberately NOT touched: this admission never incremented it,
+                # and one public scope is active at a time per instance, so anything it
+                # holds belongs to a caller this refusal is unwinding through.
                 self.refusals.append(f"{exc.code}: {exc}"[:400])
                 raise ResidencyRefusal(
                     exc.code,
                     f"{method}() declares component {name!r} and it could not be staged: {exc}",
                 ) from exc
             except self.torch.cuda.OutOfMemoryError as exc:
-                lease.held = 0
                 refusal = self._shortfall(method, name, str(exc))
                 self.last_shortfall = refusal.shortfall
                 self.refusals.append(refusal.detail[:400])
