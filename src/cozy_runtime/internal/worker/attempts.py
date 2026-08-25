@@ -25,6 +25,7 @@ measurements.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import time
@@ -124,6 +125,15 @@ _ORIGIN = {
     "request": ORIGIN.CAUSE_ORIGIN_CLIENT,
     "runtime": ORIGIN.CAUSE_ORIGIN_RUNTIME,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class InlineResult:
+    """The typed result as the EXECUTOR serialized it, with what the wire carries beside it."""
+
+    canonical: bytes
+    schema_digest: str
+    adjustments: tuple[Mapping[str, Any], ...]
 
 
 class AttemptRefusal(Exception):
@@ -932,7 +942,18 @@ class AttemptEngine:
                 f"result_too_large: {reply['oversize_result_bytes']} B over the inline door",
             )
         manifest: pb.OutputManifest | None = None
+        inline: InlineResult | None = None
         if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
+            inline, result_error = self._inline_result(attempt, reply)
+            if result_error is not None:
+                grants.abort_outputs(spool)
+                return self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_FAILED,
+                    CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                    ORIGIN.CAUSE_ORIGIN_EXECUTOR,
+                    result_error,
+                )
             manifest, tail_error = self._tail(attempt, reply)
             if tail_error is not None:
                 return self.terminal(
@@ -952,7 +973,7 @@ class AttemptEngine:
             _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),
-            result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
+            result=inline,
         )
 
     def durable_exchange(self, attempt: Attempt, frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -1260,7 +1281,22 @@ class AttemptEngine:
         # that refused came back to the coordinator as a missing destination, and the actual
         # reason was nowhere on the terminal.
         manifest: pb.OutputManifest | None = None
+        inline: InlineResult | None = None
         if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
+            # The result document is read and held to its declared identity BEFORE the output
+            # transaction: a result that cannot be verified must not leave written outputs at
+            # granted destinations behind it.
+            inline, result_error = self._inline_result(attempt, reply)
+            if result_error is not None:
+                if attempt.spool is not None:
+                    grants.abort_outputs(attempt.spool)
+                return self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_FAILED,
+                    CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                    ORIGIN.CAUSE_ORIGIN_EXECUTOR,
+                    result_error,
+                )
             manifest, tail_error = self._tail(attempt, reply)
             if tail_error is not None:
                 return self.terminal(
@@ -1296,7 +1332,7 @@ class AttemptEngine:
             _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),
-            result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
+            result=inline,
             shortfall=shortfall,
         )
 
@@ -1504,7 +1540,7 @@ class AttemptEngine:
         *,
         manifest: pb.OutputManifest | None = None,
         metrics: Mapping[str, Any] | None = None,
-        result: Mapping[str, Any] | None = None,
+        result: InlineResult | None = None,
         shortfall: Mapping[str, Any] | None = None,
     ) -> pb.AttemptTerminal:
         """CLOSE the ledger, commit the triage bundle, build, JOURNAL, then return to send.
@@ -1706,21 +1742,61 @@ class AttemptEngine:
             terminal_canonical=attempt.terminal_bytes,
         )
 
-    def _envelope(self, reply: Mapping[str, Any]) -> pb.ResultEnvelope:
+    def _inline_result(
+        self, attempt: Attempt, reply: Mapping[str, Any]
+    ) -> tuple[InlineResult | None, str | None]:
+        """Read the result bytes the executor spooled, and hold them to their declared identity.
+
+        The seam carries CONTROL. The result document takes the same road the output blobs
+        take — the attempt spool the supervisor brokered — and only its digest and length
+        cross the frame, so a result between the 64 KiB frame cap and the 4 MiB public door
+        is served instead of becoming an executor fault (reproduced live at 71,712 B).
+
+        The supervisor names the file. Nothing here is read from a path the child chose.
+        """
+        ref = reply.get("result_ref")
+        if not isinstance(ref, Mapping):
+            return None, None
+        if attempt.spool is None:
+            return None, "the attempt has no spool to read its result document from"
+        path = attempt.spool / seam.RESULT_DOCUMENT
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            return None, f"result_document_unreadable: {type(exc).__name__}"
+        if len(data) != int(ref.get("length", -1)):
+            return None, (
+                f"result_document_length: the executor declared {ref.get('length')} B and "
+                f"the spool holds {len(data)} B"
+            )
+        spelled = "sha256:" + hashlib.sha256(data).hexdigest()
+        if spelled != str(ref.get("digest", "")):
+            return None, (
+                f"result_document_digest: the executor declared {str(ref.get('digest'))[:23]}… "
+                f"and the spooled bytes hash to {spelled[:23]}…"
+            )
+        return (
+            InlineResult(
+                canonical=data,
+                schema_digest=str(reply.get("result_schema_digest") or spelled),
+                adjustments=tuple(dict(row) for row in reply.get("adjustments", ())),
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _envelope(result: InlineResult) -> pb.ResultEnvelope:
         """The TYPED function result — never the asset manifest under another name.
 
         Small results ride the terminal INLINE (<= 4 MiB), skipping the file-store round
         trip; a larger one takes the blob-receipt door. The choice is kept here explicitly
         rather than lost: it is the whole reason the field is a XOR pair.
         """
-        document = reply.get("result") or {}
-        data = canonical.write(document)
-        # The DECLARED annotated result surface's identity, computed by the executor from
-        # the endpoint's own schema — never a digest of this particular value, which would
-        # move every request and fence nothing.
-        schema_digest = str(reply.get("result_schema_digest") or canonical.digest(document))
         envelope = pb.ResultEnvelope(
-            result_schema_digest=documents.raw(schema_digest),
+            # The DECLARED annotated result surface's identity, computed by the executor from
+            # the endpoint's own schema — never a digest of this particular value, which
+            # would move every request and fence nothing.
+            result_schema_digest=documents.raw(result.schema_digest),
             adjustments=[
                 pb.AdjustmentRow(
                     field=row["field"],
@@ -1728,10 +1804,13 @@ class AttemptEngine:
                     applied=row["applied"],
                     reason=row["reason"],
                 )
-                for row in reply.get("adjustments", ())
+                for row in result.adjustments
             ],
         )
-        envelope.inline_result = data  # the oversize case never reaches here (§3.4)
+        # The EXECUTOR's exact serialized bytes, not a re-serialization of a decoded copy:
+        # the envelope's whole claim is that the bytes a coordinator holds and the value the
+        # handler returned are one thing.
+        envelope.inline_result = result.canonical
         return envelope
 
     def attest(

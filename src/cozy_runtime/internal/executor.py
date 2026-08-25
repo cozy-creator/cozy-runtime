@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import resource
@@ -45,7 +46,7 @@ from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.seam import Channel, SeamError, connect
+from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -553,14 +554,7 @@ class Executor:
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent()
         self.attempts += 1
-        result_document, outputs, oversize = _serialize_result(envelope)
-        if oversize:
-            # The seam carries CONTROL: an oversized result must not be attempted across it
-            # at all. Only its SIZE crosses, and the supervisor turns that into the typed
-            # `result_too_large` refusal — a frame that blows the cap would kill this
-            # process and turn a contract refusal into an executor fault.
-            result_document = None
-            outputs = []
+        result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # Author code entered, so reuse is poisoned by any non-success — a refusal raised
         # BEFORE entry (schema, bounds, preflight) leaves a Ready executor untouched (§3.1).
         pre_entry = (
@@ -599,7 +593,7 @@ class Executor:
             "env_intact": _env_intact(),
             "poisoned": self.poisoned,
             "outputs": outputs,
-            "result": result_document,
+            "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
                 {
@@ -736,9 +730,7 @@ class Executor:
             self.torch.cuda.synchronize()
             peak_vram = self.torch.cuda.max_memory_allocated()
         self.attempts += 1
-        result_document, outputs, oversize = _serialize_result(envelope)
-        if oversize:
-            result_document, outputs = None, []
+        result_ref, outputs, oversize = _serialize_result(envelope, spool)
         pre_entry = ("invalid_request", "unsupported_input", "default_resolution", "tree_ungranted")
         if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
@@ -764,7 +756,7 @@ class Executor:
             "env_intact": _env_intact(),
             "poisoned": self.poisoned,
             "outputs": outputs,
-            "result": result_document,
+            "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [],
             "oversize_result_bytes": oversize,
@@ -865,7 +857,7 @@ class Executor:
                 "outcome": "warmed",
                 "reason": "",
                 "payload": payload,
-                "boot_warmup_observed": bool((reply.get("result") or {}).get("warm")),
+                "boot_warmup_observed": bool(_read_result(spool).get("warm")),
                 "handler_ms": reply.get("metrics", {}).get("handler_ms", 0),
             }
         # A failed warm pass NEVER bricks the worker: it is reported and the executor is
@@ -924,7 +916,18 @@ class Executor:
         }
 
 
-def _serialize_result(envelope: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
+def _read_result(spool: Path) -> dict[str, Any]:
+    """The document this process just spooled, read back in-process (the warm pass's half)."""
+    path = spool / RESULT_DOCUMENT
+    if not path.is_file():
+        return {}
+    value = canonical.parse(path.read_bytes())
+    return value if isinstance(value, dict) else {}
+
+
+def _serialize_result(
+    envelope: Any, spool: Path
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
     """Serialize the typed result EXACTLY ONCE, before its types are lost.
 
     msgspec encodes the whole annotated result struct — nested structs, lists and all — in
@@ -938,9 +941,12 @@ def _serialize_result(envelope: Any) -> tuple[dict[str, Any] | None, list[dict[s
     into the grant: two outputs arriving in a different order must still land in their own
     destinations, and position cannot express that.
 
-    Returns `(document, outputs, oversize_bytes)`; `oversize_bytes` is non-zero when the
-    canonical result exceeds the inline door, which cr-007 REFUSES rather than papering over
-    with a receipt for bytes nobody wrote.
+    Returns `(result_ref, outputs, oversize_bytes)`. The BYTES land in the attempt spool and
+    only their digest and length ride the reply: the public door admits 4 MiB inline and one
+    control frame admits 64 KiB, so a result between the two was an executor fault instead of
+    a served result until the bytes moved to the spool the supervisor already brokers.
+    `oversize_bytes` is non-zero when the canonical result exceeds the inline door, which
+    cr-007 REFUSES rather than papering over with a receipt for bytes nobody wrote.
     """
     import msgspec
 
@@ -964,8 +970,15 @@ def _serialize_result(envelope: Any) -> tuple[dict[str, Any] | None, list[dict[s
     document = json.loads(msgspec.json.encode(envelope.result, enc_hook=hook))
     assert isinstance(document, dict)
     outputs = sorted(_assets_at(document, ""), key=lambda row: str(row["output_id"]))
-    oversize = len(canonical.write(document))
-    return document, outputs, oversize if oversize > INLINE_RESULT_MAX else 0
+    data = canonical.write(document)
+    if len(data) > INLINE_RESULT_MAX:
+        return None, [], len(data)
+    (spool / RESULT_DOCUMENT).write_bytes(data)
+    return (
+        {"digest": "sha256:" + hashlib.sha256(data).hexdigest(), "length": len(data)},
+        outputs,
+        0,
+    )
 
 
 def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:

@@ -30,6 +30,13 @@ MAX_FRAME = 64 * 1024
 #: supervisor (§3.1); the executor cannot leak what it was never handed.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
+#: The attempt-spool file the executor writes its serialized typed result into. The public
+#: contract admits an inline result up to 4 MiB and this frame admits 64 KiB, so the bytes
+#: take the same road the output blobs already take — the brokered spool — and only their
+#: digest and length cross here. The SUPERVISOR names the file, so no path ever comes off
+#: the child (cr-007).
+RESULT_DOCUMENT = "result.canonical"
+
 
 class SeamError(Exception):
     def __init__(self, code: str, detail: str) -> None:
