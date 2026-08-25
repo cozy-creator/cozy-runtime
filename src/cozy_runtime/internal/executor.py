@@ -198,6 +198,16 @@ class Executor:
             # reserved against a DECLARED budget; the device is what actually says no. The
             # request-aware ladder that would pick a plan that fits is cr-008b's.
             oom = not isinstance(exc, FillRefusal)
+            if oom:
+                # A device OOM must roll back like any other fill failure. cr-005's
+                # transaction unwinds on a typed FillRefusal, which an allocator error is
+                # not — so without this the destinations stay allocated and the refusal
+                # reports "after rollback the allocator holds 2,375,322,112 B", which is an
+                # honest report of a rollback that did not happen. Measured exactly that on
+                # a contended card. The generation is poisoned either way and the executor
+                # is replaced, but a worker holding 2.4 GiB it can never use until the
+                # process dies is a worker whose ledger tells the truth about a lie.
+                backend.rollback(())
             backend.release_lease()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
