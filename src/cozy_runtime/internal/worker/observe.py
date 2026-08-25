@@ -25,6 +25,7 @@ Benchmark-override invokes are marked so they can never pollute a measurement.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,10 +70,22 @@ class Cursor:
 class SilenceMonitor:
     """Advance versus silence over monotone positions. It never reads a clock."""
 
-    def __init__(self, ring: EventRing, give_up_after: int = GIVE_UP_AFTER) -> None:
+    def __init__(
+        self,
+        ring: EventRing,
+        give_up_after: int = GIVE_UP_AFTER,
+        busy: Callable[[], int] | None = None,
+    ) -> None:
         self.ring = ring
         self.give_up_after = give_up_after
         self.cursors: dict[str, Cursor] = {}
+        #: CPU nanoseconds the device process has burned, read by the SUPERVISOR. A subject
+        #: that emits nothing while its process burns CPU is BUSY, not wedged: a 20-minute
+        #: hash-bound conversion leg has nothing to say and is working the whole time, and
+        #: calling it wedged every tick is a flood that describes nothing (job-001).
+        #: Absent (None) means unreadable, and an unreadable meter decides nothing.
+        self.busy = busy
+        self.cpu: dict[str, int] = {}
 
     def start(self, subject: str, step: str) -> Cursor:
         """Open a subject and emit `started` AT POSITION 0 — a pre-first-unit wedge must
@@ -102,6 +115,15 @@ class SilenceMonitor:
             cursor.advanced += 1
             return "advancing"
         cursor.still += 1
+        burned = self.busy() if self.busy is not None else -1
+        if burned >= 0:
+            before = self.cpu.get(subject, -1)
+            self.cpu[subject] = burned
+            if before >= 0 and burned > before:
+                # WORKING, not wedged. Silence is the absence of narration; a wedge is the
+                # absence of PROGRESS, and a process burning CPU is making some.
+                cursor.still = 0
+                return "busy"
         if cursor.still < self.give_up_after:
             return "silent"
         if not cursor.wedged:

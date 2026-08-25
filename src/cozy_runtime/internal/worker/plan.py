@@ -21,6 +21,7 @@ something was.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -421,12 +422,13 @@ class DeclaredBinding:
                 "binding_plan_incomplete",
                 f"binding plan record is missing {', '.join(missing)}",
             )
-        snapshot = str(record.get("snapshot", ""))
+        snapshot = _digest(str(record.get("snapshot", "")), "snapshot")
         components = _split(str(record.get("components", ""))) or _split(
             str(record.get("component", ""))
         )
         offered = tuple(
-            v if isinstance(v, Variant) else Variant.read(v) for v in record.get("variants") or ()
+            _normalize(v if isinstance(v, Variant) else Variant.read(v))
+            for v in record.get("variants") or ()
         ) or (
             (
                 Variant(
@@ -453,7 +455,10 @@ class DeclaredBinding:
             variant=str(record.get("variant", "")),
             reference_snapshot=snapshot,
             components=components,
-            snapshots=_pairs(str(record.get("snapshots", ""))),
+            snapshots={
+                name: _digest(value, f"snapshots[{name}]")
+                for name, value in _pairs(str(record.get("snapshots", ""))).items()
+            },
             offered=offered,
             objective=str(record.get("objective", "latency")),
             steps_basis=int(record.get("steps_basis", 20)),
@@ -465,7 +470,9 @@ class DeclaredBinding:
             tenancy=str(record.get("tenancy", "local")),
             custody=str(record.get("custody", "canonical")),
             strict_keys=bool(record.get("strict_keys", False)),
-            expected_logical_model_digest=str(record.get("model_construction_digest", "")),
+            expected_logical_model_digest=_digest(
+                str(record.get("model_construction_digest", "")), "model_construction_digest"
+            ),
             max_input_bytes=int(record.get("max_input_bytes", 64 << 20)),
             max_inputs_total_bytes=int(record.get("max_inputs_total_bytes", 256 << 20)),
             egress_allowed_hosts=_split(str(record.get("egress_allowed_hosts", ""))),
@@ -521,8 +528,41 @@ MODEL_KEYS = frozenset(
 )
 
 
+def _digest(value: str, what: str) -> str:
+    """The ONE digest spelling, ACCEPTED EITHER WAY.
+
+    A store, a producer and a person each write a digest differently, and a border that
+    PRINTS `sha256:<hex>` while accepting only bare hex makes its own output unusable as its
+    own input (job-001). This normalizes to the one spelling the runtime speaks and refuses
+    anything that is not a digest at all — which is the half that must not be lost: a typo
+    used to travel all the way to the store as an unknown snapshot.
+    """
+    if not value:
+        return ""
+    bare = value.removeprefix("sha256:")
+    if len(bare) == 64 and not bare.strip("0123456789abcdef"):
+        return "sha256:" + bare
+    raise PlanRefusal(
+        "binding_plan_digest",
+        f"{what}: {value[:80]!r} is not a sha256 digest. Both spellings are accepted — "
+        "`sha256:<64 lowercase hex>` and the bare hex — and the runtime speaks the first",
+    )
+
+
 def _split(packed: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in packed.split(",") if part.strip())
+
+
+def _normalize(variant: Variant) -> Variant:
+    """One offered candidate, with its digests in the runtime's spelling."""
+    return dataclasses.replace(
+        variant,
+        snapshot=_digest(variant.snapshot, f"variants[{variant.name}].snapshot"),
+        snapshots=",".join(
+            f"{name}={_digest(value, f'variants[{variant.name}].snapshots[{name}]')}"
+            for name, value in sorted(variant.snapshot_map().items())
+        ),
+    )
 
 
 def _pairs(packed: str) -> dict[str, str]:
