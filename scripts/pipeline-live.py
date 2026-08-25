@@ -819,41 +819,42 @@ THROTTLE_C = r"""
 #include <sys/types.h>
 
 static double rate_bps = 0.0;
-static double tokens = 0.0;
-static struct timespec last;
+static double next_free = 0.0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static ssize_t (*real_read)(int, void *, size_t) = 0;
 static ssize_t (*real_pread)(int, void *, size_t, off_t) = 0;
 
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 static void setup(void) {
     const char *value = getenv("COZY_THROTTLE_BPS");
     rate_bps = value ? atof(value) : 0.0;
-    /* The bucket starts EMPTY. Starting it full hands out a free second of bandwidth, which
-     * on a short read is most of the read: a 100 MB file under a 50 MB/s cap measured
-     * 94 MB/s. Over a 6.4 GiB fill the difference is noise, but a benchmark whose number
-     * depends on how long the thing being measured takes is not a benchmark. */
-    tokens = 0.0;
-    clock_gettime(CLOCK_MONOTONIC, &last);
+    next_free = now_s();
     real_read = dlsym(RTLD_NEXT, "read");
     real_pread = dlsym(RTLD_NEXT, "pread64");
     if (!real_pread) real_pread = dlsym(RTLD_NEXT, "pread");
 }
 
+/* A DEADLINE bucket, not a per-thread deficit. The first version had each thread sleep for
+ * its own share of a shared negative balance, and sixteen reader threads then slept in
+ * PARALLEL — so a 1000 MB/s cap measured 1591 MB/s. Reserving a slot on one shared timeline
+ * and sleeping until it is exact regardless of how many threads are reading. */
 static void spend(size_t n) {
     if (rate_bps <= 0.0) return;
     pthread_mutex_lock(&lock);
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double dt = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
-    last = now;
-    tokens += dt * rate_bps;
-    if (tokens > rate_bps) tokens = rate_bps;
-    tokens -= (double)n;
-    double deficit = tokens < 0 ? -tokens / rate_bps : 0.0;
+    double now = now_s();
+    if (next_free < now) next_free = now;
+    next_free += (double)n / rate_bps;
+    double target = next_free;
     pthread_mutex_unlock(&lock);
-    if (deficit > 0) {
-        struct timespec wait = {(time_t)deficit, (long)((deficit - (long)deficit) * 1e9)};
-        nanosleep(&wait, 0);
+    double wait = target - now_s();
+    if (wait > 0) {
+        struct timespec ts = {(time_t)wait, (long)((wait - (long)wait) * 1e9)};
+        nanosleep(&ts, 0);
     }
 }
 
