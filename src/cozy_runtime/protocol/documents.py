@@ -1,0 +1,174 @@
+"""The digest plane: `cozy.worker.v1` messages <-> their canonical DOCUMENT bytes.
+
+Identity in this protocol is never marshaled protobuf (01 §header): a digest that fences
+MEANING is the SHA-256 of a document's exact canonical bytes under tfs-013's writer, and the
+bytes travel IN the message so a verifier recomputes rather than re-canonicalizes.
+
+This module is the WORKER's authoring half — `internal/canonical.py` is the writer, and the
+mapping below is proto3 -> JSON value:
+
+  * set fields only (a field at its proto3 default is OMITTED — absence-default equals
+    pre-introduction behaviour, R8, so omission is the one spelling of that meaning),
+  * enums spell as their NUMBER (R2: numbers are normative, names are not),
+  * BYTES NAMING LAW: a `bytes` field named `digest`/`*_digest` is a 32-byte SHA-256 spelled
+    `sha256:<hex>`; every other `bytes` field is opaque payload spelled base64,
+  * a `format` tag (`<full.Name>/1`) domain-separates two document kinds with equal fields.
+
+The reading half refuses what the writer cannot have produced: non-canonical encoding, an
+unknown key, a wrong `format`. That is what makes a planted service-class field on an
+ExecutionSpec a REFUSAL rather than an ignored unknown field.
+
+Profile note, checked live rather than asserted (`scripts/worker-live.py fixtures` renders
+th-024's frozen canonical fixtures through THIS writer and compares bytes + ids):
+cozy-runtime's writer admits floats, `null` and non-ASCII because a descriptor needs them;
+the protocol profile does not, so `_ascii` refuses a non-printable-ASCII field here instead
+of spelling it. Within the admissible profile the two writers are byte-identical.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+from typing import Any
+
+from google.protobuf.descriptor import FieldDescriptor as FD
+from google.protobuf.message import Message
+
+from cozy_runtime.internal import canonical
+
+INT_MAX = (1 << 53) - 1
+INT_MIN = -INT_MAX
+
+_INT_TYPES = frozenset(
+    {
+        FD.TYPE_INT32, FD.TYPE_INT64, FD.TYPE_UINT32, FD.TYPE_UINT64,
+        FD.TYPE_SINT32, FD.TYPE_SINT64, FD.TYPE_FIXED32, FD.TYPE_FIXED64,
+        FD.TYPE_SFIXED32, FD.TYPE_SFIXED64,
+    }
+)
+_FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
+
+
+class DocumentError(Exception):
+    """A canonical-document refusal, named by code so a caller can classify it."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+# --------------------------------------------------------------------------- digests
+
+
+def spell(raw: bytes) -> str:
+    """The 32 raw bytes protobuf transports -> `sha256:<hex>`. One identity, two spellings."""
+    if len(raw) != 32:
+        raise DocumentError("malformed_digest", f"{len(raw)} B is not a 32-byte SHA-256")
+    return "sha256:" + raw.hex()
+
+
+def raw(spelled: str) -> bytes:
+    """`sha256:<hex>` -> the 32 raw bytes protobuf transports."""
+    if not spelled.startswith("sha256:") or len(spelled) != 71:
+        raise DocumentError("malformed_digest", f"{spelled!r} is not a lowercase sha256: digest")
+    return bytes.fromhex(spelled[7:])
+
+
+def digest_of(data: bytes) -> bytes:
+    """The raw 32-byte SHA-256 of exactly these bytes — the only digest a receiver computes."""
+    return hashlib.sha256(data).digest()
+
+
+# --------------------------------------------------------------------------- writer
+
+
+def _ascii(text: str, where: str) -> str:
+    for char in text:
+        if not 0x20 <= ord(char) <= 0x7E:
+            raise DocumentError(
+                "non_ascii_field", f"U+{ord(char):04X} in {where}: fields are printable ASCII"
+            )
+    return text
+
+
+def _field(fd: FD, value: Any, where: str) -> Any:
+    if fd.type == FD.TYPE_BOOL:
+        return bool(value)
+    if fd.type == FD.TYPE_ENUM:
+        return int(value)
+    if fd.type in _INT_TYPES:
+        if not INT_MIN <= value <= INT_MAX:
+            raise DocumentError("number_range", f"{where}={value} is outside the safe range")
+        return int(value)
+    if fd.type in _FLOAT_TYPES:
+        raise DocumentError("non_integer_number", f"{where} is a float: documents are integer-only")
+    if fd.type == FD.TYPE_STRING:
+        return _ascii(str(value), where)
+    if fd.type == FD.TYPE_BYTES:
+        if fd.name == "digest" or fd.name.endswith("_digest"):
+            return spell(bytes(value))
+        return base64.b64encode(bytes(value)).decode()
+    if fd.type == FD.TYPE_MESSAGE:
+        return body(value)
+    raise DocumentError("wrong_type", f"{where}: proto type {fd.type} has no canonical form")
+
+
+def body(message: Message) -> dict[str, Any]:
+    """Set fields only, in no particular order — the writer sorts."""
+    out: dict[str, Any] = {}
+    for fd, value in message.ListFields():
+        where = fd.full_name
+        out[fd.name] = (
+            [_field(fd, item, where) for item in value]
+            if fd.is_repeated
+            else _field(fd, value, where)
+        )
+    return out
+
+
+def document(message: Message) -> dict[str, Any]:
+    """The document: the message's set fields plus the `format` tag that separates kinds."""
+    rendered = body(message)
+    if "format" in rendered:
+        raise DocumentError("unknown_field", "`format` is reserved for the document tag")
+    rendered["format"] = message.DESCRIPTOR.full_name + "/1"
+    return rendered
+
+
+def canonical_bytes(message: Message) -> bytes:
+    return canonical.write(document(message))
+
+
+def identity(message: Message) -> tuple[bytes, bytes]:
+    """`(canonical bytes, raw 32-byte digest)` — what a message carries as a fenced pair."""
+    data = canonical_bytes(message)
+    return data, digest_of(data)
+
+
+# --------------------------------------------------------------------------- reader
+
+
+def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
+    """Exact canonical bytes -> a typed document. Unknown keys REFUSE (law 4's reading side).
+
+    Deliberately returns the JSON value, not a parsed message: the document is the subject of
+    the digest, and re-encoding it into a message would create a second representation that
+    is free to disagree. Callers read fields off the mapping.
+    """
+    if len(data) > canonical.DOC_MAX_BYTES:
+        raise DocumentError("size_cap", f"{len(data)} B over the document cap")
+    try:
+        value = canonical.parse_canonical(data)
+    except canonical.CanonicalError as exc:
+        raise DocumentError(exc.code, exc.detail) from exc
+    if not isinstance(value, dict):
+        raise DocumentError("wrong_type", "a document is a JSON object")
+    want = cls.DESCRIPTOR.full_name + "/1"
+    if value.get("format") != want:
+        raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
+    known = {f.name for f in cls.DESCRIPTOR.fields} | {"format"}
+    for key in value:
+        if key not in known:
+            raise DocumentError("unknown_field", f"{want}: unknown field {key!r}")
+    return value
