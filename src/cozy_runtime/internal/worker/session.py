@@ -50,8 +50,8 @@ from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
     STATUS,
-    Attempt,
     AttemptEngine,
+    AttemptRecord,
     AttemptRefusal,
 )
 from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
@@ -194,7 +194,7 @@ class Supervisor:
         )
         self.progress_shed = 0
         self.progress_sent = 0
-        self.work: queue.Queue[Attempt | None] = queue.Queue()
+        self.work: queue.Queue[AttemptRecord | None] = queue.Queue()
         self.stop = threading.Event()
         #: SET when the intake state is a verdict (READY or ERROR), CLEAR while the worker is
         #: still becoming one. `on_start` waits on it so a request that arrives during a
@@ -836,7 +836,7 @@ class Supervisor:
                 acked = message.terminal_ack
                 self.note("terminal", self.engine.close(acked))
                 closed = self.engine.history.get((acked.request_id, acked.attempt))
-                if self.reclaim_on_terminal and closed is not None and closed.job is not None:
+                if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
                     # RUN-ONCE: one immutable build, one bounded attempt, terminal, reclaim.
                     # The worker stops HERE, after the terminal is durably acknowledged, with
                     # the recycle disposition rather than a death.
@@ -930,7 +930,7 @@ class Supervisor:
         self.engine.hold(attempt)
         self.work.put(attempt)
 
-    def await_settled(self, attempt: Attempt) -> None:
+    def await_settled(self, attempt: AttemptRecord) -> None:
         """QUEUE behind a rebuild instead of refusing through one.
 
         The alternative — the shape cl-003 measured — is a dispatch/refuse/requeue loop: a
@@ -985,7 +985,7 @@ class Supervisor:
         held = self.engine.history.get((start.request_id, start.attempt))
         if held is not None and held.state in ("terminal", "closed"):
             held = None
-        attempt = held or Attempt(
+        attempt = held or AttemptRecord(
             request_id=start.request_id,
             attempt=start.attempt,
             digest=start.exec_spec_digest,
@@ -1029,7 +1029,7 @@ class Supervisor:
                 self.execute(attempt)
                 self.rebuild_if_needed()
 
-    def admit(self, attempt: Attempt) -> bool:
+    def admit(self, attempt: AttemptRecord) -> bool:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
         key = f"{attempt.request_id}#{attempt.attempt}"
         self.await_settled(attempt)
@@ -1083,7 +1083,7 @@ class Supervisor:
         self.send(pb.WorkerMessage(attempt_accepted=accepted))
         return True
 
-    def execute(self, attempt: Attempt) -> None:
+    def execute(self, attempt: AttemptRecord) -> None:
         """RUN -> TERMINAL -> RECONCILE. The ledger closes inside `terminal()`."""
         try:
             terminal = self.engine.execute(attempt)
@@ -1109,7 +1109,7 @@ class Supervisor:
         self.send(pb.WorkerMessage(attempt_terminal=terminal))
 
     def terminate(
-        self, attempt: Attempt, build: Callable[..., pb.AttemptTerminal], *args: Any
+        self, attempt: AttemptRecord, build: Callable[..., pb.AttemptTerminal], *args: Any
     ) -> None:
         """Journal ONE terminal for a held attempt and send it, or say why it could not."""
         try:

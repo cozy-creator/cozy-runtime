@@ -174,14 +174,15 @@ def _verdict(
             "rendered": f"capacity({exc.detail})",
             "shortfall": exc.shortfall,
         }
-    degraded = "DEGRADED" in chosen.quantified_choice or "short by" in chosen.quantified_choice
+    why = chosen.decision_explanation
+    degraded = "DEGRADED" in why or "short by" in why
     label = "fits-degraded" if degraded else "fits"
     return {
         "function": surface.name,
         "exact": exact,
         "verdict": label,
         "rendered": f"{label}({chosen.delivery}, {chosen.placement}) · {chosen.compute_dtype} · "
-        f"{chosen.quantified_choice[:160]}",
+        f"{chosen.decision_explanation[:160]}",
         "plan": chosen.document(),
     }
 

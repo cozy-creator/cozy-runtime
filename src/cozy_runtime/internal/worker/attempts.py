@@ -108,6 +108,11 @@ _TERMINAL = {
     "failed": (STATUS.TERMINAL_STATUS_FAILED, CAUSE.CAUSE_CODE_AUTHOR_EXCEPTION),
     "canceled": (STATUS.TERMINAL_STATUS_CANCELED, CAUSE.CAUSE_CODE_CLIENT_CANCEL),
 }
+#: the worker's own attempt-kind word, mapped onto the wire's enum.
+_KIND = {
+    "serving": pb.AttemptKind.ATTEMPT_KIND_SERVING,
+    "job": pb.AttemptKind.ATTEMPT_KIND_JOB,
+}
 _ORIGIN = {
     "author": ORIGIN.CAUSE_ORIGIN_AUTHOR,
     "request": ORIGIN.CAUSE_ORIGIN_CLIENT,
@@ -149,7 +154,12 @@ class AttemptRefusal(Exception):
 
 
 @dataclass(slots=True)
-class Attempt:
+class AttemptRecord:
+    """ONE attempt, as this worker holds it. Named for what it is: the supervisor's RECORD
+    of an attempt, distinct from `author._services.Attempt`, which is the handler's own
+    per-attempt surface — two different things under one name is how a reader loses which
+    side of the seam they are on."""
+
     request_id: str
     attempt: int
     digest: bytes
@@ -157,6 +167,11 @@ class Attempt:
     grant: pb.DeliveryGrant
     plan: AttemptPlan | None = None
     binding: BindingPlan | None = None
+    kind: str = "serving"
+    """`serving` or `job`. It SURVIVES compaction, because what an attempt was is still a
+    fact about it after its heavy state is gone — the run-once recycle disposition and the
+    Report's attempt kind both read it, and both used to infer it from `job`, which
+    compaction clears."""
     job: JobBinding | None = None
     """Set on a JOB attempt instead of `binding`. Exactly one of the two is ever set: the
     ExecutionSpec names one mode, and a spec naming neither refuses before anything runs."""
@@ -304,8 +319,8 @@ class AttemptEngine:
         self.instance_id = instance_id
         self.send = send
         self.progress = progress
-        self.live: dict[str, Attempt] = {}  # request_id -> the attempt held right now
-        self.history: dict[tuple[str, int], Attempt] = {}
+        self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
+        self.history: dict[tuple[str, int], AttemptRecord] = {}
         self.session_id = ""
         self.recovered: list[pb.ActiveAttempt] = []
         self.executed = 0
@@ -344,7 +359,7 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ offer
 
-    def offer(self, start: pb.StartAttempt) -> Attempt:
+    def offer(self, start: pb.StartAttempt) -> AttemptRecord:
         """VALIDATING: fences and local safety, before any body field is trusted."""
         if self.journal.stopped:
             raise AttemptRefusal(
@@ -401,7 +416,7 @@ class AttemptEngine:
             previous.replays += 1
             return previous  # duplicate StartAttempt for a finished attempt: replay, no run
 
-        return Attempt(
+        return AttemptRecord(
             request_id=start.request_id,
             attempt=start.attempt,
             digest=start.exec_spec_digest,
@@ -409,7 +424,7 @@ class AttemptEngine:
             grant=start.grant,
         )
 
-    def hold(self, attempt: Attempt) -> None:
+    def hold(self, attempt: AttemptRecord) -> None:
         """RECORD the attempt on the READER, before the device lane can reach it.
 
         Registering here and not at acceptance is what keeps the idempotency fences honest
@@ -424,7 +439,7 @@ class AttemptEngine:
 
     def refuse_held(
         self,
-        attempt: Attempt,
+        attempt: AttemptRecord,
         code: str,
         detail: str,
         cause: pb.CauseCode,
@@ -441,7 +456,7 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ prepare/accept
 
-    def _fetch_payload(self, attempt: Attempt) -> None:
+    def _fetch_payload(self, attempt: AttemptRecord) -> None:
         """Fetch, verify and decode the granted payload. Shared by BOTH modes.
 
         It happens at ACCEPTANCE and not at execution time on purpose: a missing, expired or
@@ -493,7 +508,7 @@ class AttemptEngine:
         self._check_control_size(attempt)
 
     @staticmethod
-    def _check_control_size(attempt: Attempt) -> None:
+    def _check_control_size(attempt: AttemptRecord) -> None:
         """The payload must FIT THE CONTROL SEAM, checked BEFORE durable acceptance.
 
         The seam carries control, not data: one frame is capped at 64 KiB precisely so that
@@ -524,7 +539,7 @@ class AttemptEngine:
         )
 
     def _prepare_request(
-        self, attempt: Attempt, executor: Any, binding: BindingPlan
+        self, attempt: AttemptRecord, executor: Any, binding: BindingPlan
     ) -> PreparedRequest:
         """Resolve the request in the executor, and hold what a plan can be priced against.
 
@@ -573,7 +588,7 @@ class AttemptEngine:
             adjustments=tuple(dict(row) for row in reply.get("adjustments", ())),
         )
 
-    def _hydrate_inputs(self, attempt: Attempt) -> None:
+    def _hydrate_inputs(self, attempt: AttemptRecord) -> None:
         """Materialize every granted input asset into THIS attempt's spool (cr-012).
 
         The spool is created here rather than in `_run` because that is what "before
@@ -619,7 +634,7 @@ class AttemptEngine:
                 origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
             ) from exc
 
-    def _accept_job(self, attempt: Attempt) -> pb.AttemptAccepted:
+    def _accept_job(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
 
         Serving never accepts-then-cold-loads: a warm generation is the whole point of a
@@ -644,6 +659,7 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
         attempt.job = binding
+        attempt.kind = "job"
         attempt.state = "preparing"
         self._fetch_payload(attempt)
         try:
@@ -708,28 +724,9 @@ class AttemptEngine:
         except Exception:
             self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             raise
-        attempt.state = "accepted"
-        attempt.accepted_at = time.perf_counter()
-        self.live[attempt.request_id] = attempt
-        self.history[attempt.key()] = attempt
-        return pb.AttemptAccepted(
-            session_id=self.session_id,
-            executor_incarnation=self.supervision.incarnation,
-            request_id=attempt.request_id,
-            attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
-            plan_digest=documents.raw(plan_digest),
-            plan=pb.AttemptPlanSummary(
-                delivery=plan.delivery,
-                materialization=plan.materialization,
-                placement=plan.placement,
-                reserved_vram_bytes=plan.reserved_vram_bytes,
-                reserved_host_bytes=plan.reserved_host_bytes,
-                quantified_choice=plan.quantified_choice,
-            ),
-        )
+        return self._accepted(attempt)
 
-    def prepare_and_accept(self, attempt: Attempt) -> pb.AttemptAccepted:
+    def prepare_and_accept(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
         """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
 
             resolve binding -> fetch/verify/decode the payload -> derive REAL features from
@@ -852,32 +849,11 @@ class AttemptEngine:
             # an unjournaled acceptance must not leave the worker's host ledger charged.
             self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             raise
-        attempt.state = "accepted"
-        attempt.accepted_at = time.perf_counter()
-        self.live[attempt.request_id] = attempt
-        self.history[attempt.key()] = attempt
-        return pb.AttemptAccepted(
-            session_id=self.session_id,
-            executor_incarnation=self.supervision.incarnation,
-            request_id=attempt.request_id,
-            attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
-            plan_digest=documents.raw(plan_digest),
-            model_construction_digest=documents.raw(plan.model_construction_digest),
-            plan=pb.AttemptPlanSummary(
-                delivery=plan.delivery,
-                materialization=plan.materialization,
-                compute_dtype=plan.compute_dtype,
-                placement=plan.placement,
-                reserved_vram_bytes=plan.reserved_vram_bytes,
-                reserved_host_bytes=plan.reserved_host_bytes,
-                quantified_choice=plan.quantified_choice,
-            ),
-        )
+        return self._accepted(attempt)
 
     # ------------------------------------------------------------------ execute
 
-    def execute(self, attempt: Attempt) -> pb.AttemptTerminal:
+    def execute(self, attempt: AttemptRecord) -> pb.AttemptTerminal:
         """Run ONE accepted attempt. Closing it against the ledger happens inside
         `terminal()`, because the triage bundle the terminal REFERENCES has to carry the
         reconciliation — a bundle that stops one statement short of the numbers an operator
@@ -890,7 +866,7 @@ class AttemptEngine:
             return self.finish_cancel(attempt, attempt.canceling)
         return self._run(attempt)
 
-    def reconcile(self, attempt: Attempt) -> dict[str, Any]:
+    def reconcile(self, attempt: AttemptRecord) -> dict[str, Any]:
         """Every byte class, before and after, with the executor's after-state re-read.
 
         The device numbers come from the process that owns the CUDA context, so a dead
@@ -943,165 +919,7 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ the job lane
 
-    def _run_job(self, attempt: Attempt) -> pb.AttemptTerminal:
-        """One JOB attempt, run to completion. Same dispatch, same tail, same terminal.
-
-        The differences from `_run` are the ones a job actually has: no placement rung to
-        apply (a job owns its devices for its whole life), a resumable scratch tree, and a
-        DURABLE mid-attempt checkpoint exchange answered on this side. Everything after the
-        executor returns — the output transaction, the ledger reconciliation, the triage
-        bundle, the journal-before-send terminal — is the code serving already runs.
-        """
-        assert attempt.job is not None and attempt.plan is not None
-        executor = self.supervision.current
-        if executor is None or not executor.alive():
-            return self.abandon(attempt, "no live executor to run the job attempt in")
-        spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
-        spool.mkdir(parents=True, exist_ok=True)
-        attempt.spool = spool
-        attempt.state = "running"
-        attempt.executions += 1
-        self.executed += 1
-
-        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-        seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else 3600.0
-        attempt.dispatched_at = time.perf_counter()
-        key = f"{attempt.request_id}#{attempt.attempt}"
-        self.monitor.start(key, "invoke")
-        attempt.ring.emit(
-            "log",
-            "dispatched a job attempt to the executor",
-            "info",
-            job=attempt.job.job,
-            incarnation=self.supervision.incarnation,
-            deadline_s=round(seconds, 3),
-        )
-        try:
-            reply = executor.call(
-                {
-                    "cmd": "run_job",
-                    "request_id": key,
-                    "project": attempt.job.project,
-                    "job": attempt.job.job,
-                    "payload": attempt.payload,
-                    "deadline_s": seconds,
-                    "spool": str(spool),
-                    "scratch": str(attempt.scratch) if attempt.scratch else "",
-                    "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
-                    "budget": {
-                        "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
-                        "gpu_count": attempt.job.gpu_count,
-                        "cap_micro_usd": attempt.job.cap_micro_usd,
-                    },
-                },
-                timeout=None,
-                on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=lambda frame: self.durable_exchange(attempt, frame),
-            )
-        except ExecutorGone as exc:
-            attempt.resulted_at = time.perf_counter()
-            attempt.ring.emit(
-                "fault",
-                "the executor died during this job attempt",
-                str(exc)[:400],
-                incarnation=self.supervision.incarnation,
-                canceling=attempt.canceling or "no",
-            )
-            self.monitor.end(key, "executor_died")
-            self.supervision.invalidate("the executor died during a job attempt")
-            # The scratch tree deliberately SURVIVES: it is the run's, not the attempt's,
-            # and a re-run of this run reads what the killed attempt left. The attempt SPOOL
-            # is aborted, so nothing half-written can reach a granted destination.
-            grants.abort_outputs(spool)
-            if attempt.canceling:
-                return self.finish_cancel(attempt, attempt.canceling)
-            return self.abandon(attempt, str(exc))
-        attempt.resulted_at = time.perf_counter()
-        self.monitor.end(key, "returned")
-        self.absorb(attempt, reply)
-        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=False)
-
-        if attempt.canceling:
-            return self.finish_cancel(attempt, attempt.canceling)
-        if not reply.get("ok"):
-            grants.abort_outputs(spool)
-            return self.terminal(
-                attempt,
-                STATUS.TERMINAL_STATUS_FAILED,
-                CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_EXECUTOR,
-                f"{reply.get('code')}: {reply.get('detail', '')}",
-            )
-        if not reply.get("quiescent"):
-            self.supervision.invalidate("unproven quiescence")
-            return self.terminal(
-                attempt,
-                STATUS.TERMINAL_STATUS_FAILED,
-                CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
-                "the executor could not prove quiescence after the job returned",
-            )
-        if reply.get("poisoned"):
-            self.supervision.invalidate(str(reply["poisoned"]))
-
-        outcome = reply["outcome"]
-        status, cause = _TERMINAL[outcome["terminal"]]
-        if outcome["terminal"] == "refused" and outcome["code"] in (
-            "unsupported_input",
-            "tree_ungranted",
-        ):
-            cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
-        if outcome["terminal"] == "canceled":
-            cause = (
-                CAUSE.CAUSE_CODE_DEADLINE_EXPIRED
-                if outcome["code"] == "deadline"
-                else CAUSE.CAUSE_CODE_CLIENT_CANCEL
-            )
-        if int(reply.get("oversize_result_bytes", 0)):
-            grants.abort_outputs(spool)
-            return self.terminal(
-                attempt,
-                STATUS.TERMINAL_STATUS_FAILED,
-                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                ORIGIN.CAUSE_ORIGIN_RUNTIME,
-                f"result_too_large: {reply['oversize_result_bytes']} B over the inline door",
-            )
-        manifest: pb.OutputManifest | None = None
-        inline: InlineResult | None = None
-        if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
-            inline, result_error = self._inline_result(attempt, reply)
-            if result_error is not None:
-                grants.abort_outputs(spool)
-                return self.terminal(
-                    attempt,
-                    STATUS.TERMINAL_STATUS_FAILED,
-                    CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                    ORIGIN.CAUSE_ORIGIN_EXECUTOR,
-                    result_error,
-                )
-            manifest, tail_error = self._tail(attempt, reply)
-            if tail_error is not None:
-                return self.terminal(
-                    attempt,
-                    STATUS.TERMINAL_STATUS_FAILED,
-                    CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
-                    tail_error,
-                )
-        else:
-            grants.abort_outputs(spool)
-        return self.terminal(
-            attempt,
-            status,
-            cause,
-            _ORIGIN[outcome["origin"]],
-            _coded(outcome),
-            manifest=manifest,
-            metrics=reply.get("metrics", {}),
-            result=inline,
-        )
-
-    def durable_exchange(self, attempt: Attempt, frame: Mapping[str, Any]) -> dict[str, Any]:
+    def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Answer ONE durable mid-attempt request from the executor (cr-009's checkpoints).
 
         Identity is (run, attempt, operation key, logical key, content digest). The write is
@@ -1217,11 +1035,17 @@ class AttemptEngine:
                 )
             )
 
-    def _run(self, attempt: Attempt) -> pb.AttemptTerminal:
-        """The attempt itself: dispatch, freeze point, tail, journaled terminal."""
-        if attempt.job is not None:
-            return self._run_job(attempt)
-        assert attempt.binding is not None and attempt.plan is not None
+    def _run(self, attempt: AttemptRecord) -> pb.AttemptTerminal:
+        """ONE attempt: dispatch, freeze point, tail, journaled terminal.
+
+        ONE pipeline for both lanes. They differ in the COMMAND they send and in nothing
+        after the executor answers, and keeping two copies of everything after it had
+        already let them drift — the job lane never checked the env seal it reports, never
+        classified a device OOM, and its oversize refusal named no remedy (codex audit,
+        adopted 2026-08-25). What a job actually has that a serving attempt does not is a
+        durable mid-attempt exchange, and that is one argument to one call.
+        """
+        job = attempt.job is not None
         executor = self.supervision.current
         if executor is None:
             return self.abandon(attempt, "the executor vanished before dispatch")
@@ -1237,7 +1061,8 @@ class AttemptEngine:
         self.executed += 1
 
         deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-        seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else 600.0
+        default = 3600.0 if job else 600.0
+        seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else default
         attempt.dispatched_at = time.perf_counter()
         key = f"{attempt.request_id}#{attempt.attempt}"
         # The SUPERVISOR's own rows. They are the half of the narrative that cannot be lost
@@ -1248,39 +1073,16 @@ class AttemptEngine:
             "log",
             "dispatched to the executor",
             "info",
-            entrypoint=attempt.binding.entrypoint,
+            subject=self._subject(attempt),
             incarnation=self.supervision.incarnation,
             deadline_s=round(seconds, 3),
         )
         try:
             reply = executor.call(
-                {
-                    "cmd": "invoke",
-                    "request_id": f"{attempt.request_id}#{attempt.attempt}",
-                    "entrypoint": attempt.binding.entrypoint,
-                    "payload": attempt.payload,
-                    "deadline_s": seconds,
-                    "boot_warmup": False,
-                    "spool": str(spool),
-                    "placement": attempt.plan.placement,
-                    "headroom_bytes": attempt.plan.headroom_bytes,
-                    # cr-012: the VERIFIED inputs, by their stable identity. Paths into
-                    # this attempt's own spool and nothing else — no URL, no credential and
-                    # no fetch reaches the executor, which has no outbound network at all.
-                    "inputs": {
-                        input_id: {
-                            "local": str(granted.local),
-                            "media_type": granted.media_type,
-                            "digest": granted.digest,
-                            "length": granted.length,
-                            "order": granted.order,
-                        }
-                        for input_id, granted in attempt.inputs.items()
-                    },
-                    "max_input_bytes": attempt.binding.max_input_bytes,
-                },
+                self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
+                on_request=(lambda frame: self.durable_exchange(attempt, frame)) if job else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -1298,12 +1100,75 @@ class AttemptEngine:
             # loses (`waitpid` answers 0 for a few ms). Invalidating at the OBSERVATION
             # removes the race instead of narrowing it.
             self.supervision.invalidate("the executor died during an attempt")
+            # A job's scratch tree deliberately SURVIVES — it is the run's, not the
+            # attempt's — but the attempt SPOOL is aborted on both lanes, so nothing
+            # half-written can reach a granted destination.
+            grants.abort_outputs(spool)
             # A cancel that ESCALATED killed this executor on purpose: the attempt's
             # terminal is CANCELED, and the executor is already provably dead. Any other
             # death is an invalidation the attempt did not ask for.
             if attempt.canceling:
                 return self.finish_cancel(attempt, attempt.canceling)
             return self.abandon(attempt, str(exc))
+        return self._finish(attempt, reply, spool, key)
+
+    @staticmethod
+    def _subject(attempt: AttemptRecord) -> str:
+        if attempt.job is not None:
+            return attempt.job.job
+        return attempt.binding.entrypoint if attempt.binding else ""
+
+    def _command(
+        self, attempt: AttemptRecord, key: str, spool: Path, seconds: float
+    ) -> dict[str, Any]:
+        """The ONE thing the two lanes genuinely differ in: what they ask the executor."""
+        if attempt.job is not None:
+            return {
+                "cmd": "run_job",
+                "request_id": key,
+                "project": attempt.job.project,
+                "job": attempt.job.job,
+                "payload": attempt.payload,
+                "deadline_s": seconds,
+                "spool": str(spool),
+                "scratch": str(attempt.scratch) if attempt.scratch else "",
+                "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
+                "budget": {
+                    "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
+                    "gpu_count": attempt.job.gpu_count,
+                    "cap_micro_usd": attempt.job.cap_micro_usd,
+                },
+            }
+        assert attempt.binding is not None and attempt.plan is not None
+        return {
+            "cmd": "invoke",
+            "request_id": key,
+            "entrypoint": attempt.binding.entrypoint,
+            "deadline_s": seconds,
+            "boot_warmup": False,
+            "spool": str(spool),
+            "placement": attempt.plan.placement,
+            "headroom_bytes": attempt.plan.headroom_bytes,
+            # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
+            # attempt's own spool and nothing else — no URL, no credential and no fetch
+            # reaches the executor, which has no outbound network at all.
+            "inputs": {
+                input_id: {
+                    "local": str(granted.local),
+                    "media_type": granted.media_type,
+                    "digest": granted.digest,
+                    "length": granted.length,
+                    "order": granted.order,
+                }
+                for input_id, granted in attempt.inputs.items()
+            },
+            "max_input_bytes": attempt.binding.max_input_bytes,
+        }
+
+    def _finish(
+        self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
+    ) -> pb.AttemptTerminal:
+        """Everything after the executor answers. Identical for both lanes, and now once."""
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
         self.absorb(attempt, reply)
@@ -1324,6 +1189,7 @@ class AttemptEngine:
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
         if not reply.get("ok"):
+            grants.abort_outputs(spool)
             return self.terminal(
                 attempt,
                 STATUS.TERMINAL_STATUS_FAILED,
@@ -1361,7 +1227,7 @@ class AttemptEngine:
             self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=f"{attempt.request_id}#{attempt.attempt}",
+                    subject=key,
                     reason="executor_owned_counter",
                     detail=f"the executor claimed state_seq={reply['state_seq']}; monotone "
                     "wire counters are the supervisor's and this claim is dropped",
@@ -1383,7 +1249,10 @@ class AttemptEngine:
             # capacity result, and nobody goes to look at the planner. The runtime priced
             # this attempt and admitted it, so the fault is the runtime's.
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
-        if outcome["terminal"] == "refused" and outcome["code"] == "unsupported_input":
+        if outcome["terminal"] == "refused" and outcome["code"] in (
+            "unsupported_input",
+            "tree_ungranted",
+        ):
             cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
         if outcome["terminal"] == "canceled":
             cause = (
@@ -1393,7 +1262,7 @@ class AttemptEngine:
             )
         oversize = int(reply.get("oversize_result_bytes", 0))
         if oversize:
-            grants.abort_outputs(attempt.spool) if attempt.spool else None
+            grants.abort_outputs(spool)
             return self.terminal(
                 attempt,
                 STATUS.TERMINAL_STATUS_FAILED,
@@ -1418,8 +1287,7 @@ class AttemptEngine:
             # granted destinations behind it.
             inline, result_error = self._inline_result(attempt, reply)
             if result_error is not None:
-                if attempt.spool is not None:
-                    grants.abort_outputs(attempt.spool)
+                grants.abort_outputs(spool)
                 return self.terminal(
                     attempt,
                     STATUS.TERMINAL_STATUS_FAILED,
@@ -1436,8 +1304,8 @@ class AttemptEngine:
                     ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
                     tail_error,
                 )
-        elif attempt.spool is not None:
-            grants.abort_outputs(attempt.spool)
+        else:
+            grants.abort_outputs(spool)
         origin = _ORIGIN[outcome["origin"]]
         shortfall = reply.get("shortfall") or None
         if shortfall:
@@ -1488,7 +1356,7 @@ class AttemptEngine:
             int(frame.get("at_unix_ms", 0)),
         )
 
-    def absorb(self, attempt: Attempt, reply: Mapping[str, Any]) -> None:
+    def absorb(self, attempt: AttemptRecord, reply: Mapping[str, Any]) -> None:
         """Take the executor's BOUNDED observation tail into the supervisor's own ring.
 
         The executor's ring already applied every cap and every credential check at the emit
@@ -1556,7 +1424,7 @@ class AttemptEngine:
                 "tax was never paid on boot, so this request paid it",
             )
 
-    def bank_demand(self, attempt: Attempt, metrics: Mapping[str, Any], moved: bool) -> None:
+    def bank_demand(self, attempt: AttemptRecord, metrics: Mapping[str, Any], moved: bool) -> None:
         """Every serve evaluates DECLARED versus ACTUAL and banks the pair (§3.2).
 
         The actual is the attempt's own peak above what it started holding — a number that
@@ -1590,7 +1458,7 @@ class AttemptEngine:
         if confession is not None:
             attempt.confess(confession.kind, confession.quantified)
 
-    def _payload(self, attempt: Attempt) -> dict[str, Any]:
+    def _payload(self, attempt: AttemptRecord) -> dict[str, Any]:
         """The payload travels as a grant INPUT, fetched supervisor-side under the grant."""
         data = grants.read_input(attempt.grant, "payload", self.authorizer)
         value = json.loads(data)
@@ -1599,7 +1467,7 @@ class AttemptEngine:
         return value
 
     def _tail(
-        self, attempt: Attempt, reply: dict[str, Any]
+        self, attempt: AttemptRecord, reply: dict[str, Any]
     ) -> tuple[pb.OutputManifest | None, str | None]:
         """§3.4 steps 4-5, supervisor-side: the device lease is already released, the bytes
         are already immutable in the attempt spool, and this is where they are written under
@@ -1671,7 +1539,7 @@ class AttemptEngine:
         return pb.OutputManifest(manifest_id=receipt.digest(), outputs=entries), None
 
     def _publication(
-        self, attempt: Attempt, entries: list[pb.OutputEntry]
+        self, attempt: AttemptRecord, entries: list[pb.OutputEntry]
     ) -> grants.PublicationReceipt:
         """The typed subject of ONE publication, from what this attempt was actually given."""
         job = attempt.spec.get("job") or {}
@@ -1706,7 +1574,7 @@ class AttemptEngine:
 
     def terminal(
         self,
-        attempt: Attempt,
+        attempt: AttemptRecord,
         status: pb.TerminalStatus,
         cause: pb.CauseCode,
         origin: pb.CauseOrigin,
@@ -1797,7 +1665,7 @@ class AttemptEngine:
 
     def commit_bundle(
         self,
-        attempt: Attempt,
+        attempt: AttemptRecord,
         status: pb.TerminalStatus,
         cause: pb.CauseCode,
         origin: pb.CauseOrigin,
@@ -1887,9 +1755,22 @@ class AttemptEngine:
             )
             return None
 
-    def accepted_message(self, attempt: Attempt) -> pb.AttemptAccepted:
-        """Re-send the SAME acceptance for a held attempt. AttemptAccepted always carries
-        the digests that were JOURNALED, so a re-send can never move them."""
+    def _accepted(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+        """HOLD the accepted attempt and publish it. The one acceptance both lanes make."""
+        attempt.state = "accepted"
+        attempt.accepted_at = time.perf_counter()
+        self.live[attempt.request_id] = attempt
+        self.history[attempt.key()] = attempt
+        return self.accepted_message(attempt)
+
+    def accepted_message(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+        """THE acceptance message — one constructor, for a first send and for a re-send.
+
+        There were three, one per lane plus this one, and they had already drifted: the job
+        one omitted `compute_dtype` and the construction digest, which a job plan carries as
+        empty anyway. AttemptAccepted always carries the digests that were JOURNALED, so a
+        re-send can never move them.
+        """
         assert attempt.plan is not None
         plan = attempt.plan
         return pb.AttemptAccepted(
@@ -1899,7 +1780,13 @@ class AttemptEngine:
             attempt=attempt.attempt,
             exec_spec_digest=attempt.digest,
             plan_digest=documents.raw(plan.digest()),
-            model_construction_digest=documents.raw(plan.model_construction_digest),
+            # A JOB has no model construction, and an empty digest is the honest answer:
+            # spelling one for a construction that never happened would invent an identity.
+            model_construction_digest=(
+                documents.raw(plan.model_construction_digest)
+                if plan.model_construction_digest
+                else b""
+            ),
             plan=pb.AttemptPlanSummary(
                 delivery=plan.delivery,
                 materialization=plan.materialization,
@@ -1907,11 +1794,11 @@ class AttemptEngine:
                 placement=plan.placement,
                 reserved_vram_bytes=plan.reserved_vram_bytes,
                 reserved_host_bytes=plan.reserved_host_bytes,
-                quantified_choice=plan.quantified_choice,
+                quantified_choice=plan.decision_explanation,
             ),
         )
 
-    def wrap(self, attempt: Attempt) -> pb.AttemptTerminal:
+    def wrap(self, attempt: AttemptRecord) -> pb.AttemptTerminal:
         """Wrap the SAME journaled body in the CURRENT session envelope. The body is a byte
         fact; only the envelope moves across a reconnect.
 
@@ -1932,7 +1819,7 @@ class AttemptEngine:
         )
 
     def _inline_result(
-        self, attempt: Attempt, reply: Mapping[str, Any]
+        self, attempt: AttemptRecord, reply: Mapping[str, Any]
     ) -> tuple[InlineResult | None, str | None]:
         """Read the result bytes the executor spooled, and hold them to their declared identity.
 
@@ -2004,7 +1891,7 @@ class AttemptEngine:
 
     def attest(
         self,
-        attempt: Attempt,
+        attempt: AttemptRecord,
         claim: Mapping[str, Any],
         manifest: pb.OutputManifest | None,
     ) -> pb.AttemptMetrics:
@@ -2058,7 +1945,7 @@ class AttemptEngine:
         executor.cooperative_cancel()
         return f"cooperative cancel signalled ({held.canceling})"
 
-    def escalate(self, attempt: Attempt, grace: float) -> dict[str, Any]:
+    def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output
         abort -> epoch invalidation -> journal CANCELED. Rebuilding readiness happens
         AFTER, off the cancellation critical path."""
@@ -2078,7 +1965,7 @@ class AttemptEngine:
             "readiness_epoch": epoch,
         }
 
-    def finish_cancel(self, attempt: Attempt, reason: str) -> pb.AttemptTerminal:
+    def finish_cancel(self, attempt: AttemptRecord, reason: str) -> pb.AttemptTerminal:
         cause = {
             "client": CAUSE.CAUSE_CODE_CLIENT_CANCEL,
             "drain": CAUSE.CAUSE_CODE_DRAIN_CANCEL,
@@ -2102,7 +1989,7 @@ class AttemptEngine:
             ),
         )
 
-    def abandon(self, attempt: Attempt, why: str) -> pb.AttemptTerminal:
+    def abandon(self, attempt: AttemptRecord, why: str) -> pb.AttemptTerminal:
         """An accepted-but-incomplete attempt ALWAYS produces a terminal, never silence."""
         if attempt.spool is not None:
             grants.abort_outputs(attempt.spool)
@@ -2182,13 +2069,14 @@ class AttemptEngine:
             ) == documents.spell(digest)
             if not authorized:
                 continue  # the three-authorization rule: unauthorized never replays
-            attempt = Attempt(
+            attempt = AttemptRecord(
                 request_id=request_id,
                 attempt=number,
                 digest=digest,
                 spec={},
                 grant=pb.DeliveryGrant(),
                 state="terminal",
+                kind=str(row.get("attempt_kind", "serving")),
             )
             if row["state"] == "terminal":
                 attempt.terminal_id = row["terminal_id"]
@@ -2211,7 +2099,7 @@ class AttemptEngine:
                 pb.ActiveAttempt(
                     request_id=request_id,
                     attempt=number,
-                    kind=pb.AttemptKind.ATTEMPT_KIND_SERVING,
+                    kind=_KIND[attempt.kind],
                     state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
                     exec_spec_digest=digest,
                 )
@@ -2219,7 +2107,7 @@ class AttemptEngine:
         self.recovered = recovered
         return recovered
 
-    def pending_terminals(self) -> list[Attempt]:
+    def pending_terminals(self) -> list[AttemptRecord]:
         return [a for a in self.history.values() if a.state == "terminal"]
 
     def active(self) -> list[pb.ActiveAttempt]:
@@ -2234,7 +2122,7 @@ class AttemptEngine:
                 pb.ActiveAttempt(
                     request_id=attempt.request_id,
                     attempt=attempt.attempt,
-                    kind=pb.AttemptKind.ATTEMPT_KIND_SERVING,
+                    kind=_KIND[attempt.kind],
                     state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK
                     if attempt.state == "terminal"
                     else pb.AttemptState.ATTEMPT_STATE_RUNNING,

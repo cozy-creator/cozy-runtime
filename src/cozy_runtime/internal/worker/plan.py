@@ -100,7 +100,9 @@ class AttemptPlan:
     model_construction_digest: str
     """The LOGICAL model: reference variant, topology, config, factory. Identical across
     every delivery variant of one model, which is what makes it a usable deployment fence."""
-    quantified_choice: str
+    decision_explanation: str
+    """WHY this plan, in numbers, for a person reading a terminal. It rides the wire as
+    `AttemptPlanSummary.quantified_choice`, which is th-024's name for the field."""
     constructed_generation_digest: str = ""
     """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them and the
     configuration the fill ran under. The logical digest cannot answer "which bytes are
@@ -162,7 +164,7 @@ class AttemptPlan:
             headroom_bytes=0,
             entrypoint_binding_plan_id=binding.job_descriptor_id,
             model_construction_digest="",
-            quantified_choice=(
+            decision_explanation=(
                 f"job_attempt: {binding.job!r} on {max(binding.gpu_count, 0)} declared device "
                 f"floor, {caps.get('rss', 0)} B host and {caps.get('disk', 0)} B disk capped, "
                 f"publishes={binding.publishes} emits_media={binding.emits_media}"
@@ -729,7 +731,7 @@ class PlanChooser:
             overlay_digest=prepared.overlay_digest,
             shape_cell=prepared.cell(),
             delivery_variant=binding.delivery_variant,
-            quantified_choice=(
+            decision_explanation=(
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
                 f"{binding.delivery_variant or binding.variant or 'default'!r} "
                 f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
