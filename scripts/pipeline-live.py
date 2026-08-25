@@ -739,7 +739,11 @@ static ssize_t (*real_pread)(int, void *, size_t, off_t) = 0;
 static void setup(void) {
     const char *value = getenv("COZY_THROTTLE_BPS");
     rate_bps = value ? atof(value) : 0.0;
-    tokens = rate_bps;
+    /* The bucket starts EMPTY. Starting it full hands out a free second of bandwidth, which
+     * on a short read is most of the read: a 100 MB file under a 50 MB/s cap measured
+     * 94 MB/s. Over a 6.4 GiB fill the difference is noise, but a benchmark whose number
+     * depends on how long the thing being measured takes is not a benchmark. */
+    tokens = 0.0;
     clock_gettime(CLOCK_MONOTONIC, &last);
     real_read = dlsym(RTLD_NEXT, "read");
     real_pread = dlsym(RTLD_NEXT, "pread64");
