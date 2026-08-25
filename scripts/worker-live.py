@@ -344,12 +344,12 @@ def snapshot() -> str:
 
 def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     return {
-        "plan_id": plan_id,
+        "entrypoint_binding_plan_id": plan_id,
         "project": str(ROOT / "corpus" / "endpoint"),
         "model_class": "SdxlUnetModel",
-        "binding_path": f"{entrypoint}.models.model",
-        "param": "model",
-        "component": COMPONENT,
+        "model_binding_path": f"{entrypoint}.models.model",
+        "model_parameter_name": "model",
+        "components": [COMPONENT],
         "store": working_store(WORK / "store"),
         "config": str(CONFIG),
         "snapshot": snapshot(),
@@ -494,7 +494,7 @@ def stage(
         if store:
             record["store"] = store
         record.update(overrides or {})
-        record["plan_id"] = plan_id
+        record["entrypoint_binding_plan_id"] = plan_id
         record["entrypoint"] = entrypoint
         record["release"] = release
         (tmp / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
@@ -2336,14 +2336,13 @@ def pipeline_overrides() -> dict[str, Any]:
     return {
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
-        "binding_path": "generate.models.model",
-        "param": "model",
-        "component": "unet",
-        "components": ",".join(PIPE_COMPONENTS),
+        "model_binding_path": "generate.models.model",
+        "model_parameter_name": "model",
+        "components": list(PIPE_COMPONENTS),
         "store": str(PIPE_WORK / "store"),
         "config": str(PIPE_WORK / "pipeline.config.json"),
         "snapshot": snapshots["unet"],
-        "snapshots": ",".join(f"{k}={v}" for k, v in sorted(snapshots.items())),
+        "snapshots": dict(sorted(snapshots.items())),
         "variant": "sm89",
         "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,

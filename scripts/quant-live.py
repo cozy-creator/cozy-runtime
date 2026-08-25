@@ -550,17 +550,16 @@ def pipeline_snapshots(unet: str) -> dict[str, str]:
 def binding_record(unet: str) -> dict[str, Any]:
     have = pipeline_snapshots(unet)
     return {
-        "plan_id": plan_id_for("generate"),
+        "entrypoint_binding_plan_id": plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
-        "binding_path": "generate.models.model",
-        "param": "model",
-        "component": "unet",
-        "components": ",".join(COMPONENTS),
+        "model_binding_path": "generate.models.model",
+        "model_parameter_name": "model",
+        "components": list(COMPONENTS),
         "store": str(PLAIN_STORE),
         "config": str(PIPE_CONFIG),
         "snapshot": have["unet"],
-        "snapshots": ",".join(f"{k}={v}" for k, v in sorted(have.items())),
+        "snapshots": dict(sorted(have.items())),
         "release": RELEASE,
         "variant": "sm89",
         "vram_bytes": 7 * GIB,

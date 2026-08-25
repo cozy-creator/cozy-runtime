@@ -228,7 +228,7 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
     records = run_verb.resolved_bindings(config, opts)
     rows = tuple(
         (
-            str(record["binding_path"]),
+            str(record["model_binding_path"]),
             f"{record['ref']}"
             + (f" lane={record['lane']}" if record["lane"] else "")
             + f" ({record['source']}) "

@@ -217,7 +217,7 @@ class Executor:
                 name=str(binding.get("variant") or "default"),
                 store=binding["store"],
                 snapshot=binding["snapshot"],
-                snapshots=",".join(f"{k}={v}" for k, v in sorted(per_component.items())),
+                snapshots=dict(per_component),
                 reference=True,
             )
         ]
@@ -330,7 +330,7 @@ class Executor:
             backend.expect(
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in names}
             )
-            model = registry.acquire(binding["binding_path"], model_cls, artifact)
+            model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
         except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
             # The generation is already rolled back, so the numbers that matter are the
             # HIGH-WATER marks beside the after state — "released 0 B" would be true and
@@ -377,7 +377,7 @@ class Executor:
             return reply
         self.backend = backend
         self.registry = registry
-        self.models = {binding["param"]: model}
+        self.models = {binding["model_parameter_name"]: model}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the endpoint cannot observe that it happened.

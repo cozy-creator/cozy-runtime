@@ -649,7 +649,7 @@ def stage_binding_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[
     directory.mkdir(parents=True, exist_ok=True)
     plans: dict[str, str] = {}
     for record in records:
-        plan_id = str(record["plan_id"])
+        plan_id = str(record["entrypoint_binding_plan_id"])
         (directory / f"{plan_id.split(':')[-1]}.json").write_text(json.dumps(record, indent=2))
         plans[str(record["entrypoint"])] = plan_id
     return plans

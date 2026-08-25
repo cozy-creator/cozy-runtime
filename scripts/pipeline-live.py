@@ -116,17 +116,16 @@ def plan_id_for(entrypoint: str) -> str:
 
 def binding_record(**overrides: Any) -> dict[str, Any]:
     record: dict[str, Any] = {
-        "plan_id": plan_id_for("generate"),
+        "entrypoint_binding_plan_id": plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
-        "binding_path": "generate.models.model",
-        "param": "model",
-        "component": "unet",
-        "components": ",".join(COMPONENTS),
+        "model_binding_path": "generate.models.model",
+        "model_parameter_name": "model",
+        "components": list(COMPONENTS),
         "store": str(STORE),
         "config": str(CONFIG),
         "snapshot": snapshots()["unet"],
-        "snapshots": ",".join(f"{k}={v}" for k, v in sorted(snapshots().items())),
+        "snapshots": dict(sorted(snapshots().items())),
         "release": RELEASE,
         "variant": "sm89",
         "vram_bytes": 7 * GIB,
@@ -975,7 +974,7 @@ def fill_once(component: str) -> dict[str, Any]:
     del destinations
     torch.cuda.empty_cache()
     return {
-        "component": component,
+        "components": [component],
         "bytes": total,
         "tensors": len(rows),
         "fill_ms": round(fill_ms, 1),

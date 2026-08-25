@@ -377,8 +377,8 @@ def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, An
         installed = artifacts.find(config.cozy_home, chosen.ref)
         records.append(
             {
-                "binding_path": slot.path,
-                "param": slot.param,
+                "model_binding_path": slot.path,
+                "model_parameter_name": slot.param,
                 "model_class": slot.class_key,
                 "ref": chosen.ref,
                 "lane": chosen.lane or "",
@@ -460,17 +460,16 @@ def _binding_record(
         installed.components
     )
     return {
-        "plan_id": _plan_id(found.application, function),
+        "entrypoint_binding_plan_id": _plan_id(found.application, function),
         "project": str(found.project),
         "model_class": slot.class_key,
-        "binding_path": slot.path,
-        "param": slot.param,
-        "component": components[0],
-        "components": ",".join(components),
+        "model_binding_path": slot.path,
+        "model_parameter_name": slot.param,
+        "components": list(components),
         "store": installed.store,
         "config": installed.config,
         "snapshot": installed.snapshots[components[0]],
-        "snapshots": ",".join(f"{k}={v}" for k, v in sorted(installed.snapshots.items())),
+        "snapshots": dict(sorted(installed.snapshots.items())),
         "release": chosen.ref,
         "variant": installed.variant,
         "vram_bytes": 7 * GIB,

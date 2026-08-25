@@ -381,7 +381,7 @@ class DeclaredBinding:
                         "name": v.name,
                         "store": v.store,
                         "snapshot": v.snapshot,
-                        "snapshots": v.snapshots,
+                        "snapshots": dict(v.snapshots),
                         "reference": v.reference,
                     }
                     for v in self.offered
@@ -423,9 +423,7 @@ class DeclaredBinding:
                 f"binding plan record is missing {', '.join(missing)}",
             )
         snapshot = _digest(str(record.get("snapshot", "")), "snapshot")
-        components = _split(str(record.get("components", ""))) or _split(
-            str(record.get("component", ""))
-        )
+        components = tuple(str(name) for name in record.get("components") or ())
         offered = tuple(
             _normalize(v if isinstance(v, Variant) else Variant.read(v))
             for v in record.get("variants") or ()
@@ -435,7 +433,7 @@ class DeclaredBinding:
                     name=str(record.get("variant") or "default"),
                     store=str(record["store"]),
                     snapshot=snapshot,
-                    snapshots=str(record.get("snapshots", "")),
+                    snapshots=dict(record.get("snapshots") or {}),
                     reference=True,
                 ),
             )
@@ -443,12 +441,12 @@ class DeclaredBinding:
             else ()
         )
         return cls(
-            entrypoint_binding_plan_id=str(record["plan_id"]),
+            entrypoint_binding_plan_id=str(record["entrypoint_binding_plan_id"]),
             entrypoint=str(record["entrypoint"]),
             project=str(record["project"]),
             model_class=str(record.get("model_class", "")),
-            model_binding_path=str(record.get("binding_path", "")),
-            model_parameter_name=str(record.get("param", "")),
+            model_binding_path=str(record.get("model_binding_path", "")),
+            model_parameter_name=str(record.get("model_parameter_name", "")),
             store=str(record.get("store", "")),
             config=str(record.get("config", "")),
             release=str(record["release"]),
@@ -456,8 +454,8 @@ class DeclaredBinding:
             reference_snapshot=snapshot,
             components=components,
             snapshots={
-                name: _digest(value, f"snapshots[{name}]")
-                for name, value in _pairs(str(record.get("snapshots", ""))).items()
+                str(name): _digest(str(value), f"snapshots[{name}]")
+                for name, value in (record.get("snapshots") or {}).items()
             },
             offered=offered,
             objective=str(record.get("objective", "latency")),
@@ -475,23 +473,23 @@ class DeclaredBinding:
             ),
             max_input_bytes=int(record.get("max_input_bytes", 64 << 20)),
             max_inputs_total_bytes=int(record.get("max_inputs_total_bytes", 256 << 20)),
-            egress_allowed_hosts=_split(str(record.get("egress_allowed_hosts", ""))),
+            egress_allowed_hosts=tuple(
+                str(host) for host in record.get("egress_allowed_hosts") or ()
+            ),
         )
 
 
-#: The binding-plan record's CLOSED key set, in the record's own spellings. Renaming these
-#: is a two-sided change with whoever writes the record (cozy-creator today) and is
-#: scheduled rather than taken: `plan_id`, `binding_path`, `param` and the comma-packed
-#: `components`/`snapshots` become `entrypoint_binding_plan_id`, `model_binding_path`,
-#: `model_parameter_name` and real lists in one coordinated window.
+#: The binding-plan record's CLOSED key set. A two-sided document: cozy-creator writes it and
+#: this is the only place in the runtime that knows its spellings. The names say what they
+#: name, and the sets in it are REAL SETS — `components` is a list and `snapshots` a map,
+#: because a comma-packed string is a second grammar every reader has to agree about.
 RECORD_KEYS = frozenset(
     {
-        "plan_id",
+        "entrypoint_binding_plan_id",
         "project",
         "model_class",
-        "binding_path",
-        "param",
-        "component",
+        "model_binding_path",
+        "model_parameter_name",
         "components",
         "store",
         "config",
@@ -519,12 +517,20 @@ RECORD_KEYS = frozenset(
 )
 
 #: What a record cannot leave out, whether or not it declares a model.
-RECORD_REQUIRED = frozenset({"plan_id", "project", "release", "entrypoint"})
+RECORD_REQUIRED = frozenset({"entrypoint_binding_plan_id", "project", "release", "entrypoint"})
 
 #: The keys that TOGETHER declare one model. A record carries all of them or none of them:
 #: a weightless endpoint declares none and is served without a fill (cl-013).
 MODEL_KEYS = frozenset(
-    {"model_class", "binding_path", "param", "component", "store", "config", "snapshot"}
+    {
+        "model_class",
+        "model_binding_path",
+        "model_parameter_name",
+        "components",
+        "store",
+        "config",
+        "snapshot",
+    }
 )
 
 
@@ -558,10 +564,10 @@ def _normalize(variant: Variant) -> Variant:
     return dataclasses.replace(
         variant,
         snapshot=_digest(variant.snapshot, f"variants[{variant.name}].snapshot"),
-        snapshots=",".join(
-            f"{name}={_digest(value, f'variants[{variant.name}].snapshots[{name}]')}"
+        snapshots={
+            name: _digest(value, f"variants[{variant.name}].snapshots[{name}]")
             for name, value in sorted(variant.snapshot_map().items())
-        ),
+        },
     )
 
 

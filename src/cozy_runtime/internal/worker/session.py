@@ -563,8 +563,8 @@ class Supervisor:
                     "binding": {
                         "project": first.project,
                         "model_class": first.model_class,
-                        "binding_path": first.model_binding_path,
-                        "param": first.model_parameter_name,
+                        "model_binding_path": first.model_binding_path,
+                        "model_parameter_name": first.model_parameter_name,
                         "component": first.components[0] if first.components else "",
                         "components": list(first.components),
                         "snapshots": dict(first.snapshots),

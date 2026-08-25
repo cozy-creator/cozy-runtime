@@ -107,14 +107,14 @@ def variants() -> list[dict[str, Any]]:
             "name": "fp16",
             "store": str(PLAIN_STORE),
             "snapshot": plain["unet"],
-            "snapshots": ",".join(f"{k}={v}" for k, v in sorted(plain.items())),
+            "snapshots": dict(sorted(plain.items())),
             "reference": True,
         },
         {
             "name": "fp8",
             "store": str(PLAIN_STORE),
             "snapshot": encoded["unet"],
-            "snapshots": ",".join(f"{k}={v}" for k, v in sorted(encoded.items())),
+            "snapshots": dict(sorted(encoded.items())),
             "reference": False,
         },
     ]
@@ -127,13 +127,12 @@ def binding_record(
     record that omits it offers exactly what `store`/`snapshot` already named."""
     reference = next(v for v in offered if v["reference"])
     return {
-        "plan_id": Q.plan_id_for("generate"),
+        "entrypoint_binding_plan_id": Q.plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
-        "binding_path": "generate.models.model",
-        "param": "model",
-        "component": "unet",
-        "components": ",".join(COMPONENTS),
+        "model_binding_path": "generate.models.model",
+        "model_parameter_name": "model",
+        "components": list(COMPONENTS),
         "store": str(PLAIN_STORE),
         "config": str(Q.PIPE_CONFIG),
         "snapshot": reference["snapshot"],

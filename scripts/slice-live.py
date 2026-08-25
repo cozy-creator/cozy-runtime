@@ -111,12 +111,12 @@ def plan_id_for(entrypoint: str) -> str:
 
 def binding_record(entrypoint: str, store: str = "") -> dict[str, Any]:
     return {
-        "plan_id": plan_id_for(entrypoint),
+        "entrypoint_binding_plan_id": plan_id_for(entrypoint),
         "project": str(ROOT / "corpus" / "endpoint"),
         "model_class": "SdxlUnetModel",
-        "binding_path": f"{entrypoint}.models.model",
-        "param": "model",
-        "component": COMPONENT,
+        "model_binding_path": f"{entrypoint}.models.model",
+        "model_parameter_name": "model",
+        "components": [COMPONENT],
         "store": store or working_store(Path(WORK) / "store"),
         "config": str(CONFIG),
         "snapshot": snapshot(),

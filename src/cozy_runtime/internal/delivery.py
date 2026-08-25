@@ -172,17 +172,13 @@ class Variant:
     name: str
     store: str
     snapshot: str
-    snapshots: str = ""
-    """Per-component snapshots as `name=sha256:…`, comma-joined — BindingPlan's spelling."""
+    snapshots: Mapping[str, str] = field(default_factory=dict)
+    """component -> snapshot digest. A REAL map, like the record it rides in: a comma-packed
+    one is a second grammar every reader has to agree about."""
     reference: bool = False
 
     def snapshot_map(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for pair in self.snapshots.split(","):
-            name, _, digest = pair.partition("=")
-            if name and digest:
-                out[name] = digest
-        return out
+        return dict(self.snapshots)
 
     @classmethod
     def read(cls, record: Mapping[str, Any]) -> Variant:

@@ -162,8 +162,9 @@ chooser = PlanChooser(ledger)
 
 def binding(**over):
     row = dict(
-        plan_id="p", project="x", model_class="M", binding_path="b", param="m",
-        component="unet", store="s", config="c", snapshot="sha256:" + "0" * 64,
+        entrypoint_binding_plan_id="sha256:" + "0" * 64, project="x", model_class="M",
+        model_binding_path="b", model_parameter_name="m",
+        components=["unet"], store="s", config="c", snapshot="sha256:" + "0" * 64,
         release="r", variant="sm89", vram_bytes=7 << 30, host_bytes=1 << 30,
         pinned_bytes=256 << 20, entrypoint="generate",
     )
