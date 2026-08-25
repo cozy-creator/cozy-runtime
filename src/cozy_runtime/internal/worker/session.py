@@ -535,7 +535,7 @@ class Supervisor:
             # The LOAD leg gets a liveness subject and `started` at position 0. There is no
             # boot timeout here and there will not be one: a multi-GB load is slow, and the
             # only honest question is whether its integral-MiB position is still moving.
-            subject = f"prepare:{first.components[0]}"
+            subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
             reply = executor.call(
                 {
@@ -545,7 +545,7 @@ class Supervisor:
                         "model_class": first.model_class,
                         "binding_path": first.model_binding_path,
                         "param": first.model_parameter_name,
-                        "component": first.components[0],
+                        "component": first.components[0] if first.components else "",
                         "components": list(first.components),
                         "snapshots": dict(first.snapshots),
                         "store": first.store,
@@ -592,7 +592,7 @@ class Supervisor:
                     "load",
                     "refused",
                     took,
-                    component=first.components[0],
+                    component=first.components[0] if first.components else "",
                     code=str(reply.get("code")),
                 )
                 detail = str(reply.get("detail"))[:1024]
@@ -670,7 +670,7 @@ class Supervisor:
                 "load",
                 "filled",
                 took,
-                component=first.components[0],
+                component=first.entrypoint,
                 destinations=int(reply["facts"]["filled"]),
                 bytes=int(reply["facts"]["filled_bytes"]),
                 fill_ms=float(reply["facts"]["fill_ms"]),

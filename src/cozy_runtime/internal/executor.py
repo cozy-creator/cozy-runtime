@@ -144,6 +144,8 @@ class Executor:
         binding = command["binding"]
         budgets = command["budgets"]
         started = time.perf_counter()
+        if not binding.get("model_class"):
+            return self._prepare_weightless(binding, started)
 
         import torch  # the ONE torch import in the runtime, and it is in THIS process
 
@@ -511,6 +513,49 @@ class Executor:
             "facts": self.facts,
         }
 
+    def _prepare_weightless(self, binding: dict[str, Any], started: float) -> dict[str, Any]:
+        """A binding that declares NO MODEL: discover the release, be ready, import nothing.
+
+        The whole cold path below is a fill, and there is nothing to fill. Returning here is
+        what makes a weightless endpoint servable at all — and it is the ONLY thing a
+        cardless runner can ever pass, because everything past this line imports torch
+        (cl-013). There is no construction, so there is no construction identity: the
+        digests are empty and say so rather than naming a build that never happened.
+        """
+        if self.discovered is None:
+            self.discovered = discover(Path(binding["project"]))
+            self.surface_names = {s.name: s for s in self.discovered.surfaces}
+        self.ready = True
+        self.facts = {
+            "cuda_init_ms": 0.0,
+            "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
+            "fill_ms": 0.0,
+            "filled": 0,
+            "filled_bytes": 0,
+            "device_free_bytes": -1,
+            "device_total_bytes": -1,
+            "allocator_bytes": -1,
+            "reserved_bytes": -1,
+            "resident": {},
+            "parked": [],
+            "declared_scopes": {},
+            "rss_bytes": _rss(),
+            "weightless": True,
+            "custody": "canonical",
+            "ignored_extra_keys": [],
+            "transcribed_markers": [],
+        }
+        return {
+            "ok": True,
+            "ready": True,
+            "weightless": True,
+            "model_construction_digest": "",
+            "constructed_generation_digest": "",
+            "entrypoints": sorted(self.surface_names),
+            "delivery": {},
+            "facts": self.facts,
+        }
+
     # ------------------------------------------------------------------ invoke
 
     def prepare_request(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -618,8 +663,9 @@ class Executor:
                 str(command.get("placement", "all_resident")),
                 int(command.get("headroom_bytes", 0)),
             )
-        torch.cuda.reset_peak_memory_stats()
-        allocated_at_start = torch.cuda.memory_allocated()
+        if torch is not None:
+            torch.cuda.reset_peak_memory_stats()
+        allocated_at_start = torch.cuda.memory_allocated() if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
         envelope, outcome, record = run_prepared(
@@ -653,14 +699,17 @@ class Executor:
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
 
         # §3.4 step 2: the exact D2H wait BEFORE the device lease releases. Everything the
-        # tail touches must already be immutable and independent of endpoint GPU state.
+        # tail touches must already be immutable and independent of endpoint GPU state. A
+        # WEIGHTLESS generation holds no stream, so its quiescence is structural — there is
+        # nothing that could still be moving.
         d2h_started = time.perf_counter()
-        torch.cuda.synchronize()
+        if torch is not None:
+            torch.cuda.synchronize()
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
-        peak_vram = torch.cuda.max_memory_allocated()
+        peak_vram = torch.cuda.max_memory_allocated() if torch is not None else 0
         # step 3: the lease releases here, and nothing after this line touches the device.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
-        quiescent = self._quiescent()
+        quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # Author code entered, so reuse is poisoned by any non-success — a refusal raised
@@ -721,7 +770,7 @@ class Executor:
                 "allocated_at_start_bytes": allocated_at_start,
                 "rss_at_end_bytes": _rss(),
                 "started_unix": started_wall,
-                "gpu_count": 1,
+                "gpu_count": 1 if torch is not None else 0,
             },
         }
 
@@ -1006,7 +1055,8 @@ class Executor:
         return cached
 
     def _device(self) -> Device:
-        return Device("cuda", 0)
+        """No torch in this process means no device to name (cl-013)."""
+        return Device("cuda", 0) if self.torch is not None else Device()
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

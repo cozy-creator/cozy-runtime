@@ -333,6 +333,17 @@ class DeclaredBinding:
     `file://` grant needs none, and a deployment that has not declared a host cannot be
     talked into one at request time."""
 
+    @property
+    def weightless(self) -> bool:
+        """This deployment declares NO MODEL: no class, no store, no artifact.
+
+        A weightless endpoint is the only thing a cardless runner can ever serve, so it has
+        to be servable — the boot path prepared every staged binding by FILLING it, and a
+        binding with nothing to fill had no way through (cl-013). Its executor imports no
+        torch and touches no device.
+        """
+        return not self.model_class
+
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
         return self.snapshots.get(component, self.reference_snapshot)
@@ -348,6 +359,12 @@ class DeclaredBinding:
         filled (codex audit, adopted 2026-08-25). The objective belongs here for the same
         reason: it decides which of the candidates gets filled.
         """
+        if self.weightless:
+            # Nothing is constructed, so the release and the project ARE the construction:
+            # every weightless binding of one release shares one executor.
+            return canonical.digest(
+                {"weightless": True, "release": self.release, "project": self.project}
+            )
         return canonical.digest(
             {
                 "store": self.store,
@@ -386,45 +403,63 @@ class DeclaredBinding:
                 "fact (a delivery rung, a construction digest) is not a deployment's to "
                 "write at all",
             )
+        # A record either declares a MODEL or declares none. Half a declaration — a class
+        # with no store, a store with no class — is a deployment that cannot be served
+        # either way, so it refuses here rather than at the fill.
+        declares = {key for key in MODEL_KEYS if str(record.get(key, ""))}
+        if declares and declares != MODEL_KEYS:
+            raise PlanRefusal(
+                "binding_plan_partial_model",
+                f"binding plan record declares {sorted(declares)} and omits "
+                f"{sorted(MODEL_KEYS - declares)}: a binding names a whole model or names "
+                "none. A WEIGHTLESS binding is served (no class, no store, no artifact); "
+                "half of one is a deployment nothing can construct",
+            )
         missing = sorted(RECORD_REQUIRED - set(record))
         if missing:
             raise PlanRefusal(
                 "binding_plan_incomplete",
                 f"binding plan record is missing {', '.join(missing)}",
             )
-        snapshot = str(record["snapshot"])
-        components = _split(str(record.get("components", ""))) or (str(record["component"]),)
+        snapshot = str(record.get("snapshot", ""))
+        components = _split(str(record.get("components", ""))) or _split(
+            str(record.get("component", ""))
+        )
         offered = tuple(
             v if isinstance(v, Variant) else Variant.read(v) for v in record.get("variants") or ()
         ) or (
-            Variant(
-                name=str(record.get("variant") or "default"),
-                store=str(record["store"]),
-                snapshot=snapshot,
-                snapshots=str(record.get("snapshots", "")),
-                reference=True,
-            ),
+            (
+                Variant(
+                    name=str(record.get("variant") or "default"),
+                    store=str(record["store"]),
+                    snapshot=snapshot,
+                    snapshots=str(record.get("snapshots", "")),
+                    reference=True,
+                ),
+            )
+            if declares
+            else ()
         )
         return cls(
             entrypoint_binding_plan_id=str(record["plan_id"]),
             entrypoint=str(record["entrypoint"]),
             project=str(record["project"]),
-            model_class=str(record["model_class"]),
-            model_binding_path=str(record["binding_path"]),
-            model_parameter_name=str(record["param"]),
-            store=str(record["store"]),
-            config=str(record["config"]),
+            model_class=str(record.get("model_class", "")),
+            model_binding_path=str(record.get("binding_path", "")),
+            model_parameter_name=str(record.get("param", "")),
+            store=str(record.get("store", "")),
+            config=str(record.get("config", "")),
             release=str(record["release"]),
-            variant=str(record["variant"]),
+            variant=str(record.get("variant", "")),
             reference_snapshot=snapshot,
             components=components,
             snapshots=_pairs(str(record.get("snapshots", ""))),
             offered=offered,
             objective=str(record.get("objective", "latency")),
             steps_basis=int(record.get("steps_basis", 20)),
-            model_weight_bytes=int(record["vram_bytes"]),
-            host_bytes=int(record["host_bytes"]),
-            pinned_bytes=int(record["pinned_bytes"]),
+            model_weight_bytes=int(record.get("vram_bytes", 0)),
+            host_bytes=int(record.get("host_bytes", 0)),
+            pinned_bytes=int(record.get("pinned_bytes", 0)),
             vram_floor_bytes=int(record.get("vram_floor_bytes", 0)),
             resident_budget_bytes=int(record.get("resident_budget_bytes", 0)),
             tenancy=str(record.get("tenancy", "local")),
@@ -476,25 +511,13 @@ RECORD_KEYS = frozenset(
     }
 )
 
-#: What a record cannot leave out. Everything else has a default that MEANS something.
-RECORD_REQUIRED = frozenset(
-    {
-        "plan_id",
-        "project",
-        "model_class",
-        "binding_path",
-        "param",
-        "component",
-        "store",
-        "config",
-        "snapshot",
-        "release",
-        "variant",
-        "vram_bytes",
-        "host_bytes",
-        "pinned_bytes",
-        "entrypoint",
-    }
+#: What a record cannot leave out, whether or not it declares a model.
+RECORD_REQUIRED = frozenset({"plan_id", "project", "release", "entrypoint"})
+
+#: The keys that TOGETHER declare one model. A record carries all of them or none of them:
+#: a weightless endpoint declares none and is served without a fill (cl-013).
+MODEL_KEYS = frozenset(
+    {"model_class", "binding_path", "param", "component", "store", "config", "snapshot"}
 )
 
 
