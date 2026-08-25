@@ -1057,10 +1057,8 @@ class AttemptEngine:
         executor = self.supervision.current
         if executor is None:
             return self.abandon(attempt, "the executor vanished before dispatch")
-        # The spool already exists: cr-012's hydration created it before acceptance, which
-        # is what "the executor is handed verified files, never an address" requires. This
-        # stays for the recovered-attempt path, where acceptance happened in a process that
-        # is no longer running.
+        # The spool already exists — cr-012's hydration made it before acceptance. This
+        # stays for the recovered-attempt path, whose acceptance was another process's.
         spool = attempt.spool or self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
@@ -1102,11 +1100,9 @@ class AttemptEngine:
                 canceling=attempt.canceling or "no",
             )
             self.monitor.end(key, "executor_died")
-            # WHICHEVER THREAD SEES THE DEATH MARKS IT. The forceful-cancel path kills on
-            # the watchdog thread while this one is blocked in recv, so a rebuild decision
-            # that waits for the killer to finish its bookkeeping races a dying process and
-            # loses (`waitpid` answers 0 for a few ms). Invalidating at the OBSERVATION
-            # removes the race instead of narrowing it.
+            # WHICHEVER THREAD SEES THE DEATH MARKS IT: `waitpid` answers 0 for a few ms
+            # on a dying process, so invalidating at the OBSERVATION removes the race with
+            # the watchdog's kill instead of narrowing it (cr-007).
             self.supervision.invalidate("the executor died during an attempt")
             # A job's scratch tree deliberately SURVIVES — it is the run's, not the
             # attempt's — but the attempt SPOOL is aborted on both lanes, so nothing
@@ -1281,12 +1277,9 @@ class AttemptEngine:
                 "transaction and this runtime will not mint a receipt for bytes nobody "
                 "wrote (cr-017 owns that transaction)",
             )
-        # The output transaction belongs to a SUCCEEDING attempt. A refused or failed one
-        # produced no outputs by definition, so running the tail over it would find the
-        # grant unsatisfied and report `destination_absent` — replacing the author's real
-        # cause with a story about a transaction that was never owed. Found live: a handler
-        # that refused came back to the coordinator as a missing destination, and the actual
-        # reason was nowhere on the terminal.
+        # The output transaction belongs to a SUCCEEDING attempt. Running the tail over a
+        # refused one finds the grant unsatisfied and reports `destination_absent`, which
+        # replaces the author's real cause with a transaction nobody owed (cr-012).
         manifest: pb.OutputManifest | None = None
         inline: InlineResult | None = None
         if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
@@ -1330,12 +1323,9 @@ class AttemptEngine:
             status,
             cause,
             origin,
-            # The AUTHOR-SURFACE code, in front of its own sentence. The wire's `CauseCode`
-            # is deliberately a small NEUTRAL class (`INVALID_REQUEST`), so without this the
-            # typed code the author raised — `asset_ungranted`, `asset_media_type` — exists
-            # only inside prose and nothing downstream can key on it. Measured by cr-012's
-            # arms: two correct typed refusals were indistinguishable from each other to
-            # anything reading the terminal.
+            # The AUTHOR-SURFACE code in front of its own sentence. The wire's `CauseCode`
+            # is a small NEUTRAL class, so without this the typed code the author raised
+            # exists only inside prose and nothing downstream can key on it (cr-012).
             f"accepted_envelope_breach: {_coded(outcome)}" if breach else _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),

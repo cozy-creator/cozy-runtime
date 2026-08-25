@@ -641,16 +641,10 @@ class StreamingFillBackend:
         #: back from a host tier that does not exist (§3.2: eviction FREES).
         self.parked: dict[str, Any] = {}
         self.vram_charge: dict[str, int] = {}
-        #: ONE number per component: the device bytes its module holds when it is resident,
-        #: measured at construction over the module's own tensors. Every later grant, charge,
-        #: release and price uses THIS number, resident or parked.
-        #:
-        #: It exists because there were two meters. Construction charged the module's tensor
-        #: sum (which includes the derived buffers a checkpoint never supplies); `stage()`
-        #: granted the READ PLAN's sum, which does not. They differ by about a kilobyte per
-        #: pipeline, and the visible consequence was a plan whose reserved weights changed
-        #: between the first attempt and the second on a generation that had not changed at
-        #: all. A component costs what it costs.
+        #: ONE number per component: the device bytes its module holds when resident,
+        #: measured at construction over the module's own tensors, derived buffers included.
+        #: Every later grant, charge, release and price reads THIS, resident or parked — two
+        #: meters made a generation's reserved weights move between attempts (cr-008b).
         self.component_bytes: dict[str, int] = {}
         #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
         #: must outlive the first commit. It is released by `close()` with the generation.

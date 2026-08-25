@@ -258,14 +258,11 @@ class ExecutorSupervision:
     def invalidate(self, why: str) -> int:
         """In-place readiness invalidation: the PROCESS may survive, its state did not.
 
-        THE ADVERTISEMENT GOES WITH IT (cr-007, found by cl-003 from the product seat). A
-        forceful cancel killed the executor here and the worker went on reporting
-        `INTAKE_STATE_READY` until the rebuild started — which is after the terminal is
-        journaled and sent — so a coordinator dispatching in that window saw a healthy worker
-        and got `EXECUTOR_FAULT` for every attempt until its requeue budget was gone. A
-        device process that cannot serve must stop SAYING it can, at the moment it stops,
-        which is here: the ready-plan set empties and `on_invalidate` drops the intake state
-        the same instant, before this call returns.
+        THE ADVERTISEMENT GOES WITH IT (cr-007, cl-003). A device process that cannot serve
+        must stop SAYING it can at the moment it stops, which is here: the ready-plan set
+        empties and `on_invalidate` drops the intake state before this call returns.
+        Advertising READY until the rebuild started spent a coordinator's whole requeue
+        budget on a worker that was about to be healthy.
         """
         self.readiness_epoch += 1
         self.needs_rebuild = True

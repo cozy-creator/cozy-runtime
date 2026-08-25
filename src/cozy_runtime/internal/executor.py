@@ -330,16 +330,11 @@ class Executor:
             )
             model = registry.acquire(binding["binding_path"], model_cls, artifact)
         except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
-            # cr-005's transaction already rolled the generation back on the way out. The
-            # numbers that matter are therefore the HIGH-WATER marks (what was live when it
-            # failed) beside the after state — "released 0 B" would be true and useless.
-            #
-            # A device OOM is a RESOURCE SHORTFALL, not an unhandled exception. It is the
-            # ordinary outcome of another process holding the card (this box's 8 GiB fits
-            # exactly one 4.78 GiB resident), and reporting it as a crash loses the two
-            # numbers an operator needs: what was wanted and what was there. The plan
-            # reserved against a DECLARED budget; the device is what actually says no. The
-            # request-aware ladder that would pick a plan that fits is cr-008b's.
+            # The generation is already rolled back, so the numbers that matter are the
+            # HIGH-WATER marks beside the after state — "released 0 B" would be true and
+            # useless. A device OOM here is a RESOURCE SHORTFALL, not a crash: it is the
+            # ordinary outcome of a neighbour holding the card, and it carries the two
+            # numbers an operator needs (cr-005).
             oom = not isinstance(exc, FillRefusal)
             if oom:
                 # A device OOM must roll back like any other fill failure. cr-005's

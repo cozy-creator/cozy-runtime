@@ -780,20 +780,11 @@ class PlanChooser:
                     }
                 )
                 continue
-            # Both rungs need the same ACTIVATION headroom — activations do not shrink
-            # because a component moved — and each additionally needs the WEIGHTS IT MUST
-            # BRING BACK, which is where the two differ:
-            #
-            #   all_resident      needs every absent component back, and can free nothing;
-            #                     its capacity is what is allocatable right now.
-            #   component_staged  holds the declared set at a time, so the most it must
-            #                     raise at once is the LARGEST declared component — and it
-            #                     may free every resident one first, so its capacity is
-            #                     `allocatable + resident`.
-            #
-            # On a generation with everything resident, `absent_bytes` is 0 and this is the
-            # arithmetic that was already there. On one that staged, it is the difference
-            # between a rung that fits and a kernel OOM.
+            # Both rungs charge the same ACTIVATION headroom and differ in the WEIGHTS
+            # they must bring back: `all_resident` needs every absent component and can
+            # free nothing, so its capacity is bare allocatable; `component_staged` holds
+            # one declared set at a time and may free every resident component first
+            # (cl-003).
             if placement == "all_resident":
                 headroom = activations.value + absent_bytes
                 capacity = allocatable

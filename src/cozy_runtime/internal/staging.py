@@ -92,17 +92,12 @@ class ComponentResidency:
     #: instead of an exception string (cr-008a finding 8: a Fault has no shortfall slot,
     #: a TerminalCause does, and this is what fills it).
     last_shortfall: dict[str, Any] | None = None
-    #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, in allocator bytes, signed. Every stage
-    #: and every eviction this attempt performed is measured by the SAME meter the ledger
-    #: reconciles `device_allocated` with — `torch.cuda.memory_allocated()`, read either
-    #: side of the move — so the supervisor can subtract a DELIBERATE transition from an
-    #: attempt's device delta exactly, and whatever is left over is a real leak.
-    #:
-    #: Measuring rather than adding up plan bytes is the whole point: the fill plane's
-    #: `nbytes` is the tensor payload, and the allocator rounds every allocation, so a
-    #: 6.77 GB eviction reconciled to plan arithmetic leaves tens of kilobytes of "leak"
-    #: that is nothing but rounding. The meter that reports the class has to be the meter
-    #: that explains it.
+    #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, MEASURED on the same meter the
+    #: ledger reconciles `device_allocated` with (`torch.cuda.memory_allocated()`, read
+    #: either side of the move). The supervisor subtracts exactly this and holds the
+    #: remainder to zero, so the meter that reports the class must be the meter that
+    #: explains it — plan arithmetic would leave the allocator's rounding as "leak"
+    #: (cr-008b).
     allocator_delta_bytes: int = 0
     attempt_stages: int = 0
     attempt_evictions: int = 0

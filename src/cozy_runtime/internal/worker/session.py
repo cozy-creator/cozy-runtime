@@ -612,11 +612,9 @@ class Supervisor:
                         detail=detail,
                     )
                 )
-                # RECORD THE FAULT, THEN MOVE THE STATE. The transition publishes a Report
-                # immediately, so transitioning first tells a coordinator "I failed" in a
-                # message that does not yet carry why — and the next Report is a full period
-                # away. Found by the harness waiting on a fault report and getting an empty
-                # one; it is the ordering hazard every edge-published state has.
+                # RECORD THE FAULT, THEN MOVE THE STATE: the transition publishes a Report
+                # immediately, so moving first says "I failed" in a message that does not
+                # yet carry why, and the next Report is a full period away.
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.note(
                     "boot",
@@ -826,11 +824,9 @@ class Supervisor:
                 try:
                     self.apply_directive(message.directive)
                 except (ExecutorGone, JournalError) as exc:
-                    # A directive whose PREPARATION dies must say so durably. Noting it and
-                    # leaving intake at LOADING is the worst of both: the worker will never
-                    # become ready and the coordinator has no way to learn that, so it waits
-                    # on a worker that is finished. Found live by killing the executor
-                    # mid-fill — the run hung instead of converging (cr-008a arm 2).
+                    # A directive whose PREPARATION dies must say so DURABLY. Leaving intake
+                    # at LOADING means the worker never becomes ready and the coordinator
+                    # has no way to learn it (cr-008a arm 2).
                     self.note("directive", f"apply failed: {exc}")
                     self.engine.fault(
                         pb.Fault(
@@ -946,13 +942,10 @@ class Supervisor:
     def await_settled(self, attempt: AttemptRecord) -> None:
         """QUEUE behind a rebuild instead of refusing through one.
 
-        The alternative — the shape cl-003 measured — is a dispatch/refuse/requeue loop: a
-        forceful cancel kills the executor, the rebuild takes about five seconds, and every
-        attempt that lands in that window is refused `executor_not_ready` with an
-        EXECUTOR_FAULT the coordinator can only read as "this worker is broken". One cancel
-        spent a requeue budget of three in 1.8 seconds against a worker that was perfectly
-        healthy 4 seconds later. Waiting turns a refusal into a queue, which is what a
-        coordinator's budget is for.
+        The alternative is a dispatch/refuse/requeue loop: every attempt landing in a
+        rebuild window is refused `executor_not_ready`, which a coordinator can only read as
+        "this worker is broken". Waiting turns a refusal into a queue, which is what a
+        coordinator's budget is for (cl-003).
 
         The wait is on the DEVICE LANE, which is the thread that would have been idle anyway.
         It used to be on the control reader, where 120 s of waiting was 120 s in which no
