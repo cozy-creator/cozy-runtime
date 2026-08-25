@@ -282,6 +282,19 @@ class Checkpoint:
                     "TensorFS does not know",
                     [key],
                 )
+            if dtype not in TORCH_DTYPES:
+                # The store knows this dtype and this runtime has no torch spelling for it.
+                # Saying so is the point of keeping the map CHECKED rather than trusted: the
+                # alternative is passing the raw name through and comparing it against a
+                # torch dtype it can never equal, which refuses too — with a message about
+                # the wrong thing.
+                raise _refuse(
+                    "dtype_mismatch",
+                    f"{key}: TensorFS supplies dtype {dtype!r} and this runtime has no "
+                    "torch binding for it; the map lives in the runtime because torch is "
+                    "not TensorFS's business, and a missing row is a refusal, not a guess",
+                    [key],
+                )
             nbytes = width
             for extent in shape:
                 nbytes *= extent
