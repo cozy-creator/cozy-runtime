@@ -97,6 +97,7 @@ class Executor:
         self.torch: Any = None
         self.registry: Any = None
         self.backend: Any = None
+        self.residency: Any = None
         self.models: dict[str, Any] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
@@ -127,7 +128,7 @@ class Executor:
         self.torch = torch
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
-        from cozy_runtime.internal.derive import Observations, meta_substrate
+        from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.fill import (
             Checkpoint,
             FillRefusal,
@@ -135,6 +136,7 @@ class Executor:
             StreamingFillBackend,
             topology_of,
         )
+        from cozy_runtime.internal.staging import ComponentResidency
 
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats()
@@ -155,8 +157,18 @@ class Executor:
         # The store IS the artifact identity: one snapshot digest, and TensorFS answers with
         # the header, the plan and the verified lease. The interim path needed a store root
         # AND a pre-parsed read-plan file beside it; tfs-007 deleted the second one.
-        checkpoint = Checkpoint(binding["store"], binding["snapshot"])
-        rows = checkpoint.rows(binding["component"])
+        # The component SET, in the contract's own declared order. A single-component
+        # binding is the same code with a one-element set: cr-008b did not add a second
+        # path, it widened the one that existed. `snapshots` names ONE snapshot per
+        # component, because a TensorFS read plan is complete over its header and a
+        # partial read of a whole-pipeline snapshot has no representation (tfs-007).
+        names: list[str] = list(binding.get("components") or [binding["component"]])
+        per_component: dict[str, str] = dict(binding.get("snapshots") or {})
+        checkpoints = {
+            name: Checkpoint(binding["store"], per_component.get(name, binding["snapshot"]))
+            for name in names
+        }
+        rows = [row for name in names for row in checkpoints[name].rows(name)]
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
@@ -178,7 +190,7 @@ class Executor:
 
         position(0)
         backend = StreamingFillBackend(
-            checkpoint,
+            checkpoints,
             rows,
             ledger=ledger,
             on_position=position,
@@ -187,6 +199,11 @@ class Executor:
             readers=binding.get("readers", 16),
             inflight=binding.get("inflight", 8),
         )
+        # A STAGING generation re-reads the store after construction, so its GC-safe hold
+        # must outlive the first commit. `resident_budget` is what makes a parked component
+        # possible at all: 0 means every component stays resident.
+        backend.resident_budget = int(budgets.get("resident", 0))
+        backend.hold_lease = backend.resident_budget > 0
         artifact = Artifact(
             binding["snapshot"],
             topology_of(rows),
@@ -197,7 +214,7 @@ class Executor:
         registry = ModelRegistry(
             release=binding["release"],
             backend=backend,
-            substrate=lambda: meta_substrate(binding["variant"], seen),
+            substrate=lambda: serving_substrate(binding["variant"], seen),
         )
         model_cls = getattr(self.discovered.module, binding["model_class"])
         try:
@@ -205,7 +222,9 @@ class Executor:
             # a corrupt artifact refuses here, before construction and before a single
             # destination is reserved, and that refusal is a typed fill refusal like any
             # other rather than an exception escaping the prepare path.
-            backend.expect({binding["component"]: tuple(row.key for row in rows)})
+            backend.expect(
+                {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in names}
+            )
             model = registry.acquire(binding["binding_path"], model_cls, artifact)
         except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
             # cr-005's transaction already rolled the generation back on the way out. The
@@ -259,6 +278,11 @@ class Executor:
         self.backend = backend
         self.registry = registry
         self.models = {binding["param"]: model}
+        # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
+        # generation. From here on, entering a declared scope admits and materializes its
+        # set before the body runs; the endpoint cannot observe that it happened.
+        self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
+        object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
         self.construction_digest = canonical.digest(
             {
@@ -294,6 +318,9 @@ class Executor:
             "device_free_bytes": free,
             "device_total_bytes": total,
             "allocator_bytes": torch.cuda.memory_allocated(),
+            "reserved_bytes": torch.cuda.memory_reserved(),
+            "resident": dict(backend.vram_charge),
+            "parked": sorted(backend.parked),
             "rss_bytes": _rss(),
             "ledger": ledger.rows(),
             "store": backend.stats.get("store", {}),
@@ -373,6 +400,13 @@ class Executor:
                         }
                     )
 
+        # The attempt's PLACEMENT RUNG, fixed by the PlanChooser before durable acceptance
+        # and applied here. The executor decides nothing: it is handed a rung and obeys it,
+        # which is what keeps `all_resident` from quietly starting to swap.
+        if self.residency is not None:
+            self.residency.placement = str(command.get("placement", "all_resident"))
+            self.residency.headroom = int(command.get("headroom_bytes", 0))
+            self.residency.last_shortfall = None
         torch.cuda.reset_peak_memory_stats()
         lease_acquired = time.perf_counter()
         started_wall = time.time()
@@ -418,8 +452,11 @@ class Executor:
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
+        shortfall = self.residency.last_shortfall if self.residency is not None else None
         return {
             "ok": True,
+            "shortfall": shortfall,
+            "residency": self.residency.document() if self.residency is not None else {},
             "observations": record.ring.rows(),
             "observation_caps": record.ring.caps(),
             "attribution": record.attribution.document(),
@@ -540,6 +577,8 @@ class Executor:
             "device_free_bytes": free,
             "device_total_bytes": total,
             "allocator_bytes": self.torch.cuda.memory_allocated(),
+            "reserved_bytes": self.torch.cuda.memory_reserved(),
+            "residency": self.residency.document() if self.residency else {},
             "rss_bytes": _rss(),
             "attempts": self.attempts,
             "ready": self.ready,

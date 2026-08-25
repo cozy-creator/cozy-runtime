@@ -84,6 +84,17 @@ REFUSALS = frozenset(
 )
 
 
+class _Holder:
+    """A minimal census subject: the census walks `components`, so one component's restage
+    walks exactly one component. It exists so `stage` reuses the SAME census the whole
+    construction used instead of a second traversal rule."""
+
+    __slots__ = ("components",)
+
+    def __init__(self, components: Mapping[str, Any]) -> None:
+        self.components = dict(components)
+
+
 def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
     if code not in REFUSALS:
         raise AssertionError(f"{code} is not a declared fill refusal")
@@ -466,7 +477,7 @@ class StreamingFillBackend:
 
     def __init__(
         self,
-        checkpoint: Checkpoint,
+        checkpoint: Checkpoint | Mapping[str, Checkpoint],
         rows: Sequence[PlanRow],
         *,
         device: str = "cuda",
@@ -481,7 +492,17 @@ class StreamingFillBackend:
         from cozy_runtime.internal.derive import torch_module
 
         self.torch = torch_module()
-        self.checkpoint = checkpoint
+        # ONE CHECKPOINT PER COMPONENT (cr-008b). A TensorFS read plan must name every
+        # tensor its header carries — tfs-007's completeness rule — so a whole-pipeline
+        # snapshot cannot be read one component at a time, and reading 6.4 GiB to stage
+        # 0.16 GiB is not staging. Per-component snapshots turn the partial read into the
+        # store's ordinary COMPLETE read; the objects dedup, so it costs no extra disk. A
+        # single-component binding passes one Checkpoint and nothing below changes.
+        self.checkpoints: dict[str, Checkpoint] = (
+            dict(checkpoint)
+            if isinstance(checkpoint, Mapping)
+            else {row.component: checkpoint for row in rows}
+        )
         self.plan = {row.key: row for row in rows}
         self.order = [row.key for row in rows]
         self.device = self.torch.device(device)
@@ -500,12 +521,33 @@ class StreamingFillBackend:
         #: position rather than a heartbeat — a stalled transfer stops moving it, while a
         #: slow one keeps moving it however slowly.
         self.on_position = on_position
-        self.lease: Any = None
+        self.leases: dict[str, Any] = {}
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
         self.expected: dict[str, tuple[str, ...]] = {}
         self.components: dict[str, Any] = {}
+        #: components this generation OWNS but is not holding on device right now. Their
+        #: modules live on `meta`, so re-staging is a reservation plus a fill, never a copy
+        #: back from a host tier that does not exist (§3.2: eviction FREES).
+        self.parked: dict[str, Any] = {}
         self.vram_charge: dict[str, int] = {}
+        #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
+        #: must outlive the first commit. It is released by `close()` with the generation.
+        self.hold_lease = False
+        self.stage_log: list[dict[str, Any]] = []
+        #: DERIVED tensor values per component, captured once at construction. A
+        #: non-persistent buffer is a pure function of config that no checkpoint supplies,
+        #: so an eviction that dropped it could never get it back — the module's `__init__`
+        #: is not re-runnable. Held here, a re-stage restores exactly what construction
+        #: computed. Kilobytes, and the alternative is serving uninitialized memory.
+        self.derived: dict[str, dict[tuple[Any, str], Any]] = {}
+        #: The device bytes construction may leave RESIDENT. Components are filled in the
+        #: contract's own declared order while the cumulative total fits; the rest are
+        #: PARKED on `meta` and staged in on first use. 0 means "no ceiling", which is what
+        #: an all-resident plan means. This is the DEPLOYMENT's declared budget, deliberately
+        #: not a measurement: construction must be reproducible, and the attempt-time ladder
+        #: is where measured free VRAM decides things (cr-008b).
+        self.resident_budget = 0
         self.stats: dict[str, Any] = {"windows": 0, "waits": 0}
 
     # -- reservation -------------------------------------------------------------
@@ -521,9 +563,24 @@ class StreamingFillBackend:
         with gigabytes of destinations already live.
         """
         self.expected = {name: tuple(keys) for name, keys in sets.items()}
-        self.lease = self.checkpoint.acquire()
-        self.stats["lease_bytes"] = int(self.lease.bytes)
-        self.stats["lease_objects"] = len(self.lease.objects)
+        for name in sets:
+            self._acquire(name)
+        self.stats["lease_bytes"] = sum(int(v.bytes) for v in self.leases.values())
+        self.stats["lease_objects"] = sum(len(v.objects) for v in self.leases.values())
+
+    def _acquire(self, component: str) -> Any:
+        """The verified read lease for ONE component, acquired once and reused."""
+        lease = self.leases.get(component)
+        if lease is None or not lease.live:
+            checkpoint = self.checkpoints.get(component)
+            if checkpoint is None:
+                raise _refuse(
+                    "destination_absent",
+                    f"no checkpoint is bound for component {component!r} (bound: "
+                    f"{', '.join(sorted(self.checkpoints)) or 'none'})",
+                )
+            lease = self.leases[component] = checkpoint.acquire()
+        return lease
 
     def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
         """Reserve ordinary CUDA destinations for the constructed component roots.
@@ -538,23 +595,26 @@ class StreamingFillBackend:
 
         roots = dict(_members(obj))
         started = time.perf_counter_ns()
+        held = 0
         with placing():
             for name in walked.components:
                 member = roots.get(name)
                 if member is None or not hasattr(member, "to_empty"):
                     continue
-                stray = sorted(_non_persistent(member))
-                if stray:
-                    raise _refuse(
-                        "derived_unmaterialized",
-                        f"component {name!r} carries {len(stray)} non-persistent buffer(s) "
-                        f"({', '.join(stray[:4])}): no checkpoint supplies them and this "
-                        "plane moves stored bytes only. A derived table is a pure function "
-                        "of config and its re-execution on the target device is cr-008b's "
-                        "staging pass — serving uninitialized memory under a derived name "
-                        "is the alternative, and it is not one",
-                        stray[:6],
-                    )
+                size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
+                # Captured BEFORE the park decision: a parked component is staged in later
+                # and its derived tables have to survive to be restored, which they cannot
+                # if the capture happens only on the resident branch.
+                derived = self.derived[name] = _derived_values(member)
+                if self.resident_budget and held + size > self.resident_budget:
+                    # PARKED, not dropped. Its topology is built and its destinations are
+                    # known; what it does not have is device bytes, and `stage()` supplies
+                    # those on first declared use. A construction that silently skipped it
+                    # would be a different model.
+                    self.parked[name] = member
+                    self.stage_log.append({"component": name, "action": "park", "bytes": size})
+                    continue
+                held += size
                 want = sum(t.numel() * t.element_size() for _, t in _tensors(member))
                 self.ledger.grant({"vram": want}, f"component {name!r} destinations")
                 self.vram_charge[name] = want
@@ -574,6 +634,7 @@ class StreamingFillBackend:
                     member.to_empty(device=self.torch.device("meta"), recurse=True)
                     self.ledger.release({"vram": self.vram_charge.pop(name, 0)})
                     raise
+                _restore_derived(member, derived)
                 self.components[name] = member
             # Inside the placement window too: censusing a REAL module detaches every
             # tensor, and a detach on cuda is exactly the "real allocation during
@@ -594,6 +655,13 @@ class StreamingFillBackend:
         """Validate one destination against the stored row and enqueue it. No I/O here:
         every refusal in the matrix must fire before the first byte moves."""
         row = self.plan.get(key)
+        if row is not None and row.component in self.parked:
+            # A PARKED component's destinations are on `meta` and have no bytes to fill.
+            # The check is FIRST because every check below is about a device destination,
+            # and a parked one legitimately has none — `stage()` fills exactly these keys
+            # on first declared use, and `commit` requires completeness only for what is
+            # resident.
+            return
         if row is None:
             raise _refuse(
                 "destination_absent",
@@ -648,7 +716,11 @@ class StreamingFillBackend:
             self.state = "ready"
             return
         missing = [
-            key for name, keys in self.expected.items() for key in keys if key not in self.enqueued
+            key
+            for name, keys in self.expected.items()
+            if name in self.components
+            for key in keys
+            if key not in self.enqueued
         ]
         if missing:
             raise _refuse(
@@ -658,6 +730,16 @@ class StreamingFillBackend:
                 "the component does not commit",
                 missing[:6],
             )
+        self._commit_enqueued()
+        self.state = "ready"
+
+    def _commit_enqueued(self) -> None:
+        """Move whatever is enqueued right now, fence it, and clear the queue.
+
+        Split out of `commit` so a component STAGE is the same transaction over a smaller
+        DestinationSet rather than a second copy of it — there is one code path that moves
+        bytes to the device, and this is it.
+        """
         from cozy_runtime.internal.derive import placing
 
         started = time.perf_counter_ns()
@@ -690,14 +772,101 @@ class StreamingFillBackend:
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
         # for — comparing a number that includes it would flatter neither side honestly.
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
-        self.state = "ready"
+        self.enqueued.clear()
 
     def release_lease(self) -> None:
-        """Give the hold back. Idempotent: a rollback and a commit may both reach here."""
-        lease = self.lease
-        self.lease = None
-        if lease is not None and lease.live:
-            lease.release()
+        """Give the hold back. Idempotent: a rollback and a commit may both reach here.
+
+        A STAGING generation keeps it: re-staging an evicted component reads the store
+        again, and reading objects the GC may already consider free is the one thing a hold
+        exists to prevent. `close()` is where a held lease ends.
+        """
+        if self.hold_lease:
+            return
+        held, self.leases = self.leases, {}
+        for lease in held.values():
+            if lease is not None and lease.live:
+                lease.release()
+
+    def close(self) -> None:
+        """End the generation's hold. Called when the executor tears the generation down."""
+        self.hold_lease = False
+        self.release_lease()
+
+    # -- component staging (cr-008b) ---------------------------------------------
+
+    def evict(self, name: str) -> int:
+        """FREE one component's device bytes. Returns what came back.
+
+        Eviction is demand-pull and it FREES — there is no demote-copy and no host
+        residence tier (§3.2). Re-staging is an ordinary cr-005 fill from the page-cached
+        CAS mapping, which is both simpler and, on a warm page cache, faster than a D2H
+        copy plus an H2D copy would be. The module is moved to `meta` rather than dropped,
+        so its topology survives and the restage is a reservation, not a construction.
+        """
+        member = self.components.pop(name, None)
+        if member is None:
+            return 0
+        from cozy_runtime.internal.derive import placing
+
+        charged = self.vram_charge.pop(name, 0)
+        with placing():
+            self._free_storages(t for _, t in _tensors(member))
+            member.to_empty(device=self.torch.device("meta"), recurse=True)
+        self.ledger.release({"vram": charged})
+        self.parked[name] = member
+        self.stage_log.append({"component": name, "action": "evict", "bytes": charged})
+        del self.stage_log[:-64]
+        return charged
+
+    def stage(self, name: str) -> dict[str, Any]:
+        """Re-reserve and RE-FILL one evicted component. The same transaction, scoped.
+
+        Every refusal the whole-generation path has fires here too, because it IS that
+        path: `fill` validates each destination against the stored row, `_stream` splices
+        the store's batches, and the completion events fence before the component is
+        observable. A staged component that half-arrives is rolled back, not served.
+        """
+        member = self.parked.get(name)
+        if member is None:
+            raise _refuse(
+                "destination_absent",
+                f"component {name!r} is not parked on this generation (parked: "
+                f"{', '.join(sorted(self.parked)) or 'none'}) — staging moves bytes for a "
+                "component the construction already built, never for a new one",
+            )
+        from cozy_runtime.internal.derive import placing
+
+        started = time.perf_counter_ns()
+        want = sum(row.nbytes for row in self.plan.values() if row.component == name)
+        self.ledger.grant({"vram": want}, f"staging component {name!r}")
+        try:
+            with placing():
+                member.to_empty(device=self.device, recurse=True)
+                _restore_derived(member, self.derived.get(name, {}))
+                fresh = census(_Holder({name: member}))
+        except BaseException:
+            with placing():
+                self._free_storages(t for _, t in _tensors(member))
+                member.to_empty(device=self.torch.device("meta"), recurse=True)
+            self.ledger.release({"vram": want})
+            raise
+        self.vram_charge[name] = want
+        self._acquire(name)
+        try:
+            for destination in fresh.destinations:
+                self.fill(destination.key, destination.spec, fresh.live[destination.key])
+            self._commit_enqueued()
+        except BaseException:
+            self.evict(name)
+            raise
+        self.components[name] = member
+        self.parked.pop(name, None)
+        took = (time.perf_counter_ns() - started) // 1_000_000
+        row = {"component": name, "action": "stage", "bytes": want, "ms": took}
+        self.stage_log.append(row)
+        del self.stage_log[:-64]
+        return row
 
     def rollback(self, keys: Sequence[str]) -> None:
         """Abort the new generation; verified CAS is untouched by construction (this plane
@@ -713,6 +882,10 @@ class StreamingFillBackend:
         """
         from cozy_runtime.internal.derive import placing
 
+        # A rolled-back generation has nothing left to re-stage, so its hold ends here even
+        # under a staging plan — a hold kept for a generation that no longer exists is the
+        # store's reaper's problem, and leaving one is how a GC-safe hold becomes a leak.
+        self.hold_lease = False
         self.release_lease()
         with placing():
             self._free_storages(self.enqueued.values())
@@ -797,32 +970,18 @@ class StreamingFillBackend:
         rows = [self.plan[key] for key in self.order if key in self.enqueued]
         if not rows:
             return 0
-        traversal = [(row.component, row.name) for row in rows]
-        plan = self.checkpoint.read_plan(traversal, self.window_bytes)
-        expect = sum(row.nbytes for row in rows)
-        if int(plan.bytes) != expect:
-            raise _refuse(
-                "length_mismatch",
-                f"the store's read plan carries {plan.bytes} B for a traversal this "
-                f"contract prices at {expect} B",
-            )
-
-        flat = {row.what: self.enqueued[row.key].view(-1).view(self.torch.uint8) for row in rows}
-        base: dict[str, int] = {}
-        for item in plan.items():
-            base.setdefault(str(item["what"]), int(item["dest_off"]))
-        missing = sorted(set(flat) - set(base))
-        if missing:
-            raise _refuse(
-                "incomplete_fill",
-                f"{len(missing)} enqueued destination(s) are absent from the store's read "
-                f"plan ({', '.join(missing[:4])})",
-                missing[:6],
-            )
+        by_component: dict[str, list[PlanRow]] = {}
+        for row in rows:
+            by_component.setdefault(row.component, []).append(row)
 
         batches = [0]
         cursor = [0]
+        #: bytes already moved by EARLIER components. The liveness position must stay
+        #: monotone across the whole fill, and each component's plan restarts at zero.
+        moved = [0]
         torch = self.torch
+        flat: dict[str, Any] = {}
+        base: dict[str, int] = {}
 
         def on_batch(batch: Any) -> None:
             """Splice one filled slot across the destinations it covers.
@@ -849,15 +1008,46 @@ class StreamingFillBackend:
             ring.hold(event, batch)
             batches[0] += 1
             if self.on_position is not None:
-                self.on_position(cursor[0] >> 20)
+                self.on_position((moved[0] + cursor[0]) >> 20)
             # A slot whose H2D has not completed is NOT free. Query first, block last.
             ring.drain(ring.keep)
 
         started = time.perf_counter_ns()
-        with store_refusals("streaming the component"):
-            stats = self.lease.stream(plan, ring.views, on_batch, readers=self.readers)
+        stats: dict[str, Any] = {}
+        for component, group in by_component.items():
+            traversal = [(row.component, row.name) for row in group]
+            plan = self.checkpoints[component].read_plan(traversal, self.window_bytes)
+            expect = sum(row.nbytes for row in group)
+            if int(plan.bytes) != expect:
+                raise _refuse(
+                    "length_mismatch",
+                    f"{component}: the store's read plan carries {plan.bytes} B for a "
+                    f"traversal this contract prices at {expect} B",
+                )
+            flat = {r.what: self.enqueued[r.key].view(-1).view(torch.uint8) for r in group}
+            base = {}
+            for item in plan.items():
+                base.setdefault(str(item["what"]), int(item["dest_off"]))
+            missing = sorted(set(flat) - set(base))
+            if missing:
+                raise _refuse(
+                    "incomplete_fill",
+                    f"{len(missing)} enqueued destination(s) of {component!r} are absent "
+                    f"from the store's read plan ({', '.join(missing[:4])})",
+                    missing[:6],
+                )
+            # The cursor is per COMPONENT because each component gets its own read plan,
+            # and `dest_off` is an offset inside that plan's own logical stream.
+            moved[0] += cursor[0]
+            cursor[0] = 0
+            with store_refusals(f"streaming {component}"):
+                one = self._acquire(component).stream(
+                    plan, ring.views, on_batch, readers=self.readers
+                )
+            for key, value in dict(one).items():
+                stats[key] = stats.get(key, 0) + value if isinstance(value, int) else value
         self.stats["read_ns"] = time.perf_counter_ns() - started
-        self.stats["store"] = dict(stats)
+        self.stats["store"] = stats
         return batches[0]
 
 
@@ -903,3 +1093,35 @@ def _non_persistent(root: Any) -> set[str]:
         for local in getattr(sub, "_non_persistent_buffers_set", ()):
             names.add(f"{prefix}.{local}" if prefix else local)
     return names
+
+
+def _derived_values(root: Any) -> dict[tuple[Any, str], Any]:
+    """The DERIVED tensors' real values, captured before the destinations are reserved.
+
+    A non-persistent buffer is a pure function of config that no checkpoint supplies, and
+    the serving substrate lets its construction EXECUTE (on the host, where it is
+    kilobytes) precisely so there is a value to carry. `to_empty` moves shapes and drops
+    contents, so the values are held here across it and copied onto the device after.
+
+    Keyed by (module, local name) rather than by path: a path is re-derived and this is
+    the object itself, so a module renamed between the two statements cannot lose a table.
+    """
+    held: dict[tuple[Any, str], Any] = {}
+    for _, sub in root.named_modules():
+        for local in getattr(sub, "_non_persistent_buffers_set", ()):
+            value = sub._buffers.get(local)
+            if value is not None and str(value.device) != "meta":
+                held[(sub, local)] = value.detach().clone()
+    return held
+
+
+def _restore_derived(root: Any, held: Mapping[tuple[Any, str], Any]) -> int:
+    """Materialize the derived tables ON THE TARGET DEVICE. Returns how many landed."""
+    landed = 0
+    for (sub, local), value in held.items():
+        destination = sub._buffers.get(local)
+        if destination is None:
+            continue
+        sub._buffers[local] = value.to(destination.device, non_blocking=False)
+        landed += 1
+    return landed

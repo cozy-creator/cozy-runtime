@@ -165,6 +165,25 @@ class _Scope(Protocol):
     def __exit__(self, *exc: object) -> None: ...
 
 
+class Residency(Protocol):
+    """The runtime's component-use ADMISSION, installed on a constructed generation.
+
+    Declared here because the contract has one home; implemented nowhere in this package,
+    because admission, materialization, event fencing and eviction all need a device and
+    this package is torch-free by construction. cozy-runtime supplies the body
+    (`internal/staging.py`); a promoted Varena adapter would supply a different one and the
+    endpoint above would not be able to tell.
+
+    `admit` runs BEFORE method entry and either makes the declared set materialized or
+    refuses typed. `release` runs after the body returns, records the event fence, and makes
+    the leases EVICTABLE — it never forces eviction and never imposes a global scope order.
+    """
+
+    def admit(self, method: str, components: tuple[str, ...]) -> None: ...
+
+    def release(self, method: str, components: tuple[str, ...]) -> None: ...
+
+
 def uses_components(
     *names: str,
 ) -> Callable[[Callable[Concatenate[M, P], R]], Callable[Concatenate[M, P], R]]:
@@ -296,6 +315,9 @@ class Model(Generic[PipelineT]):
     _cozy_identity: ConstructionIdentity | None = None
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
+    _cozy_residency: Residency | None = None
+    """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
+    reason a scope works without one: a test double has no bytes to stage."""
 
     def __init_subclass__(cls, /, **stamps: str) -> None:
         """The class-keyword plane: one keyword per REQUIRED stamp, open vocabulary."""
@@ -530,12 +552,24 @@ class _ComponentScope:
                 "components declares them together on one method (§1.1)",
                 code="concurrent_scope",
             )
+        # ADMISSION HAPPENS BEFORE ENTRY, and before the scope is marked active: a method
+        # whose declared set cannot be materialized never runs, so there is no state in
+        # which a body is executing against a component the runtime did not admit.
+        residency = model._cozy_residency
+        if residency is not None:
+            residency.admit(self._method, self._components)
         object.__setattr__(model, "_cozy_active", (self._method, self._components))
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
     def __exit__(self, *exc: object) -> None:
-        object.__setattr__(self._model, "_cozy_active", None)
+        model = self._model
+        object.__setattr__(model, "_cozy_active", None)
+        # RELEASE MAKES BYTES EVICTABLE; it does not evict, and it imposes no global scope
+        # sequence (§3.2). The lease ends at the completion event, not at this statement.
+        residency = model._cozy_residency
+        if residency is not None:
+            residency.release(self._method, self._components)
 
 
 # --------------------------------------------------------------------------- guards

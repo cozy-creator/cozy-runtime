@@ -360,6 +360,8 @@ class Supervisor:
                         "binding_path": first.binding_path,
                         "param": first.param,
                         "component": first.component,
+                        "components": list(first.component_set()),
+                        "snapshots": first.snapshot_map(),
                         "store": first.store,
                         "config": first.config,
                         "snapshot": first.snapshot,
@@ -369,6 +371,11 @@ class Supervisor:
                     "budgets": {
                         "vram": first.vram_bytes,
                         "pinned": first.pinned_bytes,
+                        # The DECLARED construction ceiling. Components past it are PARKED
+                        # and staged in on first declared use; 0 means every component
+                        # stays resident. Construction is priced against the declaration so
+                        # it reproduces; the attempt-time ladder is what reads measurement.
+                        "resident": first.resident_budget_bytes,
                     },
                     "expect_construction_digest": first.model_construction_digest,
                 },
@@ -459,7 +466,9 @@ class Supervisor:
                 f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
                 f"{reply['facts']['filled']} destinations, "
                 f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
-                f"{reply['facts']['fill_ms'] / 1000:.3f} s, construction {digest[:23]}…",
+                f"{reply['facts']['fill_ms'] / 1000:.3f} s, construction {digest[:23]}… "
+                f"resident={sorted(reply['facts'].get('resident', {}))} "
+                f"parked={reply['facts'].get('parked', [])}",
             )
         self.run_warm_pass()
         self.intake(pb.IntakeState.INTAKE_STATE_READY)

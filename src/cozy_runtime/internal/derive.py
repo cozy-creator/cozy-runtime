@@ -424,6 +424,53 @@ def meta_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
         yield cap
 
 
+@contextmanager
+def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
+    """The SERVE substrate: parameters weightless, DERIVED BUFFERS REAL (cr-008b).
+
+    Derive mode puts everything on `meta`, and for derive that is exactly right — it walks
+    shapes and matches keys and must allocate nothing at all. Serving cannot use the same
+    substrate, and the reason is a class of tensor derive only has to NAME: a non-persistent
+    buffer is a pure function of config that NO CHECKPOINT SUPPLIES. CLIP's `position_ids`
+    is `arange(77)`; created under a meta device it has a shape and no value, and after
+    `to_empty` it is whatever was in that memory. Serving uninitialized memory under a
+    derived name is the alternative, and it is not one — the fill plane refuses it by name.
+
+    So this substrate does what a real serving loader does: it lets `__init__` EXECUTE, on
+    the host, and swaps each PARAMETER to `meta` the moment it is registered. Parameters are
+    the bytes that matter — 6.4 GiB of them here — and they are still never allocated for
+    real: the transient peak is one leaf's parameters, freed as soon as the swap lands.
+    Buffers are kilobytes and they keep the values their own construction computed, which is
+    what makes `position_ids` a derived table materialized on the target device rather than
+    a shape with garbage in it.
+    """
+    torch = torch_module()
+    nn = torch.nn
+    cap = _Capability(variant)
+    original = nn.Module.register_parameter
+
+    def register(module: Any, name: str, param: Any) -> None:
+        original(module, name, param)
+        held = module._parameters.get(name)
+        if held is None:
+            return
+        # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
+        # the fence is on WHO moves bytes, not on what (see `placing`).
+        with placing():
+            module._parameters[name] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
+
+    swap = torch.__future__.get_swap_module_params_on_conversion()
+    with ExitStack() as stack:
+        torch.__future__.set_swap_module_params_on_conversion(False)
+        stack.callback(torch.__future__.set_swap_module_params_on_conversion, swap)
+        nn.Module.register_parameter = register
+        stack.callback(setattr, nn.Module, "register_parameter", original)
+        stack.enter_context(_refuse_compile())
+        stack.enter_context(_capability(cap))
+        stack.enter_context(_guard_mode(seen))
+        yield cap
+
+
 # -------------------------------------------------------------------------- census
 
 

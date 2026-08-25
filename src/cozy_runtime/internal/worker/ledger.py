@@ -33,17 +33,22 @@ check, and here it does not have to — the parent can read the child's kernel-o
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 #: Every byte class this ledger carries, in report order. A class is added here only when a
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
 CLASSES = (
     "host_ram",
+    "host_available",
     "pinned_allocated",
     "pinned_registered",
     "active_weights",
     "activations_scratch",
     "device_allocated",
+    "device_reserved",
+    "device_out_of_allocator",
+    "device_allocatable",
     "device_free",
     "rss_supervisor",
     "rss_executor",
@@ -95,7 +100,55 @@ METHODS: dict[str, tuple[str, str]] = {
         "/proc/<pid>/status VmRSS read BY THE SUPERVISOR for its child - a parent reading "
         "the kernel's number, never the child's claim about itself",
     ),
+    "host_available": (
+        "measured",
+        "the LIVE host budget: cgroup memory.max minus memory.current when this process is "
+        "in a bounded cgroup, else /proc/meminfo MemAvailable - re-read at every grant, "
+        "because a host budget fixed at boot is a claim about a machine nobody else is on",
+    ),
+    "device_reserved": (
+        "measured",
+        "torch.cuda.memory_reserved() in the executor - the caching allocator's SEGMENTS, "
+        "which is what the driver sees; allocated is what the tensors see, and the gap "
+        "between them is reusable without asking the driver",
+    ),
+    "device_out_of_allocator": (
+        "measured",
+        "NVML per-process device memory for the executor pid MINUS "
+        "torch.cuda.memory_reserved() - the CUDA context and the cuDNN/cuBLAS workspaces, "
+        "which max_memory_allocated() structurally cannot see (the SS3.2 out-of-allocator meter)",
+    ),
+    "device_allocatable": (
+        "measured",
+        "driver-free plus the allocator's reserved-but-unallocated segments - what a new "
+        "reservation can ACTUALLY get, never arithmetic free bytes",
+    ),
 }
+
+
+def read_host_available() -> int:
+    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+
+    §3.2's host-RAM rule: host needs are MEASURED provisioning facts, and a rented pod
+    cannot guarantee host RAM either way. A budget fixed at boot describes a machine nobody
+    else is on; this is re-read at every grant. -1 means UNREADABLE, never 0.
+    """
+    try:
+        relative = Path("/proc/self/cgroup").read_text().strip().splitlines()[0].split("::")[-1]
+        cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        limit = (cgroup / "memory.max").read_text().strip()
+        if limit != "max":
+            current = int((cgroup / "memory.current").read_text().strip())
+            return max(int(limit) - current, 0)
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        return -1
+    return -1
 
 
 def read_vmrss(pid: int) -> int:
@@ -164,6 +217,9 @@ class Ledger:
     #: every attempt must return to. -1 until a generation is prepared.
     device_baseline: int = -1
     device_allocated: int = -1
+    device_reserved: int = -1
+    device_process: int = -1
+    """NVML per-process device bytes for the executor. -1 = UNREADABLE, never 0."""
     device_free: int = -1
     device_total: int = -1
     activations_peak: int = 0
@@ -174,11 +230,34 @@ class Ledger:
     supervisor_pid: int = 0
     #: classes this worker could not read, by name. Never silently zero.
     unreadable: list[str] = field(default_factory=list)
+    #: per-component RESIDENT device bytes, by component name. The staging plane's own
+    #: arithmetic, and the input the chooser's rung prices are computed from.
+    resident: dict[str, int] = field(default_factory=dict)
+    #: components this generation knows about but is not holding right now, with their size
+    evicted: dict[str, int] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
     reconciliations: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------ host grants
+
+    @property
+    def out_of_allocator(self) -> int:
+        """CUDA context + library workspaces: what the allocator's own numbers cannot see."""
+        if self.device_process < 0 or self.device_reserved < 0:
+            return -1
+        return max(self.device_process - self.device_reserved, 0)
+
+    @property
+    def allocatable(self) -> int:
+        """What a NEW reservation can actually get (§3.2: the allocator view, never
+        arithmetic free bytes). Driver-free plus the allocator's own reserved-but-unused."""
+        if self.device_free < 0:
+            return -1
+        slack = max(self.device_reserved - self.device_allocated, 0)
+        if self.device_reserved < 0 or self.device_allocated < 0:
+            slack = 0
+        return self.device_free + slack
 
     @property
     def host_charged(self) -> int:
@@ -188,10 +267,48 @@ class Ledger:
     def pinned_charged(self) -> int:
         return sum(row["pinned"] for row in self.grants.values())
 
+    #: A host move at or above this size is checked against LIVE availability before it is
+    #: attempted. Below it the check costs more than the move (§3.2's ">= 1 GiB" rule).
+    GUARD_FLOOR = 1 << 30
+    #: What must stay for the rest of the machine. A move that would consume the floor is
+    #: doomed: the OOM killer is the alternative, and it does not name its victim.
+    HOST_FLOOR = 512 << 20
+
+    def host_move_guard(self, nbytes: int, why: str) -> None:
+        """Refuse a DOOMED host move BEFORE the OOM killer, not after (§3.2).
+
+        The v1 shape this replaces detected growth AFTER the fact: RSS climbed, the kernel
+        picked a victim, and the postmortem was a dmesg line naming a process nobody chose.
+        This reads cgroup-derived availability at the moment of the grant — the same number
+        `host_available` reports — and refuses with both numbers while there is still
+        something to refuse with.
+        """
+        if nbytes < self.GUARD_FLOOR:
+            return
+        available = read_host_available()
+        if available < 0:
+            return  # UNREADABLE is not "plenty", but it is also not evidence to refuse on
+        if nbytes > available - self.HOST_FLOOR:
+            raise LedgerRefusal(
+                "host_move_doomed",
+                f"{why}: a {nbytes} B host move against {available} B available leaves "
+                f"less than the {self.HOST_FLOOR} B floor. This move is doomed and the "
+                "alternative is the OOM killer, which picks a victim nobody chose and "
+                "explains itself in dmesg - so it refuses HERE, with both numbers",
+                {
+                    "resource": "host_ram",
+                    "scope": "host_move",
+                    "needed_bytes": nbytes + self.HOST_FLOOR,
+                    "available_bytes": available,
+                    "evidence_class": "measured",
+                },
+            )
+
     def grant(self, key: str, host: int, pinned: int, why: str) -> None:
         """All classes or none — the envelope is granted whole, before anything moves."""
         if key in self.grants:
             raise LedgerRefusal("double_grant", f"{key} already holds a host grant")
+        self.host_move_guard(host, why)
         free_host = self.host_budget - self.host_charged
         free_pinned = self.pinned_budget - self.pinned_charged
         for name, need, free, budget in (
@@ -225,6 +342,9 @@ class Ledger:
         self.weights_destinations = int(facts.get("filled", 0))
         self.device_baseline = int(facts.get("allocator_bytes", -1))
         self.device_allocated = self.device_baseline
+        self.device_reserved = int(facts.get("reserved_bytes", -1))
+        self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
+        self.evicted = {}
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))
         rows = facts.get("ledger", {})
@@ -242,8 +362,13 @@ class Ledger:
     def observe_probe(self, probe: dict[str, Any]) -> None:
         """The device's after-state, read through the executor that owns the context."""
         self.device_allocated = int(probe.get("allocator_bytes", -1))
+        self.device_reserved = int(probe.get("reserved_bytes", -1))
         self.device_free = int(probe.get("device_free_bytes", -1))
         self.device_total = int(probe.get("device_total_bytes", -1))
+        residency = probe.get("residency")
+        if isinstance(residency, dict):
+            self.resident = {k: int(v) for k, v in (residency.get("resident") or {}).items()}
+            self.evicted = {k: int(v) for k, v in (residency.get("evicted") or {}).items()}
         rows = probe.get("ledger", {})
         if rows:
             self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
@@ -282,6 +407,7 @@ class Ledger:
     def counters(self) -> list[Counter]:
         values = {
             "host_ram": (self.host_charged, self.host_budget, self.peak_host),
+            "host_available": (read_host_available(), -1, -1),
             "pinned_allocated": (self.pinned_charged, self.pinned_budget, -1),
             "pinned_registered": (self.registered, self.pinned_budget, -1),
             "active_weights": (self.weights_bytes, -1, -1),
@@ -291,6 +417,9 @@ class Ledger:
                 -1,
             ),
             "device_allocated": (self.device_allocated, self.device_total, -1),
+            "device_reserved": (self.device_reserved, self.device_total, -1),
+            "device_out_of_allocator": (self.out_of_allocator, -1, -1),
+            "device_allocatable": (self.allocatable, self.device_total, -1),
             "device_free": (self.device_free, self.device_total, -1),
             "rss_supervisor": (read_vmrss(self.supervisor_pid), -1, -1),
             "rss_executor": (read_vmrss(self.executor_pid) if self.executor_pid else -1, -1, -1),
@@ -336,9 +465,13 @@ class Ledger:
                 "active_weights": self.weights_bytes,
                 "baseline": self.device_baseline,
                 "allocated": self.device_allocated,
+                "reserved": self.device_reserved,
+                "out_of_allocator": self.out_of_allocator,
+                "allocatable": self.allocatable,
                 "activations_peak": self.activations_peak,
                 "free": self.device_free,
             },
+            "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
             "grants": len(self.grants),
         }
 

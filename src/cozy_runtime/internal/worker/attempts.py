@@ -170,6 +170,8 @@ class Attempt:
     forwarded_seq: int = 0
     #: the opaque triage handle. Minted at the terminal, and the ONLY way to read the bundle.
     subject_id: str = ""
+    #: what the component-use plane actually did: stages, evictions, leases, resident set
+    residency: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
@@ -565,6 +567,8 @@ class AttemptEngine:
                     "deadline_s": seconds,
                     "boot_warmup": False,
                     "spool": str(spool),
+                    "placement": attempt.plan.placement,
+                    "headroom_bytes": attempt.plan.headroom_bytes,
                 },
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
@@ -609,6 +613,7 @@ class AttemptEngine:
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 ORIGIN.CAUSE_ORIGIN_EXECUTOR,
                 f"{reply.get('code')}: {reply.get('detail', '')}",
+                shortfall=reply.get("shortfall") or None,
             )
         if not reply.get("quiescent"):
             # No terminal is journaled while author computation might still mutate GPU or
@@ -742,6 +747,27 @@ class AttemptEngine:
                 continue
             attempt.ring.admit(self._row(row))
             kept += 1
+        residency = reply.get("residency") or {}
+        if residency:
+            attempt.residency = dict(residency)
+            if residency.get("stages"):
+                attempt.confess(
+                    "degraded",
+                    f"served on the {residency.get('placement')} rung: "
+                    f"{residency['stages']} component stage(s) costing "
+                    f"{residency.get('staged_ms', 0)} ms and "
+                    f"{residency.get('evictions', 0)} eviction(s) costing "
+                    f"{residency.get('evicted_ms', 0)} ms - the weights did not all fit "
+                    "at once and the runtime moved them rather than refusing",
+                )
+        shortfall = reply.get("shortfall")
+        if shortfall:
+            attempt.confess(
+                "degraded",
+                f"{shortfall['resource']} shortfall at {shortfall['scope']}: needed "
+                f"{shortfall['needed_bytes']} B, {shortfall['available_bytes']} B available, "
+                f"short by {shortfall['needed_bytes'] - shortfall['available_bytes']} B",
+            )
         caps["executor_rows"] = len(rows)
         caps["forwarded_live"] = attempt.forwarded_seq
         caps["absorbed_from_reply"] = kept
@@ -975,6 +1001,7 @@ class AttemptEngine:
                 for f in self.faults[-8:]
             ],
             measurements={
+                "residency": attempt.residency,
                 "ledger": attempt.reconciliation
                 or {"classes": [c.document() for c in self.ledger.counters()]},
                 "attribution": attempt.attribution,

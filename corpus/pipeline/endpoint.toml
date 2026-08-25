@@ -1,0 +1,9 @@
+# cr-008b's real-GPU endpoint: the whole four-component SDXL pipeline, one text-to-image
+# call. Bindings state SELECTION; the code names nothing.
+
+[application]
+object = "sdxl_txt2img:app"
+
+[bindings."SdxlPipelineModel"]
+repo = "cozy/sdxl-pipeline"
+release = "cr-008b"

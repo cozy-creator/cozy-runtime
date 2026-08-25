@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Eleven fences, each provable red by planting the violation (`scripts/redarm.py`):
+Twelve fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import · package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
+  endpoint-owns-no-residency
 """
 
 from __future__ import annotations
@@ -211,6 +212,73 @@ def endpoint_modules() -> list[pathlib.Path]:
                 modules.append(path)
                 break
     return modules
+
+
+def endpoint_and_model_code() -> list[pathlib.Path]:
+    """Every module an ENDPOINT AUTHOR writes: the entrypoint modules and their models.
+
+    `corpus/` counts — those are real endpoints against real weights, and the claim cr-008b
+    makes is about what an endpoint contains, not about what a weightless example contains.
+    The vendored venv is not author code and is excluded by path.
+    """
+    paths = list(endpoint_modules())
+    for base in ("corpus/pipeline", "corpus/endpoint"):
+        paths += sorted((ROOT / base).glob("*.py"))
+    for name in ("sdxl_real.py", "sdxl_pipeline.py", "sdxl.py", "h3.py"):
+        candidate = ROOT / "corpus" / name
+        if candidate.is_file():
+            paths.append(candidate)
+    return paths
+
+
+#: Residency vocabulary. An endpoint that can name one of these can move bytes, and §1.1's
+#: whole claim is that it cannot — the declaration is `@uses_components` and there is no
+#: second surface. `to`/`cuda` are deliberately ABSENT: casting a request tensor's dtype or
+#: placing a request input is ordinary module code, and the excluded-keyword fence already
+#: covers the model METHOD surface where placement would be a contract violation.
+RESIDENCY_NAMES = (
+    "to_empty",
+    "empty_cache",
+    "pin_memory",
+    "pinned_memory",
+    "cpu_offload",
+    "enable_model_cpu_offload",
+    "enable_sequential_cpu_offload",
+    "reset_peak_memory_stats",
+    "mem_get_info",
+    "memory_allocated",
+    "memory_reserved",
+    "set_per_process_memory_fraction",
+    "evict",
+    "materialize",
+    "register_backend",
+)
+
+
+def fence_endpoint_owns_no_residency() -> list[str]:
+    """cr-008b's done-when, as a scan: an endpoint serves with ZERO memory-management calls.
+
+    Not because its author is disciplined — because the vocabulary is not reachable from
+    endpoint code. The runtime admits and materializes a declared component set before
+    method entry, event-fences it, and makes it evictable after; an endpoint that could
+    also do those things would be a second policy, and two policies is the v1 defect.
+    """
+    bad: list[str] = []
+    for path in endpoint_and_model_code():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            reached, line = "", 0
+            if isinstance(node, ast.Attribute) and node.attr in RESIDENCY_NAMES:
+                reached, line = node.attr, node.lineno
+            elif isinstance(node, ast.Name) and node.id in RESIDENCY_NAMES:
+                reached, line = node.id, node.lineno
+            if reached:
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{line}: endpoint code names {reached!r} — "
+                    "residency is the runtime's, declared with @uses_components and "
+                    "nothing else; an endpoint that can move bytes is a second policy"
+                )
+    return bad
 
 
 def fence_no_identifiers() -> list[str]:
@@ -446,6 +514,7 @@ FENCES = {
     "excluded-keywords": fence_excluded_keywords,
     "no-identifiers-in-endpoint-code": fence_no_identifiers,
     "timing-decides-nothing": fence_timing_decides_nothing,
+    "endpoint-owns-no-residency": fence_endpoint_owns_no_residency,
 }
 
 

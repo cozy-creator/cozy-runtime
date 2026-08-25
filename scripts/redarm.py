@@ -60,6 +60,17 @@ STATIC_ARMS = (
     ),
     # cr-011's §1.3 rule, planted as the two ways it could break: the observation plane
     # IMPORTING a deciding module, and naming a residency operation without importing one.
+    # cr-008b's done-when as a plant: an endpoint that can move bytes is a second policy.
+    Arm(
+        "endpoint-owns-no-residency",
+        ROOT / "corpus" / "pipeline" / "sdxl_txt2img.py",
+        "def _reclaim() -> None:\n    import torch\n\n    torch.cuda.empty_cache()\n",
+    ),
+    Arm(
+        "endpoint-owns-no-residency",
+        ROOT / "corpus" / "sdxl_pipeline.py",
+        "def _offload(pipe: object) -> None:\n    pipe.enable_model_cpu_offload()\n",
+    ),
     Arm(
         "timing-decides-nothing",
         SRC / "author" / "_observations.py",
@@ -126,6 +137,34 @@ raise SystemExit(
 )
 """
 
+#: The ladder's own prelude: a real `PlanChooser` over a real `Ledger`, no device needed.
+#: Every number below is one the ledger would have MEASURED; the arms move them and observe
+#: which rung the walk picks and what it refuses.
+LADDER = """
+from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser
+
+FEATURES = {"entrypoint": "generate", "scalars": {"steps": 20}, "fields": [], "payload_bytes": 64}
+ledger = Ledger(host_budget=8 << 30, pinned_budget=512 << 20)
+ledger.resident = {"unet": 5_134_927_368, "vae": 167_307_726}
+ledger.device_free = 878_733_824
+ledger.device_total = 8_186_822_656
+ledger.device_allocated = 5_302_235_094
+ledger.device_reserved = 5_400_000_000
+chooser = PlanChooser(ledger)
+
+
+def binding(**over):
+    row = dict(
+        plan_id="p", project="x", model_class="M", binding_path="b", param="m",
+        component="unet", store="s", config="c", snapshot="sha256:" + "0" * 64,
+        release="r", variant="sm89", vram_bytes=7 << 30, host_bytes=1 << 30,
+        pinned_bytes=256 << 20, entrypoint="generate",
+    )
+    row.update(over)
+    return BindingPlan(**row)
+"""
+
 LIVE_ARMS = (
     (
         "child-env-allowlist",
@@ -173,6 +212,58 @@ LIVE_ARMS = (
         "triage-log-is-not-terminal",
         LOG_AUTHORITY,
         "observation only",
+    ),
+    # ------------------------------------------------------------------ cr-008b
+    (
+        "coefficient-unsourced-measured",
+        "from cozy_runtime.internal.worker.plan import Coefficient\n"
+        "Coefficient('activations', 1 << 30, 'measured')\n",
+        "coefficient_unsourced",
+    ),
+    (
+        "uncalibrated-cannot-refuse",
+        LADDER + "plan = chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        "assert plan.placement == 'component_staged', plan.placement\n"
+        "raise SystemExit('an uncalibrated coefficient DEEPENED to ' + plan.placement +\n"
+        "    ' and refused nothing: ' + plan.quantified_choice[-140:])\n",
+        "an uncalibrated coefficient DEEPENED",
+    ),
+    (
+        "shared-tenancy-reschedules",
+        LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
+        "ledger.activations_peak = 8 << 30\n"
+        "try:\n"
+        "    chooser.choose(binding(tenancy='shared'), FEATURES)\n"
+        "except PlanRefusal as exc:\n"
+        "    assert exc.code == 'capacity_shortfall', exc.code\n"
+        "    assert exc.shortfall['scope'] == 'worker', exc.shortfall\n"
+        "    raise SystemExit(exc.detail[:200])\n",
+        "not a structural incompatibility",
+    ),
+    (
+        "local-floor-exits-quantified",
+        LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
+        "ledger.activations_peak = 8 << 30\n"
+        "try:\n"
+        "    chooser.choose(binding(tenancy='local', vram_floor_bytes=64 << 30), FEATURES)\n"
+        "except PlanRefusal as exc:\n"
+        "    assert exc.code == 'capacity_floor', exc.code\n"
+        "    raise SystemExit(exc.detail[:220])\n",
+        "below the PHYSICAL FLOOR",
+    ),
+    (
+        "local-capacity-never-refuses-above-the-floor",
+        LADDER + "ledger.activations_peak = 8 << 30\n"
+        "plan = chooser.choose(binding(tenancy='local', vram_floor_bytes=1 << 20), FEATURES)\n"
+        "raise SystemExit('DEGRADED rather than refused: ' + plan.quantified_choice[-150:])\n",
+        "DEGRADED",
+    ),
+    (
+        "host-move-doomed-refuses-before-the-oom-killer",
+        "from cozy_runtime.internal.worker.ledger import Ledger, read_host_available\n"
+        "Ledger(host_budget=1 << 60, pinned_budget=1 << 30).grant(\n"
+        "    'doomed', read_host_available() + (4 << 30), 0, 'a move nobody can satisfy')\n",
+        "host_move_doomed",
     ),
     (
         "witness-boot-record-on-ram",
