@@ -84,8 +84,18 @@ class Executor:
         *,
         timeout: float | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_request: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """One command, its reply, and every progress frame in between."""
+        """One command, its reply, and every frame in between.
+
+        Two in-between kinds, and the difference between them is DURABILITY, not shape:
+
+        * `progress` is the lossy narration. It is forwarded and never answered.
+        * `request` is the DURABLE mid-attempt exchange (cr-009's job checkpoint): the
+          executor blocks on it, this side makes the fact durable, and the answer travels
+          back on the same channel. A durable fact never rides the lossy lane, so a
+          checkpoint save cannot be shed the way a progress frame can.
+        """
         name = command["cmd"]
         self.channel.send(command)
         while True:
@@ -102,6 +112,18 @@ class Executor:
             if frame.get("event") == "progress":
                 if on_progress is not None:
                     on_progress(frame)
+                continue
+            if frame.get("event") == "request":
+                answer = (
+                    on_request(frame)
+                    if on_request is not None
+                    else {
+                        "ok": False,
+                        "code": "no_durable_exchange",
+                        "detail": f"this attempt installed no handler for {frame.get('kind')!r}",
+                    }
+                )
+                self.channel.send({"event": "answer", "seq": frame.get("seq"), **answer})
                 continue
             if frame.get("reply") != name:
                 raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")

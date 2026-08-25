@@ -43,6 +43,8 @@ verbs:
 
 run/job flags:
   --model [path=]<ref>  override a model binding (repeatable)
+  --input <ref>=<dir>   grant one materialized input tree (job only, repeatable)
+  --org <name>          publishing org; a job's writes land in <org>/_job-<request-id>
   --out <dir>           output directory (default ./outputs)
   --seed <n>            deterministic RNG
   --in <file>           whole payload as JSON, key=value merged on top

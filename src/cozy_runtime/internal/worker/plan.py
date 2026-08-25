@@ -21,6 +21,7 @@ something was.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,6 +72,76 @@ class AttemptPlan:
 
     def digest(self) -> str:
         return canonical.digest(self.document())
+
+    @classmethod
+    def for_job(cls, binding: JobBinding, caps: Mapping[str, int]) -> AttemptPlan:
+        """The JOB lane's plan (cr-009). One attempt, one bounded envelope, no ladder.
+
+        A job has no placement ladder to walk because it has no serving residency to trade
+        against: it is one run-to-completion attempt that owns its devices for its whole
+        life. The document is still a real AttemptPlan so `plan_digest` on AttemptAccepted
+        stays an identity a coordinator can hold — the same fence, one lane over.
+        """
+        return cls(
+            delivery="job",
+            materialization="run_to_completion",
+            compute_dtype="",
+            placement="job_attempt",
+            reserved_vram_bytes=int(caps.get("vram", 0)),
+            reserved_host_bytes=int(caps.get("rss", 0)),
+            reserved_pinned_bytes=0,
+            headroom_bytes=0,
+            entrypoint_binding_plan_id=binding.job_descriptor_id,
+            model_construction_digest="",
+            quantified_choice=(
+                f"job_attempt: {binding.job!r} on {max(binding.gpu_count, 0)} declared device "
+                f"floor, {caps.get('rss', 0)} B host and {caps.get('disk', 0)} B disk capped, "
+                f"publishes={binding.publishes} emits_media={binding.emits_media}"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobBinding:
+    """The local resolution of one `job_descriptor_id` — the JOB lane's `BindingPlan`.
+
+    Same seam, one lane over: the coordinator names the job by DIGEST and never ships a
+    path; the worker resolves that digest against its own records, a small local file under
+    `<cozy_home>/job-plans/`. On the network path th-004 ships the build and tfs-003 the
+    materialized input trees; nothing below this record can tell the difference.
+
+    There is deliberately no residency, no component set and no construction digest here. A
+    job has no model residency: no warm pool, no serving pointer, no LRU, no idle dwell and
+    no second network door (§2). A job that declares read-only Model params constructs them
+    for THAT attempt through the ordinary Loader path and never retains them.
+    """
+
+    job_descriptor_id: str
+    build_id: str
+    project: str
+    job: str
+    """The registered `@app.job` name this descriptor id resolves to."""
+    gpu_count: int = 0
+    publishes: bool = False
+    emits_media: bool = False
+    gpu_rate_micro_usd_per_hour: int = 0
+    """The GPU rate as an INTEGER of micro-USD: canonical documents are integer-only, and a
+    cost fact that cannot be canonicalized cannot be journaled. It arrives on the typed
+    config channel and never from environment (§2)."""
+    cap_micro_usd: int = 0
+    reclaim_on_terminal: bool = True
+
+    @classmethod
+    def read(cls, record: dict[str, Any]) -> JobBinding:
+        known = {f for f in cls.__dataclass_fields__}
+        unknown = sorted(set(record) - known)
+        if unknown:
+            raise PlanRefusal(
+                "job_plan_unknown_field",
+                f"job plan record carries {', '.join(unknown)}: the record's key set is "
+                "closed, exactly like the documents it stands in for",
+            )
+        return cls(**record)
 
 
 @dataclass(frozen=True, slots=True)

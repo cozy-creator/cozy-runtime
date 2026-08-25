@@ -31,12 +31,18 @@ import msgspec  # noqa: E402
 
 from cozy_runtime.author import (  # noqa: E402
     App,
+    Budget,
+    BudgetFacts,
     Cancelled,
+    CheckpointReceipt,
+    Checkpoints,
+    CheckpointSave,
     Context,
     Device,
     FileAsset,
     Invocation,
     Outputs,
+    Scratch,
     Telemetry,
     attempt,
 )
@@ -96,6 +102,35 @@ def uses_services(payload: In, out: Outputs, tel: Telemetry) -> Saved:
     tel.step_callback(1, stage="probing")(0)
     out.temporary_file(suffix=".raw").write_bytes(b"spool")
     return Saved(file=out.save_bytes(b"conformance", media_type="text/plain"))
+
+
+class JobFacts(msgspec.Struct):
+    checkpoint_dir: str
+    mktemp: str
+    materialize_blob: str
+    receipt: str
+    replayed: bool
+    rate: float
+    cap: float
+    spent_is_positive: bool
+
+
+@probe.job
+def uses_job_services(payload: In, scratch: Scratch, ckpt: Checkpoints, budget: Budget) -> JobFacts:
+    """Every member of the three JOB services, called from inside author code (cr-009)."""
+    del payload
+    receipt = ckpt.save("state", b"durable", operation_key="op/1")
+    replay = ckpt.save("state", b"durable", operation_key="op/1")
+    return JobFacts(
+        checkpoint_dir=scratch.checkpoint_dir(key="resume").name,
+        mktemp=scratch.mktemp(suffix=".raw").suffix,
+        materialize_blob=str(scratch.materialize_blob(b"bytes", name="blob.bin").name),
+        receipt=receipt.receipt_id,
+        replayed=replay.replayed,
+        rate=budget.gpu_rate_usd_per_hour,
+        cap=budget.cap_usd,
+        spent_is_positive=budget.spent_usd() > 0.0,
+    )
 
 
 def _run(spool: Path, **invocation: object) -> tuple[Facts, float]:
@@ -178,7 +213,68 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
             f"{caps['kept']}/{caps['max_events']} at {caps['held_bytes']} B"
         )
 
-    return {"save": save, "telemetry": telemetry}
+    def _job_facts() -> JobFacts:
+        saved: list[CheckpointSave] = []
+
+        def sink(save: CheckpointSave) -> CheckpointReceipt:
+            held = next((s for s in saved if s.operation_key == save.operation_key), None)
+            if held is None:
+                saved.append(save)
+            return CheckpointReceipt(
+                receipt_id=f"ckpt-{len(saved)}",
+                operation_key=save.operation_key,
+                logical_key=save.logical_key,
+                content_digest=save.content_digest,
+                length=save.length,
+                replayed=held is not None,
+            )
+
+        inv = Invocation(
+            request_id="job",
+            spool=spool,
+            deadline=time.monotonic() + 30.0,
+            scratch=spool / "scratch",
+            checkpoints=sink,
+            budget=BudgetFacts(
+                gpu_rate_usd_per_hour=2.5,
+                gpu_count=2,
+                cap_usd=100.0,
+                started_monotonic=time.monotonic() - 3600.0,
+            ),
+        )
+        (spool / "scratch").mkdir(parents=True, exist_ok=True)
+        envelope, outcome, _ = attempt(probe.get("uses_job_services"), {}, inv)
+        assert envelope is not None, outcome
+        assert isinstance(envelope.result, JobFacts)
+        return envelope.result
+
+    def scratch() -> Observation:
+        facts = _job_facts()
+        return (
+            f"checkpoint_dir(key=) -> {facts.checkpoint_dir!r}, mktemp -> {facts.mktemp!r}, "
+            f"materialize_blob -> {facts.materialize_blob!r}"
+        )
+
+    def checkpoints() -> Observation:
+        facts = _job_facts()
+        assert facts.replayed, "the same identity did not replay its receipt"
+        return f"save -> {facts.receipt}, and the same identity REPLAYED it"
+
+    def budget() -> Observation:
+        facts = _job_facts()
+        assert facts.spent_is_positive, "an hour on 2 devices at 2.5 USD/h spent nothing"
+        return (
+            f"gpu_rate_usd_per_hour {facts.rate}, cap_usd {facts.cap}, spent_usd is positive "
+            "after an hour on 2 devices — all from the typed config channel"
+        )
+
+    return {
+        "save": save,
+        "telemetry": telemetry,
+        "scratch": scratch,
+        "checkpoints": checkpoints,
+        "budget": budget,
+    }
 
 
 def main() -> int:

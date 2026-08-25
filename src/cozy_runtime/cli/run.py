@@ -35,7 +35,17 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.local import LocalRequest, SliceOutcome, run_slice
 from cozy_runtime.internal.worker.session import WorkerOptions
 
-VALUE_FLAGS = ("--model", "--lane", "--adapter", "--seed", "--out", "--timeout", "--in")
+VALUE_FLAGS = (
+    "--model",
+    "--lane",
+    "--adapter",
+    "--seed",
+    "--out",
+    "--timeout",
+    "--in",
+    "--input",
+    "--org",
+)
 BOOL_FLAGS = ("--offline", "--stream", "--strict-keys")
 
 GIB = 1 << 30
@@ -186,11 +196,39 @@ def run(
     slots = surface.model_bindings
     record: dict[str, Any] | None = None
     warnings: list[str] = []
+    if slots and kind == "job":
+        raise CliError(
+            "structural",
+            f"{function} declares {len(slots)} read-only Model param(s); this build's local "
+            "job lane runs the torch-free job attempt only",
+            "a job's read-only Model params construct for THAT attempt through the ordinary "
+            "Loader path (cr-002b) and are never retained — wiring that construction into the "
+            "job lane is the next increment; today, run model-bound work as an entrypoint",
+            Exit.structural,
+        )
     if slots:
         record, warn = _binding_record(
             config, found, surface, function, flags, offline="--offline" in flags
         )
         warnings.extend(warn)
+
+    job_records: list[dict[str, Any]] = []
+    trees: dict[str, str] = {}
+    descriptor_id = ""
+    if kind == "job":
+        descriptor_id = desc.job_descriptor_id(body, function)
+        trees = _input_trees(flags.get("--input") or [])
+        job_records.append(
+            {
+                "job_descriptor_id": descriptor_id,
+                "build_id": release_id_of(body),
+                "project": str(found.project),
+                "job": function,
+                "gpu_count": int((surface.resources.gpu_count or 0) if surface.resources else 0),
+                "publishes": bool(surface.publishes),
+                "emits_media": bool(surface.emits_media),
+            }
+        )
 
     out_dir = Path((flags.get("--out") or ["outputs"])[0]).expanduser().resolve()
     workspace = out_dir / ".run"
@@ -204,6 +242,10 @@ def run(
         outputs=outputs,
         request_id=f"cli-{function}",
         deadline_ms=_timeout((flags.get("--timeout") or [""])[0]),
+        kind=kind if kind == "job" else "entrypoint",
+        job_descriptor_id=descriptor_id,
+        trees=trees,
+        org=(flags.get("--org") or ["local"])[0],
     )
     release_id = str(body["application"])
     # The supervisor narrates itself to stdout, which is the right place for a long-lived
@@ -215,11 +257,47 @@ def run(
             config,
             request,
             [record] if record else [],
+            job_records=job_records,
             workspace=workspace,
             release_id=release_id,
             options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
+
+
+def release_id_of(body: Mapping[str, Json]) -> str:
+    """The build this job runs from. Locally that is the configured application export."""
+    return str(body["application"])
+
+
+def _input_trees(values: Sequence[str]) -> dict[str, str]:
+    """`--input <ref>=<dir>` — one MATERIALIZED input tree grant per typed Tree field.
+
+    Locally the coordinator grants a directory it can already read; on the network path
+    tfs-003 materializes the snapshot and th-004 mints the same grant. Either way, the job's
+    typed field carries the ref and the GRANT carries the capability.
+    """
+    out: dict[str, str] = {}
+    for value in values:
+        ref, eq, path = value.partition("=")
+        if not eq or not ref:
+            raise CliError(
+                "usage",
+                f"--input {value!r} is not <ref>=<directory>",
+                "grant one materialized input tree per typed Tree field: "
+                "--input org/repo@release=/path/to/tree",
+                Exit.usage,
+            )
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            raise CliError(
+                "not_found",
+                f"--input {ref}: {resolved} is not a directory",
+                "an input tree is a MATERIALIZED directory; a job never opens a store by name",
+                Exit.not_found,
+            )
+        out[ref] = str(resolved)
+    return out
 
 
 def _doc_for(body: Mapping[str, Json], function: str, kind: str) -> Mapping[str, Json]:

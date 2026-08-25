@@ -10,6 +10,7 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
     prepare   construct + fill one binding; report the construction digest and ready facts
     invoke    run ONE attempt through the author invocation kernel and report its facts
+    run_job   run ONE @app.job to completion through the SAME kernel, with job services
     probe     device/host memory facts, for the supervisor's ledger reconciliation
     shutdown  cooperative exit
 
@@ -35,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import Outcome, classify
 from cozy_runtime.author._invoke import Invocation, attempt
 from cozy_runtime.author._services import ProgressFrame
@@ -107,6 +109,8 @@ class Executor:
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         self.attempts = 0
+        #: the DURABLE exchange counter (cr-009). Supervisor-answered, never sheddable.
+        self._exchange = 0
 
     # ------------------------------------------------------------------ prepare
 
@@ -374,42 +378,14 @@ class Executor:
         deadline = time.monotonic() + command["deadline_s"]
         torch = self.torch
 
-        def progress(frame: Any) -> None:
-            """The lossy lane, carrying BOTH kinds of live record.
-
-            A progress frame is not retained anywhere: its `position` is the monotone unit
-            count the supervisor's silence detector reads, and that is all it is for. A
-            RETAINED observation rides the same lane so the supervisor holds a copy BEFORE
-            this process can die — a ring that only crosses in the reply crosses never when
-            the process is killed, which is the exact case triage exists for.
-
-            A seam refusal here is dropped live output, the ONE loss this lane may incur.
-            """
-            with contextlib.suppress(SeamError):
-                if isinstance(frame, ProgressFrame):
-                    self.channel.send(
-                        {
-                            "event": "progress",
-                            "request_id": command["request_id"],
-                            "kind": "progress",
-                            "name": str(frame.name)[:120],
-                            "value": frame.fraction,
-                            "position": frame.position,
-                        }
-                    )
-                else:
-                    self.channel.send(
-                        {
-                            "event": "progress",
-                            "request_id": command["request_id"],
-                            "kind": frame.kind,
-                            "name": frame.name,
-                            "value": frame.value,
-                            "fields": dict(frame.fields),
-                            "seq": frame.seq,
-                            "at_unix_ms": frame.at_unix_ms,
-                        }
-                    )
+        # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
+        # retained anywhere: its `position` is the monotone unit count the supervisor's
+        # silence detector reads, and that is all it is for. A RETAINED observation rides the
+        # same lane so the supervisor holds a copy BEFORE this process can die — a ring that
+        # only crosses in the reply crosses never when the process is killed, which is the
+        # exact case triage exists for. A seam refusal there is dropped live output, the ONE
+        # loss this lane may incur.
+        progress = self._progress_sink(command["request_id"])
 
         # The attempt's PLACEMENT RUNG, fixed by the PlanChooser before durable acceptance
         # and applied here. The executor decides nothing: it is handed a rung and obeys it,
@@ -508,6 +484,216 @@ class Executor:
             },
         }
 
+    # ------------------------------------------------------------------ job
+
+    def run_job(self, command: dict[str, Any]) -> dict[str, Any]:
+        """ONE `@app.job`, run to completion through the SAME invocation kernel (cr-009).
+
+        Everything structural about a job is here and it is short, which is the point: a job
+        is not a second runtime, it is the one attempt kernel with a different service set
+        and no serving loop underneath it. The three differences from `invoke`, out loud:
+
+        1. **No prepared generation is required.** A job with no Model parameter never
+           imports torch in this process at all — a CPU-class conversion job pays no CUDA
+           init and holds no device. A job that DOES declare a Model was prepared exactly
+           like a serving attempt and reuses that construction for its one attempt.
+        2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
+           durable checkpoint exchange, and the typed budget facts.
+        3. **Quiescence is proven by what exists.** A torch-free job has no stream that
+           could still be moving, so the proof is structural rather than a device query.
+        """
+        global _CANCEL
+        _CANCEL = False
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.discovered is None:
+            try:
+                self.discovered = discover(Path(command["project"]))
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "code": "job_release_undiscoverable",
+                    "detail": f"{type(exc).__name__}: {exc}"[:1024],
+                }
+            self.surface_names = {s.name: s for s in self.discovered.surfaces}
+        name = command["job"]
+        surface = self.surface_names.get(name)
+        if surface is None or surface.kind != "job":
+            return {
+                "ok": False,
+                "code": "unknown_job",
+                "detail": f"{name!r} is not a registered @app.job of this release (it has "
+                f"{sorted(s.name for s in self.surface_names.values() if s.kind == 'job')})",
+            }
+        registration = self.discovered.app.get(name)
+        spool = Path(command["spool"])
+        scratch = Path(command["scratch"]) if command.get("scratch") else None
+        if scratch is not None:
+            scratch.mkdir(parents=True, exist_ok=True)
+
+        from cozy_runtime.author._services import BudgetFacts, CheckpointReceipt, CheckpointSave
+
+        def durable_checkpoint(save: CheckpointSave) -> CheckpointReceipt:
+            """Block until the supervisor says the save is DURABLE. Never the lossy lane."""
+            answer = self._durable(
+                "checkpoint",
+                {
+                    "operation_key": save.operation_key,
+                    "logical_key": save.logical_key,
+                    "content_digest": save.content_digest,
+                    "length": save.length,
+                    "path": str(save.path),
+                },
+            )
+            if not answer.get("ok"):
+                from cozy_runtime.author._services import CheckpointConflict
+
+                raise CheckpointConflict(
+                    f"{save.logical_key}: {answer.get('detail', 'the durable exchange refused')}",
+                    code=str(answer.get("code", "checkpoint_refused")),
+                )
+            return CheckpointReceipt(
+                receipt_id=str(answer["receipt_id"]),
+                operation_key=save.operation_key,
+                logical_key=save.logical_key,
+                content_digest=save.content_digest,
+                length=save.length,
+                replayed=bool(answer.get("replayed", False)),
+            )
+
+        budget = command.get("budget") or {}
+        started = time.perf_counter()
+        started_wall = time.time()
+        if self.torch is not None:
+            self.torch.cuda.reset_peak_memory_stats()
+        envelope, outcome, record = attempt(
+            registration,
+            command["payload"],
+            Invocation(
+                request_id=command["request_id"],
+                spool=spool,
+                deadline=time.monotonic() + command["deadline_s"],
+                device=self._device() if self.torch is not None else Device(),
+                cancel=lambda: _CANCEL,
+                models=self.models,
+                trees={
+                    ref: (Path(root), digest)
+                    for ref, (root, digest) in (command.get("trees") or {}).items()
+                },
+                scratch=scratch,
+                checkpoints=durable_checkpoint,
+                budget=BudgetFacts(
+                    gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
+                    gpu_count=int(budget.get("gpu_count", 0)),
+                    cap_usd=int(budget.get("cap_micro_usd", 0)) / 1e6,
+                    started_monotonic=time.monotonic(),
+                ),
+                progress=self._progress_sink(command["request_id"]),
+            ),
+        )
+        handler_ms = (time.perf_counter() - started) * 1000
+        peak_vram = 0
+        if self.torch is not None:
+            self.torch.cuda.synchronize()
+            peak_vram = self.torch.cuda.max_memory_allocated()
+        self.attempts += 1
+        result_document, outputs, oversize = _serialize_result(envelope)
+        if oversize:
+            result_document, outputs = None, []
+        pre_entry = ("invalid_request", "unsupported_input", "default_resolution", "tree_ungranted")
+        if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
+            self.poisoned = f"{outcome.terminal}/{outcome.code}"
+        return {
+            "ok": True,
+            "kind": "job",
+            "shortfall": None,
+            "residency": {},
+            "observations": record.ring.rows(),
+            "observation_caps": {**record.ring.caps(), "metrics_dropped": record.metrics_dropped},
+            "attribution": record.attribution.document(),
+            "position": record.position,
+            "outcome": {
+                "terminal": outcome.terminal,
+                "origin": outcome.origin,
+                "code": outcome.code,
+                "message": outcome.message[:2048],
+                "fields": list(outcome.fields),
+            },
+            # A torch-free job holds no stream, so quiescence is a STRUCTURAL fact rather
+            # than a device query: there is nothing that could still be moving.
+            "quiescent": self._quiescent() if self.torch is not None else True,
+            "env_intact": _env_intact(),
+            "poisoned": self.poisoned,
+            "outputs": outputs,
+            "result": result_document,
+            "result_schema_digest": self._result_schema_digest(surface),
+            "adjustments": [],
+            "oversize_result_bytes": oversize,
+            "metrics": {
+                "handler_ms": round(handler_ms, 3),
+                "device_lease_ms": round(handler_ms, 3),
+                "d2h_wait_ms": 0.0,
+                "peak_vram_bytes": peak_vram,
+                "allocated_at_start_bytes": 0,
+                "rss_at_end_bytes": _rss(),
+                "started_unix": started_wall,
+                "gpu_count": 1 if self.torch is not None else 0,
+            },
+        }
+
+    def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        """One DURABLE mid-attempt exchange. Blocks until the supervisor answers.
+
+        This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
+        separate lane from progress on purpose: a durable fact must not be sheddable, and
+        the lossy lane's whole contract is that it may shed.
+        """
+        self._exchange += 1
+        seq = self._exchange
+        self.channel.send({"event": "request", "kind": kind, "seq": seq, **body})
+        while True:
+            frame = self.channel.recv()
+            if frame is None:
+                raise SeamError("seam_closed", f"the supervisor closed during {kind!r}")
+            if frame.get("event") == "answer" and int(frame.get("seq", -1)) == seq:
+                return frame
+            raise SeamError(
+                "seam_out_of_order",
+                f"expected the answer to {kind}#{seq}, got {frame.get('event')!r}",
+            )
+
+    def _progress_sink(self, request_id: str) -> Any:
+        """The lossy lane's sink for one attempt — the same one `invoke` installs."""
+
+        def progress(frame: Any) -> None:
+            with contextlib.suppress(SeamError):
+                if isinstance(frame, ProgressFrame):
+                    self.channel.send(
+                        {
+                            "event": "progress",
+                            "request_id": request_id,
+                            "kind": "progress",
+                            "name": str(frame.name)[:120],
+                            "value": frame.fraction,
+                            "position": frame.position,
+                        }
+                    )
+                else:
+                    self.channel.send(
+                        {
+                            "event": "progress",
+                            "request_id": request_id,
+                            "kind": frame.kind,
+                            "name": frame.name,
+                            "value": frame.value,
+                            "fields": dict(frame.fields),
+                            "seq": frame.seq,
+                            "at_unix_ms": frame.at_unix_ms,
+                        }
+                    )
+
+        return progress
+
     # ------------------------------------------------------------------ warm
 
     def warm(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -569,9 +755,7 @@ class Executor:
             )
         return cached
 
-    def _device(self) -> Any:
-        from cozy_runtime.author._context import Device
-
+    def _device(self) -> Device:
         return Device("cuda", 0)
 
     def _quiescent(self) -> bool:
@@ -699,6 +883,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.prepare(command)
             elif name == "invoke":
                 reply = executor.invoke(command)
+            elif name == "run_job":
+                reply = executor.run_job(command)
             elif name == "warm":
                 reply = executor.warm(command)
             elif name == "probe":

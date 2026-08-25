@@ -1,0 +1,6 @@
+# cr-009's live job project: a structural-derivation job over a REAL cozytensors store.
+# It names no artifact identifier — the store arrives as a granted materialized input tree,
+# and the tree's ref is a request field, never a literal in the code.
+
+[application]
+object = "structural_census:app"

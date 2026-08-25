@@ -96,13 +96,72 @@ class FileAsset(Asset):
     kind: ClassVar[str] = "file"
 
 
+class Tree:
+    """A digest-verified MATERIALIZED input tree — the typed job input (jobs.md §1).
+
+    A model, dataset or checkpoint input is an ordinary typed request FIELD, and the local
+    path rides the field's VALUE (`payload.base_model.path`) rather than a context accessor.
+    `resume_from: Tree | None` is therefore just another verified input, never a reserved
+    payload name (§2).
+
+    The path exists only after the runtime materialized the tree under THIS attempt's grant.
+    A field naming a tree the grant does not cover never hydrates, so a job cannot read one
+    it was not granted — the capability is the grant, and there is no ambient store handle.
+    """
+
+    __slots__ = ("_attempt", "_root", "digest", "ref")
+
+    kind: ClassVar[str] = "tree"
+
+    def __init__(
+        self, ref: str, *, digest: str = "", root: Path | None = None, attempt: str = _UNBOUND
+    ) -> None:
+        self.ref = ref
+        self.digest = digest
+        self._root = root
+        self._attempt = attempt
+
+    def __repr__(self) -> str:
+        return f"Tree({self.ref!r}, hydrated={self.hydrated})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Tree) and other.ref == self.ref
+
+    def __hash__(self) -> int:
+        return hash(("Tree", self.ref))
+
+    @property
+    def hydrated(self) -> bool:
+        return self._root is not None
+
+    @property
+    def path(self) -> Path:
+        """The materialized tree's root. Refuses before hydration — never a silent miss."""
+        if self._root is None:
+            raise CapabilityError(
+                f"input tree {self.ref!r} was never materialized for this attempt: a tree is "
+                "granted, verified and materialized before the body runs, and a job cannot "
+                "reach one it was not granted",
+                code="tree_unhydrated",
+            )
+        return self._root
+
+    def files(self) -> tuple[Path, ...]:
+        """Every regular file in the tree, sorted. The whole read surface of an input."""
+        return tuple(p for p in sorted(self.path.rglob("*")) if p.is_file())
+
+    def row(self) -> dict[str, Any]:
+        return {"ref": self.ref, "kind": self.kind, "digest": self.digest}
+
+
 def asset_dec_hook(target: type, obj: Any) -> Any:
-    """msgspec `dec_hook` for asset request fields: a bare ref STRING, never a record.
+    """msgspec `dec_hook` for asset and tree request fields: a bare ref STRING, never a
+    record.
 
     Anything else — a mapping carrying `local`, a pre-filled digest — is refused, so the
     request cannot hand itself a hydrated handle or dictate identity-bearing fields.
     """
-    if isinstance(target, type) and issubclass(target, Asset):
+    if isinstance(target, type) and issubclass(target, (Asset, Tree)):
         if not isinstance(obj, str):
             raise TypeError(
                 f"{target.__name__} takes a reference string; "
@@ -127,3 +186,14 @@ def bind(asset: Asset, *, local: Path, attempt: str) -> None:
     data = local.read_bytes()
     asset.size_bytes = len(data)
     asset.digest = digest_bytes(data)
+
+
+def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:
+    """Materialize an input tree in place. Runtime-only, like `bind`."""
+    if tree._attempt not in (_UNBOUND, attempt):
+        raise CapabilityError(
+            f"tree {tree.ref!r} belongs to attempt {tree._attempt!r}", code="foreign_tree"
+        )
+    tree._root = root
+    tree.digest = digest
+    tree._attempt = attempt

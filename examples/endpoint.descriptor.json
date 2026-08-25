@@ -591,9 +591,11 @@
       "capabilities": [
         "budget",
         "checkpoints",
+        "save",
         "scratch",
         "telemetry"
       ],
+      "emits_media": false,
       "gpu": true,
       "kind": "job",
       "models": [
@@ -655,7 +657,9 @@
             "type": {
               "union": [
                 "null",
-                "str"
+                {
+                  "input": "tree"
+                }
               ]
             },
             "wire": "optional"
@@ -683,13 +687,25 @@
             "wire": "required"
           },
           {
+            "name": "resumed_at",
+            "type": "int",
+            "wire": "required"
+          },
+          {
             "name": "final_loss",
             "type": "float",
             "wire": "required"
           },
           {
-            "name": "published_key",
+            "name": "receipt",
             "type": "str",
+            "wire": "required"
+          },
+          {
+            "name": "manifest",
+            "type": {
+              "asset": "file"
+            },
             "wire": "required"
           }
         ],
@@ -716,11 +732,18 @@
       "service": "Adjustments"
     },
     "budget": {
-      "members": [],
+      "members": [
+        "elapsed_s",
+        "raise_if_exhausted",
+        "remaining_usd",
+        "spent_usd"
+      ],
       "service": "Budget"
     },
     "checkpoints": {
-      "members": [],
+      "members": [
+        "save"
+      ],
       "service": "Checkpoints"
     },
     "egress": {
@@ -741,7 +764,11 @@
       "service": "Outputs"
     },
     "scratch": {
-      "members": [],
+      "members": [
+        "checkpoint_dir",
+        "materialize_blob",
+        "mktemp"
+      ],
       "service": "Scratch"
     },
     "secrets": {
@@ -764,5 +791,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:fde87e916e786ee937650622363d79c5c002bf3cb08629961b56ca63e806444b"
+  "surface_digest": "sha256:56ebd391e06b1703f38008392f5e202a6bfa39d03519843f6dc7b3a4281f8aec"
 }

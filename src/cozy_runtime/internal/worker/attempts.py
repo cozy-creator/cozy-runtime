@@ -41,7 +41,7 @@ from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
-from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, PlanRefusal
+from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, JobBinding, PlanRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -136,6 +136,14 @@ class Attempt:
     grant: pb.DeliveryGrant
     plan: AttemptPlan | None = None
     binding: BindingPlan | None = None
+    job: JobBinding | None = None
+    """Set on a JOB attempt instead of `binding`. Exactly one of the two is ever set: the
+    ExecutionSpec names one mode, and a spec naming neither refuses before anything runs."""
+    trees: dict[str, tuple[Path, str]] = dataclasses_field(default_factory=dict)
+    """ref -> (materialized root, declared digest) for the input trees the grant carries."""
+    scratch: Path | None = None
+    """The RUN's scratch tree. Keyed on the run and NOT on the attempt, which is the whole
+    of resumability: a retried attempt of the same run reads what the killed one left."""
     state: str = "validating"
     spool: Path | None = None
     terminal_id: str = ""
@@ -205,7 +213,9 @@ class AttemptEngine:
         supervision: ExecutorSupervision,
         authorizer: grants.Authorizer,
         bindings: Mapping[str, BindingPlan],
+        jobs: Mapping[str, JobBinding],
         spool_root: Path,
+        scratch_root: Path,
         instance_id: str,
         send: Callable[[pb.WorkerMessage], None],
         progress: Callable[[str, int, dict[str, Any]], None],
@@ -220,7 +230,14 @@ class AttemptEngine:
         self.supervision = supervision
         self.authorizer = authorizer
         self.bindings = dict(bindings)
+        self.jobs = dict(jobs)
         self.spool_root = spool_root
+        #: Where a RUN's scratch lives. Deliberately OUTSIDE the journal root: §8 lets a
+        #: one-shot run delete its journal after a fully acknowledged terminal, and scratch
+        #: that lived under it would be deleted by exactly the ABANDONED terminal whose
+        #: whole point is that the next attempt resumes from what the killed one left.
+        #: Found live: the kill arm resumed from nothing until this moved out.
+        self.scratch_root = scratch_root
         self.instance_id = instance_id
         self.send = send
         self.progress = progress
@@ -245,6 +262,12 @@ class AttemptEngine:
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
         self.demand = observe.DemandLedger()
+        #: cr-009's DURABLE checkpoint ledger: (request_id, operation_key, logical_key) ->
+        #: the journaled receipt. Identity replays; the same key with different bytes is a
+        #: CONFLICT and never a replacement (§2).
+        self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
+        #: what the coordinator answered for each forwarded checkpoint, by receipt id
+        self.checkpoint_acks: dict[str, str] = {}
 
     # ------------------------------------------------------------------ offer
 
@@ -315,41 +338,13 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ prepare/accept
 
-    def prepare_and_accept(self, attempt: Attempt) -> pb.AttemptAccepted:
-        """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
+    def _fetch_payload(self, attempt: Attempt) -> None:
+        """Fetch, verify and decode the granted payload. Shared by BOTH modes.
 
-            resolve binding -> fetch/verify/decode the payload -> derive REAL features from
-            it -> choose the plan -> prepare the executor -> reserve the envelope -> JOURNAL
-            -> publish AttemptAccepted.
-
-        Everything before the journal either completes or raises a typed PRE-ACCEPT refusal,
-        and the reservation rolls back if the journal cannot commit. The payload is fetched
-        HERE and not at execution time on purpose: a missing, expired or malformed payload
-        must be a refusal the coordinator can read, not an accepted attempt that later dies
-        on a thread with no terminal to show for it.
-
-        Features are derived from the DECODED PAYLOAD. Deriving them from the plan id would
-        be inventing the very input the plan is supposed to be chosen against.
+        It happens at ACCEPTANCE and not at execution time on purpose: a missing, expired or
+        malformed payload must be a refusal the coordinator can read, not an accepted attempt
+        that later dies on a thread with no terminal to show for it.
         """
-        serving = attempt.spec.get("serving")
-        if serving is None:
-            raise AttemptRefusal(
-                "job_mode_unsupported",
-                "this worker serves; the job lane (bounded preparation under a fresh "
-                "per-attempt executor, checkpoints, reclaim) is cr-009",
-                cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
-            )
-        plan_id = serving["entrypoint_binding_plan_id"]
-        binding = self.bindings.get(plan_id)
-        if binding is None:
-            raise AttemptRefusal(
-                "unknown_binding_plan",
-                f"no EntrypointBindingPlan {plan_id[:24]}… is bound on this worker",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-        attempt.binding = binding
-        attempt.state = "preparing"
-
         try:
             attempt.payload = self._payload(attempt)
         except grants.GrantRefusal as exc:
@@ -392,6 +387,155 @@ class AttemptEngine:
                 cause=code,
                 origin=cause_origin,
             ) from exc
+
+    def _accept_job(self, attempt: Attempt) -> pb.AttemptAccepted:
+        """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
+
+        Serving never accepts-then-cold-loads: a warm generation is the whole point of a
+        serving worker, so an attempt is accepted only against a Ready executor. A job is the
+        opposite shape — one immutable build, one bounded attempt, terminal, reclaim — and
+        there is nothing to be warm FOR. Preparing before acceptance would only hold a rented
+        pod idle while the coordinator waits to hear whether its work was taken.
+
+        What does NOT change: acceptance is journaled BEFORE anything runs, the payload is
+        fetched and decoded here, the input trees are resolved under the grant here, and the
+        envelope is reserved here. The preparation this admits is bounded by the attempt's own
+        deadline, which the supervisor owns.
+        """
+        job = attempt.spec["job"]
+        descriptor_id = str(job["job_descriptor_id"])
+        binding = self.jobs.get(descriptor_id)
+        if binding is None:
+            raise AttemptRefusal(
+                "unknown_job_descriptor",
+                f"no job descriptor {descriptor_id[:24]}… is bound on this worker (it has "
+                f"{len(self.jobs)} job plan(s))",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        attempt.job = binding
+        attempt.state = "preparing"
+        self._fetch_payload(attempt)
+        try:
+            attempt.trees = grants.read_trees(attempt.grant, self.authorizer)
+        except grants.GrantRefusal as exc:
+            raise AttemptRefusal(
+                exc.code,
+                exc.detail,
+                cause=CAUSE.CAUSE_CODE_GRANT_EXPIRED
+                if exc.code == "grant_expired"
+                else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            ) from exc
+
+        caps = attempt.spec.get("resource_caps") or {}
+        plan = AttemptPlan.for_job(
+            binding,
+            {
+                "vram": int(caps.get("max_vram_bytes", 0)),
+                "rss": int(caps.get("max_rss_bytes", 0)),
+                "disk": int(caps.get("max_disk_bytes", 0)),
+            },
+        )
+        attempt.plan = plan
+        # The RUN's scratch, not the attempt's: `Scratch.checkpoint_dir(key=)` must hand a
+        # retried attempt the SAME tree, which is the whole of resume. It is created here,
+        # before acceptance, so a job never discovers at step 40,000 that it has nowhere
+        # durable to write.
+        attempt.scratch = self.scratch_root / attempt.request_id
+        attempt.scratch.mkdir(parents=True, exist_ok=True)
+
+        attempt.opened = self.ledger.snapshot()
+        try:
+            self.ledger.grant(
+                f"{attempt.request_id}#{attempt.attempt}",
+                plan.reserved_host_bytes,
+                plan.reserved_pinned_bytes,
+                f"job {binding.job} {attempt.request_id}#{attempt.attempt}",
+            )
+        except LedgerRefusal as exc:
+            raise AttemptRefusal(
+                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+            ) from exc
+
+        plan_digest = plan.digest()
+        try:
+            self.journal.append(
+                "accepted",
+                {
+                    "request_id": attempt.request_id,
+                    "attempt": attempt.attempt,
+                    "session_id": self.session_id,
+                    "instance_id": self.instance_id,
+                    "attempt_kind": "job",
+                    "exec_spec_digest": documents.spell(attempt.digest),
+                    "plan_digest": plan_digest,
+                    "job_descriptor_id": descriptor_id,
+                    "build_id": binding.build_id,
+                    "grant_epoch": int(attempt.grant.credential.epoch),
+                    "input_trees": ",".join(sorted(attempt.trees)),
+                },
+            )
+        except Exception:
+            self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
+            raise
+        attempt.state = "accepted"
+        attempt.accepted_at = time.perf_counter()
+        self.live[attempt.request_id] = attempt
+        self.history[attempt.key()] = attempt
+        return pb.AttemptAccepted(
+            session_id=self.session_id,
+            executor_incarnation=self.supervision.incarnation,
+            request_id=attempt.request_id,
+            attempt=attempt.attempt,
+            exec_spec_digest=attempt.digest,
+            plan_digest=documents.raw(plan_digest),
+            plan=pb.AttemptPlanSummary(
+                delivery=plan.delivery,
+                materialization=plan.materialization,
+                placement=plan.placement,
+                reserved_vram_bytes=plan.reserved_vram_bytes,
+                reserved_host_bytes=plan.reserved_host_bytes,
+                quantified_choice=plan.quantified_choice,
+            ),
+        )
+
+    def prepare_and_accept(self, attempt: Attempt) -> pb.AttemptAccepted:
+        """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
+
+            resolve binding -> fetch/verify/decode the payload -> derive REAL features from
+            it -> choose the plan -> prepare the executor -> reserve the envelope -> JOURNAL
+            -> publish AttemptAccepted.
+
+        Everything before the journal either completes or raises a typed PRE-ACCEPT refusal,
+        and the reservation rolls back if the journal cannot commit. The payload is fetched
+        HERE and not at execution time on purpose: a missing, expired or malformed payload
+        must be a refusal the coordinator can read, not an accepted attempt that later dies
+        on a thread with no terminal to show for it.
+
+        Features are derived from the DECODED PAYLOAD. Deriving them from the plan id would
+        be inventing the very input the plan is supposed to be chosen against.
+        """
+        if attempt.spec.get("job") is not None:
+            return self._accept_job(attempt)
+        serving = attempt.spec.get("serving")
+        if serving is None:
+            raise AttemptRefusal(
+                "execution_mode_unspecified",
+                "an ExecutionSpec names exactly ONE mode — serving or job — and this one "
+                "names neither; a worker that guessed would run the wrong lifecycle",
+                cause=CAUSE.CAUSE_CODE_PROTOCOL,
+            )
+        plan_id = serving["entrypoint_binding_plan_id"]
+        binding = self.bindings.get(plan_id)
+        if binding is None:
+            raise AttemptRefusal(
+                "unknown_binding_plan",
+                f"no EntrypointBindingPlan {plan_id[:24]}… is bound on this worker",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        attempt.binding = binding
+        attempt.state = "preparing"
+
+        self._fetch_payload(attempt)
         features = _features(attempt.payload, binding.entrypoint)
         try:
             plan = self.chooser.choose(binding, features)
@@ -536,8 +680,277 @@ class AttemptEngine:
             )
         return record
 
+    # ------------------------------------------------------------------ the job lane
+
+    def _run_job(self, attempt: Attempt) -> pb.AttemptTerminal:
+        """One JOB attempt, run to completion. Same dispatch, same tail, same terminal.
+
+        The differences from `_run` are the ones a job actually has: no placement rung to
+        apply (a job owns its devices for its whole life), a resumable scratch tree, and a
+        DURABLE mid-attempt checkpoint exchange answered on this side. Everything after the
+        executor returns — the output transaction, the ledger reconciliation, the triage
+        bundle, the journal-before-send terminal — is the code serving already runs.
+        """
+        assert attempt.job is not None and attempt.plan is not None
+        executor = self.supervision.current
+        if executor is None or not executor.alive():
+            return self.abandon(attempt, "no live executor to run the job attempt in")
+        spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
+        spool.mkdir(parents=True, exist_ok=True)
+        attempt.spool = spool
+        attempt.state = "running"
+        attempt.executions += 1
+        self.executed += 1
+
+        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
+        seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else 3600.0
+        attempt.dispatched_at = time.perf_counter()
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        self.monitor.start(key, "invoke")
+        attempt.ring.emit(
+            "log",
+            "dispatched a job attempt to the executor",
+            "info",
+            job=attempt.job.job,
+            incarnation=self.supervision.incarnation,
+            deadline_s=round(seconds, 3),
+        )
+        try:
+            reply = executor.call(
+                {
+                    "cmd": "run_job",
+                    "request_id": key,
+                    "project": attempt.job.project,
+                    "job": attempt.job.job,
+                    "payload": attempt.payload,
+                    "deadline_s": seconds,
+                    "spool": str(spool),
+                    "scratch": str(attempt.scratch) if attempt.scratch else "",
+                    "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
+                    "budget": {
+                        "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
+                        "gpu_count": attempt.job.gpu_count,
+                        "cap_micro_usd": attempt.job.cap_micro_usd,
+                    },
+                },
+                timeout=None,
+                on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
+                on_request=lambda frame: self.durable_exchange(attempt, frame),
+            )
+        except ExecutorGone as exc:
+            attempt.resulted_at = time.perf_counter()
+            attempt.ring.emit(
+                "fault",
+                "the executor died during this job attempt",
+                str(exc)[:400],
+                incarnation=self.supervision.incarnation,
+                canceling=attempt.canceling or "no",
+            )
+            self.monitor.end(key, "executor_died")
+            self.supervision.invalidate("the executor died during a job attempt")
+            # The scratch tree deliberately SURVIVES: it is the run's, not the attempt's,
+            # and a re-run of this run reads what the killed attempt left. The attempt SPOOL
+            # is aborted, so nothing half-written can reach a granted destination.
+            grants.abort_outputs(spool)
+            if attempt.canceling:
+                return self.finish_cancel(attempt, attempt.canceling)
+            return self.abandon(attempt, str(exc))
+        attempt.resulted_at = time.perf_counter()
+        self.monitor.end(key, "returned")
+        self.absorb(attempt, reply)
+        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=False)
+
+        if attempt.canceling:
+            return self.finish_cancel(attempt, attempt.canceling)
+        if not reply.get("ok"):
+            grants.abort_outputs(spool)
+            return self.terminal(
+                attempt,
+                STATUS.TERMINAL_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                ORIGIN.CAUSE_ORIGIN_EXECUTOR,
+                f"{reply.get('code')}: {reply.get('detail', '')}",
+            )
+        if not reply.get("quiescent"):
+            self.supervision.invalidate("unproven quiescence")
+            return self.terminal(
+                attempt,
+                STATUS.TERMINAL_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                "the executor could not prove quiescence after the job returned",
+            )
+        if reply.get("poisoned"):
+            self.supervision.invalidate(str(reply["poisoned"]))
+
+        outcome = reply["outcome"]
+        status, cause = _TERMINAL[outcome["terminal"]]
+        if outcome["terminal"] == "refused" and outcome["code"] in (
+            "unsupported_input",
+            "tree_ungranted",
+        ):
+            cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
+        if outcome["terminal"] == "canceled":
+            cause = (
+                CAUSE.CAUSE_CODE_DEADLINE_EXPIRED
+                if outcome["code"] == "deadline"
+                else CAUSE.CAUSE_CODE_CLIENT_CANCEL
+            )
+        if int(reply.get("oversize_result_bytes", 0)):
+            grants.abort_outputs(spool)
+            return self.terminal(
+                attempt,
+                STATUS.TERMINAL_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                ORIGIN.CAUSE_ORIGIN_RUNTIME,
+                f"result_too_large: {reply['oversize_result_bytes']} B over the inline door",
+            )
+        manifest: pb.OutputManifest | None = None
+        if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
+            manifest, tail_error = self._tail(attempt, reply)
+            if tail_error is not None:
+                return self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_FAILED,
+                    CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    tail_error,
+                )
+        else:
+            grants.abort_outputs(spool)
+        return self.terminal(
+            attempt,
+            status,
+            cause,
+            _ORIGIN[outcome["origin"]],
+            outcome["message"] or outcome["code"],
+            manifest=manifest,
+            metrics=reply.get("metrics", {}),
+            result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
+        )
+
+    def durable_exchange(self, attempt: Attempt, frame: Mapping[str, Any]) -> dict[str, Any]:
+        """Answer ONE durable mid-attempt request from the executor (cr-009's checkpoints).
+
+        Identity is (run, attempt, operation key, logical key, content digest). The write is
+        JOURNALED — and fsynced, because that is what `Journal.append` does — before this
+        returns, so `Checkpoints.save()` reports success only after the fact is durable.
+
+        Three answers and no fourth:
+          * a NEW identity is journaled and gets a fresh receipt;
+          * the SAME identity replays its receipt and writes nothing a second time;
+          * the same key with DIFFERENT bytes is a CONFLICT, never a replacement.
+        """
+        if str(frame.get("kind")) != "checkpoint":
+            return {
+                "ok": False,
+                "code": "unknown_durable_request",
+                "detail": f"{frame.get('kind')!r} is not a durable exchange this worker answers",
+            }
+        if attempt.job is None:
+            return {
+                "ok": False,
+                "code": pb.CheckpointFaultCode.Name(
+                    pb.CheckpointFaultCode.CHECKPOINT_FAULT_CODE_NOT_JOB_MODE
+                ),
+                "detail": "checkpoints are a JOB service; this attempt is not a job",
+            }
+        operation_key = str(frame.get("operation_key", ""))
+        logical_key = str(frame.get("logical_key", ""))
+        content_digest = str(frame.get("content_digest", ""))
+        key = (attempt.request_id, operation_key, logical_key)
+        held = self.receipts.get(key)
+        if held is not None:
+            if held["content_digest"] != content_digest:
+                return {
+                    "ok": False,
+                    "code": pb.CheckpointFaultCode.Name(
+                        pb.CheckpointFaultCode.CHECKPOINT_FAULT_CODE_IDENTITY_CONFLICT
+                    ),
+                    "detail": (
+                        f"{logical_key}: operation key {operation_key!r} is already durable at "
+                        f"{held['content_digest'][:23]}… and these bytes digest to "
+                        f"{content_digest[:23]}… — one identity is one content, and a "
+                        "checkpoint is never replaced"
+                    ),
+                    "recorded_content_digest": held["content_digest"],
+                }
+            return {"ok": True, "receipt_id": held["receipt_id"], "replayed": True}
+
+        receipt_id = f"ckpt-{uuid.uuid4().hex[:24]}"
+        record = {
+            "request_id": attempt.request_id,
+            "attempt": attempt.attempt,
+            "session_id": self.session_id,
+            "operation_key": operation_key,
+            "logical_key": logical_key,
+            "content_digest": content_digest,
+            "length": int(frame.get("length", 0)),
+            "receipt_id": receipt_id,
+        }
+        try:
+            self.journal.append("job_checkpoint", record)
+        except JournalError as exc:
+            return {
+                "ok": False,
+                "code": "checkpoint_not_durable",
+                "detail": f"the journal cannot commit ({exc.code}); this worker acknowledges "
+                "no checkpoint it cannot make durable",
+            }
+        self.receipts[key] = record
+        # The coordinator's copy rides the DURABLE control lane, after the worker's own
+        # journal — worker-local durability is what `save()` returned on, and the hub's copy
+        # is at-least-once like every other durable message (law 9).
+        self.send(
+            pb.WorkerMessage(
+                checkpoint_request=pb.JobCheckpointRequest(
+                    session_id=self.session_id,
+                    executor_incarnation=self.supervision.incarnation,
+                    request_id=attempt.request_id,
+                    attempt=attempt.attempt,
+                    operation_key=operation_key,
+                    logical_key=logical_key,
+                    content_digest=documents.raw(content_digest),
+                    seq=len(self.receipts),
+                )
+            )
+        )
+        attempt.ring.emit(
+            "log",
+            f"checkpoint {logical_key!r} is durable",
+            "info",
+            receipt=receipt_id,
+            bytes=int(frame.get("length", 0)),
+        )
+        return {"ok": True, "receipt_id": receipt_id, "replayed": False}
+
+    def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
+        """Record the COORDINATOR's verdict on a checkpoint this worker already made durable.
+
+        It is a second observer, not a second authority: `save()` already returned on the
+        worker's own journal. A coordinator CONFLICT is a real fact and is journaled as a
+        fault, because it means the run's identity is contested upstream — but it cannot
+        retroactively un-write bytes that are durable here.
+        """
+        outcome = pb.CheckpointOutcome.Name(receipt.outcome)
+        self.checkpoint_acks[receipt.receipt_id] = outcome
+        if receipt.outcome == pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT:
+            self.faults.append(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=f"{receipt.request_id}#{receipt.attempt}",
+                    reason="checkpoint_conflict_upstream",
+                    detail=safe(
+                        f"the coordinator reports {receipt.logical_key!r} under operation key "
+                        f"{receipt.operation_key!r} conflicts: {receipt.fault.detail}"
+                    ),
+                )
+            )
+
     def _run(self, attempt: Attempt) -> pb.AttemptTerminal:
         """The attempt itself: dispatch, freeze point, tail, journaled terminal."""
+        if attempt.job is not None:
+            return self._run_job(attempt)
         assert attempt.binding is not None and attempt.plan is not None
         executor = self.supervision.current
         if executor is None:

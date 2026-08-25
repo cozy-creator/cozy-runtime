@@ -12,6 +12,7 @@ what makes "escaped handle" a typed failure instead of a review rule.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import time
 import zlib
@@ -93,6 +94,12 @@ class Attempt:
     reply crosses never when the process that holds it is `kill -9`ed. The supervisor
     dedupes by the executor's own sequence, so nothing is counted twice.
     """
+    #: The metric lane's own budget. A training job emits one row per step for tens of
+    #: thousands of steps, so the RATE LIMIT is a number here rather than a hope: past it
+    #: metrics are DROPPED and COUNTED, never silently, and never at the cost of the log tail.
+    metric_budget: int = 4096
+    metrics_emitted: int = 0
+    metrics_dropped: int = 0
     _counter: int = 0
     _step_mark: float = 0.0
 
@@ -359,11 +366,23 @@ class Telemetry(_Bound):
 
     def metric(self, name: str, value: float, *, unit: str | None = None) -> None:
         self._attempt.check_open("Telemetry.metric")
-        self._attempt.emit("metric", name, value, unit=unit or "")
+        if self._admit():
+            self._attempt.emit("metric", name, value, unit=unit or "")
 
     def training_metric(self, name: str, value: float, *, step: int) -> None:
+        """The per-step training lane. RATE-LIMITED like `metric`: a 50,000-step job must
+        not be able to spend the attempt's whole observation budget on one number."""
         self._attempt.check_open("Telemetry.training_metric")
-        self._attempt.emit("metric", name, value, step=step)
+        if self._admit():
+            self._attempt.emit("metric", name, value, step=step)
+
+    def _admit(self) -> bool:
+        attempt = self._attempt
+        if attempt.metrics_emitted >= attempt.metric_budget:
+            attempt.metrics_dropped += 1
+            return False
+        attempt.metrics_emitted += 1
+        return True
 
 
 class Adjustments(_Bound):
@@ -454,22 +473,218 @@ class Secrets(Generic[S]):
         self.value = value
 
 
-class Scratch(_Bound):
-    """Job service (§2) — bounded working storage. cr-009 owns the implementation."""
+# ----------------------------------------------------------------------- job services
 
-    __slots__ = ()
+
+@dataclass(frozen=True, slots=True)
+class CheckpointReceipt:
+    """Proof one durable checkpoint save completed (suffix law: a Receipt, never a Decision).
+
+    `replayed` says the identity was already durable and this call returned the SAME
+    receipt — the idempotency fact a resumed job needs, and never a second write.
+    """
+
+    receipt_id: str
+    operation_key: str
+    logical_key: str
+    content_digest: str
+    length: int
+    replayed: bool = False
+
+
+class CheckpointConflict(CapabilityError):
+    """One logical/operation key, two different contents. Never a replacement (§2)."""
+
+    default_code = "checkpoint_conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointSave:
+    """What the runtime is asked to make durable. Bytes stay in the attempt's own spool."""
+
+    operation_key: str
+    logical_key: str
+    content_digest: str
+    length: int
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetFacts:
+    """The cost-governor facts for ONE job attempt, from the TYPED CONFIG CHANNEL (§2).
+
+    Cost facts are not filesystem state and the GPU rate never arrives through environment:
+    the deployment config plane owns these values and they are digest-pinned into the
+    execution spec like any other setting.
+    """
+
+    gpu_rate_usd_per_hour: float = 0.0
+    gpu_count: int = 0
+    cap_usd: float = 0.0
+    started_monotonic: float = 0.0
+
+
+class BudgetExhausted(CapabilityError):
+    """The attempt reached its declared spend cap. A FACT, never a retry command."""
+
+    default_code = "budget_exhausted"
+
+
+class Scratch(_Bound):
+    """Job service (§2) — bounded working storage for ONE run.
+
+    `checkpoint_dir(key=)` is keyed on the RUN, not the attempt: a retried attempt of the
+    same run is handed back the SAME tree, which is what makes resume real rather than a
+    naming convention. `mktemp()` and `materialize_blob()` are attempt-scoped and die with
+    the attempt spool.
+    """
+
+    __slots__ = ("_root",)
+
+    def __init__(self, attempt: Attempt, root: Path | None = None) -> None:
+        super().__init__(attempt)
+        self._root = root
+
+    def _base(self, what: str) -> Path:
+        self._attempt.check_open(what)
+        if self._root is None:
+            raise CapabilityError(
+                f"{what}: no scratch is granted to this attempt — Scratch is a JOB service, "
+                "and the runtime allocates its tree per run before the body starts",
+                code="scratch_unavailable",
+            )
+        return self._root
+
+    def checkpoint_dir(self, *, key: str) -> Path:
+        """The SAME directory for the same (run, key) across attempts. Resumable by
+        construction — a retried attempt reads what the killed one left."""
+        base = self._base("Scratch.checkpoint_dir")
+        if not key or "/" in key or key.startswith("."):
+            raise CapabilityError(
+                f"scratch key {key!r} is not a bare name: a key is a flat label, never a path",
+                code="scratch_key",
+            )
+        target = base / "checkpoints" / key
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def mktemp(self, suffix: str = "") -> Path:
+        """An attempt-scoped temporary path. Dies with the attempt; never resumable."""
+        base = self._base("Scratch.mktemp")
+        target = base / "tmp"
+        target.mkdir(parents=True, exist_ok=True)
+        return target / f"{self._attempt.next_handle('scratch').rsplit('/', 1)[-1]}{suffix}"
+
+    def materialize_blob(self, data: bytes, *, name: str = "") -> Path:
+        """Put bytes on the filesystem for a library that only takes a path."""
+        target = self.mktemp() if not name else self._base("Scratch.materialize_blob") / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return target
 
 
 class Checkpoints(_Bound):
-    """Job service (§2) — resumable training checkpoints. cr-009 owns the implementation."""
+    """Job service (§2) — DURABLE idempotent saves over a distinct exchange.
 
-    __slots__ = ()
+    Identity is (run, attempt, operation key, logical key, content digest). Repeating the
+    same identity returns the durable receipt; the same logical/operation key with different
+    bytes is a CONFLICT, never a replacement. The write is journaled and acknowledged before
+    this call reports success, over the durable control exchange — never the lossy stream,
+    which has no authority over a durable fact.
+    """
+
+    __slots__ = ("_sink",)
+
+    def __init__(
+        self, attempt: Attempt, sink: Callable[[CheckpointSave], CheckpointReceipt] | None = None
+    ) -> None:
+        super().__init__(attempt)
+        self._sink = sink
+
+    def save(
+        self, logical_key: str, data: bytes | Path, *, operation_key: str = ""
+    ) -> CheckpointReceipt:
+        """Make one checkpoint durable, and return only once it IS."""
+        self._attempt.check_open("Checkpoints.save")
+        if self._sink is None:
+            raise CapabilityError(
+                "no durable checkpoint exchange is installed for this attempt: Checkpoints is "
+                "a JOB service and its exchange is the supervisor's, never a local file write",
+                code="checkpoints_unavailable",
+            )
+        if not logical_key:
+            raise CapabilityError("a checkpoint needs a logical key", code="checkpoint_key")
+        blob = Path(data) if isinstance(data, Path) else None
+        if blob is None:
+            assert isinstance(data, bytes)
+            blob = self._attempt.spool / f"ckpt-{self._attempt.next_handle('ckpt')[-4:]}"
+            blob.write_bytes(data)
+        raw = blob.read_bytes()
+        return self._sink(
+            CheckpointSave(
+                operation_key=operation_key or logical_key,
+                logical_key=logical_key,
+                # SHA-256, the one identity spelling the platform uses for content (law 1),
+                # so the receipt the coordinator holds is addressable by the same digest.
+                content_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+                length=len(raw),
+                path=blob,
+            )
+        )
 
 
 class Budget(_Bound):
-    """Job service (§2) — the attempt's spend envelope. cr-009 owns the implementation."""
+    """Job service (§2) — the attempt's spend envelope, as its own service.
 
-    __slots__ = ()
+    Cost facts are NOT filesystem state and the GPU rate is not an environment variable:
+    everything here comes from the typed config channel. It reports facts and raises when
+    the declared cap is reached; it never decides retryability and never prices anything.
+    """
+
+    __slots__ = ("_facts",)
+
+    def __init__(self, attempt: Attempt, facts: BudgetFacts | None = None) -> None:
+        super().__init__(attempt)
+        self._facts = facts
+
+    def _read(self) -> BudgetFacts:
+        self._attempt.check_open("Budget")
+        if self._facts is None:
+            raise CapabilityError(
+                "no budget is granted to this attempt: Budget is a JOB service and its facts "
+                "arrive on the typed config channel, never from the environment",
+                code="budget_unavailable",
+            )
+        return self._facts
+
+    @property
+    def gpu_rate_usd_per_hour(self) -> float:
+        return self._read().gpu_rate_usd_per_hour
+
+    @property
+    def cap_usd(self) -> float:
+        return self._read().cap_usd
+
+    def elapsed_s(self) -> float:
+        facts = self._read()
+        return max(0.0, time.monotonic() - facts.started_monotonic)
+
+    def spent_usd(self) -> float:
+        """GPU-seconds x rate x devices. The one arithmetic, in the one place."""
+        facts = self._read()
+        return self.elapsed_s() / 3600.0 * facts.gpu_rate_usd_per_hour * max(facts.gpu_count, 1)
+
+    def remaining_usd(self) -> float:
+        return self._read().cap_usd - self.spent_usd()
+
+    def raise_if_exhausted(self) -> None:
+        """THE spend spelling, mirroring `ctx.raise_if_cancelled()`."""
+        facts = self._read()
+        if facts.cap_usd and self.spent_usd() >= facts.cap_usd:
+            raise BudgetExhausted(
+                f"the attempt spent {self.spent_usd():.4f} USD of a {facts.cap_usd:.4f} USD "
+                f"cap after {self.elapsed_s():.1f} s on {max(facts.gpu_count, 1)} device(s)"
+            )
 
 
 #: capability name -> service type. The ONE table injection and derivation share, so a
@@ -485,3 +700,12 @@ SERVICES: Mapping[str, type] = {
     "checkpoints": Checkpoints,
     "budget": Budget,
 }
+
+#: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs
+#: to completion and owns durable working state; a request handler owns neither.
+JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget"})
+
+#: The mirror: SERVING-ONLY surface. `adjust` writes the caller-visible adjustments envelope,
+#: which is a fact about serving one request; a run-to-completion job has no caller to
+#: confess to and no envelope to write into.
+SERVING_ONLY: frozenset[str] = frozenset({"adjust"})

@@ -81,6 +81,9 @@ class Surface:
     capabilities: frozenset[str]
     gpu: bool
     publishes: bool = False
+    emits_media: bool = False
+    """What a JOB body may write, as its own declaration. Grants mint off the declaration,
+    never off the kind (§2) — a job that declares neither cannot be granted a destination."""
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
@@ -174,6 +177,7 @@ def analyze(
     name: str,
     kind: Kind,
     publishes: bool = False,
+    emits_media: bool = False,
     resources: Resources | None = None,
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
@@ -249,6 +253,7 @@ def analyze(
         capabilities=frozenset(p.capability for p in params if p.capability),
         gpu=any(p.role == "model" for p in params),
         publishes=publishes,
+        emits_media=emits_media,
         resources=resources,
         demand_bound=demand_bound,
         preflight=spec,

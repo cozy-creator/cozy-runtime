@@ -131,7 +131,10 @@ def _callable(
     if features:
         doc["request_features"] = sorted(features, key=lambda f: (f["axis"], f["field"]))
     if surface.kind == "job":
+        # WHAT THE BODY MAY WRITE, as its own declaration. Grants mint off these two lines
+        # and never off the kind (§2): a job that declares neither is granted no destination.
         doc["publishes"] = surface.publishes
+        doc["emits_media"] = surface.emits_media
     if surface.preflight is not None:
         doc["preflight"] = {
             "identity": surface.preflight.identity,
@@ -331,6 +334,29 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
 def surface_digest(body: Mapping[str, Json]) -> str:
     """sha256 over the canonical bytes of everything EXCEPT the digest field itself."""
     return canonical.digest({k: v for k, v in body.items() if k != DIGEST_KEY})
+
+
+def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
+    """`job_descriptor_id` — sha256 of ONE job's exact callable, schemas, effects, resource
+    caps and publication contract (README §4).
+
+    DERIVED, never stored in the document: a digest of a subject that lives on this same
+    clock is still a digest, and `_fixed_point` refuses one anywhere in the body — for the
+    good reason that a reader who finds a `sha256:` string in a source-stable surface has no
+    way to know which clock it came from. The runner computes it when it needs it, from the
+    document, and every environment of one release computes the same one.
+    """
+    jobs = body.get("jobs", [])
+    assert isinstance(jobs, list)
+    for entry in jobs:
+        assert isinstance(entry, dict)
+        if entry["name"] == name:
+            return canonical.digest({"format": "cozy.runtime.JobDescriptor/1", **entry})
+    raise ConformanceError(
+        f"this release registers no job named {name!r}: it has "
+        f"{', '.join(str(j['name']) for j in jobs if isinstance(j, dict)) or 'no jobs'}",
+        code="unknown_job",
+    )
 
 
 def document(body: Mapping[str, Json]) -> dict[str, Json]:

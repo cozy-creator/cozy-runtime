@@ -43,6 +43,7 @@ class Registration:
     kind: Kind
     fn: Callable[..., object]
     publishes: bool = False
+    emits_media: bool = False
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
@@ -59,6 +60,7 @@ class Registration:
                 name=self.name,
                 kind=self.kind,
                 publishes=self.publishes,
+                emits_media=self.emits_media,
                 resources=self.resources,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
@@ -118,6 +120,7 @@ class App:
         *,
         name: str | None = None,
         publishes: bool = False,
+        emits_media: bool = False,
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -129,12 +132,27 @@ class App:
         *,
         name: str | None = None,
         publishes: bool = False,
+        emits_media: bool = False,
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register a run-to-completion callable (§2)."""
+        """Register a RUN-TO-COMPLETION callable (§2).
+
+        Structurally separate from serving, and separate in exactly one place: `kind`. What
+        a body may WRITE is its own declaration (`publishes=`, `emits_media=`) — grants mint
+        off the declaration, never off the kind — and everything else about the job is
+        derived from the signature exactly as it is for an entrypoint. There is no
+        JobContext, no second kernel and no serving loop.
+        """
         return self._register(
-            "job", fn, name, publishes=publishes, preflight=None, resources=resources, demand=demand
+            "job",
+            fn,
+            name,
+            publishes=publishes,
+            emits_media=emits_media,
+            preflight=None,
+            resources=resources,
+            demand=demand,
         )
 
     def _register(
@@ -147,6 +165,7 @@ class App:
         preflight: Callable[..., object] | None,
         resources: Resources | None,
         demand: Bound | None,
+        emits_media: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -160,7 +179,7 @@ class App:
                     f"duplicate registration {registered!r}: names are unique per app"
                 )
             self._registry[registered] = Registration(
-                registered, kind, target, publishes, resources, demand, preflight
+                registered, kind, target, publishes, emits_media, resources, demand, preflight
             )
             return target
 

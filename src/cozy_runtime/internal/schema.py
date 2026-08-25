@@ -20,7 +20,14 @@ from typing import Literal, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, VideoAsset
+from cozy_runtime.author._assets import (
+    Asset,
+    AudioAsset,
+    FileAsset,
+    ImageAsset,
+    Tree,
+    VideoAsset,
+)
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Shape, _ModelDefaultMarker
 from cozy_runtime.author._walker import MISSING, is_struct, strip, unwrap_optional
@@ -88,13 +95,17 @@ def _render_bare(tp: object, seen: frozenset[type]) -> Json:
         for asset, kind in _ASSET_KINDS:
             if issubclass(tp, asset):
                 return {"asset": kind}
+        if issubclass(tp, Tree):
+            # A JOB input: a digest-verified materialized tree. The wire spelling is a REF,
+            # exactly like an asset — the local path is never schema content (§2).
+            return {"input": "tree"}
         if issubclass(tp, enum.Enum):
             return {"enum": tp.__name__, "values": sorted(_literal(m.value) for m in tp)}
         if is_struct(tp):
             return _struct(typing.cast(type[msgspec.Struct], tp), seen)
     raise ConformanceError(
         f"{tp!r} has no descriptor spelling — the request/result surface is primitives, "
-        "enums, literals, containers, typed Assets and msgspec structs",
+        "enums, literals, containers, typed Assets, input Trees and msgspec structs",
         code="unrenderable_type",
     )
 

@@ -56,7 +56,7 @@ from cozy_runtime.internal.worker.attempts import (
 from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.control import Coordinator, GrpcCoordinator, Link, LinkError
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
-from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser
+from cozy_runtime.internal.worker.plan import BindingPlan, JobBinding, PlanChooser
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -66,6 +66,14 @@ PROGRESS_QUEUE = 256
 #: Report cadence. Report is DURABLE and carries the applied baseline, so the hub can always
 #: see a directive it issued but the worker did not apply.
 REPORT_SECONDS = 2.0
+
+#: The RUN-ONCE RECYCLE exit (cr-009, v1 rc 75). A job worker that completed its one attempt
+#: and had its terminal acknowledged asks to be RECLAIMED, and that is not a death: a
+#: supervisor exiting 0 on completion is indistinguishable from one that exited 0 because its
+#: coordinator went away, which is exactly the ambiguity that makes a pod either leak or get
+#: killed while it still had work. It is deliberately NOT in `internal/exits.py`: that matrix
+#: is the shared CLI/coordinator vocabulary, and this is a worker PROCESS disposition.
+RECYCLE_EXIT = 75
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +148,9 @@ class Supervisor:
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, BindingPlan] = {}
+        #: job_descriptor_id -> the local job plan record. A JOB directive fills this and
+        #: leaves `bindings` empty: the two modes are alternatives, never a union.
+        self.jobs: dict[str, JobBinding] = {}
         # cr-011: the worker's own bounded record, the silence-bounded liveness detector,
         # and the journal-backed bundle store. All three outlive the executor, and the
         # bundle store's receipts outlive THIS process too.
@@ -153,7 +164,9 @@ class Supervisor:
             supervision=self.supervision,
             authorizer=self.authorizer,
             bindings={},
+            jobs={},
             spool_root=self.root / "spool",
+            scratch_root=self.root.parent / "scratch",
             instance_id=options.instance_id,
             send=self.send,
             progress=self.emit_progress,
@@ -172,11 +185,13 @@ class Supervisor:
         self.work: queue.Queue[Attempt | None] = queue.Queue()
         self.stop = threading.Event()
         self.connected = threading.Event()
-        self.exit_code = Exit.ok
+        self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self.link: Link | None = None  # the live control link, so shutdown can end it
+        self.job_caps = pb.ResourceCaps()
+        self.reclaim_on_terminal = False
 
     # ------------------------------------------------------------------ plumbing
 
@@ -328,6 +343,9 @@ class Supervisor:
         self.fences.wire_minor = directive.wire_minor
         if directive.HasField("credential"):
             self.fences.credential_epoch = directive.credential.epoch
+        if directive.HasField("job"):
+            self.apply_job_directive(directive.job)
+            return
         if not directive.HasField("serving"):
             self.note("directive", "no serving mode: nothing to prepare")
             return
@@ -353,6 +371,59 @@ class Supervisor:
             f"posture={pb.Posture.Name(directive.posture)}",
         )
         self.prepare_executor()
+
+    def apply_job_directive(self, job: pb.JobDirective) -> None:
+        """The JOB lane's directive: resolve the descriptor, spawn a fresh executor, ready.
+
+        No binding plan, no fill, no warm pass and no residency — a job has none of those,
+        and inventing them so the two lanes look alike would mean holding weights a job
+        never asked for. What the worker DOES prepare is the disposable process the attempt
+        will run in; the job's own preparation (its typed inputs, its read-only Model if it
+        declares one) happens after acceptance, bounded by the attempt deadline (cr-009).
+        """
+        self.bindings = {}
+        self.engine.bindings = {}
+        self.jobs = {}
+        plans = self.config.cozy_home / "job-plans"
+        record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
+        if not record.is_file():
+            self.engine.faults.append(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=job.job_descriptor_id,
+                    reason="unresolved_job_descriptor",
+                    detail=f"no local record for {job.job_descriptor_id}",
+                )
+            )
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            return
+        self.jobs[job.job_descriptor_id] = JobBinding.read(json.loads(record.read_text()))
+        self.engine.jobs = self.jobs
+        self.job_caps = job.resource_caps
+        self.reclaim_on_terminal = job.reclaim_on_terminal
+        self.note(
+            "directive",
+            f"revision {self.fences.revision} applied in JOB mode: "
+            f"{self.jobs[job.job_descriptor_id].job!r}, gpu floor {job.gpu_count}, "
+            f"reclaim_on_terminal={job.reclaim_on_terminal}",
+        )
+        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
+        executor = self.supervision.current
+        if executor is None or not executor.alive():
+            try:
+                executor = self.supervision.spawn(imposed=self.imposed())
+            except ExecutorGone as exc:
+                self.note("boot", f"the job executor never dialled back: {exc}")
+                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                return
+            self.ledger.executor_pid = executor.pid
+            self.note(
+                "boot",
+                f"job executor incarnation {executor.incarnation} pid {executor.pid} dialled "
+                f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
+                f"(torch_loaded={executor.hello.get('torch_loaded')})",
+            )
+        self.intake(pb.IntakeState.INTAKE_STATE_READY)
 
     # ------------------------------------------------------------------ readiness
 
@@ -628,7 +699,7 @@ class Supervisor:
                         f"Register REFUSED: "
                         f"{pb.RegisterRejection.Name(message.register_ack.rejection)}",
                     )
-                    self.exit_code = Exit.credential
+                    self.exit_code = int(Exit.credential)
                     self.stop.set()
                     return
                 self.fences.wire_minor = min(WIRE_MINOR, message.register_ack.wire_minor)
@@ -662,7 +733,44 @@ class Supervisor:
             elif kind == "cancel_attempt":
                 self.note("cancel", self.engine.cancel(message.cancel_attempt))
             elif kind == "terminal_ack":
-                self.note("terminal", self.engine.close(message.terminal_ack))
+                acked = message.terminal_ack
+                self.note("terminal", self.engine.close(acked))
+                closed = self.engine.history.get((acked.request_id, acked.attempt))
+                if self.reclaim_on_terminal and closed is not None and closed.job is not None:
+                    # RUN-ONCE: one immutable build, one bounded attempt, terminal, reclaim.
+                    # The worker stops HERE, after the terminal is durably acknowledged, with
+                    # the recycle disposition rather than a death.
+                    self.note(
+                        "session",
+                        f"job attempt {acked.request_id}#{acked.attempt} is acknowledged and "
+                        f"reclaim_on_terminal is set: exiting {RECYCLE_EXIT} (recycle, not a "
+                        "death)",
+                    )
+                    self.exit_code = RECYCLE_EXIT
+                    self.stop.set()
+                    self.outbound.put(None)
+                    if self.link is not None:
+                        self.link.cancel()
+                    return
+            elif kind == "checkpoint_receipt":
+                # The COORDINATOR's copy of a checkpoint that is already durable here. It is
+                # recorded and acked; it can never un-durable a fact the worker journaled,
+                # which is why `save()` did not block on it (law 9: at-least-once).
+                receipt = message.checkpoint_receipt
+                self.engine.absorb_receipt(receipt)
+                self.send(
+                    pb.WorkerMessage(
+                        checkpoint_ack=pb.JobCheckpointAck(
+                            session_id=receipt.session_id,
+                            executor_incarnation=receipt.executor_incarnation,
+                            request_id=receipt.request_id,
+                            attempt=receipt.attempt,
+                            operation_key=receipt.operation_key,
+                            receipt_id=receipt.receipt_id,
+                            content_digest=receipt.content_digest,
+                        )
+                    )
+                )
         self.connected.clear()
 
     def on_start(self, start: pb.StartAttempt) -> None:
@@ -776,6 +884,21 @@ class Supervisor:
                 self.note("journal", f"{exc.code}: no terminal can be claimed")
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 continue
+            except Exception as exc:
+                # A BUG in the execution path is still an attempt that must terminate. Found
+                # live on the job lane: one unhandled ValueError killed this thread, and the
+                # coordinator then waited out its whole readiness deadline on an attempt it
+                # had already been told was accepted. A worker that cannot run an attempt
+                # says so with a terminal; it never converts a defect into a hang.
+                self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
+                try:
+                    terminal = self.engine.abandon(
+                        attempt, f"the worker faulted while running this attempt: {exc}"
+                    )
+                except Exception as inner:
+                    self.note("attempt", f"even ABANDONED could not be journaled: {inner}")
+                    self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                    continue
             self.send(pb.WorkerMessage(attempt_terminal=terminal))
             current = self.supervision.current
             if self.supervision.needs_rebuild:
@@ -874,6 +997,21 @@ class Supervisor:
                 ),
                 free_vram_bytes=0,
             ),
+            job_capacity=self.job_capacity(),
+        )
+
+    def job_capacity(self) -> pb.JobCapacity:
+        """How many JOB attempts this worker can take right now (cr-009).
+
+        Law 8 in the job lane: one active attempt per device group, so a worker with a live
+        job attempt advertises zero available. `jobs_available` is 0 in serving mode too —
+        it is not "unknown", it is "this worker takes no job", which is the honest answer.
+        """
+        in_flight = sum(1 for a in self.engine.live.values() if a.job is not None)
+        ready = bool(self.jobs) and self.fences.intake == pb.IntakeState.INTAKE_STATE_READY
+        return pb.JobCapacity(
+            jobs_in_flight=in_flight,
+            jobs_available=max(0, (1 if ready else 0) - in_flight),
         )
 
     # ------------------------------------------------------------------ transport
@@ -1038,7 +1176,7 @@ class Supervisor:
             time.sleep(backoff)
             backoff = min(backoff * 2, 5.0)
         self.shutdown()
-        return int(self.exit_code)
+        return self.exit_code
 
     def shutdown(self) -> None:
         seam = (

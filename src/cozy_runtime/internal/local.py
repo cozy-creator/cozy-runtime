@@ -37,12 +37,14 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryLink, Link
 from cozy_runtime.internal.worker.session import Supervisor, WorkerOptions
@@ -76,6 +78,18 @@ class LocalRequest:
     #: coordinator may grant any location it can authorize; the worker still verifies the
     #: bytes it reads against the grant's own digest and length.
     payload_url: str = ""
+    #: `entrypoint` (serving) or `job` (run-to-completion). ONE ExecutionSpec mode is named
+    #: either way; a request that named both would be two lifecycles under one identity.
+    kind: str = "entrypoint"
+    #: JOB mode only: the descriptor id the worker resolves its local job plan against, and
+    #: the materialized input trees this run grants (`ref -> local directory`).
+    job_descriptor_id: str = ""
+    trees: Mapping[str, str] = field(default_factory=dict)
+    org: str = "local"
+    """The publishing org. A job's outputs are hub-rewritten into the SCRATCH repo
+    `<org>/_job-<request-id>` — the underscore is deliberately outside the public repo
+    grammar, so no user ref can squat a job's scratch, and promotion out of it is always an
+    explicit later act under the caller's own credentials (jobs.md)."""
 
 
 @dataclass(slots=True)
@@ -104,6 +118,10 @@ class SliceOutcome:
     triage_explained: list[str] = field(default_factory=list)
     exit_code: int = 0
     journal_deleted: bool = False
+    #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
+    #: the scratch repo its outputs were rewritten into.
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    publication_scope: str = ""
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
     #: `worker_error` (the worker reported it could not become ready), `ready_timeout`, or
     #: `coordinator_error` (this side failed). A one-shot run that cannot say this would
@@ -135,6 +153,8 @@ class LocalCoordinator:
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_plan_id
+        #: JOB mode: the durable checkpoint requests this coordinator answered, in order.
+        self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
         self.release_id = release_id
         self.auto_ack = auto_ack
@@ -228,6 +248,8 @@ class LocalCoordinator:
             self.marks["accepted"] = time.perf_counter()
         elif kind == "attempt_terminal":
             self._on_terminal(message.attempt_terminal)
+        elif kind == "checkpoint_request":
+            self._on_checkpoint(message.checkpoint_request)
 
     def _on_register(self, register: pb.Register) -> None:
         self.session_id = register.session_id
@@ -265,6 +287,25 @@ class LocalCoordinator:
     def _on_report(self, report: pb.Report) -> None:
         """READY is learned from the worker's own durable Report, like a hub learns it."""
         self.reports.append(report)
+        if self.request.kind == "job":
+            # The JOB lane reads JOB capacity. A worker with no job plan applied reports
+            # zero available, which is an ANSWER — not an unknown to keep polling through.
+            ready = (
+                report.intake_state == pb.IntakeState.INTAKE_STATE_READY
+                and report.job_capacity.jobs_available > 0
+            )
+            if report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR:
+                self.marks.setdefault("ready", time.perf_counter())
+                if self.terminal is None:
+                    self.ended = "worker_error"
+                self.done.set()
+                self._link.close()
+                return
+            if ready and not self.dispatched:
+                self.marks["ready"] = time.perf_counter()
+                self.dispatched = True
+                self._dispatch(report.executor_incarnation)
+            return
         plan_id = self._plan_id()
         ready = (
             report.intake_state == pb.IntakeState.INTAKE_STATE_READY
@@ -324,11 +365,47 @@ class LocalCoordinator:
                 token=b"local",
             )
         )
+        if self.request.kind == "job":
+            # A JOB directive names the build and its caps and NOTHING about serving: there
+            # is no binding plan to prepare, no warm pool to fill and no serving pointer.
+            directive.job.CopyFrom(
+                pb.JobDirective(
+                    build_id=self.release_id,
+                    job_descriptor_id=self.request.job_descriptor_id,
+                    resource_caps=pb.ResourceCaps(
+                        gpu_required=False, max_rss_bytes=0, max_disk_bytes=0
+                    ),
+                    publication_contract=self._publication(),
+                    reclaim_on_terminal=True,
+                )
+            )
+            return directive
         directive.serving.entrypoint_binding_plan_ids.extend(sorted(set(self.bindings.values())))
         return directive
 
+    def scratch_repo(self) -> str:
+        """`<org>/_job-<request-id>` — the SCRATCH repo a job's publishes are rewritten into.
+
+        The underscore is deliberately outside the public repo grammar (`artifacts.REF`
+        admits `[a-zA-Z0-9]` first), so no user ref can ever squat a job's scratch. Promotion
+        OUT of scratch is an explicit later act under the caller's own credentials; a verdict
+        stamps metadata and never gates persistence — a failed run's writes still land.
+        """
+        return f"{self.request.org}/_job-{self.request.request_id}"
+
+    def _publication(self) -> pb.PublicationContract:
+        """What this run authorizes the job to write, by output id. Minted from the job's own
+        DECLARATION (`publishes=`/`emits_media=`), never from the fact that it is a job."""
+        return pb.PublicationContract(
+            grant_id=self.scratch_repo(),
+            outputs=[
+                pb.OutputSpec(output_id=output_id, max_bytes=64 << 20)
+                for output_id in self.request.outputs
+            ],
+        )
+
     def _dispatch(self, incarnation: int) -> None:
-        plan_id = self._plan_id()
+        plan_id = "" if self.request.kind == "job" else self._plan_id()
         spec = pb.ExecutionSpec(
             endpoint_release_id=self.release_id,
             deadline_unix_ms=self.request.deadline_ms,
@@ -336,8 +413,17 @@ class LocalCoordinator:
         # `image_digest` and `config_digest` stay EMPTY on the local door and that is a
         # statement: a bare-venv run has no container image, and minting a plausible digest
         # for one would be the fabrication class this runtime exists to prevent.
-        spec.serving.entrypoint_binding_plan_id = plan_id
-        spec.serving.attempt_binding_id = plan_id
+        if self.request.kind == "job":
+            spec.job.CopyFrom(
+                pb.JobExecutionSpec(
+                    build_id=self.release_id,
+                    job_descriptor_id=self.request.job_descriptor_id,
+                    publication_contract=self._publication(),
+                )
+            )
+        else:
+            spec.serving.entrypoint_binding_plan_id = plan_id
+            spec.serving.attempt_binding_id = plan_id
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
         self.marks["dispatched"] = time.perf_counter()
@@ -383,7 +469,18 @@ class LocalCoordinator:
                     length=len(body),
                     input_id="payload",
                     kind_mime="application/json",
-                )
+                ),
+                # The job's typed model/dataset/checkpoint inputs, as MATERIALIZED TREES.
+                # The grant is the read capability: a `Tree` field whose ref is absent here
+                # never hydrates, and the job refuses typed rather than touching a path.
+                *[
+                    pb.InputLocation(
+                        url=f"file://{Path(root).resolve()}",
+                        input_id=f"{grants_module.TREE_PREFIX}{ref}",
+                        kind_mime="inode/directory",
+                    )
+                    for ref, root in sorted(self.request.trees.items())
+                ],
             ],
             outputs=[
                 pb.OutputDestination(
@@ -397,6 +494,54 @@ class LocalCoordinator:
 
     def _filename(self, output_id: str) -> str:
         return f"{self.request.request_id}-{output_id.replace('.', '-')}.bin"
+
+    def _on_checkpoint(self, request: pb.JobCheckpointRequest) -> None:
+        """The coordinator half of the DURABLE checkpoint exchange (cr-009).
+
+        This is the seam cl-004 and the hub implement for real: the worker already made the
+        save durable in its own journal, and this side records the identity and answers with
+        its receipt. The coordinator's answer is a SECOND observation, not a second
+        authority — an at-least-once durable message like every other (law 9).
+        """
+        digest = documents.spell(request.content_digest) if request.content_digest else ""
+        held = next(
+            (
+                row
+                for row in self.checkpoints
+                if row["operation_key"] == request.operation_key
+                and row["logical_key"] == request.logical_key
+            ),
+            None,
+        )
+        conflict = held is not None and held["content_digest"] != digest
+        row = {
+            "operation_key": request.operation_key,
+            "logical_key": request.logical_key,
+            "content_digest": digest,
+            "seq": request.seq,
+            "outcome": "CONFLICT" if conflict else ("REPLAYED" if held else "RECORDED"),
+        }
+        self.checkpoints.append(row)
+        outcome = (
+            pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT
+            if conflict
+            else pb.CheckpointOutcome.CHECKPOINT_OUTCOME_RECORDED
+        )
+        self._send(
+            pb.CoordinatorMessage(
+                checkpoint_receipt=pb.JobCheckpointReceipt(
+                    session_id=request.session_id,
+                    executor_incarnation=request.executor_incarnation,
+                    request_id=request.request_id,
+                    attempt=request.attempt,
+                    operation_key=request.operation_key,
+                    logical_key=request.logical_key,
+                    content_digest=request.content_digest,
+                    receipt_id=f"crc-{request.operation_key}-{request.seq}",
+                    outcome=outcome,
+                )
+            )
+        )
 
     # ------------------------------------------------------------------ driving
 
@@ -445,6 +590,26 @@ def stage_binding_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[
     return plans
 
 
+def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:
+    """Write the local JOB plan records the worker resolves job descriptor ids against.
+
+    THE SEAM, one lane over from `stage_binding_plans`: on the network path th-004 ships the
+    build and the JobDescriptor and tfs-003 the materialized input trees. Locally it is a
+    plain file under `<cozy_home>/job-plans/`, and the worker cannot tell the difference
+    because a coordinator never ships a path either way.
+    """
+    directory = cozy_home / "job-plans"
+    directory.mkdir(parents=True, exist_ok=True)
+    plans: dict[str, str] = {}
+    for record in records:
+        descriptor_id = str(record["job_descriptor_id"])
+        (directory / f"{descriptor_id.split(':')[-1]}.json").write_text(
+            json.dumps(record, indent=2)
+        )
+        plans[str(record["job"])] = descriptor_id
+    return plans
+
+
 def run_slice(
     config: RuntimeConfig,
     request: LocalRequest,
@@ -452,6 +617,7 @@ def run_slice(
     *,
     workspace: Path,
     release_id: str,
+    job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
     auto_ack: bool = True,
@@ -465,6 +631,7 @@ def run_slice(
     """
     workspace.mkdir(parents=True, exist_ok=True)
     plans = stage_binding_plans(config.cozy_home, binding_records)
+    stage_job_plans(config.cozy_home, job_records or [])
     coordinator = LocalCoordinator(
         request, plans, workspace, release_id=release_id, auto_ack=auto_ack
     )
@@ -506,12 +673,19 @@ def _collect(
     ]
     outcome.progress = len(coordinator.progress_frames)
     outcome.executions = supervisor.engine.executed
+    outcome.checkpoints = list(coordinator.checkpoints)
+    outcome.publication_scope = (
+        coordinator.scratch_repo() if coordinator.request.kind == "job" else ""
+    )
 
     if coordinator.accepted is not None:
         accepted = coordinator.accepted
         outcome.accepted = {
-            "plan_digest": documents.spell(accepted.plan_digest),
-            "model_construction_digest": documents.spell(accepted.model_construction_digest),
+            "plan_digest": _spell(accepted.plan_digest),
+            # A JOB attempt has NO model construction: no warm pool, no serving pointer, no
+            # retained generation. The empty digest is the honest answer and spelling it as
+            # one would be inventing an identity for a construction that never happened.
+            "model_construction_digest": _spell(accepted.model_construction_digest),
             "delivery": accepted.plan.delivery,
             "materialization": accepted.plan.materialization,
             "placement": accepted.plan.placement,
@@ -574,6 +748,11 @@ def _collect(
         shutil.rmtree(supervisor.root, ignore_errors=True)
         outcome.journal_deleted = True
     return outcome
+
+
+def _spell(raw: bytes) -> str:
+    """`sha256:<hex>`, or the empty string for a digest a mode genuinely does not have."""
+    return documents.spell(raw) if len(raw) == 32 else ""
 
 
 def _b64(text: str) -> bytes:

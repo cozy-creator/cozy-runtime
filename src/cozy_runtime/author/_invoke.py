@@ -25,7 +25,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset, bind
+from cozy_runtime.author._assets import Asset, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
@@ -47,7 +47,10 @@ from cozy_runtime.author._services import (
     Adjustments,
     Attempt,
     Budget,
+    BudgetFacts,
+    CheckpointReceipt,
     Checkpoints,
+    CheckpointSave,
     Egress,
     Outputs,
     ProgressFrame,
@@ -77,6 +80,21 @@ class Invocation:
     secrets: object = None
     adapters: tuple[AdapterRef, ...] = ()
     egress_broker: Callable[..., Any] | None = None
+    trees: Mapping[str, tuple[Path, str]] = field(default_factory=dict)
+    """ref -> (materialized root, digest) for every input tree THIS attempt was granted.
+
+    A `Tree` field naming a ref absent from this mapping never hydrates and refuses typed:
+    the grant IS the read capability, and there is no ambient store handle anywhere on the
+    author surface for a job to reach around it (§2, jobs.md §1).
+    """
+    scratch: Path | None = None
+    """The RUN's scratch tree — the same directory across attempts of one run, which is what
+    makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
+    checkpoints: Callable[[CheckpointSave], CheckpointReceipt] | None = None
+    """The DURABLE checkpoint exchange. Distinct from the lossy progress lane on purpose:
+    the lossy lane has no authority over a durable fact."""
+    budget: BudgetFacts | None = None
+    """Cost-governor facts from the typed config channel. Never read from environment."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -202,23 +220,75 @@ def _preflight(surface: Surface, overlay: Overlay, inv: Invocation) -> tuple[obj
     return facts, "blake2b:" + hashlib.blake2b(canonical, digest_size=16).hexdigest()
 
 
-_CARRIES_ASSETS: dict[object, bool] = {}
+_CARRIES: dict[tuple[object, str], bool] = {}
 
 
-def declares_assets(tp: object) -> bool:
-    """Whether a schema can carry an asset at all — a describe-time fact, so a handler
-    with no asset fields never walks a value looking for one."""
-    carries = _CARRIES_ASSETS.get(tp)
+def _declares(tp: object, kind: type) -> bool:
+    key = (tp, kind.__name__)
+    carries = _CARRIES.get(key)
     if carries is None:
-        carries = _CARRIES_ASSETS[tp] = any(
-            isinstance(node.annotation, type) and issubclass(node.annotation, Asset)
+        carries = _CARRIES[key] = any(
+            isinstance(node.annotation, type) and issubclass(node.annotation, kind)
             for node in walk(tp)
         )
     return carries
 
 
+def declares_assets(tp: object) -> bool:
+    """Whether a schema can carry an asset at all — a describe-time fact, so a handler
+    with no asset fields never walks a value looking for one."""
+    return _declares(tp, Asset)
+
+
+def declares_trees(tp: object) -> bool:
+    """The same fact for input TREES — a job's typed model/dataset/checkpoint inputs."""
+    return _declares(tp, Tree)
+
+
+def trees_in(value: object) -> list[Tree]:
+    """Every input tree reachable from a payload, in declaration order."""
+    found: list[Tree] = []
+    if isinstance(value, Tree):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [t for item in value for t in trees_in(item)]
+    if isinstance(value, dict):
+        return [t for item in value.values() for t in trees_in(item)]
+    for member in field_values(value).values():
+        found += trees_in(member)
+    return found
+
+
+def _materialize_trees(payload: object, inv: Invocation) -> None:
+    """Bind every declared input tree to the root the GRANT materialized for it (§2).
+
+    An ungranted ref is a typed refusal here rather than a `FileNotFoundError` deep in the
+    body: a job that names a read it was never granted must not reach the filesystem at all.
+    """
+    if not declares_trees(type(payload)):
+        return
+    for tree in trees_in(payload):
+        granted = inv.trees.get(tree.ref)
+        if granted is None:
+            raise InvalidRequest(
+                f"input tree {tree.ref!r} is not granted to this attempt: this run "
+                f"materialized {sorted(inv.trees) or 'no trees'}. A tree is a digest-verified "
+                "READ CAPABILITY minted by the coordinator, never a path a job may name",
+                code="tree_ungranted",
+            )
+        root, digest = granted
+        if not root.is_dir():
+            raise InvalidRequest(
+                f"input tree {tree.ref!r} was granted at a location that is not a directory: "
+                "the coordinator minted this address, so this runtime substitutes none",
+                code="tree_unmaterialized",
+            )
+        bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
+
+
 def _hydrate(payload: object, inv: Invocation) -> None:
     """Materialize EVERY present asset field into the immutable attempt spool."""
+    _materialize_trees(payload, inv)
     if not declares_assets(type(payload)):
         return
     inputs = inv.spool / "inputs"
@@ -291,11 +361,11 @@ def _service(param: Param, attempt: Attempt, ctx: Context, inv: Invocation) -> o
         case "secrets":
             return Secrets(_settings_value(param.arg, inv.secrets, "secrets"))
         case "scratch":
-            return Scratch(attempt)
+            return Scratch(attempt, inv.scratch)
         case "checkpoints":
-            return Checkpoints(attempt)
+            return Checkpoints(attempt, inv.checkpoints)
         case "budget":
-            return Budget(attempt)
+            return Budget(attempt, inv.budget)
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
 

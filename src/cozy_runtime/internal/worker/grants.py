@@ -60,6 +60,13 @@ HUB_CALLS: tuple[HubCall, ...] = (
         "read one granted input asset (the payload rides the grant as an input)",
     ),
     HubCall(
+        "grant_tree_read",
+        "GET",
+        r"^file://(?P<path>/[\w./-]+)$",
+        ("input_id",),
+        "open one granted MATERIALIZED INPUT TREE (a job's typed model/dataset input)",
+    ),
+    HubCall(
         "grant_output_write",
         "PUT",
         r"^file://(?P<path>/[\w./-]+)$",
@@ -154,6 +161,41 @@ def read_input(grant: pb.DeliveryGrant, input_id: str, auth: Authorizer) -> byte
         f"the grant carries no input {input_id!r} (it has "
         f"{', '.join(e.input_id for e in grant.inputs) or 'none'})",
     )
+
+
+#: How a granted input TREE is spelled on a DeliveryGrant. The `input_id` carries the ref
+#: the job's typed field names, so the mapping from field value to grant is the ref itself.
+TREE_PREFIX = "tree:"
+
+
+def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Path, str]]:
+    """Every granted input tree, as `ref -> (root, declared digest)` (cr-009).
+
+    The BYTES of a tree are not re-hashed here and that is a layering statement, not a gap:
+    a tree is a materialized TensorFS snapshot, and its verification is the store's own —
+    the job reads it back through the verified read path, which re-checks every object it
+    actually touches (law 18, tfs-007). What this function enforces is the part it owns:
+    the grant must NAME the tree, the grant must be live, the call must be authorized, and
+    the address must actually be a directory. An ungranted ref never reaches a path at all.
+    """
+    if expired(grant):
+        raise GrantRefusal("grant_expired", "the delivery grant expired before the tree read")
+    out: dict[str, tuple[Path, str]] = {}
+    for entry in grant.inputs:
+        if not entry.input_id.startswith(TREE_PREFIX):
+            continue
+        ref = entry.input_id[len(TREE_PREFIX) :]
+        url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
+        auth.authorize("grant_tree_read", "GET", url, {"input_id": entry.input_id})
+        root = _local(entry.url, grant.file_base_url)
+        if not root.is_dir():
+            raise GrantRefusal(
+                "tree_not_a_directory",
+                f"{ref}: the grant names {root} as a materialized tree and it is not a "
+                "directory; the coordinator minted this address, so the worker substitutes none",
+            )
+        out[ref] = (root, "sha256:" + entry.digest.hex() if entry.digest else "")
+    return out
 
 
 def write_output(

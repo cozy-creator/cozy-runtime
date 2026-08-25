@@ -17,6 +17,7 @@ from cozy_runtime.author._assets import (
     AudioAsset,
     FileAsset,
     ImageAsset,
+    Tree,
     VideoAsset,
 )
 from cozy_runtime.author._context import (
@@ -67,10 +68,17 @@ from cozy_runtime.author._model import (
     uses_components,
 )
 from cozy_runtime.author._services import (
+    JOB_ONLY,
+    SERVING_ONLY,
     AdjustmentRow,
     Adjustments,
     Budget,
+    BudgetExhausted,
+    BudgetFacts,
+    CheckpointConflict,
+    CheckpointReceipt,
     Checkpoints,
+    CheckpointSave,
     Egress,
     EgressResponse,
     ImageFrame,
@@ -84,7 +92,9 @@ from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
     "DELETED_SURFACES",
+    "JOB_ONLY",
     "NEUTRAL_ERROR_SET",
+    "SERVING_ONLY",
     "AdapterRef",
     "AdjustmentRow",
     "Adjustments",
@@ -96,8 +106,13 @@ __all__ = [
     "Backend",
     "Bound",
     "Budget",
+    "BudgetExhausted",
+    "BudgetFacts",
     "Cancelled",
     "CapabilityError",
+    "CheckpointConflict",
+    "CheckpointReceipt",
+    "CheckpointSave",
     "Checkpoints",
     "Clamp",
     "Config",
@@ -145,6 +160,7 @@ __all__ = [
     "Surface",
     "Telemetry",
     "TensorSpec",
+    "Tree",
     "UnsupportedInput",
     "VideoAsset",
     "assert_declaration_shape",

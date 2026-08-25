@@ -38,6 +38,7 @@ from cozy_runtime.author import (
     Checkpoints,
     Context,
     DerivedCache,
+    FileAsset,
     ImageAsset,
     ImageFrame,
     InvalidRequest,
@@ -53,6 +54,7 @@ from cozy_runtime.author import (
     Settings,
     Shape,
     Telemetry,
+    Tree,
     UnsupportedInput,
     VideoAsset,
     uses_components,
@@ -654,17 +656,22 @@ def generate_ref(
 class DistillInput(msgspec.Struct, forbid_unknown_fields=True):
     steps: Annotated[int, msgspec.Meta(ge=1, le=10_000)]
     learning_rate: Annotated[float, msgspec.Meta(gt=0.0, le=1.0)] = 1e-4
-    resume_from: str | None = None
-    """Just another verified input field — not a reserved payload name (§2)."""
+    resume_from: Tree | None = None
+    """Just another verified input tree — not a reserved payload name (§2). Its PATH rides
+    the field value, so there is no context accessor to reach a checkpoint through."""
 
 
 class DistillResult(msgspec.Struct):
     steps_run: int
+    resumed_at: int
     final_loss: float
-    published_key: str
+    receipt: str
+    manifest: FileAsset
 
 
-@app.job(publishes=True, resources=Resources(gpu_count=2, placement="single_node"))
+@app.job(
+    publishes=True, emits_media=False, resources=Resources(gpu_count=2, placement="single_node")
+)
 def distill(
     ctx: Context,
     payload: DistillInput,
@@ -672,14 +679,33 @@ def distill(
     scratch: Scratch,
     ckpt: Checkpoints,
     budget: Budget,
+    out: Outputs,
     tel: Telemetry,
 ) -> DistillResult:
     """`gpu_count` is the override door's canonical case: a structural FLOOR neither code
-    nor measurement can discover pre-run. Everything else about this job is derived."""
-    del scratch, ckpt, budget  # cr-009 owns the bodies; the SIGNATURE is the declaration
-    loss = 1.0
-    for step in range(payload.steps):
+    nor measurement can discover pre-run. Everything else about this job is derived.
+
+    The loop is the shape every training job has: resumable scratch, a durable checkpoint
+    per interval, a spend check, and a run-to-completion return. Nothing here serves.
+    """
+    state = scratch.checkpoint_dir(key="distill")
+    marker = state / "step"
+    start = int(marker.read_text()) if marker.is_file() else 0
+    loss = 1.0 - payload.learning_rate * start
+    for step in range(start, payload.steps):
         ctx.raise_if_cancelled()
+        budget.raise_if_exhausted()
         loss *= 1.0 - payload.learning_rate
         tel.training_metric("loss", loss, step=step)
-    return DistillResult(payload.steps, loss, payload.resume_from or base.checkpoint_ref)
+        marker.write_text(str(step + 1))
+    receipt = ckpt.save("final", f"{loss:.9f}".encode(), operation_key=f"distill/{payload.steps}")
+    return DistillResult(
+        steps_run=payload.steps - start,
+        resumed_at=start,
+        final_loss=loss,
+        receipt=receipt.receipt_id,
+        manifest=out.save_bytes(
+            f"{base.checkpoint_ref} {payload.steps} {loss:.9f}\n".encode(),
+            media_type="text/plain",
+        ),
+    )

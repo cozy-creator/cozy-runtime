@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
+from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._walker import walk
 
@@ -66,18 +67,81 @@ def assert_declaration_shape(declaration: object) -> None:
             )
 
 
+def _separation(surface: Surface) -> None:
+    """The STRUCTURAL separation between a job and a serving entrypoint (§2, cr-009).
+
+    A job runs to completion: no streams, no slots, no warm state, and no caller sitting on
+    the other end of a request. The separation is not a review rule — the serving surface is
+    UNSPELLABLE from a job and the job surface is unspellable from an entrypoint, so a
+    mis-declared callable refuses at BUILD with the same verdict class as a schema violation.
+    """
+    job = surface.kind == "job"
+    forbidden = SERVING_ONLY if job else JOB_ONLY
+    reached = sorted(surface.capabilities & forbidden)
+    if reached:
+        raise ConformanceError(
+            f"{surface.name}: a {surface.kind} requests {', '.join(reached)} — "
+            + (
+                "that service writes the caller-visible adjustments envelope, and a "
+                "run-to-completion job has no caller to confess to (§2)"
+                if job
+                else "Scratch, Checkpoints and Budget are JOB services: durable working "
+                "state and a spend envelope belong to a bounded attempt, never to a "
+                "request handler on a warm serving loop (§2)"
+            ),
+            code="job_serving_separation",
+        )
+    if job and surface.preflight is not None:
+        raise ConformanceError(
+            f"{surface.name}: a job declares a preflight hook — preflight is the SERVING "
+            "pre-admission hook (it builds a schedule for a request that has not been "
+            "admitted); a job is submitted, accepted once, and runs to completion (§2)",
+            code="job_serving_separation",
+        )
+    if job and surface.demand_bound is not None:
+        raise ConformanceError(
+            f"{surface.name}: a job declares demand=Bound(…) — a demand envelope is a SERVING "
+            "admission fact used to route requests to warm capacity; a job declares structural "
+            "FLOORS through resources= and nothing else (§1.2/§2)",
+            code="job_serving_separation",
+        )
+    if not job and (surface.publishes or surface.emits_media):
+        raise ConformanceError(
+            f"{surface.name}: publishes=/emits_media= on an entrypoint — a publication "
+            "declaration is a JOB fact; an entrypoint's outputs ride its result (§2)",
+            code="job_serving_separation",
+        )
+    if (surface.publishes or surface.emits_media) and "save" not in surface.capabilities:
+        raise ConformanceError(
+            f"{surface.name}: declares publishes/emits_media but its signature names no "
+            "Outputs — grants mint off the DECLARATION, so a declaration the body cannot "
+            "act on would grant a destination nothing can write (§2)",
+            code="publication_declaration",
+        )
+
+
 def check(surface: Surface) -> Surface:
     """Every build-time refusal that needs the WHOLE surface, not just one signature."""
     assert_declaration_shape(surface.payload_type)
     assert_declaration_shape(surface.result_type)
     specs = feature_specs(surface.payload_type)
+    _separation(surface)
 
+    # A JOB's `gpu_count` is the override door's CANONICAL case (§1.2/§2): a floor is the
+    # number of devices a materialization structurally requires, and a job that shards across
+    # four cards through its own library declares no Model parameter at all. The serving rule
+    # stands unchanged — there, `gpu` derives from the signature and nothing overrides it.
     override = surface.resources
-    if override is not None and override.gpu_count is not None and not surface.gpu:
+    if (
+        surface.kind != "job"
+        and override is not None
+        and override.gpu_count is not None
+        and not surface.gpu
+    ):
         raise ConformanceError(
-            f"{surface.name}: resources=Resources(gpu_count=…) on a signature with no Model "
-            "parameter — gpu DERIVES from the signature; the override door is for structural "
-            "floors only (§1.2)",
+            f"{surface.name}: resources=Resources(gpu_count=…) on a signature with no "
+            "Model parameter — gpu DERIVES from the signature; the override door is for "
+            "structural floors only (§1.2)",
             code="resources_override",
         )
 

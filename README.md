@@ -156,6 +156,7 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
     corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
     corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
+    corpus/.venv/bin/python scripts/job-live.py all          # cr-009: the @job surface, services and runner
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
@@ -184,3 +185,12 @@ bindings. Author code never names an artifact identifier; a fence proves it.
 
 `run` · `serve` · `job` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit` land in
 cr-016 over the real attempt kernel.
+
+**Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
+`@app.job` over the one invocation kernel, the same supervisor/executor split, the same
+journal, the same output transaction. What differs is stated out loud and is short — a
+`JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
+(serving never accepts-then-cold-loads; a job has nothing to be warm for), the three job
+services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose path rides
+the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
+project: a structural census over the real 6.9 GB cozytensors store, read-only.
