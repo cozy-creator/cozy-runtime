@@ -12,7 +12,8 @@ recording what it did, plus time/memory benchmarks.
 | package | role | may import |
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
-| `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, stdlib |
+| `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
+| `cozy_runtime.protocol` | `cozy.worker.v1` — th-024's bindings, COPIED, plus the document plane | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local-coordinator adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -25,8 +26,29 @@ runtime.
 
 `internal/config.py` is the only module permitted to read process environment: one read at
 the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second read refuses.
-`internal/child_env.py` holds the device-child env projection allowlist as data (the seal
-ordering itself is cr-007). `internal/exits.py` is the one shared exit-code matrix.
+`internal/child_env.py` holds the device-child env projection allowlist as data;
+`internal/spawn.py` executes the seal (ERASE -> IMPOSE -> SEAL) around it.
+`internal/exits.py` is the one shared exit-code matrix.
+
+## The two processes
+
+    coordinator ──gRPC cozy.worker.v1──▶ supervisor (no CUDA) ──seam──▶ executor (CUDA)
+
+| module | role |
+|---|---|
+| `internal/worker/session.py` | the protocol client and the supervisor entrypoint |
+| `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, warm pass |
+| `internal/worker/plan.py` | host/pinned ledger, PlanChooser, ExecutorPreparer |
+| `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
+| `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
+| `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
+| `internal/seam.py` | the control-only, byte-accounted supervisor<->executor channel |
+| `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
+| `internal/executor.py` | the disposable device process — the ONE torch importer |
+
+The supervisor never imports torch, and that is proved against the RUNNING process
+(`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
+list), not against the import graph.
 
 ## The descriptor
 

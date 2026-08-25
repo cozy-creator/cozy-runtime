@@ -1,0 +1,12 @@
+# The real-GPU endpoint cr-007 serves. Bindings state SELECTION; the code names nothing.
+#
+# The binding below is the in-repo DEFAULT and never authority: the worker serves whatever
+# its Directive's EntrypointBindingPlan resolves to, which for this verification is the
+# local record under `<cozy_home>/binding-plans/`.
+
+[application]
+object = "sdxl_gpu:app"
+
+[bindings."SdxlUnetModel"]
+repo = "cozy/sdxl-unet"
+release = "cr-005"
