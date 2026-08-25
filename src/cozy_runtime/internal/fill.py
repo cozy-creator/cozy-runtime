@@ -423,9 +423,7 @@ class StagingRing:
                 self.window_bytes, dtype=torch.uint8, pin_memory=True, device="cpu"
             )
             block = (ctypes.c_ubyte * buffer.numel()).from_address(buffer.data_ptr())
-            self.slots.append(
-                Slot(buffer, memoryview(block).cast("B"), buffer.data_ptr())
-            )
+            self.slots.append(Slot(buffer, memoryview(block).cast("B"), buffer.data_ptr()))
         self.waits = 0
 
     def take(self, slot: Slot) -> None:
@@ -644,10 +642,7 @@ class StreamingFillBackend:
             self.state = "ready"
             return
         missing = [
-            key
-            for name, keys in self.expected.items()
-            for key in keys
-            if key not in self.enqueued
+            key for name, keys in self.expected.items() for key in keys if key not in self.enqueued
         ]
         if missing:
             raise _refuse(
@@ -787,9 +782,7 @@ class StreamingFillBackend:
                     f"{key}: segments carry {cursor - start} B for a {row.nbytes} B tensor",
                     [key],
                 )
-            placements.append(
-                (start, cursor, tensor.view(-1).view(self.torch.uint8))
-            )
+            placements.append((start, cursor, tensor.view(-1).view(self.torch.uint8)))
         return segments, placements
 
     def _stream(self, ring: StagingRing) -> int:
@@ -810,8 +803,7 @@ class StreamingFillBackend:
         starts = [p[0] for p in placements]
         seg_starts = [s[0] for s in segments]
         windows = [
-            (at, min(self.window_bytes, total - at))
-            for at in range(0, total, self.window_bytes)
+            (at, min(self.window_bytes, total - at)) for at in range(0, total, self.window_bytes)
         ]
         free: queue.Queue[Slot] = queue.Queue()
         for slot in ring.slots:
@@ -820,9 +812,7 @@ class StreamingFillBackend:
         pending = iter(windows)
         guard = threading.Lock()
         stop = threading.Event()
-        cut = (
-            int(len(windows) * self.interrupt_at) if self.interrupt_at is not None else -1
-        )
+        cut = int(len(windows) * self.interrupt_at) if self.interrupt_at is not None else -1
 
         def read_window(at: int, count: int, slot: Slot) -> None:
             index = bisect.bisect_right(seg_starts, at) - 1
@@ -975,6 +965,5 @@ def read_plan(path: str | Path, component: str | None = None) -> list[PlanRow]:
 def topology(plan: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     """The checkpoint topology table the loader matches the code against."""
     return {
-        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes)
-        for row in plan
+        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes) for row in plan
     }

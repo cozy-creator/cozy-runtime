@@ -86,12 +86,11 @@ def _value(node: Any, path: str, spool: Path) -> Any:
                 continue
         raise _Stop(f"{path}: no union member is synthesizable")
     if "list" in node or "set" in node:
-        return []          # the neutral list is the empty one
+        return []  # the neutral list is the empty one
     if "map" in node:
         return {}
     if "tuple" in node:
-        return [_value(member, f"{path}[{i}]", spool)
-                for i, member in enumerate(node["tuple"])]
+        return [_value(member, f"{path}[{i}]", spool) for i, member in enumerate(node["tuple"])]
     if "struct_ref" in node:
         raise _Stop(f"{path}: recursive struct has no bounded neutral value")
     raise _Stop(f"{path or 'payload'}: unrecognized schema node")
@@ -145,7 +144,7 @@ def _primitive(name: str, path: str) -> Any:
     if name == "null":
         return None
     if name == "bytes":
-        return ""            # base64 of zero bytes
+        return ""  # base64 of zero bytes
     raise _Stop(f"{path}: {name} has no neutral value")
 
 

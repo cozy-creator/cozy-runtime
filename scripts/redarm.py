@@ -58,8 +58,7 @@ LIVE_ARMS = (
     ),
     (
         "one-config-authority",
-        "from cozy_runtime.internal.config import read_config\n"
-        "read_config({}); read_config({})\n",
+        "from cozy_runtime.internal.config import read_config\nread_config({}); read_config({})\n",
         "exactly one config authority",
     ),
 )

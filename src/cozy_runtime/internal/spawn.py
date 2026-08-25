@@ -110,6 +110,4 @@ def interpreter() -> str:
 
 def env_fingerprint(names: Mapping[str, str]) -> str:
     """A cheap stable fingerprint for logging a seal without printing its values."""
-    return hashlib.blake2b(
-        canonical.write(dict(sorted(names.items()))), digest_size=8
-    ).hexdigest()
+    return hashlib.blake2b(canonical.write(dict(sorted(names.items()))), digest_size=8).hexdigest()

@@ -105,9 +105,7 @@ class AttemptRefusal(Exception):
     """A typed refusal that becomes a REFUSED terminal (or a dropped message, when the
     fence says the message was never ours to read)."""
 
-    def __init__(
-        self, code: str, detail: str, *, cause: pb.CauseCode, drop: bool = False
-    ) -> None:
+    def __init__(self, code: str, detail: str, *, cause: pb.CauseCode, drop: bool = False) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
@@ -172,7 +170,7 @@ class AttemptEngine:
         self.instance_id = instance_id
         self.send = send
         self.progress = progress
-        self.live: dict[str, Attempt] = {}      # request_id -> the attempt held right now
+        self.live: dict[str, Attempt] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], Attempt] = {}
         self.session_id = ""
         self.recovered: list[pb.ActiveAttempt] = []
@@ -224,7 +222,7 @@ class AttemptEngine:
         if held is not None:
             if held.attempt == start.attempt:
                 held.grant = start.grant  # a refresh swaps authority; identity never moves
-                return held               # idempotent: re-send AttemptAccepted, run once
+                return held  # idempotent: re-send AttemptAccepted, run once
             if held.state in ("accepted", "running"):
                 raise AttemptRefusal(
                     "live_attempt_supersession",
@@ -421,9 +419,7 @@ class AttemptEngine:
                     "spool": str(spool),
                 },
                 timeout=None,
-                on_progress=lambda frame: self.progress(
-                    attempt.request_id, attempt.attempt, frame
-                ),
+                on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -579,9 +575,7 @@ class AttemptEngine:
                 row = produced[output_id]
                 blob = self._blob(spool, str(row["asset_ref"]))
                 if blob is None:
-                    return None, (
-                        f"output {output_id} has no bytes in the attempt spool"
-                    )
+                    return None, (f"output {output_id} has no bytes in the attempt spool")
                 entries.append(
                     grants.write_output(
                         attempt.grant, output_id, blob.read_bytes(), self.authorizer
@@ -730,7 +724,7 @@ class AttemptEngine:
                 for row in reply.get("adjustments", ())
             ],
         )
-        envelope.inline_result = data     # the oversize case never reaches here (§3.4)
+        envelope.inline_result = data  # the oversize case never reaches here (§3.4)
         return envelope
 
     def attest(
@@ -886,12 +880,11 @@ class AttemptEngine:
             if row["state"] == "closed":
                 continue
             digest = documents.raw(row["exec_spec_digest"])
-            authorized = (
-                row.get("instance_id") == self.instance_id
-                and row.get("exec_spec_digest") == documents.spell(digest)
-            )
+            authorized = row.get("instance_id") == self.instance_id and row.get(
+                "exec_spec_digest"
+            ) == documents.spell(digest)
             if not authorized:
-                continue   # the three-authorization rule: unauthorized never replays
+                continue  # the three-authorization rule: unauthorized never replays
             attempt = Attempt(
                 request_id=request_id,
                 attempt=number,

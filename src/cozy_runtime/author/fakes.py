@@ -99,9 +99,7 @@ class TelemetryRecorder(Telemetry):
 
     def stages(self) -> Mapping[str, float]:
         return {
-            e.name: e.value
-            for e in self.events
-            if e.kind == "stage" and isinstance(e.value, float)
+            e.name: e.value for e in self.events if e.kind == "stage" and isinstance(e.value, float)
         }
 
 
@@ -119,9 +117,7 @@ def fake_outputs(attempt: Attempt | None = None, **kwargs: Any) -> OutputsRecord
     return OutputsRecorder(attempt or fake_attempt(**kwargs))
 
 
-def fake_telemetry(
-    attempt: Attempt | None = None, ctx: Context | None = None
-) -> TelemetryRecorder:
+def fake_telemetry(attempt: Attempt | None = None, ctx: Context | None = None) -> TelemetryRecorder:
     return TelemetryRecorder(attempt or fake_attempt(), ctx or fake_context())
 
 
@@ -129,9 +125,7 @@ def fake_adjustments(attempt: Attempt | None = None) -> AdjustmentsRecorder:
     return AdjustmentsRecorder(attempt or fake_attempt())
 
 
-def fake_egress(
-    respond: Callable[..., Any], attempt: Attempt | None = None
-) -> Egress:
+def fake_egress(respond: Callable[..., Any], attempt: Attempt | None = None) -> Egress:
     """An `Egress` over a local responder. The real broker, allowlist and SSRF fail-closed
     path are cr-012's; this proves only injection and the capability."""
     return Egress(attempt or fake_attempt(), respond)

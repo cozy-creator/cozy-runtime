@@ -135,13 +135,17 @@ def main() -> int:
     print(f"  factory:      {record.factory_identity}")
     print(f"  components:   {', '.join(record.components)}")
     print(f"  schedulers:   {', '.join(record.schedulers)}")
-    print(f"  destinations: {len(record.destinations)} logical tensors, "
-          f"{record.filled} filled, {record.filled_bytes} bytes through the backend")
+    print(
+        f"  destinations: {len(record.destinations)} logical tensors, "
+        f"{record.filled} filled, {record.filled_bytes} bytes through the backend"
+    )
     print(f"  topology:     {record.topology_digest}")
     print(f"  identity:     {record.identity}")
     print(f"  checkpoint:   {model.checkpoint_ref}")
-    print(f"  load(T) sugar is legal for the REGISTERED adapters only: "
-          f"{', '.join(registered_adapters())}")
+    print(
+        f"  load(T) sugar is legal for the REGISTERED adapters only: "
+        f"{', '.join(registered_adapters())}"
+    )
 
     head("derive == serve — the SAME factory and config bytes construct both graphs")
     derived = ModelRegistry(release=RELEASE, backend=None)
@@ -160,8 +164,10 @@ def main() -> int:
     print(f"  narrow artifact: {len(nr.destinations)} destinations {nr.topology_digest}")
     print(f"  dual artifact:   {len(dur.destinations)} destinations {dur.topology_digest}")
     print(f"  same destination graph: {nr.topology_digest == dur.topology_digest}")
-    print(f"  the dual's other transformer is an unbound SIBLING, not an extra key: "
-          f"{dur.ignored_extras == ()}")
+    print(
+        f"  the dual's other transformer is an unbound SIBLING, not an extra key: "
+        f"{dur.ignored_extras == ()}"
+    )
 
     head("baked vs full — the modulation source is a CONSTRUCTION fact, not a mode")
     baked = ModelRegistry(release=RELEASE, backend=StagedBackend())
@@ -169,19 +175,27 @@ def main() -> int:
         "generate.models.model", h3.Fl2VAModel, art.h3(task="fl2va", baked=True)
     )
     br = baked.generations()[0].record
-    print(f"  full  topology: {len(record.destinations)} destinations, "
-          f"modulation={type(model.modulation).__name__}")
-    print(f"  baked topology: {len(br.destinations)} destinations, "
-          f"modulation={type(baked_model.modulation).__name__}")
+    print(
+        f"  full  topology: {len(record.destinations)} destinations, "
+        f"modulation={type(model.modulation).__name__}"
+    )
+    print(
+        f"  baked topology: {len(br.destinations)} destinations, "
+        f"modulation={type(baked_model.modulation).__name__}"
+    )
     leaves = {d.key.split(".")[-1] for d in br.destinations}
-    print("  baked OMITS the AdaLN projections and CARRIES exact tables: "
-          f"{sorted(leaves - {d.key.split('.')[-1] for d in record.destinations})}")
+    print(
+        "  baked OMITS the AdaLN projections and CARRIES exact tables: "
+        f"{sorted(leaves - {d.key.split('.')[-1] for d in record.destinations})}"
+    )
 
     head("construction identity — equal coalesces ONE generation, unequal stays distinct")
     coalescing, _ = sdxl_registry()
     instances = {id(g.model) for g in coalescing.generations()}
-    print(f"  3 SDXL binding paths, 1 artifact -> {len(coalescing.generations())} generation(s), "
-          f"{len(instances)} instance(s)")
+    print(
+        f"  3 SDXL binding paths, 1 artifact -> {len(coalescing.generations())} generation(s), "
+        f"{len(instances)} instance(s)"
+    )
     for generation in coalescing.generations():
         print(f"    {generation.identity}")
         print(f"      paths: {', '.join(generation.paths)}")
@@ -191,8 +205,10 @@ def main() -> int:
     split.acquire("plan.models.model", ep.SdxlModel, art.named(a, "cozy/tiny-sdxl@v2#9f9f"))
     print(f"  a different artifact snapshot -> {len(split.generations())} generations")
     twins, _, _ = h3_registry()
-    print(f"  H3's two ROLE CLASSES on ONE dual artifact -> {len(twins.generations())} generations "
-          "(identity includes the class)")
+    print(
+        f"  H3's two ROLE CLASSES on ONE dual artifact -> {len(twins.generations())} generations "
+        "(identity includes the class)"
+    )
 
     # ---------------------------------------------------------------- invocation
     head("generate — a real attempt through the real kernel")
@@ -206,8 +222,10 @@ def main() -> int:
     print(f"  outputs:     {env.outputs}")
     print(f"  features:    {env.features.values} {env.features.digest}")
     print(f"  overlay:     {env.overlay_digest}")
-    print(f"  telemetry:   {len(env.telemetry)} events, "
-          f"stages={[e.name for e in env.telemetry if e.kind == 'stage']}")
+    print(
+        f"  telemetry:   {len(env.telemetry)} events, "
+        f"stages={[e.name for e in env.telemetry if e.kind == 'stage']}"
+    )
     print(f"  encoded PNG: {env.outputs[0]['size_bytes']} bytes, {env.outputs[0]['digest']}")
 
     head("H3 — component-staged, granular scopes, both operation twins")
@@ -238,10 +256,14 @@ def main() -> int:
         settings=h3.RefServeSettings(),
     )
     print(f"  ref2va: {ref.result}")
-    print(f"  ordered union: 3 references (image, soundtracked video, audio) hydrated, "
-          f"facts={ref.facts_digest}")
-    print(f"  the two twins are separate instances over shared components: "
-          f"{id(fl_model) != id(ref_model)}")
+    print(
+        f"  ordered union: 3 references (image, soundtracked video, audio) hydrated, "
+        f"facts={ref.facts_digest}"
+    )
+    print(
+        f"  the two twins are separate instances over shared components: "
+        f"{id(fl_model) != id(ref_model)}"
+    )
 
     head("RequestView — exactly three SDK members, fresh schedulers per request")
     ctx = fake_context(request_id="view-demo")
@@ -252,8 +274,10 @@ def main() -> int:
     print(f"  fresh instance per call: {s1 is not s2}, family={s1.config['family']}")
     print(f"  same seed -> same stream: {view_a.generator.random() == view_b.generator.random()}")
     sampled = fl_model.for_request(ctx, seed=11, sampler="dpm")
-    print(f"  sampler validated against the family table: "
-          f"{sampled.make_scheduler('video_scheduler').config}")
+    print(
+        f"  sampler validated against the family table: "
+        f"{sampled.make_scheduler('video_scheduler').config}"
+    )
     print(f"  adapters (immutable applied stack): {view_a.adapters}")
 
     head("DerivedCache — a miss builds under the ACTIVE scope, a hit reuses it")
@@ -271,8 +295,10 @@ def main() -> int:
     replan = h3.start_run(view, plan, task="fl2va", steps=8, checkpoint=cached.checkpoint_ref)
     cached.denoise(replan, condition, frames=39)
     counts.append(live.cache.entries)
-    print(f"  entries: start={counts[0]} miss->{counts[1]} hit->{counts[2]} "
-          f"another exact plan->{counts[3]}")
+    print(
+        f"  entries: start={counts[0]} miss->{counts[1]} hit->{counts[2]} "
+        f"another exact plan->{counts[3]}"
+    )
     print(f"  {live.cache!r}")
     print(f"  key: {cache_run.modulation_key}")
 
@@ -288,8 +314,10 @@ def main() -> int:
             models=registry.models("generate"),
         )
         seen[name] = (out.outputs[0]["digest"], backend_impl.route, len(backend_impl.events))
-        print(f"  {name:<9} route={backend_impl.route:<9} fills={len(backend_impl.events):<3} "
-              f"digest={out.outputs[0]['digest'][:28]}…")
+        print(
+            f"  {name:<9} route={backend_impl.route:<9} fills={len(backend_impl.events):<3} "
+            f"digest={out.outputs[0]['digest'][:28]}…"
+        )
     same_output = seen["staged"][0] == seen["resident"][0]
     other_route = seen["staged"][1] != seen["resident"][1]
     print(f"  identical output, different route: {same_output and other_route}")
@@ -330,10 +358,12 @@ def main() -> int:
 
     # ---------------------------------------------------------------- overlay
     head("ModelDefault overlay — code <- checkpoint <- adapter <- explicit <- clamp")
-    checkpoint = Recipe("checkpoint:anime-v3", "checkpoint", {"num_inference_steps": 28,
-                                                             "guidance_scale": 7.5})
-    turbo = Recipe("adapter:turbo-lora", "adapter", {"num_inference_steps": 4,
-                                                     "guidance_scale": 0.0})
+    checkpoint = Recipe(
+        "checkpoint:anime-v3", "checkpoint", {"num_inference_steps": 28, "guidance_scale": 7.5}
+    )
+    turbo = Recipe(
+        "adapter:turbo-lora", "adapter", {"num_inference_steps": 4, "guidance_scale": 0.0}
+    )
     for label, recipes, wire in (
         ("code only", (), {"prompt": "p"}),
         ("checkpoint", (checkpoint,), {"prompt": "p"}),
@@ -344,13 +374,18 @@ def main() -> int:
             ep.app.get("plan"), wire, models=models.models("plan"), recipes=recipes
         )
         rows = [f"{r.kind}:{r.field}={r.applied}<-{r.source}" for r in out.adjustments]
-        print(f"  {label:<17} steps={out.result.steps:<3} overlay={out.overlay_digest[:24]}… "
-              f"rows={rows}")
+        print(
+            f"  {label:<17} steps={out.result.steps:<3} overlay={out.overlay_digest[:24]}… "
+            f"rows={rows}"
+        )
 
     head("two-layer clamp — API bounds REJECT, deployment policy CLAMPS visibly")
     try:
-        invoke_with_fakes(ep.app.get("plan"), {"prompt": "p", "num_inference_steps": 99},
-                          models=models.models("plan"))
+        invoke_with_fakes(
+            ep.app.get("plan"),
+            {"prompt": "p", "num_inference_steps": 99},
+            models=models.models("plan"),
+        )
     except Exception as exc:
         print(f"  API bound (le=50): {type(exc).__name__}: {exc}")
     clamped = invoke_with_fakes(
@@ -377,19 +412,27 @@ def main() -> int:
     print(f"  seed 7 twice same digest: {env.outputs[0]['digest'] == again.outputs[0]['digest']}")
     print(f"  seed 8 differs:           {env.outputs[0]['digest'] != other.outputs[0]['digest']}")
     unseeded = invoke_with_fakes(
-        ep.app.get("generate"), {"prompt": "x"}, models=models.models("generate"),
+        ep.app.get("generate"),
+        {"prompt": "x"},
+        models=models.models("generate"),
         request_id="req-A",
     )
     unseeded_again = invoke_with_fakes(
-        ep.app.get("generate"), {"prompt": "x"}, models=models.models("generate"),
+        ep.app.get("generate"),
+        {"prompt": "x"},
+        models=models.models("generate"),
         request_id="req-A",
     )
-    print("  unseeded is derived from request_id, stable: "
-          f"{unseeded.outputs[0]['digest'] == unseeded_again.outputs[0]['digest']}")
+    print(
+        "  unseeded is derived from request_id, stable: "
+        f"{unseeded.outputs[0]['digest'] == unseeded_again.outputs[0]['digest']}"
+    )
 
     head("ctx.boot_warmup — a real Context fact the handler cheapens off")
     warm = invoke_with_fakes(
-        ep.app.get("generate"), {"prompt": "x"}, models=models.models("generate"),
+        ep.app.get("generate"),
+        {"prompt": "x"},
+        models=models.models("generate"),
         boot_warmup=True,
     )
     print(f"  warm pass telemetry events: {len(warm.telemetry)} (cold: {len(env.telemetry)})")
@@ -406,8 +449,10 @@ def main() -> int:
     print(f"  handler rows:  {ref_env.adjustments}")
     print(f"  result:        {ref_env.result}")
     plain = invoke_with_fakes(
-        ep.app.get("generate_ref"), {"prompt": "no reference"},
-        models=models.models("generate_ref"), settings=ep.RefSettings(),
+        ep.app.get("generate_ref"),
+        {"prompt": "no reference"},
+        models=models.models("generate_ref"),
+        settings=ep.RefSettings(),
     )
     print(f"  no-reference facts digest differs: {plain.facts_digest != ref_env.facts_digest}")
 
@@ -428,8 +473,10 @@ def main() -> int:
         )
     except Exception as exc:
         print(f"  preflight refusal: {type(exc).__name__}: {exc}")
-    print(f"  spool contents after the refusal: {sorted(p.name for p in spool.iterdir())} "
-          f"— the asset was never hydrated")
+    print(
+        f"  spool contents after the refusal: {sorted(p.name for p in spool.iterdir())} "
+        f"— the asset was never hydrated"
+    )
     shutil.rmtree(spool)
     reference.unlink()
     clip.unlink()
@@ -465,8 +512,10 @@ def main() -> int:
     )
     out_rec.assert_saved(count=1, kind="image")
     print(f"  returned:  {result}")
-    print(f"  recorded:  {[a.ref for a in out_rec.saved]} "
-          f"({out_rec.saved[0].size_bytes} bytes through the REAL encode path)")
+    print(
+        f"  recorded:  {[a.ref for a in out_rec.saved]} "
+        f"({out_rec.saved[0].size_bytes} bytes through the REAL encode path)"
+    )
     print(f"  telemetry: {len(tel_rec.events)} events, stages={dict(tel_rec.stages())}")
 
     adj_rec = fake_adjustments(fake_attempt("adj"))
@@ -520,9 +569,7 @@ def temp_project(module: str) -> Path:
 
 def descriptor_sections() -> None:
     head("describe — the isolation boundary over every fixture")
-    projects = [("tiny_h3", ROOT / "examples")] + [
-        (m, temp_project(m)) for m in ("tiny_sdxl",)
-    ]
+    projects = [("tiny_h3", ROOT / "examples")] + [(m, temp_project(m)) for m in ("tiny_sdxl",)]
     bodies = {}
     for module, project in projects:
         start = time.perf_counter()
@@ -555,19 +602,21 @@ def descriptor_sections() -> None:
     installed = Refusing()
     before = len(registered_adapters())
     body = descriptor.build(discover(ROOT / "examples"))
-    print(f"  0 fills through {type(installed).__name__}; construction adapters unchanged: "
-          f"{before} -> {len(registered_adapters())}")
-    print(f"  the descriptor names {len(body['entrypoints']) + len(body['jobs'])} callables and "
-          "0 checkpoints — a model parameter is a TYPE at this clock")
+    print(
+        f"  0 fills through {type(installed).__name__}; construction adapters unchanged: "
+        f"{before} -> {len(registered_adapters())}"
+    )
+    print(
+        f"  the descriptor names {len(body['entrypoints']) + len(body['jobs'])} callables and "
+        "0 checkpoints — a model parameter is a TYPE at this clock"
+    )
 
     head("`def` and `async def` describe IDENTICALLY — the spelling is not a caller fact")
     sync_app, async_app = App(), App()
     sync_app.entrypoint(name="handle")(spelling_plain)
     async_app.entrypoint(name="handle")(spelling_async)
     pair = [
-        canonical.write(
-            {"entrypoints": [_callable_doc(s) for s in describe(a)]}
-        )
+        canonical.write({"entrypoints": [_callable_doc(s) for s in describe(a)]})
         for a in (sync_app, async_app)
     ]
     print(f"  plain def:  {hashlib.sha256(pair[0]).hexdigest()[:32]}…")
@@ -594,8 +643,10 @@ def descriptor_sections() -> None:
         moved = descriptor.surface_digest(mutated) != base
         print(f"  {what:34} digest moved: {moved}")
     reordered = json.loads(json.dumps(bodies["tiny_h3"], indent=8))
-    print(f"  {'reformatted JSON (whitespace only)':34} digest moved: "
-          f"{descriptor.surface_digest(reordered) != base}")
+    print(
+        f"  {'reformatted JSON (whitespace only)':34} digest moved: "
+        f"{descriptor.surface_digest(reordered) != base}"
+    )
 
     head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
     committed = canonical.write(bodies["tiny_h3"])
@@ -604,12 +655,16 @@ def descriptor_sections() -> None:
     for label, artifact in configs:
         model = registry.acquire("generate.models.model", h3.Fl2VAModel, artifact)
         record = registry.record_for(model) if hasattr(registry, "record_for") else None
-        print(f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
-              + (f", {len(record.destinations)} destinations" if record else ""))
+        print(
+            f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
+            + (f", {len(record.destinations)} destinations" if record else "")
+        )
     rederived = canonical.write(descriptor.build(discover(ROOT / "examples")))
     print(f"  descriptor after both bindings: byte-unchanged = {rederived == committed}")
-    print(f"  generations now live in the registry: {len(registry.generations())} — "
-          "candidate facts, on a different clock")
+    print(
+        f"  generations now live in the registry: {len(registry.generations())} — "
+        "candidate facts, on a different clock"
+    )
 
     head("canonical bytes — the tensorfs vector join (tfs-013 owns the writer rules)")
     # Where the two profiles part, and why. tfs restricts its own header codec harder than
@@ -635,8 +690,10 @@ def descriptor_sections() -> None:
         profile_only += not agree
         note = "" if agree else f"  <- {relaxed[case.stem]}"
         print(f"  {case.stem:22} tfs refuses {verdict['code']:22} cozy {got}{note}")
-    print(f"  {shared}/{shared + profile_only} refusals SHARED at the canonical layer; "
-          f"{profile_only} are deliberate profile differences, each accounted for above")
+    print(
+        f"  {shared}/{shared + profile_only} refusals SHARED at the canonical layer; "
+        f"{profile_only} are deliberate profile differences, each accounted for above"
+    )
 
     head("the neutral author-error set at the invocation boundary")
 
@@ -654,10 +711,14 @@ def descriptor_sections() -> None:
     )
     for error in raised:
         outcome = classify(error)
-        print(f"  {type(error).__name__ if error else 'success':18} -> "
-              f"{outcome.terminal:9} origin={outcome.origin:8} code={outcome.code}")
-    print(f"  Outcome members: {[f.name for f in dataclasses.fields(Outcome)]} — "
-          "no retryable, no retry_after, no fatal; the coordinator projects those")
+        print(
+            f"  {type(error).__name__ if error else 'success':18} -> "
+            f"{outcome.terminal:9} origin={outcome.origin:8} code={outcome.code}"
+        )
+    print(
+        f"  Outcome members: {[f.name for f in dataclasses.fields(Outcome)]} — "
+        "no retryable, no retry_after, no fatal; the coordinator projects those"
+    )
 
     head("byte-identical reproduction across two REAL venvs of one release")
     reproduce()
@@ -689,7 +750,9 @@ def reproduce() -> None:
         ):
             out = subprocess.run(
                 [*argv, "describe", "--dir", "examples", "--json"],
-                cwd=ROOT, capture_output=True, env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
+                cwd=ROOT,
+                capture_output=True,
+                env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
             )
             runs.append((label, hashlib.sha256(out.stdout).hexdigest(), len(out.stdout)))
         for label, digest, size in runs:

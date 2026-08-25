@@ -189,8 +189,11 @@ class ExecutorSupervision:
             self.incarnation += 1
             self.readiness_epoch += 1
         self.spawns += 1
-        imposed = {**imposed, "COZY_EXECUTOR_SOCKET": self.socket_path,
-                   "COZY_HOME": str(self.cozy_home)}
+        imposed = {
+            **imposed,
+            "COZY_EXECUTOR_SOCKET": self.socket_path,
+            "COZY_HOME": str(self.cozy_home),
+        }
         started = time.perf_counter()
         spawned = spawn.spawn_executor(
             python=self.python,

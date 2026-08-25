@@ -211,9 +211,7 @@ class PackedLayout:
     rows: tuple[tuple[str, int], ...]
 
     @classmethod
-    def build(
-        cls, plan: H3Plan, *, visual: Sequence[int], audio: Sequence[int]
-    ) -> PackedLayout:
+    def build(cls, plan: H3Plan, *, visual: Sequence[int], audio: Sequence[int]) -> PackedLayout:
         rows = [("visual", v) for v in visual] + [("audio", a) for a in audio]
         return cls((*rows, ("target", plan.frames)))
 
@@ -258,8 +256,7 @@ class TimestepPlan:
         a = audio.set_timesteps(steps) if hasattr(audio, "set_timesteps") else ()
         pairs = tuple(zip(v, a, strict=True))
         subject = (
-            f"{task}|{has_visual}|{has_audio}|{pairs}|{video.config}|{audio.config}|"
-            f"{_TABLE_FORMAT}"
+            f"{task}|{has_visual}|{has_audio}|{pairs}|{video.config}|{audio.config}|{_TABLE_FORMAT}"
         )
         return cls(pairs, hashlib.blake2b(subject.encode(), digest_size=12).hexdigest())
 
@@ -479,9 +476,7 @@ class _H3Base(Model[MiniMaxH3ModularPipeline]):
             for r in plan.references
             if r.visual is not None
         )
-        keys = tuple(
-            self.pipe.blocks.encode_visual(k.image, clock=k.clock) for k in plan.keyframes
-        )
+        keys = tuple(self.pipe.blocks.encode_visual(k.image, clock=k.clock) for k in plan.keyframes)
         return refs + keys
 
     @uses_components("audio_vae")
@@ -536,7 +531,11 @@ class Fl2VAModel(_H3Base, task="fl2va"):
 
     @uses_components("fl2va_transformer")
     def denoise(
-        self, run: H3Run, cond: H3Conditioning, *, frames: int,
+        self,
+        run: H3Run,
+        cond: H3Conditioning,
+        *,
+        frames: int,
         on_step: Callable[[int], None] | None = None,
     ) -> H3Latents:
         return self._denoise(run, cond, "fl2va_transformer", frames=frames, on_step=on_step)
@@ -548,7 +547,11 @@ class Ref2VAModel(_H3Base, task="ref2va"):
 
     @uses_components("ref2va_transformer")
     def denoise(
-        self, run: H3Run, cond: H3Conditioning, *, frames: int,
+        self,
+        run: H3Run,
+        cond: H3Conditioning,
+        *,
+        frames: int,
         on_step: Callable[[int], None] | None = None,
     ) -> H3Latents:
         return self._denoise(run, cond, "ref2va_transformer", frames=frames, on_step=on_step)

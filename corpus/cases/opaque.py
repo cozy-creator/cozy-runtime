@@ -176,19 +176,47 @@ def _c_extension(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("custom_op_no_meta_kernel", "a torch.library op with a CPU impl and no Meta impl",
-         _custom_op_no_meta, "typed-harness-gap", names="opaque_table",
-         note="the fix lane is a meta kernel in the endpoint's own op, or this refusal"),
-    Case("custom_op_with_meta_kernel", "the same op WITH a registered Meta impl",
-         _custom_op_with_meta, "derived-correct",
-         note="a meta kernel is a shape function — the only fact a derivation needs"),
-    Case("triton_kernel_arming", "a Triton kernel launched during construction",
-         _triton_kernel, "typed-refusal", names="device pin", ground_truth=False),
-    Case("wrapper_subclass_param", "a traceable wrapper subclass as a Parameter "
-         "(the pgw#1661 shape)", _subclass_param, "derived-correct",
-         note="is_virtual must recurse; the outer metadata is not the answer"),
-    Case("torch_function_param", "a __torch_function__ subclass intercepting harness ops",
-         _torch_function_param, "derived-correct"),
-    Case("c_extension_numpy", "numpy consuming a parameter through the buffer protocol",
-         _c_extension, "typed-refusal", names="host egress"),
+    Case(
+        "custom_op_no_meta_kernel",
+        "a torch.library op with a CPU impl and no Meta impl",
+        _custom_op_no_meta,
+        "typed-harness-gap",
+        names="opaque_table",
+        note="the fix lane is a meta kernel in the endpoint's own op, or this refusal",
+    ),
+    Case(
+        "custom_op_with_meta_kernel",
+        "the same op WITH a registered Meta impl",
+        _custom_op_with_meta,
+        "derived-correct",
+        note="a meta kernel is a shape function — the only fact a derivation needs",
+    ),
+    Case(
+        "triton_kernel_arming",
+        "a Triton kernel launched during construction",
+        _triton_kernel,
+        "typed-refusal",
+        names="device pin",
+        ground_truth=False,
+    ),
+    Case(
+        "wrapper_subclass_param",
+        "a traceable wrapper subclass as a Parameter (the pgw#1661 shape)",
+        _subclass_param,
+        "derived-correct",
+        note="is_virtual must recurse; the outer metadata is not the answer",
+    ),
+    Case(
+        "torch_function_param",
+        "a __torch_function__ subclass intercepting harness ops",
+        _torch_function_param,
+        "derived-correct",
+    ),
+    Case(
+        "c_extension_numpy",
+        "numpy consuming a parameter through the buffer protocol",
+        _c_extension,
+        "typed-refusal",
+        names="host egress",
+    ),
 )

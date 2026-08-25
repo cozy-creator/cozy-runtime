@@ -123,9 +123,7 @@ def expired(grant: pb.DeliveryGrant, now: float | None = None) -> bool:
     return bool(grant.expires_at_unix) and grant.expires_at_unix < at
 
 
-def read_input(
-    grant: pb.DeliveryGrant, input_id: str, auth: Authorizer
-) -> bytes:
+def read_input(grant: pb.DeliveryGrant, input_id: str, auth: Authorizer) -> bytes:
     """One granted input, verified against the grant's own digest and length."""
     if expired(grant):
         raise GrantRefusal(

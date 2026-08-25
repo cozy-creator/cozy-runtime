@@ -115,9 +115,10 @@ def main() -> int:
     for got in results:
         counts[str(got.get("verdict"))] = counts.get(str(got.get("verdict")), 0) + 1
     print("-" * (width + 78))
-    print(f"{len(found)} cases in {elapsed:.1f}s — " + ", ".join(
-        f"{v}: {n}" for v, n in sorted(counts.items())
-    ))
+    print(
+        f"{len(found)} cases in {elapsed:.1f}s — "
+        + ", ".join(f"{v}: {n}" for v, n in sorted(counts.items()))
+    )
     if bad:
         print(f"\nFAILED: {', '.join(bad)}")
         return 1

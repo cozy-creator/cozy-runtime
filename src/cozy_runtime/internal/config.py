@@ -56,9 +56,7 @@ class Credentials:
     comfy: str | None = None
 
     def present(self) -> tuple[str, ...]:
-        return tuple(
-            source for source, _ in CREDENTIAL_ENV if getattr(self, source) is not None
-        )
+        return tuple(source for source, _ in CREDENTIAL_ENV if getattr(self, source) is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,14 +120,10 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             f"COZY_HOME must be an absolute path, got {home_raw!r}",
             f"set COZY_HOME to an absolute directory (default {COZY_HOME_DEFAULT})",
         )
-    creds = Credentials(
-        **{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV}
-    )
+    creds = Credentials(**{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV})
     _read = True
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        child_base_env=tuple(
-            sorted((k, v) for k, v in env.items() if not child_env.erased(k))
-        ),
+        child_base_env=tuple(sorted((k, v) for k, v in env.items() if not child_env.erased(k))),
     )

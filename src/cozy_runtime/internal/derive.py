@@ -263,10 +263,26 @@ def _named_device(args: tuple[object, ...], kwargs: Mapping[str, object]) -> str
 #: they are invisible to the topology and must not be refused.
 _PURE_WRITE = frozenset(
     {
-        "zero_", "fill_", "normal_", "uniform_", "random_", "constant_", "ones_", "zeros_",
-        "eye_", "dirac_", "kaiming_uniform_", "kaiming_normal_", "xavier_uniform_",
-        "xavier_normal_", "trunc_normal_", "orthogonal_", "sparse_", "requires_grad_",
-        "detach_", "share_memory_",
+        "zero_",
+        "fill_",
+        "normal_",
+        "uniform_",
+        "random_",
+        "constant_",
+        "ones_",
+        "zeros_",
+        "eye_",
+        "dirac_",
+        "kaiming_uniform_",
+        "kaiming_normal_",
+        "xavier_uniform_",
+        "xavier_normal_",
+        "trunc_normal_",
+        "orthogonal_",
+        "sparse_",
+        "requires_grad_",
+        "detach_",
+        "share_memory_",
     }
 )
 

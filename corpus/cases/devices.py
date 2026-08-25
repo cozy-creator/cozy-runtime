@@ -34,9 +34,7 @@ def _cpu_stray_nonpersistent(config: Config) -> Pipeline:
         def __init__(self) -> None:
             super().__init__()
             self.proj = nn.Linear(width, width, dtype=torch.bfloat16)
-            self.register_buffer(
-                "rope", torch.zeros(width, device="cpu"), persistent=False
-            )
+            self.register_buffer("rope", torch.zeros(width, device="cpu"), persistent=False)
 
     return Pipeline({"transformer": Stray()})
 
@@ -83,19 +81,51 @@ def _pinned(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("cpu_stray_buffer", "a persistent buffer pinned to device='cpu'", _cpu_stray,
-         "typed-refusal", names="device pin",
-         note="the planted CPU-stray buffer red arm"),
-    Case("cpu_stray_derived", "a NON-persistent buffer pinned to device='cpu'",
-         _cpu_stray_nonpersistent, "typed-refusal", names="device pin",
-         note="no checkpoint fills it, so only the census can catch it"),
-    Case("cuda_module_move", "module.to('cuda') inside the factory", _cuda_move,
-         "typed-refusal", names="device", ground_truth=False,
-         note="the fence is CUDA_VISIBLE_DEVICES='', so torch itself has no device"),
-    Case("cuda_allocation", "a leaf constructed with device='cuda'", _cuda_allocate,
-         "typed-refusal", names="device pin", ground_truth=False),
-    Case("host_transfer", "reading a parameter through .cpu() during construction",
-         _host_transfer, "typed-refusal", names="device move"),
-    Case("pinned_host_buffer", "a pin_memory() staging buffer built at construction",
-         _pinned, "typed-refusal", names="device move"),
+    Case(
+        "cpu_stray_buffer",
+        "a persistent buffer pinned to device='cpu'",
+        _cpu_stray,
+        "typed-refusal",
+        names="device pin",
+        note="the planted CPU-stray buffer red arm",
+    ),
+    Case(
+        "cpu_stray_derived",
+        "a NON-persistent buffer pinned to device='cpu'",
+        _cpu_stray_nonpersistent,
+        "typed-refusal",
+        names="device pin",
+        note="no checkpoint fills it, so only the census can catch it",
+    ),
+    Case(
+        "cuda_module_move",
+        "module.to('cuda') inside the factory",
+        _cuda_move,
+        "typed-refusal",
+        names="device",
+        ground_truth=False,
+        note="the fence is CUDA_VISIBLE_DEVICES='', so torch itself has no device",
+    ),
+    Case(
+        "cuda_allocation",
+        "a leaf constructed with device='cuda'",
+        _cuda_allocate,
+        "typed-refusal",
+        names="device pin",
+        ground_truth=False,
+    ),
+    Case(
+        "host_transfer",
+        "reading a parameter through .cpu() during construction",
+        _host_transfer,
+        "typed-refusal",
+        names="device move",
+    ),
+    Case(
+        "pinned_host_buffer",
+        "a pin_memory() staging buffer built at construction",
+        _pinned,
+        "typed-refusal",
+        names="device move",
+    ),
 )

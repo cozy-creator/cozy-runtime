@@ -215,21 +215,28 @@ class H3Blocks:
 
     def build_modulation_tables(self, plan: object) -> tuple[int, ...]:
         """Computed under the ACTIVE transformer lease on a full topology (§1.1.1)."""
-        block = self._use("fl2va_transformer" if self._has("fl2va_transformer") else
-                          "ref2va_transformer")
+        block = self._use(
+            "fl2va_transformer" if self._has("fl2va_transformer") else "ref2va_transformer"
+        )
         return tuple(block("adaln", plan, i) for i in range(4))
 
     def baked_tables(self, plan: object) -> tuple[int, ...]:
         """Ordinary checkpoint components: coverage was proven at admission (§1.1.1)."""
-        block = self._use("fl2va_transformer" if self._has("fl2va_transformer") else
-                          "ref2va_transformer")
+        block = self._use(
+            "fl2va_transformer" if self._has("fl2va_transformer") else "ref2va_transformer"
+        )
         return tuple(block("baked", plan, i) for i in range(4))
 
     def _has(self, name: str) -> bool:
         return name in self._components
 
     def step(
-        self, transformer: str, latents: int, layout: object, t_v: float, t_a: float,
+        self,
+        transformer: str,
+        latents: int,
+        layout: object,
+        t_v: float,
+        t_a: float,
         modulation: int,
     ) -> int:
         return self._use(transformer)(latents, layout, t_v, t_a, modulation)

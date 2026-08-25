@@ -62,12 +62,11 @@ def _quantized_swap(config: Config) -> Pipeline:
         def __init__(self, size: int) -> None:
             super().__init__()
             self.register_parameter(
-                "packed", nn.Parameter(torch.zeros(size, size // 2, dtype=torch.uint8),
-                                       requires_grad=False)
+                "packed",
+                nn.Parameter(torch.zeros(size, size // 2, dtype=torch.uint8), requires_grad=False),
             )
             self.register_parameter(
-                "scales", nn.Parameter(torch.zeros(size, dtype=torch.bfloat16),
-                                       requires_grad=False)
+                "scales", nn.Parameter(torch.zeros(size, dtype=torch.bfloat16), requires_grad=False)
             )
 
     class Swapped(nn.Module):
@@ -142,29 +141,84 @@ def _write_output(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("torch_compile", "torch.compile(module) inside the factory", _compiled,
-         "typed-refusal", names="torch.compile",
-         note="it prefixes every destination with `_orig_mod.`; v1 neutered it to eager, "
-              "v2 has no consumer that needs the call to survive"),
-    Case("torch_compile_method", "the in-place Module.compile() spelling", _compiled_method,
-         "typed-refusal", names="torch.compile"),
-    Case("lazy_module", "nn.LazyLinear — no shape until the first forward", _lazy_module,
-         "typed-refusal", names="LazyModuleMixin"),
-    Case("lazy_component_none", "a pipeline that declares a component and leaves it None",
-         _lazy_components, "typed-refusal", names="unbuilt component"),
-    Case("encoding_aware_swap", "a w4a16 provider replacing the leaf class",
-         _quantized_swap, "derived-correct", config={"width": 16, "variant": "w4a16"},
-         note="the packed/scales pair IS the derived topology for that variant"),
-    Case("hardware_gate_declared", "construction branching on device capability, with the "
-         "variant set declared", _capability_gate, "derived-correct",
-         variant="sm89", declared_variants=("sm89", "sm90"), ground_truth=False),
-    Case("hardware_gate_undeclared", "the same gate with NO declared variant set",
-         _capability_gate, "typed-refusal", names="hardware-conditional",
-         variant="sm89", ground_truth=False),
-    Case("boot_kernel_fetch", "a digest-pinned kernel download during construction",
-         _kernel_fetch, "typed-refusal", names="no_network", ground_truth=False),
-    Case("weight_byte_read", "opening a .safetensors file from the factory", _weight_read,
-         "typed-refusal", names="no_weight_bytes", ground_truth=False),
-    Case("filesystem_write", "writing a file from the factory", _write_output,
-         "typed-refusal", names="no_filesystem_writes", ground_truth=False),
+    Case(
+        "torch_compile",
+        "torch.compile(module) inside the factory",
+        _compiled,
+        "typed-refusal",
+        names="torch.compile",
+        note="it prefixes every destination with `_orig_mod.`; v1 neutered it to eager, "
+        "v2 has no consumer that needs the call to survive",
+    ),
+    Case(
+        "torch_compile_method",
+        "the in-place Module.compile() spelling",
+        _compiled_method,
+        "typed-refusal",
+        names="torch.compile",
+    ),
+    Case(
+        "lazy_module",
+        "nn.LazyLinear — no shape until the first forward",
+        _lazy_module,
+        "typed-refusal",
+        names="LazyModuleMixin",
+    ),
+    Case(
+        "lazy_component_none",
+        "a pipeline that declares a component and leaves it None",
+        _lazy_components,
+        "typed-refusal",
+        names="unbuilt component",
+    ),
+    Case(
+        "encoding_aware_swap",
+        "a w4a16 provider replacing the leaf class",
+        _quantized_swap,
+        "derived-correct",
+        config={"width": 16, "variant": "w4a16"},
+        note="the packed/scales pair IS the derived topology for that variant",
+    ),
+    Case(
+        "hardware_gate_declared",
+        "construction branching on device capability, with the variant set declared",
+        _capability_gate,
+        "derived-correct",
+        variant="sm89",
+        declared_variants=("sm89", "sm90"),
+        ground_truth=False,
+    ),
+    Case(
+        "hardware_gate_undeclared",
+        "the same gate with NO declared variant set",
+        _capability_gate,
+        "typed-refusal",
+        names="hardware-conditional",
+        variant="sm89",
+        ground_truth=False,
+    ),
+    Case(
+        "boot_kernel_fetch",
+        "a digest-pinned kernel download during construction",
+        _kernel_fetch,
+        "typed-refusal",
+        names="no_network",
+        ground_truth=False,
+    ),
+    Case(
+        "weight_byte_read",
+        "opening a .safetensors file from the factory",
+        _weight_read,
+        "typed-refusal",
+        names="no_weight_bytes",
+        ground_truth=False,
+    ),
+    Case(
+        "filesystem_write",
+        "writing a file from the factory",
+        _write_output,
+        "typed-refusal",
+        names="no_filesystem_writes",
+        ground_truth=False,
+    ),
 )

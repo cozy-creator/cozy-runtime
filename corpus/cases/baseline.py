@@ -135,21 +135,41 @@ def _deep(config: Config) -> Pipeline:
 
 CASES = (
     Case("plain", "ordinary Linear/LayerNorm leaves", _plain, "derived-correct"),
-    Case("tie_survives_cast", "a weight tie established by assignment, then .to(dtype)",
-         _tied, "derived-correct",
-         note="both names must appear as destinations AND share one alias group"),
-    Case("shared_submodule", "one nn.Module object reached by two attribute names",
-         _shared_submodule, "derived-correct"),
-    Case("non_persistent_buffer", "a rope table registered persistent=False",
-         _buffers, "derived-correct",
-         note="inv_freq is derived, never a destination; pos is a destination"),
-    Case("dtype_islands", "an fp32 island and int64/bool buffers beside bf16",
-         _dtype_islands, "derived-correct"),
-    Case("containers", "ModuleList / ModuleDict / ParameterList", _containers,
-         "derived-correct"),
-    Case("reflection_driven", "submodules built from config data by add_module",
-         _reflection, "derived-correct",
-         config={"width": 16, "blocks": {"alpha": "linear", "beta": "embedding"}}),
-    Case("deep_recursion", "six levels of recursively constructed blocks", _deep,
-         "derived-correct"),
+    Case(
+        "tie_survives_cast",
+        "a weight tie established by assignment, then .to(dtype)",
+        _tied,
+        "derived-correct",
+        note="both names must appear as destinations AND share one alias group",
+    ),
+    Case(
+        "shared_submodule",
+        "one nn.Module object reached by two attribute names",
+        _shared_submodule,
+        "derived-correct",
+    ),
+    Case(
+        "non_persistent_buffer",
+        "a rope table registered persistent=False",
+        _buffers,
+        "derived-correct",
+        note="inv_freq is derived, never a destination; pos is a destination",
+    ),
+    Case(
+        "dtype_islands",
+        "an fp32 island and int64/bool buffers beside bf16",
+        _dtype_islands,
+        "derived-correct",
+    ),
+    Case("containers", "ModuleList / ModuleDict / ParameterList", _containers, "derived-correct"),
+    Case(
+        "reflection_driven",
+        "submodules built from config data by add_module",
+        _reflection,
+        "derived-correct",
+        config={"width": 16, "blocks": {"alpha": "linear", "beta": "embedding"}},
+    ),
+    Case(
+        "deep_recursion", "six levels of recursively constructed blocks", _deep, "derived-correct"
+    ),
 )

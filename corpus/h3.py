@@ -162,9 +162,7 @@ def _block(width: int, structure: Structure, index: int) -> nn.Module:
         block.adaln_narrow = nn.Linear(width // 4, width * 6, bias=False, dtype=torch.bfloat16)  # type: ignore[assignment]
     else:
         # baked: the exact table IS checkpoint data, and the projection does not exist
-        block.register_buffer(
-            "modulation_table", torch.zeros(8, width * 6, dtype=torch.bfloat16)
-        )
+        block.register_buffer("modulation_table", torch.zeros(8, width * 6, dtype=torch.bfloat16))
     del index
     return block
 
@@ -236,9 +234,7 @@ class _H3Base(Model[H3Pipeline]):
     pipe: H3Pipeline
 
     def _load(self, loader: Loader, *, task: Task) -> None:
-        self.pipe = loader.construct(
-            H3Pipeline, factory=lambda config: build_h3(config, task=task)
-        )
+        self.pipe = loader.construct(H3Pipeline, factory=lambda config: build_h3(config, task=task))
         if self.pipe.structure != "baked":
             # exactly one modulation source exists per bound topology (§1.1.1); a baked
             # construction never touches this cache

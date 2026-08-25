@@ -80,8 +80,7 @@ def _convert(value: object, node: Node, where: str) -> object:
         return msgspec.convert(value, type=node.annotation, dec_hook=asset_dec_hook, strict=False)
     except (msgspec.ValidationError, TypeError, NotImplementedError) as exc:
         raise DefaultResolutionError(
-            f"{where}: {node.name}={value!r} does not validate against the request field "
-            f"({exc})",
+            f"{where}: {node.name}={value!r} does not validate against the request field ({exc})",
             fields=[node.name],
         ) from exc
 

@@ -111,17 +111,46 @@ def _config_shapes(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("data_dependent_shape", "a layer width read from a tensor's contents",
-         _shape_from_value, "typed-refusal", names="host egress"),
-    Case("value_branch", "an `if bool(tensor.any())` structural branch in __init__",
-         _branch_on_value, "typed-refusal", names="host egress"),
-    Case("nonzero_shape", "a shape derived from torch.nonzero", _nonzero_shape,
-         "typed-refusal", names="data-dependent shape"),
-    Case("numpy_protocol", "host egress through np.array(), i.e. Tensor.__array__",
-         _numpy_protocol, "typed-refusal", names="host egress"),
-    Case("tolist_egress", "reading a parameter through .tolist()", _tolist,
-         "typed-refusal", names="host egress"),
-    Case("config_driven_shapes", "shapes and a derived table from CONFIG only — the legal "
-         "twin of every case above", _config_shapes, "derived-correct",
-         config={"width": 16, "layers": 3}),
+    Case(
+        "data_dependent_shape",
+        "a layer width read from a tensor's contents",
+        _shape_from_value,
+        "typed-refusal",
+        names="host egress",
+    ),
+    Case(
+        "value_branch",
+        "an `if bool(tensor.any())` structural branch in __init__",
+        _branch_on_value,
+        "typed-refusal",
+        names="host egress",
+    ),
+    Case(
+        "nonzero_shape",
+        "a shape derived from torch.nonzero",
+        _nonzero_shape,
+        "typed-refusal",
+        names="data-dependent shape",
+    ),
+    Case(
+        "numpy_protocol",
+        "host egress through np.array(), i.e. Tensor.__array__",
+        _numpy_protocol,
+        "typed-refusal",
+        names="host egress",
+    ),
+    Case(
+        "tolist_egress",
+        "reading a parameter through .tolist()",
+        _tolist,
+        "typed-refusal",
+        names="host egress",
+    ),
+    Case(
+        "config_driven_shapes",
+        "shapes and a derived table from CONFIG only — the legal twin of every case above",
+        _config_shapes,
+        "derived-correct",
+        config={"width": 16, "layers": 3},
+    ),
 )

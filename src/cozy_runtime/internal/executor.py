@@ -387,8 +387,11 @@ class Executor:
 
         surface = self.surface_names.get(command["entrypoint"])
         if surface is None:
-            return {"ok": True, "outcome": "skipped",
-                    "reason": f"{command['entrypoint']!r} is not an entrypoint of this release"}
+            return {
+                "ok": True,
+                "outcome": "skipped",
+                "reason": f"{command['entrypoint']!r} is not an entrypoint of this release",
+            }
         spool = Path(command["spool"])
         payload, reason = warm.synthesize(schema.render(surface.payload_type), spool)
         if reason:
@@ -396,9 +399,14 @@ class Executor:
         reply = self.invoke({**command, "payload": payload, "boot_warmup": True})
         succeeded = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
         if succeeded:
-            return {"ok": True, "outcome": "warmed", "reason": "", "payload": payload,
-                    "boot_warmup_observed": bool((reply.get("result") or {}).get("warm")),
-                    "handler_ms": reply.get("metrics", {}).get("handler_ms", 0)}
+            return {
+                "ok": True,
+                "outcome": "warmed",
+                "reason": "",
+                "payload": payload,
+                "boot_warmup_observed": bool((reply.get("result") or {}).get("warm")),
+                "handler_ms": reply.get("metrics", {}).get("handler_ms", 0),
+            }
         # A failed warm pass NEVER bricks the worker: it is reported and the executor is
         # left usable, because nothing observed under boot_warmup is correctness evidence.
         self.poisoned = ""
@@ -407,7 +415,7 @@ class Executor:
             "outcome": "failed",
             "payload": payload,
             "reason": f"{reply.get('code') or reply['outcome']['code']}: "
-                      f"{(reply.get('detail') or reply['outcome']['message'])[:200]}",
+            f"{(reply.get('detail') or reply['outcome']['message'])[:200]}",
         }
 
     def _result_schema_digest(self, surface: Any) -> str:
@@ -434,9 +442,7 @@ class Executor:
         """No author computation may still mutate GPU or output state when a terminal is
         journaled. The proof is the device's own: every stream is complete."""
         torch = self.torch
-        return bool(
-            torch.cuda.current_stream().query() and torch.cuda.default_stream().query()
-        )
+        return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
 
     def probe(self) -> dict[str, Any]:
         if self.torch is None:

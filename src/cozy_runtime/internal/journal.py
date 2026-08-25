@@ -32,12 +32,12 @@ from cozy_runtime.internal import canonical
 
 #: Record kinds. Closed on purpose: a new kind is a schema change, not a new string.
 KINDS = (
-    "session",       # a new session minted (control-parent boot)
-    "accepted",      # PREPARED acceptance: spec + plan + model-construction digests
-    "terminal",      # the exact canonical TerminalBody bytes, journaled before send
-    "closed",        # TerminalAck bound by terminal_id + terminal_digest
-    "epoch",         # executor incarnation / readiness epoch movement
-    "warm",          # one boot warm-pass outcome
+    "session",  # a new session minted (control-parent boot)
+    "accepted",  # PREPARED acceptance: spec + plan + model-construction digests
+    "terminal",  # the exact canonical TerminalBody bytes, journaled before send
+    "closed",  # TerminalAck bound by terminal_id + terminal_digest
+    "epoch",  # executor incarnation / readiness epoch movement
+    "warm",  # one boot warm-pass outcome
 )
 
 
@@ -99,9 +99,7 @@ class Journal:
             try:
                 value = canonical.parse_canonical(rest)
             except canonical.CanonicalError as exc:
-                raise JournalError(
-                    "journal_corrupt", f"{self.path}:{index + 1}: {exc}"
-                ) from exc
+                raise JournalError("journal_corrupt", f"{self.path}:{index + 1}: {exc}") from exc
             yield Record(value["seq"], value["kind"], value["at_unix_ms"], value["body"])
 
     def _tear(self, index: int, line: bytes, why: str) -> None:

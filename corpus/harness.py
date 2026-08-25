@@ -30,6 +30,7 @@ from cozy_runtime.internal.derive import RichCensus, component_members, walk
 
 Verdict = Literal["derived-correct", "typed-refusal", "typed-harness-gap", "silent-wrong"]
 
+
 #: Every case builds one of these, so the component table is the same shape a real
 #: diffusers pipeline presents and the loader's own member walk finds it unchanged.
 class Pipeline:

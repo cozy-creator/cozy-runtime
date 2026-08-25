@@ -13,6 +13,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync
       - run: uv run ruff check .
+      # Formatting is a DETERMINISM check like the others here: one canonical rendering of
+      # the tree, so a diff is only ever a change of meaning. The generated `worker_pb2*`
+      # bindings are excluded in pyproject's `extend-exclude`, which covers format and check
+      # alike — protoc's output is a copied artifact and reformatting it would break the copy.
+      - run: uv run ruff format --check .
       - run: uv run mypy
       # Architecture fences + the frozen ES6 number vectors + the torch-free-import fence.
       - run: uv run python scripts/fence.py

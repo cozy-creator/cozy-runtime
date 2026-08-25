@@ -366,8 +366,7 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
         annotation = declared.get(name, object)
         if isinstance(annotation, type) and not isinstance(value, annotation):
             raise OutputError(
-                f"{surface.name}.{name} is {type(value).__name__}, declared "
-                f"{annotation.__name__}",
+                f"{surface.name}.{name} is {type(value).__name__}, declared {annotation.__name__}",
                 code="result_schema",
                 fields=[name],
             )
@@ -394,5 +393,3 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
             "output is a typed failure, never a silent drop",
             code="unreturned_handle",
         )
-
-

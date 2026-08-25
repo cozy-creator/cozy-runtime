@@ -219,9 +219,12 @@ class Config:
 
     def digest(self) -> str:
         """The immutable-configuration term of construction identity (§1.1)."""
-        return "blake2b:" + hashlib.blake2b(
-            msgspec.json.encode(_canonical(self._data)), digest_size=16
-        ).hexdigest()
+        return (
+            "blake2b:"
+            + hashlib.blake2b(
+                msgspec.json.encode(_canonical(self._data)), digest_size=16
+            ).hexdigest()
+        )
 
     def _value(self, name: str) -> object:
         try:
@@ -331,9 +334,7 @@ class DerivedCache:
 
     __slots__ = ("_bytes", "_entries", "_owner", "max_bytes", "max_entries", "name")
 
-    def __init__(
-        self, name: str, *, max_entries: int, max_bytes: int, owner: _ScopeHost
-    ) -> None:
+    def __init__(self, name: str, *, max_entries: int, max_bytes: int, owner: _ScopeHost) -> None:
         self.name = name
         self.max_entries = max_entries
         self.max_bytes = max_bytes
@@ -461,17 +462,18 @@ class ConstructionRecord:
     @property
     def topology_digest(self) -> str:
         rows = [f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations]
-        return "blake2b:" + hashlib.blake2b(
-            "\n".join(rows).encode(), digest_size=16
-        ).hexdigest()
+        return "blake2b:" + hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
 
     @property
     def identity(self) -> str:
         """The derive/serve fence: the SAME factory and config bytes construct both graphs."""
-        return "blake2b:" + hashlib.blake2b(
-            f"{self.factory_identity}|{self.config_digest}|{self.topology_digest}".encode(),
-            digest_size=16,
-        ).hexdigest()
+        return (
+            "blake2b:"
+            + hashlib.blake2b(
+                f"{self.factory_identity}|{self.config_digest}|{self.topology_digest}".encode(),
+                digest_size=16,
+            ).hexdigest()
+        )
 
 
 # --------------------------------------------------------------------------- loader
@@ -574,9 +576,7 @@ class Loader:
             raise ConformanceError(
                 f"cache name {name!r} must be a plain identifier", code="cache_name"
             )
-        cache = DerivedCache(
-            name, max_entries=max_entries, max_bytes=max_bytes, owner=self._owner
-        )
+        cache = DerivedCache(name, max_entries=max_entries, max_bytes=max_bytes, owner=self._owner)
         self._caches.append(cache)
         return cache
 

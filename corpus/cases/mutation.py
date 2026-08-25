@@ -108,18 +108,39 @@ def _hooks(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("ordinary_initialization", "nn.init.* inside a leaf's own __init__",
-         _ordinary_init, "derived-correct",
-         note="values every fill overwrites — must NOT be refused"),
-    Case("post_construction_repack", "a Marlin-class weight repack after the factory returns",
-         _repack, "typed-refusal", names="in-place weight transform"),
-    Case("weight_norm", "weight_norm replacing `weight` with a computed attribute",
-         _weight_norm, "derived-correct",
-         note="the census must report the real parametrization destinations"),
-    Case("parametrization", "register_parametrization re-homing weight under "
-         "parametrizations.weight.original", _parametrized, "derived-correct",
-         note="the key MOVES, and the derived topology must say so"),
-    Case("load_state_dict_hook", "a key-renaming load_state_dict pre-hook", _hooks,
-         "derived-correct",
-         note="derivation never calls load_state_dict, so the hook must not move a key"),
+    Case(
+        "ordinary_initialization",
+        "nn.init.* inside a leaf's own __init__",
+        _ordinary_init,
+        "derived-correct",
+        note="values every fill overwrites — must NOT be refused",
+    ),
+    Case(
+        "post_construction_repack",
+        "a Marlin-class weight repack after the factory returns",
+        _repack,
+        "typed-refusal",
+        names="in-place weight transform",
+    ),
+    Case(
+        "weight_norm",
+        "weight_norm replacing `weight` with a computed attribute",
+        _weight_norm,
+        "derived-correct",
+        note="the census must report the real parametrization destinations",
+    ),
+    Case(
+        "parametrization",
+        "register_parametrization re-homing weight under parametrizations.weight.original",
+        _parametrized,
+        "derived-correct",
+        note="the key MOVES, and the derived topology must say so",
+    ),
+    Case(
+        "load_state_dict_hook",
+        "a key-renaming load_state_dict pre-hook",
+        _hooks,
+        "derived-correct",
+        note="derivation never calls load_state_dict, so the hook must not move a key",
+    ),
 )

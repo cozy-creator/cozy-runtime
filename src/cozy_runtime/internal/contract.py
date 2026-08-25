@@ -237,9 +237,7 @@ def closed_resources(contract: ModelConstructionContract) -> dict[str, Json]:
 # ------------------------------------------------------------------------- agreement
 
 
-def check_agreement(
-    contract: ModelConstructionContract, destinations: Sequence[str]
-) -> None:
+def check_agreement(contract: ModelConstructionContract, destinations: Sequence[str]) -> None:
     """EXACT one-to-one agreement, in both directions and at both plumbing levels.
 
     `destinations` is the fill plane's own key list (cr-002b's `Loader` census, which

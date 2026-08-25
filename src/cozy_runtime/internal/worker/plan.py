@@ -35,9 +35,7 @@ from cozy_runtime.internal import canonical
 class PlanRefusal(Exception):
     """A typed pre-acceptance refusal, carrying the structured shortfall when it has one."""
 
-    def __init__(
-        self, code: str, detail: str, shortfall: dict[str, Any] | None = None
-    ) -> None:
+    def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail

@@ -140,9 +140,7 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
         assert isinstance(doc, dict)
         if doc["name"] == function:
             return _schema_view(doc)
-    known = sorted(
-        str(d["name"]) for d in [*entrypoints, *jobs] if isinstance(d, dict)
-    )
+    known = sorted(str(d["name"]) for d in [*entrypoints, *jobs] if isinstance(d, dict))
     raise CliError(
         "not_found",
         f"no registered callable named {function!r}",

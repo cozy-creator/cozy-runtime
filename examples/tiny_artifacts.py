@@ -44,7 +44,7 @@ def h3(
     data = dict(BAKED_CONFIG if baked else H3_CONFIG)
     config = Config(data)
     topology: dict[str, TensorSpec] = {}
-    for role in (("fl2va", "ref2va") if dual else (task,)):
+    for role in ("fl2va", "ref2va") if dual else (task,):
         topology.update(topology_of(_build_h3(config, task=role)))
     label = "h3-dual" if dual else f"h3-{task}"
     lane = "adaln-baked" if baked else "full"

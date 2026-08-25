@@ -209,8 +209,14 @@ class DevicePeak:
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
-_libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                       ctypes.c_int, ctypes.c_long]
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+]
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
 
@@ -268,73 +274,113 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
     derive_ms = (time.perf_counter() - started) * 1000
     body = canonical.write(derived.contract.render())
     dset = derived.contract.destination_sets[0]
-    check("one complete DestinationSet", len(derived.contract.destination_sets) == 1,
-          f"{dset.component}: {len(dset.keys)} keys, {dset.module_class}")
-    check("logical tensors match the checkpoint", len(derived.contract.logical_tensors) == 1680,
-          f"{len(derived.contract.logical_tensors)} tensors, {len(body)} contract bytes, "
-          f"derived in {derive_ms:.1f} ms")
-    check("no derived (non-persistent) tensors", not derived.contract.derived,
-          f"{len(derived.contract.derived)} — nothing the fill plane cannot supply")
+    check(
+        "one complete DestinationSet",
+        len(derived.contract.destination_sets) == 1,
+        f"{dset.component}: {len(dset.keys)} keys, {dset.module_class}",
+    )
+    check(
+        "logical tensors match the checkpoint",
+        len(derived.contract.logical_tensors) == 1680,
+        f"{len(derived.contract.logical_tensors)} tensors, {len(body)} contract bytes, "
+        f"derived in {derive_ms:.1f} ms",
+    )
+    check(
+        "no derived (non-persistent) tensors",
+        not derived.contract.derived,
+        f"{len(derived.contract.derived)} — nothing the fill plane cannot supply",
+    )
     print(f"  contract {derived.contract.digest}")
 
-    head(f"fill for real — {args.window // MIB} MiB windows, {args.slots} slots, "
-         f"{args.readers} readers, verify={args.verify}")
+    head(
+        f"fill for real — {args.window // MIB} MiB windows, {args.slots} slots, "
+        f"{args.readers} readers, verify={args.verify}"
+    )
     torch.cuda.init()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base_alloc = torch.cuda.memory_allocated()
 
-    backend = backend_for(art, torch, window_bytes=args.window, slots=args.slots,
-                          readers=args.readers, verify=args.verify)
+    backend = backend_for(
+        art,
+        torch,
+        window_bytes=args.window,
+        slots=args.slots,
+        readers=args.readers,
+        verify=args.verify,
+    )
     backend.expect({d.component: d.keys for d in derived.contract.destination_sets})
     written_before = written_bytes()
     with DevicePeak(torch) as peak:
         started = time.perf_counter()
-        served = derive_contract(art, mode="serve", backend=backend,
-                                 substrate_device=backend.device_str)
+        served = derive_contract(
+            art, mode="serve", backend=backend, substrate_device=backend.device_str
+        )
         elapsed = time.perf_counter() - started
     written = written_bytes() - written_before
 
     fill_s = backend.stats["fill_ms"] / 1000
     gbps = total_bytes / fill_s / 1e9
-    print(f"  {total_bytes / 2**30:.3f} GiB in {fill_s:.3f} s = {gbps:.3f} GB/s "
-          f"({total_bytes / fill_s / 2**30:.3f} GiB/s) — the disk->VRAM leg; "
-          f"{elapsed:.3f} s including the meta construction")
+    print(
+        f"  {total_bytes / 2**30:.3f} GiB in {fill_s:.3f} s = {gbps:.3f} GB/s "
+        f"({total_bytes / fill_s / 2**30:.3f} GiB/s) — the disk->VRAM leg; "
+        f"{elapsed:.3f} s including the meta construction"
+    )
     print(f"  store {backend.store.stats()}")
     print(f"  ring  {json.dumps(backend.stats)}")
     print(f"  ledger {json.dumps(backend.ledger.rows())}")
 
     check("the transaction is READY", backend.state == "ready", backend.state)
-    check("every contract destination was filled", len(backend.enqueued) == 1680,
-          f"{len(backend.enqueued)}/1680")
-    check("zero rehashes on a verified store", backend.store.rehashes == 0,
-          f"{backend.store.verifies} record hits, "
-          f"{backend.store.verify_ns / 1e6:.1f} ms of verification")
-    check("serve-tier write_bytes == 0, by COUNTER", written == 0,
-          f"the kernel charged this process {written} B of storage writes across the whole "
-          f"fill (/proc/self/io write_bytes) — measured, never asserted-by-absence")
+    check(
+        "every contract destination was filled",
+        len(backend.enqueued) == 1680,
+        f"{len(backend.enqueued)}/1680",
+    )
+    check(
+        "zero rehashes on a verified store",
+        backend.store.rehashes == 0,
+        f"{backend.store.verifies} record hits, "
+        f"{backend.store.verify_ns / 1e6:.1f} ms of verification",
+    )
+    check(
+        "serve-tier write_bytes == 0, by COUNTER",
+        written == 0,
+        f"the kernel charged this process {written} B of storage writes across the whole "
+        f"fill (/proc/self/io write_bytes) — measured, never asserted-by-absence",
+    )
 
     head("derive == serve, on the real byte path")
     other = canonical.write(served.contract.render())
-    check("byte-identical contracts", body == other,
-          f"{len(body)} bytes both, {served.contract.digest[:24]}…")
-    inline_bytes = sum(s.length for row in read_plan(PLAN, COMPONENT)
-                       for s in row.segments if s.oid is None)
-    check("the serve pass moved real bytes",
-          backend.store.bytes + inline_bytes == total_bytes,
-          f"{backend.store.bytes} B read from the CAS + {inline_bytes} B carried inline "
-          f"by the header = {total_bytes} B")
+    check(
+        "byte-identical contracts",
+        body == other,
+        f"{len(body)} bytes both, {served.contract.digest[:24]}…",
+    )
+    inline_bytes = sum(
+        s.length for row in read_plan(PLAN, COMPONENT) for s in row.segments if s.oid is None
+    )
+    check(
+        "the serve pass moved real bytes",
+        backend.store.bytes + inline_bytes == total_bytes,
+        f"{backend.store.bytes} B read from the CAS + {inline_bytes} B carried inline "
+        f"by the header = {total_bytes} B",
+    )
 
     head("the filled destinations vs the derived contract")
     live = {key: tensor for key, tensor in backend.enqueued.items()}
     rows = {row.key: row for row in read_plan(PLAN, COMPONENT)}
-    bad_shape = [t.key for t in derived.contract.logical_tensors
-                 if tuple(live[t.key].shape) != t.shape]
-    bad_dtype = [t.key for t in derived.contract.logical_tensors
-                 if str(live[t.key].dtype) != "torch.float16"]
-    off_device = [t.key for t in derived.contract.logical_tensors
-                  if str(live[t.key].device) != backend.device_str]
+    bad_shape = [
+        t.key for t in derived.contract.logical_tensors if tuple(live[t.key].shape) != t.shape
+    ]
+    bad_dtype = [
+        t.key for t in derived.contract.logical_tensors if str(live[t.key].dtype) != "torch.float16"
+    ]
+    off_device = [
+        t.key
+        for t in derived.contract.logical_tensors
+        if str(live[t.key].device) != backend.device_str
+    ]
     check("shapes", not bad_shape, f"1680 destinations, {len(bad_shape)} wrong")
     check("dtypes", not bad_dtype, f"all float16, {len(bad_dtype)} wrong")
     check("placement", not off_device, f"all on {backend.device_str}")
@@ -356,22 +402,37 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
                     wrong.append(key)
                 inline += 1
         took = time.perf_counter() - started
-        check("on-device sha256 == object id, every tensor", not wrong,
-              f"{hashed} hashed + {inline} inline in {took:.1f} s, {len(wrong)} wrong")
+        check(
+            "on-device sha256 == object id, every tensor",
+            not wrong,
+            f"{hashed} hashed + {inline} inline in {took:.1f} s, {len(wrong)} wrong",
+        )
 
     digest = sample_digest(torch, live, keys)
-    check("cross-arm identity with tfs-018's banked digest", digest.startswith(TFS018_DIGEST),
-          f"{digest[:12]} vs {TFS018_DIGEST}")
+    check(
+        "cross-arm identity with tfs-018's banked digest",
+        digest.startswith(TFS018_DIGEST),
+        f"{digest[:12]} vs {TFS018_DIGEST}",
+    )
 
     out: dict[str, Any] = {
-        "window": args.window, "slots": args.slots, "readers": args.readers,
-        "verify": args.verify, "seconds": round(fill_s, 4), "bytes": total_bytes,
-        "wall_seconds": round(elapsed, 4), "gbps": round(gbps, 3), "peak_vram": peak.peak,
+        "window": args.window,
+        "slots": args.slots,
+        "readers": args.readers,
+        "verify": args.verify,
+        "seconds": round(fill_s, 4),
+        "bytes": total_bytes,
+        "wall_seconds": round(elapsed, 4),
+        "gbps": round(gbps, 3),
+        "peak_vram": peak.peak,
         "peak_vram_gib": round(peak.peak / 2**30, 3),
         "torch_peak_vram_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
-        "peak_rss": peak_rss(), "peak_rss_gib": round(peak_rss() / 2**30, 3),
-        "digest": digest, "written_bytes": written,
-        "ledger": backend.ledger.rows(), **backend.store.stats(),
+        "peak_rss": peak_rss(),
+        "peak_rss_gib": round(peak_rss() / 2**30, 3),
+        "digest": digest,
+        "written_bytes": written,
+        "ledger": backend.ledger.rows(),
+        **backend.store.stats(),
         **backend.stats,
     }
 
@@ -382,9 +443,12 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
 
         def raw(*inputs: Any) -> Any:
             with torch.inference_mode():
-                return unet(inputs[0], inputs[1], encoder_hidden_states=inputs[2],
-                            added_cond_kwargs={"text_embeds": inputs[3],
-                                               "time_ids": inputs[4]}).sample
+                return unet(
+                    inputs[0],
+                    inputs[1],
+                    encoder_hidden_states=inputs[2],
+                    added_cond_kwargs={"text_embeds": inputs[3], "time_ids": inputs[4]},
+                ).sample
 
         out.update(section_forward(torch, raw, backend.device, args))
 
@@ -397,18 +461,22 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
         before = torch.cuda.memory_allocated()
         freed = backend.release(COMPONENT)
         after = torch.cuda.memory_allocated()
-        check("the allocator gave the weights back",
-              freed >= total_bytes * 0.99 and after - base_alloc < 64 * MIB,
-              f"released {freed / 2**30:.3f} GiB, allocator {before / 2**30:.3f} -> "
-              f"{after / 2**30:.3f} GiB (baseline {base_alloc / 2**30:.3f})")
-        check("the ledger agrees", backend.ledger.charged["vram"] == 0,
-              json.dumps(backend.ledger.rows()["vram"]))
+        check(
+            "the allocator gave the weights back",
+            freed >= total_bytes * 0.99 and after - base_alloc < 64 * MIB,
+            f"released {freed / 2**30:.3f} GiB, allocator {before / 2**30:.3f} -> "
+            f"{after / 2**30:.3f} GiB (baseline {base_alloc / 2**30:.3f})",
+        )
+        check(
+            "the ledger agrees",
+            backend.ledger.charged["vram"] == 0,
+            json.dumps(backend.ledger.rows()["vram"]),
+        )
         out["released_bytes"] = freed
     return out
 
 
-def section_forward(torch: Any, call: Any, device: Any, args: argparse.Namespace
-                    ) -> dict[str, Any]:
+def section_forward(torch: Any, call: Any, device: Any, args: argparse.Namespace) -> dict[str, Any]:
     """One real UNet denoising step on the filled weights — the first real inference
     computation in v2. Fixed seed, fp16, deterministic algorithms where torch has them.
 
@@ -431,8 +499,9 @@ def section_forward(torch: Any, call: Any, device: Any, args: argparse.Namespace
     latents = torch.randn(1, 4, side, side, generator=gen, device=device, dtype=torch.float16)
     prompt = torch.randn(1, 77, 2048, generator=gen, device=device, dtype=torch.float16)
     text_embeds = torch.randn(1, 1280, generator=gen, device=device, dtype=torch.float16)
-    time_ids = torch.tensor([[side * 8, side * 8, 0, 0, side * 8, side * 8]],
-                            device=device, dtype=torch.float16)
+    time_ids = torch.tensor(
+        [[side * 8, side * 8, 0, 0, side * 8, side * 8]], device=device, dtype=torch.float16
+    )
     timestep = torch.tensor([981], device=device)
 
     started = time.perf_counter()
@@ -443,19 +512,29 @@ def section_forward(torch: Any, call: Any, device: Any, args: argparse.Namespace
     body = out.view(-1).view(torch.uint8).cpu().numpy().tobytes()
     digest = hashlib.sha256(body).hexdigest()
     stats = out.float()
-    check("the step produced finite output", bool(torch.isfinite(out).all()),
-          f"shape {tuple(out.shape)} {out.dtype}, mean {stats.mean().item():+.6f}, "
-          f"std {stats.std().item():.6f}, min {stats.min().item():+.4f}, "
-          f"max {stats.max().item():+.4f}")
-    check("the output is not degenerate", stats.std().item() > 1e-3,
-          "a constant or zero field would mean the weights never landed")
+    check(
+        "the step produced finite output",
+        bool(torch.isfinite(out).all()),
+        f"shape {tuple(out.shape)} {out.dtype}, mean {stats.mean().item():+.6f}, "
+        f"std {stats.std().item():.6f}, min {stats.min().item():+.4f}, "
+        f"max {stats.max().item():+.4f}",
+    )
+    check(
+        "the output is not degenerate",
+        stats.std().item() > 1e-3,
+        "a constant or zero field would mean the weights never landed",
+    )
     print(f"  latent {side}x{side} ({side * 8}px) · step {step_ms:.1f} ms · seed {args.seed}")
     print(f"  determinism: {determinism}")
     print(f"  output sha256 {digest}")
     return {
-        "forward_digest": digest, "forward_ms": round(step_ms, 2),
-        "forward_mean": stats.mean().item(), "forward_std": stats.std().item(),
-        "determinism": determinism, "latent": side, "seed": args.seed,
+        "forward_digest": digest,
+        "forward_ms": round(step_ms, 2),
+        "forward_mean": stats.mean().item(),
+        "forward_std": stats.std().item(),
+        "determinism": determinism,
+        "latent": side,
+        "seed": args.seed,
         "forward_peak_vram_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
     }
 
@@ -484,8 +563,9 @@ def section_serve(args: argparse.Namespace) -> None:
     base = torch.cuda.memory_allocated()
 
     head("ModelRegistry.acquire — weightless construction, cr-005 places the bytes")
-    backend = backend_for(art, torch, window_bytes=args.window, slots=args.slots,
-                          readers=args.readers)
+    backend = backend_for(
+        art, torch, window_bytes=args.window, slots=args.slots, readers=args.readers
+    )
     plan = read_plan(PLAN, COMPONENT)
     backend.expect({COMPONENT: tuple(row.key for row in plan)})
     seen = Observations()
@@ -499,25 +579,37 @@ def section_serve(args: argparse.Namespace) -> None:
     elapsed = time.perf_counter() - started
     record = registry.generations()[0].record
     leg = backend.stats["fill_ms"] / 1000
-    print(f"  acquired in {elapsed:.3f} s — {record.filled} destinations, "
-          f"{record.filled_bytes / 2**30:.3f} GiB, fill leg {leg:.3f} s")
+    print(
+        f"  acquired in {elapsed:.3f} s — {record.filled} destinations, "
+        f"{record.filled_bytes / 2**30:.3f} GiB, fill leg {leg:.3f} s"
+    )
     print(f"  identity {record.identity}")
-    check("the generation is READY only after the fill fence",
-          model._cozy_ready and backend.state == "ready",
-          f"backend {backend.state}, model ready={model._cozy_ready}")
-    check("the component root is GUARDED",
-          type(model.pipe.components[COMPONENT]).__name__ == "GuardedComponent",
-          repr(model.pipe.components[COMPONENT]))
+    check(
+        "the generation is READY only after the fill fence",
+        model._cozy_ready and backend.state == "ready",
+        f"backend {backend.state}, model ready={model._cozy_ready}",
+    )
+    check(
+        "the component root is GUARDED",
+        type(model.pipe.components[COMPONENT]).__name__ == "GuardedComponent",
+        repr(model.pipe.components[COMPONENT]),
+    )
 
     head("the author's declared method, on real weights")
     digest = section_forward(torch, model.denoise, backend.device, args)
     print("  through @uses_components('unet') on the guarded root")
 
     head("the guarded root: no component access outside an ACTIVE scope")
-    red("touching the UNet outside a declared scope",
-        lambda: model.pipe.components[COMPONENT].config, code="undeclared_component")
-    red("…and the generation is POISONED, not merely scolded",
-        lambda: model.denoise(*(None,) * 5), code="poisoned_generation")
+    red(
+        "touching the UNet outside a declared scope",
+        lambda: model.pipe.components[COMPONENT].config,
+        code="undeclared_component",
+    )
+    red(
+        "…and the generation is POISONED, not merely scolded",
+        lambda: model.denoise(*(None,) * 5),
+        code="poisoned_generation",
+    )
 
     head("unload: the generation gives the device back")
     torch.cuda.synchronize()
@@ -529,12 +621,17 @@ def section_serve(args: argparse.Namespace) -> None:
     freed = backend.release(COMPONENT) if COMPONENT in backend.components else 0
     torch.cuda.empty_cache()
     after = torch.cuda.memory_allocated()
-    check("the allocator is back to baseline", after - base < 64 * MIB,
-          f"{before / 2**30:.3f} -> {after / 2**30:.3f} GiB (baseline {base / 2**30:.3f}), "
-          f"release() returned {freed / 2**30:.3f} GiB")
-    check("the ledger is back to zero",
-          all(v["charged"] == 0 for v in backend.ledger.rows().values()),
-          json.dumps(backend.ledger.rows()))
+    check(
+        "the allocator is back to baseline",
+        after - base < 64 * MIB,
+        f"{before / 2**30:.3f} -> {after / 2**30:.3f} GiB (baseline {base / 2**30:.3f}), "
+        f"release() returned {freed / 2**30:.3f} GiB",
+    )
+    check(
+        "the ledger is back to zero",
+        all(v["charged"] == 0 for v in backend.ledger.rows().values()),
+        json.dumps(backend.ledger.rows()),
+    )
     if args.marker:
         Path(args.marker).write_text(json.dumps(digest))
 
@@ -577,16 +674,18 @@ def section_arms(args: argparse.Namespace) -> None:
             shutil.copyfile(Store(STORE).object_path(oid), target)
             Store(fake).ensure_verified(wrong, tiny[0].nbytes)
 
-    red("digest mismatch (content address is identity)", digest_mismatch,
-        code="digest_mismatch")
+    red("digest mismatch (content address is identity)", digest_mismatch, code="digest_mismatch")
 
     def length_mismatch() -> None:
         store = Store(STORE)
         row = tiny[0]
         store.ensure_verified(row.segments[0].oid or "", row.nbytes + (1 << 30))
 
-    red("length mismatch (header claims more than the object holds)", length_mismatch,
-        code="length_mismatch")
+    red(
+        "length mismatch (header claims more than the object holds)",
+        length_mismatch,
+        code="length_mismatch",
+    )
 
     def budget_overrun() -> None:
         ledger = ResourceLedger(budgets={"vram": 1 << 20, "pinned": 1 << 20})
@@ -597,8 +696,11 @@ def section_arms(args: argparse.Namespace) -> None:
     def destination_absent() -> None:
         store = Store(STORE)
         backend = StreamingFillBackend(plan, store, slots=2, window_bytes=MIB)
-        backend.fill("unet.not_a_destination", TensorSpec((1,), "float16", nbytes=2),
-                     torch.empty(1, dtype=torch.float16, device="cuda"))
+        backend.fill(
+            "unet.not_a_destination",
+            TensorSpec((1,), "float16", nbytes=2),
+            torch.empty(1, dtype=torch.float16, device="cuda"),
+        )
 
     red("destination absent from the contract", destination_absent, code="destination_absent")
 
@@ -606,11 +708,17 @@ def section_arms(args: argparse.Namespace) -> None:
         store = Store(STORE)
         backend = StreamingFillBackend(plan, store, slots=2, window_bytes=MIB)
         row = tiny[0]
-        backend.fill(row.key, TensorSpec(row.shape, "float16", nbytes=row.nbytes),
-                     torch.empty(row.nbytes, dtype=torch.float16, device="cuda"))
+        backend.fill(
+            row.key,
+            TensorSpec(row.shape, "float16", nbytes=row.nbytes),
+            torch.empty(row.nbytes, dtype=torch.float16, device="cuda"),
+        )
 
-    red("destination length disagrees with the checkpoint", length_mismatch_dest,
-        code="length_mismatch")
+    red(
+        "destination length disagrees with the checkpoint",
+        length_mismatch_dest,
+        code="length_mismatch",
+    )
 
     def dtype_mismatch() -> None:
         """The SILENT case: the same byte count, read as a different dtype. Length agrees,
@@ -618,23 +726,31 @@ def section_arms(args: argparse.Namespace) -> None:
         store = Store(STORE)
         backend = StreamingFillBackend(plan, store, slots=2, window_bytes=MIB)
         row = tiny[0]
-        backend.fill(row.key, TensorSpec(row.shape, "float16", nbytes=row.nbytes),
-                     torch.empty(row.nbytes // 4, dtype=torch.float32, device="cuda"))
+        backend.fill(
+            row.key,
+            TensorSpec(row.shape, "float16", nbytes=row.nbytes),
+            torch.empty(row.nbytes // 4, dtype=torch.float32, device="cuda"),
+        )
 
-    red("same bytes, wrong dtype — a decode, and decoders are cr-006's", dtype_mismatch,
-        code="dtype_mismatch")
+    red(
+        "same bytes, wrong dtype — a decode, and decoders are cr-006's",
+        dtype_mismatch,
+        code="dtype_mismatch",
+    )
 
     def incomplete() -> None:
         store = Store(STORE)
         backend = StreamingFillBackend(plan, store, slots=2, window_bytes=MIB)
         backend.expect({COMPONENT: tuple(row.key for row in plan[:4])})
         row = plan[0]
-        backend.fill(row.key, TensorSpec(row.shape, "float16", nbytes=row.nbytes),
-                     torch.empty(row.shape, dtype=torch.float16, device="cuda"))
+        backend.fill(
+            row.key,
+            TensorSpec(row.shape, "float16", nbytes=row.nbytes),
+            torch.empty(row.shape, dtype=torch.float16, device="cuda"),
+        )
         backend.commit()
 
-    red("a DestinationSet is COMPLETE or it does not commit", incomplete,
-        code="incomplete_fill")
+    red("a DestinationSet is COMPLETE or it does not commit", incomplete, code="incomplete_fill")
 
     def not_ready() -> None:
         store = Store(STORE)
@@ -645,16 +761,21 @@ def section_arms(args: argparse.Namespace) -> None:
     red("nothing is observable as Ready before the fence", not_ready, code="not_ready")
 
     def one_slot() -> None:
-        StagingRing(torch, torch.device("cuda"), window_bytes=MIB, slots=1,
-                    ledger=ResourceLedger())
+        StagingRing(torch, torch.device("cuda"), window_bytes=MIB, slots=1, ledger=ResourceLedger())
 
     red("a one-slot ring cannot double-buffer", one_slot, code="lease_live")
 
     def early_release() -> None:
         """The lease-lifetime arm: give a slot back with no completion event recorded,
         then claim it again. The ring refuses rather than racing the copy engine."""
-        ring = StagingRing(torch, torch.device("cuda"), window_bytes=MIB, slots=2,
-                           ledger=ResourceLedger(), fence=False)
+        ring = StagingRing(
+            torch,
+            torch.device("cuda"),
+            window_bytes=MIB,
+            slots=2,
+            ledger=ResourceLedger(),
+            fence=False,
+        )
         slot = ring.slots[0]
         ring.take(slot)
         ring.give_back(slot)  # fence=False: no event recorded — the planted defect
@@ -666,26 +787,43 @@ def section_arms(args: argparse.Namespace) -> None:
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
-    backend = backend_for(art, torch, window_bytes=args.window, slots=args.slots,
-                          readers=args.readers, interrupt_at=0.5)
+    backend = backend_for(
+        art,
+        torch,
+        window_bytes=args.window,
+        slots=args.slots,
+        readers=args.readers,
+        interrupt_at=0.5,
+    )
     backend.expect({COMPONENT: tuple(row.key for row in plan)})
     interrupted = None
     try:
-        derive_contract(art, mode="serve", backend=backend,
-                        substrate_device=backend.device_str)
+        derive_contract(art, mode="serve", backend=backend, substrate_device=backend.device_str)
     except FillRefusal as exc:
         interrupted = exc
     torch.cuda.synchronize()
     after = torch.cuda.memory_allocated()
-    check("the fill refused mid-stream", interrupted is not None,
-          str(interrupted).splitlines()[0][:96] if interrupted else "")
+    check(
+        "the fill refused mid-stream",
+        interrupted is not None,
+        str(interrupted).splitlines()[0][:96] if interrupted else "",
+    )
     check("nothing is Ready", backend.state == "rolled_back", backend.state)
-    check("the destinations were released", after - base < 64 * MIB,
-          f"allocator {base / 2**30:.3f} -> {after / 2**30:.3f} GiB after rollback")
-    check("the ledger is back to zero", backend.ledger.charged["vram"] == 0
-          and backend.ledger.charged["pinned"] == 0, json.dumps(backend.ledger.rows()))
-    check("verified CAS is untouched", backend.store.rehashes == 0,
-          f"{backend.store.verifies} objects verified, 0 rehashed, 0 written")
+    check(
+        "the destinations were released",
+        after - base < 64 * MIB,
+        f"allocator {base / 2**30:.3f} -> {after / 2**30:.3f} GiB after rollback",
+    )
+    check(
+        "the ledger is back to zero",
+        backend.ledger.charged["vram"] == 0 and backend.ledger.charged["pinned"] == 0,
+        json.dumps(backend.ledger.rows()),
+    )
+    check(
+        "verified CAS is untouched",
+        backend.store.rehashes == 0,
+        f"{backend.store.verifies} objects verified, 0 rehashed, 0 written",
+    )
 
 
 def section_kill(args: argparse.Namespace) -> None:
@@ -698,9 +836,21 @@ def section_kill(args: argparse.Namespace) -> None:
     marker.unlink(missing_ok=True)
     free_before, _ = torch.cuda.mem_get_info()
     child = subprocess.Popen(
-        ["nice", "-n", "19", sys.executable, __file__, "fill", "--no-forward",
-         "--no-release", "--no-verify-bytes", "--marker", str(marker)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [
+            "nice",
+            "-n",
+            "19",
+            sys.executable,
+            __file__,
+            "fill",
+            "--no-forward",
+            "--no-release",
+            "--no-verify-bytes",
+            "--marker",
+            str(marker),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     time.sleep(args.kill_after)
     used = 0
@@ -714,17 +864,29 @@ def section_kill(args: argparse.Namespace) -> None:
     child.wait(timeout=30)
     time.sleep(1.0)
     free_after, _ = torch.cuda.mem_get_info()
-    check("the child was killed mid-fill", used > 1 << 30,
-          f"{used / 2**30:.2f} GiB of destinations were live when SIGKILL landed")
-    check("no Ready marker exists", not marker.exists(),
-          "a killed fill never reaches the freeze point")
-    check("the device is back to baseline", abs(free_after - free_before) < 64 * MIB,
-          f"free {free_before / 2**30:.3f} -> {free_after / 2**30:.3f} GiB")
+    check(
+        "the child was killed mid-fill",
+        used > 1 << 30,
+        f"{used / 2**30:.2f} GiB of destinations were live when SIGKILL landed",
+    )
+    check(
+        "no Ready marker exists",
+        not marker.exists(),
+        "a killed fill never reaches the freeze point",
+    )
+    check(
+        "the device is back to baseline",
+        abs(free_after - free_before) < 64 * MIB,
+        f"free {free_before / 2**30:.3f} -> {free_after / 2**30:.3f} GiB",
+    )
     store = CasStore(STORE)
     row = read_plan(PLAN, COMPONENT)[0]
     store.ensure_verified(row.segments[0].oid or "", row.nbytes)
-    check("verified CAS survived the kill", store.rehashes == 0,
-          "the killed fill wrote nothing, so the record still answers")
+    check(
+        "verified CAS survived the kill",
+        store.rehashes == 0,
+        "the killed fill wrote nothing, so the record still answers",
+    )
 
 
 # -------------------------------------------------------------------------- bench
@@ -734,8 +896,7 @@ def section_bench(args: argparse.Namespace) -> None:
     """Cold and warm arms, fresh process each, evicted between colds — the tfs-018 method,
     so the numbers land in the same table."""
     results = Path(args.out)
-    configs = [(int(w) * MIB, s, r) for w, s, r in
-               (c.split(":") for c in args.configs.split(","))]
+    configs = [(int(w) * MIB, s, r) for w, s, r in (c.split(":") for c in args.configs.split(","))]
     for window, slots, readers in configs:
         for mode in ["cold"] * args.colds + ["warm"]:
             evicted = pages = 0
@@ -744,29 +905,51 @@ def section_bench(args: argparse.Namespace) -> None:
                 # Verify the eviction on the LARGEST object, the same way tfs-018 did:
                 # fadvise is advisory, so a cold arm that never checks is a warm arm.
                 biggest = max(read_plan(PLAN, COMPONENT), key=lambda r: r.nbytes)
-                pages = resident_pages(
-                    CasStore(STORE).object_path(biggest.segments[0].oid or "")
-                )[0]
+                pages = resident_pages(CasStore(STORE).object_path(biggest.segments[0].oid or ""))[
+                    0
+                ]
             started = time.perf_counter()
             proc = subprocess.run(
-                ["nice", "-n", "19", sys.executable, __file__, "fill", "--no-forward",
-                 "--no-verify-bytes", "--no-release", "--json",
-                 "--window", str(window), "--slots", str(slots), "--readers", str(readers)],
-                capture_output=True, text=True,
+                [
+                    "nice",
+                    "-n",
+                    "19",
+                    sys.executable,
+                    __file__,
+                    "fill",
+                    "--no-forward",
+                    "--no-verify-bytes",
+                    "--no-release",
+                    "--json",
+                    "--window",
+                    str(window),
+                    "--slots",
+                    str(slots),
+                    "--readers",
+                    str(readers),
+                ],
+                capture_output=True,
+                text=True,
             )
             if proc.returncode != 0:
-                print(f"  FAIL {window // MIB}MiB s{slots} r{readers} {mode}: "
-                      f"{proc.stderr[-800:]}")
+                print(f"  FAIL {window // MIB}MiB s{slots} r{readers} {mode}: {proc.stderr[-800:]}")
                 continue
             row = json.loads(proc.stdout.strip().split("\n")[-1])
-            row.update(mode=mode, evicted_files=evicted, sample_resident_pages=pages,
-                       wall=round(time.perf_counter() - started, 2))
+            row.update(
+                mode=mode,
+                evicted_files=evicted,
+                sample_resident_pages=pages,
+                wall=round(time.perf_counter() - started, 2),
+            )
             with open(results, "a") as handle:
                 handle.write(json.dumps(row) + "\n")
-            print(f"  {window // MIB:>4} MiB s{slots} r{readers} {mode:4} "
-                  f"{row['seconds']:7.3f} s {row['gbps']:6.3f} GB/s  "
-                  f"vram {row['peak_vram_gib']:.2f} rss {row['peak_rss_gib']:.2f}  "
-                  f"{row['digest'][:12]}", flush=True)
+            print(
+                f"  {window // MIB:>4} MiB s{slots} r{readers} {mode:4} "
+                f"{row['seconds']:7.3f} s {row['gbps']:6.3f} GB/s  "
+                f"vram {row['peak_vram_gib']:.2f} rss {row['peak_rss_gib']:.2f}  "
+                f"{row['digest'][:12]}",
+                flush=True,
+            )
 
 
 # --------------------------------------------------------------------------- main

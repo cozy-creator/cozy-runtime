@@ -210,8 +210,7 @@ def main() -> int:
     print(f"{RUNS} runs each; peak RSS measured per case in a fresh helper process")
     for label, argv in cases:
         report(label, *timed(argv))
-    print("\nauthor surface, in-process against examples/tiny_sdxl.py + tiny_h3.py",
-          flush=True)
+    print("\nauthor surface, in-process against examples/tiny_sdxl.py + tiny_h3.py", flush=True)
     subprocess.run([py, "-c", KERNEL], check=True)
     print("\ndescriptor plane, in-process (the boundary, the writer, the digest)", flush=True)
     subprocess.run([py, "-c", DESCRIPTOR], check=True)

@@ -355,9 +355,7 @@ class Model(Generic[PipelineT]):
         """
         self._cozy_require_ready("for_request")
         if sampler is not None:
-            compatible = {
-                name for s in self._cozy_schedulers.values() for name in s.compatibles
-            }
+            compatible = {name for s in self._cozy_schedulers.values() for name in s.compatibles}
             if sampler not in compatible:
                 raise InvalidRequest(
                     f"sampler {sampler!r} is not in this family's compatibility table "
@@ -399,9 +397,7 @@ class Model(Generic[PipelineT]):
         harness = ModelTestHarness()
         object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
         object.__setattr__(model, "_cozy_harness", harness)
-        object.__setattr__(
-            model, "_cozy_schedulers", _schedulers(list(members.values()), members)
-        )
+        object.__setattr__(model, "_cozy_schedulers", _schedulers(list(members.values()), members))
         object.__setattr__(model, "_cozy_ready", True)
         return model
 
@@ -434,9 +430,7 @@ class Model(Generic[PipelineT]):
     def _cozy_check_access(self, component: str) -> None:
         """The guarded component root: every access checks the ACTIVE scope, resident or not."""
         if self._cozy_active is None:
-            self._cozy_kill(
-                f"component {component!r} was touched outside any component-use scope"
-            )
+            self._cozy_kill(f"component {component!r} was touched outside any component-use scope")
         method, declared = self._cozy_active
         if component not in declared:
             self._cozy_kill(
@@ -447,9 +441,7 @@ class Model(Generic[PipelineT]):
 
     def _cozy_kill(self, why: str) -> NoReturn:
         object.__setattr__(self, "_cozy_poison", why)
-        raise CapabilityError(
-            f"{type(self).__name__}: {why}", code="undeclared_component"
-        )
+        raise CapabilityError(f"{type(self).__name__}: {why}", code="undeclared_component")
 
     def _cozy_require_ready(self, what: str) -> None:
         if self._cozy_poison is not None:
@@ -790,9 +782,7 @@ class ModelRegistry:
         return Generation(identity, model, record)
 
     def _loader(self, model: Model[Any], artifact: Artifact, mode: Mode) -> Loader:
-        return Loader(
-            artifact, owner=model, backend=self._backend, mode=mode, device=self._device
-        )
+        return Loader(artifact, owner=model, backend=self._backend, mode=mode, device=self._device)
 
 
 _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", topology={}, config=Config({}))

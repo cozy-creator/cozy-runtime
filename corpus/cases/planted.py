@@ -34,7 +34,8 @@ def _hidden_cache(config: Config) -> Pipeline:
             super().__init__()
             self.proj = nn.Linear(width, width, dtype=torch.bfloat16)
             self.register_buffer(
-                "precomputed", torch.zeros(1 << 14, 1 << 14, dtype=torch.bfloat16),
+                "precomputed",
+                torch.zeros(1 << 14, 1 << 14, dtype=torch.bfloat16),
                 persistent=False,
             )
 
@@ -96,17 +97,35 @@ def _broken_tie(config: Config) -> Pipeline:
 
 
 CASES = (
-    Case("hidden_cache", "a GB-scale non-persistent buffer no checkpoint fills",
-         _hidden_cache, "typed-refusal", names="hidden cache", ground_truth=False,
-         note="the planted hidden-cache red arm; ground truth would allocate 512 MiB for real"),
-    Case("sized_derived_table", "the same idiom at a legitimate size", _sized_cache,
-         "derived-correct",
-         note="the cap must bound the idiom, not ban it"),
-    Case("live_tie", "a weight tie that is still live at census time", _tied,
-         "derived-correct",
-         note="the baseline the broken-tie arm is compared against"),
-    Case("broken_tie", "a tie established in __init__ and silently rebound after",
-         _broken_tie, "derived-correct",
-         note="derives correctly AND differently from live_tie — no checkpoint could tell "
-              "them apart, which is why the alias census exists"),
+    Case(
+        "hidden_cache",
+        "a GB-scale non-persistent buffer no checkpoint fills",
+        _hidden_cache,
+        "typed-refusal",
+        names="hidden cache",
+        ground_truth=False,
+        note="the planted hidden-cache red arm; ground truth would allocate 512 MiB for real",
+    ),
+    Case(
+        "sized_derived_table",
+        "the same idiom at a legitimate size",
+        _sized_cache,
+        "derived-correct",
+        note="the cap must bound the idiom, not ban it",
+    ),
+    Case(
+        "live_tie",
+        "a weight tie that is still live at census time",
+        _tied,
+        "derived-correct",
+        note="the baseline the broken-tie arm is compared against",
+    ),
+    Case(
+        "broken_tie",
+        "a tie established in __init__ and silently rebound after",
+        _broken_tie,
+        "derived-correct",
+        note="derives correctly AND differently from live_tie — no checkpoint could tell "
+        "them apart, which is why the alias census exists",
+    ),
 )

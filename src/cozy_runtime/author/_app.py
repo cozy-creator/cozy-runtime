@@ -177,8 +177,7 @@ class App:
             return self._registry[name]
         except KeyError:
             raise RegistrationError(
-                f"no registered callable named {name!r}: have "
-                f"{', '.join(self._registry) or 'none'}"
+                f"no registered callable named {name!r}: have {', '.join(self._registry) or 'none'}"
             ) from None
 
     def freeze(self) -> None:

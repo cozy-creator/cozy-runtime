@@ -108,8 +108,15 @@ class SdxlModel(Model[TinySdxlPipeline]):
     # at first touch. Coarse whole-__call__ scope: safe-and-slower (§1.1).
     @uses_components("text_encoder", "text_encoder_2", "unet", "vae")
     def generate(
-        self, view: RequestView, prompt: str, *, negative: str, width: int, height: int,
-        steps: int, guidance: float,
+        self,
+        view: RequestView,
+        prompt: str,
+        *,
+        negative: str,
+        width: int,
+        height: int,
+        steps: int,
+        guidance: float,
     ) -> ImageFrame:
         # The model calls its OWN typed pipeline; the view supplies the request-local
         # generator. RequestView has no pipeline passthrough.
@@ -154,12 +161,15 @@ def generate(
         for step in range(steps):
             on_step(step)
         frame = model.generate(
-            view, payload.prompt, negative=payload.negative_prompt, width=width,
-            height=height, steps=steps, guidance=payload.guidance_scale,
+            view,
+            payload.prompt,
+            negative=payload.negative_prompt,
+            width=width,
+            height=height,
+            steps=steps,
+            guidance=payload.guidance_scale,
         )
-    return ImageOutput(
-        image=out.save_image(frame, format="png"), checkpoint=model.checkpoint_ref
-    )
+    return ImageOutput(image=out.save_image(frame, format="png"), checkpoint=model.checkpoint_ref)
 
 
 @app.entrypoint
@@ -226,12 +236,15 @@ def generate_ref(
         adj.adjusted("num_inference_steps", steps, 8, "reference conditioning caps steps")
         steps = 8
     frame = model.generate(
-        view, payload.prompt, negative="", width=width, height=height, steps=steps,
+        view,
+        payload.prompt,
+        negative="",
+        width=width,
+        height=height,
+        steps=steps,
         guidance=payload.guidance_scale,
     )
-    return ImageOutput(
-        image=out.save_image(frame, format="png"), checkpoint=model.checkpoint_ref
-    )
+    return ImageOutput(image=out.save_image(frame, format="png"), checkpoint=model.checkpoint_ref)
 
 
 # ---------------------------------------------------------------- async arm
@@ -258,6 +271,4 @@ async def caption(ctx: Context, payload: CaptionInput, net: Egress) -> CaptionOu
 
     response = net.fetch(payload.endpoint, method="POST", body=payload.prompt.encode())
     await asyncio.sleep(0)
-    return CaptionOutput(
-        caption=response.body.decode(), loop=hex(id(asyncio.get_running_loop()))
-    )
+    return CaptionOutput(caption=response.body.decode(), loop=hex(id(asyncio.get_running_loop())))

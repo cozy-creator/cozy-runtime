@@ -71,9 +71,9 @@ REPORT_SECONDS = 2.0
 class Fences:
     """The five fence ordinals, and who owns each (worker-protocol/02 §0)."""
 
-    session_id: str = ""            # CP-minted at parent boot; a restart mints a NEW one
-    revision: int = 0               # hub-owned
-    credential_epoch: int = 0       # hub-owned, echoed by Report
+    session_id: str = ""  # CP-minted at parent boot; a restart mints a NEW one
+    revision: int = 0  # hub-owned
+    credential_epoch: int = 0  # hub-owned, echoed by Report
     applied_directive: bytes = b""  # canonical bytes of the applied Directive, for §3's
     #                                 "same revision + different body is a protocol error"
     posture: pb.Posture = pb.Posture.POSTURE_UNSPECIFIED
@@ -91,7 +91,7 @@ class Supervisor:
         self.root = Path(args.root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.fences = Fences(session_id=f"ses-{uuid.uuid4().hex[:20]}")
-        self.seq = itertools.count(1)     # SUPERVISOR-owned monotone counter
+        self.seq = itertools.count(1)  # SUPERVISOR-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.journal = Journal(self.root / "journal.log")
         self.ledger = HostLedger(host_budget=args.host_budget, pinned_budget=args.pinned_budget)
@@ -130,7 +130,7 @@ class Supervisor:
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
         self.notes: list[str] = []
-        self.call: Any = None   # the live Control call, so shutdown can cancel it
+        self.call: Any = None  # the live Control call, so shutdown can cancel it
 
     # ------------------------------------------------------------------ plumbing
 
@@ -316,14 +316,12 @@ class Supervisor:
             # `registered` is page-locked, kernel-unreclaimable bytes: the ring's PEAK is
             # the honest number, since a closed ring has charged nothing while the budget it
             # held is exactly what the driver had pinned (§3.2's two-number rule).
-            self.ledger.registered = int(
-                reply["facts"]["ledger"].get("pinned", {}).get("peak", 0)
-            )
+            self.ledger.registered = int(reply["facts"]["ledger"].get("pinned", {}).get("peak", 0))
             self.note(
                 "boot",
                 f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
                 f"{reply['facts']['filled']} destinations, "
-                f"{reply['facts']['filled_bytes'] / 2 ** 30:.3f} GiB, fill leg "
+                f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
                 f"{reply['facts']['fill_ms'] / 1000:.3f} s, construction {digest[:23]}…",
             )
         self.run_warm_pass()
@@ -452,8 +450,12 @@ class Supervisor:
             return
         if self.fences.posture == pb.Posture.POSTURE_DRAINING:
             self.note("intake", f"draining: refusing {start.request_id}")
-            self.refuse(start, "draining", "the worker is draining and admits no new attempts",
-                        CAUSE.CAUSE_CODE_LOCAL_SAFETY)
+            self.refuse(
+                start,
+                "draining",
+                "the worker is draining and admits no new attempts",
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
             return
         try:
             attempt = self.engine.offer(start)
@@ -470,8 +472,11 @@ class Supervisor:
             self.send(pb.WorkerMessage(attempt_terminal=self.engine.wrap(attempt)))
             return
         if attempt.state in ("accepted", "running"):
-            self.note("attempt", "duplicate StartAttempt for a held attempt: re-accepting "
-                                 "the SAME acceptance; nothing starts a second time")
+            self.note(
+                "attempt",
+                "duplicate StartAttempt for a held attempt: re-accepting "
+                "the SAME acceptance; nothing starts a second time",
+            )
             self.send(pb.WorkerMessage(attempt_accepted=self.engine.accepted_message(attempt)))
             return
         try:
@@ -499,9 +504,7 @@ class Supervisor:
         self.send(pb.WorkerMessage(attempt_accepted=accepted))
         self.work.put(attempt)
 
-    def refuse(
-        self, start: pb.StartAttempt, code: str, detail: str, cause: pb.CauseCode
-    ) -> None:
+    def refuse(self, start: pb.StartAttempt, code: str, detail: str, cause: pb.CauseCode) -> None:
         """A typed refusal is a TERMINAL: journaled before send, like any other."""
         attempt = Attempt(
             request_id=start.request_id,
@@ -551,8 +554,9 @@ class Supervisor:
         self.fences.intake = pb.IntakeState.INTAKE_STATE_LOADING
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
-        killed = self.supervision.sweep_orphans(exclude=self.supervision.current.pid
-                                                if self.supervision.current else 0)
+        killed = self.supervision.sweep_orphans(
+            exclude=self.supervision.current.pid if self.supervision.current else 0
+        )
         if killed:
             self.note("recovery", f"fenced {len(killed)} orphan executor(s): {killed}")
         try:
@@ -684,11 +688,21 @@ class Supervisor:
         unreadable: list[str] = []
         gpu_name, gpu_sm, vram, driver = "", 0, 0, ""
         try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10, check=True,
-            ).stdout.strip().splitlines()[0]
+            out = (
+                subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=name,memory.total,driver_version,compute_cap",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                .stdout.strip()
+                .splitlines()[0]
+            )
             name, total, drv, cap = (part.strip() for part in out.split(","))
             gpu_name, vram, driver = name, int(float(total)) * 1024 * 1024, drv
             gpu_sm = int(float(cap) * 10)
@@ -714,12 +728,15 @@ class Supervisor:
 
     def run(self) -> int:
         """Dial, register, serve, reconnect. The session outlives the connection."""
-        self.journal.append("session", {"session_id": self.fences.session_id,
-                                        "instance_id": self.args.instance_id})
+        self.journal.append(
+            "session", {"session_id": self.fences.session_id, "instance_id": self.args.instance_id}
+        )
         killed = self.supervision.sweep_orphans()
         if killed:
-            self.note("recovery", f"killed {len(killed)} orphan executor(s) from before "
-                                  f"this restart: {killed}")
+            self.note(
+                "recovery",
+                f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
+            )
         threading.Thread(target=self.worker, daemon=True, name="attempt").start()
         threading.Thread(target=self.reporter, daemon=True, name="report").start()
         threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
@@ -830,4 +847,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

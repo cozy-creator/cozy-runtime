@@ -27,8 +27,7 @@ def _clip(width: int, layers: int) -> nn.Module:
     encoder.embeddings = nn.Embedding(4096, width, dtype=torch.bfloat16)  # type: ignore[assignment]
     encoder.layers = nn.ModuleList(  # type: ignore[assignment]
         [
-            nn.TransformerEncoderLayer(width, 4, width * 4, batch_first=True,
-                                       dtype=torch.bfloat16)
+            nn.TransformerEncoderLayer(width, 4, width * 4, batch_first=True, dtype=torch.bfloat16)
             for _ in range(layers)
         ]
     )
@@ -47,8 +46,7 @@ def _unet(width: int, blocks: int) -> nn.Module:
         [nn.Conv2d(width, width, 3, padding=1, dtype=torch.bfloat16) for _ in range(blocks)]
     )
     # the rope-style table every real UNet carries and no checkpoint stores
-    unet.register_buffer("position_ids", torch.zeros(1, 77, dtype=torch.int64),
-                         persistent=False)
+    unet.register_buffer("position_ids", torch.zeros(1, 77, dtype=torch.int64), persistent=False)
     return unet
 
 
@@ -99,6 +97,4 @@ COMPONENT_USE: Mapping[str, tuple[str, ...]] = {
 }
 
 #: The planted under-declaration — three components on a four-component pipeline.
-UNDER_DECLARED: Mapping[str, tuple[str, ...]] = {
-    "generate": ("text_encoder", "unet", "vae")
-}
+UNDER_DECLARED: Mapping[str, tuple[str, ...]] = {"generate": ("text_encoder", "unet", "vae")}
