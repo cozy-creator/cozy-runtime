@@ -38,6 +38,7 @@ KINDS = (
     "closed",  # TerminalAck bound by terminal_id + terminal_digest
     "epoch",  # executor incarnation / readiness epoch movement
     "warm",  # one boot warm-pass outcome
+    "ledger",  # one attempt's byte-class reconciliation at close (cr-008a)
 )
 
 

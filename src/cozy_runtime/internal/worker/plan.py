@@ -1,13 +1,8 @@
-"""The worker-scoped host/pinned ledger, the PlanChooser, and the ExecutorPreparer.
+"""The PlanChooser, the AttemptPlan, and the local resolution of a binding plan.
 
-Three things live together because they are one decision made in one place, before durable
-acceptance (§3.2):
+Two things live together because they are one decision made in one place, before durable
+acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
 
-* **HostLedger** — device pools are executor-exclusive, so nothing arbitrates them here;
-  HOST RAM and PINNED memory are shared by every executor on the worker, so the torch-free
-  supervisor keeps their ledger and grants each attempt's host needs ATOMICALLY with its
-  envelope. No incremental cross-executor acquisition exists, so no hold-and-wait cycle can
-  form. `allocated` and `registered` stay two numbers, never one (the v1 hostslab lesson).
 * **PlanChooser** — pure arithmetic over the request shape, the bindings and the live
   ledger, returning ONE AttemptPlan. At cr-007 it is deliberately a SINGLE-plan chooser
   behind the real offer/prepare/accept seam: the closed proven set has one member, so the
@@ -26,10 +21,11 @@ something was.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.worker.ledger import Ledger
 
 
 class PlanRefusal(Exception):
@@ -40,71 +36,6 @@ class PlanRefusal(Exception):
         self.code = code
         self.detail = detail
         self.shortfall = shortfall
-
-
-@dataclass(slots=True)
-class HostLedger:
-    """The WORKER-level host/pinned ledger. Supervisor-owned, torch-free, atomic."""
-
-    host_budget: int
-    pinned_budget: int
-    #: charged host bytes per attempt/executor key, so a release cannot guess an amount
-    grants: dict[str, dict[str, int]] = field(default_factory=dict)
-    #: page-locked bytes actually REGISTERED with the driver, reported by the executor.
-    registered: int = 0
-    peak_host: int = 0
-
-    @property
-    def host_charged(self) -> int:
-        return sum(row["host"] for row in self.grants.values())
-
-    @property
-    def pinned_charged(self) -> int:
-        return sum(row["pinned"] for row in self.grants.values())
-
-    def grant(self, key: str, host: int, pinned: int, why: str) -> None:
-        """All classes or none — the envelope is granted whole, before anything moves."""
-        if key in self.grants:
-            raise PlanRefusal("double_grant", f"{key} already holds a host grant")
-        free_host = self.host_budget - self.host_charged
-        free_pinned = self.pinned_budget - self.pinned_charged
-        for name, need, free, budget in (
-            ("host_ram", host, free_host, self.host_budget),
-            ("pinned", pinned, free_pinned, self.pinned_budget),
-        ):
-            if need > free:
-                raise PlanRefusal(
-                    "host_shortfall",
-                    f"{why}: {name} needs {need} B, {free} B free of {budget} B "
-                    f"(short by {need - free} B)",
-                    {
-                        "resource": name,
-                        "scope": "attempt_envelope",
-                        "needed_bytes": need,
-                        "available_bytes": free,
-                        "evidence_class": "measured",
-                    },
-                )
-        self.grants[key] = {"host": host, "pinned": pinned}
-        self.peak_host = max(self.peak_host, self.host_charged)
-
-    def release(self, key: str) -> None:
-        self.grants.pop(key, None)
-
-    def rows(self) -> dict[str, Any]:
-        return {
-            "host_ram": {
-                "charged": self.host_charged,
-                "budget": self.host_budget,
-                "peak": self.peak_host,
-            },
-            "pinned": {
-                "allocated": self.pinned_charged,
-                "registered": self.registered,
-                "budget": self.pinned_budget,
-            },
-            "grants": len(self.grants),
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +136,7 @@ class PlanChooser:
     the closed set this walks.
     """
 
-    def __init__(self, ledger: HostLedger) -> None:
+    def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
         self.choices = 0
 

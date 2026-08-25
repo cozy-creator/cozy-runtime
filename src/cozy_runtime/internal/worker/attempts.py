@@ -36,10 +36,11 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.journal import Journal
+from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
-from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, HostLedger, PlanRefusal
+from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
+from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, PlanRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -135,6 +136,11 @@ class Attempt:
     canceling: str = ""
     cancel_started: float = 0.0
     executions: int = 0
+    #: every ledger class as it stood BEFORE this attempt's envelope was granted. The
+    #: reconciliation at close compares against this line, never against the mid-attempt
+    #: state, because "the attempt gave back what it took" is a claim about the whole
+    #: envelope — the grant included.
+    opened: dict[str, int] = dataclasses_field(default_factory=dict)
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
@@ -150,7 +156,7 @@ class AttemptEngine:
         self,
         *,
         journal: Journal,
-        ledger: HostLedger,
+        ledger: Ledger,
         chooser: Any,
         supervision: ExecutorSupervision,
         authorizer: grants.Authorizer,
@@ -333,6 +339,7 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
 
+        attempt.opened = self.ledger.snapshot()
         try:
             self.ledger.grant(
                 f"{attempt.request_id}#{attempt.attempt}",
@@ -340,7 +347,7 @@ class AttemptEngine:
                 plan.reserved_pinned_bytes,
                 f"attempt {attempt.request_id}#{attempt.attempt}",
             )
-        except PlanRefusal as exc:
+        except LedgerRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
@@ -392,7 +399,64 @@ class AttemptEngine:
     # ------------------------------------------------------------------ execute
 
     def execute(self, attempt: Attempt) -> pb.AttemptTerminal:
-        """Run ONE accepted attempt and journal its terminal before sending it."""
+        """Run ONE accepted attempt, then CLOSE it against the ledger.
+
+        The two halves are separate on purpose. `_run` ends at a journaled terminal and
+        nothing may come between the journal and the send — that is the protocol's
+        durability rule. Reconciliation happens after it, before the attempt leaves this
+        engine, and its own failure can never invalidate a terminal that is already durable:
+        a ledger that cannot be closed is a FAULT the operator sees, not a lost result.
+
+        The opening line it reconciles against was taken at ACCEPTANCE, before the envelope
+        was granted (`attempt.opened`).
+        """
+        terminal = self._run(attempt)
+        self.reconcile(attempt)
+        return terminal
+
+    def reconcile(self, attempt: Attempt) -> dict[str, Any]:
+        """Every byte class, before and after, with the executor's after-state re-read.
+
+        The device numbers come from the process that owns the CUDA context, so a dead
+        executor makes them UNREADABLE rather than zero (§3.6). That distinction is the
+        whole point on the kill path: "0 B allocated" would be a claim about a device this
+        worker can no longer see, while "unreadable, the context died with the process" is
+        what actually happened — and the bytes really are gone, because the kernel reclaims
+        a dead process's device context, which `nvidia-smi` confirms from outside.
+        """
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        executor = self.supervision.current
+        if executor is not None and executor.alive() and not executor.poisoned:
+            try:
+                self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
+            except ExecutorGone:
+                self.ledger.device_unreadable("the executor died before the ledger was read")
+        else:
+            self.ledger.device_unreadable(
+                "no live usable executor: its CUDA context died with the process"
+            )
+        record = self.ledger.close_attempt(key, attempt.opened)
+        try:
+            self.journal.append("ledger", record)
+        except JournalError as exc:
+            record["journaled"] = False
+            record["journal_error"] = exc.code
+        if record["leaks"]:
+            self.faults.append(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=key,
+                    reason="ledger_unreconciled",
+                    detail=safe(
+                        "the attempt reached a terminal without returning every class to "
+                        "its opening value: " + "; ".join(record["leaks"])
+                    ),
+                )
+            )
+        return record
+
+    def _run(self, attempt: Attempt) -> pb.AttemptTerminal:
+        """The attempt itself: dispatch, freeze point, tail, journaled terminal."""
         assert attempt.binding is not None and attempt.plan is not None
         executor = self.supervision.current
         if executor is None:
@@ -436,6 +500,11 @@ class AttemptEngine:
                 return self.finish_cancel(attempt, attempt.canceling)
             return self.abandon(attempt, str(exc))
         attempt.resulted_at = time.perf_counter()
+        # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
+        # whatever came back, success or fault: a failed attempt's activation peak is
+        # exactly the number an operator needs, and dropping it on the failure path would
+        # leave the ledger blind in the one case that matters.
+        self.ledger.observe_attempt(reply.get("metrics", {}))
 
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
