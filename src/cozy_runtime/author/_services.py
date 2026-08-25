@@ -15,7 +15,7 @@ from __future__ import annotations
 import struct
 import time
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +74,19 @@ class Attempt:
     pending: dict[str, Asset] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     events: list[TelemetryEvent] = field(default_factory=list)
+    sink: Callable[[TelemetryEvent], None] | None = None
+    """The runtime's LOSSY progress lane (cr-007), installed by the executor.
+
+    Events are always recorded for the terminal envelope; the sink is an additional,
+    best-effort forward so a long attempt renders live. It cannot fail an attempt: the
+    lossy lane never has authority over a durable fact.
+    """
     _counter: int = 0
+
+    def emit(self, event: TelemetryEvent) -> None:
+        self.events.append(event)
+        if self.sink is not None:
+            self.sink(event)
 
     def next_handle(self, kind: str) -> str:
         self._counter += 1
@@ -267,7 +279,7 @@ class Telemetry(_Bound):
 
     def progress(self, fraction: float, *, stage: str | None = None) -> None:
         self._attempt.check_open("Telemetry.progress")
-        self._attempt.events.append(
+        self._attempt.emit(
             TelemetryEvent("progress", stage or "", round(min(max(fraction, 0.0), 1.0), 6))
         )
 
@@ -283,7 +295,7 @@ class Telemetry(_Bound):
 
     def log(self, message: str, *, level: str = "info", **fields: object) -> None:
         self._attempt.check_open("Telemetry.log")
-        self._attempt.events.append(TelemetryEvent("log", message, level, dict(fields)))
+        self._attempt.emit(TelemetryEvent("log", message, level, dict(fields)))
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
@@ -294,15 +306,15 @@ class Telemetry(_Bound):
             yield
         finally:
             elapsed = (time.perf_counter() - start) * 1000
-            self._attempt.events.append(TelemetryEvent("stage", name, round(elapsed, 3)))
+            self._attempt.emit(TelemetryEvent("stage", name, round(elapsed, 3)))
 
     def metric(self, name: str, value: float, *, unit: str | None = None) -> None:
         self._attempt.check_open("Telemetry.metric")
-        self._attempt.events.append(TelemetryEvent("metric", name, value, {"unit": unit or ""}))
+        self._attempt.emit(TelemetryEvent("metric", name, value, {"unit": unit or ""}))
 
     def training_metric(self, name: str, value: float, *, step: int) -> None:
         self._attempt.check_open("Telemetry.training_metric")
-        self._attempt.events.append(TelemetryEvent("metric", name, value, {"step": step}))
+        self._attempt.emit(TelemetryEvent("metric", name, value, {"step": step}))
 
 
 class Adjustments(_Bound):

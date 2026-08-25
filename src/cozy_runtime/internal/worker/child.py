@@ -1,0 +1,288 @@
+"""The disposable device executor, from the supervisor's side.
+
+Two coupled ordinals over one execution context, kept as TWO counters on purpose
+(worker-protocol/02 §0):
+
+* `executor_incarnation` — the TRANSPORT fence. Bumps on child respawn.
+* `readiness_epoch` — the READINESS fence. Bumps on every state invalidation, which
+  includes every incarnation bump AND the in-place case where the process survives but its
+  state did not (an orphan sweep + reload). That in-place case is exactly why one merged
+  counter is not enough: it would force a full respawn — a 5-second refill — for every
+  orphan sweep.
+
+Cancellation is cooperative then forceful and the SUPERVISOR owns both clocks: the grace
+budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
+`CancelAttempt.grace_ms`, and never an author knob. The forceful path kills the executor's
+whole process GROUP, so a grandchild cannot outlive the terminal that closed its attempt.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import signal
+import socket
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from cozy_runtime.internal import spawn
+from cozy_runtime.internal.seam import Channel, SeamError, listener
+
+#: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
+#: short enough that a caller's cancel is not a lifetime. A RUNTIME CONSTANT; `grace_ms` on
+#: CancelAttempt is the operator override door, and no author surface reaches it.
+GRACE_SECONDS = 3.0
+
+#: How long the supervisor waits for a spawned executor to dial back before calling the
+#: incarnation dead. Not a boot timeout for LOADING — that stays silence-bounded (§3.3).
+DIAL_SECONDS = 60.0
+
+
+class ExecutorGone(Exception):
+    """The executor died. Always a fact about the incarnation, never about the attempt."""
+
+    def __init__(self, detail: str, status: int | None = None) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+
+@dataclass(slots=True)
+class Executor:
+    """One incarnation: a pid, a seam, and the facts it reported."""
+
+    incarnation: int
+    pid: int
+    channel: Channel
+    seal_digest: str
+    hello: dict[str, Any] = field(default_factory=dict)
+    ready_plans: set[str] = field(default_factory=set)
+    poisoned: str = ""
+    spawned_at: float = 0.0
+    ready_at: float = 0.0
+    exit_status: int | None = None
+
+    def alive(self) -> bool:
+        if self.exit_status is not None:
+            return False
+        try:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.exit_status = -1
+            return False
+        if pid == 0:
+            return True
+        self.exit_status = status
+        return False
+
+    def call(
+        self,
+        command: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """One command, its reply, and every progress frame in between."""
+        name = command["cmd"]
+        self.channel.send(command)
+        while True:
+            try:
+                frame = self.channel.recv(timeout)
+            except SeamError as exc:
+                raise ExecutorGone(f"seam: {exc}") from exc
+            if frame is None:
+                self.alive()
+                raise ExecutorGone(
+                    f"the executor died during {name!r} (exit status {self.exit_status})",
+                    self.exit_status,
+                )
+            if frame.get("event") == "progress":
+                if on_progress is not None:
+                    on_progress(frame)
+                continue
+            if frame.get("reply") != name:
+                raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
+            return frame
+
+    # ------------------------------------------------------------------ signals
+
+    def cooperative_cancel(self) -> bool:
+        """Signal the running handler to unwind. It may ignore this; that is the point."""
+        try:
+            os.kill(self.pid, signal.SIGUSR1)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def kill_group(self, sig: int = signal.SIGKILL) -> int:
+        """Forceful: the executor AND every grandchild, by process group."""
+        killed = 0
+        try:
+            os.killpg(os.getpgid(self.pid), sig)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(self.pid, sig)
+                killed += 1
+            except ProcessLookupError:
+                pass
+        return killed
+
+    def reap(self, seconds: float = 10.0) -> int | None:
+        """Wait for the process to be gone AND reaped — a zombie is not a dead executor."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not self.alive():
+                return self.exit_status
+            time.sleep(0.01)
+        return None
+
+    def close(self) -> None:
+        self.channel.close()
+
+
+class ExecutorSupervision:
+    """Spawns, watches, kills and replaces the executor; owns the two ordinals."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        python: str,
+        base_env: tuple[tuple[str, str], ...],
+        cozy_home: Path,
+        plant: str = "",
+    ) -> None:
+        self.root = root
+        self.python = python
+        self.base_env = base_env
+        self.cozy_home = cozy_home
+        self.plant = plant
+        # Both ordinals START at 1 (02 §0): a worker that has not spawned yet is already
+        # at incarnation 1, so its Register carries a valid fence rather than a zero.
+        self.incarnation = 1
+        self.readiness_epoch = 1
+        self.current: Executor | None = None
+        self.needs_rebuild = False
+        """Set by every invalidation. It exists because `alive()` is a RACE against a
+        process that is being killed on another thread: a dying executor answers `waitpid`
+        with 0 for a few milliseconds, and a rebuild decision that reads liveness alone
+        silently skips exactly when it matters most."""
+        self.spawns = 0
+        self.socket_path = str(root / "executor.sock")
+        self._listener: socket.socket | None = None
+
+    # ------------------------------------------------------------------ spawn
+
+    def spawn(self, *, imposed: dict[str, str], dial_seconds: float = DIAL_SECONDS) -> Executor:
+        """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
+        has no state, so every incarnation bump implies a readiness bump."""
+        if self._listener is None:
+            Path(self.socket_path).unlink(missing_ok=True)
+            self._listener = listener(self.socket_path)
+        if self.spawns:
+            # A RESPAWN bumps the transport fence, and with it the readiness fence: a fresh
+            # executor has no state, so no incarnation bump can leave readiness unmoved.
+            self.incarnation += 1
+            self.readiness_epoch += 1
+        self.spawns += 1
+        imposed = {**imposed, "COZY_EXECUTOR_SOCKET": self.socket_path,
+                   "COZY_HOME": str(self.cozy_home)}
+        started = time.perf_counter()
+        spawned = spawn.spawn_executor(
+            python=self.python,
+            module_argv=[
+                "-c",
+                "import sys; from cozy_runtime.internal.executor import main; "
+                "raise SystemExit(main(sys.argv[1:]))",
+                "--socket",
+                self.socket_path,
+                "--root",
+                str(self.root),
+                *(("--plant", self.plant) if self.plant else ()),
+            ],
+            base_env=self.base_env,
+            imposed=imposed,
+            cwd=str(self.root),
+        )
+        self._listener.settimeout(dial_seconds)
+        try:
+            conn, _ = self._listener.accept()
+        except TimeoutError as exc:
+            os.kill(spawned.pid, signal.SIGKILL)
+            raise ExecutorGone(
+                f"incarnation {self.incarnation} never dialled back within {dial_seconds} s"
+            ) from exc
+        executor = Executor(
+            incarnation=self.incarnation,
+            pid=spawned.pid,
+            channel=Channel(conn),
+            seal_digest=spawned.seal_digest,
+            spawned_at=started,
+        )
+        executor.hello = executor.call({"cmd": "hello"}, timeout=dial_seconds)
+        executor.ready_at = time.perf_counter()
+        self.current = executor
+        return executor
+
+    def invalidate(self, why: str) -> int:
+        """In-place readiness invalidation: the PROCESS may survive, its state did not."""
+        self.readiness_epoch += 1
+        self.needs_rebuild = True
+        if self.current is not None:
+            self.current.ready_plans.clear()
+            self.current.poisoned = self.current.poisoned or why
+        return self.readiness_epoch
+
+    def replace(self, *, imposed: dict[str, str]) -> Executor:
+        """Kill the current incarnation (group and all) and spawn a fresh one."""
+        if self.current is not None:
+            self.current.kill_group()
+            self.current.reap()
+            self.current.close()
+            self.current = None
+        return self.spawn(imposed=imposed)
+
+    # ------------------------------------------------------------------ orphans
+
+    def sweep_orphans(self, *, exclude: int = 0) -> list[int]:
+        """Fence or kill leftover executors from before a supervisor restart (§6.2 step 1).
+
+        Identity is the executor's own argv — it names this worker's socket path — so the
+        sweep can never touch another worker's executor or an unrelated process.
+        """
+        killed: list[int] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == exclude:
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            text = b" ".join(cmdline)
+            if b"cozy_runtime.internal.executor" not in text:
+                continue
+            if self.socket_path.encode() not in text:
+                continue
+            pid = int(entry.name)
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except OSError as exc:
+                if exc.errno != errno.ESRCH:
+                    raise
+        return killed
+
+    def close(self) -> None:
+        if self.current is not None:
+            self.current.kill_group()
+            self.current.reap(2.0)
+            self.current.close()
+            self.current = None
+        if self._listener is not None:
+            self._listener.close()
+            Path(self.socket_path).unlink(missing_ok=True)
+            self._listener = None

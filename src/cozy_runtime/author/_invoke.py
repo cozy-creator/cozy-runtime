@@ -77,6 +77,8 @@ class Invocation:
     adapters: tuple[AdapterRef, ...] = ()
     egress_broker: Callable[..., Any] | None = None
     max_output_bytes: int = MAX_OUTPUT_BYTES
+    progress: Callable[[TelemetryEvent], None] | None = None
+    """The runtime's lossy progress sink (cr-007). Best-effort, never authoritative."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +126,7 @@ def invoke(
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
     _hydrate(overlay.payload, inv)
 
-    attempt = Attempt(inv.request_id, inv.spool, inv.max_output_bytes)
+    attempt = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
     attempt.rows.extend(overlay.rows)
     ctx = Context(
         inv.request_id, inv.deadline, inv.boot_warmup, inv.device, inv.cancel, inv.adapters
