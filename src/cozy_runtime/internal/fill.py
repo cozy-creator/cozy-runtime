@@ -1062,6 +1062,15 @@ class StreamingFillBackend:
                 one = self._acquire(component).stream(
                     plan, ring.views, on_batch, readers=self.readers
                 )
+            # FENCE BETWEEN COMPONENTS. `stream` returns with up to `keep` slots still
+            # DMA-live, and the next component's stream starts by taking the whole ring as
+            # free — so the store's reader threads overwrite slots whose H2D has not landed,
+            # and the corruption is SILENT. Measured before the fence: 12 of
+            # `text_encoder_2`'s 517 tensors differed from the safetensors source in a
+            # four-component fill, while the same component filled alone was byte-perfect.
+            # A slot is the store's to hand out only when the ring owns it, and the ring's
+            # ownership has to be whole again before a new stream begins.
+            ring.drain(0)
             for key, value in dict(one).items():
                 stats[key] = stats.get(key, 0) + value if isinstance(value, int) else value
         self.stats["read_ns"] = time.perf_counter_ns() - started
