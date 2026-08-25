@@ -1248,11 +1248,17 @@ class AttemptEngine:
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
-        if outcome["code"] == DEVICE_OOM:
-            # A CAPACITY FACT, not an author exception. `_TERMINAL["failed"]` defaults to
-            # AUTHOR_EXCEPTION because most failures are the handler's; a device that ran out
-            # of memory is the one class where the endpoint provably had no say.
-            cause = CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+        breach = outcome["code"] == DEVICE_OOM
+        if breach:
+            # THE ACCEPTED ENVELOPE WAS BREACHED. `_TERMINAL["failed"]` defaults to
+            # AUTHOR_EXCEPTION because most failures are the handler's, and a device that ran
+            # out is the one class where the endpoint provably had no say — but it is not
+            # CONSTRAINT_INFEASIBLE either. That code means "no plan fits", which is a
+            # PRE-ENTRY answer this worker gives before it accepts anything; rendering a
+            # post-accept OOM as one makes a planner or envelope defect read as a legitimate
+            # capacity result, and nobody goes to look at the planner. The runtime priced
+            # this attempt and admitted it, so the fault is the runtime's.
+            cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
         if outcome["terminal"] == "refused" and outcome["code"] == "unsupported_input":
             cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
         if outcome["terminal"] == "canceled":
@@ -1318,6 +1324,7 @@ class AttemptEngine:
             # than only in a sentence.
             cause = CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             origin = ORIGIN.CAUSE_ORIGIN_RUNTIME
+            breach = False
         return self.terminal(
             attempt,
             status,
@@ -1329,7 +1336,7 @@ class AttemptEngine:
             # only inside prose and nothing downstream can key on it. Measured by cr-012's
             # arms: two correct typed refusals were indistinguishable from each other to
             # anything reading the terminal.
-            _coded(outcome),
+            f"accepted_envelope_breach: {_coded(outcome)}" if breach else _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),
             result=inline,
