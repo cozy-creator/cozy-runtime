@@ -202,6 +202,11 @@ class ComponentResidency:
         method declares is never a victim of its own admission.
         """
         need = sum(row.nbytes for row in self.backend.plan.values() if row.component == wanted)
+        if self.placement == "all_resident":
+            # The rung that promised everything fits does not free anything to keep the
+            # promise. If a component is not resident under it, staging is tried on the
+            # room that is actually there and a shortage is a typed refusal with numbers.
+            return
         while not self._fits(need + self.headroom):
             victim = self._victim(declared)
             if victim is None:
