@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.config import RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -401,6 +402,8 @@ class Supervisor:
                         "snapshot": first.snapshot,
                         "release": first.release,
                         "variant": first.variant,
+                        "custody": first.custody,
+                        "strict_keys": first.strict_keys,
                     },
                     "budgets": {
                         "vram": first.vram_bytes,
@@ -494,6 +497,9 @@ class Supervisor:
                 destinations=int(reply["facts"]["filled"]),
                 bytes=int(reply["facts"]["filled_bytes"]),
                 fill_ms=float(reply["facts"]["fill_ms"]),
+                custody=str(reply["facts"].get("custody", "canonical")),
+                ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
+                transcribed_markers=", ".join(reply["facts"].get("transcribed_markers", ())),
             )
             self.note(
                 "boot",
@@ -916,52 +922,22 @@ class Supervisor:
     def resources(self) -> pb.WorkerResources:
         """Host facts measured ONCE, by a bounded canary at registration.
 
-        Tri-state honesty: present / absent / UNREADABLE. Anything this supervisor cannot
-        read WITHOUT a CUDA context is named in `unreadable` rather than reported as zero —
-        a wedged driver is not a CPU pod, and a canary that hangs is worse than one that
-        fails, so every probe here is a bounded read of a file or a bounded subprocess.
+        The measurement itself belongs to `internal/hostfacts.py`, which the `doctor` verb
+        reads too: a wedged driver has to read the same to a registering worker and to a
+        user asking what is wrong, and two probes could disagree.
         """
-        import platform
-
-        unreadable: list[str] = []
-        gpu_name, gpu_sm, vram, driver = "", 0, 0, ""
-        try:
-            out = (
-                subprocess.run(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=name,memory.total,driver_version,compute_cap",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=True,
-                )
-                .stdout.strip()
-                .splitlines()[0]
-            )
-            name, total, drv, cap = (part.strip() for part in out.split(","))
-            gpu_name, vram, driver = name, int(float(total)) * 1024 * 1024, drv
-            gpu_sm = int(float(cap) * 10)
-        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-            unreadable += ["gpu_name", "gpu_sm", "vram_total_bytes", "driver_version"]
-        try:
-            pages = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (ValueError, OSError):
-            pages = 0
-            unreadable.append("host_ram_total_bytes")
+        facts = hostfacts.measure()
         return pb.WorkerResources(
-            gpu_count=1 if gpu_name else 0,
-            gpu_name=gpu_name,
-            gpu_sm=gpu_sm,
-            vram_total_bytes=vram,
-            driver_version=driver,
-            platform=platform.platform()[:120],
-            host_ram_total_bytes=pages,
-            vcpu_count=os.cpu_count() or 0,
+            gpu_count=facts.gpu_count,
+            gpu_name=facts.gpu_name,
+            gpu_sm=facts.gpu_sm,
+            vram_total_bytes=facts.vram_total_bytes,
+            driver_version=facts.driver_version,
+            platform=facts.platform,
+            host_ram_total_bytes=facts.host_ram_total_bytes,
+            vcpu_count=facts.vcpu_count,
             pinned_capacity_bytes=self.ledger.pinned_budget,
-            unreadable=sorted(unreadable),
+            unreadable=list(facts.unreadable),
         )
 
     def disk_invoice(self) -> dict[str, int | str]:

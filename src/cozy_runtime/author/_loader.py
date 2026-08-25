@@ -258,6 +258,23 @@ def _canonical(value: object) -> object:
 # --------------------------------------------------------------------------- artifact
 
 
+#: KNOWN MARKER RULES (§1.1). A checkpoint key whose PRESENCE states an inference-contract
+#: fact rather than supplying a weight. The table is deliberately tiny and closed: a marker
+#: earns a row by being a real dialect convention with a real consequence, and everything
+#: not listed here is an ordinary unknown extra that warns and is ignored.
+MARKER_RULES: Mapping[str, tuple[str, str]] = {
+    "v_pred": ("objective", "v_prediction"),
+    "v_pred_like": ("objective", "v_prediction"),
+    "ztsnr": ("noise_schedule", "zero_terminal_snr"),
+    "edm_vpred": ("objective", "edm_v_prediction"),
+}
+
+
+def marker_rule(key: str) -> tuple[str, str] | None:
+    """The rule a checkpoint key matches, by its LEAF name. `model.v_pred` is `v_pred`."""
+    return MARKER_RULES.get(key.rsplit(".", 1)[-1])
+
+
 @dataclass(frozen=True, slots=True)
 class Artifact:
     """The RESOLVED binding a slot loads: one exact snapshot, its topology, its immutable
@@ -273,6 +290,9 @@ class Artifact:
     stamps: Mapping[str, str] = field(default_factory=dict)
     variant: str = "plain"
     custody: Custody = "canonical"
+    strict_keys: bool = False
+    """`--strict-keys`: a LOCAL bind's unknown extra keys refuse instead of confessing.
+    Meaningless on a canonical lane, where every extra already refuses."""
 
 
 # --------------------------------------------------------------------------- backend
@@ -458,6 +478,9 @@ class ConstructionRecord:
     filled: int
     filled_bytes: int
     ignored_extras: tuple[str, ...] = ()
+    """LOCAL-custody extras the code does not consume: warned, ignored and CONFESSED."""
+    transcribed_markers: tuple[str, ...] = ()
+    """Known marker keys and the stamp each was transcribed to (`v_pred->objective=…`)."""
 
     @property
     def topology_digest(self) -> str:
@@ -489,6 +512,7 @@ class Loader:
         "_backend",
         "_caches",
         "_device",
+        "_markers",
         "_mode",
         "_objects",
         "_open",
@@ -511,6 +535,7 @@ class Loader:
         self._device = device or Device()
         self._owner = owner
         self._open = True
+        self._markers: tuple[str, ...] = ()
         self._records: list[ConstructionRecord] = []
         self._objects: list[object] = []
         self._caches: list[DerivedCache] = []
@@ -545,6 +570,7 @@ class Loader:
             filled=filled,
             filled_bytes=filled_bytes,
             ignored_extras=extras,
+            transcribed_markers=self._markers,
         )
         self._records.append(record)
         self._objects.append(obj)
@@ -649,7 +675,49 @@ class Loader:
                 code="topology_extra_keys",
                 fields=extras[:6],
             )
-        return tuple(extras)
+        return self._local_extras(extras)
+
+    def _local_extras(self, extras: Sequence[str]) -> tuple[str, ...]:
+        """The LOCAL/dev custody tier (§1.1): markers are never ignored, unknowns confess.
+
+        A local bind of an un-bordered checkpoint is the pull-and-run path, and its extras
+        are not all the same thing. A key matching a KNOWN MARKER RULE carries meaning the
+        inference contract depends on — the `v_pred` class — so it is transcribed to its
+        stamp or REFUSED naming the marker; ignoring it would serve the wrong objective
+        silently. Everything else warns, is ignored, and is CONFESSED: named in the bind
+        result and the attempt record, which is what "loudly ignored" has to mean if it is
+        to mean anything. `--strict-keys` opts the unknowns into refusal too.
+        """
+        if not extras:
+            return ()
+        marked: list[tuple[str, str, str]] = []
+        unknown: list[str] = []
+        for key in extras:
+            rule = marker_rule(key)
+            if rule is None:
+                unknown.append(key)
+            else:
+                marked.append((key, *rule))
+        for key, stamp, value in marked:
+            declared = self._artifact.stamps.get(stamp)
+            if declared is not None and declared != value:
+                raise ConformanceError(
+                    f"{self._artifact.snapshot} carries the marker key {key!r}, which means "
+                    f"{stamp}={value}, but the artifact is stamped {stamp}={declared!r} — a "
+                    "known marker is never ignored, so a contradiction refuses NAMING it",
+                    code="marker_conflict",
+                    fields=[key],
+                )
+        self._markers = tuple(f"{key}->{stamp}={value}" for key, stamp, value in marked)
+        if unknown and self._artifact.strict_keys:
+            raise ConformanceError(
+                f"{self._artifact.snapshot}: {len(unknown)} extra key(s) the code does not "
+                f"consume, and --strict-keys refuses rather than ignoring them: "
+                f"{', '.join(unknown[:6])}",
+                code="strict_extra_keys",
+                fields=unknown[:6],
+            )
+        return tuple(unknown)
 
     def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
         """The SINGLE fill path. Failure rolls the whole construction back (§1.1).

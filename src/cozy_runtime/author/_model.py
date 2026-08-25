@@ -833,6 +833,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled=sum(r.filled for r in records),
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
+        transcribed_markers=tuple(m for r in records for m in r.transcribed_markers),
     )
 
 

@@ -208,7 +208,12 @@ class Executor:
             binding["snapshot"],
             topology_of(rows),
             Config(json.loads(Path(binding["config"]).read_text()), "unet.config"),
-            custody="canonical",
+            # CUSTODY is a BINDING fact, not a runtime constant: a checkpoint that came
+            # through the border is canonical and a serve-time extra key is drift, while a
+            # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
+            # to canonical keeps the strict reading for any record that does not say.
+            custody=binding.get("custody", "canonical"),
+            strict_keys=bool(binding.get("strict_keys", False)),
         )
         seen = Observations()
         registry = ModelRegistry(
@@ -327,6 +332,12 @@ class Executor:
             "gpu_name": torch.cuda.get_device_name(0),
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
+            # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
+            # ignoring is named where a person and a coordinator both see it, so the extras
+            # this bind dropped and the markers it transcribed ride the bind result.
+            "custody": binding.get("custody", "canonical"),
+            "ignored_extra_keys": list(record.ignored_extras),
+            "transcribed_markers": list(record.transcribed_markers),
         }
         return {
             "ok": True,

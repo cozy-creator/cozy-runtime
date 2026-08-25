@@ -124,6 +124,12 @@ class BindingPlan:
     """`local` (single-tenant: capacity never refuses above the floor, it deepens the ladder
     and confesses) or `shared` (a shortfall is a RESCHEDULE for the coordinator, never a
     structural-incompatibility claim)."""
+    custody: str = "canonical"
+    """`canonical` (the border classified every key: a serve-time extra is drift and
+    refuses) or `local` (an un-bordered local bind: markers transcribe or refuse, unknown
+    extras warn, are ignored and are confessed — §1.1's custody tier)."""
+    strict_keys: bool = False
+    """`--strict-keys`: a local bind's unknown extras refuse instead of confessing."""
 
     def snapshot_map(self) -> dict[str, str]:
         """component -> snapshot digest. Absent names fall back to the binding's own."""
