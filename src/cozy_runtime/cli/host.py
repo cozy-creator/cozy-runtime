@@ -94,8 +94,7 @@ def list_artifacts(config: RuntimeConfig, prefix: str, opts: Options) -> Result:
     rows.append(
         (
             "total",
-            f"{len(installed)} artifact{'s' if len(installed) != 1 else ''}, "
-            f"{total / GIB:.3f} GiB",
+            f"{len(installed)} artifact{'s' if len(installed) != 1 else ''}, {total / GIB:.3f} GiB",
         )
     )
     return Result(
@@ -162,9 +161,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             )
         if not eq:
             if not rest:
-                raise CliError(
-                    "usage", f"{name} needs a value", f"pass {name} <path>", Exit.usage
-                )
+                raise CliError("usage", f"{name} needs a value", f"pass {name} <path>", Exit.usage)
             inline = rest.pop(0)
         values[name] = inline
     socket = values.get("--socket", "")

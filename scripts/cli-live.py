@@ -241,9 +241,7 @@ def section_keys(args: argparse.Namespace) -> None:
         check("canonical extra key refuses", exc.code == "topology_extra_keys", str(exc)[:120])
 
     head("a LOCAL bind warns, IGNORES and CONFESSES the same key")
-    local = Artifact(
-        snapshot=base.snapshot, topology=planted, config=base.config, custody="local"
-    )
+    local = Artifact(snapshot=base.snapshot, topology=planted, config=base.config, custody="local")
     registry = ModelRegistry(release="cli-live", backend=None)
     registry.acquire("generate.models.model", SdxlModel, local, mode="derive")
     record = registry.generations()[0].record
