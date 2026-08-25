@@ -2249,30 +2249,15 @@ def section_bench(args: argparse.Namespace) -> None:
         ("nocuda", section_nocuda),
     ):
         rows[name] = fn(args)
-    head("the protocol tax: one attempt through the worker vs the bare fill plane")
-    bare = subprocess.run(
-        [
-            "nice",
-            "-n",
-            "19",
-            sys.executable,
-            str(ROOT / "scripts" / "fill-real.py"),
-            "serve",
-            "--latent",
-            "64",
-            "--seed",
-            "1005",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(ROOT),
+    # The protocol tax used to be measured by shelling out to `fill-real.py serve` for a
+    # bare forward pass. That script died with the interim reader it drove, and the
+    # comparison no longer needs it: the attempt row already carries `handler_ms`, which IS
+    # the bare computation, beside the accept-to-terminal window that wraps it. Subtracting
+    # two numbers from one run beats comparing two runs of two programs.
+    attempt = rows.get("attempt", {})
+    rows["protocol_tax_ms"] = round(
+        float(attempt.get("accept_to_terminal_ms", 0)) - float(attempt.get("handler_ms", 0)), 2
     )
-    step_ms = 0.0
-    for line in bare.stdout.splitlines():
-        match = re.search(r"step ([\d.]+) ms", line)
-        if match:
-            step_ms = float(match.group(1))
-    rows["bare_forward_ms"] = step_ms
     with results.open("a") as handle:
         handle.write(json.dumps({"at": int(time.time()), **rows}) + "\n")
     print(json.dumps(rows, indent=2))
