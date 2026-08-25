@@ -735,6 +735,111 @@ def report(outcome: dict[str, Any], label: str, evicted: dict[str, int]) -> None
         print(f"  {name}: {path} ({Path(path).stat().st_size} B)")
 
 
+def section_fillbw(args: argparse.Namespace) -> None:
+    """The FILL LEG alone, at capped disk bandwidth. One component, small footprint.
+
+    The full cold-to-first-image ladder needs a card nobody else is on. This isolates the
+    leg bandwidth actually acts on — disk bytes into device destinations through the real
+    TensorFS reader and the real pinned ring — for a component that fits beside a
+    neighbour, so the scaling curve is measurable on a shared box.
+    """
+    head("the fill leg at capped disk bandwidth")
+    shim = build_throttle()
+    print(f"  throttle: {shim} — LD_PRELOAD deadline bucket over read/pread, BELOW the reader")
+    table: list[dict[str, Any]] = []
+    for cap in [0, *args.rates]:
+        evicted = drop_page_cache(STORE)
+        env = dict(os.environ, COZY_FILL_CHILD="1", PYTHONPATH=f"{ROOT}:{ROOT / 'src'}")
+        if cap:
+            env.update(LD_PRELOAD=str(shim), COZY_THROTTLE_BPS=str(cap))
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "pipeline-live.py"),
+                "fill",
+                "--component",
+                args.component,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        if not line.startswith("{"):
+            check(f"the fill ran at {cap or 'uncapped'}", False, out.stderr[-300:])
+            continue
+        row = json.loads(line)
+        row["cap"] = "uncapped" if not cap else f"{cap // 1_000_000} MB/s"
+        row["evicted_pages_before"] = evicted["resident_pages"]
+        table.append(row)
+        print(f"  {json.dumps(row)}", flush=True)
+    if not table:
+        return
+    check(
+        "every capped fill delivered the same bytes",
+        len({r["checksum"] for r in table}) == 1,
+        f"{table[0]['bytes']} B, {table[0]['tensors']} tensors, one checksum across "
+        f"{len(table)} runs — bandwidth is not a correctness input",
+    )
+    base = table[0]["fill_ms"]
+    print("\n  cap            fill_ms   MiB/s   vs uncapped")
+    for row in table:
+        print(
+            f"  {row['cap']:>12}  {row['fill_ms']:8.0f}  {row['MiBps']:7.0f}  "
+            f"{row['fill_ms'] / base:5.2f}x"
+        )
+
+
+def fill_once(component: str) -> dict[str, Any]:
+    """ONE component filled through the real plane, timed. The `fill` inner mode."""
+    import torch
+
+    from cozy_runtime.author._loader import TensorSpec
+    from cozy_runtime.internal.fill import TORCH_DTYPES, Checkpoint, ResourceLedger
+    from cozy_runtime.internal.fill import StreamingFillBackend as Backend
+
+    spellings = {name: getattr(torch, torch_name) for name, torch_name in TORCH_DTYPES.items()}
+    checkpoint = Checkpoint(str(STORE), snapshots()[component])
+    rows = checkpoint.rows(component)
+    backend = Backend(
+        {component: checkpoint},
+        rows,
+        ledger=ResourceLedger(budgets={"vram": 6 * GIB, "pinned": 256 * MIB}),
+        window_bytes=4 * MIB,
+        slots=16,
+        readers=16,
+        inflight=8,
+    )
+    backend.expect({component: tuple(row.key for row in rows)})
+    destinations = {
+        row.key: torch.empty(row.shape, dtype=spellings[row.dtype], device="cuda") for row in rows
+    }
+    started = time.perf_counter()
+    for row in rows:
+        backend.fill(
+            row.key,
+            TensorSpec(shape=row.shape, dtype=row.dtype, nbytes=row.nbytes),
+            destinations[row.key],
+        )
+    backend._commit_enqueued()
+    torch.cuda.synchronize()
+    fill_ms = (time.perf_counter() - started) * 1000
+    total = sum(row.nbytes for row in rows)
+    checksum = round(float(next(iter(destinations.values())).float().sum()), 6)
+    del destinations
+    torch.cuda.empty_cache()
+    return {
+        "component": component,
+        "bytes": total,
+        "tensors": len(rows),
+        "fill_ms": round(fill_ms, 1),
+        "MiBps": round(total / MIB / (fill_ms / 1000), 1),
+        "store": dict(backend.stats.get("store", {})),
+        "checksum": checksum,
+    }
+
+
 def section_bandwidth(args: argparse.Namespace) -> None:
     """Cold time-to-first-image at CAPPED disk read bandwidth. The product's real curve."""
     require_quiet_card()
@@ -896,7 +1001,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="cr-008b four-component pipeline verification")
     parser.add_argument(
         "section",
-        choices=("exec", "fixtures", "poison", "stage", "arms", "image", "bandwidth", "all"),
+        choices=(
+            "exec",
+            "fill",
+            "fixtures",
+            "poison",
+            "stage",
+            "arms",
+            "image",
+            "fillbw",
+            "bandwidth",
+            "all",
+        ),
     )
     parser.add_argument("--tmp", default="/tmp/cozy-pipe")
     parser.add_argument("--spec", default="")
@@ -905,6 +1021,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--budget", type=int, default=0)
+    parser.add_argument("--component", default="text_encoder_2")
     parser.add_argument(
         "--rates",
         type=int,
@@ -912,6 +1029,10 @@ def main() -> int:
         default=[2_000_000_000, 1_000_000_000, 500_000_000, 250_000_000],
     )
     args = parser.parse_args()
+
+    if args.section == "fill":
+        print(json.dumps(fill_once(args.component)))
+        return 0
 
     if args.section == "exec":
         outcome = run_one(json.loads(Path(args.spec).read_text()))
@@ -922,6 +1043,7 @@ def main() -> int:
     sections = {
         "fixtures": section_fixtures,
         "poison": section_poison,
+        "fillbw": section_fillbw,
         "stage": section_stage,
         "arms": section_arms,
         "image": section_image,
