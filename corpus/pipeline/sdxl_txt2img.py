@@ -147,3 +147,52 @@ def generate(
         size=side,
         digest=hashlib.sha256(rgb).hexdigest(),
     )
+
+
+class ConditionOutput(msgspec.Struct):
+    image: ImageAsset
+    prompt_absmax: float
+    digest: str
+
+
+@app.entrypoint
+def condition(
+    ctx: Context,
+    payload: Txt2ImgInput,
+    model: SdxlPipelineModel,
+    out: Outputs,
+    tel: Telemetry,
+) -> ConditionOutput:
+    """The SMALL-FOOTPRINT arm: both encoders and the VAE, no UNet.
+
+    It exists because the whole pipeline needs a card nobody else is on, and the component
+    contract does not: two scopes, three components, real staging and real eviction, in
+    1.68 GiB. Everything it proves about admission holds for the 6.46 GiB case; what it
+    cannot prove is what happens when ONE component is most of the card.
+    """
+    import hashlib
+
+    import torch
+
+    device = torch.device("cuda", 0)
+    view = model.for_request(ctx, seed=payload.seed)
+    side = payload.size
+    with tel.stage("tokenize"):
+        ids, ids_2 = _tokenize(_TOKENIZERS, payload.prompt)
+    with tel.stage("encode"):
+        prompt, _pooled = model.encode(ids.to(device), ids_2.to(device))
+    generator = torch.Generator(device=device).manual_seed(view._seed)
+    latents = torch.randn(
+        1, 4, side // 8, side // 8, generator=generator, device=device, dtype=torch.float16
+    )
+    with tel.stage("decode"):
+        image = model.decode(latents)
+    tel.metric("image_nan_fraction", round(float(torch.isnan(image).float().mean()), 6))
+    pixels = ((image / 2 + 0.5).clamp(0, 1)[0] * 255).to(torch.uint8).permute(1, 2, 0).contiguous()
+    rgb = bytes(pixels.cpu().numpy().tobytes())
+    height, width = int(pixels.shape[0]), int(pixels.shape[1])
+    return ConditionOutput(
+        image=out.save_image(ImageFrame(width, height, rgb), format="png"),
+        prompt_absmax=_finite(torch, prompt),
+        digest=hashlib.sha256(rgb).hexdigest(),
+    )
