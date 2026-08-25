@@ -853,15 +853,33 @@ class StreamingFillBackend:
             raise
         self.vram_charge[name] = want
         self._acquire(name)
+        # OUT OF `parked` BEFORE THE FILL. `fill` skips a parked component's destinations —
+        # they are on `meta` and have no bytes — so staging while still marked parked
+        # enqueues NOTHING and commits an allocation full of whatever was in that memory.
+        # It is the worst possible failure: on a warm allocator the freed pages often come
+        # back with the old contents, so the weights LOOK right and only the output is
+        # wrong. Measured exactly that — a black image from a "successful" 43 ms stage of
+        # 4.78 GiB, a rate no disk can produce.
+        self.parked.pop(name, None)
         try:
             for destination in fresh.destinations:
                 self.fill(destination.key, destination.spec, fresh.live[destination.key])
+            expected = tuple(self.expected.get(name, ()))
+            missing = [key for key in expected if key not in self.enqueued]
+            if missing:
+                raise _refuse(
+                    "incomplete_fill",
+                    f"staging {name!r} enqueued {len(self.enqueued)} of {len(expected)} "
+                    f"declared destinations ({', '.join(missing[:4])}) — a staged component "
+                    "is COMPLETE or it does not become resident",
+                    missing[:6],
+                )
             self._commit_enqueued()
         except BaseException:
+            self.parked[name] = member
             self.evict(name)
             raise
         self.components[name] = member
-        self.parked.pop(name, None)
         took = (time.perf_counter_ns() - started) // 1_000_000
         row = {"component": name, "action": "stage", "bytes": want, "ms": took}
         self.stage_log.append(row)

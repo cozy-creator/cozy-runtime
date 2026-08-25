@@ -142,6 +142,74 @@ def binding_record(**overrides: Any) -> dict[str, Any]:
     return record
 
 
+def section_fixtures(args: argparse.Namespace) -> None:
+    """Build what the other sections read: the pipeline config and the bundled tokenizers.
+
+    The four-component CAS itself is built once by `harness/ingest.py`-shaped transcription
+    (one snapshot per component, `snapshots.json`); everything else a fresh clone needs is
+    made here so the verification reproduces without hand steps.
+    """
+    head("fixtures: the construction config and the endpoint's bundled tokenizers")
+    fixed = json.loads((WORK / "vae-fp16-fix" / "config.json").read_text())
+    config: dict[str, Any] = {}
+    for name in ("text_encoder", "text_encoder_2", "unet"):
+        config[name] = _clean(json.loads((HF / name / "config.json").read_text()))
+    # SDXL 1.0's OWN VAE overflows in fp16 — measured here as 100% NaN out of the decode
+    # with healthy latents (`latent_absmax` 21.4, `image_nan_fraction` 1.0). The pipeline
+    # binds the fp16-safe VAE, which is what every fp16 SDXL deployment does.
+    config["vae"] = _clean(fixed)
+    config["scheduler"] = _clean(
+        json.loads((HF / "scheduler" / "scheduler_config.json").read_text())
+    )
+    CONFIG.write_text(json.dumps(config, indent=2, sort_keys=True))
+    check(
+        "the construction config carries shape and NOTHING about provenance",
+        not any("_name_or_path" in json.dumps(v) for v in config.values()),
+        f"{CONFIG} ({CONFIG.stat().st_size} B) — a source carrier reaching a factory is a "
+        "typed refusal (§1.1), so the border normalizes it away",
+    )
+    project = ROOT / "corpus" / "pipeline"
+    for sub in ("tokenizer", "tokenizer_2"):
+        target = project / sub
+        target.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ):
+            source = HF / sub / name
+            if source.is_file() and not (target / name).is_file():
+                shutil.copyfile(source, target / name)
+        if not (target / "merges.txt").is_file():
+            from huggingface_hub import hf_hub_download
+
+            got = hf_hub_download("stabilityai/stable-diffusion-xl-base-1.0", f"{sub}/merges.txt")
+            shutil.copyfile(got, target / "merges.txt")
+    check(
+        "the endpoint's bundled tokenizer vocabularies are staged",
+        all((project / sub / "merges.txt").is_file() for sub in ("tokenizer", "tokenizer_2")),
+        "an endpoint bundles its own vocabularies like the model library it imports; a path "
+        "in the construction config would refuse",
+    )
+    have = snapshots()
+    check(
+        "one snapshot per component, each complete over its own header",
+        sorted(have) == sorted(COMPONENTS),
+        json.dumps({k: v[7:23] for k, v in sorted(have.items())}),
+    )
+
+
+def _clean(value: Any) -> Any:
+    """Strip the SOURCE-CARRIER metadata a real ingest border normalizes away."""
+    carriers = ("_name_or_path", "_diffusers_version", "_commit_hash", "transformers_version")
+    if isinstance(value, dict):
+        return {k: _clean(v) for k, v in value.items() if k not in carriers}
+    if isinstance(value, list):
+        return [_clean(v) for v in value]
+    return value
+
+
 # --------------------------------------------------------------------------- the inner run
 
 
@@ -720,7 +788,10 @@ def build_throttle() -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="cr-008b four-component pipeline verification")
-    parser.add_argument("section", choices=("exec", "stage", "arms", "image", "bandwidth", "all"))
+    parser.add_argument(
+        "section",
+        choices=("exec", "fixtures", "stage", "arms", "image", "bandwidth", "all"),
+    )
     parser.add_argument("--tmp", default="/tmp/cozy-pipe")
     parser.add_argument("--spec", default="")
     parser.add_argument("--out", default="")
@@ -743,6 +814,7 @@ def main() -> int:
 
     Path(args.tmp).mkdir(parents=True, exist_ok=True)
     sections = {
+        "fixtures": section_fixtures,
         "stage": section_stage,
         "arms": section_arms,
         "image": section_image,

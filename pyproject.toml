@@ -66,6 +66,13 @@ ignore_missing_imports = true
 # confident nonsense. It is exercised by RUNNING it (scripts/derive-corpus.py,
 # scripts/derive-verify.py) in the corpus venv, which is the only place it can be true.
 [[tool.mypy.overrides]]
+# `huggingface_hub` is a CORPUS-venv dependency the fixture staging reaches for once, to
+# fetch a tokenizer merges file the bench download skipped. Not a runtime dependency and
+# not present in the checking venv.
+module = ["huggingface_hub"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = ["corpus.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
