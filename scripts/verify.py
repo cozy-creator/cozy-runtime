@@ -50,6 +50,7 @@ from cozy_runtime.author import (  # noqa: E402
     invoke,
     registered_adapters,
 )
+from cozy_runtime.author._services import Attempt  # noqa: E402
 from cozy_runtime.author.fakes import (  # noqa: E402
     fake_adjustments,
     fake_attempt,
@@ -222,10 +223,7 @@ def main() -> int:
     print(f"  outputs:     {env.outputs}")
     print(f"  features:    {env.features.values} {env.features.digest}")
     print(f"  overlay:     {env.overlay_digest}")
-    print(
-        f"  telemetry:   {len(env.telemetry)} events, "
-        f"stages={[e.name for e in env.telemetry if e.kind == 'stage']}"
-    )
+    print("  telemetry:   see the bounded ring below (cr-011)")
     print(f"  encoded PNG: {env.outputs[0]['size_bytes']} bytes, {env.outputs[0]['digest']}")
 
     head("H3 — component-staged, granular scopes, both operation twins")
@@ -435,7 +433,7 @@ def main() -> int:
         models=models.models("generate"),
         boot_warmup=True,
     )
-    print(f"  warm pass telemetry events: {len(warm.telemetry)} (cold: {len(env.telemetry)})")
+    print(f"  warm pass ran: {warm.result}")
 
     # ---------------------------------------------------------------- preflight
     head("typed preflight — computed once, bound to admission, handed to the handler")
@@ -470,6 +468,7 @@ def main() -> int:
                 models=models.models("generate_ref"),
                 settings=ep.RefSettings(references_enabled=False),
             ),
+            Attempt("denied", spool),
         )
     except Exception as exc:
         print(f"  preflight refusal: {type(exc).__name__}: {exc}")

@@ -40,6 +40,7 @@ from cozy_runtime.author._errors import (
     classify,
 )
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,
@@ -49,11 +50,11 @@ from cozy_runtime.author._services import (
     Checkpoints,
     Egress,
     Outputs,
+    ProgressFrame,
     Scratch,
     Secrets,
     Settings,
     Telemetry,
-    TelemetryEvent,
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, walk
@@ -77,8 +78,9 @@ class Invocation:
     adapters: tuple[AdapterRef, ...] = ()
     egress_broker: Callable[..., Any] | None = None
     max_output_bytes: int = MAX_OUTPUT_BYTES
-    progress: Callable[[TelemetryEvent], None] | None = None
-    """The runtime's lossy progress sink (cr-007). Best-effort, never authoritative."""
+    progress: Callable[[ProgressFrame | Observation], None] | None = None
+    """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
+    observations alike. Best-effort, never authoritative."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +91,6 @@ class ResultEnvelope:
     result: Any
     outputs: tuple[Mapping[str, Any], ...]
     adjustments: tuple[AdjustmentRow, ...]
-    telemetry: tuple[TelemetryEvent, ...]
     features: RequestFeatures
     overlay_digest: str
     capabilities: frozenset[str]
@@ -106,9 +107,15 @@ def surface_of(registration: Registration) -> Surface:
 
 
 def invoke(
-    registration: Registration, wire: Mapping[str, object], inv: Invocation
+    registration: Registration, wire: Mapping[str, object], inv: Invocation, record: Attempt
 ) -> ResultEnvelope:
-    """Execute one attempt end to end and return its envelope."""
+    """Execute one attempt end to end and return its envelope.
+
+    `record` is built by the BOUNDARY below and passed in, so an attempt that dies before it
+    produces an envelope still hands back its bounded observation ring — the failing
+    attempt's log tail is the one triage most needs, and building the record inside here
+    would drop it on exactly that path.
+    """
     surface = surface_of(registration)
     inv.spool.mkdir(parents=True, exist_ok=True)
 
@@ -126,7 +133,7 @@ def invoke(
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
     _hydrate(overlay.payload, inv)
 
-    attempt = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
+    attempt = record
     attempt.rows.extend(overlay.rows)
     ctx = Context(
         inv.request_id, inv.deadline, inv.boot_warmup, inv.device, inv.cancel, inv.adapters
@@ -141,7 +148,6 @@ def invoke(
         result=result,
         outputs=tuple(a.row() for a in attempt.pending.values()),
         adjustments=tuple(attempt.rows),
-        telemetry=tuple(attempt.events),
         features=features,
         overlay_digest=overlay.digest,
         capabilities=surface.capabilities,
@@ -151,7 +157,7 @@ def invoke(
 
 def attempt(
     registration: Registration, wire: Mapping[str, object], inv: Invocation
-) -> tuple[ResultEnvelope | None, Outcome]:
+) -> tuple[ResultEnvelope | None, Outcome, Attempt]:
     """The invocation BOUNDARY: one attempt in, one neutral terminal out, on every path.
 
     `invoke` raises typed refusals because author-facing code should; the boundary the
@@ -159,12 +165,13 @@ def attempt(
     fails (§2). What crosses is FACTS — terminal, origin, code — and never a retry command:
     RETRYABLE and FATAL are coordinator projections over these, never observations here.
     """
+    record = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
     try:
-        return invoke(registration, wire, inv), SUCCEEDED
+        return invoke(registration, wire, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        return None, classify(exc)
+        return None, classify(exc), record
 
 
 # ------------------------------------------------------------------------- preflight

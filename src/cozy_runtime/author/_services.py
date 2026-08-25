@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author._assets import (
     Asset,
@@ -31,6 +31,7 @@ from cozy_runtime.author._assets import (
 )
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, OutputError
+from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -56,11 +57,13 @@ class AdjustmentRow:
 
 
 @dataclass(frozen=True, slots=True)
-class TelemetryEvent:
-    kind: Literal["progress", "log", "stage", "metric"]
+class ProgressFrame:
+    """One frame on the LOSSY live lane. Never retained: its durable form is `Attribution`
+    plus the monotone `position` the supervisor's silence detector reads."""
+
     name: str
-    value: object = None
-    fields: Mapping[str, object] = field(default_factory=dict)
+    fraction: float
+    position: int
 
 
 @dataclass(slots=True)
@@ -73,20 +76,42 @@ class Attempt:
     closed: bool = False
     pending: dict[str, Asset] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
-    events: list[TelemetryEvent] = field(default_factory=list)
-    sink: Callable[[TelemetryEvent], None] | None = None
-    """The runtime's LOSSY progress lane (cr-007), installed by the executor.
+    ring: EventRing = field(default_factory=EventRing)
+    """The BOUNDED observation record (cr-011). It replaced an unbounded list: a 4,096-step
+    attempt used to grow one row per step, so the longest attempt — the one whose triage
+    matters most — was the one that leaked."""
+    attribution: Attribution = field(default_factory=Attribution)
+    #: MONOTONE progress position, in completed units. The supervisor's liveness detector
+    #: reads advance here and nowhere else; it is never a clock.
+    position: int = 0
+    sink: Callable[[ProgressFrame | Observation], None] | None = None
+    """The runtime's LOSSY live lane (cr-007), installed by the executor.
 
-    Events are always recorded for the terminal envelope; the sink is an additional,
-    best-effort forward so a long attempt renders live. It cannot fail an attempt: the
-    lossy lane never has authority over a durable fact.
+    Best-effort and never authoritative: the lossy lane has no authority over a durable
+    fact, and its failure cannot fail an attempt. RETAINED observations ride it too, and
+    that is what makes a KILLED executor explainable — a ring that only crosses in the
+    reply crosses never when the process that holds it is `kill -9`ed. The supervisor
+    dedupes by the executor's own sequence, so nothing is counted twice.
     """
     _counter: int = 0
+    _step_mark: float = 0.0
 
-    def emit(self, event: TelemetryEvent) -> None:
-        self.events.append(event)
+    def __post_init__(self) -> None:
+        if not self.ring.subject:
+            self.ring.subject = self.request_id
+
+    def emit(self, kind: str, name: str, value: Scalar = None, **fields: Scalar) -> Observation:
+        """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
+        observation = self.ring.emit(cast("Any", kind), name, value, **fields)
         if self.sink is not None:
-            self.sink(event)
+            self.sink(observation)
+        return observation
+
+    def signal(self, frame: ProgressFrame) -> None:
+        """One LOSSY frame. Not retained, so a flood cannot evict the retained tail."""
+        self.position = frame.position
+        if self.sink is not None:
+            self.sink(frame)
 
     def next_handle(self, kind: str) -> str:
         self._counter += 1
@@ -278,43 +303,67 @@ class Telemetry(_Bound):
         self._ctx = ctx
 
     def progress(self, fraction: float, *, stage: str | None = None) -> None:
-        self._attempt.check_open("Telemetry.progress")
-        self._attempt.emit(
-            TelemetryEvent("progress", stage or "", round(min(max(fraction, 0.0), 1.0), 6))
+        attempt = self._attempt
+        attempt.check_open("Telemetry.progress")
+        attempt.signal(
+            ProgressFrame(stage or "", round(min(max(fraction, 0.0), 1.0), 6), attempt.position + 1)
         )
 
     def step_callback(self, total: int, *, stage: str | None = None) -> Any:
-        """One hook doing progress + cancellation — every v1 endpoint hand-rolled this."""
-        self._attempt.check_open("Telemetry.step_callback")
+        """One hook doing progress + cancellation — every v1 endpoint hand-rolled this.
+
+        It is also the STEP-TIME instrument: the interval between consecutive calls is
+        accumulated in place (five floats per stage), so inference step time is attributable
+        without one retained row per step. The hot-path cost is one `perf_counter` and a
+        handful of float operations.
+        """
+        attempt = self._attempt
+        attempt.check_open("Telemetry.step_callback")
+        name = stage or "step"
+        # The mark starts HERE, at callback construction, so the FIRST step has an interval
+        # too. Starting it at the first call would silently drop step 0 from the count — and
+        # on a one-step request that is the whole measurement.
+        attempt._step_mark = time.perf_counter()
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
-            self.progress((step + 1) / total if total else 1.0, stage=stage)
+            now = time.perf_counter()
+            mark = attempt._step_mark
+            if mark:
+                attempt.attribution.step(name, (now - mark) * 1000)
+            attempt._step_mark = now
+            attempt.signal(ProgressFrame(name, (step + 1) / total if total else 1.0, step + 1))
 
         return on_step
 
-    def log(self, message: str, *, level: str = "info", **fields: object) -> None:
+    def log(self, message: str, *, level: str = "info", **fields: Scalar) -> None:
         self._attempt.check_open("Telemetry.log")
-        self._attempt.emit(TelemetryEvent("log", message, level, dict(fields)))
+        self._attempt.emit("log", message, level, **fields)
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
-        """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks."""
+        """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks.
+
+        Structurally separate from a component-use scope: this records a NUMBER and touches
+        no residency, no placement and no ComponentUseContract — `scripts/fence.py`'s
+        `timing-decides-nothing` fence proves the module cannot reach them.
+        """
         self._attempt.check_open("Telemetry.stage")
         start = time.perf_counter()
         try:
             yield
         finally:
             elapsed = (time.perf_counter() - start) * 1000
-            self._attempt.emit(TelemetryEvent("stage", name, round(elapsed, 3)))
+            self._attempt.attribution.stage(name, elapsed)
+            self._attempt.emit("stage", name, round(elapsed, 3))
 
     def metric(self, name: str, value: float, *, unit: str | None = None) -> None:
         self._attempt.check_open("Telemetry.metric")
-        self._attempt.emit(TelemetryEvent("metric", name, value, {"unit": unit or ""}))
+        self._attempt.emit("metric", name, value, unit=unit or "")
 
     def training_metric(self, name: str, value: float, *, step: int) -> None:
         self._attempt.check_open("Telemetry.training_metric")
-        self._attempt.emit(TelemetryEvent("metric", name, value, {"step": step}))
+        self._attempt.emit("metric", name, value, step=step)
 
 
 class Adjustments(_Bound):

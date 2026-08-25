@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Ten fences, each provable red by planting the violation (`scripts/redarm.py`):
+Eleven fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import · package-imports
   env-authority · single-config · no-interactive · excluded-keywords
-  no-identifiers-in-endpoint-code · one-attempt-kernel
+  no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
 """
 
 from __future__ import annotations
@@ -366,6 +366,74 @@ def fence_one_attempt_kernel() -> list[str]:
     return bad
 
 
+#: The OBSERVATION plane (cr-011). `tel.stage()` records a NUMBER; it must be structurally
+#: incapable of changing what is resident, where it sits, or what a method may touch.
+OBSERVATION_MODULES = (
+    "author/_observations.py",
+    "internal/worker/observe.py",
+    "internal/worker/triage.py",
+)
+#: Modules that DECIDE residency, placement or the component-use contract.
+DECIDING_MODULES = (
+    "cozy_runtime.internal.fill",
+    "cozy_runtime.internal.residency",
+    "cozy_runtime.internal.contract",
+    "cozy_runtime.internal.derive",
+    "cozy_runtime.internal.worker.plan",
+    "cozy_runtime.internal.worker.ledger",
+    "cozy_runtime.author._model",
+    "torch",
+)
+#: Names through which residency could be reached even without an import.
+DECIDING_NAMES = (
+    "_cozy_scope",
+    "_cozy_active",
+    "_cozy_check_access",
+    "materialize",
+    "evict",
+    "reserve",
+    "rollback",
+    "commit_fill",
+    "empty_cache",
+)
+
+
+def fence_timing_decides_nothing() -> list[str]:
+    """`stage_ms` per-stage timing is a COMMITTED telemetry fact and NOTHING else.
+
+    cozy-runtime.md §1.3 keeps it structurally distinct from a component-use scope. The
+    proof is not a comment: the observation plane cannot import a deciding module and cannot
+    name a residency operation, so a timing bracket has no reachable way to alter component
+    availability, placement, or the ComponentUseContract.
+    """
+    bad: list[str] = []
+    for path in py_files():
+        rel = path.relative_to(SRC).as_posix()
+        if rel not in OBSERVATION_MODULES:
+            continue
+        tree = ast.parse(path.read_text())
+        for name in imports(tree):
+            for deciding in DECIDING_MODULES:
+                if name == deciding or name.startswith(deciding + "."):
+                    bad.append(
+                        f"{path.relative_to(ROOT)}: the observation plane imports {name} — "
+                        "timing and triage RECORD, they never decide residency or placement"
+                    )
+        for node in ast.walk(tree):
+            reached = ""
+            if isinstance(node, ast.Attribute) and node.attr in DECIDING_NAMES:
+                reached, line = node.attr, node.lineno
+            elif isinstance(node, ast.Name) and node.id in DECIDING_NAMES:
+                reached, line = node.id, node.lineno
+            if reached:
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{line}: the observation plane names "
+                    f"{reached!r}, a residency operation — an observer that can move bytes "
+                    "is not an observer"
+                )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "one-attempt-kernel": fence_one_attempt_kernel,
@@ -377,6 +445,7 @@ FENCES = {
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,
     "no-identifiers-in-endpoint-code": fence_no_identifiers,
+    "timing-decides-nothing": fence_timing_decides_nothing,
 }
 
 

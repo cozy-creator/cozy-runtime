@@ -29,6 +29,7 @@ reverse, and never by growing a second execution path beside it.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -42,6 +43,7 @@ from typing import Any
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryLink, Link
 from cozy_runtime.internal.worker.session import Supervisor, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -91,6 +93,11 @@ class SliceOutcome:
     faults: list[dict[str, str]] = field(default_factory=list)
     progress: int = 0
     executions: int = 0
+    #: cr-011: the OPAQUE triage handle from the terminal, and the bundle read back by it.
+    #: The subject is the ONLY way in — there is no path anywhere in this outcome.
+    triage_subject: str = ""
+    triage: dict[str, Any] = field(default_factory=dict)
+    triage_explained: list[str] = field(default_factory=list)
     exit_code: int = 0
     journal_deleted: bool = False
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
@@ -465,6 +472,18 @@ def _collect(
     if coordinator.terminal is not None:
         body = documents.read(coordinator.terminal.terminal_canonical, pb.TerminalBody)
         outcome.terminal = body
+        # The triage read, exactly as cl-006 will do it: take the opaque subject off the
+        # terminal, and read the bundle BY KEY, verified against its journaled receipt.
+        # Nothing here holds a path to it.
+        outcome.triage_subject = str((body.get("triage_bundle") or {}).get("subject_id", ""))
+        if outcome.triage_subject:
+            with contextlib.suppress(triage.TriageError, canonical.CanonicalError):
+                outcome.triage = triage.BundleStore.read(
+                    supervisor.root / "triage",
+                    outcome.triage_subject,
+                    supervisor.root / "journal.log",
+                )
+                outcome.triage_explained = triage.explain(outcome.triage)
         outcome.status = pb.TerminalStatus.Name(
             body.get("status", pb.TerminalStatus.TERMINAL_STATUS_UNSPECIFIED)
         )

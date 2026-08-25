@@ -79,7 +79,6 @@ from cozy_runtime.author._services import (
     Secrets,
     Settings,
     Telemetry,
-    TelemetryEvent,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
 
@@ -145,7 +144,6 @@ __all__ = [
     "Shape",
     "Surface",
     "Telemetry",
-    "TelemetryEvent",
     "TensorSpec",
     "UnsupportedInput",
     "VideoAsset",

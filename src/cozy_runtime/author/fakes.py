@@ -28,6 +28,7 @@ from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,
@@ -36,7 +37,6 @@ from cozy_runtime.author._services import (
     Egress,
     Outputs,
     Telemetry,
-    TelemetryEvent,
 )
 
 
@@ -94,12 +94,15 @@ class TelemetryRecorder(Telemetry):
     __slots__ = ()
 
     @property
-    def events(self) -> tuple[TelemetryEvent, ...]:
-        return tuple(self._attempt.events)
+    def events(self) -> tuple[Observation, ...]:
+        return tuple(self._attempt.ring)
 
     def stages(self) -> Mapping[str, float]:
+        """The COMMITTED `stage_ms` facts, read off the O(1) accumulator rather than
+        recomputed from rows — the ring is bounded and a long attempt sheds its oldest."""
         return {
-            e.name: e.value for e in self.events if e.kind == "stage" and isinstance(e.value, float)
+            name: round(track.total_ms, 3)
+            for name, track in self._attempt.attribution.stages.items()
         }
 
 
@@ -149,12 +152,13 @@ def invoke_with_fakes(
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> ResultEnvelope:
     """Run a handler through the REAL kernel with no GPU, no hub and no coordinator."""
+    spool = _spool(request_id)
     return invoke(
         registration,
         wire,
         Invocation(
             request_id=request_id,
-            spool=_spool(request_id),
+            spool=spool,
             deadline=time.monotonic() + seconds,
             boot_warmup=boot_warmup,
             cancel=lambda: cancelled,
@@ -167,4 +171,5 @@ def invoke_with_fakes(
             egress_broker=egress_broker,
             max_output_bytes=max_output_bytes,
         ),
+        Attempt(request_id, spool, max_output_bytes),
     )

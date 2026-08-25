@@ -37,6 +37,7 @@ from typing import Any
 
 from cozy_runtime.author._errors import Outcome, classify
 from cozy_runtime.author._invoke import Invocation, attempt
+from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
@@ -157,10 +158,30 @@ class Executor:
         checkpoint = Checkpoint(binding["store"], binding["snapshot"])
         rows = checkpoint.rows(binding["component"])
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
+
+        # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
+        # supervisor can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
+        # `started` is published at position 0 before the first byte moves, which is what
+        # makes a pre-first-unit wedge render at all.
+        def position(mib: int) -> None:
+            with contextlib.suppress(SeamError):
+                self.channel.send(
+                    {
+                        "event": "progress",
+                        "request_id": f"prepare:{binding['component']}",
+                        "kind": "load",
+                        "name": binding["component"],
+                        "value": None,
+                        "position": mib,
+                    }
+                )
+
+        position(0)
         backend = StreamingFillBackend(
             checkpoint,
             rows,
             ledger=ledger,
+            on_position=position,
             window_bytes=binding.get("window_bytes", 4 << 20),
             slots=binding.get("slots", 16),
             readers=binding.get("readers", 16),
@@ -315,24 +336,47 @@ class Executor:
         deadline = time.monotonic() + command["deadline_s"]
         torch = self.torch
 
-        def progress(event: Any) -> None:
-            # The lossy lane never blocks the attempt: a seam refusal here is dropped
-            # progress, which is the ONE loss this lane may incur.
+        def progress(frame: Any) -> None:
+            """The lossy lane, carrying BOTH kinds of live record.
+
+            A progress frame is not retained anywhere: its `position` is the monotone unit
+            count the supervisor's silence detector reads, and that is all it is for. A
+            RETAINED observation rides the same lane so the supervisor holds a copy BEFORE
+            this process can die — a ring that only crosses in the reply crosses never when
+            the process is killed, which is the exact case triage exists for.
+
+            A seam refusal here is dropped live output, the ONE loss this lane may incur.
+            """
             with contextlib.suppress(SeamError):
-                self.channel.send(
-                    {
-                        "event": "progress",
-                        "request_id": command["request_id"],
-                        "kind": event.kind,
-                        "name": str(event.name)[:120],
-                        "value": event.value if isinstance(event.value, (int, float)) else None,
-                    }
-                )
+                if isinstance(frame, ProgressFrame):
+                    self.channel.send(
+                        {
+                            "event": "progress",
+                            "request_id": command["request_id"],
+                            "kind": "progress",
+                            "name": str(frame.name)[:120],
+                            "value": frame.fraction,
+                            "position": frame.position,
+                        }
+                    )
+                else:
+                    self.channel.send(
+                        {
+                            "event": "progress",
+                            "request_id": command["request_id"],
+                            "kind": frame.kind,
+                            "name": frame.name,
+                            "value": frame.value,
+                            "fields": dict(frame.fields),
+                            "seq": frame.seq,
+                            "at_unix_ms": frame.at_unix_ms,
+                        }
+                    )
 
         torch.cuda.reset_peak_memory_stats()
         lease_acquired = time.perf_counter()
         started_wall = time.time()
-        envelope, outcome = attempt(
+        envelope, outcome, record = attempt(
             registration,
             command["payload"],
             Invocation(
@@ -371,8 +415,15 @@ class Executor:
         pre_entry = ("invalid_request", "unsupported_input", "default_resolution")
         if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
+        # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
+        # path, success or fault. A failed attempt's log tail is the one triage most needs,
+        # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
         return {
             "ok": True,
+            "observations": record.ring.rows(),
+            "observation_caps": record.ring.caps(),
+            "attribution": record.attribution.document(),
+            "position": record.position,
             "outcome": {
                 "terminal": outcome.terminal,
                 "origin": outcome.origin,

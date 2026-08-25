@@ -58,6 +58,18 @@ STATIC_ARMS = (
         "def run_direct(registration: object, payload: dict[str, object]) -> None:\n"
         "    attempt(registration, payload, None)\n",
     ),
+    # cr-011's §1.3 rule, planted as the two ways it could break: the observation plane
+    # IMPORTING a deciding module, and naming a residency operation without importing one.
+    Arm(
+        "timing-decides-nothing",
+        SRC / "author" / "_observations.py",
+        "from cozy_runtime.internal.fill import ResourceLedger\n",
+    ),
+    Arm(
+        "timing-decides-nothing",
+        SRC / "internal" / "worker" / "observe.py",
+        "def _shrink(model: object) -> None:\n    model._cozy_active = None\n",
+    ),
     Arm(
         "one-attempt-kernel",
         SRC / "internal" / "local.py",
@@ -66,6 +78,53 @@ STATIC_ARMS = (
         "    return AttemptEngine()\n",
     ),
 )
+
+#: A committed bundle, edited on disk afterwards, must be a DETECTED corruption rather than
+#: a plausible story — the journaled write receipt is what makes that possible.
+TAMPER = """
+import json, pathlib, shutil, tempfile
+from cozy_runtime.internal.journal import Journal
+from cozy_runtime.internal.worker import triage
+
+root = pathlib.Path(tempfile.mkdtemp(prefix="cozy-triage-arm"))
+journal = Journal(root / "journal.log")
+store = triage.BundleStore(root / "triage", journal)
+receipt = store.commit(triage.Assembly(triage.mint_subject(), attempt={"request_id": "r"}))
+path = root / "triage" / (receipt.subject_id + ".json")
+document = json.loads(path.read_text())
+document["terminal"] = {"status": "TERMINAL_STATUS_SUCCEEDED"}
+path.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
+try:
+    triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+"""
+
+#: A log line cannot declare terminal success. The bundle has no field that can carry a
+#: terminal claim, and the ONE terminal fact it holds is a COPY of the journaled terminal.
+LOG_AUTHORITY = """
+import pathlib, shutil, tempfile
+from cozy_runtime.internal.journal import Journal
+from cozy_runtime.internal.worker import triage
+
+root = pathlib.Path(tempfile.mkdtemp(prefix="cozy-authority-arm"))
+journal = Journal(root / "journal.log")
+store = triage.BundleStore(root / "triage", journal)
+assembly = triage.Assembly(triage.mint_subject(), terminal={"status": "TERMINAL_STATUS_FAILED"})
+assembly.events.append({"kind": "log", "name": "SUCCEEDED", "value": "the handler is done"})
+receipt = store.commit(assembly)
+document = triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+shutil.rmtree(root, ignore_errors=True)
+claims = [row for row in document["events"] if row.get("kind") not in ("log", "metric",
+          "stage", "confession", "boot", "liveness", "fault")]
+assert not claims, claims
+assert document["terminal"]["status"] == "TERMINAL_STATUS_FAILED", document["terminal"]
+raise SystemExit(
+    "observation only: the bundle's " + str(len(document["events"])) +
+    " event row(s) are non-authoritative and the terminal it carries still reads "
+    + document["terminal"]["status"]
+)
+"""
 
 LIVE_ARMS = (
     (
@@ -78,6 +137,48 @@ LIVE_ARMS = (
         "one-config-authority",
         "from cozy_runtime.internal.config import read_config\nread_config({}); read_config({})\n",
         "exactly one config authority",
+    ),
+    # ------------------------------------------------------------------ cr-011
+    (
+        "observation-credential-field",
+        "from cozy_runtime.author._observations import EventRing\n"
+        "EventRing().emit('log', 'fetching', 'info', auth_token='ya29.a0Af')\n",
+        "credential_field",
+    ),
+    (
+        "observation-credential-value",
+        "from cozy_runtime.author._observations import EventRing\n"
+        "EventRing().emit('log', 'signed the url', "
+        "'https://s3/x?X-Amz-Signature=deadbeefcafe')\n",
+        "credential_value",
+    ),
+    (
+        "observation-malformed-kind",
+        "from cozy_runtime.author._observations import EventRing\n"
+        "EventRing().emit('progress', 'step')\n",
+        "not one of the closed observation kinds",
+    ),
+    (
+        "observation-oversize",
+        "from cozy_runtime.author._observations import EventRing\n"
+        "EventRing().emit('log', 'x' * 4096)\n",
+        "observation_too_large",
+    ),
+    (
+        "triage-bundle-tamper",
+        TAMPER,
+        "bundle_corrupt",
+    ),
+    (
+        "triage-log-is-not-terminal",
+        LOG_AUTHORITY,
+        "observation only",
+    ),
+    (
+        "witness-boot-record-on-ram",
+        "import pathlib\nfrom cozy_runtime.internal.witness import require_durable\n"
+        "require_durable(pathlib.Path('/dev/shm/cozy-witness-arm'))\n",
+        "boot_record_on_ram",
     ),
 )
 

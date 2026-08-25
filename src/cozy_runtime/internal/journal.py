@@ -39,6 +39,7 @@ KINDS = (
     "epoch",  # executor incarnation / readiness epoch movement
     "warm",  # one boot warm-pass outcome
     "ledger",  # one attempt's byte-class reconciliation at close (cr-008a)
+    "triage",  # one WorkerTriageBundle write receipt (cr-011): subject, digest, length
 )
 
 

@@ -100,7 +100,7 @@ def uses_services(payload: In, out: Outputs, tel: Telemetry) -> Saved:
 
 def _run(spool: Path, **invocation: object) -> tuple[Facts, float]:
     inv = Invocation(spool=spool, deadline=time.monotonic() + 30.0, **invocation)  # type: ignore[arg-type]
-    envelope, outcome = attempt(probe.get("report"), {}, inv)
+    envelope, outcome, _ = attempt(probe.get("report"), {}, inv)
     assert envelope is not None, outcome
     assert isinstance(envelope.result, Facts)
     return envelope.result, inv.deadline
@@ -157,7 +157,7 @@ def _context_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
 def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
     def save() -> Observation:
         inv = Invocation(request_id="svc", spool=spool, deadline=time.monotonic() + 30.0)
-        envelope, outcome = attempt(probe.get("uses_services"), {}, inv)
+        envelope, outcome, _ = attempt(probe.get("uses_services"), {}, inv)
         assert envelope is not None, outcome
         assert len(envelope.outputs) == 1, envelope.outputs
         row = envelope.outputs[0]
@@ -168,11 +168,15 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
 
     def telemetry() -> Observation:
         inv = Invocation(request_id="tel", spool=spool, deadline=time.monotonic() + 30.0)
-        envelope, outcome = attempt(probe.get("uses_services"), {}, inv)
+        envelope, outcome, record = attempt(probe.get("uses_services"), {}, inv)
         assert envelope is not None, outcome
-        kinds = sorted({event.kind for event in envelope.telemetry})
-        assert envelope.telemetry, "Telemetry recorded nothing — its writer is gone"
-        return f"{len(envelope.telemetry)} events across kinds {kinds}"
+        kinds = sorted({event.kind for event in record.ring})
+        assert len(record.ring), "Telemetry recorded nothing — its writer is gone"
+        caps = record.ring.caps()
+        return (
+            f"{caps['admitted']} observations across kinds {kinds}; ring holds "
+            f"{caps['kept']}/{caps['max_events']} at {caps['held_bytes']} B"
+        )
 
     return {"save": save, "telemetry": telemetry}
 

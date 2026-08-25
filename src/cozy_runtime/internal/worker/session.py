@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -41,7 +42,7 @@ from typing import Any
 from cozy_runtime.internal.config import RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import grants
+from cozy_runtime.internal.worker import grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -137,6 +138,12 @@ class Supervisor:
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, BindingPlan] = {}
+        # cr-011: the worker's own bounded record, the silence-bounded liveness detector,
+        # and the journal-backed bundle store. All three outlive the executor, and the
+        # bundle store's receipts outlive THIS process too.
+        self.boot = observe.BootRecord()
+        self.monitor = observe.SilenceMonitor(self.boot.ring)
+        self.bundles = triage.BundleStore(self.root / "triage", self.journal)
         self.engine = AttemptEngine(
             journal=self.journal,
             ledger=self.ledger,
@@ -148,6 +155,9 @@ class Supervisor:
             instance_id=options.instance_id,
             send=self.send,
             progress=self.emit_progress,
+            bundles=self.bundles,
+            monitor=self.monitor,
+            posture=self.applied_posture,
         )
         self.engine.session_id = self.fences.session_id
         self.outbound: queue.Queue[pb.WorkerMessage | None] = queue.Queue()
@@ -198,9 +208,40 @@ class Supervisor:
         if self.connected.is_set():
             self.send(pb.WorkerMessage(report=self.report()))
 
+    def applied_posture(self) -> dict[str, Any]:
+        """The deployment state the worker was in when something happened (§3.6).
+
+        A triage bundle that cannot say which directive was applied, which credential epoch
+        was live and whether intake was accepting explains half of what went wrong — the
+        other half is always "under what configuration".
+        """
+        return {
+            "posture": pb.Posture.Name(self.fences.posture),
+            "intake_state": pb.IntakeState.Name(self.fences.intake),
+            "applied_revision": self.fences.revision,
+            "credential_epoch": self.fences.credential_epoch,
+            "applied_wire_minor": self.fences.wire_minor,
+            "readiness_epoch": self.supervision.readiness_epoch,
+            "executor_incarnation": self.supervision.incarnation,
+            "worker_id": self.options.worker_id,
+            "release_id": self.options.release_id,
+            "boot_steps": list(self.boot.steps),
+        }
+
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded, oldest-first shed, supervisor-owned sequence numbers."""
         key = (request_id, attempt)
+        # Liveness reads the MONOTONE position off this lane and nothing else. The lane is
+        # lossy, which is exactly why silence is measured as "the position did not move"
+        # rather than "no frame arrived" — a dropped frame is not a wedge.
+        position = frame.get("position")
+        if isinstance(position, int):
+            self.monitor.advance(f"{request_id}#{attempt}", position)
+        # A RETAINED observation is held HERE the moment it arrives, so the supervisor owns
+        # a copy before the executor can die. The reply's ring fills whatever the lossy lane
+        # dropped; the executor's own sequence keeps the two from double-counting.
+        if frame.get("kind") != "progress":
+            self.engine.forward(request_id, attempt, frame)
         counter = self.progress_seq.setdefault(key, itertools.count(1))
         if len(self.progress) == PROGRESS_QUEUE:
             self.progress_shed += 1
@@ -305,6 +346,11 @@ class Supervisor:
         for group in by_construction.values():
             first = group[0]
             started = time.perf_counter()
+            # The LOAD leg gets a liveness subject and `started` at position 0. There is no
+            # boot timeout here and there will not be one: a multi-GB load is slow, and the
+            # only honest question is whether its integral-MiB position is still moving.
+            subject = f"prepare:{first.component}"
+            self.monitor.start(subject, "load")
             reply = executor.call(
                 {
                     "cmd": "prepare",
@@ -327,9 +373,20 @@ class Supervisor:
                     "expect_construction_digest": first.model_construction_digest,
                 },
                 timeout=None,
+                on_progress=lambda frame: self.monitor.advance(
+                    f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
+                ),
             )
             took = (time.perf_counter() - started) * 1000
             if not reply.get("ok"):
+                self.monitor.end(subject, str(reply.get("code")))
+                self.boot.step(
+                    "load",
+                    "refused",
+                    took,
+                    component=first.component,
+                    code=str(reply.get("code")),
+                )
                 detail = str(reply.get("detail"))[:1024]
                 shortfall = reply.get("shortfall") or {}
                 if shortfall:
@@ -387,6 +444,16 @@ class Supervisor:
             # exactly what the driver had pinned — §3.2's two-number rule). Every later
             # attempt reconciles against this line.
             self.ledger.observe_construction(reply["facts"])
+            self.monitor.end(subject, "filled")
+            self.boot.step(
+                "load",
+                "filled",
+                took,
+                component=first.component,
+                destinations=int(reply["facts"]["filled"]),
+                bytes=int(reply["facts"]["filled_bytes"]),
+                fill_ms=float(reply["facts"]["fill_ms"]),
+            )
             self.note(
                 "boot",
                 f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
@@ -449,6 +516,17 @@ class Supervisor:
                 }
             outcome["ms"] = round((time.perf_counter() - started) * 1000, 1)
             outcome["demand_evidence"] = False
+            # A warm invoke is a BENCHMARK OVERRIDE: it runs a synthetic payload at a
+            # cheapened schedule, so everything it observes is marked and can never pollute
+            # a measurement (§3.6, se#715).
+            self.boot.step(
+                "warm",
+                str(outcome["outcome"]),
+                float(outcome["ms"]),
+                entrypoint=binding.entrypoint,
+                benchmark_override=True,
+                reason=str(outcome["reason"])[:200],
+            )
             self.journal.append("warm", dict(outcome))
             self.warm.append(outcome)
             self.note(
@@ -457,6 +535,7 @@ class Supervisor:
                 f"{outcome['reason']}"[:200],
             )
             if outcome["outcome"] == "failed":
+                self.engine.degraded[plan_id] = str(outcome["reason"])[:160]
                 self.engine.faults.append(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
@@ -558,7 +637,7 @@ class Supervisor:
             attempt = self.engine.offer(start)
         except AttemptRefusal as exc:
             self.note("attempt", f"{start.request_id}#{start.attempt} refused: {exc.code}")
-            self.refuse(start, exc.code, exc.detail, exc.cause)
+            self.refuse(start, exc.code, exc.detail, exc.cause, exc.origin)
             return
         if attempt.state in ("terminal", "closed"):
             self.note(
@@ -580,7 +659,7 @@ class Supervisor:
             accepted = self.engine.prepare_and_accept(attempt)
         except AttemptRefusal as exc:
             self.note("attempt", f"{start.request_id}#{start.attempt} refused: {exc.code}")
-            self.refuse(start, exc.code, exc.detail, exc.cause)
+            self.refuse(start, exc.code, exc.detail, exc.cause, exc.origin)
             return
         except JournalError as exc:
             self.note(
@@ -601,8 +680,20 @@ class Supervisor:
         self.send(pb.WorkerMessage(attempt_accepted=accepted))
         self.work.put(attempt)
 
-    def refuse(self, start: pb.StartAttempt, code: str, detail: str, cause: pb.CauseCode) -> None:
-        """A typed refusal is a TERMINAL: journaled before send, like any other."""
+    def refuse(
+        self,
+        start: pb.StartAttempt,
+        code: str,
+        detail: str,
+        cause: pb.CauseCode,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+    ) -> None:
+        """A typed refusal is a TERMINAL: journaled before send, like any other.
+
+        `origin` is carried rather than assumed: the ORIGIN OF THE ADDRESS that missed is
+        what separates a caller's typed error from a platform-fatal one, and collapsing both
+        onto SUPERVISOR sends the wrong person to look (v1 REF_ORIGIN).
+        """
         attempt = Attempt(
             request_id=start.request_id,
             attempt=start.attempt,
@@ -615,7 +706,7 @@ class Supervisor:
                 attempt,
                 STATUS.TERMINAL_STATUS_REFUSED,
                 cause,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                origin,
                 f"{code}: {detail}",
             )
         except JournalError as exc:
@@ -702,7 +793,17 @@ class Supervisor:
                         attempt.cancel_started = time.perf_counter() + 1e9
 
     def reporter(self) -> None:
+        """The Report tick, and the liveness SAMPLE that rides it.
+
+        The cadence is a scheduling choice; the VERDICT is not. `sample` compares two
+        positions and counts consecutive stills — no elapsed time enters the decision, so a
+        transfer that advances one MiB per tick is never called wedged however slow it is,
+        and one that stops is called wedged however fast it was.
+        """
         while not self.stop.wait(REPORT_SECONDS):
+            for subject in list(self.monitor.cursors):
+                if self.monitor.sample(subject) == "wedged":
+                    self.note("liveness", f"{subject} is WEDGED by silence (no clock involved)")
             if self.connected.is_set():
                 self.send(pb.WorkerMessage(report=self.report()))
 
@@ -822,6 +923,39 @@ class Supervisor:
             unreadable=sorted(unreadable),
         )
 
+    def disk_invoice(self) -> dict[str, int | str]:
+        """The numbers a `DISK_SHAPE` claim must carry, read from the filesystem itself."""
+        try:
+            stat = os.statvfs(self.root)
+        except OSError:
+            return {"readable": "unreadable"}
+        return {
+            "readable": "measured",
+            "total_bytes": stat.f_blocks * stat.f_frsize,
+            "available_bytes": stat.f_bavail * stat.f_frsize,
+            "free_inodes": stat.f_favail,
+            "block_size": stat.f_frsize,
+        }
+
+    def boot_failure(self, reason: pb.BootFailureReason, detail: str) -> pb.BootFailure:
+        """One boot verdict, classified ONCE, with its invoice attached.
+
+        A boot that cannot write its journal is a claim about the POD SHAPE, not a transient
+        to retry: requeueing onto an identically-sized disk reproduces it exactly and burns
+        the rental twice (th#2246). So the verdict travels with the numbers that justify it
+        and the worker exits rather than looping.
+        """
+        invoice = self.disk_invoice()
+        self.boot.step("load", "boot_failure", 0.0, reason=pb.BootFailureReason.Name(reason))
+        return pb.BootFailure(
+            worker_id=self.options.worker_id,
+            instance_id=self.options.instance_id,
+            reason=reason,
+            detail=f"{detail} | disk invoice: {json.dumps(invoice, sort_keys=True)}"[:1024],
+            resources=self.resources(),
+            release_id=self.options.release_id,
+        )
+
     def run(self) -> int:
         """Link, register, serve, relink. The session outlives the connection.
 
@@ -830,10 +964,28 @@ class Supervisor:
         may come back and the worker redials the SAME session; an in-memory coordinator that
         ends the stream has ended the run, and redialling it would be a hang.
         """
-        self.journal.append(
-            "session",
-            {"session_id": self.fences.session_id, "instance_id": self.options.instance_id},
-        )
+        try:
+            self.journal.append(
+                "session",
+                {"session_id": self.fences.session_id, "instance_id": self.options.instance_id},
+            )
+        except JournalError as exc:
+            # The worker cannot durably commit anything, so it claims nothing and executes
+            # nothing. It still SAYS SO, once, with the disk numbers behind the claim.
+            failure = self.boot_failure(
+                pb.BootFailureReason.BOOT_FAILURE_REASON_DISK_SHAPE, exc.detail
+            )
+            self.note("boot", f"BOOT FAILURE (disk shape): {failure.detail}")
+            link = self.link = self.coordinator.link()
+            with contextlib.suppress(LinkError):
+                link.control(self.outbound_iterator())
+                self.send(pb.WorkerMessage(boot_failure=failure))
+                time.sleep(0.1)
+            self.stop.set()
+            self.outbound.put(None)
+            link.cancel()
+            self.journal.close()
+            return int(Exit.internal)
         killed = self.supervision.sweep_orphans()
         if killed:
             self.note(

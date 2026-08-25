@@ -46,7 +46,7 @@ import collections
 import contextlib
 import ctypes
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -476,6 +476,7 @@ class StreamingFillBackend:
         inflight: int = 8,
         ledger: ResourceLedger | None = None,
         fence: bool = True,
+        on_position: Callable[[int], None] | None = None,
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -494,6 +495,11 @@ class StreamingFillBackend:
         self.inflight = int(inflight)
         self.ledger = ledger or ResourceLedger()
         self.fence = fence
+        #: cr-011's liveness feed: the MONOTONE integral-MiB position of the logical stream,
+        #: reported per batch. It is the only thing the wedge detector reads, and it is a
+        #: position rather than a heartbeat — a stalled transfer stops moving it, while a
+        #: slow one keeps moving it however slowly.
+        self.on_position = on_position
         self.lease: Any = None
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
@@ -842,6 +848,8 @@ class StreamingFillBackend:
             cursor[0] = start + int(batch.nbytes)
             ring.hold(event, batch)
             batches[0] += 1
+            if self.on_position is not None:
+                self.on_position(cursor[0] >> 20)
             # A slot whose H2D has not completed is NOT free. Query first, block last.
             ring.drain(ring.keep)
 

@@ -154,13 +154,11 @@ class ExecutorSupervision:
         python: str,
         base_env: tuple[tuple[str, str], ...],
         cozy_home: Path,
-        plant: str = "",
     ) -> None:
         self.root = root
         self.python = python
         self.base_env = base_env
         self.cozy_home = cozy_home
-        self.plant = plant
         # Both ordinals START at 1 (02 §0): a worker that has not spawned yet is already
         # at incarnation 1, so its Register carries a valid fence rather than a zero.
         self.incarnation = 1
@@ -205,7 +203,6 @@ class ExecutorSupervision:
                 self.socket_path,
                 "--root",
                 str(self.root),
-                *(("--plant", self.plant) if self.plant else ()),
             ],
             base_env=self.base_env,
             imposed=imposed,

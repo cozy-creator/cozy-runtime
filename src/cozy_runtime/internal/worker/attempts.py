@@ -33,11 +33,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import grants
+from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
 from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, PlanRefusal
@@ -106,12 +107,24 @@ class AttemptRefusal(Exception):
     """A typed refusal that becomes a REFUSED terminal (or a dropped message, when the
     fence says the message was never ours to read)."""
 
-    def __init__(self, code: str, detail: str, *, cause: pb.CauseCode, drop: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        cause: pb.CauseCode,
+        drop: bool = False,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+    ) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
         self.cause = cause
         self.drop = drop
+        #: WHOSE fault, decided by the origin of the address that missed (v1 REF_ORIGIN).
+        #: A caller-supplied address is the caller's typed error; a platform-produced one
+        #: stays platform-fatal, and the two must never render as the same terminal.
+        self.origin = origin
 
 
 @dataclass(slots=True)
@@ -141,9 +154,38 @@ class Attempt:
     #: state, because "the attempt gave back what it took" is a claim about the whole
     #: envelope — the grant included.
     opened: dict[str, int] = dataclasses_field(default_factory=dict)
+    #: cr-011's bounded observation record for THIS attempt. Supervisor-side, merged with
+    #: whatever the executor's own ring sent back, and capped the same way on both sides.
+    ring: EventRing = dataclasses_field(default_factory=EventRing)
+    #: where the attempt's time went (executor-reported, supervisor-attested)
+    attribution: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: typed confessions: every serve differing from the plain reading of the request
+    confessions: list[dict[str, Any]] = dataclasses_field(default_factory=list)
+    #: the ledger reconciliation, folded in at close so the bundle is self-contained
+    reconciliation: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: what BOTH rings held and shed. A lost tail is a number, never a silence.
+    caps: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: the highest EXECUTOR-side sequence already held here, so the reply's ring fills the
+    #: gap the lossy lane left instead of duplicating what it delivered.
+    forwarded_seq: int = 0
+    #: the opaque triage handle. Minted at the terminal, and the ONLY way to read the bundle.
+    subject_id: str = ""
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
+
+    def confess(self, kind: str, quantified: str, *, benchmark: bool = False) -> None:
+        """Say out loud that this request was not served by its plain reading (§3.6)."""
+        row = observe.Confession(kind, f"{self.request_id}#{self.attempt}", quantified, benchmark)
+        self.confessions.append(
+            {
+                "kind": row.kind,
+                "name": row.kind,
+                "value": row.quantified,
+                "benchmark_override": row.benchmark_override,
+            }
+        )
+        row.emit_into(self.ring)
 
 
 # --------------------------------------------------------------------------- the engine
@@ -165,6 +207,9 @@ class AttemptEngine:
         instance_id: str,
         send: Callable[[pb.WorkerMessage], None],
         progress: Callable[[str, int, dict[str, Any]], None],
+        bundles: triage.BundleStore,
+        monitor: observe.SilenceMonitor,
+        posture: Callable[[], dict[str, Any]],
     ) -> None:
         self.journal = journal
         self.ledger = ledger
@@ -183,6 +228,14 @@ class AttemptEngine:
         self.executed = 0
         self.faults: list[pb.Fault] = []
         self.warm_outcomes: list[dict[str, Any]] = []
+        self.bundles = bundles
+        self.monitor = monitor
+        #: the worker's applied posture, read at bundle time — a triage bundle that cannot
+        #: say which directive was applied when it ran explains half of what went wrong.
+        self.posture = posture
+        #: binding plan ids whose boot warm pass FAILED. Every attempt served under one
+        #: carries a per-request confession: the first-call tax was never paid for it.
+        self.degraded: dict[str, str] = {}
 
     # ------------------------------------------------------------------ offer
 
@@ -298,11 +351,37 @@ class AttemptEngine:
                 if exc.code in ("grant_expired", "input_absent")
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
-        except (ValueError, OSError) as exc:
+        except OSError as exc:
+            # The ADDRESS was minted by the coordinator, so a miss here is PLATFORM-FATAL,
+            # not a bad request (v1 REF_ORIGIN). This used to fall into the branch below and
+            # report a missing file as "not a JSON object" — the wrong system, the wrong
+            # person, and a sentence with no remedy in it.
+            classified = refusal.classify(
+                "payload_unreadable",
+                f"the granted payload location could not be read ({type(exc).__name__}); the "
+                "coordinator minted this address, so this worker cannot substitute another",
+                origin=refusal.PLATFORM,
+            )
+            code, cause_origin = classified.cause()
             raise AttemptRefusal(
+                f"{classified.code}[{classified.severity()}]",
+                classified.sentence(),
+                cause=code,
+                origin=cause_origin,
+            ) from exc
+        except ValueError as exc:
+            # The BYTES are the caller's, so this one is the caller's typed error.
+            classified = refusal.classify(
                 "payload_undecodable",
                 f"the granted payload input is not a JSON object: {exc}",
-                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
+                origin=refusal.CALLER,
+            )
+            code, cause_origin = classified.cause()
+            raise AttemptRefusal(
+                f"{classified.code}[{classified.severity()}]",
+                classified.sentence(),
+                cause=code,
+                origin=cause_origin,
             ) from exc
         features = _features(attempt.payload, binding.entrypoint)
         try:
@@ -399,20 +478,11 @@ class AttemptEngine:
     # ------------------------------------------------------------------ execute
 
     def execute(self, attempt: Attempt) -> pb.AttemptTerminal:
-        """Run ONE accepted attempt, then CLOSE it against the ledger.
-
-        The two halves are separate on purpose. `_run` ends at a journaled terminal and
-        nothing may come between the journal and the send — that is the protocol's
-        durability rule. Reconciliation happens after it, before the attempt leaves this
-        engine, and its own failure can never invalidate a terminal that is already durable:
-        a ledger that cannot be closed is a FAULT the operator sees, not a lost result.
-
-        The opening line it reconciles against was taken at ACCEPTANCE, before the envelope
-        was granted (`attempt.opened`).
-        """
-        terminal = self._run(attempt)
-        self.reconcile(attempt)
-        return terminal
+        """Run ONE accepted attempt. Closing it against the ledger happens inside
+        `terminal()`, because the triage bundle the terminal REFERENCES has to carry the
+        reconciliation — a bundle that stops one statement short of the numbers an operator
+        needs is a bundle they have to leave to go find them."""
+        return self._run(attempt)
 
     def reconcile(self, attempt: Attempt) -> dict[str, Any]:
         """Every byte class, before and after, with the executor's after-state re-read.
@@ -426,7 +496,7 @@ class AttemptEngine:
         """
         key = f"{attempt.request_id}#{attempt.attempt}"
         executor = self.supervision.current
-        if executor is not None and executor.alive() and not executor.poisoned:
+        if executor is not None and executor.alive() and not executor.poisoned and attempt.spool:
             try:
                 self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
             except ExecutorGone:
@@ -436,6 +506,7 @@ class AttemptEngine:
                 "no live usable executor: its CUDA context died with the process"
             )
         record = self.ledger.close_attempt(key, attempt.opened)
+        attempt.reconciliation = record
         try:
             self.journal.append("ledger", record)
         except JournalError as exc:
@@ -471,6 +542,19 @@ class AttemptEngine:
         deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
         seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else 600.0
         attempt.dispatched_at = time.perf_counter()
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        # The SUPERVISOR's own rows. They are the half of the narrative that cannot be lost
+        # to the executor's death, because the process that writes them is the one that
+        # outlives it — which is exactly what a killed-executor postmortem is made of.
+        self.monitor.start(key, "invoke")
+        attempt.ring.emit(
+            "log",
+            "dispatched to the executor",
+            "info",
+            entrypoint=attempt.binding.entrypoint,
+            incarnation=self.supervision.incarnation,
+            deadline_s=round(seconds, 3),
+        )
         try:
             reply = executor.call(
                 {
@@ -487,6 +571,14 @@ class AttemptEngine:
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
+            attempt.ring.emit(
+                "fault",
+                "the executor died during this attempt",
+                str(exc)[:400],
+                incarnation=self.supervision.incarnation,
+                canceling=attempt.canceling or "no",
+            )
+            self.monitor.end(key, "executor_died")
             # WHICHEVER THREAD SEES THE DEATH MARKS IT. The forceful-cancel path kills on
             # the watchdog thread while this one is blocked in recv, so a rebuild decision
             # that waits for the killer to finish its bookkeeping races a dying process and
@@ -500,6 +592,8 @@ class AttemptEngine:
                 return self.finish_cancel(attempt, attempt.canceling)
             return self.abandon(attempt, str(exc))
         attempt.resulted_at = time.perf_counter()
+        self.monitor.end(key, "returned")
+        self.absorb(attempt, reply)
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -607,6 +701,70 @@ class AttemptEngine:
             result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
         )
 
+    def forward(self, request_id: str, number: int, frame: Mapping[str, Any]) -> None:
+        """Hold ONE live observation the executor just emitted, before it can be lost."""
+        attempt = self.live.get(request_id)
+        if attempt is None or attempt.attempt != number:
+            return
+        attempt.ring.admit(self._row(frame))
+        attempt.forwarded_seq = max(attempt.forwarded_seq, int(frame.get("seq", 0)))
+
+    @staticmethod
+    def _row(frame: Mapping[str, Any]) -> Observation:
+        """One executor-side row, re-bounded on this side. A disposable process is not
+        trusted to bound the supervisor's memory, so every cap is re-applied here."""
+        fields = frame.get("fields") or {}
+        return Observation(
+            cast("Any", frame.get("kind", "log")),
+            str(frame.get("name", ""))[:200],
+            cast("Any", frame.get("value")),
+            {str(k)[:48]: v for k, v in list(fields.items())[:8]},
+            int(frame.get("at_unix_ms", 0)),
+        )
+
+    def absorb(self, attempt: Attempt, reply: Mapping[str, Any]) -> None:
+        """Take the executor's BOUNDED observation tail into the supervisor's own ring.
+
+        The executor's ring already applied every cap and every credential check at the emit
+        boundary, so this side re-applies the CAPS (a disposable process is not trusted to
+        bound the supervisor's memory) and keeps the rows as they came. Whatever the ring
+        already shed is carried through as a number, never inferred.
+        """
+        caps = dict(reply.get("observation_caps") or {})
+        attempt.attribution = dict(reply.get("attribution") or {})
+        rows = list(reply.get("observations") or ())
+        kept = 0
+        for row in rows[-attempt.ring.max_events :]:
+            # Anything the lossy lane already delivered is skipped by the EXECUTOR's own
+            # sequence. Both sides shed oldest first, so this fills the gap after the last
+            # forwarded row and can never double-count one.
+            if not isinstance(row, dict) or int(row.get("seq", 0)) <= attempt.forwarded_seq:
+                continue
+            attempt.ring.admit(self._row(row))
+            kept += 1
+        caps["executor_rows"] = len(rows)
+        caps["forwarded_live"] = attempt.forwarded_seq
+        caps["absorbed_from_reply"] = kept
+        caps.update(attempt.ring.caps())
+        attempt.caps = caps
+        # Every caller-visible divergence is ALSO an operator-visible confession. The
+        # envelope tells the caller what changed; the confession tells the operator why,
+        # with the numbers, in the record that outlives the process.
+        for row in reply.get("adjustments", ()):
+            attempt.confess(
+                "substituted" if str(row.get("reason", "")).startswith("adjusted") else "degraded",
+                f"{row.get('field')}: requested {row.get('requested')}, served "
+                f"{row.get('applied')} - {row.get('reason')}",
+            )
+        plan_id = attempt.binding.plan_id if attempt.binding else ""
+        why = self.degraded.get(plan_id)
+        if why:
+            attempt.confess(
+                "degraded",
+                f"served by a binding whose boot warm pass FAILED ({why}): the first-call "
+                "tax was never paid on boot, so this request paid it",
+            )
+
     def _payload(self, attempt: Attempt) -> dict[str, Any]:
         """The payload travels as a grant INPUT, fetched supervisor-side under the grant."""
         data = grants.read_input(attempt.grant, "payload", self.authorizer)
@@ -693,7 +851,24 @@ class AttemptEngine:
         result: Mapping[str, Any] | None = None,
         shortfall: Mapping[str, Any] | None = None,
     ) -> pb.AttemptTerminal:
-        """Build, JOURNAL, and only then return the terminal for sending."""
+        """CLOSE the ledger, commit the triage bundle, build, JOURNAL, then return to send.
+
+        The order is the whole point and none of it is negotiable:
+
+            release the envelope -> reconcile every byte class -> WRITE and fsync the
+            bundle -> journal its write receipt -> journal the terminal that names it
+
+        A terminal may only reference a bundle that is already durable, or it would be a
+        claim about bytes nobody wrote. And the bundle is committed BEFORE the terminal so
+        that a crash between the two leaves an unreferenced bundle (harmless, readable)
+        rather than a terminal pointing at nothing.
+        """
+        # The grant is released FIRST because reconciliation is a claim about the whole
+        # envelope: the opening line was taken before the grant, so the closing one must be
+        # taken after its release or every attempt reports its own grant as a leak.
+        self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
+        if attempt.opened:
+            self.reconcile(attempt)
         body = pb.TerminalBody(
             request_id=attempt.request_id,
             attempt=attempt.attempt,
@@ -718,6 +893,15 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
+        receipt = self.commit_bundle(attempt, status, cause, origin, detail)
+        if receipt is not None:
+            body.triage_bundle.CopyFrom(
+                pb.TriageBundleRef(
+                    subject_id=receipt.subject_id,
+                    write_receipt_digest=documents.raw(receipt.bundle_digest),
+                    length=receipt.length,
+                )
+            )
 
         canonical_bytes, digest = documents.identity(body)
         attempt.terminal_id = f"trm-{uuid.uuid4().hex[:24]}"
@@ -737,8 +921,94 @@ class AttemptEngine:
             },
         )
         attempt.state = "terminal"
-        self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
         return self.wrap(attempt)
+
+    # ------------------------------------------------------------------ triage
+
+    def commit_bundle(
+        self,
+        attempt: Attempt,
+        status: pb.TerminalStatus,
+        cause: pb.CauseCode,
+        origin: pb.CauseOrigin,
+        detail: str,
+    ) -> triage.Receipt | None:
+        """Assemble and durably commit ONE bundle for this terminal attempt.
+
+        Observation NEVER costs a terminal (worker-protocol/01: a triage ref can replace no
+        terminal field). A bundle that cannot be built or written is a FAULT the operator
+        sees and a terminal that ships without a reference — never a lost result.
+        """
+        attempt.subject_id = attempt.subject_id or triage.mint_subject()
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        plan = attempt.plan
+        assembly = triage.Assembly(
+            subject_id=attempt.subject_id,
+            attempt={
+                "request_id": attempt.request_id,
+                "attempt": attempt.attempt,
+                "session_id": self.session_id,
+                "instance_id": self.instance_id,
+                "executor_incarnation": self.supervision.incarnation,
+                "readiness_epoch": self.supervision.readiness_epoch,
+                "exec_spec_digest": documents.spell(attempt.digest),
+                "entrypoint": attempt.binding.entrypoint if attempt.binding else "",
+                "executions": attempt.executions,
+                "replays": attempt.replays,
+            },
+            plan=plan.document() if plan is not None else {},
+            posture=self.posture(),
+            terminal={
+                "status": pb.TerminalStatus.Name(status),
+                "cause_code": pb.CauseCode.Name(cause),
+                "cause_origin": pb.CauseOrigin.Name(origin),
+                "safe_message": safe(detail, 4096),
+                "terminal_id": attempt.terminal_id,
+            },
+            faults=[
+                {
+                    "kind": pb.FaultKind.Name(f.kind),
+                    "subject": f.subject,
+                    "reason": f.reason,
+                    "detail": f.detail[:512],
+                }
+                for f in self.faults[-8:]
+            ],
+            measurements={
+                "ledger": attempt.reconciliation
+                or {"classes": [c.document() for c in self.ledger.counters()]},
+                "attribution": attempt.attribution,
+                "windows_ms": {
+                    "queue_ms": round(
+                        max(attempt.dispatched_at - attempt.accepted_at, 0.0) * 1000, 2
+                    ),
+                    "dispatch_to_result_ms": round(
+                        max(attempt.resulted_at - attempt.dispatched_at, 0.0) * 1000, 2
+                    ),
+                },
+            },
+            confessions=attempt.confessions,
+            liveness=[row for row in self.monitor.document() if str(row["subject"]).endswith(key)]
+            or self.monitor.document(),
+            events=attempt.ring.rows(),
+            caps=attempt.caps or attempt.ring.caps(),
+        )
+        try:
+            return self.bundles.commit(assembly)
+        except (triage.TriageError, JournalError, OSError) as exc:
+            self.faults.append(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=key,
+                    reason="triage_bundle_uncommitted",
+                    detail=safe(
+                        f"the triage bundle for {attempt.subject_id} could not be committed "
+                        f"({exc}); the terminal ships WITHOUT a reference, because a triage "
+                        "ref can replace no terminal field and must never cost one"
+                    ),
+                )
+            )
+            return None
 
     def accepted_message(self, attempt: Attempt) -> pb.AttemptAccepted:
         """Re-send the SAME acceptance for a held attempt. AttemptAccepted always carries

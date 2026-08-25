@@ -31,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -474,19 +475,72 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
         str((result.get("image") or {}).get("asset_ref", "none")),
     )
 
-    head("the journal: acceptance, terminal, ledger, closure — in that order")
+    head("the journal: acceptance, ledger, triage, terminal, closure — in that order")
     rows = journal_rows(workspace)
     kinds = [row["kind"] for row in rows]
     check(
         "every durable step is journaled, once, in order",
-        kinds == ["session", "accepted", "terminal", "ledger", "closed"],
+        kinds == ["session", "accepted", "ledger", "triage", "terminal", "closed"],
         " -> ".join(kinds),
+    )
+    check(
+        "the ledger closes and the triage bundle is DURABLE before the terminal names it",
+        kinds.index("ledger") < kinds.index("triage") < kinds.index("terminal"),
+        "a terminal referencing a bundle nobody wrote is the fabrication class this "
+        "runtime exists to prevent",
     )
     check(
         "exactly ONE execution happened",
         outcome["executions"] == 1,
         f"executions={outcome['executions']}",
     )
+
+    head("cr-011: the triage bundle, read back BY OPAQUE KEY with no live process")
+    subject = outcome["triage_subject"]
+    bundle = outcome["triage"]
+    check(
+        "the terminal carries an opaque triage subject",
+        subject.startswith("trb-") and "run-1" not in subject,
+        f"{subject} — an id, not an address; nothing in it names the request",
+    )
+    ref = outcome["terminal"].get("triage_bundle") or {}
+    check(
+        "the reference is TRUTHFUL: digest and length of bytes that exist",
+        bool(ref.get("write_receipt_digest")) and 0 < int(ref.get("length", 0)) <= (1 << 20),
+        f"{int(ref.get('length', 0))} B (cap 1048576), receipt "
+        f"{str(ref.get('write_receipt_digest', ''))[:23]}…",
+    )
+    check(
+        "the bundle verifies against its JOURNALED write receipt",
+        bundle.get("format") == "cozy.runtime.WorkerTriageBundle/1",
+        f"{len(bundle.get('events', ()))} event rows, "
+        f"{len(bundle.get('confessions', ()))} confession(s)",
+    )
+    attribution = bundle.get("measurements", {}).get("attribution", {})
+    steps = attribution.get("steps", {})
+    stages = attribution.get("stages", {})
+    check(
+        "STEP TIME IS ATTRIBUTABLE — per-step intervals, accumulated not listed",
+        bool(stages.get("denoise")),
+        f"stages={ {k: v['total_ms'] for k, v in stages.items()} } "
+        f"steps={ {k: (v['count'], v['mean_ms']) for k, v in steps.items()} }",
+    )
+    check(
+        "the bundle carries the applied POSTURE it ran under",
+        bundle.get("posture", {}).get("intake_state") == "INTAKE_STATE_READY",
+        f"revision {bundle.get('posture', {}).get('applied_revision')}, "
+        f"posture {bundle.get('posture', {}).get('posture')}, "
+        f"credential epoch {bundle.get('posture', {}).get('credential_epoch')}",
+    )
+    check(
+        "the ledger reconciliation is IN the bundle, not a journal join away",
+        bool(bundle.get("measurements", {}).get("ledger", {}).get("classes")),
+        f"{len(bundle['measurements']['ledger'].get('classes', ()))} byte classes, "
+        f"closed={bundle['measurements']['ledger'].get('closed')}",
+    )
+    print("\n  what a person reads first:")
+    for line in outcome["triage_explained"]:
+        print(f"    {line}")
 
     head("no CUDA in the run process — the supervisor half of a local run")
     log = (workspace / "run.log").read_text(errors="replace")
@@ -1217,6 +1271,395 @@ def section_bench(args: argparse.Namespace) -> None:
         print(f"\n  median: {json.dumps(median)}")
         check("every benchmark run produced the banked digest", all(r["digest_ok"] for r in rows))
     print(f"  GPU {gpu_used_mib()} MiB")
+    bench_observability(rows)
+
+
+def bench_observability(runs: list[dict[str, Any]]) -> None:
+    """cr-011's cost, against the thing it is measuring. It has to be noise or it is a tax."""
+    import timeit
+
+    from cozy_runtime.author._observations import Attribution, EventRing
+    from cozy_runtime.internal.journal import Journal
+    from cozy_runtime.internal.worker import triage
+
+    head("cr-011 cost — attribution on the hot path, and the bundle off it")
+    attribution = Attribution()
+    step_ns = timeit.timeit(lambda: attribution.step("denoise", 15.2), number=200_000) / 2e5 * 1e9
+    ring = EventRing(subject="bench")
+    emit_ns = (
+        timeit.timeit(lambda: ring.emit("log", "one line", "info"), number=100_000) / 1e5 * 1e9
+    )
+    step_ms = next((float(r["handler_ms"]) for r in runs if float(r.get("handler_ms", 0)) > 0), 0.0)
+    print(f"  attribution.step()      {step_ns:8.0f} ns per step")
+    print(f"  ring.emit()             {emit_ns:8.0f} ns per record")
+    print(f"  one real handler leg    {step_ms:8.1f} ms")
+    check(
+        "per-step attribution is NOISE against the step it attributes",
+        step_ns < 2000 and (step_ms == 0 or step_ns / 1e6 < step_ms / 1000),
+        f"{step_ns:.0f} ns of bookkeeping against a {step_ms:.0f} ms handler leg — "
+        f"{step_ns / 1e6 / max(step_ms, 1e-9) * 100:.5f}% of it",
+    )
+
+    root = Path(tempfile.mkdtemp(prefix="cozy-bench-triage"))
+    try:
+        journal = Journal(root / "journal.log")
+        store = triage.BundleStore(root / "triage", journal)
+        full = EventRing(subject="bench#1")
+        for index in range(1000):
+            full.emit("log", f"handler line {index} with a realistic amount of text", "info")
+
+        def build_one() -> None:
+            assembly = triage.Assembly(triage.mint_subject(), attempt={"request_id": "b"})
+            assembly.events = full.rows()
+            assembly.build()
+
+        build_ms = timeit.timeit(build_one, number=50) / 50 * 1000
+
+        def commit_one() -> None:
+            assembly = triage.Assembly(triage.mint_subject(), attempt={"request_id": "b"})
+            assembly.events = full.rows()
+            store.commit(assembly)
+
+        commit_ms = timeit.timeit(commit_one, number=20) / 20 * 1000
+        print(f"  bundle build (256 rows) {build_ms:8.3f} ms")
+        print(f"  build + fsync + journal {commit_ms:8.3f} ms")
+        check(
+            "the bundle is built and made durable OFF the hot path, in the terminal tail",
+            commit_ms < 50,
+            f"{commit_ms:.2f} ms per terminal, of which {commit_ms - build_ms:.2f} ms is "
+            "two fsyncs — the same durability the terminal itself pays for",
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- cr-011 helpers
+
+
+def clock_names_in(function: str) -> list[str]:
+    """Every clock-shaped NAME reachable in one function's syntax tree.
+
+    Deliberately the AST and not the text: the module's prose says "there is no boot
+    timeout", and a substring scan would find that sentence and call the fence red for
+    saying the true thing. What matters is whether the CODE can consult a clock.
+    """
+    import ast
+
+    clocks = ("time", "monotonic", "perf_counter", "sleep", "deadline", "timeout", "elapsed")
+    source = (ROOT / "src" / "cozy_runtime" / "internal" / "worker" / "observe.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            return sorted(
+                {
+                    inner.id if isinstance(inner, ast.Name) else inner.attr
+                    for inner in ast.walk(node)
+                    if isinstance(inner, (ast.Name, ast.Attribute))
+                    and (inner.id if isinstance(inner, ast.Name) else inner.attr) in clocks
+                }
+            )
+    raise SystemExit(f"no function named {function!r} in observe.py")
+
+
+def triage_read(root: Path, subject: str) -> dict[str, Any]:
+    """Read one triage bundle from a DIRECTORY. No process, no socket, no SSH."""
+    from cozy_runtime.internal.worker.triage import BundleStore
+
+    return BundleStore.read(root / "triage", subject, root / "journal.log")
+
+
+def explain_bundle(document: dict[str, Any]) -> list[str]:
+    from cozy_runtime.internal.worker import triage
+
+    return triage.explain(document)
+
+
+def flood_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Flood the emit boundary, then assemble a bundle far past the 1 MiB wire cap.
+
+    Two caps have to hold and they are different: the RING's memory cap (count + bytes,
+    oldest shed first) and the BUNDLE's protocol cap. A flood that fits one and blows the
+    other would produce a terminal a coordinator cannot accept.
+    """
+    from cozy_runtime.author._observations import EventRing, ObservationRefusal
+    from cozy_runtime.internal.journal import Journal
+    from cozy_runtime.internal.worker import triage
+
+    ring = EventRing(subject="flood#1")
+    for index in range(20_000):
+        ring.emit("log", f"step {index} of a handler that logs every iteration", "info")
+        if index % 5000 == 0:
+            with contextlib.suppress(ObservationRefusal):
+                ring.emit("log", "auth", "info", api_key="sk-livekeythatmustnevertravel")
+    caps = ring.caps()
+
+    journal = Journal(root / "journal.log")
+    store = triage.BundleStore(root / "triage", journal)
+    assembly = triage.Assembly("trb-" + "f" * 24, attempt={"request_id": "flood"}, caps=caps)
+    assembly.events = ring.rows()
+    # Push the assembled document PAST the wire cap on purpose: 4,000 rows at the row cap.
+    assembly.events += [
+        {"seq": n, "kind": "log", "name": "x" * 200, "value": "y" * 400, "attempt_key": "flood#1"}
+        for n in range(4000)
+    ]
+    receipt = store.commit(assembly)
+    document = triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+    return caps, {
+        "length": receipt.length,
+        "shed_to_fit": document["caps"]["shed_to_fit"],
+        "truncated": document["caps"]["truncated"],
+        "kept": len(document["events"]),
+    }
+
+
+def section_triage(args: argparse.Namespace) -> None:
+    """cr-011: kill the executor mid-attempt and explain it FROM THE BUNDLE ALONE."""
+    idle = require_quiet_card()
+
+    head("kill the executor MID-ATTEMPT and explain the attempt with no live process")
+
+    def kill_arm() -> tuple[dict[str, Any], Path]:
+        workspace = Path(args.tmp) / "triage-kill"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "denoise",
+                    "payload": {"steps": 64, "latent": 80, "seed": 3},
+                    "outputs": ["image"],
+                    "request_id": "run-triage",
+                    "no_warm": True,
+                    "delete_journal": False,
+                }
+            )
+        )
+        process = start(spec_path, out_path, workspace)
+        if not wait_for(workspace / "accepted.marker", 900, process):
+            process.wait(timeout=120)
+            return read_outcome(out_path), workspace
+        time.sleep(0.6)  # the handler is inside its step loop, on the device
+        os.kill(int((workspace / "executor.pid").read_text().strip()), signal.SIGKILL)
+        process.wait(timeout=900)
+        return read_outcome(out_path), workspace
+
+    outcome, workspace = drive("triage-kill", kill_arm)
+    check(
+        "the attempt reached a terminal despite the executor dying",
+        outcome.get("status") in ("TERMINAL_STATUS_ABANDONED", "TERMINAL_STATUS_CANCELED"),
+        f"{outcome.get('status')}: "
+        f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
+    )
+
+    # THE ARM: from here on, nothing but the directory. No process, no socket, no SSH.
+    subject = outcome["triage_subject"]
+    root = workspace / "worker"
+    bundle = triage_read(root, subject)
+    check(
+        "the bundle is readable BY OPAQUE KEY from a directory alone",
+        bundle.get("subject_id") == subject,
+        f"{root / 'triage' / (subject + '.json')} verified against its journaled receipt",
+    )
+    lines = explain_bundle(bundle)
+    print("\n  the whole postmortem, from the file:")
+    for line in lines:
+        print(f"    {line}")
+    text = "\n".join(lines)
+    check(
+        "it names the attempt, the spec and the terminal cause",
+        "run-triage#1" in text and "sha256:" in text and "CAUSE_CODE" in text,
+        "identity + cause without asking anyone",
+    )
+    check(
+        "it names the executor generation that died",
+        "incarnation" in text and "readiness epoch" in text,
+        f"incarnation {bundle['attempt']['executor_incarnation']}, "
+        f"epoch {bundle['attempt']['readiness_epoch']}",
+    )
+    classes = {row["class"]: row for row in bundle["measurements"]["ledger"]["classes"]}
+    unreadable = sorted(k for k, v in classes.items() if v["kind"] == "unreadable")
+    check(
+        "the dead executor's device classes are UNREADABLE in the bundle, never zero",
+        "device_free" in unreadable and "device_allocated" in unreadable,
+        f"unreadable: {unreadable}",
+    )
+    check(
+        "host classes still reconcile to their opening values",
+        classes["host_ram"]["after"] == classes["host_ram"]["before"] == 0,
+        f"host_ram {classes['host_ram']['before']} -> {classes['host_ram']['after']} B",
+    )
+    check(
+        "the applied posture at the moment of death is in the bundle",
+        bundle["posture"]["applied_revision"] == 1,
+        f"intake {bundle['posture']['intake_state']}, "
+        f"posture {bundle['posture']['posture']}, "
+        f"boot steps {[s['step'] + ':' + s['outcome'] for s in bundle['posture']['boot_steps']]}",
+    )
+    names = [f"{row['kind']}/{row['name']}" for row in bundle["events"]]
+    print(f"\n  the tail, from the dead process: {names}")
+    check(
+        "the EXECUTOR's own observations survived the kill, live-forwarded before it died",
+        any(row["kind"] == "log" and "denoise loop" in row["name"] for row in bundle["events"]),
+        "a ring that only crossed in the reply would have crossed never",
+    )
+    check(
+        "the SUPERVISOR's own rows are there too — dispatch, and the death it witnessed",
+        any("dispatched" in row["name"] for row in bundle["events"])
+        and any(row["kind"] == "fault" for row in bundle["events"]),
+        f"{len(bundle['events'])} rows kept, caps {json.dumps(bundle['caps'])}",
+    )
+    check(
+        "and nothing in the bundle can override the terminal",
+        bundle["terminal"]["status"] == outcome["status"],
+        "TriageBundleRef is OBSERVATION ONLY — the bundle repeats the terminal, never sets it",
+    )
+    settle_gpu(idle)
+
+    head("the emit boundary under a FLOOD, and the 1 MiB wire cap")
+    flooded = Path(args.tmp) / "triage-flood"
+    shutil.rmtree(flooded, ignore_errors=True)
+    flooded.mkdir(parents=True)
+    caps, built = flood_bundle(flooded)
+    check(
+        "a flooded emitter hits the ring caps and COUNTS what it shed",
+        caps["kept"] <= caps["max_events"] and caps["dropped"] > 0,
+        f"{caps['admitted']} admitted, {caps['kept']} kept, {caps['dropped']} shed, "
+        f"{caps['held_bytes']} B held (cap {caps['max_bytes']} B)",
+    )
+    check(
+        "the assembled bundle fits the protocol's 1 MiB reference cap",
+        built["length"] <= (1 << 20),
+        f"{built['length']} B after shedding {built['shed_to_fit']} more rows to fit",
+    )
+    check(
+        "a credential-shaped field is REFUSED at the emit boundary, not redacted later",
+        caps["refused"] > 0,
+        f"{caps['refused']} refusal(s) counted; nothing credential-shaped reached the ring",
+    )
+
+
+def section_wedge(args: argparse.Namespace) -> None:
+    """cr-011: a wedged transfer is detected by SILENCE; a slow-but-advancing one is not."""
+    head("silence-bounded liveness — the same detector, two transfers, no clock anywhere")
+    from cozy_runtime.author._observations import EventRing
+    from cozy_runtime.internal.worker.observe import SilenceMonitor
+
+    monitor = SilenceMonitor(EventRing(subject="worker"), give_up_after=8)
+    monitor.start("slow:transfer", "download")
+    monitor.start("wedged:transfer", "download")
+    verdicts: dict[str, list[str]] = {"slow": [], "wedged": []}
+    for position in range(1, 41):
+        # The SLOW one moves ONE MiB per observation, which is 1/4000th of the wedged one's
+        # nominal rate. The WEDGED one moved 4,096 MiB and then stopped. Nothing below reads
+        # a clock, sleeps, or measures elapsed time: the inputs are two integers.
+        monitor.advance("slow:transfer", position)
+        monitor.advance("wedged:transfer", 4096)
+        verdicts["slow"].append(monitor.sample("slow:transfer"))
+        verdicts["wedged"].append(monitor.sample("wedged:transfer"))
+    check(
+        "the WEDGED transfer is called wedged, by silence",
+        verdicts["wedged"][-1] == "wedged",
+        f"{verdicts['wedged'].count('silent')} silent observations, then "
+        f"{verdicts['wedged'].count('wedged')} wedged — position never left 4096",
+    )
+    check(
+        "the SLOW-BUT-ADVANCING transfer is NEVER called wedged, however slow",
+        set(verdicts["slow"]) == {"advancing"},
+        f"{len(verdicts['slow'])} observations, all advancing at 1 MiB each — a transfer "
+        "this slow would have blown any boot timeout",
+    )
+    check(
+        "there is NO CLOCK in the detector — proven against its own SYNTAX TREE",
+        not clock_names_in("sample"),
+        "`sample` reads two integers and a counter; the only time-shaped tokens anywhere "
+        "in that module are in prose saying there is no boot timeout",
+    )
+    check(
+        "`started` is published at POSITION ZERO so a pre-first-unit wedge renders",
+        any(row["name"] == "started" and row["value"] == 0 for row in monitor.ring.rows()),
+        "a subject nobody ever mentioned cannot be reported as wedged",
+    )
+    print(f"\n  cursors: {json.dumps(monitor.document())}")
+
+
+def section_witness(args: argparse.Namespace) -> None:
+    """cr-011: OOM-kill the SUPERVISOR and name the death from the surviving record."""
+    head("the postmortem witness — a parent that outlives the journal owner")
+    from cozy_runtime.internal import witness as wit
+
+    workspace = Path(args.tmp) / "witness"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+
+    kind = wit.require_durable(workspace / "witness")
+    check(
+        "the boot record lives OFF tmpfs/ramfs",
+        kind not in ("tmpfs", "ramfs"),
+        f"{workspace} is on {kind} — a boot record in RAM dies with the event it explains",
+    )
+
+    # A REAL kernel OOM kill, in a REAL memory cgroup, without root: the systemd user
+    # manager delegates a cgroup subtree, so a scope with MemoryMax set is the actual
+    # mechanism a pod uses. The victim is a stand-in for the supervisor and the witness
+    # cannot tell the difference — it reads a wait status and a kernel counter.
+    victim = workspace / "victim.py"
+    victim.write_text(
+        "import sys\nblocks = []\n"
+        "while True:\n    blocks.append(bytearray(8 << 20))\n    sys.stdout.flush()\n"
+    )
+    scope = f"cozy-witness-{os.getpid()}"
+    command = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        f"--unit={scope}",
+        "-p",
+        "MemoryMax=96M",
+        "-p",
+        "MemorySwapMax=0",
+        # Without this systemd tears the whole scope down on the OOM — witness included —
+        # and the record that exists to explain the death dies with it. `continue` leaves
+        # the kernel's per-task kill in place and lets the parent live to report it, which
+        # is exactly the arrangement a pod needs.
+        "-p",
+        "OOMPolicy=continue",
+        sys.executable,
+        "-c",
+        "import sys; from cozy_runtime.internal.witness import main;"
+        " raise SystemExit(main(sys.argv[1:]))",
+        "--root",
+        str(workspace),
+        "--",
+        sys.executable,
+        str(victim),
+    ]
+    env = dict(os.environ, PYTHONPATH=f"{ROOT}:{ROOT / 'src'}")
+    result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=300)
+    print(f"  systemd-run exit {result.returncode}: {result.stderr.strip()[:200]}")
+
+    # From here on: NO live process. Only the file.
+    death = wit.read_death(workspace)
+    print(f"  the surviving record: {json.dumps(death, sort_keys=True)}")
+    check(
+        "the death is NAMED by a process the dying one could not have written from",
+        death["how"] == "oom_killed",
+        f"how={death['how']} signal={death['signal_name']} "
+        f"oom_kill {death['cgroup_oom_kill_before']} -> {death['cgroup_oom_kill_after']}",
+    )
+    check(
+        "the OOM verdict is a MEASURED kernel counter delta, not an inference from SIGKILL",
+        death["oom_killed"] == "true"
+        and death["cgroup_oom_kill_after"] > death["cgroup_oom_kill_before"],
+        death["method"],
+    )
+    boot = json.loads((workspace / "witness" / "boot.json").read_text())
+    check(
+        "the boot record was written BEFORE the child started and survived it",
+        boot["child_pid"] == death["child_pid"] and boot["format"].endswith("WitnessBoot/1"),
+        f"child {boot['child_pid']} ran {death['ran_ms']} ms on {boot['record_filesystem']}",
+    )
 
 
 # --------------------------------------------------------------------------- main
@@ -1226,7 +1669,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="cr-008a local slice verification")
     parser.add_argument(
         "section",
-        choices=("exec", "slice", "ledger", "arms", "clone", "bench", "all"),
+        choices=(
+            "exec",
+            "slice",
+            "ledger",
+            "arms",
+            "triage",
+            "wedge",
+            "witness",
+            "clone",
+            "bench",
+            "all",
+        ),
     )
     parser.add_argument("--tmp", default="/tmp/cozy-slice")
     parser.add_argument("--spec", default="")
@@ -1244,6 +1698,9 @@ def main() -> int:
         "slice": section_slice,
         "ledger": section_ledger,
         "arms": section_arms,
+        "triage": section_triage,
+        "wedge": section_wedge,
+        "witness": section_witness,
         "clone": section_clone,
         "bench": section_bench,
     }

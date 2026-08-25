@@ -147,6 +147,7 @@ def denoise(
     # A warm case pays the first-call tax on the smallest legal shape it can: the body
     # cheapens off `ctx.boot_warmup` rather than inventing an out-of-contract schedule.
     steps = 1 if ctx.boot_warmup else payload.steps
+    tel.log("starting the denoise loop", latent=payload.latent, steps=steps, seed=view._seed)
     on_step = tel.step_callback(steps, stage="denoise")
     with tel.stage("denoise"):
         for step in range(steps):
@@ -154,6 +155,7 @@ def denoise(
             latents = model.denoise(latents, timestep, prompt, embeds, ids)
             on_step(step)
     stats = latents.float()
+    tel.metric("latent_std", round(float(stats.std()), 6))
     body = latents.reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
     return DenoiseOutput(
         image=out.save_image(_preview(torch, latents), format="png"),

@@ -45,6 +45,10 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
+| `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
+| `internal/worker/triage.py` | the `WorkerTriageBundle` schema, its assembler, and the journal-backed store |
+| `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
+| `internal/witness.py` | the out-of-process postmortem witness: it names the SUPERVISOR's own death |
 | `internal/local.py` | the ephemeral local supervisor: one request, no network |
 | `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
 | `internal/seam.py` | the control-only, byte-accounted supervisor<->executor channel |
@@ -63,6 +67,25 @@ structural, not a promise — the `one-attempt-kernel` fence proves the invocati
 exactly one caller (the device executor) and the attempt engine exactly one constructor (the
 supervisor session), so a direct-call runner beside them cannot be written without turning
 CI red.
+
+**Observability is bounded, or it is not observability.** `author/_observations.py` holds the
+ONE record shape, a ring bounded by count AND bytes that sheds oldest first and counts what it
+shed, and an O(1) time accumulator (`Attribution`) that makes inference step time attributable
+without one retained row per step — 324 ns per step against a ~100 ms handler leg. Progress
+frames are never retained; their durable form is that accumulator plus the monotone position
+the silence detector reads. A credential-shaped field is REFUSED at the emit boundary, not
+redacted downstream.
+
+**Every terminal attempt commits one `WorkerTriageBundle`** — identity, applied posture,
+ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
+written and fsynced BEFORE its write receipt is journaled and before the terminal that names
+it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
+killed executor is therefore explainable from a directory, with no live process and no SSH.
+
+**Liveness is silence-bounded, never clocked.** Progress means an advancing monotone position;
+a wedge is consecutive observations that find the position unchanged. `give_up_after` counts
+observations, not seconds — there is no boot timeout and there will not be one — and the
+`timing-decides-nothing` fence proves the observation plane cannot reach residency or placement.
 
 **The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
 supervisor's own bookkeeping, `measured` for a named device or kernel interface,
@@ -108,6 +131,9 @@ real CAS, so they are BUILDER-RUN and never CI steps):
 
     corpus/.venv/bin/python scripts/worker-live.py attempt   # cr-007: the two-process worker
     corpus/.venv/bin/python scripts/slice-live.py all        # cr-008a: one request, no network
+    corpus/.venv/bin/python scripts/slice-live.py triage     # cr-011: explain a killed executor from the bundle
+    corpus/.venv/bin/python scripts/slice-live.py wedge      # cr-011: silence vs slow, with no clock
+    corpus/.venv/bin/python scripts/slice-live.py witness    # cr-011: a real cgroup OOM kill, named
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
