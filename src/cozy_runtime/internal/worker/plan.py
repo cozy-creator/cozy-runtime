@@ -325,6 +325,40 @@ class PlanChooser:
                     "evidence_class": "measured",
                 },
             )
+        # THE PHYSICAL FLOOR, before the ladder rather than after it. The floor is the
+        # minimum device room ANY rung needs — activations plus scratch plus one component
+        # chunk — so a device that cannot provide it admits no rung, and walking a ladder to
+        # discover that is walking it for nothing. Checking it here is also what makes the
+        # refusal reachable: `_deepen` only runs when nothing fits, and an UNCALIBRATED
+        # coefficient never gets that far (#293, and correctly — it may not refuse). The
+        # floor is not a coefficient: it is a DECLARED deployment fact compared against a
+        # MEASURED allocatable, so nothing uncalibrated participates in it.
+        floor = binding.vram_floor_bytes
+        allocatable_now = self.ledger.allocatable
+        # Against the DEEPEST rung's capacity, not against bare allocatable. Once the
+        # weights are resident, `allocatable` is only what is left beside them — but the
+        # staged rung can free the largest component, so "no rung exists" means "not even
+        # after evicting everything evictable". Comparing against the bare number refused a
+        # run that the ladder serves perfectly well, which is what running it showed.
+        deepest_capacity = allocatable_now + max((self.ledger.resident or {}).values(), default=0)
+        if floor and allocatable_now >= 0 and deepest_capacity < floor:
+            raise PlanRefusal(
+                "capacity_floor",
+                f"below the PHYSICAL FLOOR: this deployment declares {floor} B for "
+                f"activations plus scratch plus one component chunk, and the deepest rung "
+                f"can raise {deepest_capacity} B ({allocatable_now} B allocatable plus the "
+                f"largest evictable component; short by {floor - deepest_capacity} B). "
+                f"There is no rung "
+                "below the floor, so this exits with a quantified capacity code rather "
+                "than a plan that cannot run",
+                {
+                    "resource": "vram",
+                    "scope": "physical_floor",
+                    "needed_bytes": floor,
+                    "available_bytes": max(deepest_capacity, 0),
+                    "evidence_class": "measured",
+                },
+            )
         terms = {c.name: c for c in self.demand(binding, features)}
         resident = self.ledger.resident or {}
         # `device_allocatable` is what a NEW reservation can actually get. It already
@@ -408,7 +442,6 @@ class PlanChooser:
         SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the coordinator, never a
         structural-incompatibility claim — a different worker may fit it exactly.
         """
-        floor = binding.vram_floor_bytes
         if not activations.enforceable:
             # An UNCALIBRATED coefficient MAY NOT REFUSE. It may deepen the ladder, because
             # a placement rung changes weight placement only — never the kernel, never the
@@ -439,22 +472,8 @@ class PlanChooser:
                     "evidence_class": "measured",
                 },
             )
-        if floor and allocatable >= 0 and allocatable < floor:
-            raise PlanRefusal(
-                "capacity_floor",
-                f"below the PHYSICAL FLOOR: this deployment declares {floor} B for "
-                f"activations plus scratch plus one component chunk, and {allocatable} B "
-                f"are allocatable (short by {floor - allocatable} B). There is no rung "
-                "below the floor, so this exits with a quantified capacity code rather "
-                "than a plan that cannot run",
-                {
-                    "resource": "vram",
-                    "scope": "physical_floor",
-                    "needed_bytes": floor,
-                    "available_bytes": max(allocatable, 0),
-                    "evidence_class": "measured",
-                },
-            )
+        # The floor was already checked at the top of `choose`: reaching here means the
+        # device HAS the floor and the ladder still does not fit, which is the degrade case.
         deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
         walk["deepened_to"] = deepest
         return deepest, (

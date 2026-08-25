@@ -60,12 +60,18 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def cli(*args: str, home: Path | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
+def cli(
+    *args: str,
+    home: Path | None = None,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     """Run the REAL entrypoint as its own process, so the exit code is a process exit."""
     env = dict(
         os.environ,
         PYTHONPATH=f"{ROOT}:{ROOT / 'src'}",
         COZY_HOME=str(home or (WORK / "home")),
+        **(env or {}),
     )
     out = subprocess.run(
         [sys.executable, "-m", "cozy_runtime.cli.main", *args],
@@ -76,6 +82,23 @@ def cli(*args: str, home: Path | None = None, cwd: Path | None = None) -> tuple[
         check=False,
     )
     return out.returncode, out.stdout, out.stderr
+
+
+def cli_retry(live: Any, *args: str, **kwargs: Any) -> tuple[int, str, str]:
+    """Run a CLI verb, retrying when a NEIGHBOUR takes the shared card mid-run.
+
+    This box's 8 GiB fits exactly one resident pipeline and another agent's worker comes and
+    goes. A `device_shortfall` on the way to readiness is completely true and completely
+    uninformative about the arm being exercised.
+    """
+    for _ in range(4):
+        code, out, err = cli(*args, **kwargs)
+        blob = (err + out).lower()
+        if "device_shortfall" not in blob and "out of memory" not in blob:
+            return code, out, err
+        print("  the card was taken mid-run by another process; waiting", flush=True)
+        live.require_quiet_card()
+    return code, out, err
 
 
 def install_artifact(home: Path, ref: str = REF, **overrides: Any) -> None:
@@ -397,9 +420,101 @@ def section_identity(args: argparse.Namespace) -> None:
     )
 
 
+def section_hubless(args: argparse.Namespace) -> None:
+    """The two arms that need the whole pipeline and a plant: no network, and the floor."""
+    import importlib.util
+
+    harness = ROOT / "scripts" / "pipeline-live.py"
+    spec = importlib.util.spec_from_file_location("pipeline_live", harness)
+    assert spec and spec.loader
+    live = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(live)
+    shim = live.build_throttle()
+    home = WORK / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    live.require_quiet_card()
+
+    head("THE HUBLESS CONTRACT: inference from a populated CAS with the network CUT")
+    install_artifact(home)
+    out_dir = WORK / "hubless"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    env = {"LD_PRELOAD": str(shim), "IO_BLOCK_NETWORK": "1"}
+    code, out, err = cli_retry(
+        live,
+        "--json",
+        "run",
+        "generate",
+        PROMPT,
+        f"steps={args.steps}",
+        f"size={args.size}",
+        "seed=1005",
+        "--offline",
+        "--out",
+        str(out_dir),
+        home=home,
+        env=env,
+    )
+    check(
+        "a network-BLOCKED --offline run completes inference",
+        code == 0,
+        (err or out).strip()[-300:] if code else "every AF_INET connect() returned ECONNREFUSED",
+    )
+    if code == 0:
+        document = json.loads(out)
+        check(
+            "and produces the SAME image as the networked run",
+            (document.get("result") or {}).get("digest", "").startswith("9917742a18d6c421"),
+            (document.get("result") or {}).get("digest", "")[:32],
+        )
+
+    head("THE PHYSICAL FLOOR: below it, exit 14 with the shortfall — never 0, never 6")
+    install_artifact(home, vram_floor_bytes=64 << 30)
+    code, out, err = cli_retry(
+        live,
+        "run",
+        "generate",
+        PROMPT,
+        "steps=2",
+        "size=512",
+        "seed=1005",
+        "--out",
+        str(WORK / "floor"),
+        home=home,
+    )
+    check(
+        "an impossible declared floor exits 14 (capacity)",
+        code == 14,
+        f"got {code}: {_first(err or out)}",
+    )
+    check(
+        "and the refusal is QUANTIFIED, not a category",
+        "short by" in (err + out) or "needed" in (err + out).lower(),
+        _first(err),
+    )
+    head("the plant is removed: the same configuration runs")
+    install_artifact(home)
+    code, out, err = cli_retry(
+        live,
+        "run",
+        "generate",
+        PROMPT,
+        "steps=2",
+        "size=512",
+        "seed=1005",
+        "--out",
+        str(WORK / "floor"),
+        home=home,
+    )
+    check(
+        "a DEGRADABLE configuration never exits 14",
+        code == 0,
+        f"got {code}: {_first(err or out)}",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="cr-016 live CLI verification")
-    parser.add_argument("section", choices=("surface", "keys", "identity", "all"))
+    parser.add_argument("section", choices=("surface", "keys", "identity", "hubless", "all"))
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--size", type=int, default=1024)
     args = parser.parse_args()
@@ -408,6 +523,7 @@ def main() -> int:
         "surface": section_surface,
         "keys": section_keys,
         "identity": section_identity,
+        "hubless": section_hubless,
     }
     for name in list(sections) if args.section == "all" else [args.section]:
         sections[name](args)

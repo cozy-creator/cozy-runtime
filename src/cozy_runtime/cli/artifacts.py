@@ -45,6 +45,11 @@ class Artifact:
     custody: str = "canonical"
     """`canonical` (the border classified every key) or `local` (an un-bordered local bind:
     unknown extra keys warn, are ignored and are confessed — §1.1's custody tier)."""
+    vram_floor_bytes: int = 0
+    """The PHYSICAL FLOOR this artifact declares — activations + scratch + one component
+    chunk. Below it no rung exists and a local run exits 14 with the quantified shortfall.
+    A deployment fact, which locally means an installed-artifact fact; 0 takes the CLI's
+    conservative default rather than asserting a floor the border never measured."""
     extra_key_markers: tuple[str, ...] = field(default_factory=tuple)
     """Known marker rules an extra key may match, e.g. `v_pred`. A match is transcribed or
     refused NAMING the marker; it is never ignored."""
@@ -70,6 +75,7 @@ class Artifact:
             "tensors": self.tensors,
             "variant": self.variant,
             "custody": self.custody,
+            "vram_floor_bytes": self.vram_floor_bytes,
             "extra_key_markers": list(self.extra_key_markers),
         }
 
@@ -121,6 +127,7 @@ def rows(cozy_home: Path, prefix: str = "") -> list[Artifact]:
                 tensors=int(doc.get("tensors", 0)),
                 variant=str(doc.get("variant", "sm89")),
                 custody=str(doc.get("custody", "canonical")),
+                vram_floor_bytes=int(doc.get("vram_floor_bytes", 0)),
                 extra_key_markers=tuple(doc.get("extra_key_markers", ())),
             )
         )

@@ -336,7 +336,7 @@ def _binding_record(
         "entrypoint": function,
         "model_construction_digest": "",
         "resident_budget_bytes": 0,
-        "vram_floor_bytes": 1 * GIB,
+        "vram_floor_bytes": installed.vram_floor_bytes or 1 * GIB,
         "tenancy": "local",
         "custody": installed.custody,
         "strict_keys": strict,
@@ -359,6 +359,15 @@ def _render(
     stream: bool,
 ) -> Result:
     """The outcome as rows, or the typed refusal it actually is."""
+    if outcome.ended == "unbound_entrypoint":
+        raise CliError(
+            "not_found",
+            outcome.error,
+            "the installed artifact and the requested function must name the same binding; "
+            "`cozy-runtime describe` lists what this release registers",
+            Exit.not_found,
+            next=("cozy-runtime describe",),
+        )
     if outcome.ended != "terminal":
         raise CliError(
             "unavailable",
@@ -471,10 +480,24 @@ def _name_for(code: Exit) -> str:
 
 def _exit_for(status: str, cause: Mapping[str, Any]) -> Exit:
     if status == "TERMINAL_STATUS_REFUSED":
-        name = cause.get("code")
-        spelled = name if isinstance(name, str) else ""
-        return CAUSE_EXITS.get(spelled, Exit.validation)
+        return CAUSE_EXITS.get(_cause_name(cause.get("code")), Exit.validation)
     return TERMINAL_EXITS.get(status, Exit.failed)
+
+
+def _cause_name(code: Any) -> str:
+    """The cause's spelling. A canonical document carries the ENUM'S NUMBER, not its name —
+    which is right for the wire and was silently wrong here: keying the exit table on names
+    matched nothing, so every refusal came out as exit 3 including the capacity one."""
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    if isinstance(code, str):
+        return code
+    if isinstance(code, int):
+        try:
+            return str(pb.CauseCode.Name(code))
+        except ValueError:
+            return ""
+    return ""
 
 
 def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:

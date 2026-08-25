@@ -55,6 +55,10 @@ from cozy_runtime.protocol import worker_pb2 as pb
 GRANT_SECONDS = 900
 
 
+class LocalBindingError(Exception):
+    """The request names an entrypoint this run staged no binding plan for."""
+
+
 @dataclass(frozen=True, slots=True)
 class LocalRequest:
     """One request, as a coordinator would put it on the wire."""
@@ -198,6 +202,14 @@ class LocalCoordinator:
         """
         try:
             self._dispatch_message(message)
+        except LocalBindingError as exc:
+            # A CONDITION, not a coordinator fault: the run ends the same way, but it says
+            # which entrypoint had no plan instead of naming a KeyError.
+            self.ended = "unbound_entrypoint"
+            self.error = str(exc)[:400]
+            print(f"[run] {self.error}", flush=True)
+            self.done.set()
+            self._link.close()
         except Exception as exc:
             self.ended = "coordinator_error"
             self.error = f"{type(exc).__name__}: {exc}"[:400]
@@ -232,10 +244,28 @@ class LocalCoordinator:
         )
         self._send(pb.CoordinatorMessage(directive=self._directive()))
 
+    def _plan_id(self) -> str:
+        """The binding plan this request runs against, or the typed refusal that it has none.
+
+        A request naming an entrypoint no binding plan covers is an ORDINARY coordinator
+        condition — a stale install, a renamed function, a `--model` for the wrong slot —
+        and it has to answer as one. It used to be a bare KeyError inside the message pump,
+        which #306 already showed turns a one-line condition into a run that ends with no
+        terminal at all.
+        """
+        plan_id = self.bindings.get(self.request.entrypoint)
+        if plan_id is None:
+            known = ", ".join(sorted(self.bindings)) or "no entrypoints"
+            raise LocalBindingError(
+                f"no binding plan covers {self.request.entrypoint!r}: this run staged "
+                f"plans for {known}"
+            )
+        return plan_id
+
     def _on_report(self, report: pb.Report) -> None:
         """READY is learned from the worker's own durable Report, like a hub learns it."""
         self.reports.append(report)
-        plan_id = self.bindings[self.request.entrypoint]
+        plan_id = self._plan_id()
         ready = (
             report.intake_state == pb.IntakeState.INTAKE_STATE_READY
             and plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids
@@ -298,7 +328,7 @@ class LocalCoordinator:
         return directive
 
     def _dispatch(self, incarnation: int) -> None:
-        plan_id = self.bindings[self.request.entrypoint]
+        plan_id = self._plan_id()
         spec = pb.ExecutionSpec(
             endpoint_release_id=self.release_id,
             deadline_unix_ms=self.request.deadline_ms,

@@ -713,8 +713,10 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "the attempt failed rather than loading a component nobody declared",
-        poison.get("status") in ("TERMINAL_STATUS_FAILED", "TERMINAL_STATUS_REFUSED"),
-        f"{poison.get('status')}: {str(poison.get('terminal', {}).get('safe_message', ''))[:180]}",
+        poison.get("status") in ("TERMINAL_STATUS_FAILED", "TERMINAL_STATUS_REFUSED")
+        or poison.get("ended") == "unbound_entrypoint",
+        f"{poison.get('ended')}/{poison.get('status')}: "
+        f"{poison.get('error') or str(poison.get('terminal', {}).get('safe_message', ''))[:180]}",
     )
 
     head("below the PHYSICAL FLOOR, a local run exits with a quantified capacity code")
@@ -1136,6 +1138,8 @@ THROTTLE_C = r"""
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <errno.h>
 
 static double rate_bps = 0.0;
 static double next_free = 0.0;
@@ -1143,7 +1147,9 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static ssize_t (*real_read)(int, void *, size_t) = 0;
 static ssize_t (*real_pread)(int, void *, size_t, off_t) = 0;
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = 0;
+static int (*real_connect)(int, const struct sockaddr *, socklen_t) = 0;
 static long mmap_min = 0;   /* 0 disables the mmap arm entirely */
+static int block_net = 0;   /* IO_BLOCK_NETWORK: refuse every INET connect */
 
 static double now_s(void) {
     struct timespec t;
@@ -1166,6 +1172,9 @@ static void setup(void) {
     real_pread = dlsym(RTLD_NEXT, "pread64");
     if (!real_pread) real_pread = dlsym(RTLD_NEXT, "pread");
     real_mmap = dlsym(RTLD_NEXT, "mmap");
+    real_connect = dlsym(RTLD_NEXT, "connect");
+    const char *blk = getenv("IO_BLOCK_NETWORK");
+    block_net = blk && blk[0] == '1';
 }
 
 /* A DEADLINE bucket, not a per-thread deficit. The first version had each thread sleep for
@@ -1250,6 +1259,22 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
 
 void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     return mmap(addr, len, prot, flags, fd, off);
+}
+
+/* The NETWORK-BLOCK arm, off unless IO_BLOCK_NETWORK=1.
+ *
+ * The hubless contract is a claim that a populated local CAS is sufficient — provable only
+ * by taking the network away and watching inference finish anyway. AF_UNIX is left alone on
+ * purpose: the supervisor/executor control channel is a Unix socket, and cutting THAT would
+ * test the harness rather than the contract. */
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (!real_connect) setup();
+    if (block_net && addr &&
+        (addr->sa_family == AF_INET || addr->sa_family == AF_INET6)) {
+        errno = ECONNREFUSED;
+        return -1;
+    }
+    return real_connect(fd, addr, len);
 }
 """
 
