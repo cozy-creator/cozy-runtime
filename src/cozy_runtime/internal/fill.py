@@ -321,8 +321,7 @@ class Checkpoint:
 def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     """The checkpoint topology table the loader matches the code against."""
     return {
-        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes)
-        for row in rows
+        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes) for row in rows
     }
 
 
@@ -774,9 +773,7 @@ class StreamingFillBackend:
                 f"contract prices at {expect} B",
             )
 
-        flat = {
-            row.what: self.enqueued[row.key].view(-1).view(self.torch.uint8) for row in rows
-        }
+        flat = {row.what: self.enqueued[row.key].view(-1).view(self.torch.uint8) for row in rows}
         base: dict[str, int] = {}
         for item in plan.items():
             base.setdefault(str(item["what"]), int(item["dest_off"]))
