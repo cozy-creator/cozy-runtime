@@ -1085,6 +1085,60 @@ class Executor:
         }
 
 
+def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
+    """Put ONE reply on the seam, and MAKE IT FIT.
+
+    The observation ring's own budget is 128 KiB and one control frame is 64 KiB, so a tail
+    the emit boundary bounded correctly can still produce a reply the seam refuses. That
+    refusal used to fire HERE, outside every handler, killing the executor — and the attempt
+    lost its real terminal to an ABANDONED that named the death instead of the refusal.
+    Reproduced from job-001's shape: a body that narrates a border and then refuses at the
+    host-fit point sends 134,743 B over a 65,536 B cap.
+
+    The TAIL is the only part of a reply that can grow, so the tail is what gives way, and
+    what it gave up is a NUMBER on `observation_caps` — the same rule the ring already
+    follows. A reply that does not fit even empty ships the OUTCOME, which is the one thing
+    a coordinator cannot reconstruct from anywhere else.
+    """
+    held = len(reply.get("observations") or ())
+    rows = list(reply.get("observations") or ())
+    while True:
+        try:
+            channel.send(reply)
+            return
+        except SeamError as exc:
+            if exc.code != "frame_too_large" or not rows:
+                break
+            rows = rows[len(rows) // 2 :]
+            reply["observations"] = rows
+            reply["observation_caps"] = {
+                **(reply.get("observation_caps") or {}),
+                "dropped_for_frame": held - len(rows),
+            }
+    channel.send(
+        {
+            "reply": reply.get("reply"),
+            "ok": reply.get("ok"),
+            "code": reply.get("code"),
+            "detail": str(reply.get("detail", ""))[:512],
+            "outcome": reply.get("outcome"),
+            "quiescent": reply.get("quiescent"),
+            "env_intact": reply.get("env_intact"),
+            "poisoned": reply.get("poisoned"),
+            "metrics": reply.get("metrics"),
+            "outputs": reply.get("outputs") or [],
+            "result_ref": reply.get("result_ref"),
+            "result_schema_digest": reply.get("result_schema_digest"),
+            "oversize_result_bytes": reply.get("oversize_result_bytes"),
+            "shortfall": reply.get("shortfall"),
+            "residency": reply.get("residency") or {},
+            "adjustments": reply.get("adjustments") or [],
+            "observations": [],
+            "observation_caps": {"dropped_for_frame": held, "minimal_reply": True},
+        }
+    )
+
+
 def _read_result(spool: Path) -> dict[str, Any]:
     """The document this process just spooled, read back in-process (the warm pass's half)."""
     path = spool / RESULT_DOCUMENT
@@ -1227,7 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
                 "origin": outcome.origin,
             }
         reply["reply"] = name
-        channel.send(reply)
+        _send_reply(channel, reply)
 
 
 if __name__ == "__main__":

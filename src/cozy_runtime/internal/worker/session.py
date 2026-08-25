@@ -180,7 +180,7 @@ class Supervisor:
         # and the journal-backed bundle store. All three outlive the executor, and the
         # bundle store's receipts outlive THIS process too.
         self.boot = observe.BootRecord()
-        self.monitor = observe.SilenceMonitor(self.boot.ring)
+        self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_cpu)
         self.bundles = triage.BundleStore(self.root / "triage", self.journal)
         self.engine = AttemptEngine(
             journal=self.journal,
@@ -311,6 +311,26 @@ class Supervisor:
             if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
                 return int(parts[1]) * 1024 * 1024
         return -1
+
+    def read_device_cpu(self) -> int:
+        """CPU nanoseconds the EXECUTOR has burned, read by the parent from `/proc`.
+
+        Like RSS and the NVML per-process bytes: the child's claim about itself is one this
+        supervisor cannot check, and here it does not have to. -1 is UNREADABLE, never a
+        zero — an unreadable meter decides nothing.
+        """
+        pid = self.ledger.executor_pid
+        if not pid:
+            return -1
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+        except (OSError, IndexError):
+            return -1
+        try:
+            ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
+        except (ValueError, IndexError):
+            return -1
+        return ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
 
     def applied_posture(self) -> dict[str, Any]:
         """The deployment state the worker was in when something happened (§3.6).
@@ -1099,8 +1119,13 @@ class Supervisor:
         try:
             terminal = self.engine.execute(attempt)
         except JournalError as exc:
-            self.note("journal", f"{exc.code}: no terminal can be claimed")
+            # NEVER SILENCE. The journal cannot commit, so nothing here will replay — and a
+            # coordinator holding an accepted attempt with no terminal waits forever, which
+            # is what job-001 measured. It gets the smallest terminal this worker can make,
+            # with the reason in it, and the worker goes ERROR.
+            self.note("journal", f"{exc.code}: only a last-resort terminal can be claimed")
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.terminate(attempt, self.engine.last_resort, f"{exc.code}: {exc.detail}")
             return
         except Exception as exc:
             # A BUG in the execution path is still an attempt that must terminate. Found
@@ -1114,19 +1139,30 @@ class Supervisor:
                     attempt, f"the worker faulted while running this attempt: {exc}"
                 )
             except Exception as inner:
-                self.note("attempt", f"even ABANDONED could not be journaled: {inner}")
+                self.note("attempt", f"even ABANDONED could not be built: {inner}")
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return
         self.send(pb.WorkerMessage(attempt_terminal=terminal))
 
     def terminate(
         self, attempt: AttemptRecord, build: Callable[..., pb.AttemptTerminal], *args: Any
     ) -> None:
-        """Journal ONE terminal for a held attempt and send it, or say why it could not."""
+        """Journal ONE terminal for a held attempt and send it. A build that fails falls
+        back to the smallest terminal there is; only that failing is silence, and it is
+        journaled as a fault rather than swallowed."""
+        why = ""
         try:
             self.send(pb.WorkerMessage(attempt_terminal=build(attempt, *args)))
-        except JournalError as exc:
-            self.note("journal", f"cannot journal a terminal ({exc.code}); sending nothing")
+            return
+        except Exception as exc:
+            why = f"{type(exc).__name__}: {exc}"
+            self.note("attempt", f"the terminal could not be built ({why}); last resort")
+        try:
+            self.send(pb.WorkerMessage(attempt_terminal=self.engine.last_resort(attempt, why)))
+        except Exception as inner:
+            self.note("attempt", f"even the last-resort terminal failed: {inner}")
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
 
     def rebuild_if_needed(self) -> None:
         """The queue starts behind the rebuild because BOTH live on this lane."""
@@ -1202,10 +1238,15 @@ class Supervisor:
         transfer that advances one MiB per tick is never called wedged however slow it is,
         and one that stops is called wedged however fast it was.
         """
+        seen: dict[str, str] = {}
         while not self.stop.wait(REPORT_SECONDS):
             for subject in list(self.monitor.cursors):
-                if self.monitor.sample(subject) == "wedged":
+                verdict = self.monitor.sample(subject)
+                # ON THE EDGE, not on every tick. A 20-minute leg was printing the same
+                # sentence every two seconds, which is a flood that says nothing new.
+                if verdict == "wedged" and seen.get(subject) != verdict:
                     self.note("liveness", f"{subject} is WEDGED by silence (no clock involved)")
+                seen[subject] = verdict
             if self.connected.is_set():
                 self.send(pb.WorkerMessage(report=self.report()))
 

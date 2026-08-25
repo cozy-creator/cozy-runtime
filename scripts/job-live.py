@@ -180,11 +180,12 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def payload(dwell_ms: int = 0) -> dict[str, Any]:
+def payload(dwell_ms: int = 0, **over: Any) -> dict[str, Any]:
     return {
         "store": REF,
         "snapshots": json.loads(SNAPSHOTS.read_text()),
         "dwell_ms": dwell_ms,
+        **over,
     }
 
 
@@ -239,6 +240,7 @@ def run_job(
     trees: dict[str, str] | None = None,
     hook: Any = None,
     attempt: int = 1,
+    **over: Any,
 ) -> Any:
     """One job attempt through `internal.local.run_slice` — the SAME body the CLI wraps."""
     from cozy_runtime.internal.local import LocalRequest, run_slice
@@ -247,7 +249,7 @@ def run_job(
     record = job_record()
     request = LocalRequest(
         entrypoint="census",
-        payload=payload(dwell_ms),
+        payload=payload(dwell_ms, **over),
         outputs=("census",),
         request_id=request_id,
         attempt=attempt,
@@ -499,6 +501,27 @@ def _declare(source: str) -> str:
 
 
 def section_arms() -> None:
+    head("a refusal AFTER a full observation ring still converges on its own message")
+    # job-001's host-fit shape: a body that narrates a border and then refuses typed. The
+    # ring's budget is 128 KiB and one control frame is 64 KiB, so the reply does not fit —
+    # and the tail is what gives way, never the terminal (the executor used to die on its
+    # own narration and the attempt reported ABANDONED instead of the refusal).
+    narrated = run_job(
+        fresh("narrate"), request_id="job-narrate", narrate_rows=300, refuse_after_narration=True
+    )
+    message = str(narrated.terminal.get("safe_message", ""))
+    check(
+        "the attempt converges on the ENDPOINT's refusal, not on an executor death",
+        narrated.status == "TERMINAL_STATUS_REFUSED" and "host_unfit" in message,
+        f"{narrated.status}: {message[:110]}",
+    )
+    dropped = int((narrated.triage.get("caps") or {}).get("dropped_for_frame", 0))
+    check(
+        "the tail it could not carry is a NUMBER, not a silence",
+        dropped > 0,
+        f"dropped_for_frame={dropped}, {len(narrated.triage.get('events') or [])} rows held",
+    )
+
     head("red arms: the structural separation refuses at BUILD")
     import inspect
 
@@ -792,6 +815,25 @@ def section_identity() -> None:
         "the same RESULT BYTES land at the granted destination on both doors",
         cli_bytes == direct_bytes and bool(cli_bytes),
         f"{len(cli_bytes)} B identical",
+    )
+    # The receipt the runtime MINTS is the receipt the CLI RENDERS. It was journaled before
+    # the terminal named it and then dropped from the document, so a producer could not read
+    # its own publication from the verb that made it (job-001).
+    receipt = document.get("publication") or {}
+    check(
+        "`job --json` renders the typed publication receipt",
+        receipt.get("format") == "cozy.runtime.PublicationReceipt/1"
+        and receipt.get("mode") == "job"
+        and bool(receipt.get("outputs")),
+        f"{receipt.get('grant_id')} · {len(receipt.get('outputs') or [])} output(s) · "
+        f"{receipt.get('total_bytes')} B",
+    )
+    check(
+        "and the scope and the durable checkpoints beside it",
+        document.get("publication_scope") == receipt.get("grant_id")
+        and len(document.get("checkpoints") or []) >= 1,
+        f"scope {document.get('publication_scope')} · "
+        f"{len(document.get('checkpoints') or [])} checkpoint receipt(s)",
     )
 
 

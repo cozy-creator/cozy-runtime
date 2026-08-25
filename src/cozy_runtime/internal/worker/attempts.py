@@ -1987,6 +1987,62 @@ class AttemptEngine:
             ),
         )
 
+    def last_resort(self, attempt: AttemptRecord, why: str) -> pb.AttemptTerminal:
+        """The SMALLEST terminal this worker can make, for when the ordinary one could not.
+
+        `terminal()` builds a rich body — a reconciliation, a triage bundle, attested
+        metrics, an inline result — and every one of those can fail on its own. When one
+        does, the attempt used to end in SILENCE: the lane returned, the coordinator held an
+        accepted attempt with no terminal, and the liveness detector printed WEDGED and did
+        nothing (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
+        that has nothing left to fail on.
+
+        It is still journaled before it is sent. A journal that cannot commit it is named IN
+        the message, so a reader knows this terminal will not replay — which is strictly
+        better than a coordinator waiting on an answer that is never coming.
+        """
+        body = pb.TerminalBody(
+            request_id=attempt.request_id,
+            attempt=attempt.attempt,
+            exec_spec_digest=attempt.digest,
+            status=STATUS.TERMINAL_STATUS_ABANDONED,
+            safe_message=safe(f"terminal_construction_failed: {why}", 4096),
+            cause=pb.TerminalCause(
+                code=CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
+                origin=ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                detail=safe(f"terminal_construction_failed: {why}"),
+            ),
+        )
+        canonical_bytes, digest = documents.identity(body)
+        attempt.terminal_id = f"trm-{uuid.uuid4().hex[:24]}"
+        attempt.terminal_digest = digest
+        attempt.terminal_bytes = canonical_bytes
+        try:
+            self.journal.append(
+                "terminal",
+                {
+                    "request_id": attempt.request_id,
+                    "attempt": attempt.attempt,
+                    "session_id": self.session_id,
+                    "instance_id": self.instance_id,
+                    "exec_spec_digest": documents.spell(attempt.digest),
+                    "terminal_id": attempt.terminal_id,
+                    "terminal_digest": documents.spell(digest),
+                    "terminal_canonical_b64": base64.b64encode(canonical_bytes).decode(),
+                },
+            )
+            attempt.state = "terminal"
+        except Exception as exc:
+            self.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=f"{attempt.request_id}#{attempt.attempt}",
+                    reason="terminal_not_durable",
+                    detail=safe(f"the last-resort terminal could not be journaled: {exc}"),
+                )
+            )
+        return self.wrap(attempt)
+
     def abandon(self, attempt: AttemptRecord, why: str) -> pb.AttemptTerminal:
         """An accepted-but-incomplete attempt ALWAYS produces a terminal, never silence."""
         if attempt.spool is not None:

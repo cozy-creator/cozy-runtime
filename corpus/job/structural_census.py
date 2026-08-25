@@ -34,6 +34,7 @@ from cozy_runtime.author import (
     Scratch,
     Telemetry,
     Tree,
+    UnsupportedInput,
 )
 
 app = App()
@@ -48,6 +49,14 @@ class CensusInput(msgspec.Struct, forbid_unknown_fields=True):
     """Per-component dwell, so a `kill -9` lands reliably INSIDE the loop rather than around
     it. A harness knob, and it is a request field because fault injection belongs to the
     harness and never to a plant switch inside the runtime (decisions #249)."""
+    narrate_rows: int = 0
+    """Bounded log rows to emit before the refusal below — a BORDER's own narration. Every
+    row is inside the emit boundary's caps; the ring's budget is what fills, and the ring's
+    budget is twice one control frame's."""
+    refuse_after_narration: bool = False
+    """Refuse typed AFTER the narration — job-001's host-fit shape. The attempt must
+    converge on the endpoint's own message, not on the death of an executor whose reply did
+    not fit."""
 
 
 class CensusResult(msgspec.Struct):
@@ -130,6 +139,15 @@ def census(
         tel.progress((index + 1) / len(payload.snapshots), stage="census")
         if payload.dwell_ms:
             time.sleep(payload.dwell_ms / 1000.0)
+
+    for index in range(payload.narrate_rows):
+        tel.log(f"border[{index}] " + "x" * 150, level="info", line="y" * 380)
+    if payload.refuse_after_narration:
+        raise UnsupportedInput(
+            "host_unfit: this host cannot hold the artifact; the priced PRODUCIBLE cloud "
+            "job is the door",
+            code="unsupported_input",
+        )
 
     projection = {name: [[row["key"], row["shape"]] for row in done[name]] for name in sorted(done)}
     body = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
