@@ -103,7 +103,7 @@ class ComponentResidency:
     #: 6.77 GB eviction reconciled to plan arithmetic leaves tens of kilobytes of "leak"
     #: that is nothing but rounding. The meter that reports the class has to be the meter
     #: that explains it.
-    moved_bytes: int = 0
+    allocator_delta_bytes: int = 0
     attempt_stages: int = 0
     attempt_evictions: int = 0
     attempt_staged_ms: float = 0.0
@@ -123,7 +123,7 @@ class ComponentResidency:
         self.placement = placement
         self.headroom = headroom
         self.last_shortfall = None
-        self.moved_bytes = 0
+        self.allocator_delta_bytes = 0
         self.attempt_stages = 0
         self.attempt_evictions = 0
         self.attempt_staged_ms = 0.0
@@ -166,7 +166,7 @@ class ComponentResidency:
                 raise refusal from exc
             self.stages += 1
             self.attempt_stages += 1
-            self.moved_bytes += self._allocated() - allocated
+            self.allocator_delta_bytes += self._allocated() - allocated
             took = (time.perf_counter() - started) * 1000
             self.staged_ms += took
             self.attempt_staged_ms += took
@@ -256,7 +256,7 @@ class ComponentResidency:
         self.attempt_evictions += 1
         self.backend.evict(victim)
         self.torch.cuda.empty_cache()
-        self.moved_bytes += self._allocated() - allocated
+        self.allocator_delta_bytes += self._allocated() - allocated
         took = (time.perf_counter() - started) * 1000
         self.evicted_ms += took
         self.attempt_evicted_ms += took
@@ -320,7 +320,7 @@ class ComponentResidency:
             "attempt_evictions": self.attempt_evictions,
             "attempt_staged_ms": round(self.attempt_staged_ms, 2),
             "attempt_evicted_ms": round(self.attempt_evicted_ms, 2),
-            "moved_bytes": self.moved_bytes,
+            "allocator_delta_bytes": self.allocator_delta_bytes,
             "staged_ms": round(self.staged_ms, 2),
             "evicted_ms": round(self.evicted_ms, 2),
             "resident": {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components},

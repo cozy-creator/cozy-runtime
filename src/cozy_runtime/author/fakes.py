@@ -30,7 +30,7 @@ from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
-from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke, prepare
+from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
@@ -155,7 +155,7 @@ def invoke_with_fakes(
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
-) -> ResultEnvelope:
+) -> InvocationResult:
     """Run a handler through the REAL kernel with no GPU, no hub and no coordinator."""
     spool = _spool(request_id)
     return invoke(

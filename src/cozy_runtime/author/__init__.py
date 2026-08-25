@@ -46,8 +46,8 @@ from cozy_runtime.author._errors import (
 )
 from cozy_runtime.author._invoke import (
     Invocation,
+    InvocationResult,
     PreparedRequest,
-    ResultEnvelope,
     attempt,
     invoke,
     prepare,
@@ -146,6 +146,7 @@ __all__ = [
     "ImageFrame",
     "InvalidRequest",
     "Invocation",
+    "InvocationResult",
     "Loader",
     "Model",
     "ModelBinding",
@@ -166,7 +167,6 @@ __all__ = [
     "RequestFeatures",
     "RequestView",
     "Resources",
-    "ResultEnvelope",
     "Scheduler",
     "ScopeCall",
     "Scratch",

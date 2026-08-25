@@ -458,7 +458,7 @@ class Ledger:
 
     def observe_residency(self, residency: dict[str, Any]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
-        self.residency_delta = int(residency.get("moved_bytes", 0))
+        self.residency_delta = int(residency.get("allocator_delta_bytes", 0))
 
     def observe_probe(self, probe: dict[str, Any]) -> None:
         """The device's after-state, read through the executor that owns the context."""

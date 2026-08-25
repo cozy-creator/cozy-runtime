@@ -120,7 +120,7 @@ class Invocation:
 
 
 @dataclass(frozen=True, slots=True)
-class ResultEnvelope:
+class InvocationResult:
     """What the wire carries (worker-protocol/01). cr-003 pins the serialized shape; the
     facts this kernel is authoritative for are these."""
 
@@ -198,7 +198,7 @@ def prepare(
     )
 
 
-def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> ResultEnvelope:
+def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> InvocationResult:
     """Execute one PREPARED attempt end to end and return its envelope.
 
     `record` is built by the BOUNDARY below and passed in, so an attempt that dies before it
@@ -223,7 +223,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Resul
 
     _validate_result(surface, result, attempt)
     attempt.closed = True
-    return ResultEnvelope(
+    return InvocationResult(
         result=result,
         outputs=tuple(a.row() for a in attempt.pending.values()),
         adjustments=tuple(attempt.rows),
@@ -236,7 +236,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Resul
 
 def run_prepared(
     prepared: PreparedRequest, inv: Invocation
-) -> tuple[ResultEnvelope | None, Outcome, Attempt]:
+) -> tuple[InvocationResult | None, Outcome, Attempt]:
     """The invocation BOUNDARY: one PREPARED attempt in, one neutral terminal out, always.
 
     `invoke` raises typed refusals because author-facing code should; the boundary the
@@ -255,7 +255,7 @@ def run_prepared(
 
 def attempt(
     registration: Registration, wire: Mapping[str, object], inv: Invocation
-) -> tuple[ResultEnvelope | None, Outcome, Attempt]:
+) -> tuple[InvocationResult | None, Outcome, Attempt]:
     """PREPARE then RUN, for the doors that do both at once — a job, and the warm pass.
 
     A serving attempt prepares BEFORE the supervisor admits it, which is the whole point of
