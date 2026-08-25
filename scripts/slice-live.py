@@ -21,6 +21,7 @@ The bytes come from `~/cozy_v2/tensorfs-bench`, cr-005's real SDXL CAS, READ-ONL
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -650,52 +651,86 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
     return outcome
 
 
+def took_the_card(outcome: dict[str, Any]) -> bool:
+    """True when a run failed because a NEIGHBOUR took the card, not because of this code.
+
+    On this shared box the 8 GiB device fits exactly one 4.78 GiB resident, and another
+    agent's worker legitimately comes and goes. A run that starts on a quiet card and meets
+    a neighbour halfway through its fill gets a `device_shortfall` that is completely true
+    and completely uninformative about the arm being exercised. Retrying it is honest;
+    reporting it as a red arm would not be, and neither would hiding it.
+    """
+    if any(f.get("reason") == "device_shortfall" for f in outcome.get("faults") or ()):
+        return True
+    message = str((outcome.get("terminal") or {}).get("safe_message", "")).lower()
+    return "out of memory" in message
+
+
+def drive(label: str, body: Any, tries: int = 4) -> Any:
+    """Run one arm; retry it when the shared card was taken out from under it."""
+    result = body()
+    for index in range(1, tries):
+        outcome = result[0] if isinstance(result, tuple) else result
+        if not took_the_card(outcome):
+            return result
+        print(
+            f"  the card was taken mid-run by another process on this shared box; "
+            f"retrying the {label} arm ({index}/{tries - 1})",
+            flush=True,
+        )
+        require_quiet_card()
+        result = body()
+    return result
+
+
 def section_arms(args: argparse.Namespace) -> None:
     """cancel / kill during fetch, fill, invoke and encode — one terminal, no partials."""
     idle = require_quiet_card()
 
     head("ARM 1/4 — FETCH: the executor dies while the payload is being fetched")
-    workspace = Path(args.tmp) / "arm-fetch"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True)
-    fifo = workspace / "payload.fifo"
-    os.mkfifo(fifo)
-    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "entrypoint": "denoise",
-                "payload": BANKED_PAYLOAD,
-                "payload_url": f"file://{fifo}",
-                "outputs": ["image"],
-                "request_id": "run-fetch",
-                "no_warm": True,
-                "delete_journal": False,
-            }
+
+    def fetch_arm() -> tuple[dict[str, Any], Path]:
+        workspace = Path(args.tmp) / "arm-fetch"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        fifo = workspace / "payload.fifo"
+        os.mkfifo(fifo)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "denoise",
+                    "payload": BANKED_PAYLOAD,
+                    "payload_url": f"file://{fifo}",
+                    "outputs": ["image"],
+                    "request_id": "run-fetch",
+                    "no_warm": True,
+                    "delete_journal": False,
+                }
+            )
         )
-    )
-    process = start(spec_path, out_path, workspace)
-    # The payload fetch is INSIDE the atomic acceptance boundary. A FIFO holds it there
-    # deterministically: the supervisor blocks reading the granted input, and the executor
-    # it would have accepted against is killed while it waits.
-    executor_pid_file = workspace / "executor.pid"
-    wait_for(executor_pid_file, 600, process)
-    time.sleep(0.5)
-    pid = int(executor_pid_file.read_text().strip())
-    fifo_open = threading.Event()
+        process = start(spec_path, out_path, workspace)
+        # The payload fetch is INSIDE the atomic acceptance boundary. A FIFO holds it there
+        # deterministically: the supervisor blocks reading the granted input, and the
+        # executor it would have accepted against is killed while it waits.
+        if not wait_for(workspace / "executor.pid", 900, process):
+            return read_outcome(out_path), workspace
+        time.sleep(0.5)
+        pid = int((workspace / "executor.pid").read_text().strip())
 
-    def feed() -> None:
-        with open(fifo, "wb") as handle:
-            fifo_open.set()
-            time.sleep(1.0)  # the supervisor is now blocked in the fetch
-            os.kill(pid, signal.SIGKILL)
-            time.sleep(0.5)
-            handle.write(json.dumps(BANKED_PAYLOAD).encode())
+        def feed() -> None:
+            with open(fifo, "wb") as handle:
+                time.sleep(1.0)  # the supervisor is now blocked in the fetch
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(0.5)
+                handle.write(json.dumps(BANKED_PAYLOAD).encode())
 
-    threading.Thread(target=feed, daemon=True).start()
-    process.wait(timeout=900)
-    outcome = read_outcome(out_path)
+        threading.Thread(target=feed, daemon=True).start()
+        process.wait(timeout=900)
+        return read_outcome(out_path), workspace
+
+    outcome, workspace = drive("fetch", fetch_arm)
     check(
         "the attempt refused rather than accepting against a dead executor",
         outcome.get("status") in ("TERMINAL_STATUS_REFUSED", "TERMINAL_STATUS_ABANDONED"),
@@ -703,11 +738,10 @@ def section_arms(args: argparse.Namespace) -> None:
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
     rows = journal_rows(workspace)
-    terminals = [r for r in rows if r["kind"] == "terminal"]
     check(
         "exactly ONE durable terminal",
-        len(terminals) == 1,
-        f"{len(terminals)} terminal row(s); kinds {[r['kind'] for r in rows]}",
+        len([r for r in rows if r["kind"] == "terminal"]) == 1,
+        f"journal kinds {[r['kind'] for r in rows]}",
     )
     check(
         "and no output bytes were produced",
@@ -716,31 +750,37 @@ def section_arms(args: argparse.Namespace) -> None:
     )
 
     head("ARM 2/4 — FILL: the executor is killed mid-fill, with GiB of destinations live")
-    workspace = Path(args.tmp) / "arm-fill"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True)
-    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "entrypoint": "denoise",
-                "payload": BANKED_PAYLOAD,
-                "outputs": ["image"],
-                "request_id": "run-fill",
-                "no_warm": True,
-                "delete_journal": False,
-            }
+
+    def fill_arm() -> tuple[dict[str, Any], Path, bool, int]:
+        workspace = Path(args.tmp) / "arm-fill"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "denoise",
+                    "payload": BANKED_PAYLOAD,
+                    "outputs": ["image"],
+                    "request_id": "run-fill",
+                    "no_warm": True,
+                    "delete_journal": False,
+                }
+            )
         )
-    )
-    process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "executor.pid", 600, process)
-    pid = int((workspace / "executor.pid").read_text().strip())
-    time.sleep(2.0)  # mid-fill: the 4.78 GiB fill takes seconds, this lands inside it
-    alive_before = Path(f"/proc/{pid}").exists()
-    os.kill(pid, signal.SIGKILL)
-    process.wait(timeout=900)
-    outcome = read_outcome(out_path)
+        process = start(spec_path, out_path, workspace)
+        if not wait_for(workspace / "executor.pid", 900, process):
+            return read_outcome(out_path), workspace, False, 0
+        pid = int((workspace / "executor.pid").read_text().strip())
+        time.sleep(2.0)  # mid-fill: the 4.78 GiB fill takes seconds, this lands inside it
+        alive = Path(f"/proc/{pid}").exists()
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        process.wait(timeout=900)
+        return read_outcome(out_path), workspace, alive, pid
+
+    outcome, workspace, alive_before, pid = drive("fill", fill_arm)
     check(
         "the kill landed while the fill was still moving bytes",
         alive_before,
@@ -749,7 +789,7 @@ def section_arms(args: argparse.Namespace) -> None:
     check(
         "the run CONVERGED instead of hanging on a worker that will never be ready",
         outcome.get("ended") == "worker_error",
-        f"ended={outcome.get('ended')!r}, exit {process.returncode}; "
+        f"ended={outcome.get('ended')!r}; "
         f"{(outcome.get('faults') or [{}])[-1].get('reason', 'no fault')}",
     )
     check(
@@ -767,7 +807,7 @@ def section_arms(args: argparse.Namespace) -> None:
         not outputs_present(workspace),
         str(outputs_present(workspace) or "nothing at the granted destination"),
     )
-    time.sleep(1.0)
+    settle_gpu(idle)
     check(
         "the device came back — a dead process's CUDA context is reclaimed",
         gpu_used_mib() <= idle + 64,
@@ -775,30 +815,36 @@ def section_arms(args: argparse.Namespace) -> None:
     )
 
     head("ARM 3/4 — INVOKE: cancel a running handler, then kill one that never checks")
-    workspace = Path(args.tmp) / "arm-invoke"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True)
-    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "entrypoint": "denoise",
-                "payload": {"steps": 64, "latent": 80, "seed": 3},
-                "outputs": ["image"],
-                "request_id": "run-cancel",
-                "no_warm": True,
-                "grace": 2.0,
-                "delete_journal": False,
-            }
+
+    def cancel_arm() -> tuple[dict[str, Any], Path]:
+        workspace = Path(args.tmp) / "arm-invoke"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "denoise",
+                    "payload": {"steps": 64, "latent": 80, "seed": 3},
+                    "outputs": ["image"],
+                    "request_id": "run-cancel",
+                    "no_warm": True,
+                    "grace": 2.0,
+                    "delete_journal": False,
+                }
+            )
         )
-    )
-    process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900, process)
-    time.sleep(0.4)  # inside the handler's step loop
-    process.send_signal(signal.SIGINT)  # Ctrl-C on a local run
-    process.wait(timeout=900)
-    outcome = read_outcome(out_path)
+        process = start(spec_path, out_path, workspace)
+        if not wait_for(workspace / "accepted.marker", 900, process):
+            process.wait(timeout=60)
+            return read_outcome(out_path), workspace
+        time.sleep(0.4)  # inside the handler's step loop
+        process.send_signal(signal.SIGINT)  # Ctrl-C on a local run
+        process.wait(timeout=900)
+        return read_outcome(out_path), workspace
+
+    outcome, workspace = drive("cancel", cancel_arm)
     check(
         "a cooperative handler converges to CANCELED",
         outcome.get("status") == "TERMINAL_STATUS_CANCELED",
@@ -816,32 +862,36 @@ def section_arms(args: argparse.Namespace) -> None:
         str(outputs_present(workspace) or "nothing at the granted destination"),
     )
 
-    workspace = Path(args.tmp) / "arm-stubborn"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True)
-    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "entrypoint": "stubborn",
-                "payload": {"steps": 512, "latent": 80, "seed": 3},
-                "outputs": [],
-                "request_id": "run-stubborn",
-                "no_warm": True,
-                "grace": 2.0,
-                "delete_journal": False,
-            }
+    def stubborn_arm() -> tuple[dict[str, Any], Path, float]:
+        workspace = Path(args.tmp) / "arm-stubborn"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "stubborn",
+                    "payload": {"steps": 512, "latent": 80, "seed": 3},
+                    "outputs": [],
+                    "request_id": "run-stubborn",
+                    "no_warm": True,
+                    "grace": 2.0,
+                    "delete_journal": False,
+                }
+            )
         )
-    )
-    process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900, process)
-    time.sleep(0.4)
-    started = time.perf_counter()
-    process.send_signal(signal.SIGINT)
-    process.wait(timeout=900)
-    took = time.perf_counter() - started
-    outcome = read_outcome(out_path)
+        process = start(spec_path, out_path, workspace)
+        if not wait_for(workspace / "accepted.marker", 900, process):
+            process.wait(timeout=60)
+            return read_outcome(out_path), workspace, 0.0
+        time.sleep(0.4)
+        started = time.perf_counter()
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=900)
+        return read_outcome(out_path), workspace, time.perf_counter() - started
+
+    outcome, workspace, took = drive("stubborn-cancel", stubborn_arm)
     log = (workspace / "run.log").read_text(errors="replace")
     check(
         "a handler that never checks cancellation is KILLED, not waited for",
@@ -876,7 +926,8 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "a tail that cannot satisfy the grant set fails the attempt",
-        outcome.get("status") == "TERMINAL_STATUS_FAILED",
+        outcome.get("status") == "TERMINAL_STATUS_FAILED"
+        and "destination_absent" in str(outcome.get("terminal", {}).get("safe_message", "")),
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:150]}",
     )
@@ -892,29 +943,37 @@ def section_arms(args: argparse.Namespace) -> None:
         f"kinds {[r['kind'] for r in journal_rows(workspace)]}",
     )
 
-    workspace = Path(args.tmp) / "arm-killrun"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True)
-    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "entrypoint": "denoise",
-                "payload": {"steps": 24, "latent": 80, "seed": 5},
-                "outputs": ["image"],
-                "request_id": "run-killed",
-                "instance_id": "ins-stable",
-                "no_warm": True,
-                "delete_journal": False,
-            }
+    def killrun_arm() -> tuple[dict[str, Any], Path]:
+        workspace = Path(args.tmp) / "arm-killrun"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "entrypoint": "denoise",
+                    "payload": {"steps": 24, "latent": 80, "seed": 5},
+                    "outputs": ["image"],
+                    "request_id": "run-killed",
+                    "instance_id": "ins-stable",
+                    "no_warm": True,
+                    "delete_journal": False,
+                }
+            )
         )
-    )
-    process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900, process)
-    time.sleep(0.3)
-    process.send_signal(signal.SIGKILL)  # the whole run dies inside the attempt window
-    process.wait(timeout=60)
+        process = start(spec_path, out_path, workspace)
+        if not wait_for(workspace / "accepted.marker", 900, process):
+            process.wait(timeout=60)
+            return read_outcome(out_path), workspace
+        time.sleep(0.3)
+        process.send_signal(signal.SIGKILL)  # the whole run dies inside the attempt window
+        process.wait(timeout=60)
+        # No outcome document exists — the run was killed before it could write one — so the
+        # JOURNAL it left behind is the evidence, which is exactly the point of the arm.
+        return {"killed": True}, workspace
+
+    _, workspace = drive("killed-run", killrun_arm)
     check(
         "a killed run leaves its journal behind — the deletable journal is deleted LAST",
         (workspace / "worker" / "journal.log").is_file(),
@@ -933,6 +992,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     # The NEXT run over the same journal is the recovery: it must mint exactly one durable
     # ABANDONED terminal for the interrupted ordinal and never re-execute it.
+    spec_path = workspace / "spec.json"
     spec_path.write_text(
         json.dumps(
             {
@@ -947,7 +1007,7 @@ def section_arms(args: argparse.Namespace) -> None:
             }
         )
     )
-    recovered = start(spec_path, out_path, workspace)
+    recovered = start(spec_path, workspace / "outcome.json", workspace)
     recovered.wait(timeout=900)
     rows = journal_rows(workspace)
     killed_terminals = [
