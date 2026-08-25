@@ -149,6 +149,21 @@ def peak_rss() -> int:
     return 0
 
 
+def written_bytes() -> int:
+    """The weight-materialization write counter, at the only boundary that cannot lie.
+
+    §3.2 requires the PyTorch serve tier's `write_bytes == 0` to be proven by a counter on
+    the write surface, not by assertion-of-absence. The kernel keeps exactly that counter:
+    `/proc/self/io write_bytes` is bytes this process actually sent to storage. A fill that
+    materialized a file anywhere — a cache, a temp decode, a "harmless" spill — moves it.
+    """
+    with open("/proc/self/io") as io:
+        for line in io:
+            if line.startswith("write_bytes:"):
+                return int(line.split()[1])
+    return -1
+
+
 def plan_keys() -> list[str]:
     """Header order — the same order tfs-018's arms hashed their sample in."""
     return [row.key for row in read_plan(PLAN, COMPONENT)]
@@ -273,13 +288,13 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
     backend = backend_for(art, torch, window_bytes=args.window, slots=args.slots,
                           readers=args.readers, verify=args.verify)
     backend.expect({d.component: d.keys for d in derived.contract.destination_sets})
+    written_before = written_bytes()
     with DevicePeak(torch) as peak:
         started = time.perf_counter()
         served = derive_contract(art, mode="serve", backend=backend,
                                  substrate_device=backend.device_str)
         elapsed = time.perf_counter() - started
-    filled_bytes = served.observations and None  # observations unused here
-    del filled_bytes
+    written = written_bytes() - written_before
 
     fill_s = backend.stats["fill_ms"] / 1000
     gbps = total_bytes / fill_s / 1e9
@@ -296,6 +311,9 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
     check("zero rehashes on a verified store", backend.store.rehashes == 0,
           f"{backend.store.verifies} record hits, "
           f"{backend.store.verify_ns / 1e6:.1f} ms of verification")
+    check("serve-tier write_bytes == 0, by COUNTER", written == 0,
+          f"the kernel charged this process {written} B of storage writes across the whole "
+          f"fill (/proc/self/io write_bytes) — measured, never asserted-by-absence")
 
     head("derive == serve, on the real byte path")
     other = canonical.write(served.contract.render())
@@ -352,7 +370,8 @@ def section_fill(args: argparse.Namespace) -> dict[str, Any]:
         "peak_vram_gib": round(peak.peak / 2**30, 3),
         "torch_peak_vram_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
         "peak_rss": peak_rss(), "peak_rss_gib": round(peak_rss() / 2**30, 3),
-        "digest": digest, "ledger": backend.ledger.rows(), **backend.store.stats(),
+        "digest": digest, "written_bytes": written,
+        "ledger": backend.ledger.rows(), **backend.store.stats(),
         **backend.stats,
     }
 
