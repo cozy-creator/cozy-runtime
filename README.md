@@ -30,17 +30,22 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 `internal/spawn.py` executes the seal (ERASE -> IMPOSE -> SEAL) around it.
 `internal/exits.py` is the one shared exit-code matrix.
 
-## The two processes
+## The two processes, and the two coordinators
 
-    coordinator ──gRPC cozy.worker.v1──▶ supervisor (no CUDA) ──seam──▶ executor (CUDA)
+    a real coordinator ──gRPC───┐
+                                ├──▶ supervisor (no CUDA) ──seam──▶ executor (CUDA)
+    an in-memory coordinator ───┘        cozy.worker.v1, either way
 
 | module | role |
 |---|---|
 | `internal/worker/session.py` | the protocol client and the supervisor entrypoint |
-| `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, warm pass |
-| `internal/worker/plan.py` | host/pinned ledger, PlanChooser, ExecutorPreparer |
+| `internal/worker/control.py` | the transport seam: `Link`/`Coordinator`, gRPC and in-memory |
+| `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
+| `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
+| `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
+| `internal/local.py` | the ephemeral local supervisor: one request, no network |
 | `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
 | `internal/seam.py` | the control-only, byte-accounted supervisor<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
@@ -49,6 +54,20 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 The supervisor never imports torch, and that is proved against the RUNNING process
 (`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
 list), not against the import graph.
+
+**One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
+ephemeral local supervisor whose coordinator is a pair of in-process queues, over the same
+process boundary, journal, acceptance boundary, freeze point and ledger. The rule is
+structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
+exactly one caller (the device executor) and the attempt engine exactly one constructor (the
+supervisor session), so a direct-call runner beside them cannot be written without turning
+CI red.
+
+**The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
+supervisor's own bookkeeping, `measured` for a named device or kernel interface,
+`unreadable` for a class this worker genuinely cannot read — never a zero standing in for
+one) and the METHOD that produced it. Every attempt closes by reconciling every class
+against the line taken before its envelope was granted, and the record is journaled.
 
 ## The descriptor
 
@@ -82,6 +101,13 @@ fresh endpoint is `--check`-clean out of the box.
     uv run python scripts/conformance.py # every descriptor-declared fact has a live writer
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
+
+Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
+real CAS, so they are BUILDER-RUN and never CI steps):
+
+    corpus/.venv/bin/python scripts/fill-real.py serve   # cr-005: the fill plane
+    corpus/.venv/bin/python scripts/worker-live.py all   # cr-007: the two-process worker
+    corpus/.venv/bin/python scripts/slice-live.py all    # cr-008a: one request, no network
 
 Two real endpoints on the author surface (weightless, no GPU), both driven end to end by
 `scripts/verify.py`:

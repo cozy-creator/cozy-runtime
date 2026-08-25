@@ -33,7 +33,7 @@ STATIC_ARMS = (
     Arm("package-imports", SRC / "author" / "_app.py", "import cozy_runtime.internal.config\n"),
     Arm("package-imports", SRC / "internal" / "config.py", "from cozy_runtime.cli import io\n"),
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
-    Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub"]'),
+    Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
@@ -815,7 +815,13 @@ def run_static(arm: Arm) -> str:
     original = arm.path.read_text()
     try:
         if arm.path.name == "pyproject.toml":
-            planted = original.replace('dependencies = ["msgspec>=0.19"]', arm.plant, 1)
+            # Plant into the FIRST dependency list, whatever it currently holds. The old
+            # plant matched one exact literal, so the day cr-007 added protobuf and grpcio
+            # it silently became a no-op and the arm read green while proving nothing —
+            # which is the failure mode this whole script exists to prevent.
+            planted = original.replace("dependencies = [", arm.plant, 1)
+            if planted == original:
+                return "NOT PROVEN — the pyproject plant matched nothing to replace"
         else:
             planted = original + "\n" + arm.plant
         arm.path.write_text(planted)
