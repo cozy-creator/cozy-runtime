@@ -41,6 +41,27 @@ GRACE_SECONDS = 3.0
 DIAL_SECONDS = 60.0
 
 
+#: `sockaddr_un.sun_path` is 108 bytes on Linux, NUL included. A COZY_HOME deep enough to
+#: pass it makes the executor's control socket unbindable, and the only symptom was a worker
+#: that exited before advertising a plan (cl-013). The cause is measurable here, so it is
+#: named here.
+SUN_PATH_MAX = 108
+
+
+def socket_path_refusal(path: str) -> str:
+    """Why this control socket cannot exist, or "" when it can."""
+    encoded = len(path.encode()) + 1
+    if encoded <= SUN_PATH_MAX:
+        return ""
+    return (
+        f"executor_socket_unbindable: the supervisor/executor control socket would be "
+        f"{path!r}, which is {encoded} B including its terminator and the kernel's "
+        f"`sockaddr_un.sun_path` holds {SUN_PATH_MAX} B. Nothing can bind it, so no executor "
+        f"can ever dial back. Point COZY_HOME (or `serve --out`) at a shorter directory: "
+        f"{encoded - SUN_PATH_MAX} B shorter is enough"
+    )
+
+
 class ExecutorGone(Exception):
     """The executor died. Always a fact about the incarnation, never about the attempt."""
 
@@ -206,6 +227,9 @@ class ExecutorSupervision:
         """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
         has no state, so every incarnation bump implies a readiness bump."""
         if self._listener is None:
+            refusal = socket_path_refusal(self.socket_path)
+            if refusal:
+                raise ExecutorGone(refusal)
             Path(self.socket_path).unlink(missing_ok=True)
             self._listener = listener(self.socket_path)
         if self.spawns:

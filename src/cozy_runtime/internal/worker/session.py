@@ -54,7 +54,12 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
 )
-from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
+from cozy_runtime.internal.worker.child import (
+    GRACE_SECONDS,
+    ExecutorGone,
+    ExecutorSupervision,
+    socket_path_refusal,
+)
 from cozy_runtime.internal.worker.control import Coordinator, GrpcCoordinator, Link, LinkError
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.plan import (
@@ -1392,6 +1397,26 @@ class Supervisor:
             link.cancel()
             self.journal.close()
             return int(Exit.internal)
+        # A path the kernel cannot bind is a POD SHAPE claim, like the disk one above, and
+        # it is knowable before anything is spawned. Saying so here is the difference
+        # between a named cause at `serve` and a worker that exits before advertising a
+        # plan (cl-013).
+        unbindable = socket_path_refusal(self.supervision.socket_path)
+        if unbindable:
+            failure = self.boot_failure(
+                pb.BootFailureReason.BOOT_FAILURE_REASON_CONFIG_INVALID, unbindable
+            )
+            self.note("boot", f"BOOT FAILURE (config): {unbindable}")
+            link = self.link = self.coordinator.link()
+            with contextlib.suppress(LinkError):
+                link.control(self.outbound_iterator())
+                self.send(pb.WorkerMessage(boot_failure=failure))
+                time.sleep(0.1)
+            self.stop.set()
+            self.outbound.put(None)
+            link.cancel()
+            self.journal.close()
+            return int(Exit.structural)
         killed = self.supervision.sweep_orphans()
         if killed:
             self.note(
