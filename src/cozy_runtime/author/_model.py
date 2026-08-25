@@ -21,6 +21,7 @@ import functools
 import inspect
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -665,11 +666,17 @@ class ModelRegistry:
     """
 
     def __init__(
-        self, *, release: str, backend: Backend | None = None, device: Device | None = None
+        self,
+        *,
+        release: str,
+        backend: Backend | None = None,
+        device: Device | None = None,
+        substrate: Callable[[], AbstractContextManager[object]] | None = None,
     ) -> None:
         self._release = release
         self._backend = backend
         self._device = device or Device()
+        self._substrate = substrate
         self._generations: dict[ConstructionIdentity, Generation] = {}
         self._by_path: dict[str, Generation] = {}
         self._lock = threading.RLock()
@@ -742,8 +749,17 @@ class ModelRegistry:
         loader = self._loader(model, artifact, mode)
         object.__setattr__(model, "_cozy_loading", True)
         try:
-            with loading(loader):
-                model.load(loader)
+            with ExitStack() as stack:
+                # SERVE CONSTRUCTS WEIGHTLESS TOO. `__init__` allocates shapes and dtypes,
+                # never values (§1.1), so a serving construction has no more reason to
+                # allocate 5 GB of initialized garbage than a derivation does — the fill
+                # plane reserves the real destinations (cr-005) and the two graphs stay
+                # byte-identical because there is one substrate and one census. Absent a
+                # substrate this is exactly the old behaviour: an ordinary construction.
+                if self._substrate is not None:
+                    stack.enter_context(self._substrate())
+                with loading(loader):
+                    model.load(loader)
             records = loader.records()
             if not records:
                 raise ConformanceError(

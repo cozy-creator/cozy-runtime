@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -540,8 +540,14 @@ def descriptor_sections() -> None:
     head("weights are never loaded — proven by a backend that refuses to be called")
 
     class Refusing(Backend):
+        def materialize(self, obj: object, walked: Any) -> Mapping[str, Any]:
+            raise AssertionError("describe reached a reservation — nothing may be placed")
+
         def fill(self, key: str, spec: object, destination: object) -> None:
             raise AssertionError("describe reached a fill — weights must never load")
+
+        def commit(self) -> None:
+            raise AssertionError("describe reached a commit — no generation exists here")
 
         def rollback(self, keys: Sequence[str]) -> None:
             raise AssertionError("describe reached a rollback — nothing was ever filled")

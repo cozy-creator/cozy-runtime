@@ -194,6 +194,19 @@ class Config:
     def as_bool(self, name: str, default: bool | None = None) -> bool:
         return self._scalar(name, bool, default)
 
+    def mapping(self) -> dict[str, object]:
+        """The whole section as a plain, canonically ordered COPY.
+
+        The typed accessors are the door for the author's own code; this one is the door
+        for the third-party constructor an endpoint brings as a dependency, every one of
+        which takes `**config` (`from_config`, `from_dict`, a dataclass). Handing it back
+        field by field would mean restating a forty-field upstream schema in the endpoint,
+        which is the declaration surface §1.1 deletes. It carries no new authority: a
+        source carrier was already refused at construction, and the result is a copy, so
+        this is still read-only configuration and never a path.
+        """
+        return cast("dict[str, object]", _canonical(self._data))
+
     def typed(self, schema: type[S]) -> S:
         """The author's own strict schema over this section — the fully typed door."""
         try:
@@ -263,10 +276,21 @@ class Artifact:
 
 
 class Backend(Protocol):
-    """The ONE fill path (§1.1). cr-005 replaces the body with the TensorFS stream; the
-    endpoint cannot observe which backend served it — that is the backend-blindness fence."""
+    """The ONE fill path (§1.1). cr-005 supplies the TensorFS stream behind it; the
+    endpoint cannot observe which backend served it — that is the backend-blindness fence.
+
+    Three calls, one transaction: `materialize` reserves the destinations the census just
+    agreed on, `fill` validates and claims each one, and `commit` moves the bytes and
+    fences the copies. `fill` is deliberately NOT the thing that moves bytes — a plane
+    that copies inside the walk cannot refuse a late destination without a partial
+    generation to undo.
+    """
+
+    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]: ...
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None: ...
+
+    def commit(self) -> None: ...
 
     def rollback(self, keys: Sequence[str]) -> None: ...
 
@@ -275,12 +299,18 @@ class Backend(Protocol):
 class _NullBackend:
     """Derive mode's backend: walk and match run, nothing is allocated or filled."""
 
+    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+        return walked.live
+
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
         raise CapabilityError(
             "derive mode allocates nothing: construction walks and matches under fake "
             "tensors, and fills only under serve (§1.1)",
             code="derive_fill",
         )
+
+    def commit(self) -> None:
+        return None
 
     def rollback(self, keys: Sequence[str]) -> None:
         return None
@@ -503,7 +533,7 @@ class Loader:
         walked = census(obj)
         destinations = walked.destinations
         extras = self._match(destinations, identity)
-        filled, filled_bytes = self._fill(walked)
+        filled, filled_bytes = self._fill(walked, obj)
         record = ConstructionRecord(
             factory_identity=identity,
             config_digest=self._artifact.config.digest(),
@@ -621,17 +651,25 @@ class Loader:
             )
         return tuple(extras)
 
-    def _fill(self, walked: Census) -> tuple[int, int]:
-        """The SINGLE fill path. Failure rolls the whole construction back (§1.1)."""
+    def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
+        """The SINGLE fill path. Failure rolls the whole construction back (§1.1).
+
+        The destinations filled are the ones `materialize` reserved, re-censused — never
+        the meta placeholders the walk agreed on. That is the seam where placement enters:
+        the construction names shapes and dtypes, and the runtime alone decides where they
+        live, so this loop can be identical under every backend.
+        """
         if self._mode == "derive":
             return 0, 0
         done: list[str] = []
         total = 0
         try:
+            live = self._backend.materialize(obj, walked)
             for d in walked.destinations:
-                self._backend.fill(d.key, self._artifact.topology[d.key], walked.live[d.key])
+                self._backend.fill(d.key, self._artifact.topology[d.key], live[d.key])
                 done.append(d.key)
                 total += self._artifact.topology[d.key].nbytes
+            self._backend.commit()
         except Exception:
             self._backend.rollback(done)
             raise

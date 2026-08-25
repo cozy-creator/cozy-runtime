@@ -134,9 +134,16 @@ class CountingBackend:
 
     def __init__(self) -> None:
         self.filled: list[str] = []
+        self.committed = False
+
+    def materialize(self, obj: Any, walked: Any) -> Any:
+        return walked.live
 
     def fill(self, key: str, spec: Any, destination: Any) -> None:
         self.filled.append(key)
+
+    def commit(self) -> None:
+        self.committed = True
 
     def rollback(self, keys: Sequence[str]) -> None:
         self.filled.clear()

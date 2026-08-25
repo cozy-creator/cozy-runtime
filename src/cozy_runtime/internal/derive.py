@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -315,6 +316,28 @@ class Observations:
     holds: list[object] = field(default_factory=list)
 
 
+_PLACEMENT = threading.local()
+
+
+@contextmanager
+def placing() -> Iterator[None]:
+    """The RUNTIME is placing bytes — the guard steps aside for exactly this window.
+
+    The guard refuses a device pin because placement is platform policy derived from
+    measurement (§1), and the fill plane IS that policy: cr-005 reserves ordinary CUDA
+    destinations, stages through pinned host memory and copies on its own stream, all of
+    which are device-naming operations by definition. So the fence is on WHO, not on what:
+    author code cannot reach this context manager (it lives under `internal/`, outside the
+    author surface), and every allocation inside it is ledgered rather than stray.
+    """
+    prior = getattr(_PLACEMENT, "on", False)
+    _PLACEMENT.on = True
+    try:
+        yield
+    finally:
+        _PLACEMENT.on = prior
+
+
 def _guard_mode(seen: Observations) -> Any:
     torch = torch_module()
 
@@ -326,6 +349,8 @@ def _guard_mode(seen: Observations) -> Any:
             args: tuple[object, ...] = (),
             kwargs: Mapping[str, object] | None = None,
         ) -> object:
+            if getattr(_PLACEMENT, "on", False):
+                return func(*args, **(kwargs or {}))
             name = getattr(func, "__name__", "")
             if name in _MOVE:
                 raise ConstructionFault(
@@ -499,15 +524,21 @@ def component_members(built: Sequence[object]) -> list[tuple[str, object]]:
 
 
 def walk(
-    components: Sequence[tuple[str, object]], strays: list[str] | None = None
+    components: Sequence[tuple[str, object]],
+    strays: list[str] | None = None,
+    substrate: str = "meta",
 ) -> RichCensus:
     """Census the component roots.
 
     SUBSTRATE-AGNOSTIC on purpose: the corpus runs this same function over a real CPU
     construction to hunt a silent wrong derivation, which only works if the walk cannot
-    tell the two apart. `strays` is the one substrate-aware output — pass a list under the
-    meta substrate to collect every tensor that landed somewhere else, and `None` when
-    censusing a real construction, where landing on CPU is the whole idea.
+    tell the two apart. `strays` is the one substrate-aware output — pass a list to
+    collect every tensor that is not on `substrate`, and `None` when censusing a real
+    construction where landing anywhere is the whole idea.
+
+    `substrate` is what lets the SERVE side use the same arm the derive side does: under
+    derivation every tensor must be on meta, and after a fill every tensor must be on the
+    device the fill plane placed it on. Same question, same code, two answers.
     """
     torch = torch_module()
     logical: list[LogicalTensor] = []
@@ -527,7 +558,7 @@ def walk(
             key = f"{name}.{local}"
             leaf = classes.get(local.rpartition(".")[0], type(member).__name__)
             kind = "parameter" if isinstance(tensor, torch.nn.Parameter) else "buffer"
-            if strays is not None and str(tensor.device) != "meta":
+            if strays is not None and str(tensor.device) != substrate:
                 strays.append(f"{key} on {tensor.device}")
             if kind == "buffer" and local in skip:
                 derived.append(
@@ -644,6 +675,7 @@ def derive(
     timestep_plans: Mapping[str, str] | None = None,
     mode: str = "derive",
     backend: Any = None,
+    substrate_device: str = "meta",
 ) -> Derivation:
     """Execute `model.load(loader)` on the meta substrate and derive its exact contract.
 
@@ -654,7 +686,7 @@ def derive(
     bytes are moved into destinations the census has already agreed on.
     """
     torch = torch_module()
-    if torch.cuda.is_initialized():
+    if mode == "derive" and torch.cuda.is_initialized():
         raise HarnessGap(
             "cuda_context",
             "a CUDA context existed before derivation — the harness runs with no GPU, and a "
@@ -678,11 +710,11 @@ def derive(
 
     shallow = [census(obj) for obj in built]
     strays: list[str] = []
-    rich = walk(component_members(built), strays)
+    rich = walk(component_members(built), strays, substrate_device)
     if strays:
         raise ConstructionFault(
             "CPU-stray tensor",
-            f"{len(strays)} destination(s) were constructed off the meta substrate: "
+            f"{len(strays)} destination(s) are not on the {substrate_device!r} substrate: "
             f"{', '.join(strays[:4])}. Every tensor lives where the runtime places it; one "
             "that names its own device serves from there forever and the ledger never "
             "learns it exists",

@@ -12,11 +12,11 @@ cr-008b the component-staging plan, behind this same call.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from cozy_runtime.author import TensorSpec
-from cozy_runtime.author._loader import TensorLike
+from cozy_runtime.author._loader import Census, TensorLike
 
 
 @dataclass(slots=True)
@@ -36,11 +36,20 @@ class _RecordingBackend:
     def filled_bytes(self) -> int:
         return sum(e.nbytes for e in self.events)
 
+    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+        """These stand-ins place nothing: the destinations the census walked are already
+        the destinations they write through."""
+        return walked.live
+
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
         write = getattr(destination, "fill_", None)
         if callable(write):
             write(spec.nbytes)
         self.events.append(FillEvent(key, spec.nbytes, self.route))
+
+    def commit(self) -> None:
+        """No device copies to fence — the freeze point is cr-005's `StreamingFillBackend`."""
+        return None
 
     def rollback(self, keys: Sequence[str]) -> None:
         """Construction is TRANSACTIONAL: a failure rolls fills back as a unit (§1.1)."""

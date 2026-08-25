@@ -63,6 +63,10 @@ warn_unused_ignores = false
 [project.optional-dependencies]
 # The derivation harness and the serving executor. Corpus venvs install this.
 derive = ["torch>=2.6"]
+# `corpus/sdxl_real.py` is a real ENDPOINT: the model architecture is its dependency, not
+# the runtime's (§1.1 — cozy-runtime defines none). Pinned here only so cr-005's real fill
+# run reproduces; nothing under `src/` may import it.
+corpus = ["torch>=2.6", "diffusers>=0.36"]
 
 [tool.ruff]
 line-length = 100
