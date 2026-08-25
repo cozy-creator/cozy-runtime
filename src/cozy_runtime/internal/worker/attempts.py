@@ -35,6 +35,7 @@ from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any, cast
 
+from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import canonical, egress, seam
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -791,10 +792,18 @@ class AttemptEngine:
                     reason="ledger_unreconciled",
                     detail=safe(
                         "the attempt reached a terminal without returning every class to "
-                        "its opening value: " + "; ".join(record["leaks"])
+                        "its opening value, beyond the residency transition it declared: "
+                        + "; ".join(record["leaks"])
                     ),
                 )
             )
+            # AND THE GENERATION GOES. An unreconciled ledger is a worker whose model of its
+            # own device is provably wrong, and §3.2 already says what re-establishes one:
+            # a new executor generation, never a repair of the old numbers. Until the rebuild
+            # lands the chooser refuses typed rather than pricing a rung against drift —
+            # which is the difference between a typed answer before acceptance and an OOM
+            # halfway through somebody's VAE decode (cl-003).
+            self.supervision.invalidate(f"ledger_unreconciled: {record['leaks'][0][:160]}")
         return record
 
     # ------------------------------------------------------------------ the job lane
@@ -1158,7 +1167,12 @@ class AttemptEngine:
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
         # leave the ledger blind in the one case that matters.
-        moved = bool(attempt.residency.get("stages") or attempt.residency.get("evictions"))
+        # THIS attempt's transitions, not the generation's history. Reading the cumulative
+        # counters made every attempt after the first staged one claim its activation basis
+        # had moved, on attempts that never touched a component.
+        moved = bool(
+            attempt.residency.get("attempt_stages") or attempt.residency.get("attempt_evictions")
+        )
         self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved)
         self.bank_demand(attempt, reply.get("metrics", {}), moved)
 
@@ -1213,6 +1227,11 @@ class AttemptEngine:
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
+        if outcome["code"] == DEVICE_OOM:
+            # A CAPACITY FACT, not an author exception. `_TERMINAL["failed"]` defaults to
+            # AUTHOR_EXCEPTION because most failures are the handler's; a device that ran out
+            # of memory is the one class where the endpoint provably had no say.
+            cause = CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
         if outcome["terminal"] == "refused" and outcome["code"] == "unsupported_input":
             cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
         if outcome["terminal"] == "canceled":
@@ -1325,13 +1344,17 @@ class AttemptEngine:
         residency = reply.get("residency") or {}
         if residency:
             attempt.residency = dict(residency)
-            if residency.get("stages"):
+            # THE DECLARED TRANSITION, into the ledger BEFORE it reconciles. Under a staged
+            # rung the attempt moved gigabytes on purpose; the reconciliation subtracts
+            # exactly this and holds the remainder to zero.
+            self.ledger.observe_residency(attempt.residency)
+            if residency.get("attempt_stages"):
                 attempt.confess(
                     "degraded",
                     f"served on the {residency.get('placement')} rung: "
-                    f"{residency['stages']} component stage(s) costing "
+                    f"{residency['attempt_stages']} component stage(s) costing "
                     f"{residency.get('staged_ms', 0)} ms and "
-                    f"{residency.get('evictions', 0)} eviction(s) costing "
+                    f"{residency.get('attempt_evictions', 0)} eviction(s) costing "
                     f"{residency.get('evicted_ms', 0)} ms - the weights did not all fit "
                     "at once and the runtime moved them rather than refusing",
                 )

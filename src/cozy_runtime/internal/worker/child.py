@@ -194,6 +194,11 @@ class ExecutorSupervision:
         self.spawns = 0
         self.socket_path = str(root / "executor.sock")
         self._listener: socket.socket | None = None
+        self.on_invalidate: Callable[[str], None] | None = None
+        """Called AFTER every invalidation, once this object's own state already says the
+        executor cannot serve. The session installs the half it owns — dropping the
+        advertised intake state — because readiness is a SESSION fact and the process
+        supervisor has no business publishing one. See `invalidate`."""
 
     # ------------------------------------------------------------------ spawn
 
@@ -251,12 +256,24 @@ class ExecutorSupervision:
         return executor
 
     def invalidate(self, why: str) -> int:
-        """In-place readiness invalidation: the PROCESS may survive, its state did not."""
+        """In-place readiness invalidation: the PROCESS may survive, its state did not.
+
+        THE ADVERTISEMENT GOES WITH IT (cr-007, found by cl-003 from the product seat). A
+        forceful cancel killed the executor here and the worker went on reporting
+        `INTAKE_STATE_READY` until the rebuild started — which is after the terminal is
+        journaled and sent — so a coordinator dispatching in that window saw a healthy worker
+        and got `EXECUTOR_FAULT` for every attempt until its requeue budget was gone. A
+        device process that cannot serve must stop SAYING it can, at the moment it stops,
+        which is here: the ready-plan set empties and `on_invalidate` drops the intake state
+        the same instant, before this call returns.
+        """
         self.readiness_epoch += 1
         self.needs_rebuild = True
         if self.current is not None:
             self.current.ready_plans.clear()
             self.current.poisoned = self.current.poisoned or why
+        if self.on_invalidate is not None:
+            self.on_invalidate(why)
         return self.readiness_epoch
 
     def replace(self, *, imposed: dict[str, str]) -> Executor:

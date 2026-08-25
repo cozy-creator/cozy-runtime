@@ -75,6 +75,13 @@ REPORT_SECONDS = 2.0
 #: is the shared CLI/coordinator vocabulary, and this is a worker PROCESS disposition.
 RECYCLE_EXIT = 75
 
+#: How long a StartAttempt that arrives while the executor is being rebuilt WAITS before it
+#: gives up and takes the ordinary not-ready refusal. It is generous because the thing it is
+#: waiting for is a real refill: about 5 s warm on the launch family and ~48 s from a cold
+#: page cache. The alternative is what cl-003 measured — a refusal per dispatch, a requeue
+#: budget of three spent in 1.8 s, and a worker that was serving again four seconds later.
+REBUILD_WAIT_SECONDS = 120.0
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerOptions:
@@ -188,6 +195,11 @@ class Supervisor:
         self.progress_sent = 0
         self.work: queue.Queue[Attempt | None] = queue.Queue()
         self.stop = threading.Event()
+        #: SET when the intake state is a verdict (READY or ERROR), CLEAR while the worker is
+        #: still becoming one. `on_start` waits on it so a request that arrives during a
+        #: rebuild queues instead of being refused for a condition that is ending.
+        self.settled = threading.Event()
+        self.supervision.on_invalidate = self.capacity_dropped
         self.connected = threading.Event()
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
@@ -227,8 +239,33 @@ class Supervisor:
         if state == self.fences.intake:
             return
         self.fences.intake = state
+        # SETTLED means the worker has finished deciding what it is: READY (it serves) or
+        # ERROR (it does not, and said why). LOADING and BOOTING are transitional — an
+        # attempt that arrives in one of them WAITS for the answer instead of being refused
+        # for a condition that is about to end. `on_start` is the only reader.
+        if state in (pb.IntakeState.INTAKE_STATE_READY, pb.IntakeState.INTAKE_STATE_ERROR):
+            self.settled.set()
+        else:
+            self.settled.clear()
         if self.connected.is_set():
             self.send(pb.WorkerMessage(report=self.report()))
+
+    def capacity_dropped(self, why: str) -> None:
+        """The executor's state was invalidated: STOP ADVERTISING READY, right now.
+
+        Installed on `ExecutorSupervision.on_invalidate`, so it runs on whichever thread
+        observed the death — the watchdog on a forceful cancel, the attempt thread on a seam
+        close — and before that call returns. The ready-plan set is already empty by then, so
+        the Report this publishes carries both halves of the same fact: no ready plans, and
+        an intake state that is not READY.
+
+        Only a READY worker is moved. An invalidation that arrives while preparation already
+        failed must not overwrite the ERROR state with a LOADING that says less.
+        """
+        if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
+            return
+        self.note("readiness", f"capacity withdrawn: {why[:200]}")
+        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
 
     def read_device_process(self) -> int:
         """NVML per-process device bytes for the EXECUTOR, read by the supervisor.
@@ -852,6 +889,7 @@ class Supervisor:
                 CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
             return
+        self.await_settled(start)
         try:
             attempt = self.engine.offer(start)
         except AttemptRefusal as exc:
@@ -898,6 +936,40 @@ class Supervisor:
             return
         self.send(pb.WorkerMessage(attempt_accepted=accepted))
         self.work.put(attempt)
+
+    def await_settled(self, start: pb.StartAttempt) -> None:
+        """QUEUE behind a rebuild instead of refusing through one.
+
+        The alternative — the shape cl-003 measured — is a dispatch/refuse/requeue loop: a
+        forceful cancel kills the executor, the rebuild takes about five seconds, and every
+        attempt that lands in that window is refused `executor_not_ready` with an
+        EXECUTOR_FAULT the coordinator can only read as "this worker is broken". One cancel
+        spent a requeue budget of three in 1.8 seconds against a worker that was perfectly
+        healthy 4 seconds later. Waiting turns a refusal into a queue, which is what a
+        coordinator's budget is for.
+
+        This blocks the CONTROL READER, deliberately and with precedent: a directive's own
+        `prepare` already does (cr-007 divergence 7), and a rebuild happens only after the
+        attempt it followed reached its terminal, so there is no live attempt whose cancel
+        this could delay. It is bounded, and the bound is generous because a rebuild is a
+        real refill — 5 s warm, ~48 s from cold page cache on the launch family.
+        """
+        if self.settled.is_set():
+            return
+        started = time.perf_counter()
+        self.note(
+            "readiness",
+            f"{start.request_id}#{start.attempt} arrived while the worker is rebuilding: "
+            f"waiting up to {REBUILD_WAIT_SECONDS:g} s rather than refusing it",
+        )
+        settled = self.settled.wait(REBUILD_WAIT_SECONDS)
+        waited = (time.perf_counter() - started) * 1000
+        self.note(
+            "readiness",
+            f"{start.request_id}#{start.attempt} waited {waited:.0f} ms; intake is "
+            f"{pb.IntakeState.Name(self.fences.intake)}"
+            + ("" if settled else " (the wait expired)"),
+        )
 
     def refuse(
         self,

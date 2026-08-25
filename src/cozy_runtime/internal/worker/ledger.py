@@ -248,7 +248,26 @@ class Ledger:
     parked: tuple[str, ...] = ()
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
+    #: TRUE once the generation's first-call tax has been paid by something that is not a
+    #: paying request — the boot warm pass. It closes the one hole in `close_attempt`'s
+    #: first-attempt forgiveness: with a warm pass on, there IS no legitimate library-
+    #: workspace shift left for a paying attempt to hide a leak behind, so none is allowed.
+    #: Measured: a planted 64 MiB persistent allocation on the first paying attempt of a
+    #: warmed generation was absorbed as a `baseline_shift` and named nothing.
+    baseline_paid: bool = False
     reconciliations: list[dict[str, Any]] = field(default_factory=list)
+    #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, in the same allocator bytes
+    #: `device_allocated` is measured in. A staged rung moves gigabytes on purpose; that
+    #: movement is a fact the attempt DECLARES, so the reconciliation subtracts it and holds
+    #: the remainder to zero. Reset at every open.
+    residency_delta: int = 0
+    #: WHY this ledger is not a truth right now, or empty. A non-empty reason is a LOUD
+    #: condition: the chooser refuses to price a rung against it, because an unreconciled
+    #: ledger is exactly a ledger whose residency numbers are known to be wrong, and pricing
+    #: against wrong residency is how a 1024px decode came to be planned `all_resident` on a
+    #: card holding one component (cl-003). It clears only when the ledger is re-established
+    #: from a real construction — never by another attempt agreeing with itself.
+    unreconciled: str = ""
 
     # ------------------------------------------------------------------ host grants
 
@@ -363,6 +382,15 @@ class Ledger:
         self.registered = int(rows.get("pinned", {}).get("peak", 0))
         self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
         self.closed_since_baseline = 0
+        self.baseline_paid = False
+        self.residency_delta = 0
+        self.activations_moved = False
+        # A generation is the ONLY thing that re-establishes this ledger. §3.2's rule is that
+        # reservations are executor-generation-scoped and the ledger restarts WITH the new
+        # generation, never reconstructed from device state — so a fresh construction is the
+        # one event allowed to clear an unreconciled ledger, and it does it by replacing
+        # every number rather than by forgiving the old ones.
+        self.unreconciled = ""
         self.unreadable = [c for c in self.unreadable if not c.startswith("device")]
 
     def observe_attempt(self, metrics: dict[str, Any], resident_moved: bool = False) -> None:
@@ -383,6 +411,10 @@ class Ledger:
         peak = int(metrics.get("peak_vram_bytes", 0))
         if peak and self.device_baseline >= 0:
             self.activations_peak = max(self.activations_peak, peak - self.device_baseline)
+
+    def observe_residency(self, residency: dict[str, Any]) -> None:
+        """The attempt's DECLARED residency transition, from the plane that performed it."""
+        self.residency_delta = int(residency.get("moved_bytes", 0))
 
     def observe_probe(self, probe: dict[str, Any]) -> None:
         """The device's after-state, read through the executor that owns the context."""
@@ -413,6 +445,7 @@ class Ledger:
         shift = self.device_allocated - self.device_baseline
         self.device_baseline = self.device_allocated
         self.closed_since_baseline = 0
+        self.baseline_paid = True
         self.baseline_notes.append(f"{why}: {shift:+d} B")
         del self.baseline_notes[:-8]
         return shift
@@ -472,6 +505,7 @@ class Ledger:
             "format": "cozy.runtime.Ledger/0",
             "classes": [counter.document() for counter in self.counters()],
             "unreadable": sorted(self.unreadable),
+            "unreconciled": self.unreconciled,
             "grants": len(self.grants),
         }
 
@@ -499,6 +533,7 @@ class Ledger:
                 "free": self.device_free,
             },
             "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
+            "unreconciled": self.unreconciled,
             "grants": len(self.grants),
         }
 
@@ -527,12 +562,23 @@ class Ledger:
         to the new line — where a genuine per-attempt leak would keep growing and be caught on
         attempt two. With the boot warm pass on, the shift lands on the warm case and the
         first paying request already reconciles to zero.
+
+        THE DECLARED RESIDENCY TRANSITION (cl-003's second-1024px defect). Under a staged
+        rung the attempt evicts and stages components ON PURPOSE, so `device_allocated`
+        legitimately ends somewhere else entirely — measured once at -6,770,424,832 B, which
+        this reconciliation called a leak and then did nothing about, leaving the next
+        attempt's chooser pricing rungs against a residency the ledger knew was stale. The
+        claim is therefore not "the same bytes" but "the bytes the attempt SAID it would
+        move, and not one more": `residency_delta` is subtracted, the remainder must be zero,
+        and the baseline MOVES TO THE NEW TRUTH so the ledger keeps describing the device.
+        A transition is a reconciliation, never a leak — and never a silence either.
         """
         after = self.snapshot()
         reconciled = ("host_ram", "pinned_allocated", "device_allocated")
         classes: list[dict[str, Any]] = []
         leaks: list[str] = []
         shifts: list[str] = []
+        moved = self.residency_delta
         for counter in self.counters():
             name = counter.name
             row = counter.document()
@@ -543,31 +589,52 @@ class Ledger:
                 delta = after[name] - before[name]
                 row["delta"] = delta
                 row["verdict"] = "reconciled"
-                if delta > 0 and name == "device_allocated" and self.closed_since_baseline == 0:
+                declared = moved if name == "device_allocated" else 0
+                residual = delta - declared
+                if declared:
+                    row["declared_transition"] = declared
+                    row["residual"] = residual
+                    row["verdict"] = "residency_transition"
+                first = self.closed_since_baseline == 0 and not self.baseline_paid
+                if residual > 0 and name == "device_allocated" and first:
                     row["verdict"] = "baseline_shift"
                     shifts.append(
-                        f"device_allocated: +{delta} B on the first attempt of this executor "
-                        "generation - lazily allocated library workspace, held by the "
-                        "process rather than the attempt; the baseline moves and every "
+                        f"device_allocated: +{residual} B on the first attempt of this "
+                        "executor generation - lazily allocated library workspace, held by "
+                        "the process rather than the attempt; the baseline moves and every "
                         "later attempt is held to the new line"
                     )
-                    self.device_baseline += delta
-                elif delta != 0:
+                    self.device_baseline += residual
+                elif residual != 0:
                     row["verdict"] = "leak"
                     leaks.append(
-                        f"{name}: {delta:+d} B across the attempt "
-                        f"({before[name]} -> {after[name]}), measured by {counter.kind}"
+                        f"{name}: {residual:+d} B unaccounted across the attempt "
+                        f"({before[name]} -> {after[name]}, of which {declared:+d} B was a "
+                        f"declared residency transition), measured by {counter.kind}"
                     )
             classes.append(row)
+        if moved and not leaks:
+            # THE LINE MOVES WITH THE DEVICE. Leaving the baseline where the construction put
+            # it is what made every later attempt measure against a residency that no longer
+            # existed. It is recorded with its size, like every other baseline move.
+            self.device_baseline += moved
+            self.baseline_notes.append(f"declared residency transition on {key}: {moved:+d} B")
+            del self.baseline_notes[:-8]
         self.closed_since_baseline += 1
+        if leaks:
+            self.unreconciled = "; ".join(leaks)
         record = {
             "attempt": key,
             "classes": classes,
             "leaks": leaks,
             "baseline_shifts": shifts,
+            "declared_residency_delta": moved,
             "unreadable": sorted(self.unreadable),
             "closed": not leaks,
         }
         self.reconciliations.append(record)
         del self.reconciliations[:-32]
+        # The transition belonged to THIS attempt. Carrying it into the next one would
+        # forgive that one's device delta by exactly the size of a move it never made.
+        self.residency_delta = 0
         return record

@@ -707,11 +707,21 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
     )
     live = re.search(r"peak allocator (\d+) B", log)
     live_bytes = int(live.group(1)) if live else -1
+    # THE FILL PLANE'S OWN LEDGER, not the torch allocator's peak. They stopped being the
+    # same number when cr-006 landed the device probe: `prepare` qualifies the encodings it
+    # may read before it takes a lease, and that probe allocates ~20 MiB of its own scratch.
+    # The claim here is about DESTINATIONS — the bytes reserved for weights — and the ledger
+    # is what counts those. Reading the allocator peak instead would make a correct refusal
+    # look like a leaking one for as long as anything else on the prepare path touches the
+    # device, which is a measurement that decays rather than a fence.
+    reserved = re.search(r"ledger (\d+) B was LIVE", log)
+    reserved_bytes = int(reserved.group(1)) if reserved else -1
     check(
         "and it refuses with ZERO destinations reserved — the lease verifies FIRST",
-        live_bytes == 0,
-        f"peak allocator {live_bytes} B was live when it failed; "
-        "the interim reader could only find this 85 % of the way through a 4.78 GiB fill",
+        reserved_bytes == 0,
+        f"{reserved_bytes} B of destinations were live when it failed (the allocator's own "
+        f"peak was {live_bytes} B, which is cr-006's pre-lease device probe); the interim "
+        "reader could only find this 85 % of the way through a 4.78 GiB fill",
     )
     charged = [
         row

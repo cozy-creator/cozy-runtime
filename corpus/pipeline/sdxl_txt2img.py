@@ -176,7 +176,12 @@ def condition(
 
     device = torch.device("cuda", 0)
     view = model.for_request(ctx, seed=payload.seed)
-    side = payload.size
+    # `ctx.boot_warmup` is honoured HERE too (cl-003). Without it the boot warm pass decoded
+    # 1024px with every component resident and OOMed on this card at every single boot, so
+    # the binding came up `BINDING_DEGRADED` for nothing and the worker served anyway — a
+    # degradation with no cause, on every worker, forever. `generate` always did this; the
+    # cheap arm did not, and the warm pass runs BOTH.
+    side = 512 if ctx.boot_warmup else payload.size
     with tel.stage("tokenize"):
         ids, ids_2 = _tokenize(_TOKENIZERS, payload.prompt)
     with tel.stage("encode"):

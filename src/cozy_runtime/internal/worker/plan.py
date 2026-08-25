@@ -409,13 +409,21 @@ class PlanChooser:
     def demand(self, binding: BindingPlan, features: dict[str, Any]) -> list[Coefficient]:
         """The attempt's byte demand, each term declaring how it was established."""
         resident = self.ledger.resident or {}
-        weights = sum(resident.values())
+        absent = self.ledger.evicted or {}
+        # The GENERATION's weights, resident or parked. A component a rung evicted is still
+        # this deployment's weight — it costs its full size to bring back — so a demand term
+        # that counted only what happened to be resident described a smaller model than the
+        # one being served.
+        weights = sum(resident.values()) + sum(absent.values())
         terms = [
             Coefficient(
                 "weights",
                 weights or binding.vram_bytes,
-                "ledger" if resident else "bound",
-                "the fill plane's committed destination bytes per component" if resident else "",
+                "ledger" if resident or absent else "bound",
+                "the fill plane's committed destination bytes per component, resident and "
+                "parked alike"
+                if resident or absent
+                else "",
             )
         ]
         if self.ledger.activations_peak > 0:
@@ -447,6 +455,28 @@ class PlanChooser:
 
     def choose(self, binding: BindingPlan, features: dict[str, Any]) -> AttemptPlan:
         self.choices += 1
+        if self.ledger.unreconciled:
+            # A CHOOSER MAY NOT PRICE AGAINST A LEDGER THAT IS KNOWN TO BE WRONG. This is the
+            # loud half of cl-003's defect: the drift existed, this repository's own
+            # reconciliation had already NAMED it, and the next request was priced against it
+            # anyway — so a capacity fact arrived as an OOM in the middle of a VAE decode and
+            # was reported as the endpoint's exception. An unreconciled ledger reconciles
+            # (a fresh generation re-establishes it) or it refuses; it never guesses.
+            raise PlanRefusal(
+                "ledger_unreconciled",
+                f"this worker's ledger is not a truth right now and no rung may be priced "
+                f"against it: {self.ledger.unreconciled}. The generation is invalidated and "
+                "rebuilt, which re-establishes every number from a real construction; until "
+                "then a plan chosen here would be arithmetic over a residency the worker "
+                "already knows it cannot vouch for",
+                {
+                    "resource": "vram",
+                    "scope": "ledger",
+                    "needed_bytes": 0,
+                    "available_bytes": max(self.ledger.allocatable, 0),
+                    "evidence_class": "measured",
+                },
+            )
         free_host = self.ledger.host_budget - self.ledger.host_charged
         if binding.host_bytes > free_host:
             raise PlanRefusal(
@@ -476,14 +506,14 @@ class PlanChooser:
         # staged rung can free the largest component, so "no rung exists" means "not even
         # after evicting everything evictable". Comparing against the bare number refused a
         # run that the ladder serves perfectly well, which is what running it showed.
-        deepest_capacity = allocatable_now + max((self.ledger.resident or {}).values(), default=0)
+        deepest_capacity = allocatable_now + sum((self.ledger.resident or {}).values())
         if floor and allocatable_now >= 0 and deepest_capacity < floor:
             raise PlanRefusal(
                 "capacity_floor",
                 f"below the PHYSICAL FLOOR: this deployment declares {floor} B for "
                 f"activations plus scratch plus one component chunk, and the deepest rung "
-                f"can raise {deepest_capacity} B ({allocatable_now} B allocatable plus the "
-                f"largest evictable component; short by {floor - deepest_capacity} B). "
+                f"can raise {deepest_capacity} B ({allocatable_now} B allocatable plus every "
+                f"resident component it may free; short by {floor - deepest_capacity} B). "
                 f"There is no rung "
                 "below the floor, so this exits with a quantified capacity code rather "
                 "than a plan that cannot run",
@@ -497,11 +527,19 @@ class PlanChooser:
             )
         terms = {c.name: c for c in self.demand(binding, features)}
         resident = self.ledger.resident or {}
+        # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
+        # rung that wants them resident has to bring every one of them BACK, and the walk
+        # below charges exactly that. Reading only the resident map is how a 1024px request
+        # came to be planned `all_resident` on a generation holding one 167 MB VAE, with the
+        # 6.3 GiB it would have to re-stage charged to nobody (cl-003).
+        absent = self.ledger.evicted or {}
+        absent_bytes = sum(absent.values())
+        declared_bytes = sum(resident.values()) + absent_bytes
         # `device_allocatable` is what a NEW reservation can actually get. It already
         # accounts for whatever this generation holds, so the ladder's arithmetic is over
         # HEADROOM: what the attempt needs ON TOP of the weights that are already there.
         allocatable = self.ledger.allocatable
-        largest = max(resident.values(), default=binding.vram_bytes)
+        largest = max((*resident.values(), *absent.values()), default=binding.vram_bytes)
         activations = terms["activations"]
         rows: list[dict[str, Any]] = []
         chosen = ""
@@ -527,12 +565,26 @@ class PlanChooser:
                     }
                 )
                 continue
-            # Both rungs need the SAME headroom above the weights — activations do not
-            # shrink because a component moved. What differs is the CAPACITY each rung can
-            # raise: all_resident has only what is free right now, while component_staged
-            # may free the LRU component first, so its capacity is `allocatable + largest`.
-            headroom = activations.value
-            capacity = allocatable if placement == "all_resident" else allocatable + largest
+            # Both rungs need the same ACTIVATION headroom — activations do not shrink
+            # because a component moved — and each additionally needs the WEIGHTS IT MUST
+            # BRING BACK, which is where the two differ:
+            #
+            #   all_resident      needs every absent component back, and can free nothing;
+            #                     its capacity is what is allocatable right now.
+            #   component_staged  holds the declared set at a time, so the most it must
+            #                     raise at once is the LARGEST declared component — and it
+            #                     may free every resident one first, so its capacity is
+            #                     `allocatable + resident`.
+            #
+            # On a generation with everything resident, `absent_bytes` is 0 and this is the
+            # arithmetic that was already there. On one that staged, it is the difference
+            # between a rung that fits and a kernel OOM.
+            if placement == "all_resident":
+                headroom = activations.value + absent_bytes
+                capacity = allocatable
+            else:
+                headroom = activations.value + largest
+                capacity = allocatable + sum(resident.values())
             fits = allocatable < 0 or capacity >= headroom
             row = {
                 "rung": placement,
@@ -540,6 +592,7 @@ class PlanChooser:
                 "needs_bytes": headroom,
                 "capacity_bytes": capacity,
                 "allocatable_bytes": allocatable,
+                "absent_bytes": absent_bytes,
                 "why": why,
             }
             rows.append(row)
@@ -551,6 +604,8 @@ class PlanChooser:
             "coefficients": [c.document() for c in terms.values()],
             "allocatable_bytes": allocatable,
             "resident": dict(resident),
+            "absent": dict(absent),
+            "declared_bytes": declared_bytes,
             "parked": list(parked),
             "rungs": rows,
             "tenancy": binding.tenancy,
@@ -567,7 +622,11 @@ class PlanChooser:
             materialization=rung.materialization,
             compute_dtype="float16",
             placement=chosen,
-            reserved_vram_bytes=sum(resident.values()) or binding.vram_bytes,
+            # THE GENERATION'S WEIGHTS, resident or not. A reservation that shrank to
+            # whatever happened to be resident made the plan summary read `vram=167307726B`
+            # for a 6.46 GiB pipeline — the VAE alone — which is the number cl-003 caught the
+            # defect by. What this deployment holds does not change because a rung parked it.
+            reserved_vram_bytes=declared_bytes or binding.vram_bytes,
             reserved_host_bytes=binding.host_bytes,
             reserved_pinned_bytes=binding.pinned_bytes,
             headroom_bytes=activations.value,
@@ -578,8 +637,9 @@ class PlanChooser:
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
                 f"{binding.delivery_variant or binding.variant or 'default'!r} "
                 f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
-                f"{chosen}: {len(resident) or 1} component(s) totalling "
-                f"{sum(resident.values()) or binding.vram_bytes} B with "
+                f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
+                f"{declared_bytes or binding.vram_bytes} B of which {absent_bytes} B is not "
+                f"resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
                 f"({activations.provenance}); request {features.get('entrypoint', '?')} "
                 f"{features.get('scalars', {})}{confession}"

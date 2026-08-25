@@ -53,11 +53,23 @@ app = App()
 #: The latent side the request may ask for. 64 is SDXL's 512 px bucket.
 LATENT = (48, 64, 80)
 
+#: Where `leak_mib`'s planted allocation lives. A module global, because that is where a real
+#: endpoint leak lives too.
+_RETAINED: list[Any] = []
+
 
 class DenoiseInput(msgspec.Struct, forbid_unknown_fields=True):
     steps: Annotated[int, msgspec.Meta(ge=1, le=64)] = 2
     latent: Annotated[int, msgspec.Meta(ge=32, le=96)] = 64
     seed: int = 1005
+    leak_mib: Annotated[int, msgspec.Meta(ge=0, le=512)] = 0
+    """THE PLANT (cr-008b's executor-poisoning arm): device bytes this handler holds PAST
+    its own terminal, in a module-level list the attempt cannot reach to free.
+
+    It lives in the CORPUS, never in the runtime — a fault switch inside the product is a
+    production hook nobody asked for (decisions #249). What it stands in for is ordinary and
+    common: an endpoint that caches a tensor on a module global. From the ledger's side it is
+    indistinguishable from any other persistent allocation, which is the point."""
 
 
 class DenoiseOutput(msgspec.Struct):
@@ -184,6 +196,11 @@ def denoise(
             ctx.raise_if_cancelled()  # THE cooperative-cancel spelling
             latents = model.denoise(latents, timestep, prompt, embeds, ids)
             on_step(step)
+    if payload.leak_mib:
+        # Retained on a MODULE GLOBAL, so it outlives every frame of this attempt and the
+        # allocator cannot give it back when the handler returns.
+        _RETAINED.append(torch.empty(payload.leak_mib << 20, dtype=torch.uint8, device=device))
+        tel.log("planted a persistent device allocation", mib=payload.leak_mib)
     stats = latents.float()
     tel.metric("latent_std", round(float(stats.std()), 6))
     body = latents.reshape(-1).view(torch.uint8).cpu().numpy().tobytes()

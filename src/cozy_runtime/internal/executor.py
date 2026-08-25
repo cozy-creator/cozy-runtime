@@ -504,9 +504,10 @@ class Executor:
         # and applied here. The executor decides nothing: it is handed a rung and obeys it,
         # which is what keeps `all_resident` from quietly starting to swap.
         if self.residency is not None:
-            self.residency.placement = str(command.get("placement", "all_resident"))
-            self.residency.headroom = int(command.get("headroom_bytes", 0))
-            self.residency.last_shortfall = None
+            self.residency.open_attempt(
+                str(command.get("placement", "all_resident")),
+                int(command.get("headroom_bytes", 0)),
+            )
         torch.cuda.reset_peak_memory_stats()
         allocated_at_start = torch.cuda.memory_allocated()
         lease_acquired = time.perf_counter()

@@ -641,6 +641,17 @@ class StreamingFillBackend:
         #: back from a host tier that does not exist (§3.2: eviction FREES).
         self.parked: dict[str, Any] = {}
         self.vram_charge: dict[str, int] = {}
+        #: ONE number per component: the device bytes its module holds when it is resident,
+        #: measured at construction over the module's own tensors. Every later grant, charge,
+        #: release and price uses THIS number, resident or parked.
+        #:
+        #: It exists because there were two meters. Construction charged the module's tensor
+        #: sum (which includes the derived buffers a checkpoint never supplies); `stage()`
+        #: granted the READ PLAN's sum, which does not. They differ by about a kilobyte per
+        #: pipeline, and the visible consequence was a plan whose reserved weights changed
+        #: between the first attempt and the second on a generation that had not changed at
+        #: all. A component costs what it costs.
+        self.component_bytes: dict[str, int] = {}
         #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
         #: must outlive the first commit. It is released by `close()` with the generation.
         self.hold_lease = False
@@ -744,6 +755,7 @@ class StreamingFillBackend:
                 if member is None or not hasattr(member, "to_empty"):
                     continue
                 size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
+                self.component_bytes[name] = size
                 # Captured BEFORE the park decision: a parked component is staged in later
                 # and its derived tables have to survive to be restored, which they cannot
                 # if the capture happens only on the resident branch.
@@ -757,7 +769,7 @@ class StreamingFillBackend:
                     self.stage_log.append({"component": name, "action": "park", "bytes": size})
                     continue
                 held += size
-                want = sum(t.numel() * t.element_size() for _, t in _tensors(member))
+                want = size
                 self.ledger.grant({"vram": want}, f"component {name!r} destinations")
                 self.vram_charge[name] = want
                 try:
@@ -990,7 +1002,12 @@ class StreamingFillBackend:
         from cozy_runtime.internal.derive import placing
 
         started = time.perf_counter_ns()
-        want = sum(row.nbytes for row in self.plan.values() if row.component == name)
+        # The ONE number (see `component_bytes`): what this module holds when it is resident,
+        # derived buffers included, measured once at construction. Granting the read plan's
+        # sum instead left the derived tensors `_restore_derived` puts back uncharged.
+        want = self.component_bytes.get(name) or sum(
+            row.nbytes for row in self.plan.values() if row.component == name
+        )
         self.ledger.grant({"vram": want}, f"staging component {name!r}")
         try:
             with placing():

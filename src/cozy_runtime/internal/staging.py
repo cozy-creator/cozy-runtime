@@ -92,8 +92,42 @@ class ComponentResidency:
     #: instead of an exception string (cr-008a finding 8: a Fault has no shortfall slot,
     #: a TerminalCause does, and this is what fills it).
     last_shortfall: dict[str, Any] | None = None
+    #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, in allocator bytes, signed. Every stage
+    #: and every eviction this attempt performed is measured by the SAME meter the ledger
+    #: reconciles `device_allocated` with — `torch.cuda.memory_allocated()`, read either
+    #: side of the move — so the supervisor can subtract a DELIBERATE transition from an
+    #: attempt's device delta exactly, and whatever is left over is a real leak.
+    #:
+    #: Measuring rather than adding up plan bytes is the whole point: the fill plane's
+    #: `nbytes` is the tensor payload, and the allocator rounds every allocation, so a
+    #: 6.77 GB eviction reconciled to plan arithmetic leaves tens of kilobytes of "leak"
+    #: that is nothing but rounding. The meter that reports the class has to be the meter
+    #: that explains it.
+    moved_bytes: int = 0
+    attempt_stages: int = 0
+    attempt_evictions: int = 0
+    attempt_staged_ms: float = 0.0
+    attempt_evicted_ms: float = 0.0
 
     # ------------------------------------------------------------------ the contract
+
+    def open_attempt(self, placement: str, headroom: int) -> None:
+        """Apply the attempt's rung and ZERO the per-attempt transition counters.
+
+        The cumulative counters stay cumulative — they are the generation's history — but a
+        reconciliation is about ONE attempt, and `stages`/`evictions` were being read as if
+        they were. Measured: after any staged attempt, every later one on that generation
+        reported `resident_moved`, so the activation basis was called unreadable on attempts
+        that never moved a byte.
+        """
+        self.placement = placement
+        self.headroom = headroom
+        self.last_shortfall = None
+        self.moved_bytes = 0
+        self.attempt_stages = 0
+        self.attempt_evictions = 0
+        self.attempt_staged_ms = 0.0
+        self.attempt_evicted_ms = 0.0
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         """Make the declared set resident BEFORE the method body runs, or refuse typed."""
@@ -113,6 +147,7 @@ class ComponentResidency:
                 continue
             self._make_room(name, components)
             started = time.perf_counter()
+            allocated = self._allocated()
             try:
                 self.backend.stage(name)
             except FillRefusal as exc:
@@ -130,7 +165,11 @@ class ComponentResidency:
                 self.refusals.append(refusal.detail[:400])
                 raise refusal from exc
             self.stages += 1
-            self.staged_ms += (time.perf_counter() - started) * 1000
+            self.attempt_stages += 1
+            self.moved_bytes += self._allocated() - allocated
+            took = (time.perf_counter() - started) * 1000
+            self.staged_ms += took
+            self.attempt_staged_ms += took
             lease.held += 1
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
@@ -172,11 +211,7 @@ class ComponentResidency:
         if self.placement == "all_resident":
             return
         for victim in self._victims(declared):
-            started = time.perf_counter()
-            self.evictions += 1
-            self.backend.evict(victim)
-            self.torch.cuda.empty_cache()
-            self.evicted_ms += (time.perf_counter() - started) * 1000
+            self._evict(victim)
 
     def _victims(self, declared: tuple[str, ...]) -> list[str]:
         """Every resident component the method does not declare, LRU first.
@@ -211,11 +246,35 @@ class ComponentResidency:
             victim = self._victim(declared)
             if victim is None:
                 return  # nothing left to give; `stage` will refuse with the real numbers
-            started = time.perf_counter()
-            self.evictions += 1
-            self.backend.evict(victim)
-            self.torch.cuda.empty_cache()
-            self.evicted_ms += (time.perf_counter() - started) * 1000
+            self._evict(victim)
+
+    def _evict(self, victim: str) -> None:
+        """One eviction, timed and MEASURED against the allocator on both sides."""
+        started = time.perf_counter()
+        allocated = self._allocated()
+        self.evictions += 1
+        self.attempt_evictions += 1
+        self.backend.evict(victim)
+        self.torch.cuda.empty_cache()
+        self.moved_bytes += self._allocated() - allocated
+        took = (time.perf_counter() - started) * 1000
+        self.evicted_ms += took
+        self.attempt_evicted_ms += took
+
+    def _allocated(self) -> int:
+        return int(self.torch.cuda.memory_allocated())
+
+    def _size(self, name: str) -> int:
+        """The component's DECLARED bytes, from the read plan — resident or not.
+
+        This is what makes a non-resident component priceable. A component that has been
+        evicted still costs exactly this much to bring back, and a chooser that reads only
+        the RESIDENT map cannot see that cost at all (cl-003's second-1024px defect).
+        """
+        known = self.backend.component_bytes.get(name)
+        if known:
+            return known
+        return sum(row.nbytes for row in self.backend.plan.values() if row.component == name)
 
     def _fits(self, need: int) -> bool:
         """ALLOCATABLE capacity, from the allocator's own view (§3.2), never arithmetic."""
@@ -257,10 +316,19 @@ class ComponentResidency:
             "admissions": self.admissions,
             "stages": self.stages,
             "evictions": self.evictions,
+            "attempt_stages": self.attempt_stages,
+            "attempt_evictions": self.attempt_evictions,
+            "attempt_staged_ms": round(self.attempt_staged_ms, 2),
+            "attempt_evicted_ms": round(self.attempt_evicted_ms, 2),
+            "moved_bytes": self.moved_bytes,
             "staged_ms": round(self.staged_ms, 2),
             "evicted_ms": round(self.evicted_ms, 2),
             "resident": {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components},
-            "evicted": {n: 0 for n in self.backend.parked},
+            # WITH THEIR REAL SIZES. An evicted component reported at 0 B is a component the
+            # planner cannot price, and pricing a rung against a residency map that says the
+            # absent weights are free is exactly how `all_resident` came to "fit" on a card
+            # holding one 167 MB VAE out of a 6.46 GiB pipeline.
+            "evicted": {n: self._size(n) for n in self.backend.parked},
             "leases": {
                 n: {"held": v.held, "last_used": v.last_used} for n, v in self.leases.items()
             },

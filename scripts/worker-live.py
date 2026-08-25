@@ -22,6 +22,7 @@ The bytes come from `~/cozy_v2/tensorfs-bench`, cr-005's real SDXL CAS, READ-ONL
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -415,8 +416,8 @@ def corrupt_store(at: Path, source: str) -> str:
     return str(at)
 
 
-def plan_id_for(entrypoint: str) -> str:
-    return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
+def plan_id_for(entrypoint: str, release: str = RELEASE) -> str:
+    return "sha256:" + hashlib.sha256(f"ebp/{release}/{entrypoint}".encode()).hexdigest()
 
 
 @dataclass
@@ -474,14 +475,28 @@ class Worker:
         return pid if "pid" in dir() else 0
 
 
-def stage(tmp: Path, entrypoints: tuple[str, ...], store: str = "") -> dict[str, str]:
+def stage(
+    tmp: Path,
+    entrypoints: tuple[str, ...],
+    store: str = "",
+    *,
+    overrides: dict[str, Any] | None = None,
+    release: str = RELEASE,
+) -> dict[str, str]:
+    """Write one binding-plan record per entrypoint. `overrides` is how a DIFFERENT fixture
+    is driven through the same coordinator: the four-component pipeline is the same worker,
+    the same protocol and the same records with another project, store and component set."""
     (tmp / "binding-plans").mkdir(parents=True, exist_ok=True)
     ids = {}
     for entrypoint in entrypoints:
-        plan_id = plan_id_for(entrypoint)
+        plan_id = plan_id_for(entrypoint, release)
         record = binding_record(plan_id, entrypoint)
         if store:
             record["store"] = store
+        record.update(overrides or {})
+        record["plan_id"] = plan_id
+        record["entrypoint"] = entrypoint
+        record["release"] = release
         (tmp / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
             json.dumps(record, indent=2)
         )
@@ -502,13 +517,15 @@ def start_worker(
     extra: tuple[str, ...] = (),
     rlimit_fsize: int = 0,
     store: str = "",
+    overrides: dict[str, Any] | None = None,
+    release: str = RELEASE,
 ) -> Worker:
     """Boot the coordinator (if needed) and the supervisor, and issue the first Directive."""
     home = tmp / "home"
     root = tmp / "worker"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    ids = stage(home, entrypoints, store=store)
+    ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
     socket_path = str(tmp / "hub.sock")
     if hub is None or server is None:
         server, hub = serve_hub(socket_path)
@@ -524,7 +541,7 @@ def start_worker(
             token=b"never-crosses-the-seam",
         ),
         serving=pb.ServingDirective(
-            endpoint_release_id=RELEASE,
+            endpoint_release_id=release,
             entrypoint_binding_plan_ids=sorted(ids.values()),
         ),
     )
@@ -554,7 +571,7 @@ def start_worker(
         "--instance-id",
         instance_id or f"ins-{uuid.uuid4().hex[:12]}",
         "--release-id",
-        RELEASE,
+        release,
         "--grace",
         str(grace),
         *(("--no-warm",) if no_warm else ()),
@@ -612,9 +629,11 @@ def payload_input(tmp: Path, name: str, payload: dict[str, Any]) -> pb.InputLoca
     )
 
 
-def make_spec(plan_id: str, *, deadline_ms: int = 0, extra_key: str = "") -> tuple[bytes, bytes]:
+def make_spec(
+    plan_id: str, *, deadline_ms: int = 0, extra_key: str = "", release: str = RELEASE
+) -> tuple[bytes, bytes]:
     spec = pb.ExecutionSpec(
-        endpoint_release_id=RELEASE,
+        endpoint_release_id=release,
         image_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         deadline_unix_ms=deadline_ms,
@@ -649,9 +668,11 @@ def dispatch(
     output_id: str = "image",
     destination_url: str = "",
     incarnation: int = 0,
+    release: str = RELEASE,
+    max_bytes: int = 8 * MIB,
 ) -> tuple[bytes, bytes]:
     canonical_bytes, digest = spec_override or make_spec(
-        plan_id, deadline_ms=deadline_ms, extra_key=extra_key
+        plan_id, deadline_ms=deadline_ms, extra_key=extra_key, release=release
     )
     out_dir = tmp / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -670,7 +691,7 @@ def dispatch(
             pb.OutputDestination(
                 output_id=output_id if index == 0 else f"{output_id}-{index}",
                 url=destination_url or f"file://{out_dir / f'{request_id}-{index}.bin'}",
-                max_bytes=8 * MIB,
+                max_bytes=max_bytes,
             )
             for index in range(outputs)
         ],
@@ -1132,16 +1153,19 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
         head("since tfs-007 the refusal PRECEDES the reservation, which is the whole point")
         text = line[0] if line else ""
         peak_bytes = _number(text, r"peak allocator (\d+) B")
+        reserved_bytes = _number(text, r"ledger (\d+) B was LIVE", default=-1)
         after_bytes = _number(text, r"allocator holds (\d+) B", default=-1)
         free_bytes = _number(text, r"has (\d+) B free")
         used = gpu_used_mib()
         check(
             "ZERO destinations were reserved before the artifact was refused",
-            peak_bytes == 0 and after_bytes == 0,
-            f"peak allocator {peak_bytes} B, {after_bytes} B afterwards — TensorFS verifies "
-            "the snapshot when the LEASE registers, so a corrupt object never reaches a "
-            "fill. The interim reader could only find the same defect 85 % of the way "
-            "through a 4.78 GiB stream, with 5,134,982,144 B of destinations already live",
+            reserved_bytes == 0 and after_bytes == 0,
+            f"{reserved_bytes} B of destinations were live, {after_bytes} B held afterwards "
+            f"(the allocator's own peak was {peak_bytes} B — cr-006's device probe qualifies "
+            "encodings before the lease, and that scratch is not a destination). TensorFS "
+            "verifies the snapshot when the LEASE registers, so a corrupt object never "
+            "reaches a fill. The interim reader could only find the same defect 85 % of the "
+            "way through a 4.78 GiB stream, with 5,134,982,144 B of destinations already live",
         )
         check(
             "and the DEVICE agrees, from outside the process",
@@ -2295,6 +2319,530 @@ def section_results(args: argparse.Namespace) -> None:
         _gpu_clean(idle)
 
 
+# --------------------------------------------------------------- the four-component fixture
+
+#: cr-008b's real SDXL pipeline, driven through THIS coordinator so a resident worker can be
+#: given more than one request. `pipeline-live.py` runs one request per process by design —
+#: it measures cold-to-first-image — and the defect cl-003 found lives entirely in the SECOND
+#: request on a worker that is already warm.
+PIPE_WORK = Path("/tmp/cozy-sdxl4")
+PIPE_RELEASE = "cozy/sdxl-pipeline@cr-008b"
+PIPE_COMPONENTS = ("text_encoder", "text_encoder_2", "unet", "vae")
+
+
+def pipeline_overrides() -> dict[str, Any]:
+    """The binding record for the whole pipeline: four components, one snapshot each."""
+    snapshots = dict(json.loads((PIPE_WORK / "snapshots.json").read_text()))
+    return {
+        "project": str(ROOT / "corpus" / "pipeline"),
+        "model_class": "SdxlPipelineModel",
+        "binding_path": "generate.models.model",
+        "param": "model",
+        "component": "unet",
+        "components": ",".join(PIPE_COMPONENTS),
+        "store": str(PIPE_WORK / "store"),
+        "config": str(PIPE_WORK / "pipeline.config.json"),
+        "snapshot": snapshots["unet"],
+        "snapshots": ",".join(f"{k}={v}" for k, v in sorted(snapshots.items())),
+        "variant": "sm89",
+        "vram_bytes": 7 * GIB,
+        "host_bytes": 2 * GIB,
+        "pinned_bytes": 256 * MIB,
+        "vram_floor_bytes": 1 * GIB,
+        "tenancy": "local",
+    }
+
+
+def _ledger_rows(worker: Worker) -> list[dict[str, Any]]:
+    """Every journaled ledger reconciliation, in order, read from the DURABLE journal."""
+    out = []
+    for line in (worker.root / "journal.log").read_text(errors="replace").splitlines():
+        # Each journal line is `<sha256 of the canonical bytes> <canonical bytes>` — the
+        # digest is the record's own integrity fence, so the body starts after the space.
+        _, _, payload = line.partition(" ")
+        try:
+            row = json.loads(payload)
+        except ValueError:
+            continue
+        if row.get("kind") == "ledger":
+            out.append(dict(row.get("body", {})))
+    return out
+
+
+def _device_row(record: dict[str, Any]) -> dict[str, Any]:
+    for row in record.get("classes", ()):
+        if row.get("class") == "device_allocated":
+            return dict(row)
+    return {}
+
+
+def section_resident(args: argparse.Namespace) -> dict[str, Any]:
+    """N consecutive 1024px requests on ONE resident worker (cl-003's blocking defect).
+
+    The defect: a `component_staged` attempt returned the generation with its components
+    evicted, the ledger reported the drift as an unreconciled leak and then did nothing about
+    it, and the NEXT request's chooser priced `all_resident` against a residency map holding
+    one 167 MB VAE — so the 1024px decode ran out of memory inside the kernel and was
+    reported as the endpoint's own exception.
+    """
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    worker = start_worker(
+        tmp,
+        entrypoints=("generate",),
+        overrides=pipeline_overrides(),
+        release=PIPE_RELEASE,
+        no_warm=args.no_warm,
+    )
+    hub = worker.hub
+    plan_id = plan_id_for("generate", PIPE_RELEASE)
+    row: dict[str, Any] = {}
+    try:
+        head(f"boot: the WHOLE four-component pipeline as one resident worker ({args.size}px)")
+        boot = time.perf_counter()
+        report = hub.ready(plan_id, 900)
+        row["ready_s"] = round(time.perf_counter() - boot, 2)
+        check(
+            "the four-component pipeline reached READY",
+            plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids,
+            f"{row['ready_s']:.1f} s, incarnation {report.executor_incarnation}",
+        )
+
+        head(f"{args.repeat} CONSECUTIVE {args.size}px requests on that one worker")
+        served: list[dict[str, Any]] = []
+        for index in range(1, args.repeat + 1):
+            request_id = f"pipe-{index}"
+            started = time.perf_counter()
+            dispatch(
+                hub,
+                tmp,
+                plan_id,
+                request_id=request_id,
+                payload={
+                    "prompt": args.prompt,
+                    "steps": args.steps,
+                    "size": args.size,
+                    "seed": 1005,
+                },
+                release=PIPE_RELEASE,
+                max_bytes=16 * MIB,
+            )
+            accepted = hub.wait(
+                lambda m, r=request_id: (
+                    m.attempt_accepted
+                    if m.WhichOneof("msg") == "attempt_accepted"
+                    and m.attempt_accepted.request_id == r
+                    else None
+                ),
+                300,
+                "AttemptAccepted",
+            )
+            terminal = hub.wait(
+                lambda m, r=request_id: (
+                    m.attempt_terminal
+                    if m.WhichOneof("msg") == "attempt_terminal"
+                    and m.attempt_terminal.request_id == r
+                    else None
+                ),
+                900,
+                "AttemptTerminal",
+            )
+            body = terminal_body(terminal)
+            inline = body.get("result", {}).get("inline_result", "") or ""
+            result = json.loads(base64.b64decode(inline)) if inline else {}
+            outputs = body.get("output_manifest", {}).get("outputs") or [{}]
+            served.append(
+                {
+                    "request": request_id,
+                    "wall_ms": round((time.perf_counter() - started) * 1000),
+                    "status": body["status"],
+                    "cause": str(body.get("cause", {}).get("code", "")),
+                    "message": str(body.get("safe_message", ""))[:200],
+                    "placement": accepted.plan.placement,
+                    "reserved_vram_bytes": int(accepted.plan.reserved_vram_bytes),
+                    "choice": accepted.plan.quantified_choice,
+                    "digest": str(result.get("digest", "")),
+                    "png_bytes": int(outputs[0].get("length", 0)),
+                }
+            )
+            last = served[-1]
+            print(
+                f"    {request_id}: {last['wall_ms']} ms status={last['status']} "
+                f"{last['placement']} vram={last['reserved_vram_bytes']} "
+                f"digest={last['digest'][:16]} png={last['png_bytes']} B",
+                flush=True,
+            )
+            if last["status"] != 1:
+                print(f"      {last['cause']}: {last['message']}", flush=True)
+        row["served"] = served
+        check(
+            f"all {args.repeat} requests SUCCEEDED on one resident worker",
+            all(s["status"] == 1 for s in served),
+            "; ".join(
+                f"{s['request']}={s['status']}"
+                + (f" {s['cause']} {s['message'][:70]}" if s["status"] != 1 else "")
+                for s in served
+            ),
+        )
+        digests = {s["digest"] for s in served}
+        check(
+            "every one produced the SAME image digest — the pixels are a fence, not a hope",
+            len(digests) == 1 and bool(next(iter(digests))),
+            f"{next(iter(digests))[:32]}… on {len(served)} runs, {served[0]['png_bytes']} B PNG",
+        )
+        check(
+            "and the plan reserved the GENERATION's weights every time, not what was resident",
+            len({s["reserved_vram_bytes"] for s in served}) == 1
+            and served[0]["reserved_vram_bytes"] > 6 * GIB,
+            f"{served[0]['reserved_vram_bytes']} B on every attempt ({served[0]['placement']})",
+        )
+
+        head("the ledger reconciles to the same numbers after every attempt")
+        records = _ledger_rows(worker)
+        row["reconciliations"] = [
+            {
+                "attempt": rec.get("attempt"),
+                "closed": rec.get("closed"),
+                "declared_residency_delta": rec.get("declared_residency_delta"),
+                "device": _device_row(rec),
+                "leaks": rec.get("leaks"),
+            }
+            for rec in records
+        ]
+        for rec in row["reconciliations"]:
+            device = rec["device"]
+            print(
+                f"    {rec['attempt']!s:<14} closed={rec['closed']} "
+                f"device {device.get('before')} -> {device.get('after')} "
+                f"delta {device.get('delta')} declared {rec['declared_residency_delta']} "
+                f"residual {device.get('residual', 0)} [{device.get('verdict')}]",
+                flush=True,
+            )
+        paying = [rec for rec in row["reconciliations"] if str(rec["attempt"]).startswith("pipe-")]
+        check(
+            "every attempt CLOSED — no unaccounted byte in any reconciled class",
+            len(paying) == args.repeat and all(rec["closed"] for rec in paying),
+            f"{len(paying)} reconciliation(s), leaks {[r['leaks'] for r in paying if r['leaks']]}",
+        )
+        # The two mechanisms COMPOSE, and the decomposition is the claim: the declared
+        # transition comes off first, and whatever is left is either nothing (reconciled) or
+        # the first-call library workspace this generation has not paid yet (`baseline_shift`
+        # — only reachable on the first attempt, and only with the warm pass off). A `leak` is
+        # what is left when neither explains it, and nothing here may be one.
+        verdicts = [rec["device"].get("verdict") for rec in paying]
+        check(
+            "a staged rung's eviction is a DECLARED TRANSITION, reconciled, never a leak",
+            bool(paying)
+            and any(rec["declared_residency_delta"] for rec in paying)
+            and "leak" not in verdicts
+            and all(rec["device"].get("residual", 0) == 0 for rec in paying[1:]),
+            "; ".join(
+                f"{rec['attempt']} moved {rec['declared_residency_delta']:+d} B "
+                f"[{rec['device'].get('verdict')}, residual "
+                f"{rec['device'].get('residual', 0)} B]"
+                for rec in paying
+            ),
+        )
+        steady = paying[1:]
+        check(
+            "and the residency the ledger reports is STABLE across requests 2..N",
+            bool(steady)
+            and len({rec["device"].get("after") for rec in steady}) == 1
+            and len({rec["device"].get("before") for rec in steady}) == 1,
+            "device_allocated "
+            + " · ".join(
+                f"{rec['device'].get('before')} -> {rec['device'].get('after')}" for rec in steady
+            ),
+        )
+        row["gpu_after"] = gpu_used_mib()
+    finally:
+        row["summary"] = _shutdown(worker)
+        _gpu_clean(idle)
+    return row
+
+
+def section_drift(args: argparse.Namespace) -> dict[str, Any]:
+    """RED ARM: a PLANTED residency leak refuses at CHOOSE time, not inside a decode.
+
+    The plant is harness-side and it is the real mechanism rather than a switch in the
+    runtime: a leak is planted by making the ENDPOINT hold a device allocation past its own
+    terminal (`corpus/endpoint/sdxl_gpu.py`'s `leak_mib` request field), which is exactly
+    what an executor-poisoning defect looks like from the ledger's side.
+    """
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    # The warm pass ON, deliberately: it absorbs the lazily-allocated library workspace, so
+    # the FIRST paying attempt already reconciles to zero and the only thing left for the
+    # plant to be is what it is (slice-live's `ledger` section proves that separately).
+    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=False)
+    hub = worker.hub
+    plan_id = plan_id_for("denoise")
+    row: dict[str, Any] = {}
+    try:
+        ready = hub.ready(plan_id, 400)
+        head("a PLANTED persistent device allocation, held past the terminal")
+        dispatch(
+            hub,
+            tmp,
+            plan_id,
+            request_id="req-leak",
+            payload={"steps": 2, "latent": 64, "seed": 7, "leak_mib": 64},
+        )
+        hub.wait(
+            lambda m: (
+                m.attempt_terminal
+                if m.WhichOneof("msg") == "attempt_terminal"
+                and m.attempt_terminal.request_id == "req-leak"
+                else None
+            ),
+            300,
+            "AttemptTerminal",
+        )
+        record = _ledger_rows(worker)[-1]
+        device = _device_row(record)
+        row["leaked"] = {"leaks": record.get("leaks"), "device": device}
+        check(
+            "the reconciliation NAMES it rather than absorbing it",
+            not record.get("closed") and bool(record.get("leaks")),
+            f"device_allocated {device.get('before')} -> {device.get('after')} "
+            f"residual {device.get('residual', device.get('delta'))} B "
+            f"[{device.get('verdict')}]",
+        )
+        reported = [
+            fault
+            for report in hub.reports()
+            for fault in report.faults
+            if fault.reason == "ledger_unreconciled"
+        ]
+        check(
+            "an unreconciled ledger is LOUD at the COORDINATOR seat, not a silent drift",
+            bool(reported) and bool(record.get("leaks")),
+            (
+                f"{pb.FaultKind.Name(reported[-1].kind)} {reported[-1].reason}: "
+                f"{reported[-1].detail[:120]}"
+                if reported
+                else "no ledger_unreconciled fault reached a Report"
+            ),
+        )
+
+        head("the NEXT request is never priced against the drift: replaced, or refused typed")
+        since = hub.mark()
+        dispatch(
+            hub,
+            tmp,
+            plan_id,
+            request_id="req-after-leak",
+            payload={"steps": 2, "latent": 64, "seed": 7},
+        )
+        after = hub.wait(
+            lambda m: (
+                m.attempt_terminal
+                if m.WhichOneof("msg") == "attempt_terminal"
+                and m.attempt_terminal.request_id == "req-after-leak"
+                else None
+            ),
+            300,
+            "AttemptTerminal",
+            since,
+        )
+        body = terminal_body(after)
+        message = str(body.get("safe_message", ""))
+        accepted = hub.accepted("req-after-leak")
+        row["after"] = {"status": body["status"], "message": message[:300]}
+        # WHAT THE NEXT REQUEST MUST NOT DO is be planned against the drift. There are two
+        # honest ways not to: refuse typed at choose time, or run on a generation whose
+        # ledger was re-established — which is what the invalidation buys, and which the
+        # readiness fence makes the ordinary outcome (the request queues behind the rebuild).
+        # Both are checked as ONE claim, because "either" is only weak if the alternative is
+        # unspecified: it either refused, or it was priced against a ledger that reconciles.
+        refused = body["status"] != 1 and "ledger_unreconciled" in message
+        reused = bool(accepted) and accepted[0].executor_incarnation <= ready.executor_incarnation
+        check(
+            "the drifted generation is NEVER reused: refused typed, or replaced first",
+            refused or (bool(accepted) and not reused),
+            f"status {body['status']} · incarnation {ready.executor_incarnation} -> "
+            f"{accepted[0].executor_incarnation if accepted else '(never accepted)'} · "
+            f"{message[:120]}",
+        )
+        closed = _ledger_rows(worker)[-1]
+        check(
+            "and whatever served next closed its own ledger — the drift did not survive",
+            body["status"] != 1 or bool(closed.get("closed")),
+            f"{closed.get('attempt')}: closed={closed.get('closed')} leaks={closed.get('leaks')}",
+        )
+        row["gpu_after"] = gpu_used_mib()
+    finally:
+        row["summary"] = _shutdown(worker)
+        _gpu_clean(idle)
+    return row
+
+
+def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
+    """cr-007: a device process that cannot serve must stop advertising READY.
+
+    cl-003 measured the shape this replaces: a forceful cancel killed the executor, the
+    worker went on reporting `INTAKE_STATE_READY` until the rebuild started, and every
+    attempt dispatched into that window died `EXECUTOR_FAULT` — one cancel spending a
+    requeue budget of three in 1.8 seconds against a worker that served again 4 s later.
+    """
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    # BOTH entrypoints, one construction: `stubborn` exists to be killed (it never asks
+    # whether it was cancelled and it produces no output), and `denoise` is what the next
+    # request needs — a handler that actually serves. Same store, same snapshot, same
+    # component, so `prepare_executor` groups them into ONE generation and both plan ids go
+    # ready together; the recovery gap measured below is therefore a real serve, not a boot.
+    worker = start_worker(tmp, entrypoints=("stubborn", "denoise"), no_warm=True, grace=2.0)
+    hub = worker.hub
+    plan_id = plan_id_for("stubborn")
+    serve_id = plan_id_for("denoise")
+    row: dict[str, Any] = {}
+    try:
+        ready = hub.ready(plan_id, 400)
+        head("a NON-COOPERATIVE handler, cancelled forcefully")
+        check(
+            "the worker starts READY and says which plans it can serve",
+            ready.intake_state == pb.IntakeState.INTAKE_STATE_READY
+            and plan_id in ready.serving_capacity.ready_entrypoint_binding_plan_ids,
+            f"{len(ready.serving_capacity.ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            f"incarnation {ready.executor_incarnation}",
+        )
+        _, digest = dispatch(
+            hub, tmp, plan_id, request_id="req-stub", payload={"steps": 400, "latent": 64}
+        )
+        hub.wait(
+            lambda m: (
+                m.attempt_accepted
+                if m.WhichOneof("msg") == "attempt_accepted"
+                and m.attempt_accepted.request_id == "req-stub"
+                else None
+            ),
+            180,
+            "AttemptAccepted",
+        )
+        time.sleep(args.kill_after)
+        since = hub.mark()
+        cancelled_at = time.perf_counter()
+        hub.send(
+            pb.CoordinatorMessage(
+                cancel_attempt=pb.CancelAttempt(
+                    session_id=hub.session(),
+                    executor_incarnation=hub.incarnation(),
+                    request_id="req-stub",
+                    attempt=1,
+                    reason=pb.CancelReason.CANCEL_REASON_CLIENT,
+                    exec_spec_digest=digest,
+                )
+            )
+        )
+        dropped = hub.wait(
+            lambda m: (
+                m.report
+                if m.WhichOneof("msg") == "report"
+                and m.report.intake_state != pb.IntakeState.INTAKE_STATE_READY
+                else None
+            ),
+            60,
+            "a Report that stops claiming READY",
+            since,
+        )
+        drop_ms = (time.perf_counter() - cancelled_at) * 1000
+        row["capacity_drop_ms"] = round(drop_ms)
+        check(
+            "the forceful kill DROPS the advertised capacity at the coordinator seat",
+            dropped.intake_state != pb.IntakeState.INTAKE_STATE_READY
+            and not list(dropped.serving_capacity.ready_entrypoint_binding_plan_ids),
+            f"{pb.IntakeState.Name(dropped.intake_state)} with "
+            f"{len(dropped.serving_capacity.ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            f"{drop_ms:.0f} ms after the cancel was sent "
+            f"(readiness epoch {dropped.readiness_epoch})",
+        )
+        # DISPATCHED INTO THE WINDOW, on purpose and immediately: the executor is dead, the
+        # rebuild has not spawned its replacement yet, so the incarnation the coordinator
+        # holds is still the current one and this StartAttempt is a live message aimed at a
+        # worker that cannot serve. That window is the whole defect — it is where every
+        # attempt used to die `executor_not_ready`/EXECUTOR_FAULT until a requeue budget was
+        # gone. There is no rush to lose: the respawn is some 200 ms behind the Report that
+        # said READY had ended, and this dispatch is one.
+        head("the NEXT request QUEUES behind the rebuild instead of burning a requeue budget")
+        queued_at = time.perf_counter()
+        dispatch(hub, tmp, serve_id, request_id="req-next", payload={"steps": 1, "latent": 64})
+
+        terminal = hub.wait(
+            lambda m: (
+                m.attempt_terminal
+                if m.WhichOneof("msg") == "attempt_terminal"
+                and m.attempt_terminal.request_id == "req-stub"
+                else None
+            ),
+            120,
+            "the CANCELED terminal",
+        )
+        cancel_body = terminal_body(terminal)
+        check(
+            "the cancelled attempt still converges to a typed CANCELED terminal",
+            cancel_body["status"] == 4,
+            f"status {cancel_body['status']} cause {cancel_body.get('cause', {}).get('code')}",
+        )
+        next_terminal = hub.wait(
+            lambda m: (
+                m.attempt_terminal
+                if m.WhichOneof("msg") == "attempt_terminal"
+                and m.attempt_terminal.request_id == "req-next"
+                else None
+            ),
+            300,
+            "the next attempt's terminal",
+        )
+        row["recovery_gap_ms"] = round((time.perf_counter() - queued_at) * 1000)
+        next_body = terminal_body(next_terminal)
+        accepted_next = hub.accepted("req-next")
+        check(
+            "it SERVED — one dispatch, one terminal, no dispatch/refuse/requeue loop",
+            next_body["status"] == 1 and len(hub.terminals("req-next")) == 1,
+            f"status {next_body['status']} after {row['recovery_gap_ms']} ms, "
+            f"{len(hub.terminals('req-next'))} terminal(s), "
+            f"{len(accepted_next)} acceptance(s)",
+        )
+        check(
+            "on a genuinely re-spawned executor, not the dead one",
+            bool(accepted_next)
+            and accepted_next[0].executor_incarnation > ready.executor_incarnation,
+            f"incarnation {ready.executor_incarnation} -> "
+            f"{accepted_next[0].executor_incarnation if accepted_next else '?'}",
+        )
+        back = [
+            report
+            for report in hub.reports()
+            if report.intake_state == pb.IntakeState.INTAKE_STATE_READY
+            and serve_id in report.serving_capacity.ready_entrypoint_binding_plan_ids
+        ]
+        check(
+            "and READY came back only once the executor was re-prepared",
+            len(back) >= 2,
+            f"{len(back)} READY report(s) carrying the plan; recovery gap "
+            f"{row['recovery_gap_ms']} ms",
+        )
+        waited = [line for line in worker.tail("arrived while the worker is rebuilding", 4)]
+        row["queue_note"] = waited[-1][-160:] if waited else ""
+        check(
+            "the worker WAITED for it rather than refusing it — one attempt, no refusal",
+            bool(waited) and not any("refused" in line for line in worker.tail("req-next", 12)),
+            row["queue_note"] or "no queue note in the supervisor's activity lane",
+        )
+        row["gpu_after"] = gpu_used_mib()
+    finally:
+        row["summary"] = _shutdown(worker)
+        _gpu_clean(idle)
+    return row
+
+
 def section_bench(args: argparse.Namespace) -> None:
     """The numbers: boot, spawn-to-ready, protocol tax, recovery, RSS."""
     results = ROOT / "results" / "worker.jsonl"
@@ -2337,12 +2885,21 @@ def main() -> int:
             "acceptance",
             "abandon",
             "results",
+            "resident",
+            "drift",
+            "readiness",
             "bench",
         ),
     )
     parser.add_argument("--tmp", default="")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--kill-after", type=float, default=3.0)
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--size", type=int, default=1024)
+    parser.add_argument("--no-warm", action="store_true")
+    # cr-008b's banked prompt, so the 1024px pixel digest is comparable to the number this
+    # repository already holds rather than to itself alone.
+    parser.add_argument("--prompt", default="a photograph of an astronaut riding a horse")
     args = parser.parse_args()
     # One workspace per invocation. A supervisor whose harness went away keeps reconnecting
     # to its hub socket, so a shared path would let a previous run's worker register into
@@ -2361,6 +2918,9 @@ def main() -> int:
         "acceptance": section_acceptance,
         "abandon": section_abandon,
         "results": section_results,
+        "resident": section_resident,
+        "drift": section_drift,
+        "readiness": section_readiness,
         "bench": section_bench,
     }
     row = sections[args.section](args)

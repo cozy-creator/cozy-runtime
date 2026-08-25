@@ -19,6 +19,7 @@ it, and every output lands in this run's own workspace.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import resource
@@ -58,6 +59,7 @@ from cozy_runtime.author import (  # noqa: E402
     Scratch,
     Tree,
 )
+from cozy_runtime.author._assets import GrantedInput  # noqa: E402
 
 PROBE = App()
 
@@ -121,8 +123,20 @@ class NoAssets(msgspec.Struct):
 
 @PROBE.job
 def reads_a_list(payload: ListOfAssets) -> ProbeOut:
-    """Read the BYTES of every element — the call that used to refuse `asset_bytes_unavailable`."""
-    return ProbeOut("|".join(frame.read_bytes().decode() for frame in payload.frames))
+    """Read the BYTES of every element — the call that used to refuse `asset_bytes_unavailable`.
+
+    The note is length + digest rather than the decoded text: since cr-012 an `ImageAsset`
+    field admits only image media types, so the elements are real PNGs and a `.decode()`
+    would be reading a picture as a string.
+    """
+    import hashlib as _hashlib
+
+    return ProbeOut(
+        "|".join(
+            f"{len(body)}:{_hashlib.sha256(body).hexdigest()[:8]}"
+            for body in (frame.read_bytes() for frame in payload.frames)
+        )
+    )
 
 
 @PROBE.job
@@ -130,6 +144,26 @@ def spender(payload: ProbeIn, budget: Budget) -> ProbeOut:
     del payload
     budget.raise_if_exhausted()
     return ProbeOut("the cap did not bite")
+
+
+def _tiny_png(index: int) -> bytes:
+    """A real 1x1 RGB PNG, one per index, built here so the three elements differ."""
+    import struct
+    import zlib
+
+    raw = bytes([0, index * 40 % 256, 0, 0])  # one filter byte + one RGB pixel
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 
 
 def head(title: str) -> None:
@@ -599,23 +633,39 @@ def _container_asset_arm() -> None:
     staged = workspace / "in"
     staged.mkdir(parents=True, exist_ok=True)
     refs = []
+    # cr-012: an input asset is a GRANTED READ CAPABILITY, not a location a request may name.
+    # The supervisor fetches, verifies and spools every one BEFORE acceptance and hands the
+    # executor identified files; this driver stands in for that half, because the claim under
+    # test is what the KERNEL does with a list of them — hydrate every element, or none.
+    grants = {}
+    expected: list[str] = []
     for index in range(3):
-        blob = staged / f"{index}.bin"
-        blob.write_bytes(b"frame-%d" % index)
+        blob = staged / f"{index}.png"
+        body = _tiny_png(index)
+        blob.write_bytes(body)
         refs.append(f"file://{blob}")
+        expected.append(f"{len(body)}:{hashlib.sha256(body).hexdigest()[:8]}")
+        grants[f"frames.{index}"] = GrantedInput(
+            input_id=f"frames.{index}",
+            local=blob,
+            media_type="image/png",
+            digest="sha256:" + hashlib.sha256(body).hexdigest(),
+            length=len(body),
+            order=index,
+        )
     from cozy_runtime.author import attempt
     from cozy_runtime.author._invoke import Invocation
 
     envelope, outcome, _ = attempt(
         PROBE.get("reads_a_list"),
         {"frames": refs},
-        Invocation(request_id="hydrate", spool=workspace / "spool", deadline=1e18),
+        Invocation(request_id="hydrate", spool=workspace / "spool", deadline=1e18, assets=grants),
     )
     note = envelope.result.note if envelope else f"{outcome.code}: {outcome.message}"
     check(
         "every element of a list[ImageAsset] arrives HYDRATED at the handler",
-        note == "frame-0|frame-1|frame-2",
-        note[:120],
+        note == "|".join(expected),
+        f"{note[:120]} (wanted {'|'.join(expected)})",
     )
 
 

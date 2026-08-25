@@ -258,6 +258,44 @@ LIVE_ARMS = (
         "raise SystemExit('DEGRADED rather than refused: ' + plan.quantified_choice[-150:])\n",
         "DEGRADED",
     ),
+    # The two arms cl-003's second-1024px defect earned. Both are pure arithmetic over a
+    # ledger whose numbers are the ones this box actually measured on the four-component
+    # pipeline, so the fence is provable without a card.
+    (
+        "chooser-refuses-an-unreconciled-ledger",
+        LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
+        "ledger.unreconciled = 'device_allocated: +67108864 B unaccounted across the attempt'\n"
+        "try:\n"
+        "    chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        "except PlanRefusal as exc:\n"
+        "    assert exc.code == 'ledger_unreconciled', exc.code\n"
+        "    raise SystemExit(exc.detail[:220])\n",
+        "no rung may be priced against it",
+    ),
+    (
+        "absent-components-are-priced-back",
+        # THE EXACT SHAPE cl-003 CAUGHT: a staged attempt left the generation holding the VAE
+        # alone, so a ladder that reads only the resident map sees 167 MB of weights, nearly
+        # the whole card allocatable, and calls `all_resident` a fit — with the 6.3 GiB it
+        # would have to re-stage charged to nobody. Measured numbers, from the real run.
+        LADDER + "ledger.resident = {'vae': 167_307_726}\n"
+        "ledger.evicted = {'unet': 5_134_927_368, 'text_encoder_2': 1_389_319_680,\n"
+        "                  'text_encoder': 246_120_960}\n"
+        "ledger.device_free = 7_424_000_000\n"
+        "ledger.device_allocated = 175_839_744\n"
+        "ledger.device_reserved = 200_000_000\n"
+        "plan = chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        "row = next(r for r in chooser.walks[-1]['rungs'] if r['rung'] == 'all_resident')\n"
+        "assert row['absent_bytes'] == 6_770_368_008, row\n"
+        "assert row['verdict'] == 'short', row\n"
+        "assert plan.placement == 'component_staged', plan.quantified_choice\n"
+        "assert plan.reserved_vram_bytes == 6_937_675_734, plan.reserved_vram_bytes\n"
+        "raise SystemExit('priced the absent weights: all_resident needs ' +\n"
+        "    str(row['needs_bytes']) + ' B (of which ' + str(row['absent_bytes']) +\n"
+        "    ' B is weight it must bring BACK) against ' + str(row['capacity_bytes']) +\n"
+        "    ' B capacity -> ' + row['verdict'] + '; chose ' + plan.placement)\n",
+        "priced the absent weights",
+    ),
     (
         "host-move-doomed-refuses-before-the-oom-killer",
         "from cozy_runtime.internal.worker.ledger import Ledger, read_host_available\n"
