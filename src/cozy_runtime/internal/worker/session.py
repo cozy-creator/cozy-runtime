@@ -117,6 +117,10 @@ class Fences:
     intake: pb.IntakeState = pb.IntakeState.INTAKE_STATE_BOOTING
     wire_minor: int = 0
     activity: list[pb.ActivityEvent] = field(default_factory=list)
+    mode: str = ""  # the Directive `mode` oneof this worker APPLIED: "serving", "job", or
+    #                 "" before any directive. READ from `WhichOneof`, never inferred from
+    #                 what happens to be in `bindings`/`jobs` — the schema already carries
+    #                 the discriminator and a second derivation of it is free to disagree.
 
 
 class Supervisor:
@@ -343,6 +347,11 @@ class Supervisor:
         self.fences.wire_minor = directive.wire_minor
         if directive.HasField("credential"):
             self.fences.credential_epoch = directive.credential.epoch
+        # THE MODE, taken from the schema's own discriminator. A Directive is a
+        # discriminated COMPLETE replacement, so the mode it carries is the mode this
+        # worker is in until the next revision — and the Report's capacity oneof is scoped
+        # by exactly this value.
+        self.fences.mode = directive.WhichOneof("mode") or ""
         if directive.HasField("job"):
             self.apply_job_directive(directive.job)
             return
@@ -351,6 +360,12 @@ class Supervisor:
             return
 
         self.bindings = {}
+        # SYMMETRIC with `apply_job_directive` clearing `bindings`. A serving directive
+        # replaces the job lane too: leaving a previous revision's job plans behind would
+        # leave the worker advertising job capacity it will not honour, and "complete
+        # replacement" has to mean complete in both directions.
+        self.jobs = {}
+        self.engine.jobs = {}
         for plan_id in directive.serving.entrypoint_binding_plan_ids:
             record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
             if not record.is_file():
@@ -980,7 +995,19 @@ class Supervisor:
                 self.send(pb.WorkerMessage(report=self.report()))
 
     def report(self) -> pb.Report:
-        return pb.Report(
+        """The Report tick. `capacity` is a ONEOF and it is scoped to the applied MODE.
+
+        Setting both members is not "reporting both": in protobuf a oneof holds exactly
+        one member, and the second assignment CLEARS the first. cr-009 added
+        `job_capacity=` beside `serving_capacity=` in this constructor and every serving
+        worker silently began advertising zero ready plans, so no coordinator could
+        dispatch to it — output-verified by cl-006's A/B against 54effcc. There is no
+        "both" to express and there never was: a Directive is a discriminated complete
+        replacement, so a worker is in ONE mode and reports ONE capacity. Before any
+        directive it reports NEITHER, which readers already see as empty — an honest
+        "no claim yet" rather than a fabricated zero.
+        """
+        report = pb.Report(
             session_id=self.fences.session_id,
             executor_incarnation=self.supervision.incarnation,
             applied_revision=self.fences.revision,
@@ -991,21 +1018,35 @@ class Supervisor:
             faults=self.engine.faults[-8:],
             activity=self.fences.activity[-8:],
             applied_wire_minor=self.fences.wire_minor,
-            serving_capacity=pb.ServingCapacity(
-                ready_entrypoint_binding_plan_ids=sorted(
-                    self.supervision.current.ready_plans if self.supervision.current else ()
-                ),
-                free_vram_bytes=0,
+        )
+        if self.fences.mode == "job":
+            report.job_capacity.CopyFrom(self.job_capacity())
+        elif self.fences.mode == "serving":
+            report.serving_capacity.CopyFrom(self.serving_capacity())
+        return report
+
+    def serving_capacity(self) -> pb.ServingCapacity:
+        """Which entrypoint binding plans this worker can serve RIGHT NOW.
+
+        The ready set is the executor's, not the directive's: a plan the hub named but the
+        executor has not prepared is not ready, which is what makes READY mean
+        first-request-servable rather than connected.
+        """
+        return pb.ServingCapacity(
+            ready_entrypoint_binding_plan_ids=sorted(
+                self.supervision.current.ready_plans if self.supervision.current else ()
             ),
-            job_capacity=self.job_capacity(),
+            free_vram_bytes=0,
         )
 
     def job_capacity(self) -> pb.JobCapacity:
         """How many JOB attempts this worker can take right now (cr-009).
 
         Law 8 in the job lane: one active attempt per device group, so a worker with a live
-        job attempt advertises zero available. `jobs_available` is 0 in serving mode too —
-        it is not "unknown", it is "this worker takes no job", which is the honest answer.
+        job attempt advertises zero available. It is only ever called in JOB mode: a
+        serving worker does not report a zero here, it reports no job capacity at all,
+        because the oneof cannot carry both and a zero would be a claim rather than a
+        silence.
         """
         in_flight = sum(1 for a in self.engine.live.values() if a.job is not None)
         ready = bool(self.jobs) and self.fences.intake == pb.IntakeState.INTAKE_STATE_READY
