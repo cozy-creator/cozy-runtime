@@ -380,11 +380,19 @@ class Checkpoint:
         for role, part in entry["parts"].items():
             shape = tuple(int(n) for n in part["shape"])
             width = self.tensorfs.DTYPES.get(str(part["dtype"]))
-            if width is None:
+            if width is None or str(part["dtype"]) not in TORCH_DTYPES:
+                # BOTH directions, for the same reason the logical row checks both: a
+                # carrier dtype TensorFS knows and this runtime has no torch spelling for
+                # would otherwise reach the scratch allocation as a KeyError, which is an
+                # implementation detail escaping where a refusal belongs.
+                why = (
+                    "this build of TensorFS does not know"
+                    if width is None
+                    else "TensorFS knows and this runtime has no torch binding for"
+                )
                 raise _refuse(
                     "dtype_mismatch",
-                    f"{key}: role {role!r} is stored as {part['dtype']!r}, which this "
-                    "build of TensorFS does not know",
+                    f"{key}: role {role!r} is stored as {part['dtype']!r}, which {why}",
                     [key],
                 )
             nbytes = width
