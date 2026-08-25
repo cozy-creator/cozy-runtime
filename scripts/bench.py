@@ -57,6 +57,7 @@ import tiny_sdxl as ep
 from tiny_diffusers import TinySdxlPipeline
 from cozy_runtime.author import Invocation, ModelRegistry, describe, invoke
 from cozy_runtime.author._loader import census
+from cozy_runtime.author._services import Attempt
 from cozy_runtime.author.fakes import (fake_attempt, fake_context, fake_outputs,
                                        invoke_with_fakes)
 from cozy_runtime.internal.residency import StagedBackend
@@ -97,7 +98,8 @@ for label, app in (("tiny_sdxl — 4 entrypoints", ep.app), ("tiny_h3 — 2 entr
     print(f"  {{'describe(' + label + '), once':<46}} {{(time.perf_counter()-t0)*1000:9.3f}} ms")
 
 kernel = bench("invoke(plan): decode+overlay+features+inject+validate",
-               lambda: invoke(ep.app.get('plan'), {{"prompt": "bench"}}, inv))
+               lambda: invoke(ep.app.get('plan'), {{"prompt": "bench"}}, inv,
+                              Attempt("bench", inv.spool)))
 handler = bench("the same handler called directly, no kernel",
                 lambda: ep.plan(payload, models['model']))
 print(f"  {{'-> injection + validation overhead per call':<46}} {{kernel - handler:9.1f}} us/call")
