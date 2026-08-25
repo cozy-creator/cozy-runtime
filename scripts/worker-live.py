@@ -362,6 +362,28 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     }
 
 
+def prefill_journal(root: Path, target_bytes: int) -> int:
+    """Grow a REAL journal to just under the planted file-size limit, using the real writer.
+
+    The ENOSPC plant used to be `RLIMIT_FSIZE=440` against an empty journal, on the reasoning
+    that the journal was the one regular file the supervisor wrote. Since tfs-007 that is no
+    longer true: registering a GC-safe read hold updates the STORE's own state file (502 B),
+    so a 440 B limit now kills PREPARATION and the arm never reaches its subject. Growing the
+    journal first keeps the limit comfortably above everything else the worker writes while
+    still making the ACCEPTANCE append the write that fails — which is the arm.
+    """
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal.journal import Journal
+
+    path = root / "journal.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    journal = Journal(path)
+    while path.stat().st_size < target_bytes:
+        journal.append("session", {"session_id": "pre-fill", "instance_id": "pre-fill"})
+    journal.close()
+    return path.stat().st_size
+
+
 def working_store(at: Path) -> str:
     """A HARDLINKED working copy of the read-only bench CAS: a TensorFS lease registers a
     GC-safe hold, which is a write, and the bench store is read-only by standing rule."""
@@ -1664,7 +1686,12 @@ def section_journal(args: argparse.Namespace) -> None:
     idle = gpu_used_mib()
 
     head("a journal that cannot durably commit acknowledges NOTHING and executes NOTHING")
-    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True, rlimit_fsize=440)
+    # 3,600 B leaves room for the supervisor's own boot `session` row (~200 B) under the
+    # 4,096 B limit, and none for the acceptance row after it — which is the write the arm
+    # is about. Grown too far, the plant bites at boot and the arm never reaches its subject.
+    grown = prefill_journal(tmp / "worker", 3600)
+    print(f"  the journal starts at {grown} B under a 4096 B planted file-size limit")
+    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True, rlimit_fsize=4096)
     hub = worker.hub
     plan_id = plan_id_for("denoise")
     try:
