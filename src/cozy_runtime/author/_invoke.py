@@ -20,7 +20,7 @@ import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import msgspec
 
@@ -60,7 +60,7 @@ from cozy_runtime.author._services import (
     Telemetry,
 )
 from cozy_runtime.author._signature import Param, Surface
-from cozy_runtime.author._walker import field_values, walk
+from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,14 +223,35 @@ def _preflight(surface: Surface, overlay: Overlay, inv: Invocation) -> tuple[obj
 _CARRIES: dict[tuple[object, str], bool] = {}
 
 
+def _reaches(annotation: object, kind: type, depth: int = 0) -> bool:
+    """Whether `kind` is reachable from ONE annotation, THROUGH containers and unions.
+
+    The type walker emits a node per FIELD and descends struct-bearing members, so a
+    `list[ImageAsset]` field is emitted as a node whose annotation is the LIST — and asking
+    `issubclass(list[ImageAsset], Asset)` is false. That made a list of assets declare no
+    assets, so `_hydrate` was skipped and every element arrived unhydrated: `read_bytes()`
+    then refused with `asset_bytes_unavailable`, which reads like a preflight violation and
+    is nothing of the kind. Found live by ev-003's judge endpoint (decisions #303), worked
+    around there by wrapping each asset in a one-asset struct.
+
+    The SILENT half was the defect. It is fixed rather than refused, because a
+    `list[ImageAsset]` is an ordinary declaration and `assets_in` already collects one
+    correctly at the VALUE level — only this predicate could not see it.
+    """
+    if depth > 8:  # a bound, not a cycle guard: annotations are trees, and shallow ones
+        return False
+    base, _ = strip(annotation)
+    base, _ = unwrap_optional(base)
+    if isinstance(base, type) and issubclass(base, kind):
+        return True
+    return any(_reaches(arg, kind, depth + 1) for arg in get_args(base))
+
+
 def _declares(tp: object, kind: type) -> bool:
     key = (tp, kind.__name__)
     carries = _CARRIES.get(key)
     if carries is None:
-        carries = _CARRIES[key] = any(
-            isinstance(node.annotation, type) and issubclass(node.annotation, kind)
-            for node in walk(tp)
-        )
+        carries = _CARRIES[key] = any(_reaches(node.annotation, kind) for node in walk(tp))
     return carries
 
 

@@ -50,7 +50,14 @@ FAIL = 0
 
 import msgspec  # noqa: E402
 
-from cozy_runtime.author import App, Budget, Checkpoints, Scratch  # noqa: E402
+from cozy_runtime.author import (  # noqa: E402
+    App,
+    Budget,
+    Checkpoints,
+    ImageAsset,
+    Scratch,
+    Tree,
+)
 
 PROBE = App()
 
@@ -90,6 +97,32 @@ def conflicting(payload: ProbeIn, ckpt: Checkpoints) -> ProbeOut:
         return ProbeOut("a conflicting save was ACCEPTED")
     except Exception as exc:
         return ProbeOut(f"{first.receipt_id}|replayed={replay.replayed}|{type(exc).__name__}")
+
+
+class OneAsset(msgspec.Struct):
+    one: ImageAsset
+
+
+class ListOfAssets(msgspec.Struct):
+    frames: list[ImageAsset]
+
+
+class OptionalAsset(msgspec.Struct):
+    one: ImageAsset | None = None
+
+
+class MapOfTrees(msgspec.Struct):
+    trees: dict[str, Tree] | None = None
+
+
+class NoAssets(msgspec.Struct):
+    n: int = 1
+
+
+@PROBE.job
+def reads_a_list(payload: ListOfAssets) -> ProbeOut:
+    """Read the BYTES of every element — the call that used to refuse `asset_bytes_unavailable`."""
+    return ProbeOut("|".join(frame.read_bytes().decode() for frame in payload.frames))
 
 
 @PROBE.job
@@ -478,8 +511,112 @@ def section_arms() -> None:
         not ungranted.outputs,
         f"outputs={sorted(ungranted.outputs)}",
     )
-
+    _oversize_arm()
+    _container_asset_arm()
     _service_arms()
+
+
+def _oversize_arm() -> None:
+    """A payload over the CONTROL SEAM cap refuses BEFORE acceptance, and never hangs.
+
+    ev-003 measured the defect (decisions #302): 73,721 B was ACCEPTED and then the dispatch
+    frame raised a supervisor-side SeamError, so no terminal was ever produced and the run
+    hung until its readiness deadline — which only fires for a run that never dispatched.
+    The check moved to the acceptance boundary, where the law already says everything either
+    completes or refuses typed. Armed on the JOB lane; the code is shared with serving.
+    """
+    from cozy_runtime.internal.local import LocalRequest, run_slice
+    from cozy_runtime.internal.worker.attempts import PAYLOAD_MAX_BYTES
+    from cozy_runtime.internal.worker.session import WorkerOptions
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    workspace = fresh("oversize")
+    record = job_record()
+    fat = dict(payload())
+    fat["snapshots"] = {
+        **fat["snapshots"],
+        **{f"pad{i:04d}": "sha256:" + "0" * 64 for i in range(1200)},
+    }
+    started = time.perf_counter()
+    outcome = run_slice(
+        config_for(workspace / "home"),
+        LocalRequest(
+            entrypoint="census",
+            payload=fat,
+            outputs=("census",),
+            request_id="job-fat",
+            kind="job",
+            job_descriptor_id=record["job_descriptor_id"],
+            trees={REF: str(STORE)},
+        ),
+        [],
+        job_records=[record],
+        workspace=workspace,
+        release_id=record["build_id"],
+        options=WorkerOptions(
+            root=workspace / "worker", release_id=record["build_id"], no_warm=True
+        ),
+    )
+    elapsed = time.perf_counter() - started
+    cause = (outcome.terminal.get("cause") or {}) if outcome.terminal else {}
+    check(
+        "a payload over the control-seam cap refuses PRE-ACCEPT, and does not hang",
+        outcome.status == "TERMINAL_STATUS_REFUSED"
+        and int(cause.get("code", 0)) == pb.CauseCode.CAUSE_CODE_INVALID_REQUEST
+        and elapsed < 60,
+        f"{outcome.status} / {pb.CauseCode.Name(int(cause.get('code', 0)))} in {elapsed:.1f} s "
+        f"(cap {PAYLOAD_MAX_BYTES} B): "
+        f"{str(outcome.terminal.get('safe_message', ''))[:110]}",
+    )
+    check(
+        "the refusal is journaled and nothing was ACCEPTED",
+        not any(row.get("kind") == "accepted" for row in outcome.journal),
+        " ".join(str(row.get("kind")) for row in outcome.journal),
+    )
+
+
+def _container_asset_arm() -> None:
+    """An asset inside a CONTAINER declares assets, so hydration runs (ev-003, #303).
+
+    The type walker emits a node per FIELD, so a `list[ImageAsset]` field's annotation is the
+    LIST — and the old predicate asked `issubclass(list[ImageAsset], Asset)`, which is false.
+    Hydration was then skipped SILENTLY and every element arrived unhydrated. Fixed rather
+    than refused: a list of assets is an ordinary declaration.
+    """
+    from cozy_runtime.author._invoke import declares_assets, declares_trees
+
+    rows = [
+        ("ImageAsset (the case that always worked)", declares_assets(OneAsset), True),
+        ("list[ImageAsset]", declares_assets(ListOfAssets), True),
+        ("ImageAsset | None", declares_assets(OptionalAsset), True),
+        ("dict[str, Tree] | None", declares_trees(MapOfTrees), True),
+        ("a schema with neither", declares_assets(NoAssets), False),
+    ]
+    for label, got, want in rows:
+        check(f"declares_assets: {label}", got is want, f"-> {got}")
+
+    workspace = fresh("hydrate")
+    staged = workspace / "in"
+    staged.mkdir(parents=True, exist_ok=True)
+    refs = []
+    for index in range(3):
+        blob = staged / f"{index}.bin"
+        blob.write_bytes(b"frame-%d" % index)
+        refs.append(f"file://{blob}")
+    from cozy_runtime.author import attempt
+    from cozy_runtime.author._invoke import Invocation
+
+    envelope, outcome, _ = attempt(
+        PROBE.get("reads_a_list"),
+        {"frames": refs},
+        Invocation(request_id="hydrate", spool=workspace / "spool", deadline=1e18),
+    )
+    note = envelope.result.note if envelope else f"{outcome.code}: {outcome.message}"
+    check(
+        "every element of a list[ImageAsset] arrives HYDRATED at the handler",
+        note == "frame-0|frame-1|frame-2",
+        note[:120],
+    )
 
 
 def _service_arms() -> None:

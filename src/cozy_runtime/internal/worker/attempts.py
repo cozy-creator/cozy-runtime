@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, seam
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -79,6 +79,13 @@ def _features(payload: Mapping[str, Any], entrypoint: str) -> dict[str, Any]:
         "payload_bytes": len(canonical.write(dict(payload))),
     }
 
+
+#: What a request DOCUMENT may weigh, checked at the acceptance boundary. The seam admits
+#: one 64 KiB frame; the dispatch command wraps the payload in ids, paths, tree grants and
+#: budget facts, so the payload's own share is the frame less a generous envelope. It is a
+#: PRE-ACCEPT condition (ev-003, decisions #302): over it, the old path accepted the attempt
+#: and then hung on a supervisor-side SeamError with no terminal ever produced.
+PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 
 #: Fields the supervisor structurally CANNOT verify. Named on every terminal that carries
 #: them, sorted, because a claim printed as a measurement is worse than no number.
@@ -387,6 +394,38 @@ class AttemptEngine:
                 cause=code,
                 origin=cause_origin,
             ) from exc
+        self._check_control_size(attempt)
+
+    @staticmethod
+    def _check_control_size(attempt: Attempt) -> None:
+        """The payload must FIT THE CONTROL SEAM, checked BEFORE durable acceptance.
+
+        The seam carries control, not data: one frame is capped at 64 KiB precisely so that
+        "a caller trying to move tensors or media through here fails immediately". It did not
+        fail immediately. Measured by ev-003 (decisions #302): a 73,721 B request is accepted,
+        the dispatch frame then raises a supervisor-side `SeamError` AFTER acceptance, and the
+        run HANGS — `LocalCoordinator` only deadlines a run that never dispatched. A 42,719 B
+        request on the same path succeeds.
+
+        That violates the acceptance-boundary law directly: everything before the journal
+        either completes or raises a typed PRE-ACCEPT refusal. So the size is a condition of
+        acceptance, it is the CALLER's typed error (the bytes are theirs), and the refusal
+        names both the cap and the remedy — media rides as ASSETS, hydrated into the attempt
+        spool, which is the shape the author surface already has.
+        """
+        size = len(canonical.write(dict(attempt.payload)))
+        if size <= PAYLOAD_MAX_BYTES:
+            return
+        raise AttemptRefusal(
+            "payload_over_control_cap",
+            f"the request document canonicalizes to {size} B and the supervisor/executor "
+            f"control seam admits {PAYLOAD_MAX_BYTES} B per payload (one {seam.MAX_FRAME} B "
+            "frame, less this attempt's own command envelope). The seam carries CONTROL: "
+            "media and tensors ride as typed Assets, which the runtime hydrates into the "
+            "attempt spool and the handler reads from there",
+            cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
+            origin=ORIGIN.CAUSE_ORIGIN_CLIENT,
+        )
 
     def _accept_job(self, attempt: Attempt) -> pb.AttemptAccepted:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
