@@ -221,6 +221,8 @@ class Attempt:
     subject_id: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: cr-009's PublicationReceipt document, once the output transaction committed one
+    publication: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
@@ -1561,11 +1563,43 @@ class AttemptEngine:
         except grants.GrantRefusal as exc:
             grants.abort_outputs(spool)
             return None, f"{exc.code}: {exc.detail}"
-        return (
-            pb.OutputManifest(
-                manifest_id=f"man-{attempt.request_id}-{attempt.attempt}", outputs=entries
+        receipt = self._publication(attempt, entries)
+        try:
+            # DURABLE BEFORE IT IS CLAIMED, exactly like the triage bundle: a terminal may
+            # only name a receipt that already exists. The bytes are at their granted
+            # destinations by now, so a journal that cannot commit makes this a FAILED
+            # attempt naming why — never a publication nobody has a record of.
+            self.journal.append("publication", receipt.document())
+        except JournalError as exc:
+            return None, (
+                f"publication_not_durable: {exc.code} — this attempt wrote its outputs and "
+                "the worker cannot durably record what it published, so it claims nothing"
+            )
+        attempt.publication = receipt.document()
+        return pb.OutputManifest(manifest_id=receipt.digest(), outputs=entries), None
+
+    def _publication(
+        self, attempt: Attempt, entries: list[pb.OutputEntry]
+    ) -> grants.PublicationReceipt:
+        """The typed subject of ONE publication, from what this attempt was actually given."""
+        job = attempt.spec.get("job") or {}
+        contract = job.get("publication_contract") or {}
+        return grants.PublicationReceipt(
+            mode="job" if attempt.job is not None else "serving",
+            grant_id=str(contract.get("grant_id", "")),
+            build_id=(
+                attempt.job.build_id
+                if attempt.job is not None
+                else (attempt.binding.release if attempt.binding else "")
             ),
-            None,
+            subject_id=(
+                attempt.job.job_descriptor_id
+                if attempt.job is not None
+                else (attempt.binding.plan_id if attempt.binding else "")
+            ),
+            request_id=attempt.request_id,
+            attempt=attempt.attempt,
+            outputs=tuple(entries),
         )
 
     @staticmethod

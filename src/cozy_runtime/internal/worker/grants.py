@@ -361,6 +361,63 @@ def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Pat
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationReceipt:
+    """ONE canonical bundle snapshot per publication (cr-009).
+
+    What an attempt actually wrote, as a document with its own identity: the scope it wrote
+    under, whose build wrote it, which attempt, and every entry with its digest and length.
+    A coordinator validates it by recomputing this document from what it already holds —
+    the publication contract it minted and the manifest on the terminal — and roots and
+    projects on the digest. Before this there was no single typed subject per publication,
+    so the Creator side was reading the mid-attempt CHECKPOINT lane to infer one, which is
+    a durability lane for a job's own progress and not a record of what it published
+    (cl-004).
+
+    The identity travels as `OutputManifest.manifest_id`. That field used to be a label
+    (`man-<request>-<attempt>`) which named nothing a reader could check.
+    """
+
+    mode: str
+    """`job` or `serving`. One rule for both, so there is one spelling of the field."""
+    grant_id: str
+    """The publication contract's scope — the scratch repo a job's writes are rewritten
+    into. Empty on the serving lane, which publishes into granted destinations only."""
+    build_id: str
+    subject_id: str
+    """`job_descriptor_id` in job mode, `entrypoint_binding_plan_id` in serving mode."""
+    request_id: str
+    attempt: int
+    outputs: tuple[pb.OutputEntry, ...]
+
+    def document(self) -> dict[str, Any]:
+        rows = sorted(self.outputs, key=lambda entry: entry.output_id)
+        return {
+            "format": "cozy.runtime.PublicationReceipt/1",
+            "mode": self.mode,
+            "grant_id": self.grant_id,
+            "build_id": self.build_id,
+            "subject_id": self.subject_id,
+            "request_id": self.request_id,
+            "attempt": self.attempt,
+            "outputs": [
+                {
+                    "output_id": entry.output_id,
+                    "digest": "sha256:" + entry.digest.hex(),
+                    "length": int(entry.length),
+                    "media_type": entry.mime_type,
+                }
+                for entry in rows
+            ],
+            "total_bytes": sum(int(entry.length) for entry in rows),
+        }
+
+    def digest(self) -> str:
+        from cozy_runtime.internal import canonical
+
+        return canonical.digest(self.document())
+
+
 def write_output(
     grant: pb.DeliveryGrant,
     output_id: str,

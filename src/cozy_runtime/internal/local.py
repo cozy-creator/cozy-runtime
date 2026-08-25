@@ -108,6 +108,9 @@ class SliceOutcome:
     result_schema_digest: str = ""
     accepted: dict[str, Any] = field(default_factory=dict)
     manifest: list[dict[str, Any]] = field(default_factory=list)
+    #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
+    #: journaled before the terminal named it. `manifest_id` on the terminal IS its digest.
+    publication: dict[str, Any] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     ledger: dict[str, Any] = field(default_factory=dict)
     reconciliation: dict[str, Any] = field(default_factory=dict)
@@ -756,6 +759,9 @@ def _collect(
         outcome.result_schema_digest = str(envelope.get("result_schema_digest", ""))
         manifest = body.get("output_manifest") or {}
         outcome.manifest = list(manifest.get("outputs", ()))
+        outcome.publication = next(
+            (row["body"] for row in outcome.journal if row.get("kind") == "publication"), {}
+        )
         for row in outcome.manifest:
             path = coordinator.destination(str(row.get("output_id", "")))
             if path.is_file():
