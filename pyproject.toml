@@ -69,7 +69,7 @@ ignore_missing_imports = true
 # `huggingface_hub` is a CORPUS-venv dependency the fixture staging reaches for once, to
 # fetch a tokenizer merges file the bench download skipped. Not a runtime dependency and
 # not present in the checking venv.
-module = ["huggingface_hub"]
+module = ["huggingface_hub", "diffusers", "diffusers.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

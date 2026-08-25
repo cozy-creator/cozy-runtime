@@ -466,6 +466,95 @@ def section_stage(args: argparse.Namespace) -> None:
     print(f"  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
 
 
+def section_poison(args: argparse.Namespace) -> None:
+    """Evict, POISON the freed pages, re-stage, compare. ~350 MiB, so it runs anywhere.
+
+    The check the first hand-written one was missing. Evict-then-stage FINGERPRINTED
+    IDENTICAL while the pipeline produced a black image, because a warm allocator returned
+    the freed pages with their old contents and the fill had been skipped entirely. A
+    correctness check on bytes has to run against memory that was deliberately overwritten,
+    or it is checking a coincidence.
+    """
+    import torch
+
+    from cozy_runtime.author import Model, ModelRegistry, uses_components
+    from cozy_runtime.author._loader import Artifact, Config
+    from cozy_runtime.internal.derive import Observations, serving_substrate
+    from cozy_runtime.internal.fill import (
+        Checkpoint,
+        ResourceLedger,
+        StreamingFillBackend,
+        _tensors,
+        topology_of,
+    )
+
+    head("evict -> poison the freed pages -> re-stage -> compare")
+    have = snapshots()
+    checkpoints = {"vae": Checkpoint(str(STORE), have["vae"])}
+    rows = checkpoints["vae"].rows("vae")
+    ledger = ResourceLedger(budgets={"vram": 2 * GIB, "pinned": 256 * MIB})
+    backend = StreamingFillBackend(
+        checkpoints, rows, ledger=ledger, window_bytes=4 * MIB, slots=16, readers=16, inflight=8
+    )
+    backend.hold_lease = True
+    config = json.loads(CONFIG.read_text())
+
+    class OnlyVae:
+        def __init__(self, bound: Config) -> None:
+            from diffusers import AutoencoderKL
+
+            self.components = {
+                "vae": AutoencoderKL.from_config(bound.mapping()["vae"]).to(torch.float16)
+            }
+
+    class VaeModel(Model[OnlyVae]):
+        pipe: OnlyVae
+
+        def load(self, loader: Any) -> None:
+            self.pipe = loader.construct(OnlyVae, factory=OnlyVae)
+
+        @uses_components("vae")
+        def touch(self) -> None:
+            return None
+
+    registry = ModelRegistry(
+        release="cr-008b",
+        backend=backend,
+        substrate=lambda: serving_substrate("sm89", Observations()),
+    )
+    artifact = Artifact(
+        have["vae"], topology_of(rows), Config(config, "pipeline.config"), custody="canonical"
+    )
+    backend.expect({"vae": tuple(row.key for row in rows)})
+    registry.acquire("poison.models.model", VaeModel, artifact)
+
+    def fingerprint() -> dict[str, float]:
+        member = backend.components["vae"]
+        return {k: float(t.detach().float().sum()) for k, t in list(_tensors(member))[:8]}
+
+    before = fingerprint()
+    freed = backend.evict("vae")
+    poison = torch.full((freed // 2,), 31415.0, dtype=torch.float16, device="cuda")
+    del poison
+    torch.cuda.empty_cache()
+    row = backend.stage("vae")
+    after = fingerprint()
+    check(
+        "the re-staged component is BIT-IDENTICAL after its freed pages were overwritten",
+        before == after,
+        f"{freed} B freed, poisoned, re-staged in {row['ms']} ms; "
+        f"{len(before)} sampled tensors, {len([k for k in before if before[k] != after[k]])} "
+        "differing",
+    )
+    check(
+        "and the stage rate is physically possible",
+        row["ms"] > 0 and (row["bytes"] / MIB) / (row["ms"] / 1000) < 40_000,
+        f"{(row['bytes'] / MIB) / (row['ms'] / 1000):.0f} MiB/s — the defect that produced a "
+        "black image announced itself as 4.78 GiB in 43 ms, which no disk can produce",
+    )
+    backend.close()
+
+
 def section_arms(args: argparse.Namespace) -> None:
     """The typed refusals: undeclared access, capacity floor, and the host-move guard."""
     require_quiet_card()
@@ -806,7 +895,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="cr-008b four-component pipeline verification")
     parser.add_argument(
         "section",
-        choices=("exec", "fixtures", "stage", "arms", "image", "bandwidth", "all"),
+        choices=("exec", "fixtures", "poison", "stage", "arms", "image", "bandwidth", "all"),
     )
     parser.add_argument("--tmp", default="/tmp/cozy-pipe")
     parser.add_argument("--spec", default="")
@@ -831,6 +920,7 @@ def main() -> int:
     Path(args.tmp).mkdir(parents=True, exist_ok=True)
     sections = {
         "fixtures": section_fixtures,
+        "poison": section_poison,
         "stage": section_stage,
         "arms": section_arms,
         "image": section_image,
