@@ -166,7 +166,6 @@ class Executor:
             readers=binding.get("readers", 16),
             inflight=binding.get("inflight", 8),
         )
-        backend.expect({binding["component"]: tuple(row.key for row in rows)})
         artifact = Artifact(
             binding["snapshot"],
             topology_of(rows),
@@ -181,6 +180,11 @@ class Executor:
         )
         model_cls = getattr(self.discovered.module, binding["model_class"])
         try:
+            # `expect` is INSIDE the handler because it now takes the verified read lease:
+            # a corrupt artifact refuses here, before construction and before a single
+            # destination is reserved, and that refusal is a typed fill refusal like any
+            # other rather than an exception escaping the prepare path.
+            backend.expect({binding["component"]: tuple(row.key for row in rows)})
             model = registry.acquire(binding["binding_path"], model_cls, artifact)
         except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
             # cr-005's transaction already rolled the generation back on the way out. The
@@ -194,6 +198,7 @@ class Executor:
             # reserved against a DECLARED budget; the device is what actually says no. The
             # request-aware ladder that would pick a plan that fits is cr-008b's.
             oom = not isinstance(exc, FillRefusal)
+            backend.release_lease()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info()

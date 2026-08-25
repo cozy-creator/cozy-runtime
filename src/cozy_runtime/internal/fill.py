@@ -31,7 +31,7 @@ on the boundary: this plane hands over the code-topology traversal and the store
 reads it, while every delivered batch names the destination its bytes belong to.
 
 **Verification is the store's job, and since tfs-007 it is done BY the store.** The interim
-Python CAS reader is gone (decisions #259): `Checkpoint` opens a real TensorFS store through
+Python CAS reader is gone (decisions #264): `Checkpoint` opens a real TensorFS store through
 the tfs-007 facade, `acquire()` takes a verified read lease whose GC-safe hold registers
 first, and `ReadLease.stream` drives a native reader pool into pinned slots this plane owns.
 Nothing here knows CAS layout, caches a file descriptor, or hashes an object. The ORDERING
@@ -244,7 +244,7 @@ class Checkpoint:
     reader pool and every refusal are the store's; what this plane adds is the projection
     from a header into the contract's rows and the H2D transaction on top of the stream.
 
-    It replaces cr-005's interim `CasStore` + `read_plan` outright (decisions #259). The
+    It replaces cr-005's interim `CasStore` + `read_plan` outright (decisions #264). The
     interim reader knew CAS layout, cached a file descriptor per (thread, object) and
     verified per object in Python; none of that survives, and none of it needs to.
     """

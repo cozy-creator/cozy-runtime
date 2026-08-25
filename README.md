@@ -50,6 +50,7 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/seam.py` | the control-only, byte-accounted supervisor<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
+| `internal/fill.py` | the fill plane: a TensorFS `Checkpoint`, the pinned ring, the transaction |
 
 The supervisor never imports torch, and that is proved against the RUNNING process
 (`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
@@ -105,9 +106,20 @@ fresh endpoint is `--check`-clean out of the box.
 Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
 real CAS, so they are BUILDER-RUN and never CI steps):
 
-    corpus/.venv/bin/python scripts/fill-real.py serve   # cr-005: the fill plane
-    corpus/.venv/bin/python scripts/worker-live.py all   # cr-007: the two-process worker
-    corpus/.venv/bin/python scripts/slice-live.py all    # cr-008a: one request, no network
+    corpus/.venv/bin/python scripts/worker-live.py attempt   # cr-007: the two-process worker
+    corpus/.venv/bin/python scripts/slice-live.py all        # cr-008a: one request, no network
+
+**TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
+extension that is not on an index yet, so the GPU venvs install a locally built wheel:
+
+    cd ../tensorfs && uvx maturin build --release \
+        --manifest-path crates/tensorfs-py/Cargo.toml --out /tmp/cozy-wheels
+    uv pip install --python corpus/.venv/bin/python /tmp/cozy-wheels/tensorfs-*.whl
+
+When TensorFS publishes, this becomes an ordinary pinned dependency and the step goes away.
+The base package installs and type-checks without it, exactly as it does without torch; a
+fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
+`ImportError` escaping a request.
 
 Two real endpoints on the author surface (weightless, no GPU), both driven end to end by
 `scripts/verify.py`:
