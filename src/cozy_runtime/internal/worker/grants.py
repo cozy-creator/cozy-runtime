@@ -11,10 +11,12 @@ is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and repor
 `Fault`, because a worker asking for something it was never granted is a fact an operator
 must see. Nothing widens the table at runtime; a new call site is a new reviewed row.
 
-Transport at launch is `file://` only, and that is a statement rather than a placeholder:
-the executor has no outbound network at all, and the supervisor's HTTPS fetch path (egress
-allowlist, SSRF fail-closed per redirect hop, presign re-plan) is cr-012's. An `https://`
-grant URL here refuses typed instead of being half-implemented.
+Two transports, one reader (cr-012). `file://` is the local deployment's own spool or CAS;
+`https://` goes out through `internal/egress.py`, which holds a declared allowlist, resolves
+fail-closed and re-applies the whole check on EVERY redirect hop. Both land in one bounded
+reader. The EXECUTOR still has no outbound network at all — every fetch happens here, in the
+supervisor, before acceptance, and the executor is handed verified files in the attempt
+spool.
 """
 
 from __future__ import annotations
@@ -58,6 +60,15 @@ HUB_CALLS: tuple[HubCall, ...] = (
         r"^file://(?P<path>/[\w./-]+)$",
         ("input_id",),
         "read one granted input asset (the payload rides the grant as an input)",
+    ),
+    HubCall(
+        "grant_input_fetch",
+        "GET",
+        r"^https://[\w.-]+(:\d+)?/[\w./?=&%~-]*$",
+        ("input_id",),
+        "fetch one granted input asset over the egress boundary (cr-012): the allowlist, "
+        "the per-hop SSRF check and the bounded reader all apply BELOW this row — this "
+        "table says the call may be made at all, not that the address is safe",
     ),
     HubCall(
         "grant_tree_read",
@@ -118,11 +129,42 @@ def _local(url: str, base: str) -> Path:
     if parsed.scheme != "file":
         raise GrantRefusal(
             "grant_transport",
-            f"{parsed.scheme or 'relative'}:// grant URLs need the supervisor HTTPS fetch "
-            "path (egress allowlist, SSRF fail-closed per hop, presign re-plan), which is "
-            "cr-012 — at launch this worker spends grants over file:// only",
+            f"{parsed.scheme or 'relative'}:// is not a local grant URL; an https grant is "
+            "fetched through the egress boundary (`internal/egress.py`), never opened here",
         )
     return Path(parsed.path)
+
+
+def _read_granted(url: str, base: str, *, declared: int, policy: Any, what: str) -> bytes:
+    """The ONE way a granted object's bytes enter this process (cr-012).
+
+    Two transports and one reader. `file://` is the local deployment's own CAS or spool;
+    `https://` goes through the egress boundary, which re-validates every redirect hop.
+    Both land in `read_bounded`, which holds the stream to the smaller of the grant's
+    declared length and the deployment cap — there is deliberately no second downloader,
+    because "two downloaders and only one had the check" is the failure this shape exists
+    against.
+    """
+    from cozy_runtime.internal import egress
+
+    absolute = url if "://" in url else base.rstrip("/") + "/" + url.lstrip("/")
+    if urlparse(absolute).scheme == "file":
+        path = _local(url, base)
+        with open(path, "rb") as handle:
+            return egress.read_bounded(
+                iter(lambda: handle.read(egress.CHUNK), b""),
+                declared=declared,
+                cap=policy.max_bytes,
+                what=what,
+            )
+    if policy is None or not policy.allowed_hosts:
+        raise GrantRefusal(
+            "grant_transport",
+            f"{what}: the grant names {absolute[:80]} and this deployment declares no "
+            "allowed egress hosts. The allowlist is a deployment-wide declaration and "
+            "nothing widens it at request time, so a remote grant is unfetchable here",
+        )
+    return egress.fetch(absolute, policy, declared=declared, what=what)
 
 
 def expired(grant: pb.DeliveryGrant, now: float | None = None) -> bool:
@@ -130,20 +172,39 @@ def expired(grant: pb.DeliveryGrant, now: float | None = None) -> bool:
     return bool(grant.expires_at_unix) and grant.expires_at_unix < at
 
 
-def read_input(grant: pb.DeliveryGrant, input_id: str, auth: Authorizer) -> bytes:
+def read_input(
+    grant: pb.DeliveryGrant, input_id: str, auth: Authorizer, policy: Any = None
+) -> bytes:
     """One granted input, verified against the grant's own digest and length."""
+    from cozy_runtime.internal import egress
+
     if expired(grant):
         raise GrantRefusal(
             "grant_expired",
             f"the delivery grant expired at {grant.expires_at_unix}; a resolver fallback is "
             "a NEW attempt, never a patch to this one",
         )
+    policy = policy or egress.EgressPolicy()
     for entry in grant.inputs:
         if entry.input_id != input_id:
             continue
         url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
-        auth.authorize("grant_input_read", "GET", url, {"input_id": input_id})
-        data = _local(entry.url, grant.file_base_url).read_bytes()
+        auth.authorize(
+            "grant_input_read" if url.startswith("file://") else "grant_input_fetch",
+            "GET",
+            url,
+            {"input_id": input_id},
+        )
+        try:
+            data = _read_granted(
+                entry.url,
+                grant.file_base_url,
+                declared=int(entry.length),
+                policy=policy,
+                what=f"input {input_id!r}",
+            )
+        except egress.EgressRefusal as exc:
+            raise GrantRefusal(exc.code, exc.detail) from exc
         if entry.length and len(data) != entry.length:
             raise GrantRefusal(
                 "input_length_mismatch",
@@ -166,6 +227,108 @@ def read_input(grant: pb.DeliveryGrant, input_id: str, auth: Authorizer) -> byte
 #: How a granted input TREE is spelled on a DeliveryGrant. The `input_id` carries the ref
 #: the job's typed field names, so the mapping from field value to grant is the ref itself.
 TREE_PREFIX = "tree:"
+
+#: The one input_id that is not an asset: the request DOCUMENT itself rides the grant as an
+#: input, which is why the payload and the assets share one authorization table and one
+#: bounded reader. It is excluded from asset hydration by name because it is the only
+#: reserved id there is (§1.3's payload/asset split, cr-009's 64 KiB seam law: control goes
+#: through the frame, DATA goes through the spool, and the seam is what makes them different
+#: things rather than one field that got large).
+PAYLOAD_INPUT = "payload"
+
+#: A conservative name for a spooled input. The input_id is a FIELD PATH the caller can
+#: influence through list indices, so it never reaches the filesystem uninspected.
+_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def hydrate_inputs(
+    grant: pb.DeliveryGrant,
+    auth: Authorizer,
+    *,
+    spool: Path,
+    policy: Any = None,
+    max_bytes: int = 64 << 20,
+    max_total_bytes: int = 256 << 20,
+) -> dict[str, Any]:
+    """Fetch, verify, sniff and spool EVERY input asset the grant carries (cr-012).
+
+    THE LAUNCH CONTRACT IS EAGER (§1.3), and this is where the eagerness lives: the whole
+    present asset set is materialized here, before acceptance and before any lease, so a
+    slow URL can never pin staged weights. Branch-selective lazy hydration is a deferred
+    optimization behind the same author-facing type; the ordering law it would have to
+    keep is exactly this one.
+
+    Every size check happens on the grant's DECLARED length first — so an oversized input
+    refuses before a byte moves — and again on the bytes, because a declaration is a claim.
+    """
+    from cozy_runtime.author._assets import GrantedInput
+    from cozy_runtime.author._media import SNIFF_BYTES, normalize, sniff
+
+    if expired(grant):
+        raise GrantRefusal("grant_expired", "the delivery grant expired before hydration")
+    entries = [
+        e
+        for e in grant.inputs
+        if e.input_id != PAYLOAD_INPUT and not e.input_id.startswith(TREE_PREFIX)
+    ]
+    declared_total = sum(int(e.length) for e in entries)
+    if declared_total > max_total_bytes:
+        raise GrantRefusal(
+            "inputs_over_total_cap",
+            f"this attempt's {len(entries)} input asset(s) declare {declared_total} B and "
+            f"this deployment admits {max_total_bytes} B per attempt. Input retention is "
+            "its own bounded story: inputs are not weights, they take no CAS lease, and "
+            "they live exactly as long as the attempt spool",
+        )
+    out: dict[str, Any] = {}
+    root = spool / "inputs"
+    for order, entry in enumerate(entries):
+        if entry.length and int(entry.length) > max_bytes:
+            raise GrantRefusal(
+                "input_over_cap",
+                f"input {entry.input_id!r} declares {entry.length} B and this deployment "
+                f"admits {max_bytes} B per input. The DECLARED length refuses before a byte "
+                "moves; the bytes are held to the same bound on the way in",
+            )
+        data = read_input(grant, entry.input_id, auth, policy)
+        declared = normalize(entry.kind_mime)
+        actual = sniff(data[:SNIFF_BYTES])
+        if declared and actual and declared != actual:
+            raise GrantRefusal(
+                "input_media_type",
+                f"input {entry.input_id!r} is declared {declared!r} and its bytes are "
+                f"{actual!r}. The declaration is a claim by whoever minted the grant; the "
+                "signature is what the object is, and a mislabelled input refuses rather "
+                "than reaching a decoder under a type nobody agreed to",
+            )
+        root.mkdir(parents=True, exist_ok=True)
+        local = root / f"{order:03d}-{_SAFE.sub('_', entry.input_id)[:96]}"
+        local.write_bytes(data)
+        out[entry.input_id] = GrantedInput(
+            input_id=entry.input_id,
+            local=local,
+            media_type=actual or declared,
+            digest="sha256:" + entry.digest.hex() if entry.digest else "",
+            length=len(data),
+            order=int(entry.order) or order,
+        )
+    return out
+
+
+def release_inputs(spool: Path) -> int:
+    """Drop this attempt's hydrated inputs. Returns how many files went.
+
+    Input retention is its OWN bounded story, deliberately outside the weights CAS: an
+    input takes no lease, participates in no eviction ladder, and is not content-addressed
+    storage — it is one attempt's spool and it ends with the attempt.
+    """
+    root = spool / "inputs"
+    removed = 0
+    for path in sorted(root.glob("*")) if root.is_dir() else ():
+        if path.is_file():
+            path.unlink()
+            removed += 1
+    return removed
 
 
 def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Path, str]]:
@@ -199,7 +362,11 @@ def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Pat
 
 
 def write_output(
-    grant: pb.DeliveryGrant, output_id: str, data: bytes, auth: Authorizer
+    grant: pb.DeliveryGrant,
+    output_id: str,
+    data: bytes,
+    auth: Authorizer,
+    media_type: str = "",
 ) -> pb.OutputEntry:
     """Write ONE output under the EXACT destination the grant names.
 
@@ -233,7 +400,12 @@ def write_output(
             output_id=output_id,
             digest=hashlib.sha256(data).digest(),
             length=len(data),
-            mime_type="application/octet-stream",
+            # The media type the AUTHOR declared when the asset was saved. It used to be
+            # hard-coded `application/octet-stream`, which made every client that trusts
+            # this field write an extensionless file — and a client that sniffs instead is
+            # a client deciding what the endpoint produced, which is the wrong owner.
+            # `application/octet-stream` remains the honest answer when nothing declared one.
+            mime_type=media_type or "application/octet-stream",
         )
     raise GrantRefusal(
         "destination_absent",

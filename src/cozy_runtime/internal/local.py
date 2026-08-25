@@ -85,6 +85,12 @@ class LocalRequest:
     #: the materialized input trees this run grants (`ref -> local directory`).
     job_descriptor_id: str = ""
     trees: Mapping[str, str] = field(default_factory=dict)
+    #: cr-012: the INPUT ASSETS this run grants, as `input_id -> local file`. The key is
+    #: the payload FIELD PATH (`photo`, `refs.0`) and the value is a location the
+    #: coordinator can authorize; the worker still verifies every byte it reads against the
+    #: grant's own digest and length, and sniffs the type it was told. Ordered, identified
+    #: subjects — never a digest-sorted anonymous list (worker-protocol/01).
+    inputs: Mapping[str, str] = field(default_factory=dict)
     org: str = "local"
     """The publishing org. A job's outputs are hub-rewritten into the SCRATCH repo
     `<org>/_job-<request-id>` — the underscore is deliberately outside the public repo
@@ -481,6 +487,21 @@ class LocalCoordinator:
                     )
                     for ref, root in sorted(self.request.trees.items())
                 ],
+                # cr-012's input ASSETS, in the declared order of their field paths. The
+                # digest and length come off the bytes here because a local coordinator IS
+                # the one that has them; a hub mints the same fields from its own record,
+                # and the worker's checks are identical either way.
+                *[
+                    pb.InputLocation(
+                        digest=hashlib.sha256(Path(source).read_bytes()).digest(),
+                        url=f"file://{Path(source).resolve()}",
+                        length=Path(source).stat().st_size,
+                        input_id=input_id,
+                        order=order,
+                        kind_mime=_declared_media_type(Path(source)),
+                    )
+                    for order, (input_id, source) in enumerate(sorted(self.request.inputs.items()))
+                ],
             ],
             outputs=[
                 pb.OutputDestination(
@@ -570,6 +591,19 @@ class LocalCoordinator:
 
 
 # --------------------------------------------------------------------------- the runner
+
+
+def _declared_media_type(path: Path) -> str:
+    """What the COORDINATOR declares one input to be (cr-012).
+
+    A local coordinator reads the bytes because it holds them; a hub reads its own record
+    instead. Either way it is a CLAIM, and the worker sniffs what it actually received and
+    refuses a disagreement — which is the point of declaring it at all.
+    """
+    from cozy_runtime.author._media import SNIFF_BYTES, sniff
+
+    with open(path, "rb") as handle:
+        return sniff(handle.read(SNIFF_BYTES)) or "application/octet-stream"
 
 
 def stage_binding_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:

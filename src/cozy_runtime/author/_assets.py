@@ -13,6 +13,7 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Final
 
@@ -175,17 +176,47 @@ def digest_bytes(data: bytes) -> str:
     return "blake2b:" + hashlib.blake2b(data, digest_size=16).hexdigest()
 
 
-def bind(asset: Asset, *, local: Path, attempt: str) -> None:
-    """Hydrate an asset in place. Runtime-only: author code has no path into this."""
+@dataclass(frozen=True, slots=True)
+class GrantedInput:
+    """ONE input the supervisor already fetched, verified and spooled (cr-012).
+
+    Everything on it was established BEFORE acceptance: the bytes were read under the
+    grant through the one bounded reader, checked against the grant's declared length and
+    content digest, and sniffed. The executor never re-fetches and never re-hashes — it
+    matches this against the FIELD it is about to fill, which is the half only it knows.
+    """
+
+    input_id: str
+    """The payload field PATH, list index included — worker-protocol/01's stable identity.
+    Inputs are IDENTIFIED, ORDERED subjects, never a digest-sorted anonymous list."""
+    local: Path
+    media_type: str
+    """What the BYTES are, from the sniff — not what the caller declared them to be."""
+    digest: str
+    length: int
+    order: int = 0
+
+
+def bind(
+    asset: Asset, *, local: Path, attempt: str, media_type: str, digest: str, length: int
+) -> None:
+    """Hydrate an asset in place. Runtime-only: author code has no path into this.
+
+    The facts come from the caller because the caller is the runtime and the runtime
+    already established them under the grant. Re-reading the file here to recompute a
+    digest — which is what this did — reads every input twice and produces a SECOND
+    identity for one object, so a handler comparing `asset.digest` to the one the
+    coordinator granted would find two different spellings of the same bytes.
+    """
     if asset._attempt not in (_UNBOUND, attempt):
         raise CapabilityError(
             f"asset {asset.ref!r} belongs to attempt {asset._attempt!r}", code="foreign_asset"
         )
     asset._local = local
     asset._attempt = attempt
-    data = local.read_bytes()
-    asset.size_bytes = len(data)
-    asset.digest = digest_bytes(data)
+    asset.media_type = media_type
+    asset.size_bytes = length
+    asset.digest = digest
 
 
 def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:

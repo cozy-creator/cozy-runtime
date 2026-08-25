@@ -119,6 +119,58 @@ class Bound:
                 raise ConformanceError(f"Bound({name}=) must be positive", fields=[name])
 
 
+@dataclass(frozen=True, slots=True)
+class AssetBound:
+    """cr-012 — the TYPED bound on ONE input-asset field: how big, and of what.
+
+    An input asset is a typed request field, so its limits belong on the field and not in
+    a deployment's config or a downloader's constant. Two facts and no more:
+
+    * `max_bytes` — the largest this field admits, enforced BEFORE the entrypoint sees the
+      value and (as a deployment-wide cap) before acceptance. A field with no bound takes
+      the deployment's cap, so "unbounded" is not spellable.
+    * `media_types` — a NARROWING of the kind's own set (`_media.KIND_MEDIA`). An endpoint
+      that decodes only PNG says so; one that lists a type its kind does not admit is a
+      conformance error, because widening a kind would promise a decoder nothing has.
+
+    COUNT bounds are not here on purpose: `Annotated[list[ImageAsset], Meta(max_length=9)]`
+    is msgspec's own, it is already in the descriptor's constraint vocabulary, and a second
+    spelling of a limit that already validates would be a second contract.
+    """
+
+    max_bytes: int | None = None
+    media_types: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_bytes is None and not self.media_types:
+            raise ConformanceError(
+                "AssetBound() declares nothing: give max_bytes or media_types, or drop the "
+                "annotation and take the deployment's cap"
+            )
+        if self.max_bytes is not None and self.max_bytes <= 0:
+            raise ConformanceError("AssetBound(max_bytes=) must be positive", fields=["max_bytes"])
+        for media_type in self.media_types:
+            if media_type != media_type.strip().lower() or "/" not in media_type:
+                raise ConformanceError(
+                    f"AssetBound(media_types=) takes lowercase `type/subtype`, got {media_type!r}",
+                    fields=["media_types"],
+                )
+
+    def check_kind(self, kind: str) -> None:
+        """A declared type outside the KIND's own set is a conformance error at describe."""
+        from cozy_runtime.author._media import KIND_MEDIA
+
+        allowed = KIND_MEDIA.get(kind, ())
+        outside = [m for m in self.media_types if allowed and m not in allowed]
+        if outside:
+            raise ConformanceError(
+                f"AssetBound(media_types={outside!r}) is outside what a {kind!r} asset "
+                f"admits ({list(allowed)}): a bound NARROWS a kind and never widens it, "
+                "because a type the runtime cannot decode is not a capability",
+                fields=["media_types"],
+            )
+
+
 _REQUIRES_TOKEN = re.compile(r"^(sm\d{2,3}\+?|vram\d+g|ram\d+g|cuda\d+\.\d+\+?)$")
 
 

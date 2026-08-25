@@ -58,7 +58,14 @@ from cozy_runtime.author._loader import (
     register_adapter,
     registered_adapters,
 )
-from cozy_runtime.author._markers import Bound, ModelDefault, Preflight, Resources, Shape
+from cozy_runtime.author._markers import (
+    AssetBound,
+    Bound,
+    ModelDefault,
+    Preflight,
+    Resources,
+    Shape,
+)
 from cozy_runtime.author._model import (
     ConstructionIdentity,
     Model,
@@ -101,6 +108,7 @@ __all__ = [
     "App",
     "Artifact",
     "Asset",
+    "AssetBound",
     "AudioAsset",
     "AuthorError",
     "Backend",

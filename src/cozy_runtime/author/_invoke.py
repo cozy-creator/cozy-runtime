@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +24,7 @@ from typing import Any, get_args
 import msgspec
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset, Tree, bind, bind_tree
+from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
@@ -39,6 +38,8 @@ from cozy_runtime.author._errors import (
     OutputError,
     classify,
 )
+from cozy_runtime.author._markers import AssetBound
+from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
@@ -87,6 +88,15 @@ class Invocation:
     the grant IS the read capability, and there is no ambient store handle anywhere on the
     author surface for a job to reach around it (§2, jobs.md §1).
     """
+    assets: Mapping[str, GrantedInput] = field(default_factory=dict)
+    """input_id -> the verified, spooled input asset (cr-012). The supervisor fetched it
+    under the grant, held it to its declared length through the one bounded reader, checked
+    its content digest and sniffed its bytes, all BEFORE acceptance. An `Asset` field whose
+    input_id is absent here never hydrates and refuses typed — same law as `trees`, one
+    modality over: the grant IS the read capability, and a ref is never a location."""
+    max_input_bytes: int = 64 << 20
+    """The DEPLOYMENT's per-input ceiling, the floor under every field's own `AssetBound`.
+    A field with no bound takes this one, so "unbounded" is not spellable."""
     scratch: Path | None = None
     """The RUN's scratch tree — the same directory across attempts of one run, which is what
     makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
@@ -307,24 +317,127 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
 
 
+def asset_inputs(payload: object) -> list[tuple[str, int, Asset]]:
+    """Every input asset with its STABLE IDENTITY: `(input_id, order, asset)`.
+
+    `input_id` is the payload FIELD PATH with the list index included, which is
+    worker-protocol/01's rule stated in code: inputs are identified, ORDERED subjects and
+    never a digest-sorted anonymous list. `order` is the position within the containing
+    list — 0 for a scalar field — because for H3's mixed reference sets the ORDER IS MODEL
+    INPUT, not a presentation fact, and two assets with equal bytes are two subjects.
+
+    Deliberately a second walk beside `assets_in`: that one answers "is this handle mine",
+    which is a question about identity and must collect a repeat, while this one answers
+    "which grant entry fills this field", which is a question about position.
+    """
+    found: list[tuple[str, int, Asset]] = []
+
+    def walk_value(value: object, path: str, order: int, seen: set[int]) -> None:
+        if isinstance(value, Asset):
+            found.append((path, order, value))
+            return
+        if isinstance(value, Tree) or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk_value(item, f"{path}.{index}" if path else str(index), index, seen)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk_value(item, f"{path}.{key}" if path else str(key), 0, seen)
+            return
+        for name, member in field_values(value).items():
+            walk_value(member, f"{path}.{name}" if path else name, 0, seen)
+
+    walk_value(payload, "", 0, set())
+    return found
+
+
+def asset_bounds(payload_type: object) -> dict[str, AssetBound]:
+    """field path (no index) -> the `AssetBound` annotating it. Describe-time knowledge."""
+    out: dict[str, AssetBound] = {}
+    for node in walk(payload_type):
+        if not _reaches(node.annotation, Asset):
+            continue
+        bound = node.marker(AssetBound)
+        if isinstance(bound, AssetBound):
+            out[node.path] = bound
+    return out
+
+
+def _unindexed(input_id: str) -> str:
+    """`refs.2.clip` -> `refs.clip`: a bound annotates the FIELD, not an element."""
+    return ".".join(part for part in input_id.split(".") if not part.isdigit())
+
+
+def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, cap: int) -> None:
+    """The typed gate every input passes before the entrypoint exists to it.
+
+    MEDIA-TYPE HONESTY is the first check and it is about the BYTES: `granted.media_type`
+    is what the supervisor sniffed, not what the caller declared, so a `.png` that is a
+    zip refuses here rather than inside a decoder the endpoint did not agree to run.
+    """
+    kind = type(asset).kind
+    if not admits(kind, granted.media_type):
+        raise InvalidRequest(
+            f"input {granted.input_id!r} is {granted.media_type or 'of no recognised type'} "
+            f"and the field is a {type(asset).__name__}, which admits "
+            f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. The type comes "
+            "from the BYTES, not from the declaration: a mislabelled upload refuses at the "
+            "field rather than inside a decoder this endpoint never agreed to run",
+            code="asset_media_type",
+        )
+    if bound is not None and bound.media_types and granted.media_type not in bound.media_types:
+        raise InvalidRequest(
+            f"input {granted.input_id!r} is {granted.media_type!r} and this field declares "
+            f"{list(bound.media_types)}",
+            code="asset_media_type",
+        )
+    limit = min(bound.max_bytes, cap) if bound is not None and bound.max_bytes else cap
+    if limit and granted.length > limit:
+        raise InvalidRequest(
+            f"input {granted.input_id!r} is {granted.length} B and this field admits "
+            f"{limit} B. A size bound is a TYPED property of the field, so it refuses "
+            "before the handler is entered and not inside it",
+            code="asset_too_large",
+        )
+
+
 def _hydrate(payload: object, inv: Invocation) -> None:
-    """Materialize EVERY present asset field into the immutable attempt spool."""
+    """Bind every declared input asset to the bytes the GRANT already materialized (§1.3).
+
+    Symmetric with `_materialize_trees` and for the same reason: an ungranted ref is a
+    typed refusal here rather than a `FileNotFoundError` deep in the body. What changed at
+    cr-012 is where the bytes come from — this used to read the ref as a LOCAL PATH and
+    copy it, which made every asset ref a filesystem read of the caller's choosing. Now
+    the supervisor fetches, verifies and spools before acceptance, and the only thing this
+    side does is match an identified input against the FIELD it fills, which is the half
+    only this side knows.
+    """
     _materialize_trees(payload, inv)
     if not declares_assets(type(payload)):
         return
-    inputs = inv.spool / "inputs"
-    for index, asset in enumerate(assets_in(payload)):
-        source = Path(asset.ref.removeprefix("file://"))
-        if not source.is_file():
+    bounds = asset_bounds(type(payload))
+    for input_id, _order, asset in asset_inputs(payload):
+        granted = inv.assets.get(input_id)
+        if granted is None:
             raise InvalidRequest(
-                f"asset {asset.ref!r} is not materializable by this runtime: the supervisor "
-                "fetch path (allowlisted egress, SSRF fail-closed) is cr-012's",
-                code="asset_unresolvable",
+                f"input asset {input_id!r} (ref {asset.ref!r}) is not granted to this "
+                f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
+                "asset is a digest-verified READ CAPABILITY minted by the coordinator, "
+                "never a location a request may name",
+                code="asset_ungranted",
             )
-        inputs.mkdir(parents=True, exist_ok=True)
-        local = inputs / f"{index:03d}-{source.name}"
-        shutil.copyfile(source, local)
-        bind(asset, local=local, attempt=inv.request_id)
+        _check_input(asset, granted, bounds.get(_unindexed(input_id)), inv.max_input_bytes)
+        bind(
+            asset,
+            local=granted.local,
+            attempt=inv.request_id,
+            media_type=granted.media_type,
+            digest=granted.digest,
+            length=granted.length,
+        )
 
 
 # ------------------------------------------------------------------------- injection

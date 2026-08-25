@@ -30,6 +30,7 @@ import msgspec
 from corpus.sdxl_real import SdxlUnetModel
 
 from cozy_runtime.author import (
+    AssetBound,
     Context,
     ImageAsset,
     ImageFrame,
@@ -103,6 +104,35 @@ class RestyleInput(msgspec.Struct, forbid_unknown_fields=True):
 
 class RestyleOutput(msgspec.Struct):
     frames: int
+
+
+class RetouchInput(msgspec.Struct, forbid_unknown_fields=True):
+    """cr-012's typed input surface: ONE required image, and an ordered reference set.
+
+    `photo` carries both bound kinds — a size the field admits and the media types it can
+    decode — so a caller learns the limits from `describe` instead of from a refusal.
+    `refs` is a LIST with a msgspec count bound, which is the count rule already in the
+    descriptor's constraint vocabulary rather than a second spelling of one; its ORDER is
+    model input and is preserved into the handler.
+    """
+
+    photo: Annotated[
+        ImageAsset, AssetBound(max_bytes=4 << 20, media_types=("image/png", "image/jpeg"))
+    ]
+    refs: Annotated[list[ImageAsset], msgspec.Meta(max_length=3)] = msgspec.field(
+        default_factory=list
+    )
+    scale: Annotated[int, msgspec.Meta(ge=1, le=8)] = 2
+
+
+class RetouchOutput(msgspec.Struct):
+    image: ImageAsset
+    source_digest: str
+    source_media_type: str
+    source_bytes: int
+    width: int
+    height: int
+    ref_order: list[str]
 
 
 def _inputs(torch: Any, device: Any, side: int, seed: int) -> tuple[Any, ...]:
@@ -226,3 +256,64 @@ def bloat(payload: DenoiseInput) -> BloatOutput:
 def restyle(payload: RestyleInput) -> RestyleOutput:
     """A required video input. Warm synthesis cannot produce one and must say so."""
     return RestyleOutput(frames=int(payload.strength * 100))
+
+
+@app.entrypoint
+def retouch(payload: RetouchInput, out: Outputs) -> RetouchOutput:
+    """cr-012's round trip: a digest-verified image in, a transformed image out.
+
+    Weightless on purpose — what is under test is the INPUT plane, and a model would only
+    put a UNet between the bytes arriving and the bytes leaving. The handler reads
+    `payload.photo.read_bytes()`, which only returns because the runtime already fetched,
+    length-checked, digest-checked, sniffed and spooled those bytes under this attempt's
+    grant. There is no fetch here, no URL, and no path: `payload.photo` is a value.
+
+    The OUTPUT side is the runtime's own (`out.save_image`), so the two directions of the
+    one asset type meet in one handler.
+    """
+    data = payload.photo.read_bytes()
+    width, height = _png_size(data)
+    pixels = _png_rgb(data, width, height)
+    step = max(int(payload.scale), 1)
+    small_w, small_h = max(width // step, 1), max(height // step, 1)
+    rows = bytearray()
+    for y in range(small_h):
+        for x in range(small_w):
+            offset = ((y * step) * width + (x * step)) * 3
+            rows += pixels[offset : offset + 3]
+    return RetouchOutput(
+        image=out.save_image(ImageFrame(small_w, small_h, bytes(rows))),
+        source_digest=payload.photo.digest,
+        source_media_type=payload.photo.media_type,
+        source_bytes=payload.photo.size_bytes,
+        width=small_w,
+        height=small_h,
+        ref_order=[ref.digest for ref in payload.refs],
+    )
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def _png_rgb(data: bytes, width: int, height: int) -> bytes:
+    """Decode a NON-INTERLACED, filter-0, 8-bit RGB PNG. The corpus writes exactly that."""
+    import zlib
+
+    stream = bytearray()
+    cursor = 8
+    while cursor < len(data):
+        length = int.from_bytes(data[cursor : cursor + 4], "big")
+        kind = data[cursor + 4 : cursor + 8]
+        if kind == b"IDAT":
+            stream += data[cursor + 8 : cursor + 8 + length]
+        cursor += 12 + length
+    raw = zlib.decompress(bytes(stream))
+    out = bytearray()
+    stride = width * 3
+    for y in range(height):
+        start = y * (stride + 1)
+        if raw[start] != 0:
+            raise ValueError("this endpoint decodes filter-0 PNG rows only")
+        out += raw[start + 1 : start + 1 + stride]
+    return bytes(out)

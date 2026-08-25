@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical, seam
+from cozy_runtime.internal import canonical, egress, seam
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -57,6 +57,21 @@ def safe(text: str, cap: int = 1024) -> str:
     stripped = _PATHY.sub("<redacted>", text)
     ascii_only = "".join(c if 0x20 <= ord(c) <= 0x7E else "." for c in stripped)
     return ascii_only[:cap]
+
+
+def _coded(outcome: Mapping[str, Any]) -> str:
+    """`<code>: <message>` — the AUTHOR's typed code in front of its own sentence.
+
+    The wire carries a small neutral `CauseCode` on purpose (a coordinator classifies, it
+    does not read author vocabulary), so the typed code has to ride the message or it does
+    not survive the boundary at all. Every other refusal on this path already renders this
+    way; author outcomes were the exception.
+    """
+    code = str(outcome.get("code") or "")
+    message = str(outcome.get("message") or "")
+    if not message:
+        return code
+    return message if not code or message.startswith(f"{code}:") else f"{code}: {message}"
 
 
 def _features(payload: Mapping[str, Any], entrypoint: str) -> dict[str, Any]:
@@ -148,6 +163,10 @@ class Attempt:
     ExecutionSpec names one mode, and a spec naming neither refuses before anything runs."""
     trees: dict[str, tuple[Path, str]] = dataclasses_field(default_factory=dict)
     """ref -> (materialized root, declared digest) for the input trees the grant carries."""
+    inputs: dict[str, Any] = dataclasses_field(default_factory=dict)
+    """input_id -> `GrantedInput` for every input ASSET this attempt was granted (cr-012).
+    Fetched, length- and digest-checked, sniffed and spooled BEFORE acceptance, so the
+    executor is handed verified files and never an address."""
     scratch: Path | None = None
     """The RUN's scratch tree. Keyed on the run and NOT on the attempt, which is the whole
     of resumability: a retried attempt of the same run reads what the killed one left."""
@@ -275,6 +294,10 @@ class AttemptEngine:
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
         #: what the coordinator answered for each forwarded checkpoint, by receipt id
         self.checkpoint_acks: dict[str, str] = {}
+        #: cr-012's egress boundary, rebuilt from the applied binding at each directive.
+        #: A default `EgressPolicy()` has an EMPTY allowlist, which means no egress at all —
+        #: the fail-closed state is the one you get by not configuring anything.
+        self.egress = egress.EgressPolicy()
 
     # ------------------------------------------------------------------ offer
 
@@ -426,6 +449,52 @@ class AttemptEngine:
             cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
             origin=ORIGIN.CAUSE_ORIGIN_CLIENT,
         )
+
+    def _hydrate_inputs(self, attempt: Attempt) -> None:
+        """Materialize every granted input asset into THIS attempt's spool (cr-012).
+
+        The spool is created here rather than in `_run` because that is what "before
+        acceptance" means for bytes: the attempt must own a directory before anything is
+        written into it, and an attempt refused during hydration leaves a spool with
+        nothing in it rather than an accepted attempt with nowhere to put its inputs.
+        """
+        spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
+        spool.mkdir(parents=True, exist_ok=True)
+        attempt.spool = spool
+        binding = attempt.binding
+        try:
+            attempt.inputs = grants.hydrate_inputs(
+                attempt.grant,
+                self.authorizer,
+                spool=spool,
+                policy=self.egress,
+                max_bytes=binding.max_input_bytes if binding else 64 << 20,
+                max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
+            )
+        except grants.GrantRefusal as exc:
+            # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
+            # absent grant entry are facts about the REQUEST; an expired grant or an
+            # unreachable coordinator-minted address are facts about the platform, and
+            # rendering the two the same way sends the wrong person to the wrong question.
+            caller = exc.code in (
+                "input_over_cap",
+                "inputs_over_total_cap",
+                "input_media_type",
+                "input_length_mismatch",
+                "input_digest_mismatch",
+                "stream_over_declared_size",
+                "stream_under_declared_size",
+            )
+            raise AttemptRefusal(
+                exc.code,
+                exc.detail,
+                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST
+                if caller
+                else CAUSE.CAUSE_CODE_GRANT_EXPIRED
+                if exc.code == "grant_expired"
+                else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+            ) from exc
 
     def _accept_job(self, attempt: Attempt) -> pb.AttemptAccepted:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
@@ -583,6 +652,15 @@ class AttemptEngine:
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
         attempt.plan = plan
+
+        # HYDRATE, after the plan and before acceptance (cr-012, §1.3's launch contract:
+        # validate -> plan -> hydrate -> prepare -> accept -> invoke). Before the plan,
+        # because a request that has no plan should download nothing; before acceptance,
+        # because an oversized, ungranted, mislabelled or unreachable input must be a
+        # refusal the coordinator can read rather than an accepted attempt that dies on a
+        # thread. And before the lease, which is the ordering that matters most: a slow URL
+        # fetched under a lease would pin staged weights for its whole duration.
+        self._hydrate_inputs(attempt)
 
         # The ExecutorPreparer: when the selected construction is not already ready, prepare
         # it BEFORE durable acceptance. Serving never accepts-then-cold-loads.
@@ -862,7 +940,7 @@ class AttemptEngine:
             status,
             cause,
             _ORIGIN[outcome["origin"]],
-            outcome["message"] or outcome["code"],
+            _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),
             result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
@@ -994,7 +1072,11 @@ class AttemptEngine:
         executor = self.supervision.current
         if executor is None:
             return self.abandon(attempt, "the executor vanished before dispatch")
-        spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
+        # The spool already exists: cr-012's hydration created it before acceptance, which
+        # is what "the executor is handed verified files, never an address" requires. This
+        # stays for the recovered-attempt path, where acceptance happened in a process that
+        # is no longer running.
+        spool = attempt.spool or self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
         attempt.state = "running"
@@ -1029,6 +1111,20 @@ class AttemptEngine:
                     "spool": str(spool),
                     "placement": attempt.plan.placement,
                     "headroom_bytes": attempt.plan.headroom_bytes,
+                    # cr-012: the VERIFIED inputs, by their stable identity. Paths into
+                    # this attempt's own spool and nothing else — no URL, no credential and
+                    # no fetch reaches the executor, which has no outbound network at all.
+                    "inputs": {
+                        input_id: {
+                            "local": str(granted.local),
+                            "media_type": granted.media_type,
+                            "digest": granted.digest,
+                            "length": granted.length,
+                            "order": granted.order,
+                        }
+                        for input_id, granted in attempt.inputs.items()
+                    },
+                    "max_input_bytes": attempt.binding.max_input_bytes,
                 },
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
@@ -1172,7 +1268,13 @@ class AttemptEngine:
             status,
             cause,
             origin,
-            outcome["message"] or outcome["code"],
+            # The AUTHOR-SURFACE code, in front of its own sentence. The wire's `CauseCode`
+            # is deliberately a small NEUTRAL class (`INVALID_REQUEST`), so without this the
+            # typed code the author raised — `asset_ungranted`, `asset_media_type` — exists
+            # only inside prose and nothing downstream can key on it. Measured by cr-012's
+            # arms: two correct typed refusals were indistinguishable from each other to
+            # anything reading the terminal.
+            _coded(outcome),
             manifest=manifest,
             metrics=reply.get("metrics", {}),
             result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
@@ -1337,7 +1439,16 @@ class AttemptEngine:
                     return None, (f"output {output_id} has no bytes in the attempt spool")
                 entries.append(
                     grants.write_output(
-                        attempt.grant, output_id, blob.read_bytes(), self.authorizer
+                        attempt.grant,
+                        output_id,
+                        blob.read_bytes(),
+                        self.authorizer,
+                        # The AUTHOR's declared media type, carried through instead of
+                        # replaced by `application/octet-stream`. cl-010 measured the cost
+                        # of dropping it: the product wrote `image` and not `image.png`,
+                        # and the client correctly refuses to sniff, so the only place that
+                        # could fix it is the place that already knows.
+                        media_type=str(row.get("media_type") or ""),
                     )
                 )
         except grants.GrantRefusal as exc:
@@ -1722,6 +1833,16 @@ class AttemptEngine:
             },
         )
         attempt.state = "closed"
+        # INPUT RETENTION ENDS HERE (cr-012), and it is its own bounded story: an input
+        # asset takes no CAS lease, joins no eviction ladder and is not content-addressed
+        # storage — it is one attempt's spool, and a closed attempt has no reader left.
+        # Deliberately at CLOSE and not at terminal: a terminal that is never acknowledged
+        # replays, and a replay whose inputs were already deleted would refuse on bytes it
+        # had verified once.
+        if attempt.spool is not None:
+            dropped = grants.release_inputs(attempt.spool)
+            if dropped:
+                attempt.ring.emit("log", f"released {dropped} hydrated inputs", "info")
         # Only the attempt that IS held clears the hold. A refusal terminal for ordinal N+1
         # closing while ordinal N runs must not evict the running attempt from `live`.
         if self.live.get(attempt.request_id) is attempt:

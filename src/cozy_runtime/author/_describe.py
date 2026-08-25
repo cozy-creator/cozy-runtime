@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
 from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY
 from cozy_runtime.author._signature import ModelBinding, Surface
@@ -65,6 +66,31 @@ def assert_declaration_shape(declaration: object) -> None:
                 code="excluded_keyword",
                 fields=[node.path],
             )
+        bound = node.marker(AssetBound)
+        if isinstance(bound, AssetBound):
+            # cr-012: a bound NARROWS a kind. Checking it at DESCRIBE rather than at
+            # hydration is the difference between an endpoint that cannot be built and one
+            # that refuses every request that reaches it — a field declaring a media type
+            # its kind does not admit promises a decoder this runtime does not have.
+            kind = _asset_kind(node.annotation)
+            if kind:
+                bound.check_kind(kind)
+
+
+def _asset_kind(annotation: object) -> str:
+    """The asset KIND an annotation reaches, through containers and unions."""
+    from cozy_runtime.author._assets import Asset
+    from cozy_runtime.author._walker import strip, unwrap_optional
+
+    base, _ = strip(annotation)
+    base, _ = unwrap_optional(base)
+    if isinstance(base, type) and issubclass(base, Asset):
+        return str(base.kind)
+    for argument in get_args(base):
+        found = _asset_kind(argument)
+        if found:
+            return found
+    return ""
 
 
 def _separation(surface: Surface) -> None:

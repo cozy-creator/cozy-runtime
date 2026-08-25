@@ -29,7 +29,7 @@ from cozy_runtime.author._assets import (
     VideoAsset,
 )
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Shape, _ModelDefaultMarker
+from cozy_runtime.author._markers import AssetBound, Shape, _ModelDefaultMarker
 from cozy_runtime.author._walker import MISSING, is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import Json, write
 
@@ -158,6 +158,17 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
     for marker in markers:
         if isinstance(marker, Shape):
             doc["shape_axes"] = list(marker.axes())
+        if isinstance(marker, AssetBound):
+            # cr-012: an input asset's TYPED limits belong in the descriptor, because a
+            # client that cannot see the bound can only discover it by being refused. The
+            # media types rendered are what this FIELD admits, already narrowed against its
+            # kind at describe — a client reads one list, not two and an intersection rule.
+            bound: dict[str, Json] = {}
+            if marker.max_bytes is not None:
+                bound["max_bytes"] = marker.max_bytes
+            if marker.media_types:
+                bound["media_types"] = list(marker.media_types)
+            doc["asset_bound"] = bound
     return doc
 
 
