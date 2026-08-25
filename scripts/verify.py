@@ -52,7 +52,9 @@ from cozy_runtime.author import (  # noqa: E402
     registered_adapters,
 )
 from cozy_runtime.author._services import Attempt  # noqa: E402
-from cozy_runtime.author.fakes import (  # noqa: E402
+from cozy_runtime.author.fakes import (  # noqa: E402  # noqa: E402
+    ResidentBackend,
+    StagedBackend,
     fake_adjustments,
     fake_attempt,
     fake_context,
@@ -64,7 +66,6 @@ from cozy_runtime.author.fakes import (  # noqa: E402
 from cozy_runtime.internal import canonical, descriptor  # noqa: E402
 from cozy_runtime.internal.bindings import read_table, resolve  # noqa: E402
 from cozy_runtime.internal.discovery import discover  # noqa: E402
-from cozy_runtime.internal.residency import ResidentBackend, StagedBackend  # noqa: E402
 from tiny_diffusers import MiniMaxH3ModularPipeline, TinyScheduler  # noqa: E402
 
 RELEASE = "release:digest(source,lock,manifest)"

@@ -205,7 +205,6 @@ class Supervisor:
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
-        self.notes: list[str] = []
         self.link: Link | None = None  # the live control link, so shutdown can end it
         self.job_caps = pb.ResourceCaps()
         self.reclaim_on_terminal = False
@@ -220,7 +219,6 @@ class Supervisor:
         )
         self.fences.activity.append(event)
         del self.fences.activity[:-64]
-        self.notes.append(f"{event.seq} {kind}: {step}")
         print(f"[supervisor] {kind}: {step}", flush=True)
 
     def send(self, message: pb.WorkerMessage) -> None:
@@ -366,7 +364,7 @@ class Supervisor:
                     f"PROTOCOL ERROR: revision {directive.revision} arrived with a different "
                     "body; a changed body must carry a new revision",
                 )
-                self.engine.faults.append(
+                self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                         subject=f"revision {directive.revision}",
@@ -407,7 +405,7 @@ class Supervisor:
         for plan_id in directive.serving.entrypoint_binding_plan_ids:
             record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
             if not record.is_file():
-                self.engine.faults.append(
+                self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=plan_id,
@@ -457,7 +455,7 @@ class Supervisor:
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
         if not record.is_file():
-            self.engine.faults.append(
+            self.engine.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     subject=job.job_descriptor_id,
@@ -599,7 +597,7 @@ class Supervisor:
                         f"needed {shortfall['needed_bytes']} B, "
                         f"{shortfall['available_bytes']} B free (measured) - {detail}"
                     )[:1024]
-                self.engine.faults.append(
+                self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=first.plan_id,
@@ -758,7 +756,7 @@ class Supervisor:
             )
             if outcome["outcome"] == "failed":
                 self.engine.degraded[plan_id] = str(outcome["reason"])[:160]
-                self.engine.faults.append(
+                self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
                         subject=plan_id,
@@ -821,7 +819,7 @@ class Supervisor:
                     # on a worker that is finished. Found live by killing the executor
                     # mid-fill — the run hung instead of converging (cr-008a arm 2).
                     self.note("directive", f"apply failed: {exc}")
-                    self.engine.faults.append(
+                    self.engine.fault(
                         pb.Fault(
                             kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                             subject=f"revision {message.directive.revision}",
@@ -979,7 +977,14 @@ class Supervisor:
         what separates a caller's typed error from a platform-fatal one, and collapsing both
         onto SUPERVISOR sends the wrong person to look (v1 REF_ORIGIN).
         """
+        # The HELD record, but only while it is still open. A refusal about a message —
+        # `attempt_digest_conflict` names a NEW StartAttempt carrying a different spec for an
+        # ordinal that already finished — must not re-terminal the attempt that finished, or
+        # it re-closes an envelope that is already closed and the ledger reports the second
+        # close as a leak. Found by `worker-live.py arms`.
         held = self.engine.history.get((start.request_id, start.attempt))
+        if held is not None and held.state in ("terminal", "closed"):
+            held = None
         attempt = held or Attempt(
             request_id=start.request_id,
             attempt=start.attempt,
@@ -1065,7 +1070,7 @@ class Supervisor:
                 "journal",
                 f"{exc.code}: acknowledging nothing and executing nothing for {key}",
             )
-            self.engine.faults.append(
+            self.engine.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=key,

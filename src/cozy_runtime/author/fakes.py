@@ -12,6 +12,9 @@ by construction — there is no parallel behavioral runtime here to maintain.
 `invoke_with_fakes()` runs a registered handler through the REAL kernel with fakes standing
 in for the runtime's side of the contract: same decode, same overlay, same preflight, same
 injection, same return validation, same output transaction.
+
+`StagedBackend`/`ResidentBackend` are the weightless fill doubles a `Model` constructs
+against with no store and no device.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,7 @@ from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke, prepare
+from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
@@ -172,3 +177,64 @@ def invoke_with_fakes(
         ),
         Attempt(request_id, spool, max_output_bytes),
     )
+
+
+# --------------------------------------------------------------------------- fill
+#
+# WEIGHTLESS FILL BACKENDS. The endpoint declares WHICH components a method may touch;
+# it never learns HOW their bytes got there, and these two prove it: the same handler
+# runs on either and cannot observe which. They are DOUBLES and they lived under
+# `internal/` as if they were a runtime plane — production fills through cr-005's
+# `StreamingFillBackend` and has never called these (codex audit, adopted 2026-08-25).
+
+
+@dataclass(slots=True)
+class FillEvent:
+    key: str
+    nbytes: int
+    route: str
+
+
+@dataclass(slots=True)
+class _RecordingBackend:
+    route: str
+    events: list[FillEvent] = field(default_factory=list)
+    rolled_back: list[str] = field(default_factory=list)
+
+    @property
+    def filled_bytes(self) -> int:
+        return sum(e.nbytes for e in self.events)
+
+    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+        """These stand-ins place nothing: the destinations the census walked are already
+        the destinations they write through."""
+        return walked.live
+
+    def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
+        write = getattr(destination, "fill_", None)
+        if callable(write):
+            write(spec.nbytes)
+        self.events.append(FillEvent(key, spec.nbytes, self.route))
+
+    def commit(self) -> None:
+        """No device copies to fence — the freeze point is cr-005's `StreamingFillBackend`."""
+        return None
+
+    def rollback(self, keys: Sequence[str]) -> None:
+        """Construction is TRANSACTIONAL: a failure rolls fills back as a unit (§1.1)."""
+        self.rolled_back.extend(keys)
+        self.events = [e for e in self.events if e.key not in set(keys)]
+
+
+@dataclass(slots=True)
+class StagedBackend(_RecordingBackend):
+    """Host-staged placement: bytes land in a staging buffer, then in the destination."""
+
+    route: str = "staged"
+
+
+@dataclass(slots=True)
+class ResidentBackend(_RecordingBackend):
+    """Direct resident placement — a different route, an identical author contract."""
+
+    route: str = "resident"

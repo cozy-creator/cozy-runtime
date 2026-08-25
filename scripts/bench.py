@@ -60,7 +60,7 @@ from cozy_runtime.author._loader import census
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.author.fakes import (fake_attempt, fake_context, fake_outputs,
                                        invoke_with_fakes)
-from cozy_runtime.internal.residency import StagedBackend
+from cozy_runtime.author.fakes import StagedBackend
 
 N = {ITERATIONS}
 

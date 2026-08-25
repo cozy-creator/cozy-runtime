@@ -444,7 +444,6 @@ OBSERVATION_MODULES = (
 #: Modules that DECIDE residency, placement or the component-use contract.
 DECIDING_MODULES = (
     "cozy_runtime.internal.fill",
-    "cozy_runtime.internal.residency",
     "cozy_runtime.internal.contract",
     "cozy_runtime.internal.derive",
     "cozy_runtime.internal.worker.plan",

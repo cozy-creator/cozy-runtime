@@ -20,6 +20,7 @@ reported as a torn tail rather than silently dropped.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import time
@@ -153,6 +154,19 @@ class Journal:
 
     def of_kind(self, kind: str) -> list[Record]:
         return [r for r in self.records if r.kind == kind]
+
+    def terminal_bytes(self, key: tuple[str, int]) -> bytes:
+        """One attempt's journaled canonical terminal, re-read.
+
+        The DURABLE record is here, so a closed attempt does not have to hold a second copy
+        of it in memory for a replay that may never come — and a terminal can carry a 4 MiB
+        inline result (codex audit, adopted 2026-08-25). Empty when the journal has no
+        terminal for that ordinal, which the caller must treat as "nothing to replay".
+        """
+        row = self.attempts().get(key)
+        if row is None or "terminal_canonical_b64" not in row:
+            return b""
+        return base64.b64decode(row["terminal_canonical_b64"])
 
     def attempts(self) -> dict[tuple[str, int], dict[str, Any]]:
         """Replay into the attempt table: acceptance, terminal body, closure.

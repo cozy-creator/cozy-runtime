@@ -93,6 +93,9 @@ PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 #: them, sorted, because a claim printed as a measurement is worse than no number.
 UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_vram_bytes")
 
+#: The fault tail this worker keeps. Every reader takes the last 8.
+FAULTS_HELD = 64
+
 CAUSE = pb.CauseCode
 ORIGIN = pb.CauseOrigin
 STATUS = pb.TerminalStatus
@@ -214,6 +217,36 @@ class Attempt:
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
 
+    def compact(self) -> None:
+        """Keep the REPLAY IDENTITY; drop everything a closed attempt cannot need again.
+
+        A closed attempt is answered by exactly two questions: the (ordinal, digest) fence,
+        and a duplicate StartAttempt that must replay its terminal. Everything else — the
+        spec, the payload, the grant, the plan, the hydrated inputs, the observation ring,
+        the reconciliation — was retained for the life of the process because nothing ever
+        released it. The terminal BYTES go too: they can carry a 4 MiB inline result and the
+        journal already holds them, so `wrap` re-reads if a replay ever comes (codex audit,
+        adopted 2026-08-25).
+        """
+        self.spec = {}
+        self.payload = {}
+        self.opened = {}
+        self.grant = pb.DeliveryGrant()
+        self.plan = None
+        self.prepared = None
+        self.binding = None
+        self.job = None
+        self.trees = {}
+        self.inputs = {}
+        self.terminal_bytes = b""
+        self.ring = EventRing()
+        self.attribution = {}
+        self.confessions = []
+        self.reconciliation = {}
+        self.caps = {}
+        self.residency = {}
+        self.publication = {}
+
     def confess(self, kind: str, quantified: str, *, benchmark: bool = False) -> None:
         """Say out loud that this request was not served by its plain reading (§3.6)."""
         row = observe.Confession(kind, f"{self.request_id}#{self.attempt}", quantified, benchmark)
@@ -276,8 +309,9 @@ class AttemptEngine:
         self.session_id = ""
         self.recovered: list[pb.ActiveAttempt] = []
         self.executed = 0
+        #: the worker's fault tail. BOUNDED: the Report and the triage bundle each read the
+        #: last 8, and an unbounded list of the other 65,528 is memory nobody reads.
         self.faults: list[pb.Fault] = []
-        self.warm_outcomes: list[dict[str, Any]] = []
         self.bundles = bundles
         self.monitor = monitor
         #: the worker's applied posture, read at bundle time — a triage bundle that cannot
@@ -296,12 +330,17 @@ class AttemptEngine:
         #: the journaled receipt. Identity replays; the same key with different bytes is a
         #: CONFLICT and never a replacement (§2).
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
-        #: what the coordinator answered for each forwarded checkpoint, by receipt id
-        self.checkpoint_acks: dict[str, str] = {}
         #: cr-012's egress boundary, rebuilt from the applied binding at each directive.
         #: A default `EgressPolicy()` has an EMPTY allowlist, which means no egress at all —
         #: the fail-closed state is the one you get by not configuring anything.
         self.egress = egress.EgressPolicy()
+
+    def fault(self, row: pb.Fault) -> None:
+        """Record ONE fault, bounded. Readers take the last 8; the tail past that is memory
+        nobody reads, and an unbounded one is how a long-lived worker grows without a leak
+        anywhere (codex audit, adopted 2026-08-25)."""
+        self.faults.append(row)
+        del self.faults[:-FAULTS_HELD]
 
     # ------------------------------------------------------------------ offer
 
@@ -881,7 +920,7 @@ class AttemptEngine:
             record["journaled"] = False
             record["journal_error"] = exc.code
         if record["leaks"]:
-            self.faults.append(
+            self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=key,
@@ -1165,10 +1204,8 @@ class AttemptEngine:
         fault, because it means the run's identity is contested upstream — but it cannot
         retroactively un-write bytes that are durable here.
         """
-        outcome = pb.CheckpointOutcome.Name(receipt.outcome)
-        self.checkpoint_acks[receipt.receipt_id] = outcome
         if receipt.outcome == pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT:
-            self.faults.append(
+            self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=f"{receipt.request_id}#{receipt.attempt}",
@@ -1321,7 +1358,7 @@ class AttemptEngine:
         if "state_seq" in reply:
             # Monotone wire counters belong to the SUPERVISOR. A disposable process that
             # restarts a counter at 1 must never become the worker's truth.
-            self.faults.append(
+            self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=f"{attempt.request_id}#{attempt.attempt}",
@@ -1698,6 +1735,10 @@ class AttemptEngine:
         self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
         if attempt.opened:
             self.reconcile(attempt)
+            # ONE ENVELOPE, ONE CLOSE. The opening line is spent here; a second terminal for
+            # the same attempt has nothing left to reconcile and re-reading this snapshot
+            # would report the first close's own baseline move as a leak.
+            attempt.opened = {}
         body = pb.TerminalBody(
             request_id=attempt.request_id,
             attempt=attempt.attempt,
@@ -1832,7 +1873,7 @@ class AttemptEngine:
         try:
             return self.bundles.commit(assembly)
         except (triage.TriageError, JournalError, OSError) as exc:
-            self.faults.append(
+            self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=key,
@@ -1872,7 +1913,13 @@ class AttemptEngine:
 
     def wrap(self, attempt: Attempt) -> pb.AttemptTerminal:
         """Wrap the SAME journaled body in the CURRENT session envelope. The body is a byte
-        fact; only the envelope moves across a reconnect."""
+        fact; only the envelope moves across a reconnect.
+
+        A CLOSED attempt no longer holds those bytes in memory — the journal does, and this
+        is the one place that ever needs them again.
+        """
+        if not attempt.terminal_bytes and attempt.terminal_id:
+            attempt.terminal_bytes = self.journal.terminal_bytes(attempt.key())
         return pb.AttemptTerminal(
             session_id=self.session_id,
             executor_incarnation=self.supervision.incarnation,
@@ -2102,6 +2149,7 @@ class AttemptEngine:
         # closing while ordinal N runs must not evict the running attempt from `live`.
         if self.live.get(attempt.request_id) is attempt:
             self.live.pop(attempt.request_id, None)
+        attempt.compact()
         return "closed"
 
     # ------------------------------------------------------------------ recovery

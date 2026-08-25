@@ -574,7 +574,7 @@ import tiny_sdxl as sd
 from cozy_runtime.author import *
 from cozy_runtime.author._signature import analyze
 from cozy_runtime.author.fakes import fake_context, invoke_with_fakes
-from cozy_runtime.internal.residency import StagedBackend
+from cozy_runtime.author.fakes import StagedBackend
 
 class Meta(msgspec.Struct):
     ok: bool
