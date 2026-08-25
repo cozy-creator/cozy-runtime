@@ -186,6 +186,10 @@ class Attempt:
     terminal_id: str = ""
     terminal_digest: bytes = b""
     terminal_bytes: bytes = b""
+    queued_at: float = 0.0
+    """When the READER recorded this attempt and handed it to the device lane. The queue a
+    caller waits in starts here, not at acceptance — acceptance is now something the lane
+    does, so measuring from it would report every wait as zero."""
     accepted_at: float = 0.0
     dispatched_at: float = 0.0
     resulted_at: float = 0.0
@@ -355,7 +359,7 @@ class AttemptEngine:
             if held.attempt == start.attempt:
                 held.grant = start.grant  # a refresh swaps authority; identity never moves
                 return held  # idempotent: re-send AttemptAccepted, run once
-            if held.state in ("accepted", "running"):
+            if held.state in ("queued", "accepted", "running"):
                 raise AttemptRefusal(
                     "live_attempt_supersession",
                     f"attempt {start.attempt} arrived while attempt {held.attempt} is live "
@@ -375,6 +379,36 @@ class AttemptEngine:
             digest=start.exec_spec_digest,
             spec=spec,
             grant=start.grant,
+        )
+
+    def hold(self, attempt: Attempt) -> None:
+        """RECORD the attempt on the READER, before the device lane can reach it.
+
+        Registering here and not at acceptance is what keeps the idempotency fences honest
+        once acceptance moved off this thread: a second StartAttempt arriving while the
+        first is still queued must find it, and a successor ordinal must see a live attempt
+        with no journaled terminal and refuse supersession.
+        """
+        attempt.state = "queued"
+        attempt.queued_at = time.perf_counter()
+        self.live[attempt.request_id] = attempt
+        self.history[attempt.key()] = attempt
+
+    def refuse_held(
+        self,
+        attempt: Attempt,
+        code: str,
+        detail: str,
+        cause: pb.CauseCode,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+    ) -> pb.AttemptTerminal:
+        """A REFUSED terminal for an attempt this worker is already holding."""
+        return self.terminal(
+            attempt,
+            STATUS.TERMINAL_STATUS_REFUSED,
+            cause,
+            origin,
+            f"{code}: {detail}",
         )
 
     # ------------------------------------------------------------------ prepare/accept
@@ -764,6 +798,12 @@ class AttemptEngine:
         `terminal()`, because the triage bundle the terminal REFERENCES has to carry the
         reconciliation — a bundle that stops one statement short of the numbers an operator
         needs is a bundle they have to leave to go find them."""
+        if attempt.canceling:
+            # Cancelled between arrival and dispatch — while it queued, or while admission
+            # was fetching and hydrating it. Nothing reached the device, so the caller's
+            # cancel is complete the moment this terminal is journaled, and spending the
+            # lease on an answer nobody is waiting for would be the opposite of honouring it.
+            return self.finish_cancel(attempt, attempt.canceling)
         return self._run(attempt)
 
     def reconcile(self, attempt: Attempt) -> dict[str, Any]:
@@ -1682,7 +1722,12 @@ class AttemptEngine:
                 "attribution": attempt.attribution,
                 "windows_ms": {
                     "queue_ms": round(
-                        max(attempt.dispatched_at - attempt.accepted_at, 0.0) * 1000, 2
+                        max(attempt.dispatched_at - (attempt.queued_at or attempt.accepted_at), 0.0)
+                        * 1000,
+                        2,
+                    ),
+                    "admission_ms": round(
+                        max(attempt.accepted_at - attempt.queued_at, 0.0) * 1000, 2
                     ),
                     "dispatch_to_result_ms": round(
                         max(attempt.resulted_at - attempt.dispatched_at, 0.0) * 1000, 2
@@ -1833,7 +1878,7 @@ class AttemptEngine:
         result). Anything it cannot observe is NAMED, never silently promoted.
         """
         window_ms = (attempt.resulted_at - attempt.dispatched_at) * 1000
-        queue_ms = (attempt.dispatched_at - attempt.accepted_at) * 1000
+        queue_ms = (attempt.dispatched_at - (attempt.queued_at or attempt.accepted_at)) * 1000
         return pb.AttemptMetrics(
             runtime_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
             queue_ms=int(max(queue_ms, 0.0)),
@@ -1865,6 +1910,12 @@ class AttemptEngine:
             pb.CancelReason.CANCEL_REASON_POLICY: "policy",
             pb.CancelReason.CANCEL_REASON_DEADLINE: "deadline",
         }.get(message.reason, "client")
+        if held.state != "running":
+            # NOTHING OF THIS ATTEMPT IS ON THE DEVICE. The signal is process-wide, so
+            # sending it here would cancel whichever attempt IS running — a different
+            # request's. The mark is enough: the device lane reads it when it reaches this
+            # attempt, and terminates it without dispatching.
+            return f"marked before dispatch ({held.canceling}); nothing signalled"
         executor = self.supervision.current
         if executor is None:
             return "executor already gone"
@@ -1906,8 +1957,13 @@ class AttemptEngine:
             ORIGIN.CAUSE_ORIGIN_COORDINATOR
             if reason in ("drain", "policy", "superseded")
             else ORIGIN.CAUSE_ORIGIN_CLIENT,
-            f"canceled ({reason}); the executor was dead and uncommitted outputs aborted "
-            "before this terminal was journaled",
+            f"canceled ({reason}); "
+            + (
+                "the executor was dead and uncommitted outputs aborted before this terminal "
+                "was journaled"
+                if attempt.executions
+                else "nothing was dispatched, so there is nothing to unwind"
+            ),
         )
 
     def abandon(self, attempt: Attempt, why: str) -> pb.AttemptTerminal:
@@ -2030,8 +2086,13 @@ class AttemptEngine:
         return [a for a in self.history.values() if a.state == "terminal"]
 
     def active(self) -> list[pb.ActiveAttempt]:
+        """The attempts this worker CLAIMS. A queued one is not among them: acceptance is
+        what makes an attempt a claim, and the wire has no state for "held, not yet
+        admitted"."""
         out = []
         for attempt in self.live.values():
+            if attempt.state == "queued":
+                continue
             out.append(
                 pb.ActiveAttempt(
                     request_id=attempt.request_id,

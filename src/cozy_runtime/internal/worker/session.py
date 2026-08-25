@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -875,7 +876,15 @@ class Supervisor:
         self.connected.clear()
 
     def on_start(self, start: pb.StartAttempt) -> None:
-        """Fence + idempotency in the READER (no I/O), then hand the work to the queue."""
+        """READER: fence, record, enqueue. Nothing here waits, fetches or leases.
+
+        Everything slow about an attempt — retrieving the payload, hydrating its inputs,
+        pricing a plan, waiting out a rebuild — happens on the DEVICE LANE below. This thread
+        is the only one that can hear a cancel, a terminal ack, a directive or a shutdown, so
+        work done here is time nobody else's message can be heard in. It used to do all four
+        (codex audit, adopted 2026-08-25), and the 120 s rebuild wait made the worst case a
+        two-minute deaf reader.
+        """
         if start.session_id != self.fences.session_id:
             self.note("fence", f"dropped: wrong session {start.session_id!r}")
             return
@@ -891,7 +900,6 @@ class Supervisor:
                 CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
             return
-        self.await_settled(start)
         try:
             attempt = self.engine.offer(start)
         except AttemptRefusal as exc:
@@ -906,6 +914,13 @@ class Supervisor:
             )
             self.send(pb.WorkerMessage(attempt_terminal=self.engine.wrap(attempt)))
             return
+        if attempt.state == "queued":
+            self.note(
+                "attempt",
+                "duplicate StartAttempt for a QUEUED attempt: it is already held in arrival "
+                "order and its acceptance will be published when the lane admits it",
+            )
+            return
         if attempt.state in ("accepted", "running"):
             self.note(
                 "attempt",
@@ -914,32 +929,10 @@ class Supervisor:
             )
             self.send(pb.WorkerMessage(attempt_accepted=self.engine.accepted_message(attempt)))
             return
-        try:
-            accepted = self.engine.prepare_and_accept(attempt)
-        except AttemptRefusal as exc:
-            self.note("attempt", f"{start.request_id}#{start.attempt} refused: {exc.code}")
-            self.refuse(start, exc.code, exc.detail, exc.cause, exc.origin)
-            return
-        except JournalError as exc:
-            self.note(
-                "journal",
-                f"{exc.code}: acknowledging nothing and executing nothing for "
-                f"{start.request_id}#{start.attempt}",
-            )
-            self.engine.faults.append(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=f"{start.request_id}#{start.attempt}",
-                    reason=exc.code,
-                    detail=exc.detail[:1024],
-                )
-            )
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)  # fault first, then the edge
-            return
-        self.send(pb.WorkerMessage(attempt_accepted=accepted))
+        self.engine.hold(attempt)
         self.work.put(attempt)
 
-    def await_settled(self, start: pb.StartAttempt) -> None:
+    def await_settled(self, attempt: Attempt) -> None:
         """QUEUE behind a rebuild instead of refusing through one.
 
         The alternative — the shape cl-003 measured — is a dispatch/refuse/requeue loop: a
@@ -950,25 +943,24 @@ class Supervisor:
         healthy 4 seconds later. Waiting turns a refusal into a queue, which is what a
         coordinator's budget is for.
 
-        This blocks the CONTROL READER, deliberately and with precedent: a directive's own
-        `prepare` already does (cr-007 divergence 7), and a rebuild happens only after the
-        attempt it followed reached its terminal, so there is no live attempt whose cancel
-        this could delay. It is bounded, and the bound is generous because a rebuild is a
-        real refill — 5 s warm, ~48 s from cold page cache on the launch family.
+        The wait is on the DEVICE LANE, which is the thread that would have been idle anyway.
+        It used to be on the control reader, where 120 s of waiting was 120 s in which no
+        cancel, ack, directive or shutdown could be heard.
         """
         if self.settled.is_set():
             return
         started = time.perf_counter()
+        key = f"{attempt.request_id}#{attempt.attempt}"
         self.note(
             "readiness",
-            f"{start.request_id}#{start.attempt} arrived while the worker is rebuilding: "
-            f"waiting up to {REBUILD_WAIT_SECONDS:g} s rather than refusing it",
+            f"{key} reached the lane while the worker is rebuilding: waiting up to "
+            f"{REBUILD_WAIT_SECONDS:g} s rather than refusing it",
         )
         settled = self.settled.wait(REBUILD_WAIT_SECONDS)
         waited = (time.perf_counter() - started) * 1000
         self.note(
             "readiness",
-            f"{start.request_id}#{start.attempt} waited {waited:.0f} ms; intake is "
+            f"{key} waited {waited:.0f} ms; intake is "
             f"{pb.IntakeState.Name(self.fences.intake)}"
             + ("" if settled else " (the wait expired)"),
         )
@@ -987,7 +979,8 @@ class Supervisor:
         what separates a caller's typed error from a platform-fatal one, and collapsing both
         onto SUPERVISOR sends the wrong person to look (v1 REF_ORIGIN).
         """
-        attempt = Attempt(
+        held = self.engine.history.get((start.request_id, start.attempt))
+        attempt = held or Attempt(
             request_id=start.request_id,
             attempt=start.attempt,
             digest=start.exec_spec_digest,
@@ -1008,41 +1001,126 @@ class Supervisor:
         self.engine.history[attempt.key()] = attempt
         self.send(pb.WorkerMessage(attempt_terminal=terminal))
 
-    def worker(self) -> None:
-        """The single device lease. Attempts serialize here, in arrival order."""
+    # ------------------------------------------------------------------ the device lane
+
+    def device_lane(self) -> None:
+        """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild.
+
+        Two phases per attempt and they are strictly ordered against each other, which is the
+        point rather than an implementation convenience. ADMISSION prices a plan against the
+        live ledger; EXECUTION runs it and reconciles the ledger at the terminal. Admitting
+        attempt N+1 before N reconciled would price it against a residency N is about to move
+        — several attempts accepted against one snapshot, which is what the audit found. So
+        the lane admits nothing until the previous attempt's terminal has closed its books.
+
+        Overlapping admission with the previous attempt's GPU work is cr-019's door: it is
+        the pipelining this shape makes reachable, and it is not claimed here.
+        """
         while not self.stop.is_set():
             attempt = self.work.get()
             if attempt is None:
                 return
+            if self.admit(attempt):
+                self.execute(attempt)
+                self.rebuild_if_needed()
+
+    def admit(self, attempt: Attempt) -> bool:
+        """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        self.await_settled(attempt)
+        if attempt.canceling:
+            # Cancelled while it sat in the queue. Nothing was fetched, planned or reserved,
+            # so there is nothing to unwind — but the attempt is HELD and every held attempt
+            # ends in a terminal.
+            self.note("cancel", f"{key} was cancelled before admission")
+            self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
+            return False
+        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
+        if deadline_ms and time.time() * 1000 > deadline_ms:
+            # The queue can hold work now, so a deadline can expire before the lane reaches
+            # it. Running it anyway would spend the card on an answer nobody is waiting for.
+            self.note("cancel", f"{key} reached the lane past its deadline")
+            self.terminate(attempt, self.engine.finish_cancel, "deadline")
+            return False
+        if self.fences.posture == pb.Posture.POSTURE_DRAINING:
+            self.note("intake", f"draining: refusing queued {key}")
+            self.terminate(
+                attempt,
+                self.engine.refuse_held,
+                "draining",
+                "the worker began draining while this attempt was queued",
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+            return False
+        try:
+            accepted = self.engine.prepare_and_accept(attempt)
+        except AttemptRefusal as exc:
+            self.note("attempt", f"{key} refused: {exc.code}")
+            self.terminate(
+                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+            )
+            return False
+        except JournalError as exc:
+            self.note(
+                "journal",
+                f"{exc.code}: acknowledging nothing and executing nothing for {key}",
+            )
+            self.engine.faults.append(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=key,
+                    reason=exc.code,
+                    detail=exc.detail[:1024],
+                )
+            )
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)  # fault first, then the edge
+            return False
+        self.send(pb.WorkerMessage(attempt_accepted=accepted))
+        return True
+
+    def execute(self, attempt: Attempt) -> None:
+        """RUN -> TERMINAL -> RECONCILE. The ledger closes inside `terminal()`."""
+        try:
+            terminal = self.engine.execute(attempt)
+        except JournalError as exc:
+            self.note("journal", f"{exc.code}: no terminal can be claimed")
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            return
+        except Exception as exc:
+            # A BUG in the execution path is still an attempt that must terminate. Found
+            # live on the job lane: one unhandled ValueError killed this thread, and the
+            # coordinator then waited out its whole readiness deadline on an attempt it
+            # had already been told was accepted. A worker that cannot run an attempt
+            # says so with a terminal; it never converts a defect into a hang.
+            self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
-                terminal = self.engine.execute(attempt)
-            except JournalError as exc:
-                self.note("journal", f"{exc.code}: no terminal can be claimed")
+                terminal = self.engine.abandon(
+                    attempt, f"the worker faulted while running this attempt: {exc}"
+                )
+            except Exception as inner:
+                self.note("attempt", f"even ABANDONED could not be journaled: {inner}")
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
-                continue
-            except Exception as exc:
-                # A BUG in the execution path is still an attempt that must terminate. Found
-                # live on the job lane: one unhandled ValueError killed this thread, and the
-                # coordinator then waited out its whole readiness deadline on an attempt it
-                # had already been told was accepted. A worker that cannot run an attempt
-                # says so with a terminal; it never converts a defect into a hang.
-                self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
-                try:
-                    terminal = self.engine.abandon(
-                        attempt, f"the worker faulted while running this attempt: {exc}"
-                    )
-                except Exception as inner:
-                    self.note("attempt", f"even ABANDONED could not be journaled: {inner}")
-                    self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
-                    continue
-            self.send(pb.WorkerMessage(attempt_terminal=terminal))
-            current = self.supervision.current
-            if self.supervision.needs_rebuild:
-                self.rebuild("readiness was invalidated during the attempt")
-            elif current is None or not current.alive():
-                self.rebuild("the executor is gone")
-            elif current.poisoned:
-                self.rebuild(f"poisoned: {current.poisoned}")
+                return
+        self.send(pb.WorkerMessage(attempt_terminal=terminal))
+
+    def terminate(
+        self, attempt: Attempt, build: Callable[..., pb.AttemptTerminal], *args: Any
+    ) -> None:
+        """Journal ONE terminal for a held attempt and send it, or say why it could not."""
+        try:
+            self.send(pb.WorkerMessage(attempt_terminal=build(attempt, *args)))
+        except JournalError as exc:
+            self.note("journal", f"cannot journal a terminal ({exc.code}); sending nothing")
+
+    def rebuild_if_needed(self) -> None:
+        """The queue starts behind the rebuild because BOTH live on this lane."""
+        current = self.supervision.current
+        if self.supervision.needs_rebuild:
+            self.rebuild("readiness was invalidated during the attempt")
+        elif current is None or not current.alive():
+            self.rebuild("the executor is gone")
+        elif current.poisoned:
+            self.rebuild(f"poisoned: {current.poisoned}")
 
     def rebuild(self, why: str) -> None:
         """Replace the executor and RELOAD before reporting ready. Never on the
@@ -1309,7 +1387,7 @@ class Supervisor:
                 "recovery",
                 f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
             )
-        threading.Thread(target=self.worker, daemon=True, name="attempt").start()
+        threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
         threading.Thread(target=self.reporter, daemon=True, name="report").start()
         threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
 
