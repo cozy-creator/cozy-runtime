@@ -45,6 +45,7 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
+| `internal/staging.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
 | `internal/worker/triage.py` | the `WorkerTriageBundle` schema, its assembler, and the journal-backed store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
@@ -86,6 +87,23 @@ killed executor is therefore explainable from a directory, with no live process 
 a wedge is consecutive observations that find the position unchanged. `give_up_after` counts
 observations, not seconds — there is no boot timeout and there will not be one — and the
 `timing-decides-nothing` fence proves the observation plane cannot reach residency or placement.
+
+**Component residency is the runtime's, and the endpoint has no vocabulary for it.** An
+endpoint declares the possible heavyweight set of each public model operation with
+`@uses_components` and nothing else. Entering that scope ADMITS and MATERIALIZES the set
+before the body runs — freeing non-declared components, LRU over refcount-0 leases whose
+CUDA events have fired, until the plan's activation envelope fits ALLOCATABLE capacity —
+and leaving it records the fence and makes the bytes evictable. Eviction FREES; there is no
+host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cached CAS
+mapping. The `endpoint-owns-no-residency` fence proves the vocabulary is unreachable from
+endpoint code rather than merely unused.
+
+**The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
+coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming
+`measured` without a source refuses. An uncalibrated coefficient may DEEPEN placement —
+which changes weight placement only, never the bits — and may never refuse. Capacity splits
+by tenancy: shared reschedules, local deepens to the deepest rung with a quantified
+confession and exits only below the declared physical floor.
 
 **The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
 supervisor's own bookkeeping, `measured` for a named device or kernel interface,
@@ -134,6 +152,10 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/slice-live.py triage     # cr-011: explain a killed executor from the bundle
     corpus/.venv/bin/python scripts/slice-live.py wedge      # cr-011: silence vs slow, with no clock
     corpus/.venv/bin/python scripts/slice-live.py witness    # cr-011: a real cgroup OOM kill, named
+    corpus/.venv/bin/python scripts/pipeline-live.py fixtures  # cr-008b: the config + bundled tokenizers
+    corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
+    corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
+    corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
