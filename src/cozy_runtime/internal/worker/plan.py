@@ -564,7 +564,18 @@ class PlanChooser:
         # accounts for whatever this generation holds, so the ladder's arithmetic is over
         # HEADROOM: what the attempt needs ON TOP of the weights that are already there.
         allocatable = self.ledger.allocatable
-        largest = max((*resident.values(), *absent.values()), default=binding.vram_bytes)
+        # THE MOST A STAGED RUNG MUST RAISE AT ONCE. A component scope holds its WHOLE
+        # declared set resident for the length of the body, so the charge is the biggest
+        # deduplicated declared set — not the biggest single component, which is what this
+        # priced before and which under-charges every method that declares several
+        # (codex audit, adopted 2026-08-25). Never below the single-component figure: a
+        # generation that reported no scopes is priced exactly as it was.
+        sizes = {**absent, **resident}
+        scoped = [
+            sum(sizes.get(name, 0) for name in dict.fromkeys(names))
+            for names in self.ledger.declared_scopes.values()
+        ]
+        largest = max([max(sizes.values(), default=binding.vram_bytes), *scoped])
         activations = terms["activations"]
         rows: list[dict[str, Any]] = []
         chosen = ""
@@ -632,6 +643,8 @@ class PlanChooser:
             "absent": dict(absent),
             "declared_bytes": declared_bytes,
             "parked": list(parked),
+            "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
+            "largest_declared_set_bytes": largest,
             "rungs": rows,
             "tenancy": binding.tenancy,
         }

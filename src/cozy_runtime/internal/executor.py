@@ -135,6 +135,7 @@ class Executor:
         self.torch = torch
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
+        from cozy_runtime.author._model import component_use
         from cozy_runtime.internal.delivery import (
             ROUTE_KERNEL,
             DeliveryChooser,
@@ -452,6 +453,12 @@ class Executor:
             # ignoring is named where a person and a coordinator both see it, so the extras
             # this bind dropped and the markers it transcribed ride the bind result.
             "custody": binding.get("custody", "canonical"),
+            # THE COMPONENT-USE CONTRACT, as a construction fact. The supervisor prices a
+            # staged rung against it and cannot read it any other way: the declaration lives
+            # on the endpoint's class, and that class is only ever imported here.
+            "declared_scopes": {
+                method: list(names) for method, names in sorted(component_use(model_cls).items())
+            },
             "ignored_extra_keys": list(record.ignored_extras),
             "transcribed_markers": list(record.transcribed_markers),
             "delivery": choice.document(),

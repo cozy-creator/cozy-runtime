@@ -246,6 +246,11 @@ class Ledger:
     #: `all_resident` because the headroom arithmetic fit, which made the plan's placement
     #: disagree with the generation it was planning for.
     parked: tuple[str, ...] = ()
+    #: method -> the component set that method DECLARES it may touch, reported by the
+    #: construction that read the class. A scope holds its whole set resident at once, so
+    #: this is what a staged rung must raise; pricing the largest single component instead
+    #: under-charged every multi-component scope (codex audit, adopted 2026-08-25).
+    declared_scopes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
     #: TRUE once the generation's first-call tax has been paid by something that is not a
@@ -375,6 +380,10 @@ class Ledger:
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
         self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
+        self.declared_scopes = {
+            str(method): tuple(str(name) for name in names)
+            for method, names in (facts.get("declared_scopes") or {}).items()
+        }
         self.evicted = {}
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))
