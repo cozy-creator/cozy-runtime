@@ -1043,7 +1043,7 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
-    head("a real 4.78 GiB fill against a header row whose object does not exist")
+    head("a real 4.78 GiB fill against a store with ONE byte flipped in a real object")
     worker = start_worker(
         tmp,
         entrypoints=("denoise",),
@@ -1077,25 +1077,28 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
             line[0].split("boot: ")[-1] if line else "",
         )
 
-        head("the rollback seam: journaled AND actually freed")
+        head("since tfs-007 the refusal PRECEDES the reservation, which is the whole point")
         text = line[0] if line else ""
         peak_bytes = _number(text, r"peak allocator (\d+) B")
         after_bytes = _number(text, r"allocator holds (\d+) B", default=-1)
         free_bytes = _number(text, r"has (\d+) B free")
         used = gpu_used_mib()
         check(
-            "the bytes that were live are freed, not merely dereferenced",
-            peak_bytes > 4 * GIB and after_bytes == 0,
-            f"{peak_bytes / GIB:.3f} GiB of destinations were allocated when the fill "
-            f"refused; the allocator holds {after_bytes} B afterwards — release is a "
-            "POSITIVE act, because the exception's traceback retains the fill loop's frame",
+            "ZERO destinations were reserved before the artifact was refused",
+            peak_bytes == 0 and after_bytes == 0,
+            f"peak allocator {peak_bytes} B, {after_bytes} B afterwards — TensorFS verifies "
+            "the snapshot when the LEASE registers, so a corrupt object never reaches a "
+            "fill. The interim reader could only find the same defect 85 % of the way "
+            "through a 4.78 GiB stream, with 5,134,982,144 B of destinations already live",
         )
         check(
             "and the DEVICE agrees, from outside the process",
-            free_bytes > 7 * GIB,
-            f"nvidia-smi: {used} MiB used ({used - idle} MiB over the {idle} MiB idle "
-            f"baseline — the poisoned executor is still alive and its CUDA context is "
-            f"what that is); torch: {free_bytes / GIB:.2f} GiB free of 7.63",
+            used - idle < 512,
+            f"nvidia-smi: {used} MiB used, {used - idle} MiB over this run's {idle} MiB "
+            f"baseline — the poisoned executor is still alive and its CUDA context is what "
+            f"that is; torch reports {free_bytes / GIB:.2f} GiB free. The comparison is "
+            "against the BASELINE, not an absolute: this box is shared and a neighbour's "
+            "residency is not this run's leak",
         )
 
         head("a fresh executor confirms the free memory from inside CUDA")

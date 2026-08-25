@@ -330,7 +330,6 @@ class Supervisor:
             )
             took = (time.perf_counter() - started) * 1000
             if not reply.get("ok"):
-                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 detail = str(reply.get("detail"))[:1024]
                 shortfall = reply.get("shortfall") or {}
                 if shortfall:
@@ -353,6 +352,12 @@ class Supervisor:
                         detail=detail,
                     )
                 )
+                # RECORD THE FAULT, THEN MOVE THE STATE. The transition publishes a Report
+                # immediately, so transitioning first tells a coordinator "I failed" in a
+                # message that does not yet carry why — and the next Report is a full period
+                # away. Found by the harness waiting on a fault report and getting an empty
+                # one; it is the ordering hazard every edge-published state has.
+                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.note(
                     "boot",
                     f"prepare REFUSED for {first.plan_id[:20]}: {reply.get('code')} - "
@@ -583,7 +588,6 @@ class Supervisor:
                 f"{exc.code}: acknowledging nothing and executing nothing for "
                 f"{start.request_id}#{start.attempt}",
             )
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             self.engine.faults.append(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
@@ -592,6 +596,7 @@ class Supervisor:
                     detail=exc.detail[:1024],
                 )
             )
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)  # fault first, then the edge
             return
         self.send(pb.WorkerMessage(attempt_accepted=accepted))
         self.work.put(attempt)
