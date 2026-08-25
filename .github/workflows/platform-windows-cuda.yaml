@@ -1,0 +1,123 @@
+name: platform-windows-cuda
+# cr-020 hardware probe. MANUALLY TRIGGERED ONLY — never on push/PR/schedule. Not a test
+# suite: a live run on a Windows+NVIDIA machine that BANKS what it exposes — the driver model
+# (WDDM is the whole point of cr-020 item 6), the commit charge that makes Windows' free-RAM
+# number dishonest, the CUDA allocator numbers, and which rungs serve vs refuse typed.
+#
+# It targets a SELF-HOSTED label, so it runs on nothing until a rented box registers itself
+# under that label (see cr-020's provisioning script). Card tiers, all consumer — the class a
+# real Windows user actually owns:
+#   windows-4090-sm89   primary. sm89 → fp8 compute SERVES.
+#   windows-3090-sm86   sm86 → fp8 compute REFUSES typed. This is the consumer no-fp8 path.
+#   windows-5090-sm120  forward tier. sm120 → fp8 compute expected to serve; stock and Windows
+#                       image support are verified live at rent time, never assumed.
+# The fp8 verdict is asserted against the capability the CARD reports (>= sm89), so one file
+# proves the serve on two tiers and the refusal on the third without per-tier branching.
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Self-hosted label of the rented Windows box.'
+        type: choice
+        default: windows-4090-sm89
+        options: [windows-4090-sm89, windows-3090-sm86, windows-5090-sm120]
+      torch_index:
+        description: 'PyTorch wheel index. cu128 covers sm86 through sm120.'
+        type: string
+        default: https://download.pytorch.org/whl/cu128
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      # No checkout: the subject is the MACHINE, not the tree.
+      - name: driver and WDDM facts
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
+          # Driver model: WDDM levies a commit charge for ALL VRAM, TCC does not. cr-020 item 6
+          # prices host RAM off the commit-corrected number, so the model must be recorded, and
+          # the commit counters below are the measurement that replaces ComfyUI's constants.
+          nvidia-smi -q | Select-String -Pattern 'Driver Model','Current DM','Pending DM'
+          Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion,AdapterRAM
+          Get-CimInstance Win32_OperatingSystem |
+            Format-List Caption,Version,TotalVisibleMemorySize,FreePhysicalMemory
+          "committed_bytes: " + (Get-Counter '\Memory\Committed Bytes').CounterSamples.CookedValue
+          "commit_limit: " + (Get-Counter '\Memory\Commit Limit').CounterSamples.CookedValue
+
+      - name: install torch
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          uv venv .venv
+          uv pip install --python .venv\Scripts\python.exe torch --index-url ${{ inputs.torch_index }}
+          .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+      - name: cuda probe
+        run: |
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          @'
+          import platform, sys, torch
+
+          def leg(name, fn):
+              # Typed both ways: SERVES with its value, or REFUSED with the exception class.
+              # A refusal is a RESULT here, not an error.
+              try:
+                  print(f"{name}: SERVES {fn()}")
+                  return True
+              except Exception as e:
+                  print(f"{name}: REFUSED {type(e).__name__}: {e}")
+                  return False
+
+          print("python:", sys.version.split()[0])
+          print("platform:", platform.platform(), platform.machine())
+          print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+          print("cuda.is_available:", torch.cuda.is_available())
+          p = torch.cuda.get_device_properties(0)
+          cap = torch.cuda.get_device_capability(0)
+          print("device:", p.name, "capability:", cap, "total_bytes:", p.total_memory)
+          print("mem_get_info (free,total):", torch.cuda.mem_get_info(0))
+
+          d = "cuda"
+          leg("fp32 matmul", lambda: (torch.randn(1024, 1024, device=d) @
+                                      torch.randn(1024, 1024, device=d)).sum().item())
+          leg("fp16 matmul", lambda: (torch.randn(1024, 1024, device=d, dtype=torch.float16) @
+                                      torch.randn(1024, 1024, device=d, dtype=torch.float16)).sum().item())
+          leg("bf16 matmul", lambda: (torch.randn(1024, 1024, device=d, dtype=torch.bfloat16) @
+                                      torch.randn(1024, 1024, device=d, dtype=torch.bfloat16)).sum().item())
+          leg("fp16 conv2d", lambda: torch.nn.Conv2d(4, 8, 3, padding=1).to(d, torch.float16)(
+              torch.randn(1, 4, 128, 128, device=d, dtype=torch.float16)).shape)
+          torch.cuda.synchronize()
+
+          for n in ("memory_allocated", "max_memory_allocated", "memory_reserved"):
+              print(f"cuda.{n}:", getattr(torch.cuda, n)(0))
+
+          # The fp8 arm. The DTYPES exist on every build; the COMPUTE path is sm89+. Asserting
+          # the verdict against the reported capability is what makes 3090 vs 4090 a RESULT.
+          for n in ("float8_e4m3fn", "float8_e5m2"):
+              print(f"dtype torch.{n} exists:", hasattr(torch, n))
+              leg(f"fp8 {n} tensor", lambda n=n: torch.zeros(
+                  64, 64, device=d, dtype=getattr(torch, n)).dtype)
+
+          served = leg("fp8 e4m3 _scaled_mm", lambda: torch._scaled_mm(
+              torch.zeros(64, 64, device=d, dtype=torch.float8_e4m3fn),
+              torch.zeros(64, 64, device=d, dtype=torch.float8_e4m3fn).t(),
+              scale_a=torch.ones(1, device=d), scale_b=torch.ones(1, device=d),
+              out_dtype=torch.bfloat16).dtype)
+
+          expected = cap >= (8, 9)
+          print(f"VERDICT fp8_compute: expected={expected} observed={served} capability={cap}")
+          if served != expected:
+              raise SystemExit(f"fp8 compute verdict violated on capability {cap}")
+          '@ | Set-Content -Encoding utf8 probe.py
+          .venv\Scripts\python.exe probe.py 2>&1 | Tee-Object -FilePath transcript.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-cuda-transcript-${{ inputs.runner_label }}
+          path: transcript.txt
