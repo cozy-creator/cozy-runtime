@@ -24,9 +24,10 @@ from typing import Any
 
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset
-from cozy_runtime.author._context import AdapterRef, Context, Device, Model
+from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke
+from cozy_runtime.author._model import Model
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,

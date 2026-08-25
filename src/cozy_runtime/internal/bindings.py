@@ -1,0 +1,105 @@
+"""Binding resolution: `endpoint.toml` defaults -> `--model` -> the deploy binding.
+
+Code states CAPABILITY; selection is a BINDING (§1.0/§1.1). Author code never names a repo,
+release, checkpoint or adapter — so this module lives outside the author fence, reads the
+repo's `endpoint.toml`, and speaks the same one binding vocabulary the deploy side does.
+
+`endpoint.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
+speaks (a bare-venv `run` with no `--model`). Production authority is the hub-side binding
+alone. Two spellings, one schema: `[bindings."<ModelClass>"]` covers every parameter of that
+class, `[bindings."<callable>.models.<param>"]` names one parameter specifically, and the
+path spelling wins where both speak.
+"""
+
+from __future__ import annotations
+
+import tomllib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from cozy_runtime.author import ConformanceError, ModelBinding
+
+
+@dataclass(frozen=True, slots=True)
+class Binding:
+    """One resolved slot: which artifact a binding path loads, and who said so."""
+
+    path: str
+    ref: str
+    lane: str | None
+    source: str
+    """Where it came from, most authoritative last."""
+
+    def __str__(self) -> str:
+        lane = f" --lane={self.lane}" if self.lane else ""
+        return f"{self.path} -> {self.ref}{lane}  [{self.source}]"
+
+
+def read_table(endpoint_toml: Path) -> Mapping[str, Mapping[str, object]]:
+    """The `[bindings.*]` table of a repo's endpoint.toml, unresolved."""
+    data = tomllib.loads(endpoint_toml.read_text())
+    table = data.get("bindings", {})
+    if not isinstance(table, dict):
+        raise ConformanceError(
+            f"{endpoint_toml}: [bindings] must be a table of binding paths", code="bindings"
+        )
+    return {str(k): dict(v) for k, v in table.items() if isinstance(v, dict)}
+
+
+def resolve(
+    slots: Sequence[ModelBinding],
+    table: Mapping[str, Mapping[str, object]],
+    *,
+    overrides: Mapping[str, str] | None = None,
+    deploy: Mapping[str, str] | None = None,
+) -> dict[str, Binding]:
+    """Resolve every declared slot, or refuse naming the slot nothing binds."""
+    ladder = ((overrides or {}, "--model"), (deploy or {}, "deploy binding"))
+    known = {s.path for s in slots} | {s.class_key for s in slots}
+    unknown = sorted(set(table) - known)
+    if unknown:
+        raise ConformanceError(
+            f"endpoint.toml binds {', '.join(unknown)}, which this release declares no slot "
+            f"for (slots: {', '.join(sorted(s.path for s in slots))})",
+            code="unknown_binding",
+            fields=unknown,
+        )
+    resolved: dict[str, Binding] = {}
+    for slot in slots:
+        chosen: Binding | None = None
+        for key, source in (
+            (slot.class_key, "endpoint.toml:class"),
+            (slot.path, "endpoint.toml:path"),
+        ):
+            entry = table.get(key)
+            if entry is not None:
+                chosen = Binding(slot.path, _ref(entry, key), _lane(entry), source)
+        for override, source in ladder:
+            ref = override.get(slot.path) or override.get(slot.class_key)
+            if ref is not None:
+                chosen = Binding(slot.path, ref, chosen.lane if chosen else None, source)
+        if chosen is None:
+            raise ConformanceError(
+                f"{slot.path} ({slot.class_key}) has no binding: code states capability, "
+                "bindings state selection — name it in endpoint.toml or pass --model",
+                code="unbound_slot",
+                fields=[slot.path],
+            )
+        resolved[slot.path] = chosen
+    return resolved
+
+
+def _ref(entry: Mapping[str, object], key: str) -> str:
+    repo = entry.get("repo")
+    if not isinstance(repo, str) or not repo:
+        raise ConformanceError(
+            f"[bindings.{key!r}] declares no repo=", code="bindings", fields=[key]
+        )
+    release = entry.get("release")
+    return f"{repo}@{release}" if isinstance(release, str) and release else repo
+
+
+def _lane(entry: Mapping[str, object]) -> str | None:
+    lane = entry.get("lane")
+    return lane if isinstance(lane, str) else None

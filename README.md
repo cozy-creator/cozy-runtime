@@ -35,12 +35,21 @@ ordering itself is cr-007). `internal/exits.py` is the one shared exit-code matr
     uv run cozy-runtime new <name>       # scaffold a minimal valid endpoint
     uv run python scripts/fence.py       # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
-    uv run python scripts/verify.py      # live run of examples/tiny_sdxl.py end to end
+    uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
 
-`examples/tiny_sdxl.py` is a real endpoint on the author surface (weightless, no GPU):
-four entrypoints covering both spellings, the derived capability set, `ModelDefault`
-overlay resolution, the typed preflight, and the output transaction.
+Two real endpoints on the author surface (weightless, no GPU), both driven end to end by
+`scripts/verify.py`:
+
+| example | what it exercises |
+|---|---|
+| `examples/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
+| `examples/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, and a declared `DerivedCache` |
+
+`examples/tiny_diffusers.py` stands in for the model library an endpoint brings as an
+ordinary dependency (and registers its own construction adapter); `examples/tiny_artifacts.py`
+and `examples/endpoint.toml` are the RUNTIME's side — resolved artifacts and default
+bindings. Author code never names an artifact identifier; a fence proves it.
 
 `run` · `serve` · `job` · `describe` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit`
 land in cr-016 over the real attempt kernel.

@@ -1,20 +1,24 @@
-"""A real, runnable endpoint on the cr-002a author surface — SDXL-shaped, weightless.
+"""A real, runnable endpoint on the author surface — SDXL-shaped, weightless.
 
-Modeled line-for-line on `cozy-runtime-sdxl.md` (and the H3 example's preflight arm), with
-one substitution: the pipeline is a tiny deterministic renderer instead of diffusers,
-because the `Model` CONSTRUCTION boundary (`Loader`, `load(T)`, `@uses_components`) is
-cr-002b's, not this issue's. Everything the handler touches is the production surface: real
-injection, real `ModelDefault` overlay, real preflight, real output transaction, real
-encode. `scripts/verify.py` runs every entrypoint here and prints what happened.
+Modeled line-for-line on `cozy-runtime-sdxl.md`, with one substitution: the pipeline comes
+from `tiny_diffusers` instead of diffusers, because cozy-runtime defines no model
+architectures and every fixture must run on this box with no weights. Everything the
+handler and the model touch is the production surface: real construction through
+`loader.load(T)`, real census/match/fill, real guarded component roots, real injection,
+real `ModelDefault` overlay, real preflight, real output transaction, real encode.
 
-Four entrypoints, each proving something the others do not:
-  generate      the common case — bare decorator, derived gpu, Shape presets, ModelDefault
-  plan          NO Outputs parameter: structurally cannot save (the capability red arm)
+This file is the MINIMUM case: one input struct, one Model class with one coarse method,
+one entrypoint — plus three arms the others do not cover.
+
+  generate      the common case — bare decorator, derived gpu, one coarse component set
+  plan          NO Outputs parameter: structurally cannot save (the capability arm)
   generate_ref  typed preflight + Settings + an asset request field + handler Adjustments
   caption       the `async def` spelling on its private per-attempt loop, with Egress
+
+`generate` and `generate_ref` both declare `model: SdxlModel`: two independent binding
+paths that COALESCE onto one model generation when their construction identities match.
 """
 
-import random
 from enum import Enum
 from typing import Annotated
 
@@ -27,6 +31,7 @@ from cozy_runtime.author import (
     Egress,
     ImageAsset,
     ImageFrame,
+    Loader,
     Model,
     ModelDefault,
     Outputs,
@@ -36,7 +41,9 @@ from cozy_runtime.author import (
     Shape,
     Telemetry,
     UnsupportedInput,
+    uses_components,
 )
+from tiny_diffusers import ImageFrameData, TinySdxlPipeline
 
 app = App()
 
@@ -80,50 +87,58 @@ class PlanOutput(msgspec.Struct):
     steps: int
 
 
-class TinyPipe:
-    """Stands in for `StableDiffusionXLPipeline` until cr-002b lands the Model boundary."""
+class SdxlModel(Model[TinySdxlPipeline]):
+    """A bare typed parameter is the whole declaration — and its presence derives `gpu`.
 
-    def __call__(
-        self, *, prompt: str, width: int, height: int, steps: int, guidance: float,
-        generator: random.Random,
-    ) -> ImageFrame:
-        jitter = generator.randbytes(3)
-        tint = (sum(prompt.encode()) + steps + int(guidance * 10)) & 0xFF
-        rows = bytearray()
-        for y in range(height):
-            for x in range(width):
-                rows += bytes(
-                    (
-                        (x * 255 // max(width - 1, 1)) ^ jitter[0],
-                        (y * 255 // max(height - 1, 1)) ^ jitter[1],
-                        tint ^ jitter[2],
-                    )
-                )
-        return ImageFrame(width, height, bytes(rows))
+    No stamp keyword: SDXL has no structural twins, so admission is pure topology
+    satisfaction and the deployment binds whatever curated gallery policy it likes.
+    """
 
+    pipe: TinySdxlPipeline  # declared state — mypy-strict checked (§1.7)
 
-class SdxlModel(Model[TinyPipe]):
-    """A bare typed parameter is the whole declaration — and its presence derives `gpu`."""
+    def load(self, loader: Loader) -> None:
+        # load(T): sugar legal because this pipeline family ships a REGISTERED construction
+        # adapter. It is never a from_pretrained duck-type and never a path handoff (§1.1).
+        self.pipe = loader.load(TinySdxlPipeline)
 
-    def __init__(self, checkpoint_ref: str = "test://sdxl-base@1") -> None:
-        self.pipe = TinyPipe()
-        self.checkpoint_ref = checkpoint_ref
+    def unload(self, loader: Loader) -> None:
+        del self.pipe
 
-    # cr-002b adds `load(self, loader: Loader)` and `@uses_components("unet", "vae", …)`.
+    # FOUR heavyweight components — SDXL has two text encoders; a missing name here poisons
+    # at first touch. Coarse whole-__call__ scope: safe-and-slower (§1.1).
+    @uses_components("text_encoder", "text_encoder_2", "unet", "vae")
     def generate(
-        self, view: RequestView, prompt: str, *, width: int, height: int,
+        self, view: RequestView, prompt: str, *, negative: str, width: int, height: int,
         steps: int, guidance: float,
     ) -> ImageFrame:
         # The model calls its OWN typed pipeline; the view supplies the request-local
         # generator. RequestView has no pipeline passthrough.
-        return self.pipe(
+        frame = self.pipe(
             prompt=prompt,
+            # CFG-free turbo execution ignores the negative branch entirely
+            negative_prompt=(negative if guidance > 1.0 else None),
             width=width,
             height=height,
             steps=steps,
             guidance=guidance,
             generator=view.generator,
         )
+        return _render(frame)
+
+
+def _render(frame: ImageFrameData) -> ImageFrame:
+    """Pure pixel packing — no component is touched, so it is module code (§1.1)."""
+    rows = bytearray()
+    for y in range(frame.height):
+        for x in range(frame.width):
+            rows += bytes(
+                (
+                    (x * 255 // max(frame.width - 1, 1)) ^ frame.jitter[0],
+                    (y * 255 // max(frame.height - 1, 1)) ^ frame.jitter[1],
+                    frame.tint ^ frame.jitter[2],
+                )
+            )
+    return ImageFrame(frame.width, frame.height, bytes(rows))
 
 
 @app.entrypoint  # bare is the common case: resources= is an override door
@@ -139,8 +154,8 @@ def generate(
         for step in range(steps):
             on_step(step)
         frame = model.generate(
-            view, payload.prompt, width=width, height=height, steps=steps,
-            guidance=payload.guidance_scale,
+            view, payload.prompt, negative=payload.negative_prompt, width=width,
+            height=height, steps=steps, guidance=payload.guidance_scale,
         )
     return ImageOutput(
         image=out.save_image(frame, format="png"), checkpoint=model.checkpoint_ref
@@ -211,7 +226,7 @@ def generate_ref(
         adj.adjusted("num_inference_steps", steps, 8, "reference conditioning caps steps")
         steps = 8
     frame = model.generate(
-        view, payload.prompt, width=width, height=height, steps=steps,
+        view, payload.prompt, negative="", width=width, height=height, steps=steps,
         guidance=payload.guidance_scale,
     )
     return ImageOutput(

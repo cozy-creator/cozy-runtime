@@ -26,7 +26,7 @@ import msgspec
 
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, bind
-from cozy_runtime.author._context import AdapterRef, Context, Device, Model
+from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
@@ -36,6 +36,7 @@ from cozy_runtime.author._errors import (
     InvalidRequest,
     OutputError,
 )
+from cozy_runtime.author._model import Model
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,

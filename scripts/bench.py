@@ -48,15 +48,34 @@ ITERATIONS = 3000
 # return validation and the output transaction. "handler" is the same handler called
 # directly with the same arguments, so the DIFFERENCE is the surface's overhead.
 KERNEL = f"""
-import resource, sys, tempfile, time
+import random, resource, sys, tempfile, time
 from pathlib import Path
 sys.path.insert(0, 'examples')
+import tiny_artifacts as art
+import tiny_h3 as h3
 import tiny_sdxl as ep
-from cozy_runtime.author import Invocation, describe, invoke
-from cozy_runtime.author.fakes import fake_attempt, fake_outputs, invoke_with_fakes
+from tiny_diffusers import TinySdxlPipeline
+from cozy_runtime.author import Invocation, ModelRegistry, describe, invoke
+from cozy_runtime.author._loader import census
+from cozy_runtime.author.fakes import (fake_attempt, fake_context, fake_outputs,
+                                       invoke_with_fakes)
+from cozy_runtime.internal.residency import StagedBackend
 
 N = {ITERATIONS}
-models = {{"model": ep.SdxlModel()}}
+
+
+def registry(app_models):
+    reg = ModelRegistry(release="bench", backend=StagedBackend())
+    for path, (cls, artifact) in app_models.items():
+        reg.acquire(path, cls, artifact)
+    return reg
+
+
+sdxl = registry({{"plan.models.model": (ep.SdxlModel, art.sdxl()),
+                 "generate.models.model": (ep.SdxlModel, art.sdxl()),
+                 "generate_ref.models.model": (ep.SdxlModel, art.sdxl())}})
+h3_reg = registry({{"generate.models.model": (h3.Fl2VAModel, art.h3(task="fl2va"))}})
+models = sdxl.models("plan")
 payload = ep.Txt2ImgInput(prompt="bench", num_inference_steps=4)
 inv = Invocation(request_id="bench", spool=Path(tempfile.mkdtemp()),
                  deadline=time.monotonic() + 3600, models=models)
@@ -72,9 +91,10 @@ def bench(label, fn, n=N):
     return per
 
 
-t0 = time.perf_counter()
-describe(ep.app)
-print(f"  {{'describe(app) — 4 entrypoints, once':<46}} {{(time.perf_counter()-t0)*1000:9.3f}} ms")
+for label, app in (("tiny_sdxl — 4 entrypoints", ep.app), ("tiny_h3 — 2 entrypoints", h3.app)):
+    t0 = time.perf_counter()
+    describe(app)
+    print(f"  {{'describe(' + label + '), once':<46}} {{(time.perf_counter()-t0)*1000:9.3f}} ms")
 
 kernel = bench("invoke(plan): decode+overlay+features+inject+validate",
                lambda: invoke(ep.app.get('plan'), {{"prompt": "bench"}}, inv))
@@ -90,15 +110,35 @@ print(f"  {{'-> the fakes overhead (mkdtemp per attempt)':<46}} {{faked - kernel
 bench("invoke(generate): 64x64 render + PNG + transaction",
       lambda: invoke_with_fakes(ep.app.get('generate'), {{"prompt": "b",
                                                          "num_inference_steps": 4}},
-                                models=models), n=N // 20)
+                                models=sdxl.models('generate')), n=N // 20)
 bench("invoke(generate_ref): + typed preflight + Settings",
       lambda: invoke_with_fakes(ep.app.get('generate_ref'), {{"prompt": "b"}},
-                                models=models, settings=ep.RefSettings()), n=N // 20)
+                                models=sdxl.models('generate_ref'),
+                                settings=ep.RefSettings()), n=N // 20)
+bench("invoke(h3.generate): 6 component scopes + cache",
+      lambda: invoke_with_fakes(h3.app.get('generate'),
+                                {{"prompt": "b", "duration_s": 1}},
+                                models=h3_reg.models('generate')), n=N // 20)
+
+print()
+pipe = h3.build_h3_pipeline(art.h3(task='fl2va').config, task='fl2va')
+h3_artifact = art.h3(task="fl2va")
+bench("census: walk one H3 construction (12 destinations)",
+      lambda: census(pipe), n=N // 3)
+bench("construct: factory + census + match + fill (H3)",
+      lambda: ModelRegistry(release='b', backend=StagedBackend()).acquire(
+          'g.models.m', h3.Fl2VAModel, h3_artifact), n=N // 10)
+bench("construct: the SDXL whole pipeline through load(T)",
+      lambda: ModelRegistry(release='b', backend=StagedBackend()).acquire(
+          'g.models.m', ep.SdxlModel, art.sdxl()), n=N // 10)
+bench("model.for_request -> RequestView + fresh scheduler",
+      lambda: sdxl.models('generate')['model'].for_request(fake_context()))
 
 attempt = fake_attempt('bench')
 out = fake_outputs(attempt)
-frame = ep.TinyPipe()(prompt='b', width=64, height=64, steps=1, guidance=1.0,
-                      generator=ep.random.Random(0))
+frame = ep._render(TinySdxlPipeline(art.sdxl().config)(
+    prompt='b', negative_prompt=None, width=64, height=64, steps=1, guidance=1.0,
+    generator=random.Random(0)))
 bench("out.save_image -> real PNG encode (64x64)",
       lambda: out.save_image(frame, format='png'), n=N // 10)
 
@@ -121,7 +161,8 @@ def main() -> int:
     print(f"{RUNS} runs each; peak RSS measured per case in a fresh helper process")
     for label, argv in cases:
         report(label, *timed(argv))
-    print("\nauthor surface, in-process against examples/tiny_sdxl.py")
+    print("\nauthor surface, in-process against examples/tiny_sdxl.py + tiny_h3.py",
+          flush=True)
     subprocess.run([py, "-c", KERNEL], check=True)
     return 0
 

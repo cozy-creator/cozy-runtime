@@ -1,4 +1,4 @@
-"""`Context`, `RequestView`, and the minimal `Model` base.
+"""`Context` and `RequestView` — where a handler runs, and its request-local model state.
 
 `Context` answers exactly one question — where and under what conditions am I executing.
 The member list below is the COMPLETE committed inventory (§1.3): anything absent is
@@ -6,10 +6,9 @@ absent on purpose. No checkpoint paths, no placement or offload knobs, no config
 environment, no provider facts, no child-call surface — and no `ctx.generator`: the
 seeded per-request generator is `view.generator`, the ONE spelling.
 
-cr-002b owns the `Model` boundary (Loader, `construct`/`load`, `uses_components`,
-`make_scheduler`). What lives here is only what the HANDLER surface needs: a model
-parameter to derive `gpu` from, its construction-identity fact, and the request view that
-carries the seeded generator and the applied adapter stack.
+The `Model` boundary itself is `author/_model.py`; this module holds only what both it and
+the handler surface need, so the construction plane can import the request plane and never
+the reverse.
 """
 
 from __future__ import annotations
@@ -17,13 +16,14 @@ from __future__ import annotations
 import hashlib
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, final
 
-from cozy_runtime.author._errors import Cancelled, DeadlineExceeded
+from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
-PipelineT = TypeVar("PipelineT")
+if TYPE_CHECKING:
+    from cozy_runtime.author._loader import Scheduler
 
 DeviceType = Literal["cuda", "cpu", "mps"]
 
@@ -48,18 +48,59 @@ class AdapterRef:
     kind: str
 
 
+@final
 @dataclass(frozen=True, slots=True)
 class RequestView:
-    """Request-local model state. SDK-owned members are exactly `generator` and `adapters`.
+    """Request-local model state. Its SDK-owned members are EXACTLY three:
+    `make_scheduler(name)`, `generator`, and `adapters`.
 
-    No pipeline passthrough and no dynamic attribute proxying exist: model code calls its
-    own typed pipeline and hands it `view.generator` explicitly (§1.3/§1.7).
-    cr-002b adds the third member, `make_scheduler(name)`.
+    There is no pipeline passthrough and no dynamic attribute proxying — `view(...)` and
+    `view.<anything else>` do not exist, which is what removes the author surface's last
+    declared `Any` seam (§1.3/§1.7). Model code calls its own typed pipeline and hands it
+    `view.generator` and fresh schedulers explicitly. It cannot be subclassed: a wider view
+    would be that deleted proxy under another name.
+
+    `generator` is a `random.Random` while the runtime is weightless; it becomes a
+    `torch.Generator` with the first real fills (cr-005). Author code passes it through and
+    never inspects it, so the swap is source-compatible.
     """
 
     generator: random.Random
-    seed: int
     adapters: tuple[AdapterRef, ...] = ()
+    _seed: int = 0
+    _prototypes: Mapping[str, Scheduler] = field(default_factory=dict, repr=False)
+    _sampler: str | None = field(default=None, repr=False)
+
+    def __init_subclass__(cls) -> None:
+        raise CapabilityError(
+            f"class {cls.__name__}(RequestView): the request view is exactly three SDK-owned "
+            "members — a subclass is the deleted pipeline proxy under another name (§1.3)",
+            code="view_subclass",
+        )
+
+    @classmethod
+    def _make(
+        cls,
+        seed: int,
+        adapters: tuple[AdapterRef, ...],
+        prototypes: Mapping[str, Scheduler],
+        sampler: str | None,
+    ) -> RequestView:
+        return cls(random.Random(seed), adapters, seed, prototypes, sampler)
+
+    def make_scheduler(self, name: str) -> Scheduler:
+        """A FRESH request-lifetime instance of the named family — never shared, and it
+        dies with the attempt. The SDK owns the sampler table; the request owns nothing."""
+        prototype = self._prototypes.get(name)
+        if prototype is None:
+            raise CapabilityError(
+                f"no scheduler named {name!r} in this construction "
+                f"({', '.join(sorted(self._prototypes)) or 'none'}) — schedulers are "
+                "construction facts, not request data",
+                code="unknown_scheduler",
+                fields=[name],
+            )
+        return prototype.clone(self._sampler)
 
 
 def derive_seed(request_id: str) -> int:
@@ -91,24 +132,3 @@ class Context:
             raise DeadlineExceeded(f"attempt {self.request_id} outlived its deadline")
         if self._cancel():
             raise Cancelled(f"attempt {self.request_id} was cancelled")
-
-
-class Model(Generic[PipelineT]):
-    """Base of an endpoint's reusable model class — a bare typed parameter is the whole
-    declaration, and its presence in a signature is what derives `gpu` (§1.2).
-
-    cr-002b brings `load(loader)`, `loader.construct`, `@uses_components`, and the
-    construction transaction. `checkpoint_ref` is a pinned-ref REPRODUCTION FACT for
-    result structs — an observation, never catalog authority.
-    """
-
-    checkpoint_ref: str = ""
-
-    def for_request(self, ctx: Context, *, seed: int | None = None) -> RequestView:
-        """The request-local view: seeded generator plus the immutable applied stack.
-
-        Request-local state lives where its lifetime is true — never as mutable fields on
-        the long-lived model.
-        """
-        effective = derive_seed(ctx.request_id) if seed is None else seed
-        return RequestView(random.Random(effective), effective, ctx._adapters)

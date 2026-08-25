@@ -1,0 +1,68 @@
+"""The RUNTIME's side of a binding, for live runs: resolved artifacts with real topologies.
+
+Selection produced these — author code never names any part of one (§1.1). Each artifact's
+topology table is derived by censusing a REFERENCE construction, which is what a checkpoint
+header supplies to the match at exact binding; the dual artifact is the union of both role
+graphs plus the shared components, exactly as job-001 packages it.
+
+Not an endpoint: this is fixture plumbing for `scripts/verify.py` and `scripts/redarm.py`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from cozy_runtime.author import Artifact, Config, TensorSpec
+from cozy_runtime.author._loader import topology_of
+from tiny_diffusers import Task, TinySdxlPipeline
+from tiny_diffusers import build_h3_pipeline as _build_h3
+
+H3_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": False}
+BAKED_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": True}
+SDXL_CONFIG: Mapping[str, object] = {"hidden_size": 32}
+
+
+def sdxl(snapshot: str = "cozy/tiny-sdxl@v1#a1b2", **config: object) -> Artifact:
+    data = {**SDXL_CONFIG, **config}
+    return Artifact(
+        snapshot=snapshot,
+        topology=topology_of(TinySdxlPipeline(Config(data))),
+        config=Config(data),
+    )
+
+
+def h3(
+    *, task: Task, snapshot: str | None = None, baked: bool = False, dual: bool = False
+) -> Artifact:
+    """A narrow role artifact, or the DUAL package carrying both transformer roles.
+
+    The `task` stamp is the SELECTED LANE's, not the package's: one snapshot carries both
+    role lanes, and a slot resolves to exactly one of them. Two slots on the dual artifact
+    therefore share a snapshot and config yet keep distinct construction identities,
+    because identity includes the model class (§1.1).
+    """
+    data = dict(BAKED_CONFIG if baked else H3_CONFIG)
+    config = Config(data)
+    topology: dict[str, TensorSpec] = {}
+    for role in (("fl2va", "ref2va") if dual else (task,)):
+        topology.update(topology_of(_build_h3(config, task=role)))
+    label = "h3-dual" if dual else f"h3-{task}"
+    lane = "adaln-baked" if baked else "full"
+    return Artifact(
+        snapshot=snapshot or f"cozy/{label}@v1/{lane}#c3d4",
+        topology=topology,
+        config=config,
+        stamps={"task": task, "family": "h3"},
+    )
+
+
+def named(artifact: Artifact, snapshot: str) -> Artifact:
+    """The same graph under a different exact snapshot — a DIFFERENT construction identity."""
+    return Artifact(
+        snapshot=snapshot,
+        topology=artifact.topology,
+        config=artifact.config,
+        stamps=artifact.stamps,
+        variant=artifact.variant,
+        custody=artifact.custody,
+    )

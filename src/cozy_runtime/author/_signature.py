@@ -11,13 +11,14 @@ import inspect
 import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Literal, get_args, get_origin
+from typing import Any, Literal, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author._context import Context, Model
+from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources, _PreflightMarker
+from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
 
@@ -49,6 +50,24 @@ class PreflightSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelBinding:
+    """One model slot as the descriptor sees it. The derived canonical PATH is the binding
+    point; the CLASS carries the admissibility stamps and the component-use contract."""
+
+    path: str
+    """`<callable>.models.<param>` — renaming a parameter is a breaking descriptor change."""
+    param: str
+    model_class: type[Model[Any]]
+    stamps: Mapping[str, str]
+    components: Mapping[str, tuple[str, ...]]
+
+    @property
+    def class_key(self) -> str:
+        """The by-class binding key: `[bindings."SdxlModel"]` covers every parameter of it."""
+        return self.model_class.__name__
+
+
+@dataclass(frozen=True, slots=True)
 class Surface:
     """One registered callable's derived surface. cr-003's descriptor consumes this."""
 
@@ -69,6 +88,27 @@ class Surface:
     @property
     def model_params(self) -> tuple[str, ...]:
         return tuple(p.name for p in self.params if p.role == "model")
+
+    @property
+    def model_bindings(self) -> tuple[ModelBinding, ...]:
+        """The slots this callable declares, each with its own independent admission."""
+        bindings = []
+        for p in self.params:
+            annotation = p.annotation
+            if p.role != "model" or not isinstance(annotation, type):
+                continue
+            if not issubclass(annotation, Model):
+                continue
+            bindings.append(
+                ModelBinding(
+                    path=f"{self.name}.models.{p.name}",
+                    param=p.name,
+                    model_class=annotation,
+                    stamps=annotation.__stamps__,
+                    components=component_use(annotation),
+                )
+            )
+        return tuple(bindings)
 
 
 def _hints(fn: Callable[..., object]) -> Mapping[str, object]:
@@ -109,6 +149,15 @@ def _classify(name: str, annotation: object, where: str) -> Param:
             if issubclass(base, plain):
                 return Param(name, "service", base, cap)
         if issubclass(base, Model):
+            if markers:
+                raise ConformanceError(
+                    f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
+                    "override-marker plane is EMPTY at launch: a bare typed parameter is "
+                    "unconditionally the whole declaration, and the class carries the "
+                    "admissibility stamps (§1.1). Future markers enter through cr-018's door",
+                    code="empty_marker_plane",
+                    fields=[name],
+                )
             return Param(name, "model", base)
         if is_struct(base):
             return Param(name, "payload", base)

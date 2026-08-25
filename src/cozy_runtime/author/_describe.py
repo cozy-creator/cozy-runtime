@@ -11,12 +11,14 @@ rely on are exercised by conformance, never by convention.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._signature import Surface
+from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
+from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._walker import walk
 
 if TYPE_CHECKING:
@@ -88,7 +90,42 @@ def check(surface: Surface) -> Surface:
                 code="preflight_result",
             )
         _two_producers(surface, specs)
+    for binding in surface.model_bindings:
+        _check_model(binding)
     return surface
+
+
+def _check_model(binding: ModelBinding) -> None:
+    """The SOURCE clock over one model slot: syntax, placement and excluded surfaces only.
+
+    It cannot prove a component name exists in an artifact that has not been selected —
+    that existence proof runs at exact binding against the censused construction (§1.1).
+    """
+    cls = binding.model_class
+    if cls.load is Model.load:
+        raise ConformanceError(
+            f"{binding.path}: {cls.__name__} defines no load(loader) — a Model constructs "
+            "through loader.construct(T, factory=…), the one construction primitive (§1.1)",
+            code="no_load",
+        )
+    try:
+        inspect.signature(cls).bind()
+    except TypeError:
+        raise ConformanceError(
+            f"{binding.path}: {cls.__name__}() takes constructor arguments — the runtime "
+            "owns WHEN construction runs, so a Model is built empty and filled by load()",
+            code="model_init",
+        ) from None
+    for method, names in binding.components.items():
+        del names
+        member = inspect.getattr_static(cls, method)
+        for name in inspect.signature(member).parameters:
+            if (why := EXCLUDED_KEYWORDS.get(name)) is not None:
+                raise ConformanceError(
+                    f"{cls.__name__}.{method}({name}=): {why}",
+                    code="excluded_keyword",
+                    fields=[name],
+                )
 
 
 def _two_producers(surface: Surface, specs: Sequence[FeatureSpec]) -> None:

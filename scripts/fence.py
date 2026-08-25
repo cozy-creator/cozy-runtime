@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Five fences, each provable red by planting the violation (`scripts/redarm.py`):
+Seven fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · package-imports · env-authority · single-config · no-interactive
+  excluded-keywords · no-identifiers-in-endpoint-code
 """
 
 from __future__ import annotations
@@ -160,12 +161,90 @@ def fence_no_interactive() -> list[str]:
     return bad
 
 
+def fence_excluded_keywords() -> list[str]:
+    """No author-callable may take a device, dtype, path, offload, pin, eviction, compile or
+    source-converter keyword: every one names a decision the runtime owns (§1.1/§7).
+
+    Dunder and private callables are the RUNTIME's own plumbing (the runtime hands the
+    Loader its device); the fence covers exactly what author code can call.
+    """
+    from cozy_runtime.author._model import EXCLUDED_KEYWORDS
+
+    # `path=` stays out of the SCAN: `out.save_file(path)` is a legitimate author surface
+    # (a file the handler produced), and the model-method clock still refuses it in-band.
+    # `author/fakes.py` supplies the RUNTIME's side of the contract, so it is exempt too.
+    fenced = {k: v for k, v in EXCLUDED_KEYWORDS.items() if k != "path"}
+    bad: list[str] = []
+    for path in py_files():
+        if path.relative_to(SRC).parts[0] != "author" or path.name == "fakes.py":
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if node.name.startswith("_"):
+                continue
+            args = node.args
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                if arg.arg in fenced:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: {node.name}({arg.arg}=) — "
+                        f"{fenced[arg.arg]}"
+                    )
+    return bad
+
+
+#: An endpoint module is one that builds an `App()` — the file `describe` imports.
+_MEDIA_PREFIXES = ("image/", "video/", "audio/", "text/", "application/", "model/")
+_IDENTIFIER = re.compile(r"^(hf|civitai|comfy|tensorhub):|^[a-z0-9][\w.-]*/[\w.-]+(@[\w.-]+)?$")
+#: A versioned FORMAT id (`adaln-tables/1`, `ggml-q4-k/v1`) is a schema name, not an artifact.
+_FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
+
+
+def endpoint_modules() -> list[pathlib.Path]:
+    modules = []
+    for path in sorted((ROOT / "examples").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "App":
+                modules.append(path)
+                break
+    return modules
+
+
+def fence_no_identifiers() -> list[str]:
+    """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
+    repo, release, checkpoint or adapter ref, in bindings or in string literals.
+
+    Code states capability; SELECTION is a binding (endpoint.toml, `--model`, the deploy
+    binding). Identity is exclusively deployment-side, so branching on one is unspellable.
+    """
+    bad: list[str] = []
+    for path in endpoint_modules():
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            text = node.value.strip()
+            if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):
+                continue
+            if _FORMAT_ID.match(text):
+                continue
+            if _IDENTIFIER.match(text):
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: artifact identifier {text!r} in "
+                    "endpoint code — selection is a binding, never a literal"
+                )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "package-imports": fence_package_imports,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,
     "no-interactive": fence_no_interactive,
+    "excluded-keywords": fence_excluded_keywords,
+    "no-identifiers-in-endpoint-code": fence_no_identifiers,
 }
 
 

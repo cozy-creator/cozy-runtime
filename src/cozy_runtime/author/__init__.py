@@ -7,9 +7,8 @@ it names no device, allocator, compile or ingest surface. `scripts/fence.py` pro
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. The surface below is the
-complete set of things an endpoint author touches, minus the `Model` construction boundary
-(cr-002b: `Loader`, `construct`/`load`, `uses_components`, `DerivedCache`) and the codec
-plane (cr-017). Per-service fakes live in `cozy_runtime.author.fakes`.
+complete set of things an endpoint author touches, minus the codec plane (cr-017). Per-service
+fakes live in `cozy_runtime.author.fakes`.
 """
 
 from cozy_runtime.author._app import App, Registration, RegistrationError
@@ -24,7 +23,6 @@ from cozy_runtime.author._context import (
     AdapterRef,
     Context,
     Device,
-    Model,
     RequestView,
 )
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe
@@ -43,7 +41,28 @@ from cozy_runtime.author._errors import (
     UnsupportedInput,
 )
 from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke
+from cozy_runtime.author._loader import (
+    Artifact,
+    Backend,
+    Config,
+    ConstructionRecord,
+    DerivedCache,
+    Loader,
+    ModuleLike,
+    Scheduler,
+    TensorSpec,
+    register_adapter,
+    registered_adapters,
+)
 from cozy_runtime.author._markers import Bound, ModelDefault, Preflight, Resources, Shape
+from cozy_runtime.author._model import (
+    ConstructionIdentity,
+    Model,
+    ModelRegistry,
+    ModelTestHarness,
+    ScopeCall,
+    uses_components,
+)
 from cozy_runtime.author._services import (
     AdjustmentRow,
     Adjustments,
@@ -59,7 +78,7 @@ from cozy_runtime.author._services import (
     Telemetry,
     TelemetryEvent,
 )
-from cozy_runtime.author._signature import Surface
+from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
     "DELETED_SURFACES",
@@ -67,19 +86,25 @@ __all__ = [
     "AdjustmentRow",
     "Adjustments",
     "App",
+    "Artifact",
     "Asset",
     "AudioAsset",
     "AuthorError",
+    "Backend",
     "Bound",
     "Budget",
     "Cancelled",
     "CapabilityError",
     "Checkpoints",
     "Clamp",
+    "Config",
     "ConformanceError",
+    "ConstructionIdentity",
+    "ConstructionRecord",
     "Context",
     "DeadlineExceeded",
     "DefaultResolutionError",
+    "DerivedCache",
     "Device",
     "Egress",
     "EgressResponse",
@@ -88,8 +113,13 @@ __all__ = [
     "ImageFrame",
     "InvalidRequest",
     "Invocation",
+    "Loader",
     "Model",
+    "ModelBinding",
     "ModelDefault",
+    "ModelRegistry",
+    "ModelTestHarness",
+    "ModuleLike",
     "OutputError",
     "Outputs",
     "Overlay",
@@ -102,6 +132,8 @@ __all__ = [
     "RequestView",
     "Resources",
     "ResultEnvelope",
+    "Scheduler",
+    "ScopeCall",
     "Scratch",
     "Secrets",
     "Settings",
@@ -109,9 +141,13 @@ __all__ = [
     "Surface",
     "Telemetry",
     "TelemetryEvent",
+    "TensorSpec",
     "UnsupportedInput",
     "VideoAsset",
     "assert_declaration_shape",
     "describe",
     "invoke",
+    "register_adapter",
+    "registered_adapters",
+    "uses_components",
 ]

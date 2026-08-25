@@ -1,0 +1,28 @@
+# The in-repo DEFAULT bindings — what a bare-venv `run` with no --model uses, and never a
+# source of truth (§1.0). Production authority is the hub-side deploy binding alone.
+#
+# Code states CAPABILITY; bindings state SELECTION. Nothing in tiny_h3.py or tiny_sdxl.py
+# names a repo, release, checkpoint or adapter — that is a hard rule, not a convention.
+
+[application]
+object = "tiny_h3:app"
+
+# By CLASS: covers every parameter of that class, the common case.
+[bindings."Fl2VAModel"]
+repo = "cozy/h3-dual"
+release = "v1"
+lane = "task=fl2va,structure=h3-full"
+
+[bindings."Ref2VAModel"]
+repo = "cozy/h3-dual"
+release = "v1"
+lane = "task=ref2va,structure=h3-full"
+
+[bindings."SdxlModel"]
+repo = "cozy/tiny-sdxl"
+release = "v1"
+
+# By PATH: one parameter specifically. The path spelling wins where both speak.
+[bindings."generate_ref.models.model"]
+repo = "cozy/tiny-sdxl-refined"
+release = "v2"
