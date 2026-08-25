@@ -237,8 +237,67 @@ def fence_no_identifiers() -> list[str]:
     return bad
 
 
+def fence_canonical_numbers() -> list[str]:
+    """Run the REAL writer over the frozen ES6 number vectors (`vectors/es6-numbers.txt`).
+
+    Frozen data, exercised by running the real writer over it — never a golden-test
+    harness. Each row is `<IEEE754 little-endian hex> <expected ES6 string>`, so the vector
+    is language-neutral and cannot drift with anyone's float parser. The oracle was V8
+    (`JSON.stringify`); the corpus banks the boundary neighbourhoods plus a deterministic
+    sample of a 1,000,000-value differential run.
+
+    It exists because RFC 8785's number rule is the one place this codec had a real defect:
+    an `is_integer()` fast path printed a double's EXACT expansion instead of its shortest
+    round-tripping digits, so `1.8645733457839102e20` serialized as
+    `186457334578391023616` where every ES6 reader writes `186457334578391020000`.
+    """
+    import struct
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import canonical
+
+    bad: list[str] = []
+    path = ROOT / "vectors" / "es6-numbers.txt"
+    rows = path.read_text().strip().splitlines()
+    for line in rows:
+        raw, expected = line.split(" ", 1)
+        value = struct.unpack("<d", bytes.fromhex(raw))[0]
+        got = canonical.write(value).decode()
+        if got != expected:
+            bad.append(f"{raw}: wrote {got!r}, ES6 says {expected!r}")
+    if not rows:
+        bad.append(f"{path} is empty — a vector file that vanishes must not read green")
+    return bad[:10]
+
+
+def fence_torch_free_import() -> list[str]:
+    """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
+
+    torch is an optional extra: the derive harness imports it INSIDE `torch_module()`, so a
+    cloned endpoint stays inspectable and the base package installs without a 3 GB wheel. A
+    module-scope `import torch` anywhere under `src/` breaks that, silently, for everyone.
+    """
+    bad = []
+    for path in py_files():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            if not any(n.split(".")[0] == "torch" for n in names):
+                continue
+            if node.col_offset == 0:
+                bad.append(
+                    f"{module_of(path)}:{node.lineno} imports torch at module scope — the "
+                    "harness imports it inside a function so the base package stays torch-free"
+                )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
+    "canonical-numbers": fence_canonical_numbers,
+    "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,

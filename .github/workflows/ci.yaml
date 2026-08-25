@@ -1,6 +1,11 @@
 name: ci
 on: [push, pull_request]
 jobs:
+  # CI is BUILD + FENCE + DETERMINISM/STALENESS only (owner rule, decisions #160, tightened
+  # 2026-08-24 after audit). `scripts/verify.py`, `scripts/redarm.py` and
+  # `scripts/derive-corpus.py` are BUILDER-RUN scripts that drive the real system — their
+  # transcripts belong in the issue's execution record, not in an automated gate. Anything
+  # below either builds, scans a boundary, or refuses a stale/non-reproducing artifact.
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -9,11 +14,12 @@ jobs:
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run mypy
+      # Architecture fences + the frozen ES6 number vectors + the torch-free-import fence.
       - run: uv run python scripts/fence.py
       # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
       # refuses a stale one (§1.0). A staleness check, not a test suite.
       - run: uv run cozy-runtime describe --check --dir examples
+      # Every descriptor-declared fact must have a live writer — a coverage refusal over
+      # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python scripts/conformance.py
-      - run: uv run python scripts/redarm.py
-      - run: uv run python scripts/verify.py
       - run: uv run cozy-runtime version
