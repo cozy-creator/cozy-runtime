@@ -9,7 +9,9 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
     prepare   construct + fill one binding; report the construction digest and ready facts
-    invoke    run ONE attempt through the author invocation kernel and report its facts
+    prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
+              the supervisor prices a plan against the record the handler will actually run
+    invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
     run_job   run ONE @app.job to completion through the SAME kernel, with job services
     probe     device/host memory facts, for the supervisor's ledger reconciliation
     shutdown  cooperative exit
@@ -40,7 +42,13 @@ from typing import Any
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import Outcome, classify
-from cozy_runtime.author._invoke import Invocation, attempt
+from cozy_runtime.author._invoke import (
+    Invocation,
+    PreparedRequest,
+    attempt,
+    prepare,
+    run_prepared,
+)
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import seal_snapshot
@@ -53,6 +61,11 @@ from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, conn
 #: cr-007 — the blob-receipt branch needs a real write-and-receipt transaction, and minting
 #: a receipt for bytes nobody wrote is the fabrication class this runtime exists to prevent.
 INLINE_RESULT_MAX = 4 * 1024 * 1024
+
+#: How many PREPARED requests this incarnation holds at once. A serving lane admits and
+#: runs one attempt at a time, so anything past the newest few is a request the
+#: supervisor prepared and then never dispatched.
+PREPARED_HELD = 8
 
 #: Set by SIGUSR1. THE cooperative-cancel signal: `ctx.raise_if_cancelled()` reads it.
 _CANCEL = False
@@ -111,6 +124,8 @@ class Executor:
         self.constructed_generation_digest = ""
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
+        #: request_id -> the record `prepare_request` resolved, run by `invoke`
+        self.prepared: dict[str, PreparedRequest] = {}
         self.attempts = 0
         #: the DURABLE exchange counter (cr-009). Supervisor-answered, never sheddable.
         self._exchange = 0
@@ -503,6 +518,61 @@ class Executor:
 
     # ------------------------------------------------------------------ invoke
 
+    def prepare_request(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Resolve ONE request through the kernel's pre-admission half, and retain it.
+
+        The supervisor calls this BEFORE it prices a plan, so the normalized features and
+        the preflight digests it journals into the AttemptPlan are the exact ones the
+        handler then runs on. The resolved payload is an author-typed object and cannot
+        cross the seam, so it stays here under the request id and only its digests travel;
+        `invoke` runs the record this produced and never resolves a second time.
+
+        No device is touched and no handler is entered, so a refusal here leaves a Ready
+        executor exactly as it found it — it is a PRE-ENTRY refusal in the strongest sense,
+        arriving before the attempt is even accepted.
+        """
+        if not self.ready:
+            return {
+                "ok": False,
+                "code": "executor_not_ready",
+                "detail": "a request prepared against a non-Ready executor",
+            }
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.surface_names.get(command["entrypoint"]) is None:
+            return {
+                "ok": False,
+                "code": "unknown_entrypoint",
+                "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
+            }
+        registration = self.discovered.app.get(command["entrypoint"])
+        try:
+            prepared = prepare(registration, command["payload"])
+        except Exception as exc:
+            outcome = classify(exc)
+            return {
+                "ok": False,
+                "code": outcome.code,
+                "detail": outcome.message[:1024],
+                "terminal": outcome.terminal,
+                "origin": outcome.origin,
+                "fields": list(outcome.fields),
+            }
+        self.prepared[command["request_id"]] = prepared
+        # A prepared request the supervisor never dispatched (a refusal after the plan, a
+        # cancel while it queued) would otherwise be retained for the generation's life.
+        for stale in list(self.prepared)[: -PREPARED_HELD or None]:
+            del self.prepared[stale]
+        return {
+            "ok": True,
+            "features": dict(prepared.features.values),
+            "adjustments": [
+                {"field": row.field, "requested": str(row.requested), "applied": str(row.applied)}
+                for row in prepared.overlay.rows
+            ],
+            **prepared.digests(),
+        }
+
     def invoke(self, command: dict[str, Any]) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
         global _CANCEL
@@ -523,7 +593,15 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
             }
-        registration = self.discovered.app.get(command["entrypoint"])
+        prepared = self.prepared.pop(command["request_id"], None)
+        if prepared is None:
+            return {
+                "ok": False,
+                "code": "prepared_request_absent",
+                "detail": f"nothing was prepared for {command['request_id']!r}: an attempt "
+                "runs the record its plan was priced against, and this executor holds none "
+                "(a fresh incarnation holds nothing at all)",
+            }
         spool = Path(command["spool"])
         deadline = time.monotonic() + command["deadline_s"]
         torch = self.torch
@@ -549,9 +627,8 @@ class Executor:
         allocated_at_start = torch.cuda.memory_allocated()
         lease_acquired = time.perf_counter()
         started_wall = time.time()
-        envelope, outcome, record = attempt(
-            registration,
-            command["payload"],
+        envelope, outcome, record = run_prepared(
+            prepared,
             Invocation(
                 request_id=command["request_id"],
                 spool=spool,
@@ -885,7 +962,18 @@ class Executor:
         payload, reason = warm.synthesize(schema.render(surface.payload_type), spool)
         if reason:
             return {"ok": True, "outcome": "skipped", "reason": reason, "payload": {}}
-        reply = self.invoke({**command, "payload": payload, "boot_warmup": True})
+        # THROUGH ORDINARY DISPATCH means through both halves in order. The warm pass has no
+        # supervisor to prepare for it, so it prepares its own request and then invokes the
+        # record — the same two calls a served attempt makes across the seam.
+        ready = self.prepare_request({**command, "payload": payload})
+        if not ready.get("ok"):
+            return {
+                "ok": True,
+                "outcome": "failed",
+                "payload": payload,
+                "reason": f"{ready.get('code')}: {str(ready.get('detail'))[:200]}",
+            }
+        reply = self.invoke({**command, "boot_warmup": True})
         succeeded = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
         if succeeded:
             return {
@@ -1069,6 +1157,8 @@ def main(argv: list[str] | None = None) -> int:
                 }
             elif name == "prepare":
                 reply = executor.prepare(command)
+            elif name == "prepare_request":
+                reply = executor.prepare_request(command)
             elif name == "invoke":
                 reply = executor.invoke(command)
             elif name == "run_job":

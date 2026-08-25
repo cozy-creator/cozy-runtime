@@ -1,8 +1,16 @@
-"""The ONE invocation kernel: decode -> resolve -> preflight -> hydrate -> invoke ->
-validate -> finalize.
+"""The ONE invocation kernel, in two halves that always run in this order:
+
+    prepare   decode -> resolve -> normalize -> preflight     (nothing is admitted yet)
+    invoke    hydrate -> inject -> call -> validate -> finalize
+
+The split is the seam a PLAN is chosen across. A serving attempt prepares BEFORE the
+supervisor admits it, so the normalized features and the preflight digests the planner
+prices against are the exact ones the handler then runs on; a job prepares inside its own
+accepted attempt, because a job has no ladder to price (cr-009). Both call these two
+functions, in this order, and neither resolves a request twice.
 
 Every door runs this. `run`, `job` and a socket-served attempt are user experiences over
-this function, never second execution implementations (§8) — and the per-service fakes are
+these functions, never second execution implementations (§8) — and the per-service fakes are
 capability adapters over THIS kernel, never a parallel behavioral runtime (§1.6). Where the
 supervisor/executor process boundary, the journal and the device leases go is cr-008a's;
 what a call MEANS is here.
@@ -134,29 +142,72 @@ def surface_of(registration: Registration) -> Surface:
     return surface
 
 
-def invoke(
-    registration: Registration, wire: Mapping[str, object], inv: Invocation, record: Attempt
-) -> ResultEnvelope:
-    """Execute one attempt end to end and return its envelope.
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """ONE request, resolved EXACTLY ONCE: decode -> resolve -> normalize -> preflight.
+
+    The half of the kernel that runs before anything is admitted, hoisted so it can run
+    before admission and its answers can be PRICED and JOURNALED rather than recomputed
+    after the fact (codex audit, adopted 2026-08-25). The planner used to be handed an ad
+    hoc scalar projection of the wire document while the real normalized features and the
+    preflight facts were derived later, inside invocation — two derivations of one thing,
+    and the one the plan was chosen against was the one nothing else ever saw again.
+
+    Immutable, and it is what `invoke` runs. There is no second resolve.
+    """
+
+    surface: Surface
+    overlay: Overlay
+    features: RequestFeatures
+    facts: object
+    facts_digest: str | None
+
+    def digests(self) -> dict[str, str]:
+        """What a supervisor can hold, journal and price against — never the payload."""
+        return {
+            "overlay_digest": self.overlay.digest,
+            "features_digest": self.features.digest,
+            "facts_digest": self.facts_digest or "",
+        }
+
+
+def prepare(
+    registration: Registration,
+    wire: Mapping[str, object],
+    *,
+    recipes: Sequence[Recipe] = (),
+    clamps: Sequence[Clamp] = (),
+    settings: object = None,
+) -> PreparedRequest:
+    """The pre-admission half. Raises typed refusals; hydrates nothing; enters nothing."""
+    surface = surface_of(registration)
+    overlay = resolve(
+        surface.payload_type,
+        wire,
+        recipes=recipes,
+        clamps=clamps,
+        model_params=surface.model_params,
+    )
+    facts, facts_digest = _preflight(surface, overlay, settings)
+    return PreparedRequest(
+        surface=surface,
+        overlay=overlay,
+        features=normalize(overlay.payload),
+        facts=facts,
+        facts_digest=facts_digest,
+    )
+
+
+def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> ResultEnvelope:
+    """Execute one PREPARED attempt end to end and return its envelope.
 
     `record` is built by the BOUNDARY below and passed in, so an attempt that dies before it
     produces an envelope still hands back its bounded observation ring — the failing
     attempt's log tail is the one triage most needs, and building the record inside here
     would drop it on exactly that path.
     """
-    surface = surface_of(registration)
+    surface, overlay = prepared.surface, prepared.overlay
     inv.spool.mkdir(parents=True, exist_ok=True)
-
-    overlay = resolve(
-        surface.payload_type,
-        wire,
-        recipes=inv.recipes,
-        clamps=inv.clamps,
-        model_params=surface.model_params,
-    )
-    features = normalize(overlay.payload)
-
-    facts, facts_digest = _preflight(surface, overlay, inv)
 
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
     _hydrate(overlay.payload, inv)
@@ -166,7 +217,7 @@ def invoke(
     ctx = Context(
         inv.request_id, inv.deadline, inv.boot_warmup, inv.device, inv.cancel, inv.adapters
     )
-    kwargs = _inject(surface, attempt, ctx, overlay, facts, inv)
+    kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     result = _call(surface, kwargs)
 
@@ -176,17 +227,17 @@ def invoke(
         result=result,
         outputs=tuple(a.row() for a in attempt.pending.values()),
         adjustments=tuple(attempt.rows),
-        features=features,
+        features=prepared.features,
         overlay_digest=overlay.digest,
         capabilities=surface.capabilities,
-        facts_digest=facts_digest,
+        facts_digest=prepared.facts_digest,
     )
 
 
-def attempt(
-    registration: Registration, wire: Mapping[str, object], inv: Invocation
+def run_prepared(
+    prepared: PreparedRequest, inv: Invocation
 ) -> tuple[ResultEnvelope | None, Outcome, Attempt]:
-    """The invocation BOUNDARY: one attempt in, one neutral terminal out, on every path.
+    """The invocation BOUNDARY: one PREPARED attempt in, one neutral terminal out, always.
 
     `invoke` raises typed refusals because author-facing code should; the boundary the
     supervisor speaks across cannot, because the terminal must still ship when the body
@@ -195,23 +246,47 @@ def attempt(
     """
     record = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
     try:
-        return invoke(registration, wire, inv, record), SUCCEEDED, record
+        return invoke(prepared, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
         return None, classify(exc), record
 
 
+def attempt(
+    registration: Registration, wire: Mapping[str, object], inv: Invocation
+) -> tuple[ResultEnvelope | None, Outcome, Attempt]:
+    """PREPARE then RUN, for the doors that do both at once — a job, and the warm pass.
+
+    A serving attempt prepares BEFORE the supervisor admits it, which is the whole point of
+    the split; a job is accept-then-prepare by design (cr-009) and has nothing to price a
+    ladder against. Both call the same two functions, in the same order.
+    """
+    try:
+        prepared = prepare(
+            registration, wire, recipes=inv.recipes, clamps=inv.clamps, settings=inv.settings
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        return (
+            None,
+            classify(exc),
+            Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress),
+        )
+    return run_prepared(prepared, inv)
+
+
 # ------------------------------------------------------------------------- preflight
 
 
-def _preflight(surface: Surface, overlay: Overlay, inv: Invocation) -> tuple[object, str | None]:
+def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[object, str | None]:
     spec = surface.preflight
     if spec is None:
         return None, None
     args: list[object] = [overlay.payload]
     if spec.settings_type is not None:
-        args.append(_settings_value(spec.settings_type, inv.settings, "preflight settings"))
+        args.append(_settings_value(spec.settings_type, settings, "preflight settings"))
     try:
         facts = spec.fn(*args)
     except AuthorError:

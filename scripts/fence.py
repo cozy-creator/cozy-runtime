@@ -380,7 +380,7 @@ def fence_torch_free_import() -> list[str]:
 #: Anything that wants to run an attempt therefore has to go through the supervisor, over
 #: the seam, into the executor. A direct-call runner beside it cannot be written without
 #: turning this fence red.
-KERNEL_CALLS = ("attempt", "invoke")
+KERNEL_CALLS = ("attempt", "prepare", "invoke", "run_prepared")
 KERNEL_CALLER = "internal/executor.py"
 ENGINE_CLASS = "AttemptEngine"
 ENGINE_BUILDER = "internal/worker/session.py"

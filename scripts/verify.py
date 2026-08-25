@@ -48,6 +48,7 @@ from cozy_runtime.author import (  # noqa: E402
     classify,
     describe,
     invoke,
+    prepare,
     registered_adapters,
 )
 from cozy_runtime.author._services import Attempt  # noqa: E402
@@ -459,8 +460,11 @@ def main() -> int:
         shutil.rmtree(spool)
     try:
         invoke(
-            ep.app.get("generate_ref"),
-            {"prompt": "denied", "reference": str(reference)},
+            prepare(
+                ep.app.get("generate_ref"),
+                {"prompt": "denied", "reference": str(reference)},
+                settings=ep.RefSettings(references_enabled=False),
+            ),
             Invocation(
                 request_id="denied",
                 spool=spool,

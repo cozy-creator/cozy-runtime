@@ -13,6 +13,7 @@ execute — it takes no I/O, loads no weights, and never touches the device.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,12 @@ from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser, PlanRefusal
+from cozy_runtime.internal.worker.plan import (
+    BindingPlan,
+    PlanChooser,
+    PlanRefusal,
+    PreparedRequest,
+)
 
 MIB = 1 << 20
 
@@ -154,9 +160,12 @@ def _verdict(
     ledger.resident = dict.fromkeys(installed.components, share)
     plan = BindingPlan.read(dict(record))
     chooser = PlanChooser(ledger)
-    features = {"entrypoint": surface.name, "scalars": document}
+    # `fit` prices a HYPOTHETICAL: there is no endpoint process to prepare the request, so
+    # the shape axes are normalized from the document by the one normalizer and the record
+    # says out loud that nothing resolved it (its digests are empty).
+    request = PreparedRequest.unresolved(surface.name, _axes(surface, document))
     try:
-        chosen = chooser.choose(plan, features)
+        chosen = chooser.choose(plan, request)
     except PlanRefusal as exc:
         return {
             "function": surface.name,
@@ -175,3 +184,19 @@ def _verdict(
         f"{chosen.quantified_choice[:160]}",
         "plan": chosen.document(),
     }
+
+
+def _axes(surface: Any, document: Mapping[str, Any]) -> Mapping[str, int]:
+    """The normalized shape axes of a document, through `author._demand` and nothing else.
+
+    A document `fit` was handed may be partial — it is an estimate over a request nobody has
+    sent — so a decode that does not converge yields NO axes rather than invented ones.
+    """
+    import msgspec
+
+    from cozy_runtime.author._demand import normalize
+
+    try:
+        return normalize(msgspec.convert(dict(document), type=surface.payload_type)).values
+    except (msgspec.ValidationError, TypeError):
+        return {}

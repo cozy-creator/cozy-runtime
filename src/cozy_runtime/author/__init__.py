@@ -44,7 +44,14 @@ from cozy_runtime.author._errors import (
     UnsupportedInput,
     classify,
 )
-from cozy_runtime.author._invoke import Invocation, ResultEnvelope, attempt, invoke
+from cozy_runtime.author._invoke import (
+    Invocation,
+    PreparedRequest,
+    ResultEnvelope,
+    attempt,
+    invoke,
+    prepare,
+)
 from cozy_runtime.author._loader import (
     Artifact,
     Backend,
@@ -152,6 +159,7 @@ __all__ = [
     "Overlay",
     "Preflight",
     "PreflightViolation",
+    "PreparedRequest",
     "Recipe",
     "Registration",
     "RegistrationError",
@@ -176,6 +184,7 @@ __all__ = [
     "classify",
     "describe",
     "invoke",
+    "prepare",
     "register_adapter",
     "registered_adapters",
     "uses_components",

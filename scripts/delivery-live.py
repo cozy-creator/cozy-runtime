@@ -697,7 +697,12 @@ def arms() -> None:
     from cozy_runtime.internal.fill import Checkpoint, dtype_name, survey_routes
     from cozy_runtime.internal.probe import qualify
     from cozy_runtime.internal.worker.ledger import Ledger
-    from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser, PlanRefusal
+    from cozy_runtime.internal.worker.plan import (
+        BindingPlan,
+        PlanChooser,
+        PlanRefusal,
+        PreparedRequest,
+    )
 
     table, device = load_table()
     providers = launch_providers()
@@ -778,7 +783,7 @@ def arms() -> None:
         dict(binding_record(variants()), delivery_rung="aot_decode", delivery_variant="fp8")
     )
     chooser = PlanChooser(ledger)
-    good = chooser.choose(binding, {"entrypoint": "generate", "scalars": {}})
+    good = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
     original = RUNGS_BY_NAME["staged_decode"]
     RUNGS_BY_NAME["staged_decode"] = type(original)(
         name=original.name,
@@ -790,7 +795,7 @@ def arms() -> None:
         status=original.status,
     )
     try:
-        planted = chooser.choose(binding, {"entrypoint": "generate", "scalars": {}})
+        planted = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
         if planted.placement != "component_staged":
             check(
                 "ARM: the plant needs the staged cross to fire",
@@ -807,7 +812,7 @@ def arms() -> None:
         )
     finally:
         RUNGS_BY_NAME["staged_decode"] = original
-    after = chooser.choose(binding, {"entrypoint": "generate", "scalars": {}})
+    after = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
     check(
         "the plant is REMOVED: the same choice is served again",
         after.delivery == good.delivery and after.materialization == good.materialization,

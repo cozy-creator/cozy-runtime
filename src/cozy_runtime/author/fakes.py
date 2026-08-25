@@ -26,7 +26,7 @@ from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
-from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke
+from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke, prepare
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
@@ -154,8 +154,7 @@ def invoke_with_fakes(
     """Run a handler through the REAL kernel with no GPU, no hub and no coordinator."""
     spool = _spool(request_id)
     return invoke(
-        registration,
-        wire,
+        prepare(registration, wire, recipes=recipes, clamps=clamps, settings=settings),
         Invocation(
             request_id=request_id,
             spool=spool,

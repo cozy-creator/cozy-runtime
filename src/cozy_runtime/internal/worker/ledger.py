@@ -225,6 +225,14 @@ class Ledger:
     device_free: int = -1
     device_total: int = -1
     activations_peak: int = 0
+    #: the device this generation was BUILT on, named by the process that owns it
+    accelerator: str = ""
+    #: shape cell -> the activation peak measured on THAT cell. A generation-wide maximum
+    #: prices a 512px request against whatever a 1024px one needed, which is a refusal or a
+    #: worse rung charged to a request that never asked for it (codex audit, adopted
+    #: 2026-08-25). `activations_for` reads this and falls back, LABELLED, when a cell has
+    #: no serve behind it yet.
+    activations_by_cell: dict[str, int] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -380,6 +388,7 @@ class Ledger:
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
         self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
+        self.accelerator = str(facts.get("gpu_name", ""))
         self.declared_scopes = {
             str(method): tuple(str(name) for name in names)
             for method, names in (facts.get("declared_scopes") or {}).items()
@@ -391,6 +400,7 @@ class Ledger:
         self.registered = int(rows.get("pinned", {}).get("peak", 0))
         self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
         self.closed_since_baseline = 0
+        self.activations_by_cell = {}
         self.baseline_paid = False
         self.residency_delta = 0
         self.activations_moved = False
@@ -402,7 +412,9 @@ class Ledger:
         self.unreconciled = ""
         self.unreadable = [c for c in self.unreadable if not c.startswith("device")]
 
-    def observe_attempt(self, metrics: dict[str, Any], resident_moved: bool = False) -> None:
+    def observe_attempt(
+        self, metrics: dict[str, Any], resident_moved: bool = False, cell: str = ""
+    ) -> None:
         """What one attempt's kernel allocated ON TOP of the resident weights.
 
         `resident_moved` makes the number UNREADABLE rather than wrong. The figure is
@@ -419,7 +431,30 @@ class Ledger:
             return
         peak = int(metrics.get("peak_vram_bytes", 0))
         if peak and self.device_baseline >= 0:
-            self.activations_peak = max(self.activations_peak, peak - self.device_baseline)
+            measured = peak - self.device_baseline
+            self.activations_peak = max(self.activations_peak, measured)
+            if cell:
+                self.activations_by_cell[cell] = max(
+                    self.activations_by_cell.get(cell, 0), measured
+                )
+
+    def activations_for(self, cell: str) -> tuple[int, str]:
+        """The activation envelope for ONE shape cell, and where the number came from.
+
+        A cell with its own serve behind it is measured. A cell with none takes the largest
+        cell measured on this generation — conservative, and NAMED as an upper bound over
+        other shapes rather than passed off as this request's measurement.
+        """
+        exact = self.activations_by_cell.get(cell, 0)
+        if exact:
+            return exact, f"max_memory_allocated() minus the post-fill baseline, on cell {cell}"
+        if self.activations_by_cell:
+            widest = max(self.activations_by_cell, key=lambda k: self.activations_by_cell[k])
+            return self.activations_by_cell[widest], (
+                f"no serve has been banked on cell {cell}; the widest cell measured on this "
+                f"generation ({widest}) is the upper bound this request is priced against"
+            )
+        return 0, ""
 
     def observe_residency(self, residency: dict[str, Any]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""

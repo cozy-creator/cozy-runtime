@@ -41,6 +41,50 @@ class PlanRefusal(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """ONE request, resolved ONCE by the executor's kernel, as the supervisor holds it.
+
+    The resolved payload is an author-typed object and cannot cross a process boundary, so
+    it stays in the executor under `request_id` and this carries only what a plan can be
+    priced against and a journal can hold: the NORMALIZED shape axes and the three digests.
+    `invoke` runs the record these digests describe, so the plan and the handler agree by
+    construction rather than by two derivations happening to match (codex audit, adopted
+    2026-08-25 — they did not: the planner read an ad hoc scalar projection of the wire
+    document and the real features were computed later, inside invocation).
+    """
+
+    request_id: str
+    entrypoint: str
+    features: Mapping[str, int]
+    features_digest: str
+    overlay_digest: str
+    facts_digest: str
+    adjustments: tuple[Mapping[str, str], ...] = ()
+
+    def cell(self) -> str:
+        """The normalized SHAPE CELL demand is banked and read per — never the whole
+        request. Two 512px requests are one cell however their prompts differ."""
+        return ",".join(f"{axis}={value}" for axis, value in sorted(self.features.items())) or "-"
+
+    @classmethod
+    def unresolved(cls, entrypoint: str, features: Mapping[str, int]) -> PreparedRequest:
+        """A request NOBODY RESOLVED — what `fit` prices a hypothetical against.
+
+        There is no endpoint process to prepare it, so the three digests are EMPTY and say
+        so. An admission path that reached for this would be pricing against an identity it
+        cannot bind, which is the thing the record exists to stop.
+        """
+        return cls(
+            request_id="",
+            entrypoint=entrypoint,
+            features=dict(features),
+            features_digest="",
+            overlay_digest="",
+            facts_digest="",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptPlan:
     """One exact choice. `document()` is its identity; `summary()` is its projection."""
 
@@ -62,6 +106,13 @@ class AttemptPlan:
     configuration the fill ran under. The logical digest cannot answer "which bytes are
     resident", so two generations over different artifacts were indistinguishable without
     this (codex audit, adopted 2026-08-25)."""
+    request_features_digest: str = ""
+    """The exact PreparedRequest this plan was priced against, bound into the plan document
+    so `plan_digest` covers it. cr-002a claimed this end to end; it is true now."""
+    preflight_facts_digest: str = ""
+    overlay_digest: str = ""
+    shape_cell: str = ""
+    """The normalized shape cell — the key demand is banked and read per."""
     delivery_variant: str = ""
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a coordinator holds, and two plans that read different artifacts of one model
@@ -82,6 +133,10 @@ class AttemptPlan:
             "entrypoint_binding_plan_id": self.entrypoint_binding_plan_id,
             "model_construction_digest": self.model_construction_digest,
             "constructed_generation_digest": self.constructed_generation_digest,
+            "request_features_digest": self.request_features_digest,
+            "preflight_facts_digest": self.preflight_facts_digest,
+            "overlay_digest": self.overlay_digest,
+            "shape_cell": self.shape_cell,
         }
 
     def digest(self) -> str:
@@ -431,8 +486,11 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ demand
 
-    def demand(self, binding: BindingPlan, features: dict[str, Any]) -> list[Coefficient]:
-        """The attempt's byte demand, each term declaring how it was established."""
+    def demand(self, binding: BindingPlan, prepared: PreparedRequest) -> list[Coefficient]:
+        """The attempt's byte demand for THIS request's shape, each term declaring how it
+        was established. It read a generation-wide activation maximum before and ignored
+        the request entirely, which is the same number for every shape a deployment serves
+        (codex audit, adopted 2026-08-25)."""
         resident = self.ledger.resident or {}
         absent = self.ledger.evicted or {}
         # The GENERATION's weights, resident or parked. A component a rung evicted is still
@@ -451,15 +509,9 @@ class PlanChooser:
                 else "",
             )
         ]
-        if self.ledger.activations_peak > 0:
-            terms.append(
-                Coefficient(
-                    "activations",
-                    self.ledger.activations_peak,
-                    "measured",
-                    "max_memory_allocated() minus the post-fill baseline, banked per serve",
-                )
-            )
+        activations, source = self.ledger.activations_for(prepared.cell())
+        if activations > 0:
+            terms.append(Coefficient("activations", activations, "measured", source))
         else:
             # No serve has been banked on this generation, so there is no measurement. The
             # authored bound is LABELLED and cannot arm enforcement: an uncalibrated number
@@ -478,7 +530,7 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ the walk
 
-    def choose(self, binding: BindingPlan, features: dict[str, Any]) -> AttemptPlan:
+    def choose(self, binding: BindingPlan, prepared: PreparedRequest) -> AttemptPlan:
         self.choices += 1
         if self.ledger.unreconciled:
             # A CHOOSER MAY NOT PRICE AGAINST A LEDGER THAT IS KNOWN TO BE WRONG. This is the
@@ -550,7 +602,7 @@ class PlanChooser:
                     "evidence_class": "measured",
                 },
             )
-        terms = {c.name: c for c in self.demand(binding, features)}
+        terms = {c.name: c for c in self.demand(binding, prepared)}
         resident = self.ledger.resident or {}
         # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
         # rung that wants them resident has to bring every one of them BACK, and the walk
@@ -647,6 +699,7 @@ class PlanChooser:
             "largest_declared_set_bytes": largest,
             "rungs": rows,
             "tenancy": binding.tenancy,
+            "shape_cell": prepared.cell(),
         }
         self.walks.append(walk)
         del self.walks[:-16]
@@ -671,6 +724,10 @@ class PlanChooser:
             entrypoint_binding_plan_id=binding.plan_id,
             model_construction_digest=binding.model_construction_digest,
             constructed_generation_digest=binding.constructed_generation_digest,
+            request_features_digest=prepared.features_digest,
+            preflight_facts_digest=prepared.facts_digest,
+            overlay_digest=prepared.overlay_digest,
+            shape_cell=prepared.cell(),
             delivery_variant=binding.delivery_variant,
             quantified_choice=(
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
@@ -680,8 +737,8 @@ class PlanChooser:
                 f"{declared_bytes or binding.vram_bytes} B of which {absent_bytes} B is not "
                 f"resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
-                f"({activations.provenance}); request {features.get('entrypoint', '?')} "
-                f"{features.get('scalars', {})}{confession}"
+                f"({activations.provenance}); request {prepared.entrypoint} "
+                f"on shape cell {prepared.cell()}{confession}"
             ),
         )
 

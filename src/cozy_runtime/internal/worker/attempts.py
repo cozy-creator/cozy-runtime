@@ -43,7 +43,13 @@ from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
-from cozy_runtime.internal.worker.plan import AttemptPlan, BindingPlan, JobBinding, PlanRefusal
+from cozy_runtime.internal.worker.plan import (
+    AttemptPlan,
+    BindingPlan,
+    JobBinding,
+    PlanRefusal,
+    PreparedRequest,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -74,27 +80,6 @@ def _coded(outcome: Mapping[str, Any]) -> str:
     if not message:
         return code
     return message if not code or message.startswith(f"{code}:") else f"{code}: {message}"
-
-
-def _features(payload: Mapping[str, Any], entrypoint: str) -> dict[str, Any]:
-    """The request shape the plan is chosen AGAINST, read off the decoded payload.
-
-    Bounded and structural: which fields the caller actually sent, the scalar values that
-    can move demand, and the payload's own size. cr-008b replaces this with the declared
-    normalized feature basis; what must not come back is a "shape" invented from the plan
-    id, which is a fact about the deployment and says nothing about the request.
-    """
-    scalars = {
-        name: value
-        for name, value in sorted(payload.items())
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    }
-    return {
-        "entrypoint": entrypoint,
-        "fields": sorted(payload),
-        "scalars": scalars,
-        "payload_bytes": len(canonical.write(dict(payload))),
-    }
 
 
 #: What a request DOCUMENT may weigh, checked at the acceptance boundary. The seam admits
@@ -221,6 +206,8 @@ class Attempt:
     subject_id: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: the record the plan was PRICED against, resolved once by the executor's kernel
+    prepared: PreparedRequest | None = None
     #: cr-009's PublicationReceipt document, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
 
@@ -497,6 +484,56 @@ class AttemptEngine:
             origin=ORIGIN.CAUSE_ORIGIN_CLIENT,
         )
 
+    def _prepare_request(
+        self, attempt: Attempt, executor: Any, binding: BindingPlan
+    ) -> PreparedRequest:
+        """Resolve the request in the executor, and hold what a plan can be priced against.
+
+        This is the pre-admission half of the invocation kernel, run across the seam before
+        anything is accepted. The supervisor cannot run it itself — resolving needs the
+        endpoint's declared types and this process never imports endpoint code — and it must
+        not be skipped: a plan priced against a projection of the wire document is a plan
+        chosen against a request nobody will run (codex audit, adopted 2026-08-25).
+
+        A refusal here is PRE-ENTRY in the strongest sense. Nothing was accepted, no device
+        was touched, and the executor is exactly as it was.
+        """
+        try:
+            reply = executor.call(
+                {
+                    "cmd": "prepare_request",
+                    "request_id": f"{attempt.request_id}#{attempt.attempt}",
+                    "entrypoint": binding.entrypoint,
+                    "payload": attempt.payload,
+                },
+                timeout=None,
+            )
+        except ExecutorGone as exc:
+            raise AttemptRefusal(
+                "executor_absent",
+                f"the executor died while resolving this request: {exc}",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+            ) from exc
+        if not reply.get("ok"):
+            code = str(reply.get("code", "request_unresolvable"))
+            raise AttemptRefusal(
+                code,
+                str(reply.get("detail", ""))[:1024],
+                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST
+                if str(reply.get("origin")) in ("request", "author")
+                else CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                origin=_ORIGIN.get(str(reply.get("origin")), ORIGIN.CAUSE_ORIGIN_EXECUTOR),
+            )
+        return PreparedRequest(
+            request_id=f"{attempt.request_id}#{attempt.attempt}",
+            entrypoint=binding.entrypoint,
+            features={str(k): int(v) for k, v in (reply.get("features") or {}).items()},
+            features_digest=str(reply.get("features_digest", "")),
+            overlay_digest=str(reply.get("overlay_digest", "")),
+            facts_digest=str(reply.get("facts_digest", "")),
+            adjustments=tuple(dict(row) for row in reply.get("adjustments", ())),
+        )
+
     def _hydrate_inputs(self, attempt: Attempt) -> None:
         """Materialize every granted input asset into THIS attempt's spool (cr-012).
 
@@ -691,26 +728,11 @@ class AttemptEngine:
         attempt.state = "preparing"
 
         self._fetch_payload(attempt)
-        features = _features(attempt.payload, binding.entrypoint)
-        try:
-            plan = self.chooser.choose(binding, features)
-        except PlanRefusal as exc:
-            raise AttemptRefusal(
-                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
-            ) from exc
-        attempt.plan = plan
-
-        # HYDRATE, after the plan and before acceptance (cr-012, §1.3's launch contract:
-        # validate -> plan -> hydrate -> prepare -> accept -> invoke). Before the plan,
-        # because a request that has no plan should download nothing; before acceptance,
-        # because an oversized, ungranted, mislabelled or unreachable input must be a
-        # refusal the coordinator can read rather than an accepted attempt that dies on a
-        # thread. And before the lease, which is the ordering that matters most: a slow URL
-        # fetched under a lease would pin staged weights for its whole duration.
-        self._hydrate_inputs(attempt)
 
         # The ExecutorPreparer: when the selected construction is not already ready, prepare
-        # it BEFORE durable acceptance. Serving never accepts-then-cold-loads.
+        # it BEFORE durable acceptance. Serving never accepts-then-cold-loads. It is checked
+        # HERE, ahead of the request preparation below, because that preparation runs in the
+        # executor and there is no sense resolving a request against one that cannot serve.
         executor = self.supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
@@ -734,6 +756,25 @@ class AttemptEngine:
                 "recovery edge to Ready",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
+
+        prepared = self._prepare_request(attempt, executor, binding)
+        attempt.prepared = prepared
+        try:
+            plan = self.chooser.choose(binding, prepared)
+        except PlanRefusal as exc:
+            raise AttemptRefusal(
+                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+            ) from exc
+        attempt.plan = plan
+
+        # HYDRATE, after the plan and before acceptance (cr-012, §1.3's launch contract:
+        # validate -> plan -> hydrate -> prepare -> accept -> invoke). After the plan,
+        # because a request that has no plan should download nothing; before acceptance,
+        # because an oversized, ungranted, mislabelled or unreachable input must be a
+        # refusal the coordinator can read rather than an accepted attempt that dies on a
+        # thread. And before the lease, which is the ordering that matters most: a slow URL
+        # fetched under a lease would pin staged weights for its whole duration.
+        self._hydrate_inputs(attempt)
 
         attempt.opened = self.ledger.snapshot()
         try:
@@ -761,6 +802,8 @@ class AttemptEngine:
                     "plan_digest": plan_digest,
                     "model_construction_digest": plan.model_construction_digest,
                     "constructed_generation_digest": plan.constructed_generation_digest,
+                    "request_features_digest": plan.request_features_digest,
+                    "preflight_facts_digest": plan.preflight_facts_digest,
                     "grant_epoch": int(attempt.grant.credential.epoch),
                     "entrypoint_binding_plan_id": plan_id,
                 },
@@ -1237,7 +1280,8 @@ class AttemptEngine:
         moved = bool(
             attempt.residency.get("attempt_stages") or attempt.residency.get("attempt_evictions")
         )
-        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved)
+        cell = attempt.plan.shape_cell if attempt.plan else ""
+        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved, cell=cell)
         self.bank_demand(attempt, reply.get("metrics", {}), moved)
 
         if attempt.canceling:
@@ -1493,7 +1537,18 @@ class AttemptEngine:
             # The resident set moved under the attempt, so `peak - start` is not the
             # attempt's own demand. Named absent rather than banked as a number.
             actual = -1
-        lane = f"{attempt.binding.entrypoint if attempt.binding else '?'} x {plan.placement}"
+        # THE DESIGNED KEY (§3.2): construction variant x accelerator x exact plan x
+        # normalized shape cell. Banking per entrypoint x placement folded every request
+        # shape a deployment serves into one lane, so a 512px serve and a 1024px one moved
+        # the same number and neither described either.
+        lane = " x ".join(
+            (
+                plan.delivery_variant or "default",
+                self.ledger.accelerator or "unknown-accelerator",
+                f"{plan.delivery}/{plan.materialization or 'verbatim'}/{plan.placement}",
+                plan.shape_cell or "-",
+            )
+        )
         confession = self.demand.bank(lane, plan.headroom_bytes, actual)
         if confession is not None:
             attempt.confess(confession.kind, confession.quantified)
