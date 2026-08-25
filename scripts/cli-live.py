@@ -322,9 +322,11 @@ def section_identity(args: argparse.Namespace) -> None:
         f"{sorted(saved)} — `image` is the one ImageAsset field on Txt2ImgOutput",
     )
     check(
-        "and the asset is a real PNG on disk",
-        bool(saved) and Path(saved["image"]).stat().st_size > 100_000,
-        f"{Path(saved['image']).stat().st_size} B" if saved else "",
+        "and the asset is a real PNG on disk, named by its DECLARED media type",
+        bool(saved)
+        and saved["image"].endswith(".png")
+        and Path(saved["image"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n",
+        f"{saved.get('image', '')} ({Path(saved['image']).stat().st_size} B)" if saved else "",
     )
 
     head("the SAME request through `internal.local.run_slice`, with no CLI in the picture")

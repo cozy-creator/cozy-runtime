@@ -14,8 +14,10 @@ the confession and the shortfall all arrive on the outcome; this renders them.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -204,14 +206,19 @@ def run(
         deadline_ms=_timeout((flags.get("--timeout") or [""])[0]),
     )
     release_id = str(body["application"])
-    outcome = run_slice(
-        config,
-        request,
-        [record] if record else [],
-        workspace=workspace,
-        release_id=release_id,
-        options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
-    )
+    # The supervisor narrates itself to stdout, which is the right place for a long-lived
+    # `serve` process and the wrong place for a verb whose stdout IS a result document. The
+    # narration is not suppressed — it is a real progress channel — it just goes where
+    # progress goes, so `--json` emits exactly the document and nothing else.
+    with contextlib.redirect_stdout(sys.stderr):
+        outcome = run_slice(
+            config,
+            request,
+            [record] if record else [],
+            workspace=workspace,
+            release_id=release_id,
+            options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
+        )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
 
 
@@ -471,14 +478,33 @@ def _exit_for(status: str, cause: Mapping[str, Any]) -> Exit:
 
 
 def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
-    """Move the granted outputs into `--out`, named by their descriptor FIELD PATH."""
+    """Move the granted outputs into `--out`, named by their descriptor FIELD PATH.
+
+    The EXTENSION comes from the asset's own declared media type, not from the granted
+    destination's filename: a coordinator grants an opaque location and the worker writes
+    bytes to it, so the grant path knows nothing about what the encoder produced. The
+    author's returned asset does.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     saved: dict[str, str] = {}
     for name, path in sorted(outcome.outputs.items()):
         source = Path(path)
         if not source.is_file():
             continue
-        target = out_dir / f"{name.replace('.', '_')}{source.suffix}"
+        target = out_dir / f"{name.replace('.', '_')}{_extension(outcome, name)}"
         shutil.copyfile(source, target)
         saved[name] = str(target)
     return saved
+
+
+def _extension(outcome: SliceOutcome, field: str) -> str:
+    """`.png` from `image/png`. An unknown or absent media type stays extensionless."""
+    import mimetypes
+
+    node: Any = outcome.result
+    for part in field.split("."):
+        if not isinstance(node, dict):
+            return ""
+        node = node.get(part)
+    media = node.get("media_type", "") if isinstance(node, dict) else ""
+    return mimetypes.guess_extension(str(media)) or "" if media else ""
