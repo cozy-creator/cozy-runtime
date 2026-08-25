@@ -212,6 +212,7 @@ class AttemptEngine:
         bundles: triage.BundleStore,
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
+        device_process: Callable[[], int],
     ) -> None:
         self.journal = journal
         self.ledger = ledger
@@ -235,6 +236,8 @@ class AttemptEngine:
         #: the worker's applied posture, read at bundle time — a triage bundle that cannot
         #: say which directive was applied when it ran explains half of what went wrong.
         self.posture = posture
+        #: the NVML per-process reader, so the out-of-allocator meter has a real producer
+        self.device_process = device_process
         #: binding plan ids whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -501,6 +504,7 @@ class AttemptEngine:
         if executor is not None and executor.alive() and not executor.poisoned and attempt.spool:
             try:
                 self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
+                self.ledger.device_process = self.device_process()
             except ExecutorGone:
                 self.ledger.device_unreadable("the executor died before the ledger was read")
         else:
@@ -602,7 +606,8 @@ class AttemptEngine:
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
         # leave the ledger blind in the one case that matters.
-        self.ledger.observe_attempt(reply.get("metrics", {}))
+        moved = bool(attempt.residency.get("stages") or attempt.residency.get("evictions"))
+        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved)
 
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)

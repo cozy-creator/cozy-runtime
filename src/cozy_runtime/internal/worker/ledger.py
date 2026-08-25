@@ -79,7 +79,9 @@ METHODS: dict[str, tuple[str, str]] = {
     "activations_scratch": (
         "measured",
         "torch.cuda.max_memory_allocated() across the attempt minus the post-fill "
-        "allocator baseline - everything the kernel allocated that the weights did not",
+        "allocator baseline - everything the kernel allocated that the weights did not. "
+        "UNREADABLE when the attempt staged or evicted: the baseline is only a line to "
+        "measure against while the resident set stands still",
     ),
     "device_allocated": (
         "measured",
@@ -223,6 +225,8 @@ class Ledger:
     device_free: int = -1
     device_total: int = -1
     activations_peak: int = 0
+    #: set when an attempt staged or evicted: the activation basis moved under it
+    activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
     #: close is the first on this generation, which is the only one allowed to shift it.
     closed_since_baseline: int = 0
@@ -353,8 +357,21 @@ class Ledger:
         self.closed_since_baseline = 0
         self.unreadable = [c for c in self.unreadable if not c.startswith("device")]
 
-    def observe_attempt(self, metrics: dict[str, Any]) -> None:
-        """What one attempt's kernel allocated ON TOP of the resident weights."""
+    def observe_attempt(self, metrics: dict[str, Any], resident_moved: bool = False) -> None:
+        """What one attempt's kernel allocated ON TOP of the resident weights.
+
+        `resident_moved` makes the number UNREADABLE rather than wrong. The figure is
+        `peak_allocated - the post-fill baseline`, and that baseline is only a line to
+        measure against while the resident set STANDS STILL. Under a staged rung the
+        attempt evicts and re-stages gigabytes underneath itself, so the same subtraction
+        produced 2,048 B for a 1024px pipeline — a number that is not small, it is
+        meaningless. A measurement whose basis moved is named absent (§3.6), never printed.
+        """
+        if resident_moved:
+            self.activations_moved = True
+            if "activations_scratch" not in self.unreadable:
+                self.unreadable.append("activations_scratch")
+            return
         peak = int(metrics.get("peak_vram_bytes", 0))
         if peak and self.device_baseline >= 0:
             self.activations_peak = max(self.activations_peak, peak - self.device_baseline)
@@ -412,7 +429,9 @@ class Ledger:
             "pinned_registered": (self.registered, self.pinned_budget, -1),
             "active_weights": (self.weights_bytes, -1, -1),
             "activations_scratch": (
-                -1 if self.device_baseline < 0 else self.activations_peak,
+                -1
+                if (self.device_baseline < 0 or self.activations_moved)
+                else self.activations_peak,
                 -1,
                 -1,
             ),

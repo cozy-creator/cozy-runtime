@@ -151,24 +151,47 @@ class ComponentResidency:
     # ------------------------------------------------------------------ room
 
     def _make_headroom(self, declared: tuple[str, ...]) -> None:
-        """Free non-declared components until the attempt's activation envelope fits.
+        """Under a STAGED rung, the declared set is what is resident. Everything else goes.
 
-        `all_resident` frees NOTHING: it is the rung that promised everything fits, and a
-        rung that quietly starts swapping is a rung whose price was a lie. The eviction
-        order is LRU over refcount-0 leases whose completion events have fired, and a
-        component the CURRENT method declares is never a victim of its own admission.
+        The first version freed only down to the plan's activation envelope, and that
+        envelope is an AUTHORED BOUND until a serve has been banked — so on a fresh
+        generation it is a guess, and a guess that is 1 GiB when a 1024px VAE decode wants
+        three is a kernel OOM with nothing left to decide. Measured exactly that: latents
+        healthy, `Tried to allocate 512.00 MiB` with 98 MiB free, twice.
+
+        So the rung means what its name says: `component_staged` keeps the component-use set
+        resident AT A TIME, and every other evictable component is freed at admission. Each
+        scope gets the whole card minus its own declared set, which makes the memory
+        behaviour PREDICTABLE instead of dependent on an uncalibrated number. It is the
+        sequential plan, it is what an 8 GiB card can actually do with a 6.46 GiB pipeline,
+        and its price is measured rather than hidden: one component swap per scope change.
+
+        `all_resident` frees NOTHING — that rung's whole claim is that it did not have to,
+        and a rung that quietly starts swapping is a rung whose price was a lie.
         """
-        if self.placement == "all_resident" or self.headroom <= 0:
+        if self.placement == "all_resident":
             return
-        while not self._fits(self.headroom):
-            victim = self._victim(declared)
-            if victim is None:
-                return
+        for victim in self._victims(declared):
             started = time.perf_counter()
             self.evictions += 1
             self.backend.evict(victim)
             self.torch.cuda.empty_cache()
             self.evicted_ms += (time.perf_counter() - started) * 1000
+
+    def _victims(self, declared: tuple[str, ...]) -> list[str]:
+        """Every resident component the method does not declare, LRU first.
+
+        Evictable means refcount ZERO and the completion event FIRED. A component whose
+        kernels may still be reading it is never a victim, which is what the event fence is
+        for, and a component the CURRENT method declares is never a victim of its own
+        admission.
+        """
+        candidates = [
+            name
+            for name in list(self.backend.components)
+            if name not in declared and self.leases.get(name, Lease(name)).evictable()
+        ]
+        return sorted(candidates, key=lambda n: self.leases.get(n, Lease(n)).last_used)
 
     def _make_room(self, wanted: str, declared: tuple[str, ...]) -> None:
         """Demand-pull eviction, LRU over refcount-0 leases whose events have fired.
@@ -196,14 +219,8 @@ class ComponentResidency:
         return int(free) + max(int(slack), 0) >= need
 
     def _victim(self, declared: tuple[str, ...]) -> str | None:
-        candidates = [
-            name
-            for name in self.backend.components
-            if name not in declared and self.leases.get(name, Lease(name)).evictable()
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda n: self.leases.get(n, Lease(n)).last_used)
+        victims = self._victims(declared)
+        return victims[0] if victims else None
 
     def _shortfall(self, method: str, name: str, detail: str) -> ResidencyRefusal:
         need = sum(row.nbytes for row in self.backend.plan.values() if row.component == name)

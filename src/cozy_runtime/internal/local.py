@@ -101,9 +101,11 @@ class SliceOutcome:
     exit_code: int = 0
     journal_deleted: bool = False
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
-    #: `worker_error` (the worker reported it could not become ready) or `ready_timeout`.
-    #: A one-shot run that cannot say this would have to pretend a hang was a result.
+    #: `worker_error` (the worker reported it could not become ready), `ready_timeout`, or
+    #: `coordinator_error` (this side failed). A one-shot run that cannot say this would
+    #: have to pretend a hang was a result.
     ended: str = "unstarted"
+    error: str = ""
 
 
 class LocalCoordinator:
@@ -134,6 +136,7 @@ class LocalCoordinator:
         self.auto_ack = auto_ack
         self.ready_timeout = ready_timeout
         self.ended = "unstarted"
+        self.error = ""
         self._link = InMemoryLink()
         self._link.on_message = self._on_message
         self._link.on_progress = on_progress
@@ -186,6 +189,23 @@ class LocalCoordinator:
     # ------------------------------------------------------------------ the exchange
 
     def _on_message(self, message: pb.WorkerMessage) -> None:
+        """One coordinator-side message. A FAILURE HERE ENDS THE RUN, never hangs it.
+
+        Found live: a `KeyError` in the report handler killed the message-pump thread, and
+        the worker then talked to nobody for the full 1,800-second readiness deadline. A
+        one-shot run has a person in front of it — a coordinator that cannot do its job says
+        so and stops, exactly as it does when the worker reports an intake error.
+        """
+        try:
+            self._dispatch_message(message)
+        except Exception as exc:
+            self.ended = "coordinator_error"
+            self.error = f"{type(exc).__name__}: {exc}"[:400]
+            print(f"[run] the coordinator failed: {self.error}", flush=True)
+            self.done.set()
+            self._link.close()
+
+    def _dispatch_message(self, message: pb.WorkerMessage) -> None:
         kind = message.WhichOneof("msg")
         if kind == "register":
             self._on_register(message.register)
@@ -436,7 +456,7 @@ def _collect(
     exit_code: int,
     delete_journal: bool,
 ) -> SliceOutcome:
-    outcome = SliceOutcome(exit_code=exit_code, ended=coordinator.ended)
+    outcome = SliceOutcome(exit_code=exit_code, ended=coordinator.ended, error=coordinator.error)
     outcome.journal = _journal_rows(supervisor.root / "journal.log")
     outcome.reconciliation = (
         supervisor.ledger.reconciliations[-1] if supervisor.ledger.reconciliations else {}

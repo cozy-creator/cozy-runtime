@@ -31,6 +31,7 @@ import json
 import os
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -158,6 +159,7 @@ class Supervisor:
             bundles=self.bundles,
             monitor=self.monitor,
             posture=self.applied_posture,
+            device_process=self.read_device_process,
         )
         self.engine.session_id = self.fences.session_id
         self.outbound: queue.Queue[pb.WorkerMessage | None] = queue.Queue()
@@ -207,6 +209,38 @@ class Supervisor:
         self.fences.intake = state
         if self.connected.is_set():
             self.send(pb.WorkerMessage(report=self.report()))
+
+    def read_device_process(self) -> int:
+        """NVML per-process device bytes for the EXECUTOR, read by the supervisor.
+
+        The out-of-allocator meter needs a number the allocator structurally cannot see —
+        the CUDA context and the cuDNN/cuBLAS workspaces — and the only place it exists is
+        the driver's own per-process accounting. Read by the PARENT, like RSS: the child's
+        claim about its own footprint is one the supervisor cannot check, and here it does
+        not have to. -1 is UNREADABLE and never a zero.
+        """
+        pid = self.ledger.executor_pid
+        if not pid:
+            return -1
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return -1
+        for line in out.stdout.strip().splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
+                return int(parts[1]) * 1024 * 1024
+        return -1
 
     def applied_posture(self) -> dict[str, Any]:
         """The deployment state the worker was in when something happened (§3.6).
@@ -887,9 +921,7 @@ class Supervisor:
         a wedged driver is not a CPU pod, and a canary that hangs is worse than one that
         fails, so every probe here is a bounded read of a file or a bounded subprocess.
         """
-        import os
         import platform
-        import subprocess
 
         unreadable: list[str] = []
         gpu_name, gpu_sm, vram, driver = "", 0, 0, ""
