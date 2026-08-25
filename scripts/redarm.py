@@ -8,9 +8,13 @@ Run it whenever a fence changes: `uv run python scripts/redarm.py`.
 
 from __future__ import annotations
 
+import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -859,6 +863,284 @@ def run_mistyped() -> str:
     )
 
 
+# ---------------------------------------------------------------- cr-003: the boundary
+# Each arm builds a THROWAWAY endpoint project and runs the real `describe` verb over it.
+# The refusal observed is the CLI's, exit code included — this is the build's own gate.
+
+_VALID_MODULE = """
+import msgspec
+from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs
+
+app = App()
+
+
+class In(msgspec.Struct):
+    prompt: str
+
+
+class Out(msgspec.Struct):
+    image: ImageAsset
+
+
+@app.entrypoint
+def generate(ctx: Context, payload: In, out: Outputs) -> Out:
+    return Out(image=out.save_image(ImageFrame(1, 1, b"rgb"), format="png"))
+"""
+
+BOUNDARY_ARMS: tuple[tuple[str, str, str, str, int], ...] = (
+    (
+        "zero_application",
+        '[application]\nobject = "ep:app"\n',
+        "import msgspec\nAPP = 1\n",
+        "exports no 'app' and no App at all",
+        3,
+    ),
+    (
+        "no_application_named",
+        "# an endpoint.toml that names nothing\n",
+        _VALID_MODULE,
+        "names no [application] object",
+        3,
+    ),
+    (
+        "not_an_app",
+        '[application]\nobject = "ep:app"\n',
+        "app = object()\n",
+        "is a object, not an App",
+        3,
+    ),
+    (
+        "missing_dependency",
+        '[application]\nobject = "ep:app"\n',
+        "import a_dependency_this_release_forgot_to_lock\n" + _VALID_MODULE,
+        "missing_dependency",
+        3,
+    ),
+    (
+        "broken_submodule_real_traceback",
+        '[application]\nobject = "ep:app"\n',
+        _VALID_MODULE + "\n_ = 1 / 0\n",
+        "ZeroDivisionError",
+        3,
+    ),
+    (
+        "endpoint_job_name_collision",
+        '[application]\nobject = "ep:app"\n',
+        _VALID_MODULE
+        + """
+
+@app.job(name="generate")
+def also_generate(payload: In) -> Out:
+    raise NotImplementedError
+""",
+        "duplicate registration 'generate'",
+        3,
+    ),
+    (
+        "device_field_on_the_request",
+        '[application]\nobject = "ep:app"\n',
+        _VALID_MODULE.replace("    prompt: str", "    prompt: str\n    device: str = 'cuda:0'"),
+        "excluded_keyword",
+        3,
+    ),
+    (
+        "author_declared_retryability",
+        '[application]\nobject = "ep:app"\n',
+        _VALID_MODULE.replace(
+            "    image: ImageAsset", "    image: ImageAsset\n    retryable: bool = True"
+        ),
+        "deleted_surface",
+        3,
+    ),
+    (
+        "recursive_discovery",
+        '[application]\nobject = "ep:app"\n',
+        _VALID_MODULE,
+        "",  # asserted by COUNT, below: the sibling's registrations must not appear
+        0,
+    ),
+)
+
+#: A sibling module that registers on its own `App` and is imported by nobody. A harvester
+#: would find it; the one configured export is the complete algorithm, so describe cannot.
+_SIBLING = """
+import msgspec
+from cozy_runtime.author import App
+
+sibling_app = App()
+
+
+class SideIn(msgspec.Struct):
+    x: int
+
+
+class SideOut(msgspec.Struct):
+    y: int
+
+
+@sibling_app.entrypoint
+def harvested_if_recursive(payload: SideIn) -> SideOut:
+    return SideOut(payload.x)
+"""
+
+
+def _project(tmp: pathlib.Path, endpoint_toml: str, module: str) -> pathlib.Path:
+    project = tmp / "endpoint"
+    (project / "src" / "ep").mkdir(parents=True, exist_ok=True)
+    (project / "endpoint.toml").write_text(endpoint_toml)
+    (project / "src" / "ep" / "__init__.py").write_text(module)
+    return project
+
+
+def _describe(
+    project: pathlib.Path, *args: str, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    out = subprocess.run(
+        [sys.executable, "-m", "cozy_runtime.cli.main", "describe", "--dir", str(project), *args],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), **(env or {})},
+        check=False,
+    )
+    return out.returncode, out.stdout + out.stderr
+
+
+def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> str:
+    with tempfile.TemporaryDirectory(prefix=f"cozy-arm-{name}-") as tmp:
+        project = _project(pathlib.Path(tmp), toml, module)
+        if name == "recursive_discovery":
+            (project / "src" / "ep" / "sibling.py").write_text(_SIBLING)
+            got, output = _describe(project)
+            if got != 0:
+                return f"NOT PROVEN — {name}: describe failed ({output.strip()[:120]})"
+            if "harvested_if_recursive" in output:
+                return f"NOT PROVEN — {name}: a sibling module's registration was harvested"
+            skip = ("counts", "surface_digest", "next")
+            names = [
+                ln.split(":")[0]
+                for ln in output.splitlines()
+                if " · " in ln and not ln.startswith(skip)
+            ]
+            return (
+                f"red — {name}: the sibling registers on import and describe reports "
+                f"{names} — no recursive discovery, no harvester"
+            )
+        got, output = _describe(project)
+        if got != code or expect not in output:
+            return f"NOT PROVEN — {name}: exit {got} (wanted {code}), output {output.strip()[:160]}"
+        line = next(ln for ln in output.splitlines() if expect in ln)
+        return f"red — {name} (exit {got}): {line.strip()[:150]}"
+
+
+def run_stale_descriptor() -> list[str]:
+    """The committed descriptor is a CHECKED CACHE: hand-edit it, and both --check and any
+    build step that runs --check refuse."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="cozy-arm-stale-") as tmp:
+        project = _project(pathlib.Path(tmp), '[application]\nobject = "ep:app"\n', _VALID_MODULE)
+        code, _ = _describe(project, "--write-descriptor")
+        assert code == 0, "the fixture must describe cleanly before it can be made stale"
+        target = project / "endpoint.descriptor.json"
+        good = target.read_text()
+
+        document = json.loads(good)
+        document["entrypoints"][0]["capabilities"] = ["save", "egress"]
+        target.write_text(json.dumps(document, indent=2, sort_keys=True))
+        code, output = _describe(project, "--check")
+        results.append(
+            f"red — stale_descriptor (exit {code}): {_first(output, 'different documents')}"
+            if code == 13
+            else f"NOT PROVEN — a hand-edited descriptor passed --check (exit {code})"
+        )
+
+        committed = good.split('"surface_digest": "')[1][:71]
+        target.write_text(good.replace(committed, "sha256:" + "0" * 64))
+        code, output = _describe(project, "--check")
+        results.append(
+            f"red — digest_line_edited (exit {code}): {_first(output, 'digests to')}"
+            if code == 13
+            else f"NOT PROVEN — an edited digest line passed --check (exit {code})"
+        )
+
+        target.write_text(good.replace('"schema":', '"smuggled": 1,\n  "schema":'))
+        code, output = _describe(project, "--check")
+        results.append(
+            f"red — unknown_top_level_field (exit {code}): {_first(output, 'unknown top-level')}"
+            if code == 13
+            else f"NOT PROVEN — an unknown top-level field passed --check (exit {code})"
+        )
+
+        target.unlink()
+        code, output = _describe(project, "--check")
+        results.append(
+            f"red — missing_descriptor (exit {code}): {_first(output, 'not committed')}"
+            if code == 13
+            else f"NOT PROVEN — a missing descriptor passed --check (exit {code})"
+        )
+    return results
+
+
+def run_environment_drift() -> str:
+    """Two environments claiming to be one release must derive one document (§1.0). Plant a
+    DIFFERENT cozy_runtime ahead of the installed one and prove --check refuses."""
+    with tempfile.TemporaryDirectory(prefix="cozy-arm-drift-") as tmp:
+        drift = pathlib.Path(tmp) / "src"
+        shutil.copytree(ROOT / "src", drift)
+        target = drift / "cozy_runtime" / "internal" / "schema.py"
+        target.write_text(
+            target.read_text().replace(
+                'DEFAULT_SOURCES = ("code_fallback"',
+                'DEFAULT_SOURCES = ("drifted", "code_fallback"',
+            )
+        )
+        code, output = _describe(ROOT / "examples", "--check", env={"PYTHONPATH": str(drift)})
+    if code != 13:
+        return f"NOT PROVEN — a drifted environment passed --check (exit {code})"
+    return f"red — environment_drift (exit {code}): {_first(output, 'different documents')}"
+
+
+def run_fixed_point() -> list[str]:
+    """The descriptor's fixed point, planted four ways over the REAL built document."""
+    source = (
+        "import sys, json\n"
+        "sys.path.insert(0, 'src')\n"
+        "from cozy_runtime.internal import descriptor\n"
+        "from cozy_runtime.internal.discovery import discover\n"
+        "found = discover(__import__('pathlib').Path('examples'))\n"
+        "body = descriptor.build(found)\n"
+        "body{where} = {value}\n"
+        "descriptor._fixed_point(body, descriptor._binding_values(found.bindings))\n"
+        "print('NOT PROVEN')\n"
+    )
+    plants = (
+        ("release_digest", "['entrypoints'][0]['release']", '"sha256:" + "ab" * 32'),
+        ("build_timestamp", "['entrypoints'][0]['kind']", '"2026-08-24T11:02:00Z"'),
+        ("machine_path", "['entrypoints'][0]['kind']", '"/home/fidika/cozy_v2/cozy-runtime"'),
+        ("mutable_binding", "['entrypoints'][0]['kind']", '"cozy/h3-dual@v1"'),
+    )
+    out = []
+    for name, where, value in plants:
+        run = subprocess.run(
+            [sys.executable, "-c", source.format(where=where, value=value)],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
+        )
+        if run.returncode == 0 or "fixed_point" not in run.stderr:
+            out.append(f"NOT PROVEN — fixed_point/{name} was accepted into the descriptor")
+            continue
+        line = [ln for ln in run.stderr.splitlines() if "fixed_point" in ln][-1]
+        out.append(f"red — fixed_point/{name}: {line.split('fixed_point: ')[-1].strip()[:120]}")
+    return out
+
+
+def _first(output: str, needle: str) -> str:
+    line = next((ln for ln in output.splitlines() if needle in ln), output.splitlines()[0])
+    return line.strip()[:140]
+
+
 def main() -> int:
     code, _ = fence()
     if code != 0:
@@ -870,6 +1152,10 @@ def main() -> int:
     results += [run_live(name, MODEL_PRELUDE + body, expect) for name, body, expect in MODEL_ARMS]
     results.append(run_mistyped())
     results.append(run_separation())
+    results += [run_boundary(*a) for a in BOUNDARY_ARMS]
+    results += run_stale_descriptor()
+    results += run_fixed_point()
+    results.append(run_environment_drift())
     for r in results:
         print(r)
     unproven = [r for r in results if r.startswith("NOT PROVEN")]

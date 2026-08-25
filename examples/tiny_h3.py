@@ -34,6 +34,8 @@ import msgspec
 from cozy_runtime.author import (
     App,
     AudioAsset,
+    Budget,
+    Checkpoints,
     Context,
     DerivedCache,
     ImageAsset,
@@ -45,7 +47,9 @@ from cozy_runtime.author import (
     Outputs,
     Preflight,
     RequestView,
+    Resources,
     Scheduler,
+    Scratch,
     Settings,
     Shape,
     Telemetry,
@@ -636,3 +640,43 @@ def generate_ref(
         audio_samples=0 if payload.mute else (waveform & 0xFFFF) * (sample_rate // 48_000),
         checkpoint=model.checkpoint_ref,
     )
+
+
+# ---------------------------------------------------------------------------- the job
+# Structurally separate from serving — one immutable build, one bounded attempt, terminal,
+# reclaim — but the SAME kernel and the same one service set (§2). What makes this a job is
+# `@app.job` plus which services the signature requests, never a second context class.
+
+
+class DistillInput(msgspec.Struct, forbid_unknown_fields=True):
+    steps: Annotated[int, msgspec.Meta(ge=1, le=10_000)]
+    learning_rate: Annotated[float, msgspec.Meta(gt=0.0, le=1.0)] = 1e-4
+    resume_from: str | None = None
+    """Just another verified input field — not a reserved payload name (§2)."""
+
+
+class DistillResult(msgspec.Struct):
+    steps_run: int
+    final_loss: float
+    published_key: str
+
+
+@app.job(publishes=True, resources=Resources(gpu_count=2, placement="single_node"))
+def distill(
+    ctx: Context,
+    payload: DistillInput,
+    base: Fl2VAModel,
+    scratch: Scratch,
+    ckpt: Checkpoints,
+    budget: Budget,
+    tel: Telemetry,
+) -> DistillResult:
+    """`gpu_count` is the override door's canonical case: a structural FLOOR neither code
+    nor measurement can discover pre-run. Everything else about this job is derived."""
+    del scratch, ckpt, budget  # cr-009 owns the bodies; the SIGNATURE is the declaration
+    loss = 1.0
+    for step in range(payload.steps):
+        ctx.raise_if_cancelled()
+        loss *= 1.0 - payload.learning_rate
+        tel.training_metric("loss", loss, step=step)
+    return DistillResult(payload.steps, loss, payload.resume_from or base.checkpoint_ref)

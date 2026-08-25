@@ -10,6 +10,10 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run python scripts/fence.py
+      # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
+      # refuses a stale one (§1.0). A staleness check, not a test suite.
+      - run: uv run cozy-runtime describe --check --dir examples
+      - run: uv run python scripts/conformance.py
       - run: uv run python scripts/redarm.py
       - run: uv run python scripts/verify.py
       - run: uv run cozy-runtime version

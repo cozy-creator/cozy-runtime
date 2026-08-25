@@ -29,6 +29,7 @@ from cozy_runtime.author._defaults import Clamp, Overlay, Recipe
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import DELETED_SURFACES, assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
+    NEUTRAL_ERROR_SET,
     AuthorError,
     Cancelled,
     CapabilityError,
@@ -36,11 +37,13 @@ from cozy_runtime.author._errors import (
     DeadlineExceeded,
     DefaultResolutionError,
     InvalidRequest,
+    Outcome,
     OutputError,
     PreflightViolation,
     UnsupportedInput,
+    classify,
 )
-from cozy_runtime.author._invoke import Invocation, ResultEnvelope, invoke
+from cozy_runtime.author._invoke import Invocation, ResultEnvelope, attempt, invoke
 from cozy_runtime.author._loader import (
     Artifact,
     Backend,
@@ -82,6 +85,7 @@ from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
     "DELETED_SURFACES",
+    "NEUTRAL_ERROR_SET",
     "AdapterRef",
     "AdjustmentRow",
     "Adjustments",
@@ -120,6 +124,7 @@ __all__ = [
     "ModelRegistry",
     "ModelTestHarness",
     "ModuleLike",
+    "Outcome",
     "OutputError",
     "Outputs",
     "Overlay",
@@ -145,6 +150,8 @@ __all__ = [
     "UnsupportedInput",
     "VideoAsset",
     "assert_declaration_shape",
+    "attempt",
+    "classify",
     "describe",
     "invoke",
     "register_adapter",

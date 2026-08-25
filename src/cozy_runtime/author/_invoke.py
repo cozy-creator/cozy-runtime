@@ -31,10 +31,13 @@ from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
 from cozy_runtime.author._errors import (
+    SUCCEEDED,
     AuthorError,
     ConformanceError,
     InvalidRequest,
+    Outcome,
     OutputError,
+    classify,
 )
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._services import (
@@ -142,6 +145,24 @@ def invoke(
         capabilities=surface.capabilities,
         facts_digest=facts_digest,
     )
+
+
+def attempt(
+    registration: Registration, wire: Mapping[str, object], inv: Invocation
+) -> tuple[ResultEnvelope | None, Outcome]:
+    """The invocation BOUNDARY: one attempt in, one neutral terminal out, on every path.
+
+    `invoke` raises typed refusals because author-facing code should; the boundary the
+    supervisor speaks across cannot, because the terminal must still ship when the body
+    fails (§2). What crosses is FACTS — terminal, origin, code — and never a retry command:
+    RETRYABLE and FATAL are coordinator projections over these, never observations here.
+    """
+    try:
+        return invoke(registration, wire, inv), SUCCEEDED
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        return None, classify(exc)
 
 
 # ------------------------------------------------------------------------- preflight

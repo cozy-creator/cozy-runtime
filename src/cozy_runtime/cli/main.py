@@ -9,23 +9,29 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 
-BUILT = ("new", "version")
+BUILT = ("describe", "new", "version")
 # Spec verbs whose implementation lands with cr-016, over the real attempt kernel.
-PENDING = ("run", "serve", "job", "describe", "pull", "ingest", "list", "rm", "doctor", "fit")
+PENDING = ("run", "serve", "job", "pull", "ingest", "list", "rm", "doctor", "fit")
 
 HELP = f"""cozy-runtime — everything a single endpoint venv can do alone
 
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
 
 verbs:
+  describe [<fn>]  the EndpointDescriptor, without loading weights
   new <name>       scaffold a minimal valid endpoint skeleton
   version          tag, commit, and the two independent semvers
+
+describe flags:
+  --write-descriptor  commit endpoint.descriptor.json (bare describe is read-only)
+  --check             refuse a stale committed descriptor (exit 13)
 
 not in this build (cr-016): {", ".join(PENDING)}
 
@@ -38,6 +44,7 @@ global flags:
 """
 
 _VALUE_FLAGS = ("--fields", "--dir")
+_VERB_FLAGS = describe_verb.FLAGS
 
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
@@ -47,6 +54,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     directory = "."
     verb: str | None = None
     args: list[str] = []
+    verb_flags: list[str] = []
     unknown: list[str] = []
     rest = list(argv)
     while rest:
@@ -69,6 +77,8 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
                 fields = tuple(f.strip() for f in inline.split(",") if f.strip())
             else:
                 directory = inline
+        elif item in _VERB_FLAGS:
+            verb_flags.append(item)
         elif item.startswith("-") and item != "-":
             unknown.append(item)
         elif verb is None:
@@ -84,10 +94,26 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             Exit.usage,
             next=("cozy-runtime --help",),
         )
-    return verb, args, Options(as_json, full, fields, directory), want_help
+    return verb, args + verb_flags, Options(as_json, full, fields, directory), want_help
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
+    if verb == "describe":
+        flags = [a for a in args if a in describe_verb.FLAGS]
+        names = [a for a in args if a not in describe_verb.FLAGS]
+        if len(names) > 1:
+            raise CliError(
+                "usage",
+                f"describe takes at most one function name, got {len(names)}",
+                "cozy-runtime describe [<function>] [--json|--write-descriptor|--check]",
+                Exit.usage,
+            )
+        return describe_verb.run(
+            names[0] if names else None,
+            opts,
+            write="--write-descriptor" in flags,
+            check="--check" in flags,
+        )
     if verb == "version":
         return version_verb.run(config, opts.full)
     if verb == "new":

@@ -35,17 +35,33 @@ DELETED_SURFACES: Mapping[str, str] = {
     "tuned": "no parallel family-defaults struct or model.tuned exists (§1.2)",
     "callback_on_step_end": "mid-run tensor mutation is an unconfessed quality change (§1.3)",
     "compile": "no compile surface is nameable from author code (§1.3)",
+    "retryable": "author code reports neutral FACTS; retryability is a coordinator "
+    "projection over them, never an observation the author writes (§2)",
+    "retry_after": "no author-raised retry command exists at any tier (§2)",
+    "fatal": "FATAL is a coordinator projection, not a worker or author observation (§2)",
 }
 
 
 def assert_declaration_shape(declaration: object) -> None:
-    """Refuse a declaration that names a deleted surface, anywhere in its type tree."""
+    """Refuse a declaration that names a deleted or excluded surface, anywhere in its tree.
+
+    The excluded-keyword list is the same one method wrappers are held to (§1.1): placement,
+    dtype, filesystem paths, offload, pinning and eviction are not nameable from author code,
+    and a REQUEST FIELD is exactly as much of the author surface as a method parameter is.
+    """
     for node in walk(declaration):
+        owner = getattr(node.owner, "__name__", node.owner)
         if (why := DELETED_SURFACES.get(node.name)) is not None:
             raise ConformanceError(
-                f"{getattr(node.owner, '__name__', node.owner)}.{node.path} declares the "
-                f"deleted field {node.name!r}: {why}",
+                f"{owner}.{node.path} declares the deleted field {node.name!r}: {why}",
                 code="deleted_surface",
+                fields=[node.path],
+            )
+        if (why := EXCLUDED_KEYWORDS.get(node.name)) is not None:
+            raise ConformanceError(
+                f"{owner}.{node.path} declares {node.name!r}: {why} — the schema surface is "
+                "held to the same excluded-keyword list as a method wrapper",
+                code="excluded_keyword",
                 fields=[node.path],
             )
 

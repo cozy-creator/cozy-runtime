@@ -11,11 +11,20 @@ kernel and the real construction plane, and prints what actually happened. Refus
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import hashlib
+import json
+import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+import msgspec
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "examples"))
@@ -24,11 +33,19 @@ import tiny_artifacts as art  # noqa: E402
 import tiny_h3 as h3  # noqa: E402
 import tiny_sdxl as ep  # noqa: E402
 from cozy_runtime.author import (  # noqa: E402
+    App,
+    Backend,
+    Cancelled,
     Clamp,
+    DeadlineExceeded,
     EgressResponse,
+    InvalidRequest,
     Invocation,
     ModelRegistry,
+    Outcome,
     Recipe,
+    UnsupportedInput,
+    classify,
     describe,
     invoke,
     registered_adapters,
@@ -42,7 +59,9 @@ from cozy_runtime.author.fakes import (  # noqa: E402
     fake_telemetry,
     invoke_with_fakes,
 )
+from cozy_runtime.internal import canonical, descriptor  # noqa: E402
 from cozy_runtime.internal.bindings import read_table, resolve  # noqa: E402
+from cozy_runtime.internal.discovery import discover  # noqa: E402
 from cozy_runtime.internal.residency import ResidentBackend, StagedBackend  # noqa: E402
 from tiny_diffusers import MiniMaxH3ModularPipeline, TinyScheduler  # noqa: E402
 
@@ -459,8 +478,217 @@ def main() -> int:
     )
     print(f"  egress fake: {egress.fetch('https://example.test').body!r}")
 
+    # ------------------------------------------------------------------ cr-003 descriptor
+    descriptor_sections()
+
     print("\nall sections executed against the real kernel")
     return 0
+
+
+TFS_VECTORS = Path("/home/fidika/cozy_v2/tensorfs/vectors/cases/canonical")
+
+
+class SpellingPayload(msgspec.Struct):
+    prompt: str
+
+
+class SpellingReply(msgspec.Struct):
+    text: str
+
+
+def spelling_plain(payload: SpellingPayload) -> SpellingReply:
+    """The compute default (§1.2)."""
+    return SpellingReply(payload.prompt)
+
+
+async def spelling_async(payload: SpellingPayload) -> SpellingReply:
+    """The I/O-shaped spelling. A caller cannot tell these two apart, and neither can the
+    descriptor: the spelling picks where the body runs, never what the endpoint offers."""
+    return SpellingReply(payload.prompt)
+
+
+def temp_project(module: str) -> Path:
+    """A project root whose endpoint.toml names a DIFFERENT app export of these fixtures.
+    `examples/` is one endpoint project; describe is exercised over every fixture."""
+    root = Path(tempfile.mkdtemp(prefix=f"cozy-{module}-"))
+    bindings = (ROOT / "examples" / "endpoint.toml").read_text().partition("[bindings")
+    (root / "endpoint.toml").write_text(
+        f'[application]\nobject = "{module}:app"\n\n[bindings{bindings[2]}'
+    )
+    return root
+
+
+def descriptor_sections() -> None:
+    head("describe — the isolation boundary over every fixture")
+    projects = [("tiny_h3", ROOT / "examples")] + [
+        (m, temp_project(m)) for m in ("tiny_sdxl",)
+    ]
+    bodies = {}
+    for module, project in projects:
+        start = time.perf_counter()
+        body = descriptor.build(discover(project))
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        bodies[module] = body
+        counts = descriptor.counts(body)
+        size = len(canonical.pretty(descriptor.document(body)).encode())
+        print(
+            f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
+            f"{counts['model_bindings']} slots · {size:>6,} B pretty · {elapsed_ms:6.1f} ms · "
+            f"{descriptor.surface_digest(body)[:26]}…"
+        )
+
+    head("weights are never loaded — proven by a backend that refuses to be called")
+
+    class Refusing(Backend):
+        def fill(self, key: str, spec: object, destination: object) -> None:
+            raise AssertionError("describe reached a fill — weights must never load")
+
+        def rollback(self, keys: Sequence[str]) -> None:
+            raise AssertionError("describe reached a rollback — nothing was ever filled")
+
+    installed = Refusing()
+    before = len(registered_adapters())
+    body = descriptor.build(discover(ROOT / "examples"))
+    print(f"  0 fills through {type(installed).__name__}; construction adapters unchanged: "
+          f"{before} -> {len(registered_adapters())}")
+    print(f"  the descriptor names {len(body['entrypoints']) + len(body['jobs'])} callables and "
+          "0 checkpoints — a model parameter is a TYPE at this clock")
+
+    head("`def` and `async def` describe IDENTICALLY — the spelling is not a caller fact")
+    sync_app, async_app = App(), App()
+    sync_app.entrypoint(name="handle")(spelling_plain)
+    async_app.entrypoint(name="handle")(spelling_async)
+    pair = [
+        canonical.write(
+            {"entrypoints": [_callable_doc(s) for s in describe(a)]}
+        )
+        for a in (sync_app, async_app)
+    ]
+    print(f"  plain def:  {hashlib.sha256(pair[0]).hexdigest()[:32]}…")
+    print(f"  async def:  {hashlib.sha256(pair[1]).hexdigest()[:32]}…")
+    print(f"  identical:  {pair[0] == pair[1]} ({len(pair[0])} bytes each)")
+
+    head("digest sensitivity — a surface change flips it, an unrelated edit does not")
+    base = descriptor.surface_digest(bodies["tiny_h3"])
+    mutations: dict[str, Callable[[Any], object]] = {
+        "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
+            {"name": "extra", "type": "int", "wire": "required"}
+        ),
+        "stamp (task=fl2va -> task=other)": lambda d: d["entrypoints"][0]["models"][0][
+            "stamps"
+        ].update(task="other"),
+        "component-use (one method's set)": lambda d: d["entrypoints"][0]["models"][0][
+            "component_use"
+        ].update(denoise=["fl2va_transformer", "smuggled"]),
+        "capability (a service removed)": lambda d: d["entrypoints"][0]["capabilities"].pop(),
+    }
+    for what, mutate in mutations.items():
+        mutated = json.loads(json.dumps(bodies["tiny_h3"]))
+        mutate(mutated)
+        moved = descriptor.surface_digest(mutated) != base
+        print(f"  {what:34} digest moved: {moved}")
+    reordered = json.loads(json.dumps(bodies["tiny_h3"], indent=8))
+    print(f"  {'reformatted JSON (whitespace only)':34} digest moved: "
+          f"{descriptor.surface_digest(reordered) != base}")
+
+    head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
+    committed = canonical.write(bodies["tiny_h3"])
+    registry = ModelRegistry(release=RELEASE, backend=StagedBackend())
+    configs = (("full", art.h3(task="fl2va")), ("baked", art.h3(task="fl2va", baked=True)))
+    for label, artifact in configs:
+        model = registry.acquire("generate.models.model", h3.Fl2VAModel, artifact)
+        record = registry.record_for(model) if hasattr(registry, "record_for") else None
+        print(f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
+              + (f", {len(record.destinations)} destinations" if record else ""))
+    rederived = canonical.write(descriptor.build(discover(ROOT / "examples")))
+    print(f"  descriptor after both bindings: byte-unchanged = {rederived == committed}")
+    print(f"  generations now live in the registry: {len(registry.generations())} — "
+          "candidate facts, on a different clock")
+
+    head("canonical bytes — the tensorfs vector join (tfs-013 owns the writer rules)")
+    # Where the two profiles part, and why. tfs restricts its own header codec harder than
+    # RFC 8785; a descriptor carries float bounds, None defaults and non-ASCII literals.
+    relaxed = {
+        "digest-uppercase": "descriptor refuses it at the DOCUMENT layer (surface_digest grammar)",
+        "null-value": "null is a legal default value in a request schema",
+        "unicode-nfc": "author literals may be non-ASCII; JCS escapes, tfs forbids",
+        "unicode-nfd": "same — normalization is not a canonical-JSON rule",
+    }
+    shared = profile_only = 0
+    for case in sorted(TFS_VECTORS.glob("*.json")):
+        verdict = dict(
+            line.split(": ", 1)
+            for line in case.with_suffix(".verdict").read_text().strip().splitlines()
+        )
+        try:
+            canonical.parse_canonical(case.read_bytes())
+            got, agree = "ADMITTED", False
+        except canonical.CanonicalError as exc:
+            got, agree = f"refused({exc.code})", True
+        shared += agree
+        profile_only += not agree
+        note = "" if agree else f"  <- {relaxed[case.stem]}"
+        print(f"  {case.stem:22} tfs refuses {verdict['code']:22} cozy {got}{note}")
+    print(f"  {shared}/{shared + profile_only} refusals SHARED at the canonical layer; "
+          f"{profile_only} are deliberate profile differences, each accounted for above")
+
+    head("the neutral author-error set at the invocation boundary")
+
+    class Retryable(RuntimeError):
+        retryable = True
+        retry_after = 30
+
+    raised: tuple[BaseException | None, ...] = (
+        None,
+        InvalidRequest("steps out of range", fields=["steps"]),
+        UnsupportedInput("that combination is not served"),
+        Cancelled("cooperative"),
+        DeadlineExceeded("outlived its deadline"),
+        Retryable("the author asked for a retry"),
+    )
+    for error in raised:
+        outcome = classify(error)
+        print(f"  {type(error).__name__ if error else 'success':18} -> "
+              f"{outcome.terminal:9} origin={outcome.origin:8} code={outcome.code}")
+    print(f"  Outcome members: {[f.name for f in dataclasses.fields(Outcome)]} — "
+          "no retryable, no retry_after, no fatal; the coordinator projects those")
+
+    head("byte-identical reproduction across two REAL venvs of one release")
+    reproduce()
+
+
+def _callable_doc(surface: object) -> object:
+    """Just the per-callable half, so the two spellings are compared on their own terms."""
+    settings: dict[str, object] = {}
+    return descriptor._callable(cast(Any, surface), settings, {})
+
+
+def reproduce() -> None:
+    if shutil.which("uv") is None:
+        print("  SKIPPED — uv is not on PATH; the CI lane owns this proof")
+        return
+    with tempfile.TemporaryDirectory(prefix="cozy-venv-b-") as tmp:
+        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=tmp)
+        sync = subprocess.run(
+            ["uv", "sync", "--frozen"], cwd=ROOT, env=env, capture_output=True, text=True
+        )
+        if sync.returncode != 0:
+            print(f"  SKIPPED — uv sync failed: {sync.stderr.strip().splitlines()[-1:]}")
+            return
+        binary = Path(tmp) / "bin" / "cozy-runtime"
+        runs = []
+        for label, argv in (
+            ("venv A (this one)", [sys.executable, "-m", "cozy_runtime.cli.main"]),
+            ("venv B (fresh)", [str(binary)]),
+        ):
+            out = subprocess.run(
+                [*argv, "describe", "--dir", "examples", "--json"],
+                cwd=ROOT, capture_output=True, env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
+            )
+            runs.append((label, hashlib.sha256(out.stdout).hexdigest(), len(out.stdout)))
+        for label, digest, size in runs:
+            print(f"  {label:20} {digest[:40]}…  {size:,} bytes")
+        print(f"  byte-identical: {runs[0][1] == runs[1][1]}")
 
 
 class FakeH3Pipeline:

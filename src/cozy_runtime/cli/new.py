@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from cozy_runtime.cli.io import CliError, Result
+from cozy_runtime.cli import describe as describe_verb
+from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import descriptor
 from cozy_runtime.internal.exits import Exit
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -149,11 +151,14 @@ def _readme(name: str, pkg: str) -> str:
     return f"""# {name}
 
     uv sync
-    uv run cozy-runtime describe --write-descriptor
     uv run python -m {pkg}
+    uv run cozy-runtime describe --check
 
-`endpoint.descriptor.json` and `uv.lock` are generated and committed; the release is
-digest(source, lock, manifest).
+`endpoint.descriptor.json` was derived by the scaffold and is already `--check`-clean;
+re-derive it with `describe --write-descriptor` whenever a signature or schema changes, and
+commit the diff — it is how a surface-contract change gets reviewed. `uv.lock` and the
+descriptor are the two generated, committed files; the release is
+digest(source, lock, manifest), so both re-key it.
 """
 
 
@@ -188,20 +193,28 @@ def run(name: str, target_dir: str) -> Result:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
 
+    # The skeleton is only MINIMAL VALID once its surface contract is derived and committed
+    # (§1.0), so the scaffold runs the same describe the build runs: a fresh endpoint is
+    # `describe --check`-clean out of the box, and its first commit already carries the
+    # surface a reviewer diffs against.
+    written = describe_verb.run(None, Options(dir=str(target)), write=True, check=False)
+    assert isinstance(written.document, dict)
+
     return Result(
         rows=(
             ("created", str(target)),
             ("package", pkg),
             ("entry", f"{pkg}:app"),
-            ("files", str(len(files))),
+            ("files", str(len(files) + 1)),
+            (descriptor.DIGEST_KEY, str(written.document[descriptor.DIGEST_KEY])),
         ),
         commands=(
             f"cd {target} && uv sync",
-            "uv run cozy-runtime describe --write-descriptor",
             f"uv run python -m {pkg}",
+            "uv run cozy-runtime describe --check",
         ),
         next=(
             f"cd {target} && uv sync",
-            "uv.lock and endpoint.descriptor.json are generated, then committed",
+            f"git add {descriptor.FILE} — it is generated, committed, and CI-checked",
         ),
     )

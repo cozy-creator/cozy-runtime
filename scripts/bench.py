@@ -147,6 +147,51 @@ print(f"  {{'peak RSS after these runs':<46}} "
 """
 
 
+DESCRIPTOR = """
+import statistics, time, sys, pathlib
+sys.path.insert(0, 'examples')
+from cozy_runtime.internal import canonical, descriptor
+from cozy_runtime.internal.discovery import discover
+
+project = pathlib.Path('examples')
+
+
+def bench(label, fn, n):
+    fn()
+    samples = []
+    for _ in range(n):
+        start = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - start) * 1e6)
+    median = statistics.median(samples)
+    unit = f"{median:9.1f} us" if median < 1000 else f"{median / 1000:9.2f} ms"
+    print(f"  {label:<46} {unit}  (n={n})")
+
+
+found = discover(project)
+body = descriptor.build(found)
+document = descriptor.document(body)
+pretty = canonical.pretty(document)
+raw = canonical.write(body)
+
+bench('descriptor.build (frozen app -> document)', lambda: descriptor.build(found), 200)
+bench('canonical.write (the hashed bytes)', lambda: canonical.write(body), 500)
+bench('surface_digest (canonicalize + sha256)', lambda: descriptor.surface_digest(body), 500)
+bench('canonical.pretty (the committed rendering)', lambda: canonical.pretty(document), 500)
+bench('canonical.parse (read the committed file)', lambda: canonical.parse(raw), 500)
+bench('compare (the --check comparison)',
+      lambda: descriptor.compare(document, document, ('a', 'b')), 500)
+print(f"  {'canonical bytes':<46} {len(raw):9,} B")
+print(f"  {'committed pretty bytes':<46} {len(pretty.encode()):9,} B")
+print(f"  {'callables / model slots described':<46} "
+      f"{descriptor.counts(body)['entrypoints'] + descriptor.counts(body)['jobs']:5} / "
+      f"{descriptor.counts(body)['model_bindings']}")
+"""
+
+
+DESCRIBE = ("cozy-runtime", "describe", "--dir", "examples")
+
+
 def main() -> int:
     py = sys.executable
     cases = [
@@ -157,6 +202,10 @@ def main() -> int:
         ("import msgspec (the one dependency)", [py, "-c", "import msgspec"]),
         ("import cozy_runtime.cli.main", [py, "-c", "import cozy_runtime.cli.main"]),
         ("bare python interpreter", [py, "-c", "pass"]),
+        # cr-003: what the build and CI actually pay per endpoint.
+        ("cozy-runtime describe (h3)", [*DESCRIBE]),
+        ("cozy-runtime describe --json", [*DESCRIBE, "--json"]),
+        ("cozy-runtime describe --check", [*DESCRIBE, "--check"]),
     ]
     print(f"{RUNS} runs each; peak RSS measured per case in a fresh helper process")
     for label, argv in cases:
@@ -164,6 +213,8 @@ def main() -> int:
     print("\nauthor surface, in-process against examples/tiny_sdxl.py + tiny_h3.py",
           flush=True)
     subprocess.run([py, "-c", KERNEL], check=True)
+    print("\ndescriptor plane, in-process (the boundary, the writer, the digest)", flush=True)
+    subprocess.run([py, "-c", DESCRIPTOR], check=True)
     return 0
 
 

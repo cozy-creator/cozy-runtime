@@ -24,6 +24,10 @@ class Result:
     rows: tuple[tuple[str, str], ...] = ()
     commands: tuple[str, ...] = ()
     next: tuple[str, ...] = ()
+    lines: tuple[str, ...] = ()
+    """Free-form compact lines (a schema view), printed after the rows."""
+    document: object | None = None
+    """A full typed document `--json` emits verbatim instead of the row projection."""
 
 
 class CliError(Exception):
@@ -57,6 +61,11 @@ def emit(result: Result, opts: Options) -> None:
     if opts.fields:
         rows = tuple(r for r in rows if r[0] in opts.fields)
     nxt = result.next[:2]
+    if opts.json and result.document is not None:
+        # The full typed document IS the result — never a row projection of it, because the
+        # byte-identical reproduction contract is over these exact bytes.
+        print(json.dumps(result.document, indent=2, sort_keys=True, ensure_ascii=False))
+        return
     if opts.json:
         doc: dict[str, object] = {k: v for k, v in rows}
         if result.commands:
@@ -67,6 +76,8 @@ def emit(result: Result, opts: Options) -> None:
     width = max((len(k) for k, _ in rows), default=0)
     for key, value in rows:
         print(f"{key + ':':<{width + 1}} {_elide(value, opts.full)}")
+    for line in result.lines:
+        print(line)
     for i, command in enumerate(result.commands, 1):
         print(f"  {i}  {command}")
     for line in nxt:

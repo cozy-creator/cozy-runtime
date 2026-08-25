@@ -7,7 +7,9 @@ whether an endpoint is broken or a request is.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal
 
 
 class AuthorError(Exception):
@@ -84,3 +86,54 @@ class DeadlineExceeded(Cancelled):
     """The attempt outlived its deadline — a cancellation cause, not a separate spelling."""
 
     default_code = "deadline"
+
+
+# ------------------------------------------------------- the neutral set at the boundary
+
+Terminal = Literal["succeeded", "refused", "failed", "canceled"]
+Origin = Literal["author", "request", "runtime"]
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    """What ONE attempt reports at the invocation boundary — neutral FACTS only (§2).
+
+    There is deliberately no `retryable`, `retry_after` or `fatal` member. RETRYABLE and
+    FATAL are coordinator PROJECTIONS over these facts, never observations the worker or
+    the author writes: each wrongly-classified retry buys a pod.
+    """
+
+    terminal: Terminal
+    origin: Origin
+    code: str
+    message: str = ""
+    fields: tuple[str, ...] = ()
+
+
+#: The frozen vocabulary the descriptor publishes and the refusal layer maps.
+NEUTRAL_ERROR_SET: Mapping[str, object] = {
+    "author_raises": ["InvalidRequest", "UnsupportedInput", "Cancelled", "exception"],
+    "terminals": ["succeeded", "refused", "failed", "canceled"],
+    "origins": ["author", "request", "runtime"],
+    "retryability": "a coordinator projection over these facts; never author-declared",
+}
+
+SUCCEEDED = Outcome("succeeded", "runtime", "ok")
+
+
+def classify(exc: BaseException | None) -> Outcome:
+    """Map what escaped a handler onto the neutral set.
+
+    A retryability attribute on the exception is NEVER read — an author who sets one has
+    written a fact nobody consumes, which is the point (§2).
+    """
+    if exc is None:
+        return SUCCEEDED
+    if isinstance(exc, Cancelled):
+        origin: Origin = "runtime" if isinstance(exc, DeadlineExceeded) else "author"
+        return Outcome("canceled", origin, exc.code, exc.message, exc.fields)
+    if isinstance(exc, InvalidRequest):
+        return Outcome("refused", "request", exc.code, exc.message, exc.fields)
+    if isinstance(exc, AuthorError):
+        return Outcome("failed", "author", exc.code, exc.message, exc.fields)
+    return Outcome("failed", "author", "unhandled_exception", f"{type(exc).__name__}: {exc}")
