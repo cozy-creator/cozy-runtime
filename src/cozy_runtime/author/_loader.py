@@ -576,6 +576,14 @@ class Loader:
     def _match(self, destinations: Sequence[Destination], identity: str) -> tuple[str, ...]:
         """Match the code topology against the checkpoint topology BEFORE allocating."""
         table = self._artifact.topology
+        if self._mode == "derive" and not table:
+            # Derivation and matching are two steps on one clock, not one step. A release
+            # can be derived before any binding exists (§1.0), and an open/BYOM slot binds
+            # checkpoints that did not exist at build — so an artifact with no header table
+            # yields the CODE topology alone, and the match runs when a candidate arrives.
+            # Serve mode has no such case: an empty table there is a checkpoint supplying
+            # nothing, and the missing-key refusal below is the correct answer.
+            return ()
         missing = [d.key for d in destinations if d.key not in table]
         if missing:
             raise ConformanceError(

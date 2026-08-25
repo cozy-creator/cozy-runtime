@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Seven fences, each provable red by planting the violation (`scripts/redarm.py`):
-  forbidden-dependency · package-imports · env-authority · single-config · no-interactive
-  excluded-keywords · no-identifiers-in-endpoint-code
+Nine fences, each provable red by planting the violation (`scripts/redarm.py`):
+  forbidden-dependency · canonical-numbers · torch-free-import · package-imports
+  env-authority · single-config · no-interactive · excluded-keywords
+  no-identifiers-in-endpoint-code
 """
 
 from __future__ import annotations
@@ -283,7 +284,11 @@ def fence_torch_free_import() -> list[str]:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Import, ast.ImportFrom)):
                 continue
-            names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
             if not any(n.split(".")[0] == "torch" for n in names):
                 continue
             if node.col_offset == 0:

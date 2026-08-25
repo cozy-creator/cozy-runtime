@@ -34,6 +34,23 @@ warn_unreachable = true
 disallow_any_generics = true
 implicit_reexport = false
 
+# torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
+# does not have it and mypy cannot see its types. The consequence is recorded rather than
+# papered over: the two modules that touch torch are checked without unused-ignore warnings
+# and with torch itself untyped. `scripts/fence.py::torch-free-import` is what actually
+# holds the packaging rule; mypy never could.
+[[tool.mypy.overrides]]
+module = ["torch.*", "corpus.*", "triton.*", "numpy.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cozy_runtime.internal.derive"]
+warn_unused_ignores = false
+
+[project.optional-dependencies]
+# The derivation harness and the serving executor. Corpus venvs install this.
+derive = ["torch>=2.6"]
+
 [tool.ruff]
 line-length = 100
 src = ["src", "scripts", "examples"]
