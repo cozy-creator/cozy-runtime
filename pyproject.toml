@@ -3,7 +3,7 @@ name = "cozy-runtime"
 version = "0.0.1"
 description = "Cozy v2 worker runtime: author surface, supervisor, executor"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["msgspec>=0.19"]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
@@ -23,7 +23,7 @@ members = ["packages/*"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src", "scripts"]
+files = ["src", "scripts", "examples"]
 strict = true
 warn_unreachable = true
 disallow_any_generics = true
@@ -31,7 +31,7 @@ implicit_reexport = false
 
 [tool.ruff]
 line-length = 100
-src = ["src", "scripts"]
+src = ["src", "scripts", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -65,53 +65,84 @@ object = "{pkg}:app"
 """
 
 
-def _module(pkg: str) -> str:
-    return f'''"""{pkg} — a cozy-runtime endpoint.
+_MODULE = '''"""__PKG__ — a cozy-runtime endpoint.
 
-Code states capability; endpoint.toml states selection.
+Code states capability; endpoint.toml states selection. The SIGNATURE is the contract:
+naming `out: Outputs` IS declaring the save capability, and a `model: MyModel` parameter
+is what derives `gpu`. Nothing else declares either.
 """
 
-from dataclasses import dataclass
+import msgspec
 
-from cozy_runtime.author import App
+from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs
 
 app = App()
 
 
-@dataclass(frozen=True, slots=True)
-class GenerateRequest:
+class GenerateRequest(msgspec.Struct, forbid_unknown_fields=True):
     prompt: str
-    steps: int = 4
+    # Axis-named fields normalize into RequestFeatures with nothing authored.
+    width: int = 64
+    height: int = 64
+    seed: int | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class GenerateResult:
-    text: str
-    steps: int
+class GenerateResult(msgspec.Struct):
+    image: ImageAsset
+    prompt: str
 
 
 @app.entrypoint
-def generate(request: GenerateRequest) -> GenerateResult:
-    # Fake-backed: no weights, no device. Bind a real Model parameter here (cr-002a).
-    return GenerateResult(text=f"[{pkg}] {{request.prompt}}", steps=request.steps)
+def generate(ctx: Context, payload: GenerateRequest, out: Outputs) -> GenerateResult:
+    # Weightless: no model parameter yet, so this endpoint derives gpu=False. Adding
+    # `model: MyModel` binds real weights and gives you `model.for_request(ctx, seed=...)`.
+    ctx.raise_if_cancelled()
+    pixels = bytearray()
+    for y in range(payload.height):
+        for x in range(payload.width):
+            pixels += bytes((x % 256, y % 256, len(payload.prompt) % 256))
+    frame = ImageFrame(payload.width, payload.height, bytes(pixels))
+    return GenerateResult(
+        image=out.save_image(frame, format="png"), prompt=payload.prompt
+    )
 '''
 
 
-def _example(pkg: str) -> str:
-    return f'''"""Runnable fake-backed example: `uv run python -m {pkg}`."""
+def _module(pkg: str) -> str:
+    return _MODULE.replace("__PKG__", pkg)
 
-from {pkg} import GenerateRequest, app, generate
+
+_EXAMPLE = '''"""Runnable, weightless, no GPU: `uv run python -m __PKG__`.
+
+The fakes are capability adapters over the PRODUCTION invocation kernel — the decode,
+injection, validation and encode below are the ones a served request runs.
+"""
+
+from cozy_runtime.author import describe
+from cozy_runtime.author.fakes import invoke_with_fakes
+
+from __PKG__ import app
 
 
 def main() -> None:
-    result = generate(GenerateRequest(prompt="a cozy cabin in the woods"))
-    print("registered:", ", ".join(r.name for r in app.registrations()))
-    print("result:", result.text, f"(steps={{result.steps}})")
+    for surface in describe(app):
+        caps = ", ".join(sorted(surface.capabilities)) or "(none)"
+        print(f"registered: {surface.name}  gpu={surface.gpu}  capabilities: {caps}")
+    envelope = invoke_with_fakes(
+        app.get("generate"), {"prompt": "a cozy cabin in the woods", "seed": 7}
+    )
+    print("result:  ", envelope.result)
+    print("outputs: ", envelope.outputs)
+    print("features:", envelope.features.values)
 
 
 if __name__ == "__main__":
     main()
 '''
+
+
+def _example(pkg: str) -> str:
+    return _EXAMPLE.replace("__PKG__", pkg)
 
 
 def _readme(name: str, pkg: str) -> str:

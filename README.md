@@ -11,9 +11,17 @@ recording what it did, plus time/memory benchmarks.
 
 | package | role | may import |
 |---|---|---|
-| `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + schema/typing libraries |
+| `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, stdlib |
 | `cozy_runtime.cli` | local-coordinator adapter over the core | author, internal |
+
+`cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
+-> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
+no device, config, environment, protocol or network — so it lives beside the types it
+enforces, and `internal` depends on `author`, never the reverse. Every door (`run`, `job`,
+a served attempt) is a user experience over that one function, and the per-service fakes
+in `cozy_runtime.author.fakes` are capability adapters over it rather than a parallel
+runtime.
 
 `internal/config.py` is the only module permitted to read process environment: one read at
 the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second read refuses.
@@ -27,7 +35,12 @@ ordering itself is cr-007). `internal/exits.py` is the one shared exit-code matr
     uv run cozy-runtime new <name>       # scaffold a minimal valid endpoint
     uv run python scripts/fence.py       # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
+    uv run python scripts/verify.py      # live run of examples/tiny_sdxl.py end to end
     uv run python scripts/bench.py       # time + memory benchmarks
+
+`examples/tiny_sdxl.py` is a real endpoint on the author surface (weightless, no GPU):
+four entrypoints covering both spellings, the derived capability set, `ModelDefault`
+overlay resolution, the typed preflight, and the output transaction.
 
 `run` · `serve` · `job` · `describe` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit`
 land in cr-016 over the real attempt kernel.
