@@ -12,6 +12,7 @@ execute — it takes no I/O, loads no weights, and never touches the device.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +85,11 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         rows.append((surface.name, verdict["rendered"]))
     return Result(
         rows=tuple(rows),
-        document={"host": facts.__dict__ | {}, "verdicts": verdicts} if opts.json else None,
+        # `HostFacts` is a SLOTTED dataclass and has no `__dict__`, so reading one made
+        # every `--json` invocation exit 1 `internal` (found by cl-010 driving the
+        # product CLI, which fell back to the row rendering to work around it).
+        # `dataclasses.asdict` is the reader that works for both shapes.
+        document={"host": dataclasses.asdict(facts), "verdicts": verdicts} if opts.json else None,
         lines=(
             ()
             if any(v["exact"] for v in verdicts)

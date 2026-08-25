@@ -328,6 +328,71 @@ def _timeout(spelled: str) -> int:
     )
 
 
+def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, Any]]:
+    """Every declared slot's RESOLVED SELECTION, from the one resolver (cl-010's debt 7).
+
+    It prints what `endpoint.toml` SELECTS — the ref, the lane, and which rule won — plus
+    whatever the local CAS has for it. Deliberately NOT the full binding-plan record: an
+    uninstalled artifact still has a selection, and a verb that refused `offline_miss` here
+    would be useless for the question it exists to answer ("what does this project bind?").
+    That question is the whole of the second reader cozy-creator grew, and answering it is
+    what deletes `internal/launch/bindings.go` (the deletion is cl-003's).
+
+    It resolves and reports; it constructs nothing, touches no device and loads no weights.
+    """
+    project = Path(opts.dir).expanduser().resolve()
+    try:
+        found = discover(project)
+    except ConformanceError as exc:
+        raise CliError(
+            "validation",
+            str(exc),
+            "an endpoint's surface must be valid before its bindings can resolve (§1.0)",
+            Exit.validation,
+        ) from exc
+    slots = [
+        slot
+        for surface in found.surfaces
+        if surface.kind == "entrypoint"
+        for slot in surface.model_bindings
+    ]
+    if not slots:
+        return []
+    try:
+        # ONE resolve over the WHOLE declared slot set, which is what a serving deployment
+        # does: the selection is checked against every slot the release declares, so a
+        # binding for a slot that does not exist refuses here rather than being silently
+        # unused by whichever entrypoint happened to be asked for.
+        resolved = binding_table.resolve(slots, found.bindings)
+    except ConformanceError as exc:
+        raise CliError(
+            "validation",
+            str(exc),
+            "code states capability, bindings state selection — name the slot in endpoint.toml",
+            Exit.validation,
+        ) from exc
+    records: list[dict[str, Any]] = []
+    for slot in sorted(slots, key=lambda s: s.path):
+        chosen = resolved[slot.path]
+        installed = artifacts.find(config.cozy_home, chosen.ref)
+        records.append(
+            {
+                "binding_path": slot.path,
+                "param": slot.param,
+                "model_class": slot.class_key,
+                "ref": chosen.ref,
+                "lane": chosen.lane or "",
+                "source": chosen.source,
+                "components": list(installed.components) if installed else [],
+                "store": str(config.cozy_home) if installed else "",
+                "snapshots": dict(installed.snapshots) if installed else {},
+                "custody": installed.custody if installed else "",
+                "installed": installed is not None,
+            }
+        )
+    return records
+
+
 def _binding_record(
     config: RuntimeConfig,
     found: Any,

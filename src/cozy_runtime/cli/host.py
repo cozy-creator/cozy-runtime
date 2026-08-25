@@ -137,31 +137,59 @@ def unavailable(verb: str) -> Result:
     )
 
 
+#: `serve` flag -> the supervisor flag it translates to. The set is CLOSED and it is the
+#: whole launch surface a coordinator needs: who this worker is, what release it serves,
+#: which devices it may touch, and how long a cancel gets before it stops being cooperative.
+#: cl-010 measured the cost of the smaller set — the product could not use `serve` at all
+#: and launched `internal.worker.session:main` directly, which is a second process entry
+#: into the same loop and exactly what this verb exists to prevent.
+_SERVE_FLAGS: dict[str, str] = {
+    "--worker-id": "--worker-id",
+    "--instance-id": "--instance-id",
+    "--release-id": "--release-id",
+    "--git-commit": "--git-commit",
+    "--devices": "--devices",
+    "--threads": "--threads",
+    "--grace": "--grace",
+    "--host-budget": "--host-budget",
+    "--pinned-budget": "--pinned-budget",
+}
+
+#: Flags that carry no value.
+_SERVE_SWITCHES = ("--no-warm",)
+
+
 def serve(config: RuntimeConfig, args: list[str]) -> int:
     """The process entry into cr-007's supervisor — a TRANSLATION, never a second loop.
 
-    `--socket`/`--cas`/`--out` are the coordinator-issued path grants and the only flags:
-    directives, grants and config arrive over the protocol. Everything below this call is
-    the supervisor `serve` has always been.
+    `--socket`/`--cas`/`--out` are the coordinator-issued path grants; `_SERVE_FLAGS` are
+    the launch facts a coordinator must state because nothing can discover them for it —
+    identity, release, device envelope, budgets and the grace clock. Everything else —
+    directives, grants, config — arrives over the protocol, and always will.
     """
     from cozy_runtime.internal.worker.session import main as supervisor_main
 
     values: dict[str, str] = {}
+    switches: list[str] = []
     rest = list(args)
     while rest:
         item = rest.pop(0)
         name, eq, inline = item.partition("=")
-        if name not in ("--socket", "--cas", "--out"):
+        if name in _SERVE_SWITCHES:
+            switches.append(name)
+            continue
+        if name not in ("--socket", "--cas", "--out") and name not in _SERVE_FLAGS:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
-                "serve takes --socket <path> [--cas <dir>] [--out <dir>]; everything else "
-                "arrives over the protocol",
+                "serve takes --socket <path> [--cas <dir>] [--out <dir>] "
+                + " ".join(f"[{f} <value>]" for f in sorted(_SERVE_FLAGS))
+                + " [--no-warm]; directives, grants and config arrive over the protocol",
                 Exit.usage,
             )
         if not eq:
             if not rest:
-                raise CliError("usage", f"{name} needs a value", f"pass {name} <path>", Exit.usage)
+                raise CliError("usage", f"{name} needs a value", f"pass {name} <value>", Exit.usage)
             inline = rest.pop(0)
         values[name] = inline
     socket = values.get("--socket", "")
@@ -173,13 +201,50 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             Exit.usage,
         )
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
-    return supervisor_main(
-        [
-            "--hub",
-            socket if ":" in socket else f"unix:{socket}",
-            "--root",
-            str(root),
-        ]
+    argv = ["--hub", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
+    for flag, supervisor_flag in _SERVE_FLAGS.items():
+        if flag in values:
+            argv += [supervisor_flag, values[flag]]
+    argv += switches
+    return supervisor_main(argv)
+
+
+def bindings(config: RuntimeConfig, opts: Options) -> Result:
+    """`cozy-runtime bindings` — the RESOLVED binding records, from the one resolver.
+
+    cl-010's finding: no runtime verb emitted the resolved record, so cozy-creator grew a
+    second narrow reader of `endpoint.toml`'s selection grammar
+    (`internal/launch/bindings.go`) to get at the same three keys. Two readers of one closed
+    grammar is exactly the duplication the CLI reference forbids, and the fix belongs here
+    because this side owns the resolution. With this verb that file deletes — the deletion
+    is cl-003's to make.
+
+    It resolves and prints; it constructs nothing, touches no device and loads no weights.
+    """
+    from cozy_runtime.cli import run as run_verb
+
+    records = run_verb.resolved_bindings(config, opts)
+    rows = tuple(
+        (
+            str(record["binding_path"]),
+            f"{record['ref']}"
+            + (f" lane={record['lane']}" if record["lane"] else "")
+            + f" ({record['source']}) "
+            + (
+                "installed: " + ", ".join(record["components"])
+                if record["installed"]
+                else "NOT installed"
+            ),
+        )
+        for record in records
+    )
+    return Result(
+        rows=rows,
+        document={"bindings": records} if opts.json else None,
+        lines=()
+        if records
+        else ("note: this project declares no model binding — nothing to resolve",),
+        next=("cozy-runtime serve --socket <path> — serve these bindings over the protocol",),
     )
 
 

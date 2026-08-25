@@ -157,6 +157,9 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
     corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
     corpus/.venv/bin/python scripts/job-live.py all          # cr-009: the @job surface, services and runner
+    corpus/.venv/bin/python scripts/quant-live.py arms       # cr-006: the encoding border and its refusals
+    corpus/.venv/bin/python scripts/delivery-live.py all     # cr-008c: the delivery ladder, chosen over two real artifacts
+    corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:

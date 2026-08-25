@@ -19,7 +19,19 @@ from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 
-BUILT = ("run", "job", "serve", "describe", "doctor", "fit", "list", "rm", "new", "version")
+BUILT = (
+    "run",
+    "job",
+    "serve",
+    "describe",
+    "bindings",
+    "doctor",
+    "fit",
+    "list",
+    "rm",
+    "new",
+    "version",
+)
 #: `pull`/`ingest` PARSE and refuse typed: both are thin invocations of TensorFS's one
 #: fetch+ingest implementation and that border is not a dependency of this build yet
 #: (tfs-002/tfs-003). They are verbs, not unknown words — the refusal names the owner.
@@ -34,6 +46,7 @@ verbs:
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
   serve --socket <path>          speak the worker protocol for a coordinator
   describe [<fn>]                the EndpointDescriptor, without loading weights
+  bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/CAS/credential facts
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
   list [<ref-prefix>]            CAS-resident checkpoints, one artifact one size
@@ -156,6 +169,16 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return new_verb.run(args[0], opts.dir)
     if verb in ("run", "job"):
         return run_verb.run(verb, args, opts, config)
+    if verb == "bindings":
+        if args:
+            raise CliError(
+                "usage",
+                f"bindings takes no arguments, got {len(args)}",
+                "cozy-runtime bindings [--json] [--dir <path>] — it resolves the project's "
+                "declared selection and constructs nothing, so it takes no payload",
+                Exit.usage,
+            )
+        return host_verbs.bindings(config, opts)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
     if verb == "doctor":
