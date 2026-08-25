@@ -406,6 +406,19 @@ analyze(handler, name='handler', kind='entrypoint')
         "empty_marker_plane",
     ),
     (
+        "slot-object-at-a-use-site",
+        """
+class Slot:
+    def __init__(self, cls, **policy): ...
+
+def handler(payload: In, model: sd.SdxlModel = Slot(sd.SdxlModel, repo='cozy/sdxl')) -> Meta:
+    return Meta(ok=True)
+
+analyze(handler, name='handler', kind='entrypoint')
+""",
+        "injected_default",
+    ),
+    (
         "empty-component-set",
         "uses_components()\n",
         "empty_component_set",
