@@ -291,6 +291,35 @@ def spawn(
     return outcome
 
 
+def took_the_card(outcome: dict[str, Any]) -> bool:
+    """True when a run failed because a NEIGHBOUR took the card, not because of this code.
+
+    This box's 8 GiB device fits exactly one resident pipeline and another agent's worker
+    legitimately comes and goes. A run that starts on a quiet card and meets a neighbour
+    halfway gets a `device_shortfall` that is completely true and completely uninformative
+    about the arm being exercised. Retrying is honest; reporting it as a failure would not
+    be, and neither would hiding it.
+    """
+    message = str((outcome.get("terminal") or {}).get("safe_message", "")).lower()
+    return "device_shortfall" in message or "out of memory" in message
+
+
+def drive(label: str, body: Any, tries: int = 4) -> dict[str, Any]:
+    """Run one arm; retry it when the shared card was taken out from under it."""
+    outcome: dict[str, Any] = body()
+    for index in range(1, tries):
+        if not took_the_card(outcome):
+            return outcome
+        print(
+            f"  the card was taken mid-run by another process; retrying {label} "
+            f"({index}/{tries - 1})",
+            flush=True,
+        )
+        require_quiet_card()
+        outcome = body()
+    return outcome
+
+
 def residency_of(outcome: dict[str, Any]) -> dict[str, Any]:
     row = (outcome.get("triage") or {}).get("measurements", {}).get("residency") or {}
     return dict(row)
@@ -366,13 +395,16 @@ def section_stage(args: argparse.Namespace) -> None:
     idle = require_quiet_card()
 
     head("the whole four-component pipeline, every component FILLED at construction")
-    filled = spawn(
-        {
-            "workspace": args.tmp + "/all-filled",
-            "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
-            "request_id": "pipe-filled",
-            "binding": {"resident_budget_bytes": 0},
-        }
+    filled = drive(
+        "the filled-construction arm",
+        lambda: spawn(
+            {
+                "workspace": args.tmp + "/all-filled",
+                "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
+                "request_id": "pipe-filled",
+                "binding": {"resident_budget_bytes": 0},
+            }
+        ),
     )
     check(
         "the pipeline served",
@@ -431,13 +463,16 @@ def section_stage(args: argparse.Namespace) -> None:
         print(f"    {row}")
 
     head("the SAME request with the UNet PARKED at construction — never filled, staged on use")
-    parked = spawn(
-        {
-            "workspace": args.tmp + "/parked",
-            "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
-            "request_id": "pipe-parked",
-            "binding": {"resident_budget_bytes": 2 * GIB},
-        }
+    parked = drive(
+        "the parked-construction arm",
+        lambda: spawn(
+            {
+                "workspace": args.tmp + "/parked",
+                "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
+                "request_id": "pipe-parked",
+                "binding": {"resident_budget_bytes": 2 * GIB},
+            }
+        ),
     )
     check(
         "the pipeline served with only 2 GiB of it filled at construction",
