@@ -366,7 +366,7 @@ def run_mistyped() -> str:
     planted.write_text(MISTYPED)
     try:
         checked = subprocess.run(
-            ["mypy", "--strict", str(planted.relative_to(ROOT))],
+            [sys.executable, "-m", "mypy", "--strict", str(planted.relative_to(ROOT))],
             capture_output=True,
             text=True,
             cwd=ROOT,

@@ -7,8 +7,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync
-      - run: uv run --with ruff ruff check .
-      - run: uv run --with mypy mypy
+      - run: uv run ruff check .
+      - run: uv run mypy
       - run: uv run python scripts/fence.py
       - run: uv run python scripts/redarm.py
+      - run: uv run python scripts/verify.py
       - run: uv run cozy-runtime version
