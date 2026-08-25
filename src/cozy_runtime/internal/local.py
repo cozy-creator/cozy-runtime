@@ -93,6 +93,10 @@ class SliceOutcome:
     executions: int = 0
     exit_code: int = 0
     journal_deleted: bool = False
+    #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
+    #: `worker_error` (the worker reported it could not become ready) or `ready_timeout`.
+    #: A one-shot run that cannot say this would have to pretend a hang was a result.
+    ended: str = "unstarted"
 
 
 class LocalCoordinator:
@@ -114,12 +118,15 @@ class LocalCoordinator:
         release_id: str,
         auto_ack: bool = True,
         on_progress: Any = None,
+        ready_timeout: float = 1800.0,
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_plan_id
         self.workspace = workspace
         self.release_id = release_id
         self.auto_ack = auto_ack
+        self.ready_timeout = ready_timeout
+        self.ended = "unstarted"
         self._link = InMemoryLink()
         self._link.on_message = self._on_message
         self._link.on_progress = on_progress
@@ -149,7 +156,25 @@ class LocalCoordinator:
         return "local:in-memory"
 
     def link(self) -> Link:
+        # A one-shot run gets a readiness DEADLINE. With the worker reporting an intake
+        # error on a failed preparation this rarely fires, but "rarely" is not "never", and
+        # a local run that hangs forever waiting for a worker that will not arrive is worse
+        # than one that says so: a person is sitting in front of it.
+        threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()
         return self._link
+
+    def _deadline(self) -> None:
+        if self.done.wait(self.ready_timeout):
+            return
+        if not self.dispatched:
+            self.ended = "ready_timeout"
+            print(
+                f"[run] the worker never reported ready within {self.ready_timeout:g} s; "
+                "ending the run rather than waiting on it",
+                flush=True,
+            )
+            self.done.set()
+            self._link.close()
 
     # ------------------------------------------------------------------ the exchange
 
@@ -189,7 +214,11 @@ class LocalCoordinator:
             and plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids
         )
         if report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR:
+            # The worker said it cannot become ready. That is an answer, and a one-shot run
+            # ends on it instead of waiting for a readiness that will never come.
             self.marks.setdefault("ready", time.perf_counter())
+            if self.terminal is None:
+                self.ended = "worker_error"
             self.done.set()
             self._link.close()
             return
@@ -200,6 +229,7 @@ class LocalCoordinator:
 
     def _on_terminal(self, terminal: pb.AttemptTerminal) -> None:
         self.terminal = terminal
+        self.ended = "terminal"
         self.marks["terminal"] = time.perf_counter()
         if not self.auto_ack:
             return
@@ -399,7 +429,7 @@ def _collect(
     exit_code: int,
     delete_journal: bool,
 ) -> SliceOutcome:
-    outcome = SliceOutcome(exit_code=exit_code)
+    outcome = SliceOutcome(exit_code=exit_code, ended=coordinator.ended)
     outcome.journal = _journal_rows(supervisor.root / "journal.log")
     outcome.reconciliation = (
         supervisor.ledger.reconciliations[-1] if supervisor.ledger.reconciliations else {}

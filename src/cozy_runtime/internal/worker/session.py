@@ -332,12 +332,26 @@ class Supervisor:
             took = (time.perf_counter() - started) * 1000
             if not reply.get("ok"):
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                detail = str(reply.get("detail"))[:1024]
+                shortfall = reply.get("shortfall") or {}
+                if shortfall:
+                    # `Fault` has no structured shortfall slot — only `TerminalCause` does
+                    # (worker-protocol/01), and that schema is th-024's, not this repo's. So
+                    # the two numbers go into `detail` in a fixed shape rather than being
+                    # lost: what was needed, what was measured free, on which resource. A
+                    # Fault-level ResourceShortfall is a protocol change and is named as a
+                    # seam, not smuggled in.
+                    detail = (
+                        f"{shortfall['resource']} shortfall at {shortfall['scope']}: "
+                        f"needed {shortfall['needed_bytes']} B, "
+                        f"{shortfall['available_bytes']} B free (measured) - {detail}"
+                    )[:1024]
                 self.engine.faults.append(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=first.plan_id,
                         reason=str(reply.get("code")),
-                        detail=str(reply.get("detail"))[:1024],
+                        detail=detail,
                     )
                 )
                 self.note(
@@ -496,7 +510,21 @@ class Supervisor:
                 try:
                     self.apply_directive(message.directive)
                 except (ExecutorGone, JournalError) as exc:
+                    # A directive whose PREPARATION dies must say so durably. Noting it and
+                    # leaving intake at LOADING is the worst of both: the worker will never
+                    # become ready and the coordinator has no way to learn that, so it waits
+                    # on a worker that is finished. Found live by killing the executor
+                    # mid-fill — the run hung instead of converging (cr-008a arm 2).
                     self.note("directive", f"apply failed: {exc}")
+                    self.engine.faults.append(
+                        pb.Fault(
+                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            subject=f"revision {message.directive.revision}",
+                            reason="directive_preparation_failed",
+                            detail=f"{type(exc).__name__}: {exc}"[:1024],
+                        )
+                    )
+                    self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             elif kind == "start_attempt":
                 self.on_start(message.start_attempt)
             elif kind == "cancel_attempt":

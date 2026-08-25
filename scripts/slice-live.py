@@ -173,15 +173,16 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     )
 
     def arm(coordinator: LocalCoordinator, supervisor: Any) -> None:
-        # SIGINT/SIGTERM on a local run CANCEL the attempt — the same CancelAttempt a hub
-        # sends, on the same lane. This is the local spelling of Ctrl-C, and it is why the
-        # cancellation arms need no hook inside the runtime.
+        # SIGINT on a local run CANCELS the attempt — the same CancelAttempt a hub sends,
+        # on the same lane. This is the local spelling of Ctrl-C, and it is why the
+        # cancellation arms need no hook inside the runtime. SIGTERM is deliberately NOT
+        # bound: a terminate must remain a terminate, or an operator's kill turns into a
+        # polite request the run may outlive.
         def cancel(signum: int, frame: object) -> None:
             print(f"[run] signal {signum}: cancelling the live attempt", flush=True)
             coordinator.cancel(pb.CancelReason.CANCEL_REASON_CLIENT)
 
         signal.signal(signal.SIGINT, cancel)
-        signal.signal(signal.SIGTERM, cancel)
         marker = Path(spec["workspace"]) / "accepted.marker"
 
         def watch() -> None:
@@ -688,9 +689,10 @@ def section_arms(args: argparse.Namespace) -> None:
         f"executor pid {pid} was live when SIGKILL was sent",
     )
     check(
-        "the run converged instead of hanging",
-        process.returncode is not None,
-        f"exit {process.returncode}, worker exit {outcome.get('exit_code')}",
+        "the run CONVERGED instead of hanging on a worker that will never be ready",
+        outcome.get("ended") == "worker_error",
+        f"ended={outcome.get('ended')!r}, exit {process.returncode}; "
+        f"{(outcome.get('faults') or [{}])[-1].get('reason', 'no fault')}",
     )
     check(
         "NO acceptance was journaled for a generation that never became ready",

@@ -180,17 +180,26 @@ class Executor:
         model_cls = getattr(self.discovered.module, binding["model_class"])
         try:
             model = registry.acquire(binding["binding_path"], model_cls, artifact)
-        except FillRefusal as exc:
+        except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
             # cr-005's transaction already rolled the generation back on the way out. The
             # numbers that matter are therefore the HIGH-WATER marks (what was live when it
             # failed) beside the after state — "released 0 B" would be true and useless.
+            #
+            # A device OOM is a RESOURCE SHORTFALL, not an unhandled exception. It is the
+            # ordinary outcome of another process holding the card (this box's 8 GiB fits
+            # exactly one 4.78 GiB resident), and reporting it as a crash loses the two
+            # numbers an operator needs: what was wanted and what was there. The plan
+            # reserved against a DECLARED budget; the device is what actually says no. The
+            # request-aware ladder that would pick a plan that fits is cr-008b's.
+            oom = not isinstance(exc, FillRefusal)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info()
-            self.poisoned = f"fill refused: {exc.code}"
-            return {
+            code = "device_shortfall" if oom else exc.code
+            self.poisoned = f"fill refused: {code}"
+            reply: dict[str, Any] = {
                 "ok": False,
-                "code": exc.code,
+                "code": code,
                 "detail": str(exc).splitlines()[0][:400],
                 "state": backend.state,
                 "peak_allocator_bytes": torch.cuda.max_memory_allocated(),
@@ -200,6 +209,15 @@ class Executor:
                 "device_total_bytes": total,
                 "ledger": ledger.rows(),
             }
+            if oom:
+                reply["shortfall"] = {
+                    "resource": "vram",
+                    "scope": "component_generation",
+                    "needed_bytes": int(budgets["vram"]),
+                    "available_bytes": int(free),
+                    "evidence_class": "measured",
+                }
+            return reply
         self.backend = backend
         self.registry = registry
         self.models = {binding["param"]: model}
