@@ -85,6 +85,33 @@ def _number(text: str, pattern: str, default: int = 0) -> int:
     return int(found.group(1)) if found else default
 
 
+#: A quiet card, in MiB. The real UNet is 4.78 GiB on an 8 GiB device, so a section only
+#: means anything when nothing else is resident: this box is shared, and a neighbour holding
+#: 5 GiB turns a correct run into an OOM that says nothing about this code.
+QUIET_MIB = 400
+
+
+def require_quiet_card(seconds: float = 3600.0) -> int:
+    """Block until the card is effectively idle, saying so while it waits."""
+    started = time.monotonic()
+    announced = False
+    while time.monotonic() - started < seconds:
+        used = gpu_used_mib()
+        if used < 0 or used <= QUIET_MIB:
+            if announced:
+                print(f"  the card is quiet again after {time.monotonic() - started:.0f} s")
+            return used
+        if not announced:
+            announced = True
+            print(
+                f"  waiting for a quiet card: {used} MiB in use by another process on this "
+                f"shared box (need <= {QUIET_MIB} MiB)",
+                flush=True,
+            )
+        time.sleep(5.0)
+    return gpu_used_mib()
+
+
 def gpu_used_mib() -> int:
     out = (
         subprocess.run(
@@ -480,6 +507,9 @@ def start_worker(
         ),
     )
     hub.revision = 1
+    # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
+    # neighbour holds 5 GiB fails with a device shortfall that is true and uninformative.
+    require_quiet_card()
     log = tmp / "supervisor.log"
     env = {
         "PATH": os.environ["PATH"],
