@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Nine fences, each provable red by planting the violation (`scripts/redarm.py`):
+Ten fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import · package-imports
   env-authority · single-config · no-interactive · excluded-keywords
-  no-identifiers-in-endpoint-code
+  no-identifiers-in-endpoint-code · one-attempt-kernel
 """
 
 from __future__ import annotations
@@ -299,8 +299,76 @@ def fence_torch_free_import() -> list[str]:
     return bad
 
 
+#: §8's ONE ATTEMPT KERNEL, as a structural rule rather than a promise.
+#:
+#: `run`, `job` and `serve` are three ENTRANCES to one execution state machine. The v1
+#: failure mode this exists to prevent is exact and was expensive: the developer door and
+#: the production door ran different lifecycle code, so everything proven about one proved
+#: nothing about the other. Two facts hold the shape:
+#:
+#:   * the author invocation kernel is CALLED from exactly one module — the device executor;
+#:   * the attempt engine is CONSTRUCTED in exactly one module — the supervisor session.
+#:
+#: Anything that wants to run an attempt therefore has to go through the supervisor, over
+#: the seam, into the executor. A direct-call runner beside it cannot be written without
+#: turning this fence red.
+KERNEL_CALLS = ("attempt", "invoke")
+KERNEL_CALLER = "internal/executor.py"
+ENGINE_CLASS = "AttemptEngine"
+ENGINE_BUILDER = "internal/worker/session.py"
+
+
+def fence_one_attempt_kernel() -> list[str]:
+    bad: list[str] = []
+    for path in py_files():
+        rel = path.relative_to(SRC)
+        # The author package IS the kernel and its declared testing seam (§1.6).
+        if rel.parts[0] == "author":
+            continue
+        tree = ast.parse(path.read_text())
+        allowed_caller = rel.as_posix() == KERNEL_CALLER
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "cozy_runtime.author"
+            ):
+                names = {a.name for a in node.names}
+                hit = names & set(KERNEL_CALLS)
+                if hit and not allowed_caller:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: imports the invocation "
+                        f"kernel {sorted(hit)} — only {KERNEL_CALLER} may, so that `run`, "
+                        "`job` and `serve` cannot diverge into two lifecycles"
+                    )
+            if isinstance(node, ast.Call) and not allowed_caller:
+                func = node.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else ""
+                )
+                if name in KERNEL_CALLS:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: calls the invocation "
+                        f"kernel {name}() — the ONE kernel runs in the device executor"
+                    )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == ENGINE_CLASS
+                and rel.as_posix() != ENGINE_BUILDER
+            ):
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: constructs {ENGINE_CLASS} — "
+                    f"only {ENGINE_BUILDER} may; a second engine is a second lifecycle"
+                )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
+    "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,

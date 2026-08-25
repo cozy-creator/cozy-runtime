@@ -47,6 +47,24 @@ STATIC_ARMS = (
         ROOT / "examples" / "tiny_h3.py",
         '_PINNED = "minimaxai/h3@v1"\n',
     ),
+    # §8's one-kernel rule, planted as the exact thing it forbids: a SECOND direct-call
+    # path into the author invocation kernel, and a SECOND attempt engine beside the
+    # supervisor's. Both are the v1 failure mode where the developer door and the
+    # production door ran different lifecycle code.
+    Arm(
+        "one-attempt-kernel",
+        SRC / "cli" / "version.py",
+        "from cozy_runtime.author import attempt\n\n\n"
+        "def run_direct(registration: object, payload: dict[str, object]) -> None:\n"
+        "    attempt(registration, payload, None)\n",
+    ),
+    Arm(
+        "one-attempt-kernel",
+        SRC / "internal" / "local.py",
+        "from cozy_runtime.internal.worker.attempts import AttemptEngine as _E\n\n\n"
+        "def second_engine() -> object:\n"
+        "    return AttemptEngine()\n",
+    ),
 )
 
 LIVE_ARMS = (

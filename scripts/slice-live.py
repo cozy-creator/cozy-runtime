@@ -1,0 +1,1072 @@
+#!/usr/bin/env python
+"""cr-008a's live verification: ONE request, through the whole real path, no network.
+
+Not a test suite (#160). Every section starts the actual system — an ephemeral local
+supervisor in a REAL process, with an in-memory coordinator instead of a gRPC one, and a
+disposable CUDA executor child serving cr-005's real SDXL UNet — and prints what it observed.
+
+    nice -n 19 corpus/.venv/bin/python scripts/slice-live.py slice
+    nice -n 19 corpus/.venv/bin/python scripts/slice-live.py ledger
+    nice -n 19 corpus/.venv/bin/python scripts/slice-live.py arms
+    nice -n 19 corpus/.venv/bin/python scripts/slice-live.py clone
+    nice -n 19 corpus/.venv/bin/python scripts/slice-live.py bench
+
+`exec` is the inner mode: ONE slice in ONE process, which is what a `cozy-runtime run`
+process will be. Every section spawns it, so a kill is a real kill of a real run and the
+no-torch-in-the-run-process claim is a fact about a process rather than an import graph.
+
+The bytes come from `~/cozy_v2/tensorfs-bench`, cr-005's real SDXL CAS, READ-ONLY.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
+BENCH = Path("/home/fidika/cozy_v2/tensorfs-bench")
+STORE = BENCH / "store"
+PLAN = BENCH / "results" / "read.plan"
+CONFIG = BENCH / "hf" / "sdxl" / "unet" / "config.json"
+CHECKPOINT = BENCH / "results" / "checkpoint.txt"
+RELEASE = "cozy/sdxl-unet@cr-005"
+COMPONENT = "unet"
+MIB = 1 << 20
+GIB = 1 << 30
+
+#: cr-005 banked this digest for ONE denoising step on the real filled UNet at seed 1005,
+#: 64x64 latents, fp16, deterministic algorithms. cr-008a's whole point is that the same
+#: computation, driven through the PROTOCOL PATH instead of a direct call, produces the same
+#: bits — which is what proves the protocol did not perturb execution.
+BANKED = "19ca4b8dee5f8e498e012baf67f921f7210cfcbb68a0d350de5b6909d20ff05c"
+BANKED_PAYLOAD = {"steps": 1, "latent": 64, "seed": 1005}
+
+PASS = 0
+FAIL = 0
+
+
+def head(title: str) -> None:
+    print(f"\n=== {title}", flush=True)
+
+
+def check(label: str, ok: bool, detail: str = "") -> bool:
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  {'ok  ' if ok else 'FAIL'} {label}" + (f" — {detail}" if detail else ""), flush=True)
+    return ok
+
+
+def gpu_used_mib() -> int:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        return int(out.stdout.strip().splitlines()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return -1
+
+
+def snapshot() -> str:
+    for line in CHECKPOINT.read_text().strip().split("\n"):
+        name, _, value = line.partition("\t")
+        if name == "checkpoint":
+            return value
+    raise SystemExit("no checkpoint digest in results/checkpoint.txt")
+
+
+def plan_id_for(entrypoint: str) -> str:
+    return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
+
+
+def binding_record(entrypoint: str, plan_file: str = "") -> dict[str, Any]:
+    return {
+        "plan_id": plan_id_for(entrypoint),
+        "project": str(ROOT / "corpus" / "endpoint"),
+        "model_class": "SdxlUnetModel",
+        "binding_path": f"{entrypoint}.models.model",
+        "param": "model",
+        "component": COMPONENT,
+        "store": str(STORE),
+        "plan": plan_file or str(PLAN),
+        "config": str(CONFIG),
+        "snapshot": snapshot(),
+        "release": RELEASE,
+        "variant": "sm89",
+        "vram_bytes": 6 * GIB,
+        "host_bytes": 2 * GIB,
+        "pinned_bytes": 64 * MIB,
+        "entrypoint": entrypoint,
+        "model_construction_digest": "",
+    }
+
+
+def doctored_plan(target: Path) -> str:
+    """A COPY of the real read plan with one late row pointing at an object that does not
+    exist: the fill fails 85 % of the way through, for the most ordinary reason a fill can
+    fail, with ~5 GiB of destinations already reserved. No plant switch in the runtime."""
+    rows = PLAN.read_text().strip().split("\n")
+    index = int(len(rows) * 0.85)
+    head_, key, dtype, shape, nbytes, where = rows[index].split("\t")
+    _, _, length = where.partition(":")
+    rows[index] = "\t".join([head_, key, dtype, shape, nbytes, "ff" * 32 + ":" + length])
+    target.write_text("\n".join(rows) + "\n")
+    return str(target)
+
+
+# --------------------------------------------------------------------------- the inner run
+
+
+def run_one(spec: dict[str, Any]) -> dict[str, Any]:
+    """ONE slice, in THIS process. The whole of `exec` mode."""
+    from cozy_runtime.internal.config import read_config
+    from cozy_runtime.internal.local import LocalCoordinator, LocalRequest, run_slice
+    from cozy_runtime.internal.worker.session import WorkerOptions
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    workspace = Path(spec["workspace"])
+    home = workspace / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    config = read_config(
+        {
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ["HOME"],
+            "COZY_HOME": str(home),
+            "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
+        }
+    )
+    request = LocalRequest(
+        entrypoint=spec["entrypoint"],
+        payload=spec["payload"],
+        outputs=tuple(spec.get("outputs", ("image",))),
+        request_id=spec.get("request_id", "run-1"),
+        deadline_ms=int(spec.get("deadline_ms", 0)),
+        payload_url=spec.get("payload_url", ""),
+    )
+    options = WorkerOptions(
+        root=workspace / "worker",
+        release_id=RELEASE,
+        instance_id=spec.get("instance_id", ""),
+        grace=float(spec.get("grace", 2.0)),
+        no_warm=bool(spec.get("no_warm", True)),
+    )
+
+    def arm(coordinator: LocalCoordinator, supervisor: Any) -> None:
+        # SIGINT/SIGTERM on a local run CANCEL the attempt — the same CancelAttempt a hub
+        # sends, on the same lane. This is the local spelling of Ctrl-C, and it is why the
+        # cancellation arms need no hook inside the runtime.
+        def cancel(signum: int, frame: object) -> None:
+            print(f"[run] signal {signum}: cancelling the live attempt", flush=True)
+            coordinator.cancel(pb.CancelReason.CANCEL_REASON_CLIENT)
+
+        signal.signal(signal.SIGINT, cancel)
+        signal.signal(signal.SIGTERM, cancel)
+        marker = Path(spec["workspace"]) / "accepted.marker"
+
+        def watch() -> None:
+            while not coordinator.done.is_set():
+                if coordinator.accepted is not None and not marker.exists():
+                    marker.write_text("accepted\n")
+                if supervisor.supervision.current is not None:
+                    executor = workspace / "executor.pid"
+                    if not executor.exists():
+                        executor.write_text(f"{supervisor.supervision.current.pid}\n")
+                time.sleep(0.005)
+
+        threading.Thread(target=watch, daemon=True, name="marks").start()
+
+    outcome = run_slice(
+        config,
+        request,
+        [binding_record(spec["entrypoint"], spec.get("plan_file", ""))],
+        workspace=workspace,
+        release_id=RELEASE,
+        options=options,
+        delete_journal=bool(spec.get("delete_journal", True)),
+        coordinator_hook=arm,
+    )
+    return dataclasses.asdict(outcome)
+
+
+def spawn(spec: dict[str, Any], *, timeout: float = 900.0) -> tuple[dict[str, Any], Any]:
+    """Run one slice in its OWN process and read back what it observed."""
+    workspace = Path(spec["workspace"])
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True, exist_ok=True)
+    spec_path = workspace / "spec.json"
+    out_path = workspace / "outcome.json"
+    spec_path.write_text(json.dumps(spec))
+    process = start(spec_path, out_path, workspace)
+    process.wait(timeout=timeout)
+    return read_outcome(out_path), process
+
+
+def start(spec_path: Path, out_path: Path, workspace: Path) -> subprocess.Popen[bytes]:
+    log = workspace / "run.log"
+    process = subprocess.Popen(
+        [
+            "nice",
+            "-n",
+            "19",
+            sys.executable,
+            str(ROOT / "scripts" / "slice-live.py"),
+            "exec",
+            "--spec",
+            str(spec_path),
+            "--out",
+            str(out_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ["HOME"],
+            "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
+        },
+    )
+
+    def pump() -> None:
+        assert process.stdout is not None
+        with open(log, "wb") as handle:
+            for line in process.stdout:
+                handle.write(line)
+                handle.flush()
+
+    threading.Thread(target=pump, daemon=True).start()
+    return process
+
+
+def read_outcome(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text())
+    return value if isinstance(value, dict) else {}
+
+
+def wait_for(path: Path, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def journal_rows(workspace: Path, kind: str = "") -> list[dict[str, Any]]:
+    """Read the surviving journal of a run whose process is gone."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal.local import _journal_rows
+
+    rows = _journal_rows(workspace / "worker" / "journal.log")
+    return [row for row in rows if not kind or row.get("kind") == kind]
+
+
+def outputs_present(workspace: Path) -> list[str]:
+    directory = workspace / "outputs"
+    return sorted(str(p.name) for p in directory.glob("*")) if directory.is_dir() else []
+
+
+# --------------------------------------------------------------------------- sections
+
+
+def section_slice(args: argparse.Namespace) -> dict[str, Any]:
+    """The headline: one request, one model, one kernel, one ledger, one typed result."""
+    idle = gpu_used_mib()
+    head("one request through the REAL protocol path, with no network")
+    workspace = Path(args.tmp) / "slice"
+    outcome, process = spawn(
+        {
+            "workspace": str(workspace),
+            "entrypoint": "denoise",
+            "payload": BANKED_PAYLOAD,
+            "outputs": ["image"],
+            "request_id": "run-1",
+            "no_warm": True,
+            "delete_journal": False,
+        }
+    )
+    if not outcome:
+        raise SystemExit(
+            f"the slice produced no outcome; log:\n{(workspace / 'run.log').read_text()}"
+        )
+
+    check(
+        "the run exited clean",
+        process.returncode == 0 and outcome["exit_code"] == 0,
+        f"process {process.returncode}, worker exit {outcome['exit_code']}",
+    )
+    check(
+        "the terminal SUCCEEDED",
+        outcome["status"] == "TERMINAL_STATUS_SUCCEEDED",
+        f"{outcome['status']} — {str(outcome['terminal'].get('safe_message', ''))[:80]}",
+    )
+    accepted = outcome["accepted"]
+    check(
+        "acceptance carried the digests it JOURNALED",
+        bool(accepted.get("plan_digest")) and bool(accepted.get("model_construction_digest")),
+        f"plan {accepted.get('plan_digest', '')[7:23]}… construction "
+        f"{accepted.get('model_construction_digest', '')[7:23]}…",
+    )
+    check(
+        "the plan is the CLOSED observable projection, not just a hash",
+        accepted.get("placement") == "all_resident" and accepted.get("delivery") == "native",
+        f"{accepted.get('delivery')}/{accepted.get('materialization')}/"
+        f"{accepted.get('placement')} {accepted.get('compute_dtype')}, "
+        f"{accepted.get('reserved_vram_bytes', 0) / GIB:.2f} GiB reserved",
+    )
+
+    head("the kernel: one real denoising step on the real weights")
+    result = outcome["result"] or {}
+    check(
+        "the typed result rode the terminal INLINE",
+        bool(result),
+        f"schema digest {outcome['result_schema_digest'][7:23]}…, "
+        f"{len(json.dumps(result))} B of canonical result",
+    )
+    check(
+        "THE PROTOCOL PATH DID NOT PERTURB EXECUTION — cr-005's banked digest reproduces",
+        result.get("digest") == BANKED,
+        f"{result.get('digest', 'none')} vs banked {BANKED[:32]}…",
+    )
+    check(
+        "the step is real computation, not a fixture",
+        abs(float(result.get("std", 0.0)) - 1.0) < 0.2 and int(result.get("steps", 0)) == 1,
+        f"steps={result.get('steps')} mean={result.get('mean')} std={result.get('std')}",
+    )
+    check(
+        "`ctx.boot_warmup` is FALSE on a paying request",
+        result.get("warm") is False,
+        "true only during the boot warm pass",
+    )
+
+    head("the output transaction: one grant, one destination, one manifest")
+    manifest = outcome["manifest"]
+    check(
+        "the tail wrote under the EXACT granted destination",
+        len(manifest) == 1 and manifest[0]["output_id"] == "image",
+        f"{manifest[0]['output_id']} -> {manifest[0]['length']} B {manifest[0]['digest'][:23]}…"
+        if manifest
+        else "no manifest",
+    )
+    landed = outcome["outputs"].get("image", "")
+    check(
+        "the bytes are actually on disk at that destination",
+        bool(landed) and Path(landed).is_file(),
+        f"{Path(landed).name if landed else 'nothing'} "
+        f"({Path(landed).stat().st_size if landed else 0} B)",
+    )
+    check(
+        "the result names the asset by its FIELD PATH, never a position",
+        (result.get("image") or {}).get("asset_ref", "").startswith("attempt:"),
+        str((result.get("image") or {}).get("asset_ref", "none")),
+    )
+
+    head("the journal: acceptance, terminal, ledger, closure — in that order")
+    rows = journal_rows(workspace)
+    kinds = [row["kind"] for row in rows]
+    check(
+        "every durable step is journaled, once, in order",
+        kinds == ["session", "accepted", "terminal", "ledger", "closed"],
+        " -> ".join(kinds),
+    )
+    check(
+        "exactly ONE execution happened",
+        outcome["executions"] == 1,
+        f"executions={outcome['executions']}",
+    )
+
+    head("no CUDA in the run process — the supervisor half of a local run")
+    log = (workspace / "run.log").read_text(errors="replace")
+    check(
+        "the run process spawned a disposable executor child",
+        "spawning the device executor" in log,
+        next((ln for ln in log.splitlines() if "dialled back" in ln), "")[:140],
+    )
+    print(f"\n  timings: {json.dumps(outcome['timings'])}")
+    print(f"  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
+    return outcome
+
+
+def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
+    """Ledger v0: every class declares its method, and every attempt closes reconciled."""
+    head("ledger v0: every counter declares HOW it was measured")
+    workspace = Path(args.tmp) / "ledger"
+    outcome, _ = spawn(
+        {
+            "workspace": str(workspace),
+            "entrypoint": "denoise",
+            "payload": {"steps": 2, "latent": 64, "seed": 7},
+            "outputs": ["image"],
+            "request_id": "run-ledger",
+            "no_warm": True,
+            "delete_journal": False,
+        }
+    )
+    ledger = outcome.get("ledger", {})
+    classes = ledger.get("classes", [])
+    check(
+        "every class carries a kind and a method",
+        bool(classes) and all(row.get("kind") and row.get("method") for row in classes),
+        f"{len(classes)} classes, kinds {sorted({row['kind'] for row in classes})}",
+    )
+    for row in classes:
+        print(f"    {row['class']:<20} {row['bytes']:>14} B  [{row['kind']}]  {row['method'][:74]}")
+    measured = [row for row in classes if row["kind"] == "measured"]
+    check(
+        "the weights class is MEASURED, not asserted",
+        any(row["class"] == "active_weights" and row["bytes"] > 4 * GIB for row in classes),
+        next(
+            (
+                f"{row['bytes'] / GIB:.3f} GiB"
+                for row in classes
+                if row["class"] == "active_weights"
+            ),
+            "absent",
+        ),
+    )
+    check(
+        "activations are the attempt's peak MINUS the resident baseline",
+        any(row["class"] == "activations_scratch" and row["bytes"] > 0 for row in classes),
+        next(
+            (
+                f"{row['bytes'] / MIB:.1f} MiB of scratch above the weights"
+                for row in classes
+                if row["class"] == "activations_scratch"
+            ),
+            "absent",
+        ),
+    )
+    check(
+        "arithmetic and measurement are not conflated",
+        len(measured) >= 5 and any(row["kind"] == "arithmetic" for row in classes),
+        f"{len(measured)} measured, "
+        f"{len([r for r in classes if r['kind'] == 'arithmetic'])} arithmetic",
+    )
+
+    head("attempt close reconciles EVERY class — the success path")
+    record = outcome.get("reconciliation", {})
+    check(
+        "the attempt closed with no leak in any reconciled class",
+        bool(record) and record.get("closed") is True,
+        f"leaks {record.get('leaks', ['<no record>'])}",
+    )
+    for row in record.get("classes", []):
+        if row.get("reconciled"):
+            print(
+                f"    {row['class']:<20} {row['before']:>14} -> {row['after']:<14} "
+                f"delta {row.get('delta', 0):+d} B  [{row.get('verdict', '-')}]"
+            )
+    check(
+        "the whole granted envelope came back, not just what the kernel allocated",
+        all(
+            row.get("verdict") == "reconciled"
+            for row in record.get("classes", [])
+            if row.get("reconciled") and row["class"] in ("host_ram", "pinned_allocated")
+        ),
+        "host_ram and pinned_allocated are compared against the line BEFORE acceptance",
+    )
+    check(
+        "the ledger reconciliation is DURABLE, not a print",
+        len(journal_rows(workspace, "ledger")) == 1,
+        f"{len(journal_rows(workspace, 'ledger'))} ledger row(s) in the journal",
+    )
+
+    head("the device baseline: a first-attempt SHIFT is named, a per-attempt leak is not")
+    shifted = Path(args.tmp) / "ledger-warm"
+    outcome_warm, _ = spawn(
+        {
+            "workspace": str(shifted),
+            "entrypoint": "denoise",
+            "payload": BANKED_PAYLOAD,
+            "outputs": ["image"],
+            "request_id": "run-warm",
+            "no_warm": False,  # the boot warm pass runs one case through ORDINARY dispatch
+            "delete_journal": False,
+        }
+    )
+    warm_record = outcome_warm.get("reconciliation", {})
+    device_row: dict[str, Any] = next(
+        (r for r in warm_record.get("classes", []) if r["class"] == "device_allocated"), {}
+    )
+    check(
+        "with the warm pass on, the first PAYING request reconciles device bytes to zero",
+        device_row.get("verdict") == "reconciled" and device_row.get("delta") == 0,
+        f"delta {device_row.get('delta')} B [{device_row.get('verdict')}] — the lazily "
+        "allocated library workspace was paid by the warm case, like the first-call tax",
+    )
+    check(
+        "and the warm pass is what absorbed it",
+        bool(outcome_warm.get("warm")) and outcome_warm["warm"][0]["outcome"] == "warmed",
+        f"warm outcomes {[w['outcome'] for w in outcome_warm.get('warm', [])]}",
+    )
+    cold_shift: dict[str, Any] = next(
+        (
+            r
+            for r in outcome.get("reconciliation", {}).get("classes", [])
+            if r["class"] == "device_allocated"
+        ),
+        {},
+    )
+    check(
+        "without it, the shift is RECORDED with its size rather than called zero",
+        cold_shift.get("verdict") in ("baseline_shift", "reconciled"),
+        f"delta {cold_shift.get('delta')} B [{cold_shift.get('verdict')}]: "
+        f"{(outcome.get('reconciliation', {}).get('baseline_shifts') or ['none'])[0][:120]}",
+    )
+
+    head("the failure path: an INJECTED fill failure releases every reservation")
+    failed = Path(args.tmp) / "ledger-fail"
+    failed.mkdir(parents=True, exist_ok=True)
+    plan_file = doctored_plan(failed / "doctored.plan")
+    outcome2, _ = spawn(
+        {
+            "workspace": str(failed / "run"),
+            "entrypoint": "denoise",
+            "payload": BANKED_PAYLOAD,
+            "outputs": ["image"],
+            "request_id": "run-fail",
+            "no_warm": True,
+            "plan_file": plan_file,
+            "delete_journal": False,
+        }
+    )
+    log = (failed / "run" / "run.log").read_text(errors="replace")
+    check(
+        "the fill REFUSED mid-stream with GiB of destinations live",
+        "prepare REFUSED" in log,
+        next((ln for ln in log.splitlines() if "prepare REFUSED" in ln), "")[13:200],
+    )
+    live = re.search(r"peak allocator (\d+) B", log)
+    after = re.search(r"the allocator holds (\d+) B", log)
+    live_bytes = int(live.group(1)) if live else -1
+    after_bytes = int(after.group(1)) if after else -1
+    check(
+        "and after rollback the allocator is back to zero",
+        after_bytes == 0,
+        f"{live_bytes} B was live when it failed, {after_bytes} B after rollback",
+    )
+    charged = [
+        row
+        for row in outcome2.get("ledger", {}).get("classes", [])
+        if row["class"] in ("host_ram", "pinned_allocated") and row["bytes"] > 0
+    ]
+    check(
+        "no host reservation survived the failure",
+        not charged,
+        "host_ram and pinned_allocated both 0 B" if not charged else str(charged),
+    )
+    check(
+        "and no attempt was ever accepted against a generation that never became ready",
+        not journal_rows(failed / "run", "accepted"),
+        "the journal carries no acceptance — serving never accepts-then-cold-loads",
+    )
+    check(
+        "no output bytes exist anywhere",
+        not outputs_present(failed / "run"),
+        f"{outputs_present(failed / 'run') or 'nothing at the granted destination'}",
+    )
+    print(f"  GPU {gpu_used_mib()} MiB")
+    return outcome
+
+
+def section_arms(args: argparse.Namespace) -> None:
+    """cancel / kill during fetch, fill, invoke and encode — one terminal, no partials."""
+    idle = gpu_used_mib()
+
+    head("ARM 1/4 — FETCH: the executor dies while the payload is being fetched")
+    workspace = Path(args.tmp) / "arm-fetch"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    fifo = workspace / "payload.fifo"
+    os.mkfifo(fifo)
+    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": BANKED_PAYLOAD,
+                "payload_url": f"file://{fifo}",
+                "outputs": ["image"],
+                "request_id": "run-fetch",
+                "no_warm": True,
+                "delete_journal": False,
+            }
+        )
+    )
+    process = start(spec_path, out_path, workspace)
+    # The payload fetch is INSIDE the atomic acceptance boundary. A FIFO holds it there
+    # deterministically: the supervisor blocks reading the granted input, and the executor
+    # it would have accepted against is killed while it waits.
+    executor_pid_file = workspace / "executor.pid"
+    wait_for(executor_pid_file, 600)
+    time.sleep(0.5)
+    pid = int(executor_pid_file.read_text().strip())
+    fifo_open = threading.Event()
+
+    def feed() -> None:
+        with open(fifo, "wb") as handle:
+            fifo_open.set()
+            time.sleep(1.0)  # the supervisor is now blocked in the fetch
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(0.5)
+            handle.write(json.dumps(BANKED_PAYLOAD).encode())
+
+    threading.Thread(target=feed, daemon=True).start()
+    process.wait(timeout=900)
+    outcome = read_outcome(out_path)
+    check(
+        "the attempt refused rather than accepting against a dead executor",
+        outcome.get("status") in ("TERMINAL_STATUS_REFUSED", "TERMINAL_STATUS_ABANDONED"),
+        f"{outcome.get('status')}: "
+        f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
+    )
+    rows = journal_rows(workspace)
+    terminals = [r for r in rows if r["kind"] == "terminal"]
+    check(
+        "exactly ONE durable terminal",
+        len(terminals) == 1,
+        f"{len(terminals)} terminal row(s); kinds {[r['kind'] for r in rows]}",
+    )
+    check(
+        "and no output bytes were produced",
+        not outputs_present(workspace),
+        str(outputs_present(workspace) or "nothing at the granted destination"),
+    )
+
+    head("ARM 2/4 — FILL: the executor is killed mid-fill, with GiB of destinations live")
+    workspace = Path(args.tmp) / "arm-fill"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": BANKED_PAYLOAD,
+                "outputs": ["image"],
+                "request_id": "run-fill",
+                "no_warm": True,
+                "delete_journal": False,
+            }
+        )
+    )
+    process = start(spec_path, out_path, workspace)
+    wait_for(workspace / "executor.pid", 600)
+    pid = int((workspace / "executor.pid").read_text().strip())
+    time.sleep(2.0)  # mid-fill: the 4.78 GiB fill takes seconds, this lands inside it
+    alive_before = Path(f"/proc/{pid}").exists()
+    os.kill(pid, signal.SIGKILL)
+    process.wait(timeout=900)
+    outcome = read_outcome(out_path)
+    check(
+        "the kill landed while the fill was still moving bytes",
+        alive_before,
+        f"executor pid {pid} was live when SIGKILL was sent",
+    )
+    check(
+        "the run converged instead of hanging",
+        process.returncode is not None,
+        f"exit {process.returncode}, worker exit {outcome.get('exit_code')}",
+    )
+    check(
+        "NO acceptance was journaled for a generation that never became ready",
+        not journal_rows(workspace, "accepted"),
+        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+    )
+    check(
+        "no terminal was FABRICATED for an attempt that was never accepted",
+        not journal_rows(workspace, "terminal"),
+        "a worker that owes nothing claims nothing",
+    )
+    check(
+        "and no output bytes exist",
+        not outputs_present(workspace),
+        str(outputs_present(workspace) or "nothing at the granted destination"),
+    )
+    time.sleep(1.0)
+    check(
+        "the device came back — a dead process's CUDA context is reclaimed",
+        gpu_used_mib() <= idle + 64,
+        f"{gpu_used_mib()} MiB (idle baseline {idle} MiB)",
+    )
+
+    head("ARM 3/4 — INVOKE: cancel a running handler, then kill one that never checks")
+    workspace = Path(args.tmp) / "arm-invoke"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": {"steps": 64, "latent": 80, "seed": 3},
+                "outputs": ["image"],
+                "request_id": "run-cancel",
+                "no_warm": True,
+                "grace": 2.0,
+                "delete_journal": False,
+            }
+        )
+    )
+    process = start(spec_path, out_path, workspace)
+    wait_for(workspace / "accepted.marker", 900)
+    time.sleep(0.4)  # inside the handler's step loop
+    process.send_signal(signal.SIGINT)  # Ctrl-C on a local run
+    process.wait(timeout=900)
+    outcome = read_outcome(out_path)
+    check(
+        "a cooperative handler converges to CANCELED",
+        outcome.get("status") == "TERMINAL_STATUS_CANCELED",
+        f"{outcome.get('status')}: "
+        f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
+    )
+    check(
+        "exactly ONE durable terminal, journaled before it was sent",
+        len(journal_rows(workspace, "terminal")) == 1,
+        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+    )
+    check(
+        "no partial output is visible",
+        not outputs_present(workspace) and not outcome.get("manifest"),
+        str(outputs_present(workspace) or "nothing at the granted destination"),
+    )
+
+    workspace = Path(args.tmp) / "arm-stubborn"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "stubborn",
+                "payload": {"steps": 512, "latent": 80, "seed": 3},
+                "outputs": [],
+                "request_id": "run-stubborn",
+                "no_warm": True,
+                "grace": 2.0,
+                "delete_journal": False,
+            }
+        )
+    )
+    process = start(spec_path, out_path, workspace)
+    wait_for(workspace / "accepted.marker", 900)
+    time.sleep(0.4)
+    started = time.perf_counter()
+    process.send_signal(signal.SIGINT)
+    process.wait(timeout=900)
+    took = time.perf_counter() - started
+    outcome = read_outcome(out_path)
+    log = (workspace / "run.log").read_text(errors="replace")
+    check(
+        "a handler that never checks cancellation is KILLED, not waited for",
+        "forceful" in log and outcome.get("status") == "TERMINAL_STATUS_CANCELED",
+        next((ln for ln in log.splitlines() if "forceful:" in ln), "")[:150],
+    )
+    check(
+        "grace expired first, and the terminal came after the process was gone",
+        took >= 2.0,
+        f"{took:.2f} s from cancel to a closed run (2.0 s grace)",
+    )
+    check(
+        "still exactly ONE durable terminal",
+        len(journal_rows(workspace, "terminal")) == 1,
+        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+    )
+
+    head("ARM 4/4 — ENCODE: a tail failure, and a run killed inside the attempt window")
+    workspace = Path(args.tmp) / "arm-tail"
+    outcome, _ = spawn(
+        {
+            "workspace": str(workspace),
+            "entrypoint": "denoise",
+            "payload": BANKED_PAYLOAD,
+            # The grant names a destination the handler will not produce. The tail binds by
+            # FIELD PATH with exact set equality, so it refuses WHOLE (#248).
+            "outputs": ["image", "thumbnail"],
+            "request_id": "run-tail",
+            "no_warm": True,
+            "delete_journal": False,
+        }
+    )
+    check(
+        "a tail that cannot satisfy the grant set fails the attempt",
+        outcome.get("status") == "TERMINAL_STATUS_FAILED",
+        f"{outcome.get('status')}: "
+        f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:150]}",
+    )
+    check(
+        "the output transaction is not partially successful",
+        not outcome.get("manifest") and not outputs_present(workspace),
+        f"manifest {outcome.get('manifest')}, destination {outputs_present(workspace) or 'empty'}",
+    )
+    check(
+        "one durable terminal, and the ledger still closed",
+        len(journal_rows(workspace, "terminal")) == 1
+        and outcome.get("reconciliation", {}).get("closed") is True,
+        f"kinds {[r['kind'] for r in journal_rows(workspace)]}",
+    )
+
+    workspace = Path(args.tmp) / "arm-killrun"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    spec_path, out_path = workspace / "spec.json", workspace / "outcome.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": {"steps": 24, "latent": 80, "seed": 5},
+                "outputs": ["image"],
+                "request_id": "run-killed",
+                "instance_id": "ins-stable",
+                "no_warm": True,
+                "delete_journal": False,
+            }
+        )
+    )
+    process = start(spec_path, out_path, workspace)
+    wait_for(workspace / "accepted.marker", 900)
+    time.sleep(0.3)
+    process.send_signal(signal.SIGKILL)  # the whole run dies inside the attempt window
+    process.wait(timeout=60)
+    check(
+        "a killed run leaves its journal behind — the deletable journal is deleted LAST",
+        (workspace / "worker" / "journal.log").is_file(),
+        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+    )
+    check(
+        "the accepted-but-incomplete attempt is on record with no terminal",
+        bool(journal_rows(workspace, "accepted")) and not journal_rows(workspace, "terminal"),
+        "acceptance is journaled before anything can run, which is what makes recovery "
+        "possible without guessing",
+    )
+    check(
+        "and no output bytes are visible from the interrupted attempt",
+        not outputs_present(workspace),
+        str(outputs_present(workspace) or "nothing at the granted destination"),
+    )
+    # The NEXT run over the same journal is the recovery: it must mint exactly one durable
+    # ABANDONED terminal for the interrupted ordinal and never re-execute it.
+    spec_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": BANKED_PAYLOAD,
+                "outputs": ["image"],
+                "request_id": "run-after",
+                "instance_id": "ins-stable",
+                "no_warm": True,
+                "delete_journal": False,
+            }
+        )
+    )
+    recovered = start(spec_path, out_path, workspace)
+    recovered.wait(timeout=900)
+    rows = journal_rows(workspace)
+    killed_terminals = [
+        r for r in rows if r["kind"] == "terminal" and r["body"]["request_id"] == "run-killed"
+    ]
+    check(
+        "recovery minted exactly one durable terminal for the interrupted attempt",
+        len(killed_terminals) == 1,
+        f"{len(killed_terminals)} terminal(s) for run-killed",
+    )
+    check(
+        "the interrupted attempt was never re-executed",
+        len(
+            [r for r in rows if r["kind"] == "accepted" and r["body"]["request_id"] == "run-killed"]
+        )
+        == 1,
+        "one acceptance, one terminal, zero second executions",
+    )
+    print(f"\n  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
+
+
+def section_clone(args: argparse.Namespace) -> None:
+    """The git-clone packaging contract, against a CLEAN clone of this repo."""
+    head("git clone + `uv sync --frozen` + one slice, with no other Cozy software")
+    clone = Path(args.tmp) / "clone"
+    shutil.rmtree(clone, ignore_errors=True)
+    out = subprocess.run(
+        ["git", "clone", "--quiet", "--depth", "1", "file://" + str(ROOT), str(clone)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check("a clean clone of the committed tree", out.returncode == 0, out.stderr[:150])
+    started = time.perf_counter()
+    sync = subprocess.run(
+        ["nice", "-n", "19", "uv", "sync", "--frozen", "--extra", "corpus"],
+        cwd=clone,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check(
+        "`uv sync --frozen` resolves the committed lock with nothing else installed",
+        sync.returncode == 0,
+        f"{(time.perf_counter() - started):.1f} s — {sync.stderr.strip().splitlines()[-1][:110]}"
+        if sync.stderr.strip()
+        else "",
+    )
+    workspace = Path(args.tmp) / "clone-run"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    spec = {
+        "workspace": str(workspace),
+        "entrypoint": "denoise",
+        "payload": BANKED_PAYLOAD,
+        "outputs": ["image"],
+        "request_id": "run-clone",
+        "no_warm": True,
+        "delete_journal": True,
+    }
+    (workspace / "spec.json").write_text(json.dumps(spec))
+    run = subprocess.run(
+        [
+            "nice",
+            "-n",
+            "19",
+            str(clone / ".venv" / "bin" / "python"),
+            str(clone / "scripts" / "slice-live.py"),
+            "exec",
+            "--spec",
+            str(workspace / "spec.json"),
+            "--out",
+            str(workspace / "outcome.json"),
+        ],
+        cwd=clone,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ["HOME"],
+            "PYTHONPATH": f"{clone}:{clone / 'src'}",
+        },
+        timeout=1800,
+    )
+    outcome = read_outcome(workspace / "outcome.json")
+    check(
+        "the clone served one real request end to end",
+        run.returncode == 0 and outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        f"exit {run.returncode}, {outcome.get('status')}; "
+        f"{run.stdout.strip().splitlines()[-1][:110] if run.stdout.strip() else run.stderr[:110]}",
+    )
+    check(
+        "and it produced the SAME bits as the working tree",
+        (outcome.get("result") or {}).get("digest") == BANKED,
+        f"{(outcome.get('result') or {}).get('digest', 'none')}",
+    )
+    check(
+        "the one-shot run deleted its journal after a fully acknowledged terminal",
+        outcome.get("journal_deleted") is True,
+        "§8: deletable AFTER the ack, never before",
+    )
+    print(f"  GPU {gpu_used_mib()} MiB")
+
+
+def section_bench(args: argparse.Namespace) -> None:
+    """request -> result, with the legs attributed. Compared against cr-007's numbers."""
+    head("benchmarks: request -> result, per-leg")
+    rows: list[dict[str, Any]] = []
+    for index in range(args.repeat):
+        workspace = Path(args.tmp) / f"bench-{index}"
+        outcome, _ = spawn(
+            {
+                "workspace": str(workspace),
+                "entrypoint": "denoise",
+                "payload": BANKED_PAYLOAD,
+                "outputs": ["image"],
+                "request_id": f"bench-{index}",
+                "no_warm": index == 0,
+                "delete_journal": False,
+            }
+        )
+        ledger = {row["class"]: row["bytes"] for row in outcome["ledger"]["classes"]}
+        metrics = outcome["terminal"].get("metrics", {})
+        rows.append(
+            {
+                **outcome["timings"],
+                "handler_ms": metrics.get("handler_ms", 0),
+                "finalization_ms": metrics.get("finalization_ms", 0),
+                "activations_mib": round(ledger.get("activations_scratch", 0) / MIB, 1),
+                "weights_gib": round(ledger.get("active_weights", 0) / GIB, 3),
+                "rss_run_mib": round(ledger.get("rss_supervisor", 0) / MIB, 1),
+                "rss_executor_mib": round(ledger.get("rss_executor", 0) / MIB, 1),
+                "digest_ok": (outcome.get("result") or {}).get("digest") == BANKED,
+            }
+        )
+        print(f"  run {index}: {json.dumps(rows[-1])}")
+    if rows:
+        keys = [k for k in rows[0] if k != "digest_ok"]
+        median = {k: sorted(float(r[k]) for r in rows)[len(rows) // 2] for k in keys}
+        print(f"\n  median: {json.dumps(median)}")
+        check("every benchmark run produced the banked digest", all(r["digest_ok"] for r in rows))
+    print(f"  GPU {gpu_used_mib()} MiB")
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="cr-008a local slice verification")
+    parser.add_argument(
+        "section",
+        choices=("exec", "slice", "ledger", "arms", "clone", "bench", "all"),
+    )
+    parser.add_argument("--tmp", default="/tmp/cozy-slice")
+    parser.add_argument("--spec", default="")
+    parser.add_argument("--out", default="")
+    parser.add_argument("--repeat", type=int, default=3)
+    args = parser.parse_args()
+
+    if args.section == "exec":
+        outcome = run_one(json.loads(Path(args.spec).read_text()))
+        Path(args.out).write_text(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    Path(args.tmp).mkdir(parents=True, exist_ok=True)
+    sections = {
+        "slice": section_slice,
+        "ledger": section_ledger,
+        "arms": section_arms,
+        "clone": section_clone,
+        "bench": section_bench,
+    }
+    chosen = list(sections) if args.section == "all" else [args.section]
+    for name in chosen:
+        sections[name](args)
+    print(f"\n{PASS} passed, {FAIL} failed")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
