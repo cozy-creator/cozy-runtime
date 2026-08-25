@@ -224,6 +224,10 @@ def spawn(spec: dict[str, Any], *, timeout: float = 900.0) -> tuple[dict[str, An
 
 
 def start(spec_path: Path, out_path: Path, workspace: Path) -> subprocess.Popen[bytes]:
+    # EVERY run waits for a quiet card, not just the first of a section. The neighbour on
+    # this shared box comes and goes, and a 4.78 GiB resident that starts while it holds
+    # 2.5 GiB fails with a device shortfall that is true and says nothing about this code.
+    require_quiet_card()
     log = workspace / "run.log"
     process = subprocess.Popen(
         [
@@ -312,11 +316,18 @@ def settle_gpu(baseline: int, seconds: float = 60.0) -> int:
     return gpu_used_mib()
 
 
-def wait_for(path: Path, seconds: float) -> bool:
+def wait_for(path: Path, seconds: float, process: subprocess.Popen[bytes] | None = None) -> bool:
+    """Wait for a marker, and STOP waiting when the run that would write it has exited.
+
+    Waiting out a full timeout on a process that is already gone turns one failed arm into
+    fifteen wasted minutes, and the arm still fails — it just fails later and says less.
+    """
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if path.exists():
             return True
+        if process is not None and process.poll() is not None:
+            return False
         time.sleep(0.005)
     return False
 
@@ -669,7 +680,7 @@ def section_arms(args: argparse.Namespace) -> None:
     # deterministically: the supervisor blocks reading the granted input, and the executor
     # it would have accepted against is killed while it waits.
     executor_pid_file = workspace / "executor.pid"
-    wait_for(executor_pid_file, 600)
+    wait_for(executor_pid_file, 600, process)
     time.sleep(0.5)
     pid = int(executor_pid_file.read_text().strip())
     fifo_open = threading.Event()
@@ -723,7 +734,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
     )
     process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "executor.pid", 600)
+    wait_for(workspace / "executor.pid", 600, process)
     pid = int((workspace / "executor.pid").read_text().strip())
     time.sleep(2.0)  # mid-fill: the 4.78 GiB fill takes seconds, this lands inside it
     alive_before = Path(f"/proc/{pid}").exists()
@@ -783,7 +794,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
     )
     process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900)
+    wait_for(workspace / "accepted.marker", 900, process)
     time.sleep(0.4)  # inside the handler's step loop
     process.send_signal(signal.SIGINT)  # Ctrl-C on a local run
     process.wait(timeout=900)
@@ -824,7 +835,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
     )
     process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900)
+    wait_for(workspace / "accepted.marker", 900, process)
     time.sleep(0.4)
     started = time.perf_counter()
     process.send_signal(signal.SIGINT)
@@ -900,7 +911,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
     )
     process = start(spec_path, out_path, workspace)
-    wait_for(workspace / "accepted.marker", 900)
+    wait_for(workspace / "accepted.marker", 900, process)
     time.sleep(0.3)
     process.send_signal(signal.SIGKILL)  # the whole run dies inside the attempt window
     process.wait(timeout=60)
