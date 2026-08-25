@@ -53,6 +53,14 @@ implicit_reexport = false
 module = ["torch.*", "triton.*", "numpy.*"]
 ignore_missing_imports = true
 
+# `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
+# hand-written `_ext.pyi`), so this is not a case of an untyped dependency: it is simply not
+# installed in the checking venv, exactly like torch, because it is a native extension the
+# base package does not require. The GPU venvs install the wheel; see README.
+[[tool.mypy.overrides]]
+module = ["tensorfs", "tensorfs.*"]
+ignore_missing_imports = true
+
 # `corpus/` is the adversarial corpus and the real-torch H3 fixture. Checking it here would
 # be checking torch-shaped code against a torch that is not installed, which produces
 # confident nonsense. It is exercised by RUNNING it (scripts/derive-corpus.py,

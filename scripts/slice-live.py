@@ -42,9 +42,16 @@ sys.path.insert(0, str(ROOT / "src"))
 
 BENCH = Path("/home/fidika/cozy_v2/tensorfs-bench")
 STORE = BENCH / "store"
-PLAN = BENCH / "results" / "read.plan"
 CONFIG = BENCH / "hf" / "sdxl" / "unet" / "config.json"
 CHECKPOINT = BENCH / "results" / "checkpoint.txt"
+#: Where the hardlinked working copies of the read-only bench CAS live. Shared across
+#: sections and across runs, because a hardlink tree costs blocks nobody duplicates.
+WORK = Path("/tmp/cozy-slice-store")
+#: tfs-007's facade wheel. TensorFS is not on an index yet (its PyPI done-when is
+#: deliberately deferred), so the wheel is built once from the tensorfs repo at c67a9da
+#: (`maturin build --release`) and dropped here. When it publishes, this becomes an ordinary
+#: pinned dependency and every `uv pip install` below disappears.
+WHEELHOUSE = Path("/tmp/cozy-wheels")
 RELEASE = "cozy/sdxl-unet@cr-005"
 COMPONENT = "unet"
 MIB = 1 << 20
@@ -101,7 +108,7 @@ def plan_id_for(entrypoint: str) -> str:
     return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
 
 
-def binding_record(entrypoint: str, plan_file: str = "") -> dict[str, Any]:
+def binding_record(entrypoint: str, store: str = "") -> dict[str, Any]:
     return {
         "plan_id": plan_id_for(entrypoint),
         "project": str(ROOT / "corpus" / "endpoint"),
@@ -109,31 +116,53 @@ def binding_record(entrypoint: str, plan_file: str = "") -> dict[str, Any]:
         "binding_path": f"{entrypoint}.models.model",
         "param": "model",
         "component": COMPONENT,
-        "store": str(STORE),
-        "plan": plan_file or str(PLAN),
+        "store": store or working_store(Path(WORK) / "store"),
         "config": str(CONFIG),
         "snapshot": snapshot(),
         "release": RELEASE,
         "variant": "sm89",
         "vram_bytes": 6 * GIB,
         "host_bytes": 2 * GIB,
-        "pinned_bytes": 64 * MIB,
+        "pinned_bytes": 256 * MIB,  # tfs-007 measured shape: 16 slots x 16 MiB
         "entrypoint": entrypoint,
         "model_construction_digest": "",
     }
 
 
-def doctored_plan(target: Path) -> str:
-    """A COPY of the real read plan with one late row pointing at an object that does not
-    exist: the fill fails 85 % of the way through, for the most ordinary reason a fill can
-    fail, with ~5 GiB of destinations already reserved. No plant switch in the runtime."""
-    rows = PLAN.read_text().strip().split("\n")
-    index = int(len(rows) * 0.85)
-    head_, key, dtype, shape, nbytes, where = rows[index].split("\t")
-    _, _, length = where.partition(":")
-    rows[index] = "\t".join([head_, key, dtype, shape, nbytes, "ff" * 32 + ":" + length])
-    target.write_text("\n".join(rows) + "\n")
-    return str(target)
+def working_store(at: Path) -> str:
+    """A HARDLINKED working copy of the read-only bench CAS.
+
+    TensorFS registers a GC-safe hold when a lease is acquired, which is a WRITE into the
+    store. `~/cozy_v2/tensorfs-bench` is read-only by standing rule, so every run reads
+    through a hardlinked copy: the object files share their blocks with the originals (no
+    4.9 GB duplicated, no bytes rewritten) while holds, tmp and verification records land in
+    the copy's own directories.
+    """
+    if not (at / "store.json").is_file():
+        at.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(at, ignore_errors=True)
+        subprocess.run(["cp", "-al", str(STORE), str(at)], check=True)
+    return str(at)
+
+
+def corrupt_store(at: Path, source: str) -> str:
+    """A working copy with ONE object corrupted — the fill-failure plant, harness-side.
+
+    A byte is flipped in a real object, and the hardlink is BROKEN first so the original CAS
+    is untouched. This is the most ordinary way a stored artifact goes wrong, and it needs
+    no switch inside the runtime (decisions #249). Since tfs-007 it is caught when the lease
+    verifies the snapshot — before a single destination is reserved.
+    """
+    if (at / "store.json").is_file():
+        return str(at)
+    subprocess.run(["cp", "-al", source, str(at)], check=True)
+    objects = sorted((at / "objects" / "sha256").rglob("*"))
+    target = max((p for p in objects if p.is_file()), key=lambda p: p.stat().st_size)
+    body = bytearray(target.read_bytes())
+    body[len(body) // 2] ^= 0x40
+    target.unlink()  # break the hardlink BEFORE writing: the original must not move
+    target.write_bytes(bytes(body))
+    return str(at)
 
 
 # --------------------------------------------------------------------------- the inner run
@@ -201,7 +230,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     outcome = run_slice(
         config,
         request,
-        [binding_record(spec["entrypoint"], spec.get("plan_file", ""))],
+        [binding_record(spec["entrypoint"], spec.get("store", ""))],
         workspace=workspace,
         release_id=RELEASE,
         options=options,
@@ -596,10 +625,10 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
         f"{(outcome.get('reconciliation', {}).get('baseline_shifts') or ['none'])[0][:120]}",
     )
 
-    head("the failure path: an INJECTED fill failure releases every reservation")
+    head("the failure path: an INJECTED corrupt object refuses BEFORE anything is reserved")
     failed = Path(args.tmp) / "ledger-fail"
     failed.mkdir(parents=True, exist_ok=True)
-    plan_file = doctored_plan(failed / "doctored.plan")
+    bad = corrupt_store(WORK / "store-corrupt", working_store(WORK / "store"))
     outcome2, _ = spawn(
         {
             "workspace": str(failed / "run"),
@@ -608,24 +637,24 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
             "outputs": ["image"],
             "request_id": "run-fail",
             "no_warm": True,
-            "plan_file": plan_file,
+            "store": bad,
             "delete_journal": False,
         }
     )
     log = (failed / "run" / "run.log").read_text(errors="replace")
+    fault = (outcome2.get("faults") or [{}])[-1]
     check(
-        "the fill REFUSED mid-stream with GiB of destinations live",
-        "prepare REFUSED" in log,
-        next((ln for ln in log.splitlines() if "prepare REFUSED" in ln), "")[13:200],
+        "one flipped byte in a real object refuses the whole preparation",
+        fault.get("reason") == "digest_mismatch",
+        f"{fault.get('reason')}: {str(fault.get('detail', ''))[:140]}",
     )
     live = re.search(r"peak allocator (\d+) B", log)
-    after = re.search(r"the allocator holds (\d+) B", log)
     live_bytes = int(live.group(1)) if live else -1
-    after_bytes = int(after.group(1)) if after else -1
     check(
-        "and after rollback the allocator is back to zero",
-        after_bytes == 0,
-        f"{live_bytes} B was live when it failed, {after_bytes} B after rollback",
+        "and it refuses with ZERO destinations reserved — the lease verifies FIRST",
+        live_bytes == 0,
+        f"peak allocator {live_bytes} B was live when it failed; "
+        "the interim reader could only find this 85 % of the way through a 4.78 GiB fill",
     )
     charged = [
         row
@@ -1057,6 +1086,29 @@ def section_clone(args: argparse.Namespace) -> None:
         if sync.stderr.strip()
         else "",
     )
+    wheels = sorted(WHEELHOUSE.glob("tensorfs-*.whl"))
+    check(
+        "the TensorFS facade wheel is available to install into the clone",
+        bool(wheels),
+        str(wheels[0].name) if wheels else f"no tensorfs wheel under {WHEELHOUSE}",
+    )
+    if wheels:
+        # NAMED, not hidden: TensorFS has no index yet, so the clone installs the wheel
+        # explicitly. Everything the REPO owns resolves from the committed lock; this one
+        # external dependency is a step the packaging contract does not yet cover, and
+        # saying so is the honest form of the claim.
+        extra = subprocess.run(
+            ["nice", "-n", "19", "uv", "pip", "install", str(wheels[0])],
+            cwd=clone,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        check(
+            "and it installs into the clone's venv",
+            extra.returncode == 0,
+            (extra.stderr or extra.stdout).strip().splitlines()[-1][:110],
+        )
     workspace = Path(args.tmp) / "clone-run"
     shutil.rmtree(workspace, ignore_errors=True)
     workspace.mkdir(parents=True)

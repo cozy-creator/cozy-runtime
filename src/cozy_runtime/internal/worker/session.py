@@ -315,7 +315,6 @@ class Supervisor:
                         "param": first.param,
                         "component": first.component,
                         "store": first.store,
-                        "plan": first.plan,
                         "config": first.config,
                         "snapshot": first.snapshot,
                         "release": first.release,

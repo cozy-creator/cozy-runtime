@@ -25,26 +25,26 @@ which a partially filled component answers a request.
 on the stream that consumed it. Returning a slot with a live copy is a typed refusal, not
 a race — `lease_live`.
 
-**Read order is the STORE's, write order is the CONTRACT's.** The DestinationSet says
-which keys; the checkpoint header says in what order their bytes sit on disk. Ordering is
-movement, and movement is the runtime's — so the ring streams in header order and splices
-into whichever destination each window covers.
+**Read order is the STORE's, write order is the CONTRACT's.** The DestinationSet says which
+keys; TensorFS decides how to touch the disk for them. Since tfs-007 that split falls exactly
+on the boundary: this plane hands over the code-topology traversal and the store plans and
+reads it, while every delivered batch names the destination its bytes belong to.
 
-**Verification is the store's job, done here on loan.** Until tfs-005/007 land, this module
-reads CAS object files directly and verifies sha256 == object id on every object, through
-the store's own verification record (tfs-002's `tensorfs.verification/1`: a record whose
-(dev, ino, length, mtime) still describes the live inode asserts that object's digest
-without a rehash). A missing or stale record REHASHES. That is the interim seam, and the
-whole of it is `CasStore` — tfs-007 replaces that class with the real read lease.
+**Verification is the store's job, and since tfs-007 it is done BY the store.** The interim
+Python CAS reader is gone (decisions #259): `Checkpoint` opens a real TensorFS store through
+the tfs-007 facade, `acquire()` takes a verified read lease whose GC-safe hold registers
+first, and `ReadLease.stream` drives a native reader pool into pinned slots this plane owns.
+Nothing here knows CAS layout, caches a file descriptor, or hashes an object. The ORDERING
+that buys is the point: the snapshot is verified when the lease is taken, so a corrupt
+artifact refuses before a single destination is reserved, where the interim reader could
+only find it mid-stream with gigabytes already live.
 """
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import ctypes
-import hashlib
-import json
-import os
-import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -150,244 +150,197 @@ class ResourceLedger:
         }
 
 
-# ------------------------------------------------------------------------ CAS source
+# ------------------------------------------------------------------- the TensorFS reader
 
 
-@dataclass(frozen=True, slots=True)
-class Segment:
-    """One contiguous run of a logical tensor's bytes. `oid` is None for inline bytes
-    (the header carries tensors too small to be worth an object)."""
+def tensorfs_module() -> Any:
+    """The tfs-007 facade, or a typed refusal naming what is missing.
 
-    oid: str | None
-    length: int
-    inline: bytes | None = None
+    TensorFS is a compiled extension and the base runtime package stays installable without
+    it, exactly as it stays installable without torch. An absent reader is a REFUSAL that
+    names the install, never an `ImportError` surfacing out of a fill.
+    """
+    try:
+        import tensorfs
+    except ImportError as exc:  # pragma: no cover - environment, not logic
+        raise _refuse(
+            "reader_unavailable",
+            "the TensorFS reader (tfs-007's `tensorfs` facade) is not installed in this "
+            "environment; the fill plane has no other way to read a verified object and "
+            "will not invent one",
+        ) from exc
+    return tensorfs
+
+
+#: How a TensorFS refusal is spoken in THIS plane's vocabulary. Closed and explicit: a code
+#: this table does not name is re-raised UNCHANGED, because a plane that renames a refusal
+#: it does not understand is worse than one that admits it did not.
+STORE_REFUSALS: dict[str, str] = {
+    "OBJECT_CORRUPT": "digest_mismatch",
+    "OBJECT_ID_MISMATCH": "digest_mismatch",
+    "MALFORMED_DIGEST": "digest_mismatch",
+    "OBJECT_ABSENT": "missing_object",
+    "LEASE_NOT_COVERED": "missing_object",
+    "SHORT_READ": "length_mismatch",
+    "RANGE_BOUNDS": "length_mismatch",
+    "BUFFER_SIZE": "length_mismatch",
+    "LENGTH_MISMATCH": "length_mismatch",
+    "BYTE_LENGTH_MISMATCH": "length_mismatch",
+    "DTYPE_MISMATCH": "dtype_mismatch",
+    "DTYPE_UNKNOWN": "dtype_mismatch",
+    "MISSING_TENSOR": "destination_absent",
+    "TRAVERSAL_INCOMPLETE": "incomplete_fill",
+    "SLOT_STARVED": "lease_live",
+    "LEASE_REVOKED": "lease_revoked",
+    "NONCANONICAL_ENCODING": "checkpoint_unreadable",
+    "MALFORMED_JSON": "checkpoint_unreadable",
+    "UNKNOWN_FORMAT": "checkpoint_unreadable",
+    "MISSING_FIELD": "checkpoint_unreadable",
+}
+
+
+@contextlib.contextmanager
+def store_refusals(what: str) -> Iterator[None]:
+    """Speak a TensorFS refusal in this plane's vocabulary, or let it through untranslated."""
+    tensorfs = tensorfs_module()
+    try:
+        yield
+    except tensorfs.errors.Refusal as exc:
+        code = STORE_REFUSALS.get(getattr(exc, "code", ""))
+        if code is None:
+            raise
+        raise _refuse(
+            code,
+            f"{what}: TensorFS refused {exc.code} - {getattr(exc, 'detail', exc)}",
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
 class PlanRow:
-    """One checkpoint header row: what the store holds for one logical tensor."""
+    """One checkpoint header row: what the store holds for one logical tensor.
+
+    `what` is TensorFS's own name for the destination (`<component>/<key>#<part>`), carried
+    verbatim so a batch item can be routed back to its tensor without this plane re-deriving
+    a naming rule the store already owns.
+    """
 
     key: str
+    """The CONTRACT's key: component-qualified, e.g. `unet.conv_in.weight`."""
+    name: str
+    """The HEADER's key for the same tensor, unqualified, e.g. `conv_in.weight`."""
     component: str
     dtype: str
     shape: tuple[int, ...]
     nbytes: int
-    segments: tuple[Segment, ...]
+    what: str
+    """TensorFS's own destination name, `<component>/<name>#<part>`."""
 
 
-Verify = Literal["record", "rehash"]
+class Checkpoint:
+    """One snapshot of a TensorFS store, opened through the tfs-007 facade.
 
+    This class is the ONLY place in the runtime that speaks to TensorFS, and it is
+    deliberately thin. Object verification, GC-safe holds, plan ordering, dtype names, the
+    reader pool and every refusal are the store's; what this plane adds is the projection
+    from a header into the contract's rows and the H2D transaction on top of the stream.
 
-class CasStore:
-    """Direct verified reads over a tensorfs CAS tree — the tfs-007 interim seam.
-
-    Thread-safe by construction: verification is decided once per object under a lock, and
-    each reader thread keeps its own file handle (a shared fd would serialize the pool).
+    It replaces cr-005's interim `CasStore` + `read_plan` outright (decisions #259). The
+    interim reader knew CAS layout, cached a file descriptor per (thread, object) and
+    verified per object in Python; none of that survives, and none of it needs to.
     """
 
-    def __init__(self, root: str | Path, *, verify: Verify = "record") -> None:
-        self.root = Path(root)
-        self.verify = verify
-        self._ok: set[str] = set()
-        self._gates: dict[str, threading.Lock] = {}
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self.opens = 0
-        self.verifies = 0
-        self.rehashes = 0
-        self.verify_ns = 0
-        self.bytes = 0
+    def __init__(self, root: str | Path, snapshot_id: str) -> None:
+        tensorfs = tensorfs_module()
+        self.tensorfs = tensorfs
+        self.root = str(root)
+        self.snapshot_id = snapshot_id
+        with store_refusals(f"opening snapshot {snapshot_id[:23]}"):
+            self.store = tensorfs.Store.open(self.root)
+            snapshot = self.store.snapshot(snapshot_id)
+            self.header_bytes: bytes = snapshot["header"]
+            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes)
 
-    # -- layout ------------------------------------------------------------------
-
-    def object_path(self, oid: str) -> Path:
-        return self.root / "objects" / "sha256" / oid[:2] / oid[2:4] / oid
-
-    def record_path(self, oid: str) -> Path:
-        return self.root / "verified" / oid[:2] / oid[2:4] / oid
-
-    # -- verification ------------------------------------------------------------
-
-    def _rehash(self, path: Path, oid: str) -> int:
-        digest = hashlib.sha256()
-        length = 0
-        with open(path, "rb", buffering=0) as handle:
-            while chunk := handle.read(1 << 22):
-                digest.update(chunk)
-                length += len(chunk)
-        if digest.hexdigest() != oid:
+    def rows(self, component: str) -> list[PlanRow]:
+        """The header's table for one component, in the header's own key order."""
+        table = self.header["components"].get(component)
+        if table is None:
             raise _refuse(
-                "digest_mismatch",
-                f"CAS object {oid[:16]}… hashes to {digest.hexdigest()[:16]}… — content "
-                "address is the only identity a stored byte has; a mismatch is a corrupt "
-                "or substituted object and never a fill input",
-                [oid],
+                "destination_absent",
+                f"this checkpoint has no component {component!r} (it has "
+                f"{', '.join(sorted(self.header['components'])) or 'none'})",
             )
-        return length
-
-    def ensure_verified(self, oid: str, expect: int) -> None:
-        """sha256 == object id, by record hit where the store's own record still describes
-        the live inode, and by rehash otherwise.
-
-        SINGLE-FLIGHT per object (§3.2's registry rule, at the byte tier): several reader
-        threads hitting one object must verify it ONCE. Without the per-object gate a
-        1,679-object corpus verifies a few dozen objects twice, which is invisible on a
-        record hit and doubles the work on a rehash.
-        """
-        with self._lock:
-            if oid in self._ok:
-                return
-            gate = self._gates.setdefault(oid, threading.Lock())
-        with gate:
-            if oid in self._ok:
-                return
-            self._verify_one(oid, expect)
-
-    def _verify_one(self, oid: str, expect: int) -> None:
-        started = time.perf_counter_ns()
-        path = self.object_path(oid)
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            raise _refuse(
-                "missing_object",
-                f"CAS object {oid[:16]}… is not in {self.root} — a declared segment with "
-                "no object is a broken checkpoint, not a cache miss to fetch around",
-                [oid],
-            ) from None
-        rehashed = False
-        if self.verify == "rehash":
-            length = self._rehash(path, oid)
-            rehashed = True
-        else:
-            record = self._record(oid)
-            if record is None or not self._fresh(record, stat, oid):
-                length = self._rehash(path, oid)
-                rehashed = True
-            else:
-                length = int(record["length"])
-        if length != stat.st_size:
-            raise _refuse(
-                "length_mismatch",
-                f"CAS object {oid[:16]}… is {stat.st_size} B, verified as {length} B",
-                [oid],
-            )
-        if expect > length:
-            raise _refuse(
-                "length_mismatch",
-                f"a segment claims {expect} B of CAS object {oid[:16]}…, which holds "
-                f"{length} B — the header and the store disagree about the bytes",
-                [oid],
-            )
-        with self._lock:
-            self._ok.add(oid)
-            self.verifies += 1
-            self.rehashes += int(rehashed)
-            self.verify_ns += time.perf_counter_ns() - started
-
-    def _record(self, oid: str) -> dict[str, Any] | None:
-        try:
-            body = self.record_path(oid).read_bytes()
-        except FileNotFoundError:
-            return None
-        record: dict[str, Any] = json.loads(body)
-        if record.get("format") != "tensorfs.verification/1":
-            return None
-        if record.get("sha256") != oid:
-            raise _refuse(
-                "digest_mismatch",
-                f"the verification record at {self.record_path(oid)} asserts "
-                f"{str(record.get('sha256'))[:16]}… for object {oid[:16]}… — a record that "
-                "names a different digest than the object it files under is not evidence",
-                [oid],
-            )
-        return record
-
-    @staticmethod
-    def _fresh(record: Mapping[str, Any], stat: os.stat_result, oid: str) -> bool:
-        """Does this record still describe the live inode? The record asserts sha256 for
-        exactly (dev, ino, length, mtime); any drift and it asserts nothing."""
-        return (
-            int(record.get("dev", -1)) == stat.st_dev
-            and int(record.get("ino", -1)) == stat.st_ino
-            and int(record.get("length", -1)) == stat.st_size
-            and int(record.get("mtime_s", -1)) == stat.st_mtime_ns // 1_000_000_000
-            and int(record.get("mtime_ns", -1)) == stat.st_mtime_ns % 1_000_000_000
-        )
-
-    # -- reads -------------------------------------------------------------------
-
-    def _handle(self, oid: str) -> int:
-        cache: dict[str, int] | None = getattr(self._local, "handles", None)
-        if cache is None:
-            cache = {}
-            self._local.handles = cache
-        fd = cache.get(oid)
-        if fd is None:
-            fd = os.open(self.object_path(oid), os.O_RDONLY)
-            cache[oid] = fd
-            with self._lock:
-                self.opens += 1
-        return fd
-
-    def read_into(self, oid: str, offset: int, length: int, view: memoryview) -> None:
-        """`length` VERIFIED bytes of object `oid` from `offset`, into caller memory."""
-        self.ensure_verified(oid, offset + length)
-        fd = self._handle(oid)
-        at = 0
-        while at < length:
-            got = os.preadv(fd, [view[at:length]], offset + at)
-            if got <= 0:
+        out: list[PlanRow] = []
+        for key, entry in table.items():
+            logical = entry["logical"]
+            shape = tuple(int(n) for n in logical["shape"])
+            dtype = str(logical["dtype"])
+            width = self.tensorfs.DTYPES.get(dtype)
+            if width is None:
                 raise _refuse(
-                    "length_mismatch",
-                    f"short read on CAS object {oid[:16]}…: {at} of {length} B",
-                    [oid],
+                    "dtype_mismatch",
+                    f"{key}: the header declares dtype {dtype!r}, which this build of "
+                    "TensorFS does not know",
+                    [key],
                 )
-            at += got
-        with self._lock:
-            self.bytes += length
+            nbytes = width
+            for extent in shape:
+                nbytes *= extent
+            out.append(
+                PlanRow(
+                    # The contract's key is component-qualified (`unet.conv_in.weight`);
+                    # the header's is not, and TensorFS's `what` is a third spelling.
+                    # Carrying all three is what keeps the plane from re-deriving any of
+                    # them — a naming rule guessed in two places is a wrong copy waiting.
+                    key=f"{component}.{key}",
+                    name=key,
+                    component=component,
+                    dtype=dtype,
+                    shape=shape,
+                    nbytes=nbytes,
+                    what=f"{component}/{key}#value",
+                )
+            )
+        return out
 
-    def close(self) -> None:
-        cache: dict[str, int] | None = getattr(self._local, "handles", None)
-        for fd in (cache or {}).values():
-            os.close(fd)
-        self._local.handles = {}
+    def read_plan(self, traversal: Sequence[tuple[str, str]], window_bytes: int) -> Any:
+        """The store's own read plan over the traversal THIS PLANE asks for.
 
-    def stats(self) -> dict[str, int | str]:
-        return {
-            "verify": self.verify,
-            "opens": self.opens,
-            "verifies": self.verifies,
-            "rehashes": self.rehashes,
-            "verify_ms": self.verify_ns // 1_000_000,
-            "read_bytes": self.bytes,
-        }
+        cr-005's rule survives the swap and is now the store's to keep: read order is the
+        STORE's, write order is the CONTRACT's. The runtime hands over the code-topology
+        traversal and TensorFS decides how to touch the disk for it.
+        """
+        with store_refusals("planning the read"):
+            return self.tensorfs.plan(self.header_bytes, list(traversal), window=window_bytes)
 
-
-# --------------------------------------------------------------------------- ring
+    def acquire(self) -> Any:
+        """A verified read lease over the whole snapshot. The GC-safe hold registers FIRST."""
+        with store_refusals(f"acquiring a lease on {self.snapshot_id[:23]}"):
+            return self.store.acquire_snapshot(self.snapshot_id)
 
 
-@dataclass(slots=True)
-class Slot:
-    """One pinned staging buffer and the lease that keeps it alive: `event` is the exact
-    H2D completion the next user must wait on."""
-
-    tensor: Any
-    view: memoryview
-    ptr: int
-    event: Any = None
-    dirty: bool = False
-    """Holds bytes a copy may still be reading. Cleared by the EVENT, never by the return."""
-    charged: bool = False
-    """Its staging bytes are charged to the ledger right now."""
+def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
+    """The checkpoint topology table the loader matches the code against."""
+    return {
+        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes)
+        for row in rows
+    }
 
 
 class StagingRing:
     """A fixed pinned ring, never a residence tier (§3.2): bytes pass through, warm bytes
     are never page-locked, and the ring never grows under pressure.
 
-    `fence` exists to be turned OFF exactly once, by the red arm that proves the event
-    fence is load-bearing rather than decorative.
+    Since tfs-007 the ring is this plane's CONTRIBUTION to the store's reader pool rather
+    than a loop it drives: the runtime allocates the pinned slots and hands their views to
+    `ReadLease.stream`, and TensorFS fills them from its own native pool — which is what
+    lets reading continue while this process holds the GIL. What stays here is the half that
+    is the runtime's by boundary (pinned staging is the runtime's, boundaries.md) and the
+    discipline that actually matters: a slot goes back to the ring only when the H2D
+    completion event for its bytes has FIRED, never on the return of the callback.
+
+    Size BOTH consumers. Readers and copies in flight share the same slots, so holding
+    `slots - 1` copies leaves the pool one slot to fill and reads at queue depth 1 — tfs-007
+    measured exactly that (0.836 GB/s at 4 slots / 2 in flight, 1.63 GB/s at 16 / 8).
     """
 
     def __init__(
@@ -398,6 +351,7 @@ class StagingRing:
         window_bytes: int,
         slots: int,
         ledger: ResourceLedger,
+        inflight: int,
         fence: bool = True,
     ) -> None:
         if slots < 2:
@@ -406,15 +360,24 @@ class StagingRing:
                 f"a {slots}-slot ring cannot double-buffer: the single slot is refilled "
                 "while its copy is in flight, so there is no lease to hold",
             )
+        if inflight >= slots:
+            raise _refuse(
+                "lease_live",
+                f"{inflight} copies in flight against {slots} slots leaves the reader pool "
+                "nothing to fill: a slot whose H2D has not completed is NOT free, so the "
+                "ring must hold strictly more slots than in-flight copies",
+            )
         self.torch = torch
         self.device = device
         self.window_bytes = int(window_bytes)
         self.ledger = ledger
         self.fence = fence
+        self.keep = int(inflight)
         self.charge = {"pinned": self.window_bytes * slots}
         ledger.grant(self.charge, f"pinned staging ring ({slots} x {window_bytes} B)")
         self.stream = torch.cuda.Stream(device=device)
-        self.slots: list[Slot] = []
+        self.buffers: list[Any] = []
+        self.views: list[memoryview] = []
         for _ in range(slots):
             # device="cpu" is NOT redundant: construction runs under an ambient meta
             # device, and a meta staging buffer has data_ptr() == 0 — the ring would read
@@ -423,39 +386,36 @@ class StagingRing:
                 self.window_bytes, dtype=torch.uint8, pin_memory=True, device="cpu"
             )
             block = (ctypes.c_ubyte * buffer.numel()).from_address(buffer.data_ptr())
-            self.slots.append(Slot(buffer, memoryview(block).cast("B"), buffer.data_ptr()))
+            self.buffers.append(buffer)
+            self.views.append(memoryview(block).cast("B"))
+        self.inflight: collections.deque[tuple[Any, Any]] = collections.deque()
         self.waits = 0
+        self.charged = 0
 
-    def take(self, slot: Slot) -> None:
-        """Claim a slot for a new window. A dirty slot with no recorded event is a lease
-        that was dropped while its bytes were still DMA-live."""
-        if slot.dirty and slot.event is None:
-            raise _refuse(
-                "lease_live",
-                "a staging slot was returned before its H2D completion event was "
-                "recorded — the ring would overwrite bytes the copy engine is still "
-                "reading. A lease is released by the EVENT, never by the return",
-            )
-        if slot.event is not None:
-            self.waits += 1
-            slot.event.synchronize()
-            slot.event = None
-        slot.dirty = True
-        slot.charged = True
+    def hold(self, event: Any, batch: Any) -> None:
+        """This batch's slot is now DMA-live; it is charged until its event fires."""
+        self.inflight.append((event, batch))
+        self.charged += 1
         self.ledger.grant({"staging": self.window_bytes}, "staging slot")
 
-    def copy_out(self, slot: Slot, src_off: int, dst: Any, dst_off: int, count: int) -> None:
-        with self.torch.cuda.stream(self.stream):
-            dst[dst_off : dst_off + count].copy_(
-                slot.tensor[src_off : src_off + count], non_blocking=True
-            )
+    def drain(self, keep: int) -> None:
+        """Return slots whose H2D has actually completed. QUERY FIRST, BLOCK LAST.
 
-    def give_back(self, slot: Slot) -> None:
-        if self.fence:
-            event = self.torch.cuda.Event()
-            event.record(self.stream)
-            slot.event = event
-        slot.charged = False
+        The callback runs on the store's delivery thread, so blocking here stops the ring
+        from handing out the next filled slot even when readers have work ready. Blocking
+        only when the caller is genuinely out of slots is worth ~1.7x (tfs-007, measured).
+        """
+        while self.inflight and self.inflight[0][0].query():
+            self._retire()
+        while len(self.inflight) > keep:
+            self.inflight[0][0].synchronize()
+            self.waits += 1
+            self._retire()
+
+    def _retire(self) -> None:
+        _, batch = self.inflight.popleft()
+        batch.release()
+        self.charged -= 1
         self.ledger.release({"staging": self.window_bytes})
 
     def track(self, tensor: Any) -> None:
@@ -463,24 +423,23 @@ class StagingRing:
         tensor.record_stream(self.stream)
 
     def finish(self) -> None:
+        self.drain(0)
         self.stream.synchronize()
         self.torch.cuda.current_stream(self.device).wait_stream(self.stream)
-        for slot in self.slots:
-            slot.event = None
-            slot.dirty = False
-            slot.charged = False
 
     def close(self) -> None:
         """Give every byte back, including the slots an aborted stream never handed in —
         an interrupted fill that leaks its own staging charge is an interrupted fill that
         the next grant prices wrong."""
-        outstanding = sum(1 for slot in self.slots if slot.charged)
-        self.ledger.release({"staging": self.window_bytes * outstanding})
-        self.slots.clear()
+        self.ledger.release({"staging": self.window_bytes * max(self.charged, 0)})
+        self.inflight.clear()
+        self.buffers.clear()
+        self.views.clear()
         self.ledger.release(self.charge)
 
 
 # -------------------------------------------------------------------------- backend
+
 
 State = Literal["open", "staging", "ready", "rolled_back"]
 
@@ -495,31 +454,35 @@ class StreamingFillBackend:
 
     def __init__(
         self,
-        plan: Sequence[PlanRow],
-        store: CasStore,
+        checkpoint: Checkpoint,
+        rows: Sequence[PlanRow],
         *,
         device: str = "cuda",
         window_bytes: int = 16 << 20,
-        slots: int = 4,
-        readers: int = 4,
+        slots: int = 16,
+        readers: int = 16,
+        inflight: int = 8,
         ledger: ResourceLedger | None = None,
         fence: bool = True,
-        interrupt_at: float | None = None,
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
         self.torch = torch_module()
-        self.plan = {row.key: row for row in plan}
-        self.order = [row.key for row in plan]
-        self.store = store
+        self.checkpoint = checkpoint
+        self.plan = {row.key: row for row in rows}
+        self.order = [row.key for row in rows]
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
+        # The window is the store's PLANNING unit and the slot is this plane's staging unit;
+        # tfs-007 measured 4 MiB windows into 16 MiB slots as the shape that works.
         self.window_bytes = int(window_bytes)
+        self.slot_bytes = max(int(window_bytes) * 4, 16 << 20)
         self.slots = int(slots)
         self.readers = int(readers)
+        self.inflight = int(inflight)
         self.ledger = ledger or ResourceLedger()
         self.fence = fence
-        self.interrupt_at = interrupt_at
+        self.lease: Any = None
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
         self.expected: dict[str, tuple[str, ...]] = {}
@@ -530,9 +493,19 @@ class StreamingFillBackend:
     # -- reservation -------------------------------------------------------------
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
-        """The contract's COMPLETE DestinationSets. Commit refuses on any key that never
-        arrives, which is what makes a narrow component declaration authoritative."""
+        """The contract's COMPLETE DestinationSets, and the verified read lease.
+
+        Commit refuses on any key that never arrives, which is what makes a narrow component
+        declaration authoritative. The LEASE is acquired here rather than at commit, and the
+        ordering is the point: TensorFS verifies every object in the snapshot when the hold
+        registers, so a corrupt or truncated artifact refuses BEFORE this plane reserves a
+        single byte of device memory. The interim reader could only discover that mid-stream,
+        with gigabytes of destinations already live.
+        """
         self.expected = {name: tuple(keys) for name, keys in sets.items()}
+        self.lease = self.checkpoint.acquire()
+        self.stats["lease_bytes"] = int(self.lease.bytes)
+        self.stats["lease_objects"] = len(self.lease.objects)
 
     def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
         """Reserve ordinary CUDA destinations for the constructed component roots.
@@ -659,9 +632,10 @@ class StreamingFillBackend:
             ring = StagingRing(
                 self.torch,
                 self.device,
-                window_bytes=self.window_bytes,
+                window_bytes=self.slot_bytes,
                 slots=self.slots,
                 ledger=self.ledger,
+                inflight=self.inflight,
                 fence=self.fence,
             )
             try:
@@ -674,13 +648,23 @@ class StreamingFillBackend:
                 self.stats["waits"] = ring.waits
             finally:
                 ring.close()
-                self.store.close()
+                # The lease is released AFTER the fence, explicitly. A hold that outlives
+                # the process is the store's to reap; a hold dropped before the copies land
+                # is a read against bytes the GC may already consider free.
+                self.release_lease()
         self.stats["stream_ms"] = (time.perf_counter_ns() - started) // 1_000_000
         # The tfs-018-comparable leg: reserve device destinations, read, copy, fence. It
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
         # for — comparing a number that includes it would flatter neither side honestly.
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
         self.state = "ready"
+
+    def release_lease(self) -> None:
+        """Give the hold back. Idempotent: a rollback and a commit may both reach here."""
+        lease = self.lease
+        self.lease = None
+        if lease is not None and lease.live:
+            lease.release()
 
     def rollback(self, keys: Sequence[str]) -> None:
         """Abort the new generation; verified CAS is untouched by construction (this plane
@@ -696,6 +680,7 @@ class StreamingFillBackend:
         """
         from cozy_runtime.internal.derive import placing
 
+        self.release_lease()
         with placing():
             self._free_storages(self.enqueued.values())
             self.enqueued.clear()
@@ -761,157 +746,117 @@ class StreamingFillBackend:
 
     # -- the stream ---------------------------------------------------------------
 
-    def _segments(self) -> tuple[list[tuple[int, int, Segment]], list[tuple[int, int, Any]]]:
-        """The virtual byte stream, in STORE order over the enqueued keys, and the
-        destination placements that stream covers."""
-        segments: list[tuple[int, int, Segment]] = []
-        placements: list[tuple[int, int, Any]] = []
-        cursor = 0
-        for key in self.order:
-            tensor = self.enqueued.get(key)
-            if tensor is None:
-                continue
-            row = self.plan[key]
-            start = cursor
-            for segment in row.segments:
-                segments.append((cursor, cursor + segment.length, segment))
-                cursor += segment.length
-            if cursor - start != row.nbytes:
-                raise _refuse(
-                    "length_mismatch",
-                    f"{key}: segments carry {cursor - start} B for a {row.nbytes} B tensor",
-                    [key],
-                )
-            placements.append((start, cursor, tensor.view(-1).view(self.torch.uint8)))
-        return segments, placements
-
     def _stream(self, ring: StagingRing) -> int:
-        """Reader pool over disjoint windows; the copy is issued by the consumer thread on
-        one runtime stream, and the slot's lease ends at that copy's event.
+        """The store streams; this plane splices and fences.
 
-        Queue depth is a MEASURED requirement, not a preference: tfs-018 showed a
-        queue-depth-1 ring loses cold against safetensors on this very store, and wins by
-        1.30x at depth 4. A serial reader is the wrong shape for a 1,679-object corpus.
+        cr-005's rule survives the reader swap and is now split across the boundary exactly
+        where it belongs: READ ORDER IS THE STORE'S — TensorFS plans the disk touches for
+        the traversal it is given — and WRITE ORDER IS THE CONTRACT'S, because the traversal
+        handed over IS the contract's DestinationSet order and every batch item carries the
+        destination it belongs to.
+
+        Queue depth is a MEASURED requirement, not a preference: tfs-018 found 3.5x between
+        depth 1 and depth 4 on this store, tfs-005 confirmed it, and tfs-007 confirmed it a
+        third time from a third language. What tfs-007 added is that COPIES IN FLIGHT share
+        the ring with readers, so the caller sizes both or reads at the depth the leftovers
+        allow.
         """
-        import bisect
-        import queue
-
-        segments, placements = self._segments()
-        if not segments:
+        rows = [self.plan[key] for key in self.order if key in self.enqueued]
+        if not rows:
             return 0
-        total = segments[-1][1]
-        starts = [p[0] for p in placements]
-        seg_starts = [s[0] for s in segments]
-        windows = [
-            (at, min(self.window_bytes, total - at)) for at in range(0, total, self.window_bytes)
-        ]
-        free: queue.Queue[Slot] = queue.Queue()
-        for slot in ring.slots:
-            free.put(slot)
-        done: queue.Queue[tuple[int, int, Slot] | BaseException] = queue.Queue()
-        pending = iter(windows)
-        guard = threading.Lock()
-        stop = threading.Event()
-        cut = int(len(windows) * self.interrupt_at) if self.interrupt_at is not None else -1
+        traversal = [(row.component, row.name) for row in rows]
+        plan = self.checkpoint.read_plan(traversal, self.window_bytes)
+        expect = sum(row.nbytes for row in rows)
+        if int(plan.bytes) != expect:
+            raise _refuse(
+                "length_mismatch",
+                f"the store's read plan carries {plan.bytes} B for a traversal this "
+                f"contract prices at {expect} B",
+            )
 
-        def read_window(at: int, count: int, slot: Slot) -> None:
-            index = bisect.bisect_right(seg_starts, at) - 1
-            written = 0
-            while written < count:
-                start, end, segment = segments[index]
-                skip = at + written - start
-                take = min(end - start - skip, count - written)
-                if segment.oid is None:
-                    body = segment.inline or b""
-                    slot.view[written : written + take] = body[skip : skip + take]
-                else:
-                    self.store.read_into(
-                        segment.oid, skip, take, slot.view[written : written + take]
+        flat = {
+            row.what: self.enqueued[row.key].view(-1).view(self.torch.uint8) for row in rows
+        }
+        base: dict[str, int] = {}
+        for item in plan.items():
+            base.setdefault(str(item["what"]), int(item["dest_off"]))
+        missing = sorted(set(flat) - set(base))
+        if missing:
+            raise _refuse(
+                "incomplete_fill",
+                f"{len(missing)} enqueued destination(s) are absent from the store's read "
+                f"plan ({', '.join(missing[:4])})",
+                missing[:6],
+            )
+
+        batches = [0]
+        cursor = [0]
+        torch = self.torch
+
+        def on_batch(batch: Any) -> None:
+            """Splice one filled slot across the destinations it covers.
+
+            A batch item carries `off` — where its bytes sit IN THE SLOT — and the store
+            delivers batches in plan order, so the cursor is what turns a slot offset back
+            into a position in the logical stream. `base` then turns that into an offset
+            inside one destination tensor. Every arithmetic step here comes from a number
+            the store handed over; none of it is re-derived from a naming rule.
+            """
+            start = cursor[0]
+            with torch.cuda.stream(ring.stream):
+                for item in batch.items():
+                    what = str(item["what"])
+                    source = int(item["off"])
+                    length = int(item["len"])
+                    target = start + source - base[what]
+                    flat[what][target : target + length].copy_(
+                        ring.buffers[batch.slot][source : source + length], non_blocking=True
                     )
-                written += take
-                index += 1
+                event = torch.cuda.Event()
+                event.record(ring.stream)
+            cursor[0] = start + int(batch.nbytes)
+            ring.hold(event, batch)
+            batches[0] += 1
+            # A slot whose H2D has not completed is NOT free. Query first, block last.
+            ring.drain(ring.keep)
 
-        timing = {"read_ns": 0, "slot_wait_ns": 0, "copy_ns": 0, "done_wait_ns": 0}
-
-        def worker() -> None:
-            while not stop.is_set():
-                with guard:
-                    window = next(pending, None)
-                if window is None:
-                    return
-                waited = time.perf_counter_ns()
-                slot = free.get()
-                try:
-                    ring.take(slot)
-                    started = time.perf_counter_ns()
-                    timing["slot_wait_ns"] += started - waited
-                    read_window(window[0], window[1], slot)
-                    timing["read_ns"] += time.perf_counter_ns() - started
-                except BaseException as exc:
-                    stop.set()
-                    done.put(exc)
-                    return
-                done.put((window[0], window[1], slot))
-
-        pool = [
-            threading.Thread(target=worker, name=f"fill-reader-{n}", daemon=True)
-            for n in range(self.readers)
-        ]
-        for thread in pool:
-            thread.start()
-        try:
-            for n in range(len(windows)):
-                waited = time.perf_counter_ns()
-                item = done.get()
-                started = time.perf_counter_ns()
-                timing["done_wait_ns"] += started - waited
-                if isinstance(item, BaseException):
-                    raise item
-                at, count, slot = item
-                if n == cut:
-                    raise _refuse(
-                        "incomplete_fill",
-                        f"planted interruption after {n} of {len(windows)} windows — the "
-                        "arm that proves a killed fill leaves nothing Ready",
-                    )
-                index = bisect.bisect_right(starts, at) - 1
-                while index < len(placements) and placements[index][0] < at + count:
-                    start, end, flat = placements[index]
-                    if end > at:
-                        low, high = max(start, at), min(end, at + count)
-                        ring.copy_out(slot, low - at, flat, low - start, high - low)
-                    index += 1
-                ring.give_back(slot)
-                free.put(slot)
-                timing["copy_ns"] += time.perf_counter_ns() - started
-        finally:
-            stop.set()
-            for slot in ring.slots:
-                free.put(slot)
-            for thread in pool:
-                thread.join(timeout=5)
-        self.stats.update({k: v // 1_000_000 for k, v in timing.items()})
-        return len(windows)
+        started = time.perf_counter_ns()
+        with store_refusals("streaming the component"):
+            stats = self.lease.stream(plan, ring.views, on_batch, readers=self.readers)
+        self.stats["read_ns"] = time.perf_counter_ns() - started
+        self.stats["store"] = dict(stats)
+        return batches[0]
 
 
 # ------------------------------------------------------------------------- helpers
 
 
+#: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
+#: is a fact about torch, and TensorFS has no business knowing torch exists. What the store
+#: DOES own is the set of names and their widths, so this map is CHECKED against
+#: `tensorfs.DTYPES` rather than trusted — a name the store knows and this map does not is a
+#: refusal, not a silent passthrough that would land the wrong number of bytes.
+TORCH_DTYPES: dict[str, str] = {
+    "f16": "float16",
+    "bf16": "bfloat16",
+    "f32": "float32",
+    "f64": "float64",
+    "f8_e4m3fn": "float8_e4m3fn",
+    "f8_e5m2": "float8_e5m2",
+    "i64": "int64",
+    "i32": "int32",
+    "i16": "int16",
+    "i8": "int8",
+    "u8": "uint8",
+    "bool": "bool",
+}
+
+
 def _dtype_name(dtype: object) -> str:
-    """The one dtype spelling. The store writes tensorfs names (`f16`), torch prints its
+    """The one dtype spelling. The store writes TensorFS names (`f16`), torch prints its
     own (`torch.float16`), and a fill that guesses which is which is a silent wrong copy."""
     name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
-    return {
-        "f16": "float16",
-        "bf16": "bfloat16",
-        "f32": "float32",
-        "f64": "float64",
-        "i64": "int64",
-        "i32": "int32",
-        "i16": "int16",
-        "i8": "int8",
-        "u8": "uint8",
-    }.get(name, name)
+    return TORCH_DTYPES.get(name, name)
 
 
 def _tensors(module: Any) -> Iterator[tuple[str, Any]]:
@@ -925,45 +870,3 @@ def _non_persistent(root: Any) -> set[str]:
         for local in getattr(sub, "_non_persistent_buffers_set", ()):
             names.add(f"{prefix}.{local}" if prefix else local)
     return names
-
-
-def read_plan(path: str | Path, component: str | None = None) -> list[PlanRow]:
-    """Parse a tensorfs read plan (component, key, dtype, shape, nbytes, segments).
-
-    This is the header table in the store's own order, which is the order the fill plane
-    reads in. tfs-007 replaces this parser with the real `Header` reader; the ROW SHAPE is
-    the seam and is deliberately identical.
-    """
-    import base64
-
-    rows: list[PlanRow] = []
-    for line in Path(path).read_text().strip().split("\n"):
-        comp, key, dtype, shape, nbytes, where = line.split("\t")
-        if component is not None:
-            comp = component
-        segments: list[Segment] = []
-        if where.startswith("INLINE:"):
-            body = base64.b64decode(where[7:])
-            segments.append(Segment(None, len(body), body))
-        else:
-            for piece in where.split(","):
-                oid, length = piece.split(":")
-                segments.append(Segment(oid, int(length)))
-        rows.append(
-            PlanRow(
-                key=f"{comp}.{key}",
-                component=comp,
-                dtype=dtype,
-                shape=tuple(int(d) for d in shape.split(",") if d),
-                nbytes=int(nbytes),
-                segments=tuple(segments),
-            )
-        )
-    return rows
-
-
-def topology(plan: Sequence[PlanRow]) -> dict[str, TensorSpec]:
-    """The checkpoint topology table the loader matches the code against."""
-    return {
-        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), "plain", row.nbytes) for row in plan
-    }

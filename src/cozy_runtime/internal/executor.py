@@ -128,12 +128,11 @@ class Executor:
         from cozy_runtime.author._loader import Artifact, Config
         from cozy_runtime.internal.derive import Observations, meta_substrate
         from cozy_runtime.internal.fill import (
-            CasStore,
+            Checkpoint,
             FillRefusal,
             ResourceLedger,
             StreamingFillBackend,
-            read_plan,
-            topology,
+            topology_of,
         )
 
         torch.cuda.init()
@@ -152,22 +151,25 @@ class Executor:
             self.discovered = discover(Path(binding["project"]))
             self.surface_names = {s.name: s for s in self.discovered.surfaces}
 
-        plan = read_plan(binding["plan"], binding["component"])
-        store = CasStore(binding["store"], verify=binding.get("verify", "record"))
+        # The store IS the artifact identity: one snapshot digest, and TensorFS answers with
+        # the header, the plan and the verified lease. The interim path needed a store root
+        # AND a pre-parsed read-plan file beside it; tfs-007 deleted the second one.
+        checkpoint = Checkpoint(binding["store"], binding["snapshot"])
+        rows = checkpoint.rows(binding["component"])
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
         backend = StreamingFillBackend(
-            plan,
-            store,
+            checkpoint,
+            rows,
             ledger=ledger,
-            window_bytes=binding.get("window_bytes", 16 << 20),
-            slots=binding.get("slots", 4),
-            readers=binding.get("readers", 4),
-            interrupt_at=command.get("plant_interrupt_at"),
+            window_bytes=binding.get("window_bytes", 4 << 20),
+            slots=binding.get("slots", 16),
+            readers=binding.get("readers", 16),
+            inflight=binding.get("inflight", 8),
         )
-        backend.expect({binding["component"]: tuple(row.key for row in plan)})
+        backend.expect({binding["component"]: tuple(row.key for row in rows)})
         artifact = Artifact(
             binding["snapshot"],
-            topology(plan),
+            topology_of(rows),
             Config(json.loads(Path(binding["config"]).read_text()), "unet.config"),
             custody="canonical",
         )
@@ -258,7 +260,7 @@ class Executor:
             "allocator_bytes": torch.cuda.memory_allocated(),
             "rss_bytes": _rss(),
             "ledger": ledger.rows(),
-            "store": backend.store.stats(),
+            "store": backend.stats.get("store", {}),
             "gpu_name": torch.cuda.get_device_name(0),
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",

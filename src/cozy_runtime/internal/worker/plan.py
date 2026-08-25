@@ -88,7 +88,6 @@ class BindingPlan:
     param: str
     component: str
     store: str
-    plan: str
     config: str
     snapshot: str
     release: str
@@ -104,7 +103,6 @@ class BindingPlan:
         return canonical.digest(
             {
                 "store": self.store,
-                "plan": self.plan,
                 "config": self.config,
                 "snapshot": self.snapshot,
                 "release": self.release,

@@ -52,9 +52,9 @@ from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc  # noqa: E402
 
 BENCH = Path("/home/fidika/cozy_v2/tensorfs-bench")
 STORE = BENCH / "store"
-PLAN = BENCH / "results" / "read.plan"
 CONFIG = BENCH / "hf" / "sdxl" / "unet" / "config.json"
 CHECKPOINT = BENCH / "results" / "checkpoint.txt"
+WORK = Path("/tmp/cozy-slice-store")
 RELEASE = "cozy/sdxl-unet@cr-005"
 COMPONENT = "unet"
 FIXTURES = Path("/home/fidika/cozy_v2/worker-protocol/fixtures")
@@ -322,33 +322,45 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
         "binding_path": f"{entrypoint}.models.model",
         "param": "model",
         "component": COMPONENT,
-        "store": str(STORE),
-        "plan": str(PLAN),
+        "store": working_store(WORK / "store"),
         "config": str(CONFIG),
         "snapshot": snapshot(),
         "release": RELEASE,
         "variant": "sm89",
         "vram_bytes": 6 * GIB,
         "host_bytes": 2 * GIB,
-        "pinned_bytes": 64 * MIB,
+        "pinned_bytes": 256 * MIB,  # tfs-007 measured shape: 16 slots x 16 MiB
         "entrypoint": entrypoint,
         "model_construction_digest": "",
     }
 
 
-def doctored_plan(tmp: Path) -> str:
-    """A COPY of the real read plan with one late row pointing at an object that does not
-    exist. No plant switch anywhere in the runtime: the fill fails for the most ordinary
-    reason a fill can fail, 85 % of the way through, with 4.78 GiB of destinations already
-    reserved — which is exactly the state the rollback has to unwind."""
-    rows = PLAN.read_text().strip().split("\n")
-    index = int(len(rows) * 0.85)
-    head_, key, dtype, shape, nbytes, where = rows[index].split("\t")
-    _, _, length = where.partition(":")
-    rows[index] = "\t".join([head_, key, dtype, shape, nbytes, "ff" * 32 + ":" + length])
-    target = tmp / "doctored.plan"
-    target.write_text("\n".join(rows) + "\n")
-    return str(target)
+def working_store(at: Path) -> str:
+    """A HARDLINKED working copy of the read-only bench CAS: a TensorFS lease registers a
+    GC-safe hold, which is a write, and the bench store is read-only by standing rule."""
+    if not (at / "store.json").is_file():
+        at.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(at, ignore_errors=True)
+        subprocess.run(["cp", "-al", str(STORE), str(at)], check=True)
+    return str(at)
+
+
+def corrupt_store(at: Path, source: str) -> str:
+    """A working copy with ONE byte flipped in a real object, the hardlink broken first so
+    the original CAS is untouched. The most ordinary way a stored artifact goes wrong, and
+    no switch inside the runtime (decisions #249)."""
+    if (at / "store.json").is_file():
+        return str(at)
+    subprocess.run(["cp", "-al", source, str(at)], check=True)
+    target = max(
+        (p for p in (at / "objects" / "sha256").rglob("*") if p.is_file()),
+        key=lambda p: p.stat().st_size,
+    )
+    body = bytearray(target.read_bytes())
+    body[len(body) // 2] ^= 0x40
+    target.unlink()
+    target.write_bytes(bytes(body))
+    return str(at)
 
 
 def plan_id_for(entrypoint: str) -> str:
@@ -410,14 +422,14 @@ class Worker:
         return pid if "pid" in dir() else 0
 
 
-def stage(tmp: Path, entrypoints: tuple[str, ...], plan_file: str = "") -> dict[str, str]:
+def stage(tmp: Path, entrypoints: tuple[str, ...], store: str = "") -> dict[str, str]:
     (tmp / "binding-plans").mkdir(parents=True, exist_ok=True)
     ids = {}
     for entrypoint in entrypoints:
         plan_id = plan_id_for(entrypoint)
         record = binding_record(plan_id, entrypoint)
-        if plan_file:
-            record["plan"] = plan_file
+        if store:
+            record["store"] = store
         (tmp / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
             json.dumps(record, indent=2)
         )
@@ -437,14 +449,14 @@ def start_worker(
     posture: pb.Posture = pb.Posture.POSTURE_ACCEPTING,
     extra: tuple[str, ...] = (),
     rlimit_fsize: int = 0,
-    plan_file: str = "",
+    store: str = "",
 ) -> Worker:
     """Boot the coordinator (if needed) and the supervisor, and issue the first Directive."""
     home = tmp / "home"
     root = tmp / "worker"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    ids = stage(home, entrypoints, plan_file=plan_file)
+    ids = stage(home, entrypoints, store=store)
     socket_path = str(tmp / "hub.sock")
     if hub is None or server is None:
         server, hub = serve_hub(socket_path)
@@ -1029,7 +1041,12 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
     head("a real 4.78 GiB fill against a header row whose object does not exist")
-    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True, plan_file=doctored_plan(tmp))
+    worker = start_worker(
+        tmp,
+        entrypoints=("denoise",),
+        no_warm=True,
+        store=corrupt_store(WORK / "store-corrupt", working_store(WORK / "store")),
+    )
     hub = worker.hub
     plan_id = plan_id_for("denoise")
     row: dict[str, Any] = {}
