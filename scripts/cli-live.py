@@ -40,6 +40,12 @@ PASS = 0
 FAIL = 0
 
 
+def _first(text: str) -> str:
+    """The first line of an output, for a one-line observation."""
+    stripped = text.strip()
+    return stripped.splitlines()[0][:110] if stripped else ""
+
+
 def head(title: str) -> None:
     print(f"\n=== {title}", flush=True)
 
@@ -119,7 +125,7 @@ def section_surface(args: argparse.Namespace) -> None:
         check(
             f"{label} -> exit {want}",
             code == want,
-            f"got {code}: {(err or out).strip().splitlines()[0][:110] if (err or out).strip() else ''}",
+            f"got {code}: {_first(err or out)}",
         )
 
     head("AXI conformance")
@@ -131,19 +137,22 @@ def section_surface(args: argparse.Namespace) -> None:
         f"{len(sources)} modules scanned; anything that would ask is a flag",
     )
     code, out, _ = cli("--help", home=home)
-    check("--help is one screen and never touches the network", code == 0 and len(out) < 3000,
-          f"{len(out)} B")
+    check(
+        "--help is one screen and never touches the network",
+        code == 0 and len(out) < 3000,
+        f"{len(out)} B",
+    )
     code, out, _ = cli("list", home=home)
     check(
         "empty states are definitive",
         "0 artifacts" in out,
-        out.strip().splitlines()[0] if out.strip() else "",
+        _first(out),
     )
     code, out, err = cli("rm", REF, home=home)
     check(
         "a destructive act refuses with the remedy, never a question",
         "remedy:" in err and "?" not in err,
-        err.strip().splitlines()[0][:110],
+        _first(err),
     )
 
     head("describe is READ-ONLY by default")
@@ -161,13 +170,20 @@ def section_surface(args: argparse.Namespace) -> None:
     code, out, _ = cli("list", home=home)
     check("list shows one artifact, one size", REF in out and "6.461 GiB" in out, out.strip())
     code, out, _ = cli("fit", "generate", "steps=20", "size=1024", home=home)
-    check("fit renders a verdict from the real chooser", code == 0 and "generate:" in out,
-          [ln for ln in out.splitlines() if ln.startswith("generate")][0][:150] if code == 0 else out)
+    verdict = next((ln for ln in out.splitlines() if ln.startswith("generate")), out)
+    check(
+        "fit renders a verdict from the real chooser",
+        code == 0 and "generate:" in out,
+        verdict[:150],
+    )
     code, out, _ = cli("rm", REF, "--yes", home=home)
-    check("rm --yes removes it", code == 0 and "removed" in out, out.strip().splitlines()[0])
+    check("rm --yes removes it", code == 0 and "removed" in out, _first(out))
     code, out, _ = cli("rm", REF, "--yes", home=home)
-    check("and an absent ref is an idempotent 0 that says so", code == 0 and "not present" in out,
-          out.strip().splitlines()[0])
+    check(
+        "and an absent ref is an idempotent 0 that says so",
+        code == 0 and "not present" in out,
+        _first(out),
+    )
 
 
 # --------------------------------------------------------------------------- keys
@@ -181,7 +197,6 @@ def section_keys(args: argparse.Namespace) -> None:
     inside this function; nothing is left behind.
     """
     import tiny_artifacts as art
-
     from cozy_runtime.author import Artifact, ConformanceError, TensorSpec
     from cozy_runtime.author._model import ModelRegistry
     from tiny_sdxl import SdxlModel
@@ -283,7 +298,8 @@ def section_identity(args: argparse.Namespace) -> None:
     """ONE attempt kernel: the CLI's run and a direct `run_slice` produce the same bytes."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("pipeline_live", ROOT / "scripts" / "pipeline-live.py")
+    harness = ROOT / "scripts" / "pipeline-live.py"
+    spec = importlib.util.spec_from_file_location("pipeline_live", harness)
     assert spec and spec.loader
     live = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(live)
@@ -356,10 +372,11 @@ def section_identity(args: argparse.Namespace) -> None:
         f"{document.get('status')} vs {direct.get('status')}",
     )
     cli_plan = document.get("plan") or {}
+    accepted = direct.get("accepted", {}).get("delivery")
+    placement = direct.get("accepted", {}).get("placement")
     check(
         "the same chosen plan",
-        (cli_plan.get("delivery"), cli_plan.get("placement"))
-        == (direct.get("accepted", {}).get("delivery"), direct.get("accepted", {}).get("placement")),
+        (cli_plan.get("delivery"), cli_plan.get("placement")) == (accepted, placement),
         f"{cli_plan.get('delivery')}/{cli_plan.get('placement')}",
     )
     cli_classes = {row["class"] for row in (document.get("ledger") or {}).get("classes", ())}
