@@ -7,3 +7,4 @@ dist/
 corpus/.venv/
 results/*.txt
 results/*.log
+corpus/endpoint/imports/

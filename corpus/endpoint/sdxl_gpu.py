@@ -22,9 +22,12 @@ Three entrypoints, each earning its place in the verification:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Annotated, Any
 
 import msgspec
+from corpus.sdxl_real import SdxlUnetModel
 
 from cozy_runtime.author import (
     Context,
@@ -34,9 +37,15 @@ from cozy_runtime.author import (
     Telemetry,
     VideoAsset,
 )
-from corpus.sdxl_real import SdxlUnetModel
-
 from cozy_runtime.author._app import App
+
+# IMPORT TRIPWIRE (cr-007 red arm, deliberate module-scope side effect). Every process
+# that imports this endpoint records its own pid here. The supervisor must never appear:
+# it is the long-lived no-CUDA process, and endpoint module scope is exactly where a real
+# endpoint would touch torch. `scripts/worker-live.py tripwire` reads these files.
+_IMPORTS = Path(__file__).resolve().parent / "imports"
+_IMPORTS.mkdir(exist_ok=True)
+(_IMPORTS / f"{os.getpid()}.pid").write_text(f"{os.getpid()}\n")
 
 app = App()
 
@@ -66,6 +75,25 @@ class StubbornInput(msgspec.Struct, forbid_unknown_fields=True):
     steps: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 256
     latent: Annotated[int, msgspec.Meta(ge=32, le=96)] = 80
     seed: int = 3
+
+
+class PairDetail(msgspec.Struct):
+    """A NESTED typed value in the result. It exists to prove two things at once: the
+    result is serialized exactly once (so `scores` arrives as numbers, not as a string),
+    and an output nested under it gets the stable id `detail.thumb`."""
+
+    thumb: ImageAsset
+    note: str
+    scores: list[float]
+
+
+class PairOutput(msgspec.Struct):
+    preview: ImageAsset
+    detail: PairDetail
+
+
+class BloatOutput(msgspec.Struct):
+    blob: str
 
 
 class RestyleInput(msgspec.Struct, forbid_unknown_fields=True):
@@ -160,6 +188,36 @@ def stubborn(payload: StubbornInput, model: SdxlUnetModel, ctx: Context) -> Deno
         digest=hashlib.sha256(b"stubborn").hexdigest(),
         warm=False,
     )
+
+
+@app.entrypoint
+def pair(ctx: Context, payload: DenoiseInput, model: SdxlUnetModel, out: Outputs) -> PairOutput:
+    """TWO outputs, one of them nested. Their ids are their field paths (`preview`,
+    `detail.thumb`), never their position in a list."""
+    import torch
+
+    view = model.for_request(ctx, seed=payload.seed)
+    device = torch.device("cuda", 0)
+    latents, timestep, prompt, embeds, ids = _inputs(torch, device, payload.latent, view._seed)
+    latents = model.denoise(latents, timestep, prompt, embeds, ids)
+    frame = _preview(torch, latents)
+    small = ImageFrame(8, 8, frame.rgb[: 8 * 8 * 3])
+    stats = latents.float()
+    return PairOutput(
+        preview=out.save_image(frame, format="png"),
+        detail=PairDetail(
+            thumb=out.save_image(small, format="png"),
+            note="latent preview and its thumbnail",
+            scores=[round(float(stats.mean()), 6), round(float(stats.std()), 6)],
+        ),
+    )
+
+
+@app.entrypoint
+def bloat(payload: DenoiseInput) -> BloatOutput:
+    """A typed result far past the inline door. The runtime must REFUSE it typed rather
+    than mint a blob receipt for bytes nobody wrote."""
+    return BloatOutput(blob="x" * (5 * 1024 * 1024))
 
 
 @app.entrypoint

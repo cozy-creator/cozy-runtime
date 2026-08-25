@@ -28,6 +28,7 @@ import json
 import os
 import queue
 import re
+import resource
 import shutil
 import signal
 import subprocess
@@ -79,6 +80,11 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def _number(text: str, pattern: str, default: int = 0) -> int:
+    found = re.search(pattern, text)
+    return int(found.group(1)) if found else default
+
+
 def gpu_used_mib() -> int:
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
@@ -91,10 +97,12 @@ def gpu_used_mib() -> int:
 
 
 @dataclass
-class Hub(pb_grpc.WorkerServicer):
+class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servicer is untyped
     """The coordinator side of th-024, scripted. cl-001 will be the real one."""
 
-    outbound: queue.Queue[pb.CoordinatorMessage] = field(default_factory=queue.Queue)
+    outbound: queue.Queue[pb.CoordinatorMessage | None] = field(
+        default_factory=queue.Queue
+    )
     seen: list[pb.WorkerMessage] = field(default_factory=list)
     lock: threading.Condition = field(default_factory=threading.Condition)
     progress: list[pb.AttemptProgress] = field(default_factory=list)
@@ -120,7 +128,7 @@ class Hub(pb_grpc.WorkerServicer):
         while True:
             message = self.outbound.get()
             if message is None:
-                return
+                break
             yield message
 
     def StreamProgress(self, request_iterator: Any, context: Any) -> Any:
@@ -205,7 +213,7 @@ class Hub(pb_grpc.WorkerServicer):
 
     # ------------------------------------------------------------ driving
 
-    def send(self, message: pb.CoordinatorMessage) -> None:
+    def send(self, message: pb.CoordinatorMessage | None) -> None:
         self.outbound.put(message)
 
     def session(self) -> str:
@@ -216,7 +224,7 @@ class Hub(pb_grpc.WorkerServicer):
         what the worker told it; a hard-coded 1 is dropped by the §0 stale fence the moment
         the executor respawns, which is that fence working."""
         reports = self.reports()
-        return reports[-1].executor_incarnation if reports else 1
+        return int(reports[-1].executor_incarnation) if reports else 1
 
     def mark(self) -> int:
         """A cursor into the observed stream, so a wait can require a FRESH message."""
@@ -272,7 +280,7 @@ class Hub(pb_grpc.WorkerServicer):
         return [m.report for m in list(self.seen) if m.WhichOneof("msg") == "report"]
 
     def ready(self, plan_id: str, seconds: float = 300.0, since: int = 0) -> pb.Report:
-        return self.wait(
+        report: pb.Report = self.wait(
             lambda m: m.report
             if m.WhichOneof("msg") == "report"
             and m.report.intake_state == pb.IntakeState.INTAKE_STATE_READY
@@ -282,6 +290,7 @@ class Hub(pb_grpc.WorkerServicer):
             "READY",
             since,
         )
+        return report
 
 
 def serve_hub(path: str) -> tuple[grpc.Server, Hub]:
@@ -327,6 +336,21 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     }
 
 
+def doctored_plan(tmp: Path) -> str:
+    """A COPY of the real read plan with one late row pointing at an object that does not
+    exist. No plant switch anywhere in the runtime: the fill fails for the most ordinary
+    reason a fill can fail, 85 % of the way through, with 4.78 GiB of destinations already
+    reserved — which is exactly the state the rollback has to unwind."""
+    rows = PLAN.read_text().strip().split("\n")
+    index = int(len(rows) * 0.85)
+    head_, key, dtype, shape, nbytes, where = rows[index].split("\t")
+    _, _, length = where.partition(":")
+    rows[index] = "\t".join([head_, key, dtype, shape, nbytes, "ff" * 32 + ":" + length])
+    target = tmp / "doctored.plan"
+    target.write_text("\n".join(rows) + "\n")
+    return str(target)
+
+
 def plan_id_for(entrypoint: str) -> str:
     return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
 
@@ -357,6 +381,26 @@ class Worker:
         rows = [line for line in text if not pattern or re.search(pattern, line)]
         return rows[-lines:]
 
+    def result_schema_digest(self, entrypoint: str) -> str:
+        """The DECLARED result-surface digest, computed independently of the worker.
+
+        In a SUBPROCESS on purpose: the coordinator has no business importing endpoint code
+        either, and the import tripwire must stay a fact about the worker's processes.
+        """
+        code = (
+            "import sys, json\n"
+            f"sys.path[:0] = [{str(ROOT)!r}, {str(ROOT / 'src')!r}]\n"
+            "from pathlib import Path\n"
+            "from cozy_runtime.internal import canonical, schema\n"
+            "from cozy_runtime.internal.discovery import discover\n"
+            f"found = discover(Path({str(ROOT / 'corpus' / 'endpoint')!r}))\n"
+            f"surface = next(s for s in found.surfaces if s.name == {entrypoint!r})\n"
+            "print(canonical.digest(schema.render(surface.result_type)))\n"
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             check=True)
+        return out.stdout.strip().splitlines()[-1]
+
     def executor_pid(self) -> int:
         for line in self.log.read_text(errors="replace").splitlines():
             match = re.search(r"incarnation (\d+) pid (\d+)", line)
@@ -365,12 +409,14 @@ class Worker:
         return pid if "pid" in dir() else 0
 
 
-def stage(tmp: Path, entrypoints: tuple[str, ...]) -> dict[str, str]:
+def stage(tmp: Path, entrypoints: tuple[str, ...], plan_file: str = "") -> dict[str, str]:
     (tmp / "binding-plans").mkdir(parents=True, exist_ok=True)
     ids = {}
     for entrypoint in entrypoints:
         plan_id = plan_id_for(entrypoint)
         record = binding_record(plan_id, entrypoint)
+        if plan_file:
+            record["plan"] = plan_file
         (tmp / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
             json.dumps(record, indent=2)
         )
@@ -382,24 +428,22 @@ def start_worker(
     tmp: Path,
     *,
     entrypoints: tuple[str, ...] = ("denoise",),
-    plant: str = "",
-    executor_plant: str = "",
-    interrupt_at: float = 0.0,
     instance_id: str = "",
     hub: Hub | None = None,
     server: grpc.Server | None = None,
     no_warm: bool = False,
     grace: float = 3.0,
-    posture: int = pb.Posture.POSTURE_ACCEPTING,
+    posture: pb.Posture = pb.Posture.POSTURE_ACCEPTING,
     extra: tuple[str, ...] = (),
-    fsize_limit: int = 4096,
+    rlimit_fsize: int = 0,
+    plan_file: str = "",
 ) -> Worker:
     """Boot the coordinator (if needed) and the supervisor, and issue the first Directive."""
     home = tmp / "home"
     root = tmp / "worker"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    ids = stage(home, entrypoints)
+    ids = stage(home, entrypoints, plan_file=plan_file)
     socket_path = str(tmp / "hub.sock")
     if hub is None or server is None:
         server, hub = serve_hub(socket_path)
@@ -432,10 +476,6 @@ def start_worker(
         "--instance-id", instance_id or f"ins-{uuid.uuid4().hex[:12]}",
         "--release-id", RELEASE,
         "--grace", str(grace),
-        "--fsize-limit", str(fsize_limit),
-        *(("--plant", plant) if plant else ()),
-        *(("--executor-plant", executor_plant) if executor_plant else ()),
-        *(("--plant-interrupt-at", str(interrupt_at)) if interrupt_at else ()),
         *(("--no-warm",) if no_warm else ()),
         *extra,
     ]
@@ -443,8 +483,19 @@ def start_worker(
     # ENOSPC plant) applies to regular files and not to pipes, so the plant bites exactly
     # the journal — the one regular file the supervisor writes — instead of also killing
     # its ability to say what happened.
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               env=env, bufsize=0)
+    def plant_disk_full() -> None:
+        """HARNESS-SIDE fault injection: cap the child's file size so the journal's next
+        append gets a REAL kernel error (EFBIG), the ENOSPC class. It runs in the harness's
+        forked child before exec, so the runtime carries no plant switch of its own. stdout
+        is a PIPE and pipes are not subject to RLIMIT_FSIZE, so the plant bites exactly the
+        journal — the one regular file the supervisor writes."""
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (rlimit_fsize, rlimit_fsize))
+
+    process = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, bufsize=0,
+        preexec_fn=plant_disk_full if rlimit_fsize else None,
+    )
     threading.Thread(target=_pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
     return Worker(home, root, process, hub, server, log)
@@ -509,7 +560,7 @@ def dispatch(
     extra_key: str = "",
     spec_override: tuple[bytes, bytes] | None = None,
     grant_expires: int = 0,
-    output_id: str = "image-0",
+    output_id: str = "image",
     destination_url: str = "",
     incarnation: int = 0,
 ) -> tuple[bytes, bytes]:
@@ -688,7 +739,8 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         manifest = body.get("output_manifest", {})
         entries = manifest.get("outputs", [])
         written = sorted((tmp / "outputs").glob("req-1-*.bin"))
-        check("a valid write produced a canonical manifest", len(entries) == 1 and written,
+        check("a valid write produced a canonical manifest",
+              len(entries) == 1 and bool(written),
               f"{manifest.get('manifest_id')}: {entries[0]['length'] if entries else 0} B "
               f"at {written[0].name if written else 'nothing'}")
         if entries and written:
@@ -859,8 +911,9 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
-    head("plant an interruption at 50 % of a real 4.78 GiB fill")
-    worker = start_worker(tmp, entrypoints=("denoise",), interrupt_at=0.5, no_warm=True)
+    head("a real 4.78 GiB fill against a header row whose object does not exist")
+    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True,
+                          plan_file=doctored_plan(tmp))
     hub = worker.hub
     plan_id = plan_id_for("denoise")
     row: dict[str, Any] = {}
@@ -879,9 +932,10 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
               line[0].split("boot: ")[-1] if line else "")
 
         head("the rollback seam: journaled AND actually freed")
-        peak_bytes = int(re.search(r"peak allocator (\d+) B", line[0]).group(1)) if line else 0
-        after_bytes = int(re.search(r"allocator holds (\d+) B", line[0]).group(1)) if line else -1
-        free_bytes = int(re.search(r"has (\d+) B free", line[0]).group(1)) if line else 0
+        text = line[0] if line else ""
+        peak_bytes = _number(text, r"peak allocator (\d+) B")
+        after_bytes = _number(text, r"allocator holds (\d+) B", default=-1)
+        free_bytes = _number(text, r"has (\d+) B free")
         used = gpu_used_mib()
         check("the bytes that were live are freed, not merely dereferenced",
               peak_bytes > 4 * GIB and after_bytes == 0,
@@ -1248,7 +1302,7 @@ def section_journal(args: argparse.Namespace) -> None:
 
     head("a journal that cannot durably commit acknowledges NOTHING and executes NOTHING")
     worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True,
-                          plant="journal-enospc", fsize_limit=440)
+                          rlimit_fsize=440)
     hub = worker.hub
     plan_id = plan_id_for("denoise")
     try:
@@ -1345,51 +1399,317 @@ def section_journal(args: argparse.Namespace) -> None:
         _gpu_clean(idle)
 
 
-def section_executor_honesty(args: argparse.Namespace) -> None:
-    """The three executor-claim arms: late env, unproven quiescence, a restarted counter."""
+def section_seal(args: argparse.Namespace) -> None:
+    """The late-imposition property, measured in a HARNESS-OWNED CUDA process.
+
+    The runtime carries no plant switch for this (the red-arm discipline is
+    plant -> observe -> REMOVE, and a permanent switch is decay). What is re-runnable is
+    the PROPERTY and the CHECK that catches it, both exercised against real code: a child
+    process snapshots the seal with the runtime's own `config.seal_snapshot`, initializes
+    CUDA, imposes a value afterwards, and reports what the driver did and what the seal
+    check says.
+    """
+    head("late environment imposition, after CUDA init")
+    probe = Path(args.tmp) / "seal_probe.py"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text(
+        "import os, sys, json\n"
+        f"sys.path[:0] = [{str(ROOT / 'src')!r}]\n"
+        "from cozy_runtime.internal.config import seal_snapshot\n"
+        "sealed = seal_snapshot()\n"
+        "import torch\n"
+        "torch.cuda.init()\n"
+        "before = torch.cuda.device_count()\n"
+        "os.environ['CUDA_VISIBLE_DEVICES'] = ''\n"
+        "after = torch.cuda.device_count()\n"
+        "print(json.dumps({'before': before, 'after': after,\n"
+        "                  'intact': seal_snapshot() == sealed}))\n"
+    )
+    out = subprocess.run(
+        ["nice", "-n", "19", sys.executable, str(probe)],
+        capture_output=True, text=True,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
+    )
+    facts = json.loads(out.stdout.strip().splitlines()[-1])
+    check("the imposition is a SILENT no-op for the running process",
+          facts["before"] == facts["after"] == 1,
+          f"device_count {facts['before']} -> {facts['after']} after "
+          "CUDA_VISIBLE_DEVICES='' — the driver read its environment once, at init")
+    check("the runtime's seal check is what turns that into a refusal",
+          facts["intact"] is False,
+          "config.seal_snapshot() no longer equals the snapshot CUDA initialized under, "
+          "which is the `env_seal_broken` refusal the executor raises")
+
+
+def section_tripwire(args: argparse.Namespace) -> None:
+    """STRUCTURAL: the supervisor never imports endpoint code, whatever the endpoint does.
+
+    The endpoint module writes `<pid>.pid` into `corpus/endpoint/imports/` at MODULE SCOPE.
+    Any process that imports it leaves a mark it cannot avoid leaving — a friendly endpoint
+    whose torch imports are inside functions would prove nothing, so the tripwire fires on
+    the import itself.
+    """
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    marks = ROOT / "corpus" / "endpoint" / "imports"
+    shutil.rmtree(marks, ignore_errors=True)
+    worker = start_worker(tmp, entrypoints=("denoise", "restyle"))
+    hub = worker.hub
+    try:
+        hub.ready(plan_id_for("denoise"), 400)
+        head("who imported the endpoint module")
+        supervisor_pid = worker.process.pid
+        executor_pid = worker.executor_pid()
+        seen = sorted(int(path.stem) for path in marks.glob("*.pid"))
+        check("the endpoint was imported by the EXECUTOR and by nobody else",
+              seen == [executor_pid],
+              f"import marks {seen}; executor {executor_pid}, supervisor {supervisor_pid} "
+              "— the warm pass synthesizes and runs INSIDE the disposable process, so no "
+              "endpoint module scope can ever contaminate the no-CUDA parent")
+        check("and the warm pass still ran, through ordinary dispatch",
+              bool(worker.tail(r"warm: denoise: warmed", 1)),
+              " | ".join(row.split("warm: ")[-1] for row in worker.tail(r"warm:", 4)))
+    finally:
+        _shutdown(worker)
+        worker.server.stop(0)
+        _gpu_clean(idle)
+
+
+def section_acceptance(args: argparse.Namespace) -> None:
+    """The acceptance boundary: nothing is accepted that cannot then run."""
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True)
+    hub = worker.hub
     plan_id = plan_id_for("denoise")
-    for plant, label, expect in (
-        ("late-env", "late env imposition after CUDA init", "env_seal_broken"),
-        ("unquiesced", "a terminal under unproven quiescence", "quiescence"),
-        ("state-seq", "an executor claiming a monotone wire counter", "state_seq"),
-    ):
-        tmp = Path(f"{args.tmp}-{plant}")
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
-        idle = gpu_used_mib()
-        head(f"plant: {label}")
-        worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True,
-                              executor_plant=plant)
-        hub = worker.hub
-        try:
-            hub.ready(plan_id, 400)
-            dispatch(hub, tmp, plan_id, request_id=f"req-{plant}",
-                     payload={"steps": 1, "latent": 48})
-            body = terminal_body(hub.wait(
-                lambda m: m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal" else None, 300, "terminal"))
-            if plant == "state-seq":
-                report = hub.wait(
-                    lambda m: m.report
-                    if m.WhichOneof("msg") == "report"
-                    and any(f.reason == "executor_owned_counter" for f in m.report.faults)
-                    else None, 30, "fault")
-                fault = next(f for f in report.faults if f.reason == "executor_owned_counter")
-                check("the executor's counter claim is DROPPED, not adopted", True,
-                      fault.detail[:120])
-            else:
-                check(f"{label} is caught", body["status"] == 3
-                      and expect in body["safe_message"], body["safe_message"][:130])
-            if plant == "late-env":
-                device_count = worker.tail("", 400)
-                del device_count
-                check("the late imposition was a SILENT no-op for the running process", True,
-                      "CUDA_VISIBLE_DEVICES='' after init left device_count unchanged; the "
-                      "seal check is what turns that into a refusal")
-        finally:
-            _shutdown(worker)
-            worker.server.stop(0)
-            _gpu_clean(idle)
+    try:
+        hub.ready(plan_id, 400)
+
+        head("a granted payload input that is not there")
+        canonical_bytes, digest = make_spec(plan_id)
+        grant = pb.DeliveryGrant(
+            file_base_url=f"file://{tmp / 'grants'}",
+            expires_at_unix=int(time.time()) + 600,
+            inputs=[pb.InputLocation(input_id="payload",
+                                     url=f"file://{tmp / 'grants' / 'absent.json'}",
+                                     length=17, digest=bytes(32))],
+            outputs=[],
+        )
+        hub.send(pb.CoordinatorMessage(start_attempt=pb.StartAttempt(
+            session_id=hub.session(), executor_incarnation=hub.incarnation(),
+            request_id="req-nopayload", attempt=1, exec_spec_digest=digest,
+            grant=grant, exec_spec_canonical=canonical_bytes)))
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-nopayload" else None, 120, "refusal"))
+        check("refused BEFORE acceptance, with no accept ever published",
+              body["status"] == 2 and not hub.accepted("req-nopayload"),
+              body["safe_message"][:130])
+
+        head("an EXPIRED delivery grant")
+        dispatch(hub, tmp, plan_id, request_id="req-expired",
+                 payload={"steps": 1, "latent": 48}, grant_expires=int(time.time()) - 60)
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-expired" else None, 120, "refusal"))
+        check("an expired grant is a pre-accept refusal, never an accepted attempt",
+              body["status"] == 2 and not hub.accepted("req-expired"),
+              f"cause {body['cause']['code']} — {body['safe_message'][:100]}")
+
+        head("a malformed payload document")
+        bad = tmp / "grants" / "malformed.json"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(b"[1, 2, 3]")
+        grant = pb.DeliveryGrant(
+            file_base_url=f"file://{tmp / 'grants'}",
+            expires_at_unix=int(time.time()) + 600,
+            inputs=[pb.InputLocation(input_id="payload", url=f"file://{bad}")],
+            outputs=[],
+        )
+        hub.send(pb.CoordinatorMessage(start_attempt=pb.StartAttempt(
+            session_id=hub.session(), executor_incarnation=hub.incarnation(),
+            request_id="req-malformed", attempt=1, exec_spec_digest=digest,
+            grant=grant, exec_spec_canonical=canonical_bytes)))
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-malformed" else None, 120, "refusal"))
+        check("a payload that is not an object refuses typed",
+              body["status"] == 2 and "payload_undecodable" in body["safe_message"],
+              body["safe_message"][:120])
+
+        head("and a VALID request on the same worker still serves")
+        dispatch(hub, tmp, plan_id, request_id="req-good",
+                 payload={"steps": 1, "latent": 48})
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-good" else None, 300, "terminal"))
+        check("three pre-accept refusals left the worker fully serving",
+              body["status"] == 1, "the refusals never touched the executor")
+    finally:
+        _shutdown(worker)
+        worker.server.stop(0)
+        _gpu_clean(idle)
+
+
+def section_abandon(args: argparse.Namespace) -> None:
+    """Supervisor death AFTER acceptance and BEFORE any terminal."""
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    worker = start_worker(tmp, entrypoints=("denoise", "stubborn"), no_warm=True,
+                          instance_id="ins-abandon")
+    hub = worker.hub
+    stubborn_id = plan_id_for("stubborn")
+    try:
+        hub.ready(stubborn_id, 400)
+        head("kill -9 the SUPERVISOR while an accepted attempt is running")
+        dispatch(hub, tmp, stubborn_id, request_id="req-lost",
+                 payload={"steps": 900, "latent": 80}, outputs=0)
+        hub.wait(lambda m: m.attempt_accepted
+                 if m.WhichOneof("msg") == "attempt_accepted"
+                 and m.attempt_accepted.request_id == "req-lost" else None, 120, "accepted")
+        time.sleep(2.0)
+        check("the attempt is accepted with no terminal", not hub.terminals("req-lost"),
+              "journaled ACCEPTED, running, nothing shipped")
+        worker.process.send_signal(signal.SIGKILL)
+        worker.process.wait(timeout=20)
+        worker.server.stop(0)
+
+        head("the restarted supervisor mints the terminal the dead one owed")
+        restarted = start_worker(tmp, entrypoints=("denoise", "stubborn"), no_warm=True,
+                                 instance_id="ins-abandon")
+        hub2 = restarted.hub
+        register = hub2.wait(lambda m: m.register
+                             if m.WhichOneof("msg") == "register" else None, 60, "Register")
+        check("the recovered attempt rides Register as TERMINAL-PENDING-ACK",
+              len(register.recovered_attempts) == 1
+              and register.recovered_attempts[0].state
+              == pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
+              "recovery mints a durable terminal, never a live attempt with no plan")
+        terminal = hub2.wait(lambda m: m.attempt_terminal
+                             if m.WhichOneof("msg") == "attempt_terminal" else None,
+                             60, "ABANDONED")
+        body = terminal_body(terminal)
+        check("it is ABANDONED / EXECUTOR_INVALIDATED, journaled and replayable",
+              body["status"] == 5 and body["cause"]["code"] == 16,
+              body["safe_message"][:120])
+
+        head("a duplicate StartAttempt for that ordinal replays, and starts nothing")
+        mark = hub2.mark()
+        dispatch(hub2, tmp, stubborn_id, request_id="req-lost",
+                 payload={"steps": 900, "latent": 80}, outputs=0)
+        # The restarted worker is preparing its executor on the reader thread, so the
+        # duplicate waits behind that; it is queued, never lost.
+        hub2.wait(lambda m: m.attempt_terminal
+                  if m.WhichOneof("msg") == "attempt_terminal"
+                  and m.attempt_terminal.request_id == "req-lost" else None,
+                  400, "replayed terminal", mark)
+        replays = hub2.terminals("req-lost")
+        check("the recovered terminal replays byte-for-byte; no plan is ever demanded",
+              len(replays) >= 2
+              and replays[0].terminal_canonical == replays[-1].terminal_canonical,
+              f"{len(replays)} terminals, identical bodies, id {replays[0].terminal_id}")
+        _shutdown(restarted)
+        restarted.server.stop(0)
+    finally:
+        _gpu_clean(idle)
+
+
+def section_results(args: argparse.Namespace) -> None:
+    """Result truthfulness: serialized once, declared schema digest, ids not positions."""
+    tmp = Path(args.tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    idle = gpu_used_mib()
+    worker = start_worker(tmp, entrypoints=("pair", "bloat"), no_warm=True)
+    hub = worker.hub
+    pair_id, bloat_id = plan_id_for("pair"), plan_id_for("bloat")
+    try:
+        hub.ready(pair_id, 400)
+        head("two outputs, nested, granted in the WRONG order")
+        out_dir = tmp / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        canonical_bytes, digest = make_spec(pair_id)
+        grant = pb.DeliveryGrant(
+            file_base_url=f"file://{tmp / 'grants'}",
+            expires_at_unix=int(time.time()) + 600,
+            inputs=[payload_input(tmp, "req-pair", {"steps": 1, "latent": 48})],
+            outputs=[
+                # deliberately NOT in the order the handler produced them
+                pb.OutputDestination(output_id="detail.thumb",
+                                     url=f"file://{out_dir / 'thumb.png'}",
+                                     max_bytes=8 * MIB),
+                pb.OutputDestination(output_id="preview",
+                                     url=f"file://{out_dir / 'preview.png'}",
+                                     max_bytes=8 * MIB),
+            ],
+        )
+        hub.send(pb.CoordinatorMessage(start_attempt=pb.StartAttempt(
+            session_id=hub.session(), executor_incarnation=hub.incarnation(),
+            request_id="req-pair", attempt=1, exec_spec_digest=digest,
+            grant=grant, exec_spec_canonical=canonical_bytes)))
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-pair" else None, 300, "terminal"))
+        entries = body.get("output_manifest", {}).get("outputs", [])
+        ids = sorted(entry["output_id"] for entry in entries)
+        check("both outputs landed, addressed by their FIELD PATHS",
+              ids == ["detail.thumb", "preview"], f"{ids} — never by list position")
+        landed = {
+            "preview": (out_dir / "preview.png").read_bytes(),
+            "detail.thumb": (out_dir / "thumb.png").read_bytes(),
+        }
+        by_id = {entry["output_id"]: entry for entry in entries}
+        check("each destination holds the bytes its own id names",
+              all(by_id[name]["digest"] == "sha256:" + hashlib.sha256(data).hexdigest()
+                  for name, data in landed.items())
+              and len(landed["preview"]) != len(landed["detail.thumb"]),
+              f"preview {len(landed['preview'])} B, thumb {len(landed['detail.thumb'])} B "
+              "— a positional binding would have swapped them")
+
+        head("the typed result survived as TYPES, serialized exactly once")
+        import base64 as b64
+
+        from cozy_runtime.internal import canonical
+
+        result = canonical.parse(b64.b64decode(body["result"]["inline_result"]))
+        scores = result.get("detail", {}).get("scores")
+        check("a nested struct is a struct and its numbers are numbers",
+              isinstance(scores, list) and all(isinstance(s, float) for s in scores)
+              and isinstance(result["detail"]["note"], str),
+              f"detail.scores = {scores} — no member was stringified on the way out")
+
+        head("the carried schema digest is the DECLARED result surface's")
+        declared = worker.result_schema_digest("pair")
+        check("it equals the descriptor's annotated result-surface digest, exactly",
+              body["result"]["result_schema_digest"] == declared,
+              f"{declared[:32]}… — a digest of this VALUE would move every request")
+
+        head("a typed result past the inline door")
+        hub.ready(bloat_id, 400, since=hub.mark())
+        dispatch(hub, tmp, bloat_id, request_id="req-bloat",
+                 payload={"steps": 1, "latent": 48}, outputs=0)
+        body = terminal_body(hub.wait(
+            lambda m: m.attempt_terminal
+            if m.WhichOneof("msg") == "attempt_terminal"
+            and m.attempt_terminal.request_id == "req-bloat" else None, 300, "refusal"))
+        check("it REFUSES typed rather than minting a receipt for bytes nobody wrote",
+              body["status"] == 3 and "result_too_large" in body["safe_message"],
+              body["safe_message"][:150])
+    finally:
+        _shutdown(worker)
+        worker.server.stop(0)
+        _gpu_clean(idle)
 
 
 def section_bench(args: argparse.Namespace) -> None:
@@ -1422,7 +1742,7 @@ def main() -> int:
     parser.add_argument(
         "section",
         choices=("fixtures", "attempt", "kill", "rollback", "nocuda", "arms", "journal",
-                 "honesty", "bench"),
+                 "seal", "tripwire", "acceptance", "abandon", "results", "bench"),
     )
     parser.add_argument("--tmp", default="")
     parser.add_argument("--steps", type=int, default=4)
@@ -1440,7 +1760,11 @@ def main() -> int:
         "nocuda": section_nocuda,
         "arms": section_arms,
         "journal": section_journal,
-        "honesty": section_executor_honesty,
+        "seal": section_seal,
+        "tripwire": section_tripwire,
+        "acceptance": section_acceptance,
+        "abandon": section_abandon,
+        "results": section_results,
         "bench": section_bench,
     }
     row = sections[args.section](args)

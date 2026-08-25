@@ -52,7 +52,6 @@ from cozy_runtime.internal.worker.attempts import (
     Attempt,
     AttemptEngine,
     AttemptRefusal,
-    synthesize,
 )
 from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.plan import BindingPlan, HostLedger, PlanChooser
@@ -89,7 +88,6 @@ class Supervisor:
     def __init__(self, config: RuntimeConfig, args: argparse.Namespace) -> None:
         self.config = config
         self.args = args
-        self.plants = set(filter(None, args.plant.split(",")))
         self.root = Path(args.root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.fences = Fences(session_id=f"ses-{uuid.uuid4().hex[:20]}")
@@ -103,7 +101,6 @@ class Supervisor:
             python=args.python or sys.executable,
             base_env=config.child_base_env,
             cozy_home=config.cozy_home,
-            plant=args.executor_plant,
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, BindingPlan] = {}
@@ -279,7 +276,6 @@ class Supervisor:
                         "pinned": first.pinned_bytes,
                     },
                     "expect_construction_digest": first.model_construction_digest,
-                    "plant_interrupt_at": self.args.plant_interrupt_at or None,
                 },
                 timeout=None,
             )
@@ -336,10 +332,16 @@ class Supervisor:
     def run_warm_pass(self) -> None:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch.
 
+        The pass is DRIVEN here and RUN in the executor. That split is a fence, not a
+        layering preference: synthesizing a payload needs the entrypoint's schema, and the
+        supervisor must never import endpoint code — an endpoint whose module scope touches
+        torch would contaminate this long-lived no-CUDA process permanently. The executor
+        has the schema because it has the endpoint, and it is disposable.
+
         The tax lands on boot, never on a paying request. Every attempt lands one durable
         outcome — `warmed`, `skipped` or `failed` — with a typed reason; a failed pass emits
         `serve_degrade` and the worker still serves. Nothing observed here may ever seed,
-        fit or arm cr-008b's demand coefficients (se#715), which is why the outcome record
+        fit or arm cr-008b's demand coefficients (se#715), which is why every outcome record
         carries `demand_evidence: false` and the chooser never reads this list.
         """
         if self.args.no_warm:
@@ -352,49 +354,40 @@ class Supervisor:
                 continue
             spool = self.root / "warm" / binding.entrypoint
             spool.mkdir(parents=True, exist_ok=True)
-            surface = _surface_of(binding)
-            payload, why = synthesize(surface, spool) if surface is not None else ({}, "no schema")
             started = time.perf_counter()
-            outcome: dict[str, Any]
-            if why:
-                outcome = {"entrypoint": binding.entrypoint, "outcome": "skipped", "reason": why}
-            else:
-                try:
-                    reply = executor.call(
-                        {
-                            "cmd": "invoke",
-                            "request_id": f"warm-{binding.entrypoint}",
-                            "entrypoint": binding.entrypoint,
-                            "payload": payload,
-                            "deadline_s": 120.0,
-                            "boot_warmup": True,
-                            "spool": str(spool),
-                        },
-                        timeout=None,
-                    )
-                    ok = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
-                    outcome = {
+            try:
+                reply = executor.call(
+                    {
+                        "cmd": "warm",
+                        "request_id": f"warm-{binding.entrypoint}",
                         "entrypoint": binding.entrypoint,
-                        "outcome": "warmed" if ok else "failed",
-                        "reason": ""
-                        if ok
-                        else f"{reply.get('code') or reply['outcome']['code']}: "
-                        f"{(reply.get('detail') or reply['outcome']['message'])[:160]}",
-                        "boot_warmup_observed": bool(
-                            (reply.get("result") or {}).get("warm", False)
-                        ),
-                    }
-                except ExecutorGone as exc:
-                    outcome = {
-                        "entrypoint": binding.entrypoint,
-                        "outcome": "failed",
-                        "reason": str(exc)[:200],
-                    }
+                        "deadline_s": 300.0,
+                        "spool": str(spool),
+                    },
+                    timeout=None,
+                )
+                outcome: dict[str, Any] = {
+                    "entrypoint": binding.entrypoint,
+                    "outcome": str(reply.get("outcome", "failed")),
+                    "reason": str(reply.get("reason", ""))[:200],
+                    "boot_warmup_observed": bool(reply.get("boot_warmup_observed", False)),
+                }
+            except ExecutorGone as exc:
+                outcome = {
+                    "entrypoint": binding.entrypoint,
+                    "outcome": "failed",
+                    "reason": str(exc)[:200],
+                    "boot_warmup_observed": False,
+                }
             outcome["ms"] = round((time.perf_counter() - started) * 1000, 1)
             outcome["demand_evidence"] = False
             self.journal.append("warm", dict(outcome))
             self.warm.append(outcome)
-            self.note("warm", f"{binding.entrypoint}: {outcome['outcome']} ({outcome['ms']} ms)")
+            self.note(
+                "warm",
+                f"{binding.entrypoint}: {outcome['outcome']} ({outcome['ms']} ms) "
+                f"{outcome['reason']}"[:200],
+            )
             if outcome["outcome"] == "failed":
                 self.engine.faults.append(
                     pb.Fault(
@@ -402,7 +395,7 @@ class Supervisor:
                         subject=plan_id,
                         reason="serve_degrade",
                         detail=f"boot warm pass failed for {binding.entrypoint}: "
-                        f"{outcome['reason']} — the worker still serves",
+                        f"{outcome['reason']} - the worker still serves",
                     )
                 )
 
@@ -721,10 +714,6 @@ class Supervisor:
 
     def run(self) -> int:
         """Dial, register, serve, reconnect. The session outlives the connection."""
-        if "journal-enospc" in self.plants:
-            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-            resource.setrlimit(resource.RLIMIT_FSIZE, (self.args.fsize_limit,) * 2)
-            self.note("plant", f"RLIMIT_FSIZE planted at {self.args.fsize_limit} B")
         self.journal.append("session", {"session_id": self.fences.session_id,
                                         "instance_id": self.args.instance_id})
         killed = self.supervision.sweep_orphans()
@@ -800,19 +789,6 @@ class Supervisor:
         )
 
 
-def _surface_of(binding: BindingPlan) -> Any:
-    """The entrypoint's checked surface, for warm synthesis. Read in the SUPERVISOR, which
-    means importing the endpoint module here — weightless by §1.0, and the fence that says
-    so is `scripts/worker-live.py nocuda`: discovery must not pull torch."""
-    from cozy_runtime.internal.discovery import discover
-
-    discovered = discover(Path(binding.project))
-    for surface in discovered.surfaces:
-        if surface.name == binding.entrypoint:
-            return surface
-    return None
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="cozy-runtime worker supervisor (no CUDA)")
     parser.add_argument("--hub", required=True, help="gRPC target, e.g. unix:/path/hub.sock")
@@ -828,10 +804,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
     parser.add_argument("--host-budget", type=int, default=8 << 30)
     parser.add_argument("--pinned-budget", type=int, default=512 << 20)
-    parser.add_argument("--plant", default="")
-    parser.add_argument("--executor-plant", default="")
-    parser.add_argument("--plant-interrupt-at", type=float, default=0.0)
-    parser.add_argument("--fsize-limit", type=int, default=4096)
     parser.add_argument("--no-warm", action="store_true")
     args = parser.parse_args(argv)
     args.instance_id = args.instance_id or f"ins-{uuid.uuid4().hex[:16]}"

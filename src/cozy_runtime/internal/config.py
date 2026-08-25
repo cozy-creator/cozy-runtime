@@ -91,19 +91,6 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
 
 
-def impose_late(name: str, value: str) -> None:
-    """Impose an environment value AFTER process start — always wrong, kept to prove it.
-
-    No ordinary runtime path calls this. It exists because the late-imposition defect
-    (pgw#1640) has to be OBSERVABLE: the CUDA allocator and the driver read their
-    environment once, at init, so a value imposed afterwards changes nothing about the
-    running process while looking exactly like configuration. cr-007's red arm calls this
-    after CUDA init, measures that device visibility did not move, and then observes the
-    typed `env_seal_broken` refusal that `seal_snapshot` makes possible.
-    """
-    os.environ[name] = value
-
-
 _read: bool = False
 
 

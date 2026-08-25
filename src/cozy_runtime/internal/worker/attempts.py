@@ -30,7 +30,8 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,27 @@ def safe(text: str, cap: int = 1024) -> str:
     stripped = _PATHY.sub("<redacted>", text)
     ascii_only = "".join(c if 0x20 <= ord(c) <= 0x7E else "." for c in stripped)
     return ascii_only[:cap]
+
+
+def _features(payload: Mapping[str, Any], entrypoint: str) -> dict[str, Any]:
+    """The request shape the plan is chosen AGAINST, read off the decoded payload.
+
+    Bounded and structural: which fields the caller actually sent, the scalar values that
+    can move demand, and the payload's own size. cr-008b replaces this with the declared
+    normalized feature basis; what must not come back is a "shape" invented from the plan
+    id, which is a fact about the deployment and says nothing about the request.
+    """
+    scalars = {
+        name: value
+        for name, value in sorted(payload.items())
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    return {
+        "entrypoint": entrypoint,
+        "fields": sorted(payload),
+        "scalars": scalars,
+        "payload_bytes": len(canonical.write(dict(payload))),
+    }
 
 
 #: Fields the supervisor structurally CANNOT verify. Named on every terminal that carries
@@ -111,6 +133,7 @@ class Attempt:
     dispatched_at: float = 0.0
     resulted_at: float = 0.0
     replays: int = 0
+    payload: dict[str, Any] = dataclasses_field(default_factory=dict)
     canceling: str = ""
     cancel_started: float = 0.0
     executions: int = 0
@@ -227,7 +250,21 @@ class AttemptEngine:
     # ------------------------------------------------------------------ prepare/accept
 
     def prepare_and_accept(self, attempt: Attempt) -> pb.AttemptAccepted:
-        """PREPARING then ACCEPTED — in that order, and the journal is between them."""
+        """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
+
+            resolve binding -> fetch/verify/decode the payload -> derive REAL features from
+            it -> choose the plan -> prepare the executor -> reserve the envelope -> JOURNAL
+            -> publish AttemptAccepted.
+
+        Everything before the journal either completes or raises a typed PRE-ACCEPT refusal,
+        and the reservation rolls back if the journal cannot commit. The payload is fetched
+        HERE and not at execution time on purpose: a missing, expired or malformed payload
+        must be a refusal the coordinator can read, not an accepted attempt that later dies
+        on a thread with no terminal to show for it.
+
+        Features are derived from the DECODED PAYLOAD. Deriving them from the plan id would
+        be inventing the very input the plan is supposed to be chosen against.
+        """
         serving = attempt.spec.get("serving")
         if serving is None:
             raise AttemptRefusal(
@@ -247,7 +284,23 @@ class AttemptEngine:
         attempt.binding = binding
         attempt.state = "preparing"
 
-        features = {"shape": plan_id[7:15], "entrypoint": binding.entrypoint}
+        try:
+            attempt.payload = self._payload(attempt)
+        except grants.GrantRefusal as exc:
+            raise AttemptRefusal(
+                exc.code,
+                exc.detail,
+                cause=CAUSE.CAUSE_CODE_GRANT_EXPIRED
+                if exc.code in ("grant_expired", "input_absent")
+                else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            ) from exc
+        except (ValueError, OSError) as exc:
+            raise AttemptRefusal(
+                "payload_undecodable",
+                f"the granted payload input is not a JSON object: {exc}",
+                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
+            ) from exc
+        features = _features(attempt.payload, binding.entrypoint)
         try:
             plan = self.chooser.choose(binding, features)
         except PlanRefusal as exc:
@@ -353,7 +406,6 @@ class AttemptEngine:
         attempt.executions += 1
         self.executed += 1
 
-        payload = self._payload(attempt)
         deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
         seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else 600.0
         attempt.dispatched_at = time.perf_counter()
@@ -363,7 +415,7 @@ class AttemptEngine:
                     "cmd": "invoke",
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": attempt.binding.entrypoint,
-                    "payload": payload,
+                    "payload": attempt.payload,
                     "deadline_s": seconds,
                     "boot_warmup": False,
                     "spool": str(spool),
@@ -447,6 +499,19 @@ class AttemptEngine:
                 if outcome["code"] == "deadline"
                 else CAUSE.CAUSE_CODE_CLIENT_CANCEL
             )
+        oversize = int(reply.get("oversize_result_bytes", 0))
+        if oversize:
+            grants.abort_outputs(attempt.spool) if attempt.spool else None
+            return self.terminal(
+                attempt,
+                STATUS.TERMINAL_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                ORIGIN.CAUSE_ORIGIN_RUNTIME,
+                f"result_too_large: the typed result canonicalizes to {oversize} B, over "
+                "the inline door; the blob-receipt branch needs a real write-and-receipt "
+                "transaction and this runtime will not mint a receipt for bytes nobody "
+                "wrote (cr-017 owns that transaction)",
+            )
         manifest, tail_error = self._tail(attempt, reply)
         if tail_error is not None:
             return self.terminal(
@@ -471,7 +536,8 @@ class AttemptEngine:
         """The payload travels as a grant INPUT, fetched supervisor-side under the grant."""
         data = grants.read_input(attempt.grant, "payload", self.authorizer)
         value = json.loads(data)
-        assert isinstance(value, dict)
+        if not isinstance(value, dict):
+            raise ValueError(f"a payload document is an object, not {type(value).__name__}")
         return value
 
     def _tail(
@@ -484,36 +550,41 @@ class AttemptEngine:
         The tail runs SYNCHRONOUSLY with the attempt (launch). Overlapping it with the next
         attempt's GPU work is cr-018's door and is not claimed here.
 
-        Outputs bind to granted destinations BY POSITION, in the author's own registration
-        order — `out.save_*` mints handles from a per-attempt counter, and the grant lists
-        `OutputDestination`s sorted by `output_id`, so the Nth returned asset is the Nth
-        granted destination. An attempt that produced MORE assets than the coordinator
-        granted destinations for is refused whole (it is not a partial success), which is
-        the property that makes "a stale or wrong grant cannot write" hold.
+        Outputs bind to granted destinations by STABLE OUTPUT ID — the result's own field
+        path (`image`, `pair.thumb`, `frames.0`) — with EXACT SET EQUALITY against the
+        grant. Never by list index: two outputs that arrive in a different order must still
+        land in their own destinations, and a position cannot express that. A produced
+        output the coordinator did not grant, or a granted destination the attempt did not
+        fill, refuses the tail WHOLE — an output transaction is not partially successful.
         """
-        rows = reply.get("outputs", ())
+        rows = list(reply.get("outputs", ()))
         spool = attempt.spool
-        if not rows or spool is None:
+        if not rows and not attempt.grant.outputs:
             return None, None
-        if len(rows) > len(attempt.grant.outputs):
+        if spool is None:
+            return None, "the attempt has no spool to read outputs from"
+        produced = {str(row["output_id"]): row for row in rows}
+        granted = {destination.output_id for destination in attempt.grant.outputs}
+        if set(produced) != granted:
             grants.abort_outputs(spool)
             return None, (
-                f"destination_absent: the attempt produced {len(rows)} output(s) and the "
-                f"grant names {len(attempt.grant.outputs)} destination(s); an output the "
-                "coordinator did not grant is unwritable, however the attempt produced it"
+                f"destination_absent: the attempt produced {sorted(produced) or 'nothing'} "
+                f"and the grant names {sorted(granted) or 'nothing'}; an output the "
+                "coordinator did not grant is unwritable however it was produced, and a "
+                "granted destination the attempt never filled is not a success"
             )
         entries = []
         try:
-            for index, row in enumerate(rows):
-                blob = self._blob(spool, str(row["ref"]))
+            for output_id in sorted(produced):
+                row = produced[output_id]
+                blob = self._blob(spool, str(row["asset_ref"]))
                 if blob is None:
-                    return None, f"output {row['ref']} has no bytes in the attempt spool"
+                    return None, (
+                        f"output {output_id} has no bytes in the attempt spool"
+                    )
                 entries.append(
                     grants.write_output(
-                        attempt.grant,
-                        attempt.grant.outputs[index].output_id,
-                        blob.read_bytes(),
-                        self.authorizer,
+                        attempt.grant, output_id, blob.read_bytes(), self.authorizer
                     )
                 )
         except grants.GrantRefusal as exc:
@@ -643,8 +714,12 @@ class AttemptEngine:
         """
         document = reply.get("result") or {}
         data = canonical.write(document)
+        # The DECLARED annotated result surface's identity, computed by the executor from
+        # the endpoint's own schema — never a digest of this particular value, which would
+        # move every request and fence nothing.
+        schema_digest = str(reply.get("result_schema_digest") or canonical.digest(document))
         envelope = pb.ResultEnvelope(
-            result_schema_digest=documents.raw(canonical.digest(document)),
+            result_schema_digest=documents.raw(schema_digest),
             adjustments=[
                 pb.AdjustmentRow(
                     field=row["field"],
@@ -655,17 +730,7 @@ class AttemptEngine:
                 for row in reply.get("adjustments", ())
             ],
         )
-        if len(data) <= 4 * 1024 * 1024:
-            envelope.inline_result = data
-        else:
-            envelope.result_blob.CopyFrom(
-                pb.OutputEntry(
-                    output_id="result",
-                    digest=documents.digest_of(data),
-                    length=len(data),
-                    mime_type="application/json",
-                )
-            )
+        envelope.inline_result = data     # the oversize case never reaches here (§3.4)
         return envelope
 
     def attest(
@@ -801,47 +866,63 @@ class AttemptEngine:
     def recover(self) -> list[pb.ActiveAttempt]:
         """Replay the journal into `recovered_attempts` for the new session's Register.
 
-        A new `session_id` never manufactures absence: everything the journal authorizes is
-        REPORTED FIRST, and the hub closes it before minting any next ordinal. Accepted-but-
-        incomplete rows get a typed ABANDONED terminal and are never re-executed.
+        Two states survive a restart and each becomes a DURABLE, REPLAYABLE TERMINAL here —
+        never a half-built live attempt:
+
+        * a journaled TERMINAL replays verbatim, if and only if the three-authorization rule
+          admits it (persisted assignment, stable `instance_id`, matching execution digest);
+        * an ACCEPTED row with no terminal is accepted-but-incomplete. Its execution context
+          died with the process, so recovery MINTS `ABANDONED/EXECUTOR_INVALIDATED`,
+          journals it, and reports it as terminal-pending-ack. It is never re-executed and
+          it never re-enters `live` as an attempt with no plan and no grant — an attempt
+          object that cannot answer "what would you run" has no business being dispatchable.
+
+        The identity a recovered ABANDONED terminal needs — request id, ordinal, execution
+        digest, instance — is journaled at ACCEPTANCE, before the attempt can start, which
+        is what makes this reconstruction possible without guessing.
         """
         recovered: list[pb.ActiveAttempt] = []
         for (request_id, number), row in self.journal.attempts().items():
             if row["state"] == "closed":
                 continue
             digest = documents.raw(row["exec_spec_digest"])
+            authorized = (
+                row.get("instance_id") == self.instance_id
+                and row.get("exec_spec_digest") == documents.spell(digest)
+            )
+            if not authorized:
+                continue   # the three-authorization rule: unauthorized never replays
             attempt = Attempt(
                 request_id=request_id,
                 attempt=number,
                 digest=digest,
                 spec={},
                 grant=pb.DeliveryGrant(),
+                state="terminal",
             )
             if row["state"] == "terminal":
-                authorized = (
-                    row.get("instance_id") == self.instance_id
-                    and row.get("exec_spec_digest") == documents.spell(digest)
-                )
-                if not authorized:
-                    continue  # the three-authorization rule: unauthorized never replays
-                attempt.state = "terminal"
                 attempt.terminal_id = row["terminal_id"]
                 attempt.terminal_digest = documents.raw(row["terminal_digest"])
                 attempt.terminal_bytes = base64.b64decode(row["terminal_canonical_b64"])
-                state = pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK
             elif row["state"] == "accepted":
-                attempt.state = "accepted"
-                state = pb.AttemptState.ATTEMPT_STATE_RUNNING
+                self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_ABANDONED,
+                    CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
+                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    "accepted-but-incomplete across a control-parent restart: the execution "
+                    "context is gone, so this attempt reports ABANDONED and is never "
+                    "re-executed",
+                )
             else:
                 continue
             self.history[attempt.key()] = attempt
-            self.live[request_id] = attempt
             recovered.append(
                 pb.ActiveAttempt(
                     request_id=request_id,
                     attempt=number,
                     kind=pb.AttemptKind.ATTEMPT_KIND_SERVING,
-                    state=state,
+                    state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
                     exec_spec_digest=digest,
                 )
             )
@@ -866,60 +947,3 @@ class AttemptEngine:
                 )
             )
         return out
-
-
-# --------------------------------------------------------------------------- warm pass
-
-
-@dataclass(slots=True)
-class WarmCase:
-    entrypoint: str
-    outcome: str
-    reason: str
-    payload: dict[str, Any] = field(default_factory=dict)
-    ms: float = 0.0
-
-
-def synthesize(surface: Any, spool: Path) -> tuple[dict[str, Any], str]:
-    """A deterministic, bounded payload at NEUTRAL DEFAULTS, or the reason there is none.
-
-    There is no warmup DSL and there will not be one (§3.3): every knob here would be a
-    second declaration surface that drifts from the schema. What the synthesizer can make it
-    makes — defaults, strings, numbers, booleans, enums, and a real tiny image written into
-    the attempt spool. What it cannot make, it SAYS: a required video has no legal tiny
-    fixture in this release (cr-017 owns the codec plane), so such an entrypoint is
-    `skipped` with the field named, and never `warmed`.
-    """
-    from cozy_runtime.author._walker import MISSING, walk
-
-    payload: dict[str, Any] = {}
-    for node in walk(surface.payload_type):
-        if "." in node.path:
-            continue
-        if node.default is not MISSING or node.optional:
-            continue
-        annotation = node.annotation
-        name = getattr(annotation, "__name__", str(annotation))
-        if name in ("VideoAsset", "AudioAsset"):
-            return {}, f"required {name} field {node.name!r} has no synthesizable fixture"
-        if name == "ImageAsset":
-            path = spool / f"warm-{node.name}.png"
-            path.write_bytes(_tiny_png())
-            payload[node.name] = f"file://{path}"
-        elif name == "str":
-            payload[node.name] = "warm"
-        elif name == "int":
-            payload[node.name] = 1
-        elif name == "float":
-            payload[node.name] = 1.0
-        elif name == "bool":
-            payload[node.name] = False
-        else:
-            return {}, f"required field {node.name!r} of type {name} is not synthesizable"
-    return payload, ""
-
-
-def _tiny_png() -> bytes:
-    from cozy_runtime.author._services import ImageFrame, encode_png
-
-    return encode_png(ImageFrame(8, 8, bytes(8 * 8 * 3)))

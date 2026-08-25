@@ -38,10 +38,16 @@ from typing import Any
 from cozy_runtime.author._errors import Outcome, classify
 from cozy_runtime.author._invoke import Invocation, attempt
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.config import impose_late, seal_snapshot
+from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import Channel, SeamError, connect
+
+#: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
+#: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
+#: cr-007 — the blob-receipt branch needs a real write-and-receipt transaction, and minting
+#: a receipt for bytes nobody wrote is the fabrication class this runtime exists to prevent.
+INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Set by SIGUSR1. THE cooperative-cancel signal: `ctx.raise_if_cancelled()` reads it.
 _CANCEL = False
@@ -97,6 +103,7 @@ class Executor:
         self.poisoned = ""
         self.construction_digest = ""
         self.facts: dict[str, Any] = {}
+        self.schema_digests: dict[str, str] = {}
         self.attempts = 0
 
     # ------------------------------------------------------------------ prepare
@@ -316,6 +323,14 @@ class Executor:
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent()
         self.attempts += 1
+        result_document, outputs, oversize = _serialize_result(envelope)
+        if oversize:
+            # The seam carries CONTROL: an oversized result must not be attempted across it
+            # at all. Only its SIZE crosses, and the supervisor turns that into the typed
+            # `result_too_large` refusal — a frame that blows the cap would kill this
+            # process and turn a contract refusal into an executor fault.
+            result_document = None
+            outputs = []
         # Author code entered, so reuse is poisoned by any non-success — a refusal raised
         # BEFORE entry (schema, bounds, preflight) leaves a Ready executor untouched (§3.1).
         pre_entry = ("invalid_request", "unsupported_input", "default_resolution")
@@ -333,8 +348,9 @@ class Executor:
             "quiescent": quiescent,
             "env_intact": _env_intact(),
             "poisoned": self.poisoned,
-            "outputs": [dict(row) for row in (envelope.outputs if envelope else ())],
-            "result": _result_document(envelope),
+            "outputs": outputs,
+            "result": result_document,
+            "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
                 {
                     "field": row.field,
@@ -344,6 +360,7 @@ class Executor:
                 }
                 for row in (envelope.adjustments if envelope else ())
             ],
+            "oversize_result_bytes": oversize,
             "metrics": {
                 "handler_ms": round(handler_ms, 3),
                 "device_lease_ms": round(lease_ms, 3),
@@ -354,6 +371,59 @@ class Executor:
                 "gpu_count": 1,
             },
         }
+
+    # ------------------------------------------------------------------ warm
+
+    def warm(self, command: dict[str, Any]) -> dict[str, Any]:
+        """One attempted warm case for one entrypoint, through ORDINARY dispatch.
+
+        It runs HERE, in the disposable process, for one reason that is not convenience:
+        synthesizing a payload needs the entrypoint's schema, and reading that schema in the
+        supervisor would mean importing endpoint code into the long-lived no-CUDA process.
+        An endpoint whose module scope touches torch would then contaminate the supervisor
+        forever. The executor already imported it and is already disposable.
+        """
+        from cozy_runtime.internal import schema, warm
+
+        surface = self.surface_names.get(command["entrypoint"])
+        if surface is None:
+            return {"ok": True, "outcome": "skipped",
+                    "reason": f"{command['entrypoint']!r} is not an entrypoint of this release"}
+        spool = Path(command["spool"])
+        payload, reason = warm.synthesize(schema.render(surface.payload_type), spool)
+        if reason:
+            return {"ok": True, "outcome": "skipped", "reason": reason, "payload": {}}
+        reply = self.invoke({**command, "payload": payload, "boot_warmup": True})
+        succeeded = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
+        if succeeded:
+            return {"ok": True, "outcome": "warmed", "reason": "", "payload": payload,
+                    "boot_warmup_observed": bool((reply.get("result") or {}).get("warm")),
+                    "handler_ms": reply.get("metrics", {}).get("handler_ms", 0)}
+        # A failed warm pass NEVER bricks the worker: it is reported and the executor is
+        # left usable, because nothing observed under boot_warmup is correctness evidence.
+        self.poisoned = ""
+        return {
+            "ok": True,
+            "outcome": "failed",
+            "payload": payload,
+            "reason": f"{reply.get('code') or reply['outcome']['code']}: "
+                      f"{(reply.get('detail') or reply['outcome']['message'])[:200]}",
+        }
+
+    def _result_schema_digest(self, surface: Any) -> str:
+        """The identity of the DECLARED annotated result surface — never of the value.
+
+        A digest over the value document would change with every request and would fence
+        nothing; the coordinator needs to know which CONTRACT the bytes satisfy.
+        """
+        from cozy_runtime.internal import schema
+
+        cached = self.schema_digests.get(surface.name)
+        if cached is None:
+            cached = self.schema_digests[surface.name] = canonical.digest(
+                schema.render(surface.result_type)
+            )
+        return cached
 
     def _device(self) -> Any:
         from cozy_runtime.author._context import Device
@@ -387,22 +457,62 @@ class Executor:
         }
 
 
-def _result_document(envelope: Any) -> dict[str, Any] | None:
-    """The typed function result, canonicalized. An asset manifest is never conflated with
-    the return value (§3.4 step 5), so this carries the RESULT only."""
-    if envelope is None:
-        return None
-    from cozy_runtime.author._walker import field_values
+def _serialize_result(envelope: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
+    """Serialize the typed result EXACTLY ONCE, before its types are lost.
 
-    out: dict[str, Any] = {}
-    for name, value in field_values(envelope.result).items():
-        if hasattr(value, "ref"):
-            out[name] = {"asset": value.ref, "digest": value.digest, "bytes": value.size_bytes}
-        elif isinstance(value, (str, int, float, bool)) or value is None:
-            out[name] = value
-        else:
-            out[name] = str(value)
-    return out
+    msgspec encodes the whole annotated result struct — nested structs, lists and all — in
+    one pass, so nothing is stringified on the way out and a nested typed value survives as
+    a typed value. Assets are the one thing that cannot go on the wire as themselves: the
+    hook replaces each with its MANIFEST ROW (`asset_ref`, digest, media type, size), which
+    is exactly what `Asset.row()` already publishes and carries no local path.
+
+    Output identity comes from the result's own FIELD PATH (`image`, `pair.thumb`,
+    `frames.0`) — a stable name the coordinator can grant against. It is never a list index
+    into the grant: two outputs arriving in a different order must still land in their own
+    destinations, and position cannot express that.
+
+    Returns `(document, outputs, oversize_bytes)`; `oversize_bytes` is non-zero when the
+    canonical result exceeds the inline door, which cr-007 REFUSES rather than papering over
+    with a receipt for bytes nobody wrote.
+    """
+    import msgspec
+
+    from cozy_runtime.author._assets import Asset
+
+    if envelope is None:
+        return None, [], 0
+
+    def hook(value: object) -> object:
+        if isinstance(value, Asset):
+            row = value.row()
+            return {
+                "asset_ref": row["ref"],
+                "kind": row["kind"],
+                "media_type": row["media_type"],
+                "size_bytes": row["size_bytes"],
+                "digest": row["digest"],
+            }
+        raise TypeError(f"{type(value).__name__} has no wire spelling in a result")
+
+    document = json.loads(msgspec.json.encode(envelope.result, enc_hook=hook))
+    assert isinstance(document, dict)
+    outputs = sorted(_assets_at(document, ""), key=lambda row: str(row["output_id"]))
+    oversize = len(canonical.write(document))
+    return document, outputs, oversize if oversize > INLINE_RESULT_MAX else 0
+
+
+def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
+    """Every asset node in the serialized result, with the field path that names it."""
+    found: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        if "asset_ref" in node:
+            return [{"output_id": path, **node}]
+        for key, value in node.items():
+            found += _assets_at(value, f"{path}.{key}" if path else str(key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found += _assets_at(value, f"{path}.{index}" if path else str(index))
+    return found
 
 
 # --------------------------------------------------------------------------- main
@@ -412,7 +522,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--root", required=True)
-    parser.add_argument("--plant", default="")
     args = parser.parse_args(argv)
 
     _capture_seal()
@@ -446,17 +555,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.prepare(command)
             elif name == "invoke":
                 reply = executor.invoke(command)
-                if args.plant == "late-env":
-                    # RED ARM: impose after CUDA init. The allocator already read its
-                    # environment, so this changes nothing about the running process —
-                    # which is exactly why the seal check must catch it.
-                    impose_late("CUDA_VISIBLE_DEVICES", "")
-                    reply["late_env_device_count"] = executor.torch.cuda.device_count()
-                    reply["env_intact"] = _env_intact()
-                if args.plant == "unquiesced":
-                    reply["quiescent"] = False
-                if args.plant == "state-seq":
-                    reply["state_seq"] = 1
+            elif name == "warm":
+                reply = executor.warm(command)
             elif name == "probe":
                 reply = executor.probe()
             elif name == "shutdown":

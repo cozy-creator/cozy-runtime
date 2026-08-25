@@ -75,13 +75,6 @@ derive = ["torch>=2.6"]
 corpus = ["torch>=2.6", "diffusers>=0.36"]
 
 [[tool.mypy.overrides]]
-# The live harness plays the COORDINATOR: it subclasses the generated (untyped) gRPC
-# servicer and drives protobuf messages positionally. Checking it against stubs the
-# generated module does not carry produces confident nonsense; it is exercised by RUNNING it.
-module = ["worker-live"]
-ignore_errors = true
-
-[[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.
 module = ["grpc", "grpc.*", "cozy_runtime.protocol.worker_pb2_grpc"]
 ignore_missing_imports = true
