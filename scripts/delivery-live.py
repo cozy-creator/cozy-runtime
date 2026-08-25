@@ -698,9 +698,10 @@ def arms() -> None:
     from cozy_runtime.internal.probe import qualify
     from cozy_runtime.internal.worker.ledger import Ledger
     from cozy_runtime.internal.worker.plan import (
-        BindingPlan,
+        DeclaredBinding,
         PlanChooser,
         PlanRefusal,
+        PreparedGeneration,
         PreparedRequest,
     )
 
@@ -779,11 +780,12 @@ def arms() -> None:
     ledger.device_free = 1 * GIB
     ledger.device_reserved = 0
     ledger.device_allocated = 0
-    binding = BindingPlan.read(
-        dict(binding_record(variants()), delivery_rung="aot_decode", delivery_variant="fp8")
-    )
+    declared = DeclaredBinding.read(binding_record(variants()))
+    # The RESOLVED half is the arm's subject: a generation that chose `aot_decode` on the
+    # fp8 variant. A deployment cannot write it any more, so the harness states it directly.
+    generation = PreparedGeneration(delivery_rung="aot_decode", delivery_variant="fp8")
     chooser = PlanChooser(ledger)
-    good = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
+    good = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))
     original = RUNGS_BY_NAME["staged_decode"]
     RUNGS_BY_NAME["staged_decode"] = type(original)(
         name=original.name,
@@ -795,7 +797,7 @@ def arms() -> None:
         status=original.status,
     )
     try:
-        planted = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
+        planted = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))
         if planted.placement != "component_staged":
             check(
                 "ARM: the plant needs the staged cross to fire",
@@ -812,7 +814,7 @@ def arms() -> None:
         )
     finally:
         RUNGS_BY_NAME["staged_decode"] = original
-    after = chooser.choose(binding, PreparedRequest.unresolved("generate", {}))
+    after = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))
     check(
         "the plant is REMOVED: the same choice is served again",
         after.delivery == good.delivery and after.materialization == good.materialization,

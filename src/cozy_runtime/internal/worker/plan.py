@@ -93,6 +93,9 @@ class AttemptPlan:
     compute_dtype: str
     placement: str
     reserved_vram_bytes: int
+    """The wire's word for the generation's WEIGHT bytes (th-024 owns the field name). It is
+    not the resident set and it is not this attempt's activation envelope — `resident_bytes`
+    and `headroom_bytes` are those, named separately because they are different facts."""
     reserved_host_bytes: int
     reserved_pinned_bytes: int
     headroom_bytes: int
@@ -115,6 +118,10 @@ class AttemptPlan:
     overlay_digest: str = ""
     shape_cell: str = ""
     """The normalized shape cell — the key demand is banked and read per."""
+    model_weight_bytes: int = 0
+    """The generation's weights, resident or parked. What it COSTS to hold this model."""
+    resident_bytes: int = 0
+    """What is on the device right now. A staged rung moves this and never the weights."""
     delivery_variant: str = ""
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a coordinator holds, and two plans that read different artifacts of one model
@@ -139,6 +146,8 @@ class AttemptPlan:
             "preflight_facts_digest": self.preflight_facts_digest,
             "overlay_digest": self.overlay_digest,
             "shape_cell": self.shape_cell,
+            "model_weight_bytes": self.model_weight_bytes,
+            "resident_bytes": self.resident_bytes,
         }
 
     def digest(self) -> str:
@@ -216,46 +225,84 @@ class JobBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class BindingPlan:
-    """The local resolution of one `entrypoint_binding_plan_id`.
+class PreparedGeneration:
+    """What ONE `prepare` RESOLVED. Output only: a deployment never writes any of it.
+
+    It lived on the binding record beside the deployment's own declarations, so one type
+    carried both what was asked for and what came back, and a record could arrive claiming
+    a delivery rung nothing had chosen (codex audit, adopted 2026-08-25). Two types, and
+    the record's closed key set no longer admits a resolved field at all.
+    """
+
+    logical_model_digest: str = ""
+    """The LOGICAL model the fill constructed — identical across every delivery variant."""
+    constructed_generation_digest: str = ""
+    """WHAT WAS BUILT: selected bytes, route, materialization, topology, configuration."""
+    delivery_rung: str = ""
+    """Which `DELIVERY_RUNGS` entry the executor's `DeliveryChooser` took. Empty means
+    `verbatim`."""
+    delivery_variant: str = ""
+    """Which offered variant this generation actually read."""
+    weight_bytes: int = 0
+    """What the fill COMMITTED, measured. Distinct from the deployment's declared
+    `model_weight_bytes` and from the ledger's live resident map — three different facts
+    that were all called some form of "vram bytes"."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredBinding:
+    """What a DEPLOYMENT DECLARES for one `entrypoint_binding_plan_id`. Input only.
 
     The coordinator names the plan by digest and never ships a path; the worker resolves
     that digest against its own records. At launch the record is a small local file staged
     under `<cozy_home>/binding-plans/` — th-004 owns the real EntrypointBindingPlan document
     and tfs-003 the artifact fetch, so this is the SEAM, named, not a pretend hub.
+
+    Every set here is a REAL set: the component order is a tuple, the per-component
+    snapshots are a map, the egress allowlist is a tuple. They arrive comma-packed in the
+    record — a two-sided document whose key names and spellings are cozy-creator's contract
+    as much as this repo's — and `read` unpacks them ONCE, so nothing downstream splits a
+    string again. The singular/plural pairs are gone with them: `component` was the
+    one-element case of `components` and `snapshot` of `snapshots`, and carrying both let
+    them disagree.
     """
 
-    plan_id: str
+    entrypoint_binding_plan_id: str
+    entrypoint: str
     project: str
     model_class: str
-    binding_path: str
-    param: str
-    component: str
+    model_binding_path: str
+    model_parameter_name: str
     store: str
     config: str
-    snapshot: str
     release: str
     variant: str
-    vram_bytes: int
-    host_bytes: int
-    pinned_bytes: int
-    entrypoint: str
-    model_construction_digest: str = ""
-    snapshots: str = ""
-    """Per-component snapshots, as `name=sha256:…` comma-joined. Empty means every
-    component reads the one `snapshot`.
-
-    A read plan is COMPLETE over its header (tfs-007), so a component cannot be read out of
-    a whole-pipeline snapshot without reading the pipeline. Per-component snapshots make a
-    partial fill the store's ordinary complete read; the objects dedup, so it costs nothing.
-    """
-    components: str = ""
-    """The ORDERED component set, comma-joined. Empty means `component` alone.
-
-    Additive on purpose: cozy-creator writes this record (decisions #269, a two-sided closed
-    contract with no fence to hold it), so a field it does not yet write must default to
-    exactly what the single-component record meant.
-    """
+    reference_snapshot: str
+    """The record's own `snapshot`: the artifact its `variant` names, and the fallback for
+    any component the snapshot map omits."""
+    components: tuple[str, ...]
+    """The ORDERED component set this binding constructs."""
+    snapshots: Mapping[str, str]
+    """component -> snapshot digest. A read plan is COMPLETE over its header (tfs-007), so a
+    component cannot be read out of a whole-pipeline snapshot without reading the pipeline;
+    per-component snapshots make a partial fill the store's ordinary complete read, and the
+    objects dedup so it costs nothing."""
+    offered: tuple[Variant, ...]
+    """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
+    empty — a record naming none offers exactly the bytes it already named, and that one IS
+    the reference because there is nothing to compare it against."""
+    objective: str = "latency"
+    """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
+    fidelity`). A deployment property, not a request knob: delivery decides which bytes are
+    resident, so it is chosen once for the generation."""
+    steps_basis: int = 20
+    """The declared step count the `latency` objective prices a per-step cost against. It
+    is a LABEL on the arithmetic, not a claim about any one request."""
+    model_weight_bytes: int = 0
+    """The DECLARED total weight of this model. Not what is resident, and not what an
+    attempt reserves."""
+    host_bytes: int = 0
+    pinned_bytes: int = 0
     vram_floor_bytes: int = 0
     """The PHYSICAL FLOOR the deployment declares: activations + scratch + one component
     chunk. Below it there is no rung, and a local capacity refusal is the honest answer."""
@@ -272,53 +319,23 @@ class BindingPlan:
     extras warn, are ignored and are confessed — §1.1's custody tier)."""
     strict_keys: bool = False
     """`--strict-keys`: a local bind's unknown extras refuse instead of confessing."""
-    variants: tuple[Variant, ...] = ()
-    """cr-008c: the artifact variants this deployment OFFERS for one logical model —
-    encodings of the same topology. Empty means the record offers exactly what `store` and
-    `snapshot` name, which is what every single-variant record already meant."""
-    objective: str = "latency"
-    """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
-    fidelity`). A deployment property, not a request knob: delivery decides which bytes are
-    resident, so it is chosen once for the generation."""
-    steps_basis: int = 20
-    """The declared step count the `latency` objective prices a per-step cost against. It
-    is a LABEL on the arithmetic, not a claim about any one request."""
-    delivery_rung: str = ""
-    """RESOLVED AT PREPARE, never written by the deployment: which `DELIVERY_RUNGS` entry
-    the executor's `DeliveryChooser` took. Empty means `verbatim`."""
-    delivery_variant: str = ""
-    """RESOLVED AT PREPARE: which offered variant the generation actually read."""
-    constructed_generation_digest: str = ""
-    """RESOLVED AT PREPARE: the identity of what was BUILT, selected bytes included. The
-    deployment declares `model_construction_digest` (the logical model) as its fence and
-    never writes this one."""
+    expected_logical_model_digest: str = ""
+    """The deployment's FENCE: the logical model it prices against. A prepare that builds a
+    different one refuses rather than serving it."""
     max_input_bytes: int = 64 << 20
     """cr-012: the DEPLOYMENT's per-input-asset ceiling, checked pre-accept against the
-    grant's declared length. A field's own `AssetBound` narrows it and never widens it, so
-    the two bounds live where their knowledge does: the deployment's here, the endpoint's
-    on the field."""
+    grant's declared length. A field's own `AssetBound` narrows it and never widens it."""
     max_inputs_total_bytes: int = 256 << 20
     """The whole attempt's input budget. Input retention is its own bounded story: inputs
     take no CAS lease and end with the attempt spool."""
-    egress_allowed_hosts: str = ""
-    """Comma-joined hosts this deployment may fetch a remote grant from. EMPTY MEANS NO
-    EGRESS: a `file://` grant needs none, and a deployment that has not declared a host
-    cannot be talked into one at request time."""
+    egress_allowed_hosts: tuple[str, ...] = ()
+    """Hosts this deployment may fetch a remote grant from. EMPTY MEANS NO EGRESS: a
+    `file://` grant needs none, and a deployment that has not declared a host cannot be
+    talked into one at request time."""
 
-    def snapshot_map(self) -> dict[str, str]:
-        """component -> snapshot digest. Absent names fall back to the binding's own."""
-        out: dict[str, str] = {}
-        for pair in self.snapshots.split(","):
-            name, _, digest = pair.partition("=")
-            if name and digest:
-                out[name] = digest
-        return out
-
-    def component_set(self) -> tuple[str, ...]:
-        """The components this binding constructs, in the order it constructs them."""
-        if not self.components:
-            return (self.component,)
-        return tuple(name for name in self.components.split(",") if name)
+    def snapshot_for(self, component: str) -> str:
+        """This component's snapshot, or the binding's own when the map omits it."""
+        return self.snapshots.get(component, self.reference_snapshot)
 
     def construction_key(self) -> str:
         """Two binding plans over the SAME construction share one executor generation.
@@ -335,12 +352,12 @@ class BindingPlan:
             {
                 "store": self.store,
                 "config": self.config,
-                "snapshot": self.snapshot,
+                "snapshot": self.reference_snapshot,
                 "release": self.release,
                 "variant": self.variant,
                 "model_class": self.model_class,
-                "component": self.component,
-                "components": self.components,
+                "components": list(self.components),
+                "snapshots": dict(self.snapshots),
                 "variants": [
                     {
                         "name": v.name,
@@ -349,47 +366,149 @@ class BindingPlan:
                         "snapshots": v.snapshots,
                         "reference": v.reference,
                     }
-                    for v in self.offered()
+                    for v in self.offered
                 ],
                 "objective": self.objective,
             }
         )
 
-    def offered(self) -> tuple[Variant, ...]:
-        """The candidate set, with the single-variant record's implicit one made explicit.
-
-        A record that names no variants offers exactly one — the bytes it already names —
-        and that one IS the reference, because there is nothing to compare it against.
-        """
-        if self.variants:
-            return self.variants
-        return (
-            Variant(
-                name=self.variant or "default",
-                store=self.store,
-                snapshot=self.snapshot,
-                snapshots=self.snapshots,
-                reference=True,
-            ),
-        )
-
     @classmethod
-    def read(cls, record: dict[str, Any]) -> BindingPlan:
-        known = {f for f in cls.__dataclass_fields__}
-        unknown = sorted(set(record) - known)
+    def read(cls, record: Mapping[str, Any]) -> DeclaredBinding:
+        """Unpack ONE binding-plan record. Its key set is CLOSED and its spellings are a
+        two-sided contract with whoever writes it, so the record's names live here and
+        nowhere else — this is the only place in the runtime that knows them."""
+        unknown = sorted(set(record) - RECORD_KEYS)
         if unknown:
             raise PlanRefusal(
                 "binding_plan_unknown_field",
                 f"binding plan record carries {', '.join(unknown)}: the record's key set is "
-                "closed, exactly like the documents it stands in for",
+                "closed, exactly like the documents it stands in for. A prepare-RESOLVED "
+                "fact (a delivery rung, a construction digest) is not a deployment's to "
+                "write at all",
             )
-        data = dict(record)
-        offers = data.get("variants")
-        if offers:
-            data["variants"] = tuple(
-                v if isinstance(v, Variant) else Variant.read(v) for v in offers
+        missing = sorted(RECORD_REQUIRED - set(record))
+        if missing:
+            raise PlanRefusal(
+                "binding_plan_incomplete",
+                f"binding plan record is missing {', '.join(missing)}",
             )
-        return cls(**data)
+        snapshot = str(record["snapshot"])
+        components = _split(str(record.get("components", ""))) or (str(record["component"]),)
+        offered = tuple(
+            v if isinstance(v, Variant) else Variant.read(v) for v in record.get("variants") or ()
+        ) or (
+            Variant(
+                name=str(record.get("variant") or "default"),
+                store=str(record["store"]),
+                snapshot=snapshot,
+                snapshots=str(record.get("snapshots", "")),
+                reference=True,
+            ),
+        )
+        return cls(
+            entrypoint_binding_plan_id=str(record["plan_id"]),
+            entrypoint=str(record["entrypoint"]),
+            project=str(record["project"]),
+            model_class=str(record["model_class"]),
+            model_binding_path=str(record["binding_path"]),
+            model_parameter_name=str(record["param"]),
+            store=str(record["store"]),
+            config=str(record["config"]),
+            release=str(record["release"]),
+            variant=str(record["variant"]),
+            reference_snapshot=snapshot,
+            components=components,
+            snapshots=_pairs(str(record.get("snapshots", ""))),
+            offered=offered,
+            objective=str(record.get("objective", "latency")),
+            steps_basis=int(record.get("steps_basis", 20)),
+            model_weight_bytes=int(record["vram_bytes"]),
+            host_bytes=int(record["host_bytes"]),
+            pinned_bytes=int(record["pinned_bytes"]),
+            vram_floor_bytes=int(record.get("vram_floor_bytes", 0)),
+            resident_budget_bytes=int(record.get("resident_budget_bytes", 0)),
+            tenancy=str(record.get("tenancy", "local")),
+            custody=str(record.get("custody", "canonical")),
+            strict_keys=bool(record.get("strict_keys", False)),
+            expected_logical_model_digest=str(record.get("model_construction_digest", "")),
+            max_input_bytes=int(record.get("max_input_bytes", 64 << 20)),
+            max_inputs_total_bytes=int(record.get("max_inputs_total_bytes", 256 << 20)),
+            egress_allowed_hosts=_split(str(record.get("egress_allowed_hosts", ""))),
+        )
+
+
+#: The binding-plan record's CLOSED key set, in the record's own spellings. Renaming these
+#: is a two-sided change with whoever writes the record (cozy-creator today) and is
+#: scheduled rather than taken: `plan_id`, `binding_path`, `param` and the comma-packed
+#: `components`/`snapshots` become `entrypoint_binding_plan_id`, `model_binding_path`,
+#: `model_parameter_name` and real lists in one coordinated window.
+RECORD_KEYS = frozenset(
+    {
+        "plan_id",
+        "project",
+        "model_class",
+        "binding_path",
+        "param",
+        "component",
+        "components",
+        "store",
+        "config",
+        "snapshot",
+        "snapshots",
+        "release",
+        "variant",
+        "variants",
+        "objective",
+        "steps_basis",
+        "vram_bytes",
+        "host_bytes",
+        "pinned_bytes",
+        "vram_floor_bytes",
+        "resident_budget_bytes",
+        "entrypoint",
+        "model_construction_digest",
+        "tenancy",
+        "custody",
+        "strict_keys",
+        "max_input_bytes",
+        "max_inputs_total_bytes",
+        "egress_allowed_hosts",
+    }
+)
+
+#: What a record cannot leave out. Everything else has a default that MEANS something.
+RECORD_REQUIRED = frozenset(
+    {
+        "plan_id",
+        "project",
+        "model_class",
+        "binding_path",
+        "param",
+        "component",
+        "store",
+        "config",
+        "snapshot",
+        "release",
+        "variant",
+        "vram_bytes",
+        "host_bytes",
+        "pinned_bytes",
+        "entrypoint",
+    }
+)
+
+
+def _split(packed: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in packed.split(",") if part.strip())
+
+
+def _pairs(packed: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in _split(packed):
+        name, _, value = pair.partition("=")
+        if name and value:
+            out[name] = value
+    return out
 
 
 #: The CLOSED, ORDERED placement ladder (§3.2). Delivery is `native` at launch — `aot_decode`
@@ -488,7 +607,7 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ demand
 
-    def demand(self, binding: BindingPlan, prepared: PreparedRequest) -> list[Coefficient]:
+    def demand(self, declared: DeclaredBinding, prepared: PreparedRequest) -> list[Coefficient]:
         """The attempt's byte demand for THIS request's shape, each term declaring how it
         was established. It read a generation-wide activation maximum before and ignored
         the request entirely, which is the same number for every shape a deployment serves
@@ -503,7 +622,7 @@ class PlanChooser:
         terms = [
             Coefficient(
                 "weights",
-                weights or binding.vram_bytes,
+                weights or declared.model_weight_bytes,
                 "ledger" if resident or absent else "bound",
                 "the fill plane's committed destination bytes per component, resident and "
                 "parked alike"
@@ -532,7 +651,12 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ the walk
 
-    def choose(self, binding: BindingPlan, prepared: PreparedRequest) -> AttemptPlan:
+    def choose(
+        self,
+        declared: DeclaredBinding,
+        generation: PreparedGeneration,
+        prepared: PreparedRequest,
+    ) -> AttemptPlan:
         self.choices += 1
         if self.ledger.unreconciled:
             # A CHOOSER MAY NOT PRICE AGAINST A LEDGER THAT IS KNOWN TO BE WRONG. This is the
@@ -557,15 +681,15 @@ class PlanChooser:
                 },
             )
         free_host = self.ledger.host_budget - self.ledger.host_charged
-        if binding.host_bytes > free_host:
+        if declared.host_bytes > free_host:
             raise PlanRefusal(
                 "constraint_infeasible",
-                f"no proven plan fits: host_ram needs {binding.host_bytes} B and "
+                f"no proven plan fits: host_ram needs {declared.host_bytes} B and "
                 f"{free_host} B are free",
                 {
                     "resource": "host_ram",
                     "scope": "plan",
-                    "needed_bytes": binding.host_bytes,
+                    "needed_bytes": declared.host_bytes,
                     "available_bytes": free_host,
                     "evidence_class": "measured",
                 },
@@ -578,7 +702,7 @@ class PlanChooser:
         # coefficient never gets that far (#293, and correctly — it may not refuse). The
         # floor is not a coefficient: it is a DECLARED deployment fact compared against a
         # MEASURED allocatable, so nothing uncalibrated participates in it.
-        floor = binding.vram_floor_bytes
+        floor = declared.vram_floor_bytes
         allocatable_now = self.ledger.allocatable
         # Against the DEEPEST rung's capacity, not against bare allocatable. Once the
         # weights are resident, `allocatable` is only what is left beside them — but the
@@ -604,7 +728,7 @@ class PlanChooser:
                     "evidence_class": "measured",
                 },
             )
-        terms = {c.name: c for c in self.demand(binding, prepared)}
+        terms = {c.name: c for c in self.demand(declared, prepared)}
         resident = self.ledger.resident or {}
         # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
         # rung that wants them resident has to bring every one of them BACK, and the walk
@@ -614,6 +738,7 @@ class PlanChooser:
         absent = self.ledger.evicted or {}
         absent_bytes = sum(absent.values())
         declared_bytes = sum(resident.values()) + absent_bytes
+        weights = declared_bytes or declared.model_weight_bytes
         # `device_allocatable` is what a NEW reservation can actually get. It already
         # accounts for whatever this generation holds, so the ladder's arithmetic is over
         # HEADROOM: what the attempt needs ON TOP of the weights that are already there.
@@ -629,7 +754,7 @@ class PlanChooser:
             sum(sizes.get(name, 0) for name in dict.fromkeys(names))
             for names in self.ledger.declared_scopes.values()
         ]
-        largest = max([max(sizes.values(), default=binding.vram_bytes), *scoped])
+        largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
         rows: list[dict[str, Any]] = []
         chosen = ""
@@ -700,51 +825,58 @@ class PlanChooser:
             "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
             "largest_declared_set_bytes": largest,
             "rungs": rows,
-            "tenancy": binding.tenancy,
+            "tenancy": declared.tenancy,
             "shape_cell": prepared.cell(),
         }
         self.walks.append(walk)
         del self.walks[:-16]
         if not chosen:
-            chosen, confession = self._deepen(binding, activations, allocatable, walk)
+            chosen, confession = self._deepen(declared, activations, allocatable, walk)
         else:
             confession = ""
-        rung = self._delivery(binding, chosen, walk)
+        rung = self._delivery(generation, chosen, walk)
         return AttemptPlan(
             delivery=rung.delivery,
             materialization=rung.materialization,
             compute_dtype="float16",
             placement=chosen,
-            # THE GENERATION'S WEIGHTS, resident or not. A reservation that shrank to
-            # whatever happened to be resident made the plan summary read `vram=167307726B`
-            # for a 6.46 GiB pipeline — the VAE alone — which is the number cl-003 caught the
-            # defect by. What this deployment holds does not change because a rung parked it.
-            reserved_vram_bytes=declared_bytes or binding.vram_bytes,
-            reserved_host_bytes=binding.host_bytes,
-            reserved_pinned_bytes=binding.pinned_bytes,
+            # THREE DIFFERENT FACTS, three names (codex audit, adopted 2026-08-25). The
+            # generation's WEIGHTS resident or not; what is resident RIGHT NOW; and what
+            # this attempt is admitted against. `reserved_vram_bytes` is the wire's word
+            # (th-024's) and keeps its meaning — the weights, because a reservation that
+            # shrank to whatever happened to be resident made the summary read
+            # `vram=167307726B` for a 6.46 GiB pipeline, which is how cl-003 caught the
+            # defect. The other two are named beside it instead of being the same number
+            # read three ways.
+            reserved_vram_bytes=weights,
+            model_weight_bytes=weights,
+            resident_bytes=sum(resident.values()),
+            reserved_host_bytes=declared.host_bytes,
+            reserved_pinned_bytes=declared.pinned_bytes,
             headroom_bytes=activations.value,
-            entrypoint_binding_plan_id=binding.plan_id,
-            model_construction_digest=binding.model_construction_digest,
-            constructed_generation_digest=binding.constructed_generation_digest,
+            entrypoint_binding_plan_id=declared.entrypoint_binding_plan_id,
+            model_construction_digest=generation.logical_model_digest,
+            constructed_generation_digest=generation.constructed_generation_digest,
             request_features_digest=prepared.features_digest,
             preflight_facts_digest=prepared.facts_digest,
             overlay_digest=prepared.overlay_digest,
             shape_cell=prepared.cell(),
-            delivery_variant=binding.delivery_variant,
+            delivery_variant=generation.delivery_variant,
             decision_explanation=(
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
-                f"{binding.delivery_variant or binding.variant or 'default'!r} "
+                f"{generation.delivery_variant or declared.variant or 'default'!r} "
                 f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
                 f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
-                f"{declared_bytes or binding.vram_bytes} B of which {absent_bytes} B is not "
-                f"resident, with "
+                f"{weights} B of which {absent_bytes} B is not resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
                 f"({activations.provenance}); request {prepared.entrypoint} "
                 f"on shape cell {prepared.cell()}{confession}"
             ),
         )
 
-    def _delivery(self, binding: BindingPlan, placement: str, walk: dict[str, Any]) -> Any:
+    def _delivery(
+        self, generation: PreparedGeneration, placement: str, walk: dict[str, Any]
+    ) -> Any:
         """THE CROSS (cr-008c): the resolved delivery rung, crossed with the placement one.
 
         Delivery was chosen ONCE, at prepare, against measured envelopes — this function
@@ -762,7 +894,7 @@ class PlanChooser:
         rather than restated, so a delivery switch arriving as a placement side effect is a
         refusal instead of a silent reinterpretation of the request.
         """
-        name = binding.delivery_rung or "verbatim"
+        name = generation.delivery_rung or "verbatim"
         rung = RUNGS_BY_NAME.get(name)
         if rung is None:
             raise PlanRefusal(
@@ -792,7 +924,7 @@ class PlanChooser:
                 },
             )
         walk["delivery"] = {
-            "variant": binding.delivery_variant,
+            "variant": generation.delivery_variant,
             "rung": crossed.name,
             "delivery": crossed.delivery,
             "materialization": crossed.materialization,
@@ -804,7 +936,7 @@ class PlanChooser:
 
     def _deepen(
         self,
-        binding: BindingPlan,
+        declared: DeclaredBinding,
         activations: Coefficient,
         allocatable: int,
         walk: dict[str, Any],
@@ -833,7 +965,7 @@ class PlanChooser:
                 f"deepen placement (which changes no bits) and it may NOT refuse, so the "
                 f"ladder goes to {deepest} and the first serve banks the measurement"
             )
-        if binding.tenancy == "shared":
+        if declared.tenancy == "shared":
             raise PlanRefusal(
                 "capacity_shortfall",
                 f"no proven rung fits on THIS worker: {activations.value} B of headroom "

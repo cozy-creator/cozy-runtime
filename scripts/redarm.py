@@ -142,9 +142,15 @@ raise SystemExit(
 #: which rung the walk picks and what it refuses.
 LADDER = """
 from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    PlanChooser,
+    PreparedGeneration,
+    PreparedRequest,
+)
 
-FEATURES = {"entrypoint": "generate", "scalars": {"steps": 20}, "fields": [], "payload_bytes": 64}
+REQUEST = PreparedRequest.unresolved("generate", {"steps": 20})
+GENERATION = PreparedGeneration()
 ledger = Ledger(host_budget=8 << 30, pinned_budget=512 << 20)
 ledger.resident = {"unet": 5_134_927_368, "vae": 167_307_726}
 ledger.device_free = 878_733_824
@@ -162,7 +168,11 @@ def binding(**over):
         pinned_bytes=256 << 20, entrypoint="generate",
     )
     row.update(over)
-    return BindingPlan(**row)
+    return DeclaredBinding.read(row)
+
+
+def choose(**over):
+    return chooser.choose(binding(**over), GENERATION, REQUEST)
 """
 
 LIVE_ARMS = (
@@ -222,18 +232,18 @@ LIVE_ARMS = (
     ),
     (
         "uncalibrated-cannot-refuse",
-        LADDER + "plan = chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        LADDER + "plan = choose(tenancy='local')\n"
         "assert plan.placement == 'component_staged', plan.placement\n"
         "raise SystemExit('an uncalibrated coefficient DEEPENED to ' + plan.placement +\n"
-        "    ' and refused nothing: ' + plan.quantified_choice[-140:])\n",
+        "    ' and refused nothing: ' + plan.decision_explanation[-140:])\n",
         "an uncalibrated coefficient DEEPENED",
     ),
     (
         "shared-tenancy-reschedules",
         LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
-        "ledger.activations_peak = 8 << 30\n"
+        "ledger.activations_by_cell = {REQUEST.cell(): 8 << 30}\n"
         "try:\n"
-        "    chooser.choose(binding(tenancy='shared'), FEATURES)\n"
+        "    choose(tenancy='shared')\n"
         "except PlanRefusal as exc:\n"
         "    assert exc.code == 'capacity_shortfall', exc.code\n"
         "    assert exc.shortfall['scope'] == 'worker', exc.shortfall\n"
@@ -243,9 +253,9 @@ LIVE_ARMS = (
     (
         "local-floor-exits-quantified",
         LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
-        "ledger.activations_peak = 8 << 30\n"
+        "ledger.activations_by_cell = {REQUEST.cell(): 8 << 30}\n"
         "try:\n"
-        "    chooser.choose(binding(tenancy='local', vram_floor_bytes=64 << 30), FEATURES)\n"
+        "    choose(tenancy='local', vram_floor_bytes=64 << 30)\n"
         "except PlanRefusal as exc:\n"
         "    assert exc.code == 'capacity_floor', exc.code\n"
         "    raise SystemExit(exc.detail[:220])\n",
@@ -253,9 +263,9 @@ LIVE_ARMS = (
     ),
     (
         "local-capacity-never-refuses-above-the-floor",
-        LADDER + "ledger.activations_peak = 8 << 30\n"
-        "plan = chooser.choose(binding(tenancy='local', vram_floor_bytes=1 << 20), FEATURES)\n"
-        "raise SystemExit('DEGRADED rather than refused: ' + plan.quantified_choice[-150:])\n",
+        LADDER + "ledger.activations_by_cell = {REQUEST.cell(): 8 << 30}\n"
+        "plan = choose(tenancy='local', vram_floor_bytes=1 << 20)\n"
+        "raise SystemExit('DEGRADED rather than refused: ' + plan.decision_explanation[-150:])\n",
         "DEGRADED",
     ),
     # The two arms cl-003's second-1024px defect earned. Both are pure arithmetic over a
@@ -266,7 +276,7 @@ LIVE_ARMS = (
         LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
         "ledger.unreconciled = 'device_allocated: +67108864 B unaccounted across the attempt'\n"
         "try:\n"
-        "    chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        "    choose(tenancy='local')\n"
         "except PlanRefusal as exc:\n"
         "    assert exc.code == 'ledger_unreconciled', exc.code\n"
         "    raise SystemExit(exc.detail[:220])\n",
@@ -284,11 +294,11 @@ LIVE_ARMS = (
         "ledger.device_free = 7_424_000_000\n"
         "ledger.device_allocated = 175_839_744\n"
         "ledger.device_reserved = 200_000_000\n"
-        "plan = chooser.choose(binding(tenancy='local'), FEATURES)\n"
+        "plan = choose(tenancy='local')\n"
         "row = next(r for r in chooser.walks[-1]['rungs'] if r['rung'] == 'all_resident')\n"
         "assert row['absent_bytes'] == 6_770_368_008, row\n"
         "assert row['verdict'] == 'short', row\n"
-        "assert plan.placement == 'component_staged', plan.quantified_choice\n"
+        "assert plan.placement == 'component_staged', plan.decision_explanation\n"
         "assert plan.reserved_vram_bytes == 6_937_675_734, plan.reserved_vram_bytes\n"
         "raise SystemExit('priced the absent weights: all_resident needs ' +\n"
         "    str(row['needs_bytes']) + ' B (of which ' + str(row['absent_bytes']) +\n"

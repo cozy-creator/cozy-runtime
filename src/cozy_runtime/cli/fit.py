@@ -29,9 +29,10 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
-    BindingPlan,
+    DeclaredBinding,
     PlanChooser,
     PlanRefusal,
+    PreparedGeneration,
     PreparedRequest,
 )
 
@@ -158,14 +159,16 @@ def _verdict(
     ledger.device_total = facts.vram_total_bytes
     share = installed.bytes // max(len(installed.components), 1)
     ledger.resident = dict.fromkeys(installed.components, share)
-    plan = BindingPlan.read(dict(record))
+    declared = DeclaredBinding.read(dict(record))
     chooser = PlanChooser(ledger)
     # `fit` prices a HYPOTHETICAL: there is no endpoint process to prepare the request, so
     # the shape axes are normalized from the document by the one normalizer and the record
     # says out loud that nothing resolved it (its digests are empty).
     request = PreparedRequest.unresolved(surface.name, _axes(surface, document))
     try:
-        chosen = chooser.choose(plan, request)
+        # NOTHING PREPARED THIS: `fit` estimates before any executor exists, so the
+        # resolved half is empty and the estimate says so through the plan document.
+        chosen = chooser.choose(declared, PreparedGeneration(), request)
     except PlanRefusal as exc:
         return {
             "function": surface.name,

@@ -57,7 +57,12 @@ from cozy_runtime.internal.worker.attempts import (
 from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.control import Coordinator, GrpcCoordinator, Link, LinkError
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
-from cozy_runtime.internal.worker.plan import BindingPlan, JobBinding, PlanChooser
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    JobBinding,
+    PlanChooser,
+    PreparedGeneration,
+)
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -159,7 +164,10 @@ class Supervisor:
             cozy_home=config.cozy_home,
         )
         self.chooser = PlanChooser(self.ledger)
-        self.bindings: dict[str, BindingPlan] = {}
+        self.bindings: dict[str, DeclaredBinding] = {}
+        #: plan id -> what THIS worker's `prepare` resolved for it. Kept apart from the
+        #: declaration above because a deployment writes one and never the other.
+        self.generations: dict[str, PreparedGeneration] = {}
         #: job_descriptor_id -> the local job plan record. A JOB directive fills this and
         #: leaves `bindings` empty: the two modes are alternatives, never a union.
         self.jobs: dict[str, JobBinding] = {}
@@ -176,6 +184,7 @@ class Supervisor:
             supervision=self.supervision,
             authorizer=self.authorizer,
             bindings={},
+            generations={},
             jobs={},
             spool_root=self.root / "spool",
             scratch_root=self.root.parent / "scratch",
@@ -396,6 +405,7 @@ class Supervisor:
             return
 
         self.bindings = {}
+        self.generations = {}
         # SYMMETRIC with `apply_job_directive` clearing `bindings`. A serving directive
         # replaces the job lane too: leaving a previous revision's job plans behind would
         # leave the worker advertising job capacity it will not honour, and "complete
@@ -414,19 +424,14 @@ class Supervisor:
                     )
                 )
                 continue
-            self.bindings[plan_id] = BindingPlan.read(json.loads(record.read_text()))
+            self.bindings[plan_id] = DeclaredBinding.read(json.loads(record.read_text()))
         self.engine.bindings = self.bindings
         # cr-012: the EGRESS boundary is a deployment fact, rebuilt from the applied
         # directive's bindings and from nothing else. A revision that names no host leaves
         # it empty, which means no egress — the fail-closed state is the default state, and
         # nothing at request time can widen it.
         hosts = sorted(
-            {
-                host.strip()
-                for binding in self.bindings.values()
-                for host in binding.egress_allowed_hosts.split(",")
-                if host.strip()
-            }
+            {host for binding in self.bindings.values() for host in binding.egress_allowed_hosts}
         )
         self.engine.egress = egress.EgressPolicy(
             allowed_hosts=tuple(hosts),
@@ -450,7 +455,9 @@ class Supervisor:
         declares one) happens after acceptance, bounded by the attempt deadline (cr-009).
         """
         self.bindings = {}
+        self.generations = {}
         self.engine.bindings = {}
+        self.engine.generations = {}
         self.jobs = {}
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
@@ -514,7 +521,7 @@ class Supervisor:
                 f"oom_score_adj={executor.hello.get('oom_score_adj')}, "
                 f"torch_loaded={executor.hello.get('torch_loaded')})",
             )
-        by_construction: dict[str, list[BindingPlan]] = {}
+        by_construction: dict[str, list[DeclaredBinding]] = {}
         for binding in self.bindings.values():
             by_construction.setdefault(binding.construction_key(), []).append(binding)
         for group in by_construction.values():
@@ -523,7 +530,7 @@ class Supervisor:
             # The LOAD leg gets a liveness subject and `started` at position 0. There is no
             # boot timeout here and there will not be one: a multi-GB load is slow, and the
             # only honest question is whether its integral-MiB position is still moving.
-            subject = f"prepare:{first.component}"
+            subject = f"prepare:{first.components[0]}"
             self.monitor.start(subject, "load")
             reply = executor.call(
                 {
@@ -531,14 +538,14 @@ class Supervisor:
                     "binding": {
                         "project": first.project,
                         "model_class": first.model_class,
-                        "binding_path": first.binding_path,
-                        "param": first.param,
-                        "component": first.component,
-                        "components": list(first.component_set()),
-                        "snapshots": first.snapshot_map(),
+                        "binding_path": first.model_binding_path,
+                        "param": first.model_parameter_name,
+                        "component": first.components[0],
+                        "components": list(first.components),
+                        "snapshots": dict(first.snapshots),
                         "store": first.store,
                         "config": first.config,
-                        "snapshot": first.snapshot,
+                        "snapshot": first.reference_snapshot,
                         "release": first.release,
                         "variant": first.variant,
                         "custody": first.custody,
@@ -552,13 +559,13 @@ class Supervisor:
                         # where the device and the capability table live — this process
                         # never imports torch — and it comes back on the reply as a fact
                         # this supervisor journals and reports.
-                        "variants": [dataclasses.asdict(offer) for offer in first.offered()],
+                        "variants": [dataclasses.asdict(offer) for offer in first.offered],
                         "objective": first.objective,
                         "steps_basis": first.steps_basis,
                         "delivery_cache": str(self.config.cozy_home / "probe"),
                     },
                     "budgets": {
-                        "vram": first.vram_bytes,
+                        "vram": first.model_weight_bytes,
                         "pinned": first.pinned_bytes,
                         # The DECLARED construction ceiling. Components past it are PARKED
                         # and staged in on first declared use; 0 means every component
@@ -566,7 +573,7 @@ class Supervisor:
                         # it reproduces; the attempt-time ladder is what reads measurement.
                         "resident": first.resident_budget_bytes,
                     },
-                    "expect_construction_digest": first.model_construction_digest,
+                    "expect_construction_digest": first.expected_logical_model_digest,
                 },
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(
@@ -580,7 +587,7 @@ class Supervisor:
                     "load",
                     "refused",
                     took,
-                    component=first.component,
+                    component=first.components[0],
                     code=str(reply.get("code")),
                 )
                 detail = str(reply.get("detail"))[:1024]
@@ -600,7 +607,7 @@ class Supervisor:
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=first.plan_id,
+                        subject=first.entrypoint_binding_plan_id,
                         reason=str(reply.get("code")),
                         detail=detail,
                     )
@@ -613,7 +620,8 @@ class Supervisor:
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.note(
                     "boot",
-                    f"prepare REFUSED for {first.plan_id[:20]}: {reply.get('code')} - "
+                    f"prepare REFUSED for {first.entrypoint_binding_plan_id[:20]}: "
+                    f"{reply.get('code')} - "
                     f"peak allocator {reply.get('peak_allocator_bytes', 0)} B / ledger "
                     f"{reply.get('peak_ledger_vram_bytes', 0)} B was LIVE when it failed; "
                     f"after rollback the allocator holds "
@@ -628,21 +636,26 @@ class Supervisor:
             # PlanChooser reads these two fields and structurally cannot re-choose, which
             # is what keeps a delivery switch from arriving as a placement side effect.
             delivery = reply.get("delivery") or {}
+            resolved = PreparedGeneration(
+                logical_model_digest=digest,
+                constructed_generation_digest=str(reply["constructed_generation_digest"]),
+                delivery_rung=str(delivery.get("rung", "")),
+                delivery_variant=str(delivery.get("variant", "")),
+                weight_bytes=int(reply["facts"]["filled_bytes"]),
+            )
             for binding in group:
-                if binding.model_construction_digest and (
-                    binding.model_construction_digest != digest
+                if binding.expected_logical_model_digest and (
+                    binding.expected_logical_model_digest != digest
                 ):
-                    self.note("boot", f"{binding.plan_id[:20]}… construction digest mismatch")
+                    self.note(
+                        "boot",
+                        f"{binding.entrypoint_binding_plan_id[:20]}… construction digest mismatch",
+                    )
                     continue
-                executor.ready_plans.add(binding.plan_id)
-                self.bindings[binding.plan_id] = dataclasses.replace(
-                    binding,
-                    model_construction_digest=digest,
-                    constructed_generation_digest=str(reply["constructed_generation_digest"]),
-                    delivery_rung=str(delivery.get("rung", "")),
-                    delivery_variant=str(delivery.get("variant", "")),
-                )
+                executor.ready_plans.add(binding.entrypoint_binding_plan_id)
+                self.generations[binding.entrypoint_binding_plan_id] = resolved
             self.engine.bindings = self.bindings
+            self.engine.generations = self.generations
             # The generation's RESIDENT BASELINE enters the ledger here: the destinations the
             # fill actually committed, the allocator's live bytes behind them, and the ring's
             # page-locked PEAK (a closed ring has charged nothing while the budget it held is
@@ -654,7 +667,7 @@ class Supervisor:
                 "load",
                 "filled",
                 took,
-                component=first.component,
+                component=first.components[0],
                 destinations=int(reply["facts"]["filled"]),
                 bytes=int(reply["facts"]["filled_bytes"]),
                 fill_ms=float(reply["facts"]["fill_ms"]),

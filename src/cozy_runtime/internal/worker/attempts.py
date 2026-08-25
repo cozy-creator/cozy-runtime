@@ -45,9 +45,10 @@ from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
 from cozy_runtime.internal.worker.plan import (
     AttemptPlan,
-    BindingPlan,
+    DeclaredBinding,
     JobBinding,
     PlanRefusal,
+    PreparedGeneration,
     PreparedRequest,
 )
 from cozy_runtime.protocol import documents
@@ -166,7 +167,9 @@ class AttemptRecord:
     spec: dict[str, Any]
     grant: pb.DeliveryGrant
     plan: AttemptPlan | None = None
-    binding: BindingPlan | None = None
+    declared: DeclaredBinding | None = None
+    #: what THIS worker's prepare resolved for that binding — never what it declared
+    generation: PreparedGeneration | None = None
     kind: str = "serving"
     """`serving` or `job`. It SURVIVES compaction, because what an attempt was is still a
     fact about it after its heavy state is gone — the run-once recycle disposition and the
@@ -249,7 +252,8 @@ class AttemptRecord:
         self.grant = pb.DeliveryGrant()
         self.plan = None
         self.prepared = None
-        self.binding = None
+        self.declared = None
+        self.generation = None
         self.job = None
         self.trees = {}
         self.inputs = {}
@@ -290,7 +294,8 @@ class AttemptEngine:
         chooser: Any,
         supervision: ExecutorSupervision,
         authorizer: grants.Authorizer,
-        bindings: Mapping[str, BindingPlan],
+        bindings: Mapping[str, DeclaredBinding],
+        generations: Mapping[str, PreparedGeneration],
         jobs: Mapping[str, JobBinding],
         spool_root: Path,
         scratch_root: Path,
@@ -308,6 +313,7 @@ class AttemptEngine:
         self.supervision = supervision
         self.authorizer = authorizer
         self.bindings = dict(bindings)
+        self.generations = dict(generations)
         self.jobs = dict(jobs)
         self.spool_root = spool_root
         #: Where a RUN's scratch lives. Deliberately OUTSIDE the journal root: §8 lets a
@@ -539,7 +545,7 @@ class AttemptEngine:
         )
 
     def _prepare_request(
-        self, attempt: AttemptRecord, executor: Any, binding: BindingPlan
+        self, attempt: AttemptRecord, executor: Any, declared: DeclaredBinding
     ) -> PreparedRequest:
         """Resolve the request in the executor, and hold what a plan can be priced against.
 
@@ -557,7 +563,7 @@ class AttemptEngine:
                 {
                     "cmd": "prepare_request",
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
-                    "entrypoint": binding.entrypoint,
+                    "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
                 },
                 timeout=None,
@@ -580,7 +586,7 @@ class AttemptEngine:
             )
         return PreparedRequest(
             request_id=f"{attempt.request_id}#{attempt.attempt}",
-            entrypoint=binding.entrypoint,
+            entrypoint=declared.entrypoint,
             features={str(k): int(v) for k, v in (reply.get("features") or {}).items()},
             features_digest=str(reply.get("features_digest", "")),
             overlay_digest=str(reply.get("overlay_digest", "")),
@@ -599,7 +605,7 @@ class AttemptEngine:
         spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
-        binding = attempt.binding
+        binding = attempt.declared
         try:
             attempt.inputs = grants.hydrate_inputs(
                 attempt.grant,
@@ -753,14 +759,16 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
         plan_id = serving["entrypoint_binding_plan_id"]
-        binding = self.bindings.get(plan_id)
-        if binding is None:
+        declared = self.bindings.get(plan_id)
+        generation = self.generations.get(plan_id)
+        if declared is None or generation is None:
             raise AttemptRefusal(
                 "unknown_binding_plan",
                 f"no EntrypointBindingPlan {plan_id[:24]}… is bound on this worker",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        attempt.binding = binding
+        attempt.declared = declared
+        attempt.generation = generation
         attempt.state = "preparing"
 
         self._fetch_payload(attempt)
@@ -793,10 +801,10 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
 
-        prepared = self._prepare_request(attempt, executor, binding)
+        prepared = self._prepare_request(attempt, executor, declared)
         attempt.prepared = prepared
         try:
-            plan = self.chooser.choose(binding, prepared)
+            plan = self.chooser.choose(declared, generation, prepared)
         except PlanRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -1116,7 +1124,7 @@ class AttemptEngine:
     def _subject(attempt: AttemptRecord) -> str:
         if attempt.job is not None:
             return attempt.job.job
-        return attempt.binding.entrypoint if attempt.binding else ""
+        return attempt.declared.entrypoint if attempt.declared else ""
 
     def _command(
         self, attempt: AttemptRecord, key: str, spool: Path, seconds: float
@@ -1139,11 +1147,11 @@ class AttemptEngine:
                     "cap_micro_usd": attempt.job.cap_micro_usd,
                 },
             }
-        assert attempt.binding is not None and attempt.plan is not None
+        assert attempt.declared is not None and attempt.plan is not None
         return {
             "cmd": "invoke",
             "request_id": key,
-            "entrypoint": attempt.binding.entrypoint,
+            "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
             "boot_warmup": False,
             "spool": str(spool),
@@ -1162,7 +1170,7 @@ class AttemptEngine:
                 }
                 for input_id, granted in attempt.inputs.items()
             },
-            "max_input_bytes": attempt.binding.max_input_bytes,
+            "max_input_bytes": attempt.declared.max_input_bytes,
         }
 
     def _finish(
@@ -1415,7 +1423,7 @@ class AttemptEngine:
                 f"{row.get('field')}: requested {row.get('requested')}, served "
                 f"{row.get('applied')} - {row.get('reason')}",
             )
-        plan_id = attempt.binding.plan_id if attempt.binding else ""
+        plan_id = attempt.declared.entrypoint_binding_plan_id if attempt.declared else ""
         why = self.degraded.get(plan_id)
         if why:
             attempt.confess(
@@ -1550,12 +1558,12 @@ class AttemptEngine:
             build_id=(
                 attempt.job.build_id
                 if attempt.job is not None
-                else (attempt.binding.release if attempt.binding else "")
+                else (attempt.declared.release if attempt.declared else "")
             ),
             subject_id=(
                 attempt.job.job_descriptor_id
                 if attempt.job is not None
-                else (attempt.binding.plan_id if attempt.binding else "")
+                else (attempt.declared.entrypoint_binding_plan_id if attempt.declared else "")
             ),
             request_id=attempt.request_id,
             attempt=attempt.attempt,
@@ -1690,7 +1698,7 @@ class AttemptEngine:
                 "executor_incarnation": self.supervision.incarnation,
                 "readiness_epoch": self.supervision.readiness_epoch,
                 "exec_spec_digest": documents.spell(attempt.digest),
-                "entrypoint": attempt.binding.entrypoint if attempt.binding else "",
+                "entrypoint": attempt.declared.entrypoint if attempt.declared else "",
                 "executions": attempt.executions,
                 "replays": attempt.replays,
             },
