@@ -539,7 +539,22 @@ class StreamingFillBackend:
                 want = sum(t.numel() * t.element_size() for _, t in _tensors(member))
                 self.ledger.grant({"vram": want}, f"component {name!r} destinations")
                 self.vram_charge[name] = want
-                member.to_empty(device=self.device, recurse=True)
+                try:
+                    member.to_empty(device=self.device, recurse=True)
+                except BaseException:
+                    # RESERVATION IS A TRANSACTION TOO. `to_empty` on a 4.78 GiB component
+                    # can run out of device memory halfway, and the half it moved is held by
+                    # the module — not by `components` (set below) and not by `enqueued`
+                    # (the fill has not run). Nothing else would ever free it, so the worker
+                    # would sit on gigabytes it can never use until the process died, while
+                    # reporting a rollback that returned them. Measured: two concurrent
+                    # residents on one 8 GiB card left 2,345,812,992 B held after the
+                    # refusal. Same lesson as cr-005's finding 3, a different loop: release
+                    # is a POSITIVE ACT.
+                    self._free_storages(t for _, t in _tensors(member))
+                    member.to_empty(device=self.torch.device("meta"), recurse=True)
+                    self.ledger.release({"vram": self.vram_charge.pop(name, 0)})
+                    raise
                 self.components[name] = member
             # Inside the placement window too: censusing a REAL module detaches every
             # tensor, and a detach on cuda is exactly the "real allocation during
