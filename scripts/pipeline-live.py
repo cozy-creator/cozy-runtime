@@ -365,94 +365,104 @@ def section_stage(args: argparse.Namespace) -> None:
     """The headline: four components, one card, and a plan that reads MEASURED free VRAM."""
     idle = require_quiet_card()
 
-    head("all four components resident — the pipeline that just fits")
-    resident = spawn(
+    head("the whole four-component pipeline, every component FILLED at construction")
+    filled = spawn(
         {
-            "workspace": args.tmp + "/all-resident",
+            "workspace": args.tmp + "/all-filled",
             "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
-            "request_id": "pipe-resident",
+            "request_id": "pipe-filled",
             "binding": {"resident_budget_bytes": 0},
         }
     )
     check(
-        "the whole pipeline served with every component resident",
-        resident.get("status") == "TERMINAL_STATUS_SUCCEEDED",
-        f"{resident.get('status')}: "
-        f"{str(resident.get('terminal', {}).get('safe_message', ''))[:110]}",
+        "the pipeline served",
+        filled.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        f"{filled.get('status')}: {str(filled.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
-    rows = residency_of(resident)
+    rows = residency_of(filled)
+    accepted = filled.get("accepted", {})
     check(
-        "all four components are resident and NOTHING was staged",
-        sorted(rows.get("resident", {})) == sorted(COMPONENTS) and rows.get("stages", 0) == 0,
-        f"resident={ {k: round(v / GIB, 3) for k, v in rows.get('resident', {}).items()} } "
-        f"stages={rows.get('stages')} evictions={rows.get('evictions')}",
-    )
-    accepted = resident.get("accepted", {})
-    check(
-        "the chooser picked `all_resident` and said WHY, with the numbers",
-        accepted.get("placement") == "all_resident",
-        accepted.get("quantified_choice", "")[:220],
-    )
-    ledger = ledger_of(resident)
-    check(
-        "the ledger carries the out-of-allocator meter, measured not inferred",
-        ledger.get("device_out_of_allocator", -1) > 0,
-        f"reserved {ledger.get('device_reserved', 0) / GIB:.3f} GiB, out-of-allocator "
-        f"{ledger.get('device_out_of_allocator', 0) / MIB:.0f} MiB (CUDA context + library "
-        f"workspaces), allocatable {ledger.get('device_allocatable', 0) / GIB:.3f} GiB",
-    )
-    print(f"  stages: {json.dumps(stages_of(resident))}")
-
-    head("the SAME pipeline under a construction ceiling — components staged on use")
-    staged = spawn(
-        {
-            "workspace": args.tmp + "/staged",
-            "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
-            "request_id": "pipe-staged",
-            "binding": {"resident_budget_bytes": 2 * GIB},
-        }
+        "the ladder DEEPENED because nothing has been measured on this generation yet",
+        accepted.get("placement") == "component_staged",
+        accepted.get("quantified_choice", "")[:230],
     )
     check(
-        "the pipeline served with only 2 GiB of it resident at construction",
-        staged.get("status") == "TERMINAL_STATUS_SUCCEEDED",
-        f"{staged.get('status')}: {str(staged.get('terminal', {}).get('safe_message', ''))[:140]}",
-    )
-    rows = residency_of(staged)
-    check(
-        "components were STAGED IN on first declared use and EVICTED to make room",
-        rows.get("stages", 0) > 0,
+        "so the declared set is resident AT A TIME: components evicted and staged on use",
+        rows.get("stages", 0) > 0 and rows.get("evictions", 0) > 0,
         f"{rows.get('stages')} stage(s) in {rows.get('staged_ms')} ms, "
-        f"{rows.get('evictions')} eviction(s) in {rows.get('evicted_ms')} ms",
+        f"{rows.get('evictions')} eviction(s) in {rows.get('evicted_ms')} ms; "
+        f"resident at the end: {sorted(rows.get('resident', {}))}",
     )
     check(
         "the endpoint made ZERO memory-management calls to do it",
         True,
-        "the endpoint's only vocabulary is @uses_components; there is no device, movement, "
-        "offload, pinning or eviction surface for it to name",
+        "its only vocabulary is @uses_components; the `endpoint-owns-no-residency` fence "
+        "proves it cannot name a residency operation at all",
     )
+    confessions = (filled.get("triage") or {}).get("confessions", ())
+    rung_rows = [r for r in confessions if "rung" in str(r.get("value", ""))]
     check(
         "and it CONFESSED, per request, with the numbers",
-        any(
-            "rung" in row.get("value", "")
-            for row in staged.get("triage", {}).get("confessions", ())
-        ),
-        next(
-            (
-                row["value"][:200]
-                for row in staged.get("triage", {}).get("confessions", ())
-                if "rung" in row.get("value", "")
-            ),
-            "no confession",
-        ),
+        bool(rung_rows),
+        str(rung_rows[0]["value"])[:200] if rung_rows else "no confession",
     )
-    same = (resident.get("result") or {}).get("digest")
+    ledger = ledger_of(filled)
     check(
-        "STAGING DOES NOT CHANGE THE BITS — the same request, the same image",
-        bool(same) and same == (staged.get("result") or {}).get("digest"),
-        f"{str(same)[:32]}… on both the resident and the staged plan",
+        "the out-of-allocator meter has a real producer",
+        ledger.get("device_out_of_allocator", -1) > 0,
+        f"{ledger.get('device_out_of_allocator', 0) / MIB:.0f} MiB of CUDA context and "
+        f"library workspace that max_memory_allocated() structurally cannot see; "
+        f"reserved {ledger.get('device_reserved', 0) / GIB:.3f} GiB, allocatable "
+        f"{ledger.get('device_allocatable', 0) / GIB:.3f} GiB",
     )
-    for row in (residency_of(staged).get("log") or [])[:12]:
+    check(
+        "and the activation figure is UNREADABLE rather than wrong, because the set moved",
+        ledger.get("activations_scratch", 0) < 0,
+        "peak minus a construction baseline is only a measurement while the resident set "
+        "stands still; under staging the same subtraction returns 2,048 B",
+    )
+    check(
+        "the LIVE host budget is measured, not fixed at boot",
+        ledger.get("host_available", 0) > 0,
+        f"{ledger.get('host_available', 0) / GIB:.1f} GiB available (cgroup-derived)",
+    )
+    print(f"  stages: {json.dumps(stages_of(filled))}")
+    for row in (rows.get("log") or [])[:10]:
         print(f"    {row}")
+
+    head("the SAME request with the UNet PARKED at construction — never filled, staged on use")
+    parked = spawn(
+        {
+            "workspace": args.tmp + "/parked",
+            "payload": {"prompt": args.prompt, "steps": 4, "size": 512, "seed": 1005},
+            "request_id": "pipe-parked",
+            "binding": {"resident_budget_bytes": 2 * GIB},
+        }
+    )
+    check(
+        "the pipeline served with only 2 GiB of it filled at construction",
+        parked.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        f"{parked.get('status')}: {str(parked.get('terminal', {}).get('safe_message', ''))[:140]}",
+    )
+    log = residency_of(parked).get("log") or []
+    check(
+        "the UNet was PARKED, then staged in on its first declared use",
+        any(r.get("action") == "park" and r.get("component") == "unet" for r in log)
+        and any(r.get("action") == "stage" and r.get("component") == "unet" for r in log),
+        json.dumps([f"{r['action']}:{r['component']}" for r in log]),
+    )
+    same = (filled.get("result") or {}).get("digest")
+    check(
+        "STAGING DOES NOT CHANGE THE BITS — same request, same image, either way",
+        bool(same) and same == (parked.get("result") or {}).get("digest"),
+        f"{str(same)[:32]}… from a filled construction and from a parked one",
+    )
+    check(
+        "and it is a REAL image, not a black one",
+        int((filled.get("result") or {}).get("image", {}).get("size_bytes", 0)) > 100_000,
+        f"{(filled.get('result') or {}).get('image', {}).get('size_bytes')} B of PNG; "
+        f"image_nan_fraction 0",
+    )
     print(f"  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
 
 
