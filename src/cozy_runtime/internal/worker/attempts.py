@@ -577,15 +577,25 @@ class AttemptEngine:
                 "transaction and this runtime will not mint a receipt for bytes nobody "
                 "wrote (cr-017 owns that transaction)",
             )
-        manifest, tail_error = self._tail(attempt, reply)
-        if tail_error is not None:
-            return self.terminal(
-                attempt,
-                STATUS.TERMINAL_STATUS_FAILED,
-                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
-                tail_error,
-            )
+        # The output transaction belongs to a SUCCEEDING attempt. A refused or failed one
+        # produced no outputs by definition, so running the tail over it would find the
+        # grant unsatisfied and report `destination_absent` — replacing the author's real
+        # cause with a story about a transaction that was never owed. Found live: a handler
+        # that refused came back to the coordinator as a missing destination, and the actual
+        # reason was nowhere on the terminal.
+        manifest: pb.OutputManifest | None = None
+        if status == STATUS.TERMINAL_STATUS_SUCCEEDED:
+            manifest, tail_error = self._tail(attempt, reply)
+            if tail_error is not None:
+                return self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_FAILED,
+                    CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    tail_error,
+                )
+        elif attempt.spool is not None:
+            grants.abort_outputs(attempt.spool)
         return self.terminal(
             attempt,
             status,

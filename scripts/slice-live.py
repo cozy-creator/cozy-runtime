@@ -266,6 +266,52 @@ def read_outcome(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+#: A quiet card, in MiB. The real UNet is 4.78 GiB on an 8 GiB device, so a benchmark or a
+#: red arm only means anything when nothing else is resident: this box is shared, and a
+#: neighbour holding 2.5 GiB turns a correct run into an OOM that says nothing about this
+#: code. Waiting is the honest answer; measuring through the interference is not.
+QUIET_MIB = 400
+
+
+def require_quiet_card(seconds: float = 3600.0) -> int:
+    """Block until the card is effectively idle, saying so while it waits."""
+    started = time.monotonic()
+    announced = False
+    while time.monotonic() - started < seconds:
+        used = gpu_used_mib()
+        if used < 0 or used <= QUIET_MIB:
+            if announced:
+                print(f"  the card is quiet again after {time.monotonic() - started:.0f} s")
+            return used
+        if not announced:
+            announced = True
+            print(
+                f"  waiting for a quiet card: {used} MiB in use by another process on this "
+                f"shared box (need <= {QUIET_MIB} MiB)",
+                flush=True,
+            )
+        time.sleep(5.0)
+    return gpu_used_mib()
+
+
+def settle_gpu(baseline: int, seconds: float = 60.0) -> int:
+    """Wait for the card to come back before starting the next run.
+
+    A SIGKILLed executor holding ~5 GiB is reaped by `waitpid` well before the NVIDIA driver
+    has finished tearing its context down, so a run started the instant the previous process
+    exits can find the card still occupied — and on an 8 GiB card that is a real
+    `device_shortfall`, not a flake. It is a HARNESS concern here (back-to-back benchmark
+    runs); a back-to-back local `run` meets the same edge and cr-016 owns what it should say.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        used = gpu_used_mib()
+        if used < 0 or used <= baseline + 64:
+            return used
+        time.sleep(0.5)
+    return gpu_used_mib()
+
+
 def wait_for(path: Path, seconds: float) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -294,7 +340,7 @@ def outputs_present(workspace: Path) -> list[str]:
 
 def section_slice(args: argparse.Namespace) -> dict[str, Any]:
     """The headline: one request, one model, one kernel, one ledger, one typed result."""
-    idle = gpu_used_mib()
+    idle = require_quiet_card()
     head("one request through the REAL protocol path, with no network")
     workspace = Path(args.tmp) / "slice"
     outcome, process = spawn(
@@ -412,6 +458,7 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
 
 def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
     """Ledger v0: every class declares its method, and every attempt closes reconciled."""
+    require_quiet_card()
     head("ledger v0: every counter declares HOW it was measured")
     workspace = Path(args.tmp) / "ledger"
     outcome, _ = spawn(
@@ -594,7 +641,7 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
 
 def section_arms(args: argparse.Namespace) -> None:
     """cancel / kill during fetch, fill, invoke and encode — one terminal, no partials."""
-    idle = gpu_used_mib()
+    idle = require_quiet_card()
 
     head("ARM 1/4 — FETCH: the executor dies while the payload is being fetched")
     workspace = Path(args.tmp) / "arm-fetch"
@@ -913,6 +960,7 @@ def section_arms(args: argparse.Namespace) -> None:
 
 def section_clone(args: argparse.Namespace) -> None:
     """The git-clone packaging contract, against a CLEAN clone of this repo."""
+    require_quiet_card()
     head("git clone + `uv sync --frozen` + one slice, with no other Cozy software")
     clone = Path(args.tmp) / "clone"
     shutil.rmtree(clone, ignore_errors=True)
@@ -998,8 +1046,11 @@ def section_clone(args: argparse.Namespace) -> None:
 def section_bench(args: argparse.Namespace) -> None:
     """request -> result, with the legs attributed. Compared against cr-007's numbers."""
     head("benchmarks: request -> result, per-leg")
+    idle = require_quiet_card()
     rows: list[dict[str, Any]] = []
     for index in range(args.repeat):
+        settle_gpu(idle)
+        require_quiet_card()
         workspace = Path(args.tmp) / f"bench-{index}"
         outcome, _ = spawn(
             {
@@ -1012,6 +1063,13 @@ def section_bench(args: argparse.Namespace) -> None:
                 "delete_journal": False,
             }
         )
+        if not check(
+            f"run {index} produced a terminal",
+            outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+            f"ended={outcome.get('ended')!r} status={outcome.get('status')!r} "
+            f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:120]}",
+        ):
+            continue
         ledger = {row["class"]: row["bytes"] for row in outcome["ledger"]["classes"]}
         metrics = outcome["terminal"].get("metrics", {})
         rows.append(

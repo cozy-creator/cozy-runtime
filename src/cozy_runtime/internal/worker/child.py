@@ -280,11 +280,15 @@ class ExecutorSupervision:
         return killed
 
     def close(self) -> None:
-        if self.current is not None:
-            self.current.kill_group()
-            self.current.reap(2.0)
-            self.current.close()
-            self.current = None
+        # Bind ONCE. `current` is written by the rebuild path on another thread, so a
+        # check-then-use here races a concurrent replacement and dies on `None` mid-shutdown
+        # — observed live, as an AttributeError that took the whole run down after its
+        # terminal was already durable.
+        executor, self.current = self.current, None
+        if executor is not None:
+            executor.kill_group()
+            executor.reap(2.0)
+            executor.close()
         if self._listener is not None:
             self._listener.close()
             Path(self.socket_path).unlink(missing_ok=True)
