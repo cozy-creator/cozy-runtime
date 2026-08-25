@@ -1120,6 +1120,7 @@ class StreamingFillBackend:
             return 0
         started = time.perf_counter_ns()
         freed = 0
+        spent: list[Any] = []
         for row in pending:
             selection = self.selected[row.key]
             parts = self.scratch.pop(row.key, {})
@@ -1133,9 +1134,21 @@ class StreamingFillBackend:
                     missing[:6],
                 )
             selection.provider.decode(self.torch, parts, self.enqueued[row.key])
-            freed += self._free_storages(parts.values())
+            spent.append(parts)
             self.decoded["tensors"] += 1
             self.decoded["bytes"] += row.stored_nbytes
+        # THE DECODE'S OWN FENCE, before its scratch goes back to the allocator. `decode`
+        # ENQUEUES kernels on this stream and returns; `resize_(0)` frees the block those
+        # kernels are still reading, and the very next role's H2D on the ring's stream —
+        # which is where the scratch was allocated, so it is that pool the block returns to
+        # — writes over it. An e4m3 byte of 0xff IS NaN, so the damage arrives as a handful
+        # of NaN elements rather than as a fault: measured on the real fp8 UNet at 2 of 6
+        # stage-ins, 9 to 13 tensors of 1,680 with 9 to 16 NaN elements each, and never on
+        # a whole-generation fill (a fresh allocator does not hand the block straight back).
+        # An endpoint without an output-integrity floor SERVES that (se-008).
+        self.torch.cuda.current_stream().synchronize()
+        for parts in spent:
+            freed += self._free_storages(parts.values())
         pending.clear()
         self.decoded["flushes"] += 1
         self.decoded["ms"] += (time.perf_counter_ns() - started) // 1_000_000
