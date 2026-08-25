@@ -93,6 +93,18 @@ def _list(body: Mapping[str, Json], document: Mapping[str, Json]) -> Result:
         for doc in entries:
             assert isinstance(doc, dict)
             rows.append((str(doc["name"]), _one_line(doc)))
+            if kind == "jobs":
+                # THE ID A COORDINATOR DISPATCHES BY. It is derived, never stored in the
+                # document (a digest inside a source-stable surface has no clock a reader
+                # can name), so the only way anyone else gets it is by re-deriving the
+                # canonical form — which cozy-creator was doing in Go. Printing it here is
+                # what deletes that second implementation (cl-004).
+                rows.append(
+                    (
+                        f"{doc['name']}.job_descriptor_id",
+                        desc.job_descriptor_id(body, str(doc["name"])),
+                    )
+                )
     counts = desc.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
@@ -139,7 +151,7 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
     for doc in [*entrypoints, *jobs]:
         assert isinstance(doc, dict)
         if doc["name"] == function:
-            return _schema_view(doc)
+            return _schema_view(doc, body)
     known = sorted(str(d["name"]) for d in [*entrypoints, *jobs] if isinstance(d, dict))
     raise CliError(
         "not_found",
@@ -150,12 +162,21 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
     )
 
 
-def _schema_view(doc: Mapping[str, Json]) -> Result:
+def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json]) -> Result:
     rows: list[tuple[str, str]] = [
         ("function", f"{doc['name']} ({doc['kind']})"),
         ("capabilities", ", ".join(str(c) for c in _as_list(doc["capabilities"])) or "none"),
         ("gpu", str(doc["gpu"]).lower()),
     ]
+    view: dict[str, Json] = dict(doc)
+    if doc["kind"] == "job":
+        # DERIVED here, and only here. It may not enter the committed descriptor — a
+        # `sha256:` inside a source-stable surface leaves a reader no way to know which
+        # clock it came from — but a coordinator dispatches by it, so a verb that would not
+        # say it forces every consumer to re-derive the canonical form (cl-004 measured one
+        # doing exactly that, in Go).
+        view["job_descriptor_id"] = desc.job_descriptor_id(body, str(doc["name"]))
+        rows.append(("job_descriptor_id", str(view["job_descriptor_id"])))
     lines: list[str] = ["request:"]
     lines += _fields(doc["request"])
     lines.append("result:")
@@ -174,7 +195,7 @@ def _schema_view(doc: Mapping[str, Json]) -> Result:
         assert isinstance(preflight, dict)
         lines.append(f"preflight {preflight['identity']}:")
         lines += _fields(preflight["facts"])
-    return Result(rows=tuple(rows), lines=tuple(lines), document=doc)
+    return Result(rows=tuple(rows), lines=tuple(lines), document=view)
 
 
 def _as_list(value: Json) -> Sequence[Json]:
