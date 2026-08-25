@@ -349,8 +349,11 @@ def corrupt_store(at: Path, source: str) -> str:
     """A working copy with ONE byte flipped in a real object, the hardlink broken first so
     the original CAS is untouched. The most ordinary way a stored artifact goes wrong, and
     no switch inside the runtime (decisions #249)."""
-    if (at / "store.json").is_file():
-        return str(at)
+    # Rebuilt EVERY time, never reused: TensorFS QUARANTINES an object it finds corrupt, so
+    # the second lease over the same doctored store reports the object ABSENT rather than
+    # corrupt. That is the store behaving correctly, and it would quietly turn this arm into
+    # a different arm — so the plant is fresh on every run.
+    shutil.rmtree(at, ignore_errors=True)
     subprocess.run(["cp", "-al", source, str(at)], check=True)
     target = max(
         (p for p in (at / "objects" / "sha256").rglob("*") if p.is_file()),

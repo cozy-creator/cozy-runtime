@@ -153,8 +153,11 @@ def corrupt_store(at: Path, source: str) -> str:
     no switch inside the runtime (decisions #249). Since tfs-007 it is caught when the lease
     verifies the snapshot — before a single destination is reserved.
     """
-    if (at / "store.json").is_file():
-        return str(at)
+    # Rebuilt EVERY time, never reused: TensorFS QUARANTINES an object it finds corrupt, so
+    # the second lease over the same doctored store reports the object ABSENT rather than
+    # corrupt. That is the store behaving correctly, and it would quietly turn this arm into
+    # a different arm — so the plant is fresh on every run.
+    shutil.rmtree(at, ignore_errors=True)
     subprocess.run(["cp", "-al", source, str(at)], check=True)
     objects = sorted((at / "objects" / "sha256").rglob("*"))
     target = max((p for p in objects if p.is_file()), key=lambda p: p.stat().st_size)
