@@ -418,6 +418,29 @@ class Checkpoint:
             return self.store.acquire_snapshot(self.snapshot_id)
 
 
+def survey_routes(rows: Sequence[PlanRow], selector: Selector) -> tuple[dict[str, int], str]:
+    """What ROUTES an artifact's own header demands, and whether this device serves them.
+
+    cr-008c's delivery choice needs both facts about a CANDIDATE artifact before choosing
+    to read it, and both come from the header alone: cr-006 measured the whole per-tensor
+    encoding plan of the real fp8 UNet at 400,592 B read and 6.7 MiB peak RSS, zero tensor
+    bytes. So surveying every offered variant is header work, not a load.
+
+    Returns (route -> tensor count, refusal sentence or ""). The refusal is carried out
+    VERBATIM from cr-006's `Selector` rather than re-derived, so what a reader sees is what
+    the capability table actually said — including the device line and the named seam that
+    would serve these bytes elsewhere.
+    """
+    routes: dict[str, int] = {}
+    for row in rows:
+        try:
+            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype))
+        except EncodingRefusal as exc:
+            return routes, str(exc)
+        routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
+    return routes, ""
+
+
 def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     """The checkpoint topology table the loader matches the code against.
 
@@ -427,7 +450,7 @@ def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     encoding would be the only place in the runtime that did.
     """
     return {
-        row.key: TensorSpec(row.shape, _dtype_name(row.dtype), row.encoded.alias, row.nbytes)
+        row.key: TensorSpec(row.shape, dtype_name(row.dtype), row.encoded.alias, row.nbytes)
         for row in rows
     }
 
@@ -574,6 +597,7 @@ class StreamingFillBackend:
         probe_cache: str | Path | None = None,
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.1",
+        qualified: tuple[Capabilities, dict[str, Any]] | None = None,
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -644,14 +668,21 @@ class StreamingFillBackend:
         self.device_facts: DeviceFacts = measure_device(self.torch, self.device.index or 0)
         self.providers = launch_providers()
         self.capabilities: Capabilities
-        self.capabilities, self.probe = qualify(
-            self.torch,
-            self.providers,
-            self.device_facts,
-            sorted({_dtype_name(row.dtype) for row in rows}),
-            release=release,
-            cache=Path(probe_cache) if probe_cache else None,
-        )
+        # cr-008c hands the suite's result IN. The delivery choice has to ask the capability
+        # table which variants this device can serve BEFORE it knows which artifact to fill,
+        # so the suite runs once above this constructor and its result is passed down —
+        # rather than being re-run here against the variant the choice already made.
+        if qualified is not None:
+            self.capabilities, self.probe = qualified
+        else:
+            self.capabilities, self.probe = qualify(
+                self.torch,
+                self.providers,
+                self.device_facts,
+                sorted({dtype_name(row.dtype) for row in rows}),
+                release=release,
+                cache=Path(probe_cache) if probe_cache else None,
+            )
         self.selector = Selector(self.providers, self.capabilities, self.device_facts)
         #: The provider chosen for each destination, resolved in `fill` before a byte moves.
         self.selected: dict[str, Selection] = {}
@@ -791,11 +822,11 @@ class StreamingFillBackend:
                 "destination, with no reshaping in between",
                 [key],
             )
-        if _dtype_name(tensor.dtype) != _dtype_name(row.dtype):
+        if dtype_name(tensor.dtype) != dtype_name(row.dtype):
             raise _refuse(
                 "dtype_mismatch",
                 f"{key}: the checkpoint's LOGICAL dtype is {row.dtype} and the destination "
-                f"is {_dtype_name(tensor.dtype)} — a decoder targets the logical dtype the "
+                f"is {dtype_name(tensor.dtype)} — a decoder targets the logical dtype the "
                 "border assigned, it does not choose a different one (cr-006). A "
                 "destination that wants another dtype is a different construction",
                 [key],
@@ -805,7 +836,7 @@ class StreamingFillBackend:
         # an unqualified device or a role set no decoder accounts for all refuse HERE,
         # where the generation has nothing to undo.
         try:
-            self.selected[key] = self.selector.select(key, row.encoded, _dtype_name(row.dtype))
+            self.selected[key] = self.selector.select(key, row.encoded, dtype_name(row.dtype))
         except EncodingRefusal as exc:
             raise _refuse(exc.code, str(exc), exc.fields) from exc
         if str(getattr(tensor, "device", "")) != self.device_str:
@@ -1343,7 +1374,7 @@ TORCH_DTYPES: dict[str, str] = {
 }
 
 
-def _dtype_name(dtype: object) -> str:
+def dtype_name(dtype: object) -> str:
     """The one dtype spelling. The store writes TensorFS names (`f16`), torch prints its
     own (`torch.float16`), and a fill that guesses which is which is a silent wrong copy."""
     name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")

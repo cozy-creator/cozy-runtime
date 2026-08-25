@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import egress, hostfacts
 from cozy_runtime.internal.config import RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -380,6 +380,23 @@ class Supervisor:
                 continue
             self.bindings[plan_id] = BindingPlan.read(json.loads(record.read_text()))
         self.engine.bindings = self.bindings
+        # cr-012: the EGRESS boundary is a deployment fact, rebuilt from the applied
+        # directive's bindings and from nothing else. A revision that names no host leaves
+        # it empty, which means no egress — the fail-closed state is the default state, and
+        # nothing at request time can widen it.
+        hosts = sorted(
+            {
+                host.strip()
+                for binding in self.bindings.values()
+                for host in binding.egress_allowed_hosts.split(",")
+                if host.strip()
+            }
+        )
+        self.engine.egress = egress.EgressPolicy(
+            allowed_hosts=tuple(hosts),
+            max_bytes=max((b.max_input_bytes for b in self.bindings.values()), default=64 << 20),
+            allow_private=any(b.tenancy == "local" for b in self.bindings.values()),
+        )
         self.note(
             "directive",
             f"revision {directive.revision} applied: {len(self.bindings)} binding plans, "
@@ -494,6 +511,15 @@ class Supervisor:
                         # by the device tuple under cozy_home and shared across every
                         # binding this rig serves.
                         "probe_cache": str(self.config.cozy_home / "probe"),
+                        # cr-008c: the OFFERED artifact variants and the measured axis to
+                        # order them on. The choice is made in the executor because that is
+                        # where the device and the capability table live — this process
+                        # never imports torch — and it comes back on the reply as a fact
+                        # this supervisor journals and reports.
+                        "variants": [dataclasses.asdict(offer) for offer in first.offered()],
+                        "objective": first.objective,
+                        "steps_basis": first.steps_basis,
+                        "delivery_cache": str(self.config.cozy_home / "probe"),
                     },
                     "budgets": {
                         "vram": first.vram_bytes,
@@ -561,6 +587,11 @@ class Supervisor:
                 self.supervision.invalidate(f"prepare refused: {reply.get('code')}")
                 return
             digest = reply["model_construction_digest"]
+            # THE DELIVERY CHOICE, ABSORBED (cr-008c). It is resolved exactly once, here,
+            # and every attempt served by this generation prices against it — the
+            # PlanChooser reads these two fields and structurally cannot re-choose, which
+            # is what keeps a delivery switch from arriving as a placement side effect.
+            delivery = reply.get("delivery") or {}
             for binding in group:
                 if binding.model_construction_digest and (
                     binding.model_construction_digest != digest
@@ -569,7 +600,10 @@ class Supervisor:
                     continue
                 executor.ready_plans.add(binding.plan_id)
                 self.bindings[binding.plan_id] = dataclasses.replace(
-                    binding, model_construction_digest=digest
+                    binding,
+                    model_construction_digest=digest,
+                    delivery_rung=str(delivery.get("rung", "")),
+                    delivery_variant=str(delivery.get("variant", "")),
                 )
             self.engine.bindings = self.bindings
             # The generation's RESIDENT BASELINE enters the ledger here: the destinations the
@@ -600,6 +634,15 @@ class Supervisor:
                 f"resident={sorted(reply['facts'].get('resident', {}))} "
                 f"parked={reply['facts'].get('parked', [])}",
             )
+            if delivery:
+                self.note(
+                    "delivery",
+                    f"{delivery['variant']!r} on rung {delivery['rung']} "
+                    f"({delivery['delivery']}/{delivery['materialization'] or 'verbatim'}, "
+                    f"{delivery['cost_class']} decode, {delivery['kernel']} kernel) chosen "
+                    f"on the {delivery['objective']} axis"
+                    + (f" — {delivery['confession']}" if delivery.get("confession") else ""),
+                )
         self.run_warm_pass()
         self.intake(pb.IntakeState.INTAKE_STATE_READY)
 

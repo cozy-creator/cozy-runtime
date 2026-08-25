@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.delivery import ROUTE_KERNEL, RUNGS_BY_NAME, Variant
 from cozy_runtime.internal.worker.ledger import Ledger
 
 
@@ -54,12 +55,17 @@ class AttemptPlan:
     entrypoint_binding_plan_id: str
     model_construction_digest: str
     quantified_choice: str
+    delivery_variant: str = ""
+    """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
+    identity a coordinator holds, and two plans that read different artifacts of one model
+    are not the same plan however identical their placement."""
 
     def document(self) -> dict[str, Any]:
         return {
             "format": "cozy.runtime.AttemptPlan/1",
             "delivery": self.delivery,
             "materialization": self.materialization,
+            "delivery_variant": self.delivery_variant,
             "compute_dtype": self.compute_dtype,
             "placement": self.placement,
             "reserved_vram_bytes": self.reserved_vram_bytes,
@@ -201,6 +207,34 @@ class BindingPlan:
     extras warn, are ignored and are confessed — §1.1's custody tier)."""
     strict_keys: bool = False
     """`--strict-keys`: a local bind's unknown extras refuse instead of confessing."""
+    variants: tuple[Variant, ...] = ()
+    """cr-008c: the artifact variants this deployment OFFERS for one logical model —
+    encodings of the same topology. Empty means the record offers exactly what `store` and
+    `snapshot` name, which is what every single-variant record already meant."""
+    objective: str = "latency"
+    """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
+    fidelity`). A deployment property, not a request knob: delivery decides which bytes are
+    resident, so it is chosen once for the generation."""
+    steps_basis: int = 20
+    """The declared step count the `latency` objective prices a per-step cost against. It
+    is a LABEL on the arithmetic, not a claim about any one request."""
+    delivery_rung: str = ""
+    """RESOLVED AT PREPARE, never written by the deployment: which `DELIVERY_RUNGS` entry
+    the executor's `DeliveryChooser` took. Empty means `verbatim`."""
+    delivery_variant: str = ""
+    """RESOLVED AT PREPARE: which offered variant the generation actually read."""
+    max_input_bytes: int = 64 << 20
+    """cr-012: the DEPLOYMENT's per-input-asset ceiling, checked pre-accept against the
+    grant's declared length. A field's own `AssetBound` narrows it and never widens it, so
+    the two bounds live where their knowledge does: the deployment's here, the endpoint's
+    on the field."""
+    max_inputs_total_bytes: int = 256 << 20
+    """The whole attempt's input budget. Input retention is its own bounded story: inputs
+    take no CAS lease and end with the attempt spool."""
+    egress_allowed_hosts: str = ""
+    """Comma-joined hosts this deployment may fetch a remote grant from. EMPTY MEANS NO
+    EGRESS: a `file://` grant needs none, and a deployment that has not declared a host
+    cannot be talked into one at request time."""
 
     def snapshot_map(self) -> dict[str, str]:
         """component -> snapshot digest. Absent names fall back to the binding's own."""
@@ -218,7 +252,12 @@ class BindingPlan:
         return tuple(name for name in self.components.split(",") if name)
 
     def construction_key(self) -> str:
-        """Two binding plans over the SAME construction share one executor generation."""
+        """Two binding plans over the SAME construction share one executor generation.
+
+        The OFFERED variant set and the objective are inside the key because they decide
+        which bytes get filled: two bindings that would make different delivery choices are
+        not one construction, however identical the rest of the record reads.
+        """
         return canonical.digest(
             {
                 "store": self.store,
@@ -229,7 +268,27 @@ class BindingPlan:
                 "model_class": self.model_class,
                 "component": self.component,
                 "components": self.components,
+                "variants": [v.name for v in self.variants],
+                "objective": self.objective,
             }
+        )
+
+    def offered(self) -> tuple[Variant, ...]:
+        """The candidate set, with the single-variant record's implicit one made explicit.
+
+        A record that names no variants offers exactly one — the bytes it already names —
+        and that one IS the reference, because there is nothing to compare it against.
+        """
+        if self.variants:
+            return self.variants
+        return (
+            Variant(
+                name=self.variant or "default",
+                store=self.store,
+                snapshot=self.snapshot,
+                snapshots=self.snapshots,
+                reference=True,
+            ),
         )
 
     @classmethod
@@ -242,7 +301,13 @@ class BindingPlan:
                 f"binding plan record carries {', '.join(unknown)}: the record's key set is "
                 "closed, exactly like the documents it stands in for",
             )
-        return cls(**record)
+        data = dict(record)
+        offers = data.get("variants")
+        if offers:
+            data["variants"] = tuple(
+                v if isinstance(v, Variant) else Variant.read(v) for v in offers
+            )
+        return cls(**data)
 
 
 #: The CLOSED, ORDERED placement ladder (§3.2). Delivery is `native` at launch — `aot_decode`
@@ -440,9 +505,27 @@ class PlanChooser:
         activations = terms["activations"]
         rows: list[dict[str, Any]] = []
         chosen = ""
+        # THE CONSTRUCTION FLOOR. A generation whose deployment ceiling PARKED components
+        # is staged as a FACT — the components are on `meta` and `stage()` moves them in on
+        # first declared use. Headroom arithmetic can still say `all_resident` fits, and
+        # cr-008c's cross caught exactly that: a plan reporting `all_resident` for a
+        # generation with a parked UNet. The ladder may deepen below the floor; it may
+        # never claim to be above it.
+        parked = tuple(self.ledger.parked)
         for placement, why, status in RUNGS:
             if status != "proven":
                 rows.append({"rung": placement, "verdict": "unproven", "why": why})
+                continue
+            if parked and placement == "all_resident":
+                rows.append(
+                    {
+                        "rung": placement,
+                        "verdict": "construction_parked",
+                        "why": f"construction parked {list(parked)} under this deployment's "
+                        "resident ceiling: the components are not held, so no plan over "
+                        "this generation is all-resident",
+                    }
+                )
                 continue
             # Both rungs need the SAME headroom above the weights — activations do not
             # shrink because a component moved. What differs is the CAPACITY each rung can
@@ -468,6 +551,7 @@ class PlanChooser:
             "coefficients": [c.document() for c in terms.values()],
             "allocatable_bytes": allocatable,
             "resident": dict(resident),
+            "parked": list(parked),
             "rungs": rows,
             "tenancy": binding.tenancy,
         }
@@ -477,9 +561,10 @@ class PlanChooser:
             chosen, confession = self._deepen(binding, activations, allocatable, walk)
         else:
             confession = ""
+        rung = self._delivery(binding, chosen, walk)
         return AttemptPlan(
-            delivery="native",
-            materialization="aot_decode",
+            delivery=rung.delivery,
+            materialization=rung.materialization,
             compute_dtype="float16",
             placement=chosen,
             reserved_vram_bytes=sum(resident.values()) or binding.vram_bytes,
@@ -488,7 +573,11 @@ class PlanChooser:
             headroom_bytes=activations.value,
             entrypoint_binding_plan_id=binding.plan_id,
             model_construction_digest=binding.model_construction_digest,
+            delivery_variant=binding.delivery_variant,
             quantified_choice=(
+                f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
+                f"{binding.delivery_variant or binding.variant or 'default'!r} "
+                f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
                 f"{chosen}: {len(resident) or 1} component(s) totalling "
                 f"{sum(resident.values()) or binding.vram_bytes} B with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
@@ -496,6 +585,64 @@ class PlanChooser:
                 f"{features.get('scalars', {})}{confession}"
             ),
         )
+
+    def _delivery(self, binding: BindingPlan, placement: str, walk: dict[str, Any]) -> Any:
+        """THE CROSS (cr-008c): the resolved delivery rung, crossed with the placement one.
+
+        Delivery was chosen ONCE, at prepare, against measured envelopes — this function
+        does not re-choose it and structurally cannot: it has no table, no device and no
+        candidate set. What it does is read the placement the ladder just walked to and
+        DERIVE the honest cost-class label, because a float delivery under a staged
+        placement is not the same fact as one under all_resident: the decode is paid again
+        on every stage-in (per_transition), not once for the generation (per_generation).
+        That is pgw#1505's distinction, and collapsing it would price a staged encoded
+        component at a cost it only pays the first time.
+
+        Then it FENCES the axis: the rung it hands back must compute with the same kernel
+        the prepare-time choice did. §3.2's claim is that a placement rung changes weight
+        placement only and never the compute kernel; this is where that claim is checked
+        rather than restated, so a delivery switch arriving as a placement side effect is a
+        refusal instead of a silent reinterpretation of the request.
+        """
+        name = binding.delivery_rung or "verbatim"
+        rung = RUNGS_BY_NAME.get(name)
+        if rung is None:
+            raise PlanRefusal(
+                "unknown_delivery_rung",
+                f"the binding resolved delivery rung {name!r} and the closed ladder holds "
+                f"{sorted(RUNGS_BY_NAME)}; a rung nothing implements cannot be planned "
+                "against",
+            )
+        crossed = rung
+        if rung.name == "aot_decode" and placement == "component_staged":
+            crossed = RUNGS_BY_NAME["staged_decode"]
+        if ROUTE_KERNEL[crossed.route] != ROUTE_KERNEL[rung.route]:
+            raise PlanRefusal(
+                "delivery_side_effect",
+                f"the placement walk to {placement!r} moved delivery from {rung.name!r} "
+                f"({ROUTE_KERNEL[rung.route]}) to {crossed.name!r} "
+                f"({ROUTE_KERNEL[crossed.route]}). A placement rung changes WEIGHT "
+                "PLACEMENT only and never the compute kernel (§3.2); a delivery switch is "
+                "an explicit, separately authorized choice made once at prepare, never "
+                "something a capacity ladder does on the way past",
+                {
+                    "resource": "delivery",
+                    "scope": "plan",
+                    "needed_bytes": 0,
+                    "available_bytes": 0,
+                    "evidence_class": "structural",
+                },
+            )
+        walk["delivery"] = {
+            "variant": binding.delivery_variant,
+            "rung": crossed.name,
+            "delivery": crossed.delivery,
+            "materialization": crossed.materialization,
+            "cost_class": crossed.cost_class,
+            "kernel": ROUTE_KERNEL[crossed.route],
+            "chosen_at": "prepare",
+        }
+        return crossed
 
     def _deepen(
         self,

@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import Outcome, classify
 from cozy_runtime.author._invoke import Invocation, attempt
@@ -132,14 +133,25 @@ class Executor:
         self.torch = torch
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
+        from cozy_runtime.internal.delivery import (
+            DeliveryChooser,
+            DeliveryFact,
+            DeliveryRefusal,
+            DeliveryTable,
+            Variant,
+        )
         from cozy_runtime.internal.derive import Observations, serving_substrate
+        from cozy_runtime.internal.encoding import Selector, launch_providers, measure_device
         from cozy_runtime.internal.fill import (
             Checkpoint,
             FillRefusal,
             ResourceLedger,
             StreamingFillBackend,
+            dtype_name,
+            survey_routes,
             topology_of,
         )
+        from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.staging import ComponentResidency
 
         torch.cuda.init()
@@ -168,11 +180,65 @@ class Executor:
         # partial read of a whole-pipeline snapshot has no representation (tfs-007).
         names: list[str] = list(binding.get("components") or [binding["component"]])
         per_component: dict[str, str] = dict(binding.get("snapshots") or {})
-        checkpoints = {
-            name: Checkpoint(binding["store"], per_component.get(name, binding["snapshot"]))
-            for name in names
-        }
-        rows = [row for name in names for row in checkpoints[name].rows(name)]
+
+        # ------------------------------------------------------------ the delivery choice
+        #
+        # cr-008c. WHICH stored bytes this generation reads, decided once, here, before a
+        # destination is reserved — because delivery decides what is resident and that is a
+        # property of the construction, not of a request. Every candidate is surveyed from
+        # its HEADER (no tensor bytes), the qualification suite runs once for the union of
+        # logical dtypes, and the chooser is pure arithmetic over measured envelopes.
+        offered = [
+            v if isinstance(v, Variant) else Variant.read(v)
+            for v in (binding.get("variants") or ())
+        ] or [
+            Variant(
+                name=str(binding.get("variant") or "default"),
+                store=binding["store"],
+                snapshot=binding["snapshot"],
+                snapshots=",".join(f"{k}={v}" for k, v in sorted(per_component.items())),
+                reference=True,
+            )
+        ]
+        surveyed: dict[str, tuple[dict[str, Any], list[Any]]] = {}
+        for variant in offered:
+            vmap = variant.snapshot_map()
+            books = {
+                name: Checkpoint(variant.store, vmap.get(name, variant.snapshot)) for name in names
+            }
+            surveyed[variant.name] = (books, [r for name in names for r in books[name].rows(name)])
+        device_facts = measure_device(torch, 0)
+        providers = launch_providers()
+        qualified = qualify(
+            torch,
+            providers,
+            device_facts,
+            sorted({dtype_name(r.dtype) for _, rs in surveyed.values() for r in rs}),
+            release=binding["release"],
+            cache=Path(binding["probe_cache"]) if binding.get("probe_cache") else None,
+        )
+        selector = Selector(providers, qualified[0], device_facts)
+        candidates = [
+            (variant, *survey_routes(surveyed[variant.name][1], selector)) for variant in offered
+        ]
+        table_root = Path(binding.get("delivery_cache") or binding.get("probe_cache") or ".")
+        table_path = DeliveryTable.path_for(table_root, device_facts)
+        table = DeliveryTable.load(table_path, device_facts)
+        try:
+            choice = DeliveryChooser(table, device_facts).choose(
+                candidates,
+                objective=str(binding.get("objective") or "latency"),
+                steps_basis=int(binding.get("steps_basis") or 20),
+            )
+        except DeliveryRefusal as exc:
+            self.poisoned = f"delivery refused: {exc.code}"
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": str(exc).splitlines()[0][:900],
+                "delivery": {"walk": exc.walk, "objective": binding.get("objective")},
+            }
+        checkpoints, rows = surveyed[choice.variant.name]
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
@@ -208,6 +274,9 @@ class Executor:
             # rig has already probed skips the suite entirely.
             probe_cache=binding.get("probe_cache"),
             release=binding["release"],
+            # The suite already ran, above, to answer the delivery choice. Running it a
+            # second time here would re-measure a device fact that has not changed.
+            qualified=qualified,
         )
         # A STAGING generation re-reads the store after construction, so its GC-safe hold
         # must outlive the first commit. `resident_budget` is what makes a parked component
@@ -215,7 +284,7 @@ class Executor:
         backend.resident_budget = int(budgets.get("resident", 0))
         backend.hold_lease = backend.resident_budget > 0
         artifact = Artifact(
-            binding["snapshot"],
+            choice.variant.snapshot,
             topology_of(rows),
             Config(json.loads(Path(binding["config"]).read_text()), "unet.config"),
             # CUSTODY is a BINDING fact, not a runtime constant: a checkpoint that came
@@ -299,12 +368,20 @@ class Executor:
         self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
+        # `artifact` is the LOGICAL model's identity — the REFERENCE variant's snapshot —
+        # and not the variant this generation happened to read. cr-006 proved that claim on
+        # real bytes: an encoding rung changes no logical keyset and shares its
+        # `topology_digest` byte for byte, so every delivery variant of one model IS one
+        # construction. Which bytes served is a separate journaled fact (`delivery_variant`
+        # on the AttemptPlan), which is what keeps `expect_construction_digest` a usable
+        # fence for a binding that offers several variants.
+        reference = next((v for v in offered if v.reference), offered[0])
         self.construction_digest = canonical.digest(
             {
                 "format": "cozy.runtime.ModelConstructionContract/1",
                 "release": binding["release"],
                 "model_class": f"{model_cls.__module__}:{model_cls.__qualname__}",
-                "artifact": binding["snapshot"],
+                "artifact": reference.snapshot,
                 "config_digest": record.config_digest,
                 "factory_identity": record.factory_identity,
                 "topology_digest": record.topology_digest,
@@ -348,12 +425,42 @@ class Executor:
             "custody": binding.get("custody", "canonical"),
             "ignored_extra_keys": list(record.ignored_extras),
             "transcribed_markers": list(record.transcribed_markers),
+            "delivery": choice.document(),
         }
+        # BANK WHAT THIS RUN MEASURED (cr-008c). The envelope the next choice reads is the
+        # one this fill actually paid: its wall, its decode share, the destinations that
+        # ended up resident and the decode scratch high-water the ledger saw. `step_ms` and
+        # the deviation are NOT measurable here — they need a forward pass and a comparison
+        # against the reference — so an existing row's values are preserved and a fresh row
+        # is written UNCONFORMED (-1.0), which makes it ineligible for selection until
+        # something measures them. A rung admitted by fill numbers alone is exactly what
+        # "arithmetic fit admits nothing" forbids.
+        prior = table.get(choice.variant.name, choice.rung.name)
+        table.put(
+            DeliveryFact(
+                variant=choice.variant.name,
+                rung=choice.rung.name,
+                stored_bytes=sum(r.stored_nbytes for r in rows),
+                resident_bytes=sum(backend.vram_charge.values()),
+                scratch_bytes=int(ledger.peak.get("decode", 0)),
+                fill_ms=int(backend.stats["fill_ms"]),
+                decode_ms=int(backend.decoded["ms"]),
+                step_ms=prior.step_ms if prior else -1.0,
+                deviation_rel_l2=(
+                    0.0 if choice.variant.reference else (prior.deviation_rel_l2 if prior else -1.0)
+                ),
+                samples=(prior.samples + 1) if prior else 1,
+                evidence=f"prepare on {device_facts.tuple_key()} at {binding['release']}",
+                encodings=tuple(sorted({r.encoded.alias for r in rows})),
+            )
+        )
+        table.save(table_path)
         return {
             "ok": True,
             "ready": True,
             "model_construction_digest": self.construction_digest,
             "entrypoints": sorted(self.surface_names),
+            "delivery": choice.document(),
             "facts": self.facts,
         }
 
@@ -416,6 +523,21 @@ class Executor:
                 cancel=lambda: _CANCEL,
                 models=self.models,
                 progress=progress,
+                # cr-012: the inputs the SUPERVISOR already fetched, verified and spooled.
+                # Every value is a path inside this attempt's own spool; this process has
+                # no outbound network and never resolves an address of its own.
+                assets={
+                    input_id: GrantedInput(
+                        input_id=input_id,
+                        local=Path(row["local"]),
+                        media_type=str(row["media_type"]),
+                        digest=str(row["digest"]),
+                        length=int(row["length"]),
+                        order=int(row.get("order", 0)),
+                    )
+                    for input_id, row in (command.get("inputs") or {}).items()
+                },
+                max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
             ),
         )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
@@ -440,7 +562,17 @@ class Executor:
             outputs = []
         # Author code entered, so reuse is poisoned by any non-success — a refusal raised
         # BEFORE entry (schema, bounds, preflight) leaves a Ready executor untouched (§3.1).
-        pre_entry = ("invalid_request", "unsupported_input", "default_resolution")
+        pre_entry = (
+            "invalid_request",
+            "unsupported_input",
+            "default_resolution",
+            # cr-012's typed input refusals. They fire BEFORE the entrypoint exists to the
+            # request, so they leave the generation exactly as they found it — listing them
+            # here is what keeps a bad input from poisoning a Ready executor.
+            "asset_ungranted",
+            "asset_media_type",
+            "asset_too_large",
+        )
         if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every

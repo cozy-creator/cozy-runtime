@@ -239,6 +239,13 @@ class Ledger:
     resident: dict[str, int] = field(default_factory=dict)
     #: components this generation knows about but is not holding right now, with their size
     evicted: dict[str, int] = field(default_factory=dict)
+    #: components CONSTRUCTION parked, because the deployment's resident ceiling did not
+    #: hold them (cr-008b). It is a fact about the generation that exists, not a rung the
+    #: attempt ladder chose — so a plan may deepen BELOW it and may never claim to be above
+    #: it. Found by cr-008c's cross: a generation with a parked UNet was reporting
+    #: `all_resident` because the headroom arithmetic fit, which made the plan's placement
+    #: disagree with the generation it was planning for.
+    parked: tuple[str, ...] = ()
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
     reconciliations: list[dict[str, Any]] = field(default_factory=list)
@@ -348,6 +355,7 @@ class Ledger:
         self.device_allocated = self.device_baseline
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
+        self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
         self.evicted = {}
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))
