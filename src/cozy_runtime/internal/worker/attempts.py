@@ -705,15 +705,26 @@ class AttemptEngine:
                 )
         elif attempt.spool is not None:
             grants.abort_outputs(attempt.spool)
+        origin = _ORIGIN[outcome["origin"]]
+        shortfall = reply.get("shortfall") or None
+        if shortfall:
+            # A capacity fact reached the handler as an exception, so the author-error
+            # classifier saw an author error. It is not one: the runtime could not admit a
+            # declared component set, which is CONSTRAINT_INFEASIBLE from the RUNTIME, and
+            # the two numbers belong in the terminal's structured shortfall slot rather
+            # than only in a sentence.
+            cause = CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+            origin = ORIGIN.CAUSE_ORIGIN_RUNTIME
         return self.terminal(
             attempt,
             status,
             cause,
-            _ORIGIN[outcome["origin"]],
+            origin,
             outcome["message"] or outcome["code"],
             manifest=manifest,
             metrics=reply.get("metrics", {}),
             result=reply if status == STATUS.TERMINAL_STATUS_SUCCEEDED else None,
+            shortfall=shortfall,
         )
 
     def forward(self, request_id: str, number: int, frame: Mapping[str, Any]) -> None:
