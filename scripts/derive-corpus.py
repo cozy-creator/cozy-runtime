@@ -33,6 +33,7 @@ MODULES = (
     "corpus.cases.mutation",
     "corpus.cases.opaque",
     "corpus.cases.lifecycle",
+    "corpus.cases.planted",
 )
 #: Two workers, never `-n auto` — this box is shared.
 WORKERS = 2

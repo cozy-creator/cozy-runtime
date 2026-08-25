@@ -24,7 +24,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from corpus import h3  # noqa: E402
+from corpus import h3, sdxl  # noqa: E402
 
 from cozy_runtime.author._errors import AuthorError  # noqa: E402
 from cozy_runtime.author._loader import Artifact, Config, TensorSpec  # noqa: E402
@@ -648,6 +648,135 @@ class _MetaUnsafe(h3.Fl2VAModel):
         self.pipe = loader.construct(h3.H3Pipeline, factory=factory)
 
 
+def section_sdxl() -> None:
+    head("SDXL: the WHOLE-PIPELINE path, derived twice")
+    cfg = Config({"width": 64, "layers": 2, "blocks": 2})
+    first = derive(sdxl.SdxlModel(), Artifact("cozy/sdxl@v1", {}, cfg), release=RELEASE,
+                   application="corpus.sdxl:app", hardware_variant="sm89",
+                   component_use=sdxl.COMPONENT_USE)
+    second = derive(sdxl.SdxlModel(), Artifact("cozy/sdxl@v1", {}, cfg), release=RELEASE,
+                    application="corpus.sdxl:app", hardware_variant="sm89",
+                    component_use=sdxl.COMPONENT_USE)
+    left = canonical.write(first.contract.render())
+    check("SDXL derives twice byte-identically",
+          left == canonical.write(second.contract.render()),
+          f"{len(left)} bytes, {first.contract.digest[:26]}…")
+    check("four heavyweight components, no role scoping and no structural variant",
+          list(first.contract.components) == ["text_encoder", "text_encoder_2", "unet", "vae"],
+          ", ".join(f"{d.component}:{len(d.keys)}" for d in first.contract.destination_sets))
+    check("SDXL admits by PURE TOPOLOGY SATISFACTION — no class keyword",
+          sdxl.SdxlModel.__stamps__ == {}, "no task/objective/distilled stamp")
+    check("the UNet's non-persistent position_ids is derived, never a destination",
+          any("position_ids" in d.key for d in first.contract.derived)
+          and not any("position_ids" in t.key for t in first.contract.logical_tensors),
+          f"{len(first.contract.derived)} derived, {len(first.contract.logical_tensors)} dest")
+    check("the VAE's fp32 island carries its dtype; the bf16 majority stays silent",
+          any(t.dtype == "float32" for t in first.contract.logical_tensors)
+          and any(t.dtype is None for t in first.contract.logical_tensors),
+          "the dtype-diet rule over a real mixed-precision pipeline")
+    print("  — the second text encoder is load-bearing (§1.1):")
+    red("a three-component declaration on a four-component pipeline refuses",
+        lambda: derive(sdxl.SdxlModel(), Artifact("cozy/sdxl@v1", {}, cfg), release=RELEASE,
+                       application="corpus.sdxl:app", hardware_variant="sm89",
+                       component_use={"generate": ("text_encoder", "unet", "vae", "refiner")}),
+        code="unknown component")
+    check("an UNDER-declaration is caught at SERVE by cr-002b's guarded roots, not here",
+          set(sdxl.UNDER_DECLARED["generate"]) < set(first.contract.components),
+          "conformance validates names EXIST; the guard proves the subset at first touch")
+
+
+def section_planted_census_arms() -> None:
+    head("planted arms only a CENSUS can catch")
+    print("  A broken tie and a live tie present IDENTICAL keys and shapes, so no")
+    print("  checkpoint match can distinguish them. Only object/storage identity can.")
+    live = _run_case("corpus.cases.planted", "live_tie")
+    broken = _run_case("corpus.cases.planted", "broken_tie")
+    check("both derive correctly", live["verdict"] == broken["verdict"] == "derived-correct",
+          f"{live['destinations']} destinations each")
+    check("and derive DIFFERENT contracts", live["digest"] != broken["digest"],
+          f"live {live['digest'][:22]}… vs broken {broken['digest'][:22]}…")
+    check("…on identical keys and shapes — the alias group is the only difference",
+          live["destinations"] == broken["destinations"],
+          "never `_tied_weights_keys`: that lists names a class MIGHT tie")
+    cache = _run_case("corpus.cases.planted", "hidden_cache")
+    check("a GB-scale non-persistent buffer refuses as a hidden cache",
+          cache["verdict"] == "typed-refusal" and "hidden cache" in str(cache.get("named")),
+          str(cache.get("detail", ""))[:96])
+    sized = _run_case("corpus.cases.planted", "sized_derived_table")
+    check("…while the same idiom at a legitimate size derives",
+          sized["verdict"] == "derived-correct",
+          "the cap bounds the idiom, it does not ban it")
+
+
+def _run_case(module: str, name: str) -> Any:
+    """Drive the real corpus runner in its own sandboxed child, and read its verdict."""
+    import json
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env.update(CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(ROOT))
+    proc = subprocess.run([sys.executable, "-m", "corpus.run_case", module, name],
+                          capture_output=True, text=True, cwd=ROOT, env=env, timeout=300)
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def section_orphan_parts() -> None:
+    head("orphan part / scale: an encoded leaf's pair, split")
+    print("  The w4a16 provider leaf constructs a `packed`/`scales` PAIR. Either half")
+    print("  alone is an orphan, and the two directions refuse differently.")
+    from corpus.cases.lifecycle import _quantized_swap
+
+    class Quantized(h3.Fl2VAModel):
+        def load(self, loader: Any) -> None:
+            self.pipe = loader.construct(  # type: ignore[assignment]
+                type(_quantized_swap(Config({"width": 16, "variant": "w4a16"}))),
+                factory=lambda cfg: _quantized_swap(Config({"width": 16, "variant": "w4a16"})),
+            )
+
+    encoded = derive(Quantized(), Artifact("cozy/h3-w4a16@v1", {}, Config({"width": 16})),
+                     release=RELEASE, application="corpus.h3:app", hardware_variant="sm89",
+                     component_use={})
+    keys = {t.key for t in encoded.contract.logical_tensors}
+    check("the encoded variant constructs both halves of the pair",
+          any(k.endswith("packed") for k in keys) and any(k.endswith("scales") for k in keys),
+          ", ".join(sorted(keys)))
+    table = {t.key: TensorSpec(t.shape, t.dtype or "bf16", nbytes=8)
+             for t in encoded.contract.logical_tensors}
+    orphaned = {k: v for k, v in table.items() if not k.endswith("packed")}
+    red("a checkpoint carrying `scales` without `packed` refuses, naming the missing half",
+        lambda: derive(Quantized(),
+                       Artifact("cozy/h3-w4a16@v1", orphaned, Config({"width": 16})),
+                       release=RELEASE, application="corpus.h3:app",
+                       hardware_variant="sm89", component_use={}),
+        code="topology_missing_keys")
+
+
+def section_source_converter() -> None:
+    head("derive-mode source-converter and path fences")
+    from cozy_runtime.author._loader import Config as RawConfig
+
+    red("a construction config carrying a checkpoint path refuses to be BUILT",
+        lambda: RawConfig({"width": 32, "pretrained_model_name_or_path": "/models/h3"}),
+        code="config_path")
+    red("…and so does one whose VALUE is a path however the key is spelled",
+        lambda: RawConfig({"width": 32, "base": "/var/models/h3.safetensors"}),
+        code="config_path")
+    red("…or a URL",
+        lambda: RawConfig({"width": 32, "base": "https://example.invalid/h3"}),
+        code="config_path")
+
+    class Reflective(h3.Fl2VAModel):
+        def load(self, loader: Any) -> None:
+            self.pipe = loader.load(h3.H3Pipeline)  # no registered adapter exists
+
+    red("`load(T)` with no registered construction adapter refuses — no reflective fallback",
+        lambda: derive(Reflective(), artifact(config()), release=RELEASE,
+                       application="corpus.h3:app", hardware_variant="sm89",
+                       component_use={}),
+        code="unregistered_adapter")
+
+
 def section_benchmarks() -> None:
     head("benchmarks (this box, nice -n 19)")
     import resource
@@ -656,16 +785,22 @@ def section_benchmarks() -> None:
     fixtures = (
         ("H3 full (2 blocks, width 32)", config()),
         ("H3 baked (2 blocks)", config(structure="baked")),
-        ("SDXL-class (4 blocks, width 64)", config(width=64, blocks=4)),
         # production scale: meta parameters cost nothing, so the only thing that grows is
         # the census and the document. That is the claim worth measuring.
         ("H3-scale full (48 blocks, width 3072)", config(width=3072, blocks=48)),
         ("H3-scale baked (48 blocks, width 3072)",
          config(width=3072, blocks=48, structure="baked")),
     )
-    for label, cfg in fixtures:
+    sdxl_cfg = Config({"width": 320, "layers": 12, "blocks": 4})
+    for label, cfg in (*fixtures, ("SDXL whole-pipeline (real 4-component)", sdxl_cfg)):
         started = time.perf_counter()
-        result = run(h3.Fl2VAModel, cfg)
+        result = (
+            derive(sdxl.SdxlModel(), Artifact("cozy/sdxl@v1", {}, cfg), release=RELEASE,
+                   application="corpus.sdxl:app", hardware_variant="sm89",
+                   component_use=sdxl.COMPONENT_USE)
+            if cfg is sdxl_cfg
+            else run(h3.Fl2VAModel, cfg)
+        )
         elapsed = (time.perf_counter() - started) * 1000
         body = canonical.write(result.contract.render())
         logical = sum(_elements(t.shape) for t in result.contract.logical_tensors)
@@ -675,7 +810,7 @@ def section_benchmarks() -> None:
     for label, elapsed, dest, size, logical in rows:
         print(f"  {label:<40} {elapsed:>7.1f}ms {dest:>6} {size:>9,}B {logical:>15,}")
     print(f"  peak RSS for this whole script: {rss:.1f} MiB (torch resident, no weights)")
-    big = rows[-2]
+    big = next(r for r in rows if "H3-scale full" in r[0])
     check("a 48-block production-scale H3 derives in well under a second",
           big[1] < 1000, f"{big[1]:.0f}ms for {big[4]:,} logical parameters")
     check("zero weight bytes were allocated to do it", True,
@@ -693,7 +828,9 @@ def main() -> int:
     for section in (
         section_determinism, section_identity, section_derive_equals_serve,
         section_agreement, section_unrepresentable, section_h3_structures,
-        section_h3_schedule, section_match_direction, section_component_use,
+        section_h3_schedule, section_sdxl, section_planted_census_arms,
+        section_orphan_parts, section_source_converter,
+        section_match_direction, section_component_use,
         section_order_and_widening, section_sensitivity, section_gap_doctrine,
         section_fences, section_benchmarks,
     ):
