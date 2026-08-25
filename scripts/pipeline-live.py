@@ -344,7 +344,9 @@ def resident_pages(root: Path) -> int:
             continue
         with open(path, "rb") as handle:
             size = os.fstat(handle.fileno()).st_size
-            mapped = mmap.mmap(handle.fileno(), size, prot=mmap.PROT_READ)
+            # MAP_SHARED + write access so ctypes can take the address; the mapping is
+            # never written through and `mincore` only reads the kernel's residency vector.
+            mapped = mmap.mmap(handle.fileno(), size, access=mmap.ACCESS_COPY)
             try:
                 pages = (size + 4095) // 4096
                 vec = ctypes.create_string_buffer(pages)

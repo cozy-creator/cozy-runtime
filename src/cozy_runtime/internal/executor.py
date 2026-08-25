@@ -408,6 +408,7 @@ class Executor:
             self.residency.headroom = int(command.get("headroom_bytes", 0))
             self.residency.last_shortfall = None
         torch.cuda.reset_peak_memory_stats()
+        allocated_at_start = torch.cuda.memory_allocated()
         lease_acquired = time.perf_counter()
         started_wall = time.time()
         envelope, outcome, record = attempt(
@@ -489,6 +490,7 @@ class Executor:
                 "device_lease_ms": round(lease_ms, 3),
                 "d2h_wait_ms": round(d2h_ms, 3),
                 "peak_vram_bytes": peak_vram,
+                "allocated_at_start_bytes": allocated_at_start,
                 "rss_at_end_bytes": _rss(),
                 "started_unix": started_wall,
                 "gpu_count": 1,

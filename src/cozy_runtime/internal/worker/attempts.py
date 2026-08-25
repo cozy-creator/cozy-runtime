@@ -241,6 +241,10 @@ class AttemptEngine:
         #: binding plan ids whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
+        #: the demand falsifier. It ships first, it counts, and it decides nothing — the
+        #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
+        #: planner, the ledger or the fill plane.
+        self.demand = observe.DemandLedger()
 
     # ------------------------------------------------------------------ offer
 
@@ -608,6 +612,7 @@ class AttemptEngine:
         # leave the ledger blind in the one case that matters.
         moved = bool(attempt.residency.get("stages") or attempt.residency.get("evictions"))
         self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved)
+        self.bank_demand(attempt, reply.get("metrics", {}), moved)
 
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
@@ -795,6 +800,29 @@ class AttemptEngine:
                 f"served by a binding whose boot warm pass FAILED ({why}): the first-call "
                 "tax was never paid on boot, so this request paid it",
             )
+
+    def bank_demand(self, attempt: Attempt, metrics: Mapping[str, Any], moved: bool) -> None:
+        """Every serve evaluates DECLARED versus ACTUAL and banks the pair (§3.2).
+
+        The actual is the attempt's own peak above what it started holding — a number that
+        survives staging, unlike a figure measured against a construction baseline the
+        attempt then moved out from under itself. A miss is COUNTED and CONFESSED; it
+        selects nothing and refuses nothing.
+        """
+        plan = attempt.plan
+        if plan is None:
+            return
+        peak = int(metrics.get("peak_vram_bytes", 0))
+        started = int(metrics.get("allocated_at_start_bytes", -1))
+        actual = peak - started if peak and started >= 0 else -1
+        if moved:
+            # The resident set moved under the attempt, so `peak - start` is not the
+            # attempt's own demand. Named absent rather than banked as a number.
+            actual = -1
+        lane = f"{attempt.binding.entrypoint if attempt.binding else '?'} x {plan.placement}"
+        confession = self.demand.bank(lane, plan.headroom_bytes, actual)
+        if confession is not None:
+            attempt.confess(confession.kind, confession.quantified)
 
     def _payload(self, attempt: Attempt) -> dict[str, Any]:
         """The payload travels as a grant INPUT, fetched supervisor-side under the grant."""
@@ -1007,6 +1035,7 @@ class AttemptEngine:
             ],
             measurements={
                 "residency": attempt.residency,
+                "demand": self.demand.document(),
                 "ledger": attempt.reconciliation
                 or {"classes": [c.document() for c in self.ledger.counters()]},
                 "attribution": attempt.attribution,
