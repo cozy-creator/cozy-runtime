@@ -1455,7 +1455,14 @@ class Supervisor:
         )
 
 
-def main(argv: list[str] | None = None) -> int:
+def supervise(config: RuntimeConfig, argv: list[str] | None = None) -> int:
+    """Parse the launch flags and run ONE supervisor against a real coordinator.
+
+    Not an entrypoint: the config arrives from whoever already read it. `cozy-runtime serve`
+    reads the environment for its own verb dispatch and then calls this, and a second read
+    inside here refused `config_authority` — one config per process — so every worker the
+    CLI launched exited 1 before it could register (cl-004).
+    """
     parser = argparse.ArgumentParser(description="cozy-runtime worker supervisor (no CUDA)")
     parser.add_argument("--hub", required=True, help="gRPC target, e.g. unix:/path/hub.sock")
     parser.add_argument("--root", required=True)
@@ -1488,7 +1495,6 @@ def main(argv: list[str] | None = None) -> int:
         pinned_budget=args.pinned_budget,
         no_warm=args.no_warm,
     )
-    config = read_config()
     supervisor = Supervisor(config, options, GrpcCoordinator(args.hub))
 
     def terminate(signum: int, frame: object) -> None:
@@ -1506,6 +1512,11 @@ def main(argv: list[str] | None = None) -> int:
     except JournalError as exc:
         print(f"[supervisor] {exc}", file=sys.stderr, flush=True)
         return int(Exit.internal)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The PROCESS entrypoint: read the ONE config here, then supervise."""
+    return supervise(read_config(), argv)
 
 
 if __name__ == "__main__":

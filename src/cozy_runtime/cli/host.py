@@ -167,7 +167,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     identity, release, device envelope, budgets and the grace clock. Everything else —
     directives, grants, config — arrives over the protocol, and always will.
     """
-    from cozy_runtime.internal.worker.session import main as supervisor_main
+    from cozy_runtime.internal.worker.session import supervise
 
     values: dict[str, str] = {}
     switches: list[str] = []
@@ -206,7 +206,9 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         if flag in values:
             argv += [supervisor_flag, values[flag]]
     argv += switches
-    return supervisor_main(argv)
+    # THE CONFIG THIS VERB ALREADY READ. `session.main` reads it itself because it is a
+    # process entrypoint too; calling that from here was a second read and refused.
+    return supervise(config, argv)
 
 
 def bindings(config: RuntimeConfig, opts: Options) -> Result:
