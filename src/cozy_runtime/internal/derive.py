@@ -642,8 +642,17 @@ def derive(
     declared_variants: Sequence[str] = (),
     component_use: Mapping[str, Sequence[str]] | None = None,
     timestep_plans: Mapping[str, str] | None = None,
+    mode: str = "derive",
+    backend: Any = None,
 ) -> Derivation:
-    """Execute `model.load(loader)` on the meta substrate and derive its exact contract."""
+    """Execute `model.load(loader)` on the meta substrate and derive its exact contract.
+
+    `mode="serve"` runs the IDENTICAL substrate and the identical walk, and differs only in
+    that the fill path runs. That is the derive/serve fence made mechanical rather than
+    argued: the two modes cannot produce different contract bytes, because there is one
+    factory, one substrate and one census, and the only branch between them is whether
+    bytes are moved into destinations the census has already agreed on.
+    """
     torch = torch_module()
     if torch.cuda.is_initialized():
         raise HarnessGap(
@@ -653,7 +662,7 @@ def derive(
         )
     seen = Observations()
     with meta_substrate(hardware_variant, seen) as cap:
-        loader = Loader(artifact, owner=model, mode="derive")
+        loader = Loader(artifact, owner=model, mode=cast("Any", mode), backend=backend)
         with loading(loader):
             _load_typed(model, loader)
         built = loader.constructed()
