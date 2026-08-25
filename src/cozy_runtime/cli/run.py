@@ -241,7 +241,7 @@ def run(
         payload=document,
         outputs=outputs,
         request_id=f"cli-{function}",
-        deadline_ms=_timeout((flags.get("--timeout") or [""])[0]),
+        timeout_ms=_timeout((flags.get("--timeout") or [""])[0]),
         kind=kind if kind == "job" else "entrypoint",
         job_descriptor_id=descriptor_id,
         trees=trees,
@@ -568,6 +568,27 @@ def _render(
         "timings": outcome.timings,
         "warnings": warnings,
     }
+    # THE PUBLICATION, rendered. The runtime mints a typed receipt per publication and
+    # journals it before the terminal names it, and this verb dropped all three of the
+    # facts that carry it — a producer could not read its own publication from the CLI that
+    # made it (job-001). The scope and the durable checkpoints ride with it: they are what
+    # a producer promotes out of, and what it resumes from.
+    if outcome.publication:
+        document["publication"] = outcome.publication
+        rows.append(
+            (
+                "publication",
+                f"{len(outcome.publication.get('outputs') or [])} output(s), "
+                f"{outcome.publication.get('total_bytes', 0)} B under "
+                f"{outcome.publication.get('grant_id') or 'no scope'}",
+            )
+        )
+    if outcome.publication_scope:
+        document["publication_scope"] = outcome.publication_scope
+        rows.append(("publication_scope", outcome.publication_scope))
+    if outcome.checkpoints:
+        document["checkpoints"] = outcome.checkpoints
+        rows.append(("checkpoints", f"{len(outcome.checkpoints)} durable receipt(s)"))
     if code != Exit.ok:
         message = str(terminal.get("safe_message", "")) if isinstance(terminal, dict) else ""
         detail = str(cause.get("detail", "")) if isinstance(cause, dict) else ""

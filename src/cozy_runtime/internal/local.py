@@ -51,10 +51,15 @@ from cozy_runtime.internal.worker.session import Supervisor, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-#: How long a granted local file URL stays valid. A local grant still EXPIRES: the expiry
-#: path is the same code the network path walks, and a run that never exercises it would
-#: leave the worker's most security-relevant branch unproven on the local door.
-GRANT_SECONDS = 900
+#: What an OUTPUT TRANSACTION is allowed AFTER the handler returns: read the attempt spool,
+#: write every granted destination, mint the receipt. The grant outlives the attempt by this
+#: and by nothing more — it is a tail, never a lifetime.
+#:
+#: The lifetime itself is DERIVED FROM THE ATTEMPT (`LocalCoordinator.expiry`). It used to be
+#: a 900 s constant derived from nothing, which is not a bound but a ceiling on what a job
+#: may be: job-001's dual production ran 20:15.89, landed its 99 GB artifact intact, and died
+#: `grant_expired: the output grant expired before the write`.
+GRANT_TAIL_SECONDS = 300
 
 
 class LocalBindingError(Exception):
@@ -73,7 +78,13 @@ class LocalRequest:
     outputs: tuple[str, ...] = ("image",)
     request_id: str = "run-1"
     attempt: int = 1
-    deadline_ms: int = 0
+    timeout_ms: int = 0
+    """The caller's own bound on this attempt, as a DURATION. 0 means none.
+
+    A coordinator mints the absolute deadline when it DISPATCHES, which is what `_dispatch`
+    does — a duration written straight into `deadline_unix_ms` is a 1970 timestamp, and
+    every attempt under it was silently given the 0.5 s floor.
+    """
     #: grant the payload from THIS location instead of a file staged beside the run. A
     #: coordinator may grant any location it can authorize; the worker still verifies the
     #: bytes it reads against the grant's own digest and length.
@@ -358,6 +369,19 @@ class LocalCoordinator:
 
     # ------------------------------------------------------------------ documents
 
+    def expiry(self) -> int:
+        """When this run's grant stops being authority — DERIVED, never a constant.
+
+        A deadline is the caller's own bound, so the grant is that plus the tail an output
+        transaction needs. A run with NO deadline has no bound to derive one from, and
+        `grants.expired()` reads 0 as "does not expire": inventing a ceiling for a
+        run-to-completion job is exactly what job-001 hit. The expiry PATH is still walked
+        on every deadlined run, so the branch stays proven on the local door.
+        """
+        if not self.request.timeout_ms:
+            return 0
+        return int(time.time()) + self.request.timeout_ms // 1000 + GRANT_TAIL_SECONDS
+
     def _directive(self) -> pb.Directive:
         directive = pb.Directive(
             session_id=self.session_id,
@@ -370,7 +394,7 @@ class LocalCoordinator:
                 issuer="cozy-runtime-local",
                 key_id="local",
                 epoch=1,
-                expires_at_unix=int(time.time()) + GRANT_SECONDS,
+                expires_at_unix=self.expiry(),
                 token=b"local",
             )
         )
@@ -417,7 +441,11 @@ class LocalCoordinator:
         plan_id = "" if self.request.kind == "job" else self._plan_id()
         spec = pb.ExecutionSpec(
             endpoint_release_id=self.release_id,
-            deadline_unix_ms=self.request.deadline_ms,
+            # THE DEADLINE IS MINTED AT DISPATCH, from the caller's duration. It is what the
+            # grant's own lifetime is derived from too, so the two cannot disagree.
+            deadline_unix_ms=(
+                int(time.time() * 1000) + self.request.timeout_ms if self.request.timeout_ms else 0
+            ),
         )
         # `image_digest` and `config_digest` stay EMPTY on the local door and that is a
         # statement: a bare-venv run has no container image, and minting a plausible digest
@@ -460,7 +488,7 @@ class LocalCoordinator:
             path = self.grant_dir / f"{self.request.request_id}.json"
             path.write_bytes(body)
             url = f"file://{path}"
-        expires = int(time.time()) + GRANT_SECONDS
+        expires = self.expiry()
         return pb.DeliveryGrant(
             credential=pb.Credential(
                 issuer="cozy-runtime-local",

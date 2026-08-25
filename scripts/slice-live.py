@@ -195,7 +195,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         payload=spec["payload"],
         outputs=tuple(spec.get("outputs", ("image",))),
         request_id=spec.get("request_id", "run-1"),
-        deadline_ms=int(spec.get("deadline_ms", 0)),
+        timeout_ms=int(spec.get("timeout_ms", spec.get("deadline_ms", 0))),
         payload_url=spec.get("payload_url", ""),
     )
     options = WorkerOptions(
