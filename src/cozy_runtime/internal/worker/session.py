@@ -24,12 +24,11 @@ from __future__ import annotations
 
 import argparse
 import collections
-import contextlib
 import dataclasses
 import itertools
 import json
+import os
 import queue
-import resource
 import signal
 import sys
 import threading
@@ -38,8 +37,6 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-import grpc
 
 from cozy_runtime.internal.config import RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -54,10 +51,11 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRefusal,
 )
 from cozy_runtime.internal.worker.child import GRACE_SECONDS, ExecutorGone, ExecutorSupervision
-from cozy_runtime.internal.worker.plan import BindingPlan, HostLedger, PlanChooser
+from cozy_runtime.internal.worker.control import Coordinator, GrpcCoordinator, Link, LinkError
+from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.plan import BindingPlan, PlanChooser
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 #: The lossy lane's depth. Oldest is shed first; a durable message never enters here.
 PROGRESS_QUEUE = 256
@@ -65,6 +63,34 @@ PROGRESS_QUEUE = 256
 #: Report cadence. Report is DURABLE and carries the applied baseline, so the hub can always
 #: see a directive it issued but the worker did not apply.
 REPORT_SECONDS = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerOptions:
+    """One worker's settings, as a typed value rather than a parser's leftovers.
+
+    The supervisor has two entrances — the long-lived `serve` process and the ephemeral
+    local supervisor a one-shot `run` builds in memory (§8) — and only one of them has a
+    command line. A frozen dataclass is what makes the second one possible without a fake
+    `argparse.Namespace`, and what makes every setting typed at the point it is read.
+
+    The coordinator is NOT here: who drives this worker is a transport (`worker/control.py`),
+    not a setting.
+    """
+
+    root: Path
+    worker_id: str = "wrk-local"
+    instance_id: str = ""
+    release_id: str = "cozy/sdxl-unet@cr-005"
+    git_commit: str = ""
+    python: str = ""
+    devices: str = "0"
+    alloc_conf: str = "expandable_segments:True"
+    threads: int = 4
+    grace: float = GRACE_SECONDS
+    host_budget: int = 8 << 30
+    pinned_budget: int = 512 << 20
+    no_warm: bool = False
 
 
 @dataclass(slots=True)
@@ -85,20 +111,27 @@ class Fences:
 class Supervisor:
     """The no-CUDA control parent."""
 
-    def __init__(self, config: RuntimeConfig, args: argparse.Namespace) -> None:
+    def __init__(
+        self, config: RuntimeConfig, options: WorkerOptions, coordinator: Coordinator
+    ) -> None:
         self.config = config
-        self.args = args
-        self.root = Path(args.root)
+        self.options = options
+        self.coordinator = coordinator
+        self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.fences = Fences(session_id=f"ses-{uuid.uuid4().hex[:20]}")
         self.seq = itertools.count(1)  # SUPERVISOR-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.journal = Journal(self.root / "journal.log")
-        self.ledger = HostLedger(host_budget=args.host_budget, pinned_budget=args.pinned_budget)
+        self.ledger = Ledger(
+            host_budget=options.host_budget,
+            pinned_budget=options.pinned_budget,
+            supervisor_pid=os.getpid(),
+        )
         self.authorizer = grants.Authorizer()
         self.supervision = ExecutorSupervision(
             root=self.root,
-            python=args.python or sys.executable,
+            python=options.python or sys.executable,
             base_env=config.child_base_env,
             cozy_home=config.cozy_home,
         )
@@ -112,7 +145,7 @@ class Supervisor:
             authorizer=self.authorizer,
             bindings={},
             spool_root=self.root / "spool",
-            instance_id=args.instance_id,
+            instance_id=options.instance_id,
             send=self.send,
             progress=self.emit_progress,
         )
@@ -130,7 +163,7 @@ class Supervisor:
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
         self.notes: list[str] = []
-        self.call: Any = None  # the live Control call, so shutdown can cancel it
+        self.link: Link | None = None  # the live control link, so shutdown can end it
 
     # ------------------------------------------------------------------ plumbing
 
@@ -148,6 +181,22 @@ class Supervisor:
     def send(self, message: pb.WorkerMessage) -> None:
         """Durable. Queued, never shed, and replayed after a reconnect if unacknowledged."""
         self.outbound.put(message)
+
+    def intake(self, state: pb.IntakeState) -> None:
+        """Move the intake state and REPORT IT IMMEDIATELY.
+
+        Readiness is an EDGE, not a poll. The Report ticker exists so a coordinator can
+        always see a directive the worker did not apply; it is not a way to learn that
+        loading finished. Publishing on the transition costs one durable message and takes
+        the cost of learning "ready" from up to a full report period down to the seam
+        round-trip — which is the difference between a one-shot local `run` paying a
+        two-second tax and paying none.
+        """
+        if state == self.fences.intake:
+            return
+        self.fences.intake = state
+        if self.connected.is_set():
+            self.send(pb.WorkerMessage(report=self.report()))
 
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded, oldest-first shed, supervisor-owned sequence numbers."""
@@ -236,11 +285,12 @@ class Supervisor:
         before any attempt may be accepted against this executor."""
         if not self.bindings:
             return
-        self.fences.intake = pb.IntakeState.INTAKE_STATE_LOADING
+        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
         executor = self.supervision.current
         if executor is None or not executor.alive():
             self.note("boot", "spawning the device executor (exec-first trampoline)")
             executor = self.supervision.spawn(imposed=self.imposed())
+            self.ledger.executor_pid = executor.pid
             self.note(
                 "boot",
                 f"incarnation {executor.incarnation} pid {executor.pid} dialled back in "
@@ -281,7 +331,7 @@ class Supervisor:
             )
             took = (time.perf_counter() - started) * 1000
             if not reply.get("ok"):
-                self.fences.intake = pb.IntakeState.INTAKE_STATE_ERROR
+                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.engine.faults.append(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
@@ -313,10 +363,12 @@ class Supervisor:
                     binding, model_construction_digest=digest
                 )
             self.engine.bindings = self.bindings
-            # `registered` is page-locked, kernel-unreclaimable bytes: the ring's PEAK is
-            # the honest number, since a closed ring has charged nothing while the budget it
-            # held is exactly what the driver had pinned (§3.2's two-number rule).
-            self.ledger.registered = int(reply["facts"]["ledger"].get("pinned", {}).get("peak", 0))
+            # The generation's RESIDENT BASELINE enters the ledger here: the destinations the
+            # fill actually committed, the allocator's live bytes behind them, and the ring's
+            # page-locked PEAK (a closed ring has charged nothing while the budget it held is
+            # exactly what the driver had pinned — §3.2's two-number rule). Every later
+            # attempt reconciles against this line.
+            self.ledger.observe_construction(reply["facts"])
             self.note(
                 "boot",
                 f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
@@ -325,7 +377,7 @@ class Supervisor:
                 f"{reply['facts']['fill_ms'] / 1000:.3f} s, construction {digest[:23]}…",
             )
         self.run_warm_pass()
-        self.fences.intake = pb.IntakeState.INTAKE_STATE_READY
+        self.intake(pb.IntakeState.INTAKE_STATE_READY)
 
     def run_warm_pass(self) -> None:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch.
@@ -342,7 +394,7 @@ class Supervisor:
         fit or arm cr-008b's demand coefficients (se#715), which is why every outcome record
         carries `demand_evidence: false` and the chooser never reads this list.
         """
-        if self.args.no_warm:
+        if self.options.no_warm:
             return
         executor = self.supervision.current
         if executor is None:
@@ -396,13 +448,26 @@ class Supervisor:
                         f"{outcome['reason']} - the worker still serves",
                     )
                 )
+        # The warm pass IS execution: it allocates the library workspaces the first kernel
+        # launch needs, and those belong to the generation rather than to the first paying
+        # request. Re-reading the device here is what makes the first paying attempt
+        # reconcile to zero — the first-call tax landing on boot, measured rather than
+        # asserted. Nothing observed in the warm pass may seed cr-008b's demand
+        # coefficients (se#715); a resident BASELINE is not a demand coefficient.
+        if self.warm and executor.alive():
+            try:
+                self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
+            except ExecutorGone:
+                return
+            shift = self.ledger.rebaseline("boot warm pass")
+            self.note("warm", f"the resident device baseline moved {shift:+d} B on the warm pass")
 
     def imposed(self) -> dict[str, str]:
         """The IMPOSE half of the seal. Every name here is in the reviewed allowlist."""
         return {
-            "CUDA_VISIBLE_DEVICES": self.args.devices,
-            "PYTORCH_CUDA_ALLOC_CONF": self.args.alloc_conf,
-            "OMP_NUM_THREADS": str(self.args.threads),
+            "CUDA_VISIBLE_DEVICES": self.options.devices,
+            "PYTORCH_CUDA_ALLOC_CONF": self.options.alloc_conf,
+            "OMP_NUM_THREADS": str(self.options.threads),
         }
 
     # ------------------------------------------------------------------ the loops
@@ -491,7 +556,7 @@ class Supervisor:
                 f"{exc.code}: acknowledging nothing and executing nothing for "
                 f"{start.request_id}#{start.attempt}",
             )
-            self.fences.intake = pb.IntakeState.INTAKE_STATE_ERROR
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             self.engine.faults.append(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
@@ -537,7 +602,7 @@ class Supervisor:
                 terminal = self.engine.execute(attempt)
             except JournalError as exc:
                 self.note("journal", f"{exc.code}: no terminal can be claimed")
-                self.fences.intake = pb.IntakeState.INTAKE_STATE_ERROR
+                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 continue
             self.send(pb.WorkerMessage(attempt_terminal=terminal))
             current = self.supervision.current
@@ -551,7 +616,7 @@ class Supervisor:
     def rebuild(self, why: str) -> None:
         """Replace the executor and RELOAD before reporting ready. Never on the
         cancellation critical path — the caller's cancel completed when CANCELED journaled."""
-        self.fences.intake = pb.IntakeState.INTAKE_STATE_LOADING
+        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
         killed = self.supervision.sweep_orphans(
@@ -563,7 +628,7 @@ class Supervisor:
             self.supervision.replace(imposed=self.imposed())
         except ExecutorGone as exc:
             self.note("recovery", f"respawn failed: {exc}")
-            self.fences.intake = pb.IntakeState.INTAKE_STATE_ERROR
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             return
         self.prepare_executor()
         # Cleared LAST, not first: an invalidation raised by another thread WHILE the
@@ -593,13 +658,13 @@ class Supervisor:
                 if attempt.canceling:
                     started = getattr(attempt, "cancel_started", 0.0) or time.perf_counter()
                     attempt.cancel_started = started
-                    if time.perf_counter() - started > self.args.grace:
+                    if time.perf_counter() - started > self.options.grace:
                         self.note(
                             "cancel",
-                            f"grace of {self.args.grace:g} s expired: escalating to a "
+                            f"grace of {self.options.grace:g} s expired: escalating to a "
                             "forceful kill (the handler never asked whether it was cancelled)",
                         )
-                        facts = self.engine.escalate(attempt, self.args.grace)
+                        facts = self.engine.escalate(attempt, self.options.grace)
                         self.note("cancel", f"forceful: {json.dumps(facts)}")
                         attempt.canceling = attempt.canceling or "client"
                         attempt.cancel_started = time.perf_counter() + 1e9
@@ -638,11 +703,10 @@ class Supervisor:
                 return
             yield message
 
-    def pump_progress(self, stub: Any) -> None:
-        """The lossy lane, on its OWN RPC and its OWN thread. Its failure is invisible to
+    def pump_progress(self, link: Link) -> None:
+        """The lossy lane, on its OWN lane and its OWN thread. Its failure is invisible to
         Control by construction — there is no shared buffer for backpressure to cross."""
-        with contextlib.suppress(grpc.RpcError):
-            stub.StreamProgress(self.progress_iterator())
+        link.progress(self.progress_iterator())
 
     def progress_iterator(self) -> Any:
         while not self.stop.is_set():
@@ -664,11 +728,11 @@ class Supervisor:
             session_id=self.fences.session_id,
             executor_incarnation=self.supervision.incarnation,
             wire_minor=WIRE_MINOR,
-            worker_id=self.args.worker_id,
-            instance_id=self.args.instance_id,
-            release_id=self.args.release_id,
+            worker_id=self.options.worker_id,
+            instance_id=self.options.instance_id,
+            release_id=self.options.release_id,
             image_digest="sha256:" + "00" * 32,
-            git_commit=self.args.git_commit,
+            git_commit=self.options.git_commit,
             resources=self.resources(),
             recovered_attempts=recovered,
         )
@@ -727,9 +791,16 @@ class Supervisor:
         )
 
     def run(self) -> int:
-        """Dial, register, serve, reconnect. The session outlives the connection."""
+        """Link, register, serve, relink. The session outlives the connection.
+
+        The loop is the same whichever coordinator drives it — that is the point of the
+        transport seam. What differs is `reconnects`: a network peer that drops the stream
+        may come back and the worker redials the SAME session; an in-memory coordinator that
+        ends the stream has ended the run, and redialling it would be a hang.
+        """
         self.journal.append(
-            "session", {"session_id": self.fences.session_id, "instance_id": self.args.instance_id}
+            "session",
+            {"session_id": self.fences.session_id, "instance_id": self.options.instance_id},
         )
         killed = self.supervision.sweep_orphans()
         if killed:
@@ -743,13 +814,12 @@ class Supervisor:
 
         backoff = 0.2
         while not self.stop.is_set():
-            channel = grpc.insecure_channel(self.args.hub)
-            stub = pb_grpc.WorkerStub(channel)
+            link = self.link = self.coordinator.link()
             try:
                 threading.Thread(
-                    target=self.pump_progress, args=(stub,), daemon=True, name="progress"
+                    target=self.pump_progress, args=(link,), daemon=True, name="progress"
                 ).start()
-                responses = self.call = stub.Control(self.outbound_iterator())
+                responses = link.control(self.outbound_iterator())
                 self.send(pb.WorkerMessage(register=self.register()))
                 for attempt in self.engine.pending_terminals():
                     self.note(
@@ -759,9 +829,9 @@ class Supervisor:
                     )
                     self.send(pb.WorkerMessage(attempt_terminal=self.engine.wrap(attempt)))
                 self.reader(responses)
-            except grpc.RpcError as exc:
-                self.note("session", f"stream error: {exc.code()}")
-            if self.stop.is_set():
+            except LinkError as exc:
+                self.note("session", f"stream error: {exc}")
+            if self.stop.is_set() or not self.coordinator.reconnects:
                 break
             self.note("session", f"reconnecting in {backoff:.1f} s (same session)")
             time.sleep(backoff)
@@ -778,8 +848,8 @@ class Supervisor:
         self.stop.set()
         self.work.put(None)
         self.outbound.put(None)
-        if self.call is not None:
-            self.call.cancel()
+        if self.link is not None:
+            self.link.cancel()
         self.supervision.close()
         self.journal.close()
         print(
@@ -799,7 +869,7 @@ class Supervisor:
                     "seam": seam,
                     "ledger": self.ledger.rows(),
                     "warm": self.warm,
-                    "rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+                    "rss_bytes": read_vmrss(os.getpid()),
                 }
             ),
             flush=True,
@@ -823,18 +893,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pinned-budget", type=int, default=512 << 20)
     parser.add_argument("--no-warm", action="store_true")
     args = parser.parse_args(argv)
-    args.instance_id = args.instance_id or f"ins-{uuid.uuid4().hex[:16]}"
 
+    options = WorkerOptions(
+        root=Path(args.root),
+        worker_id=args.worker_id,
+        instance_id=args.instance_id or f"ins-{uuid.uuid4().hex[:16]}",
+        release_id=args.release_id,
+        git_commit=args.git_commit,
+        python=args.python,
+        devices=args.devices,
+        alloc_conf=args.alloc_conf,
+        threads=args.threads,
+        grace=args.grace,
+        host_budget=args.host_budget,
+        pinned_budget=args.pinned_budget,
+        no_warm=args.no_warm,
+    )
     config = read_config()
-    supervisor = Supervisor(config, args)
+    supervisor = Supervisor(config, options, GrpcCoordinator(args.hub))
 
     def terminate(signum: int, frame: object) -> None:
         supervisor.stop.set()
         supervisor.outbound.put(None)
-        if supervisor.call is not None:
+        if supervisor.link is not None:
             # Half-closing the request stream is not enough: the peer's response generator
             # may be parked waiting to send. Cancelling ends the call from this side.
-            supervisor.call.cancel()
+            supervisor.link.cancel()
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
