@@ -501,6 +501,99 @@ def section_stage(args: argparse.Namespace) -> None:
     print(f"  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
 
 
+def section_sources(args: argparse.Namespace) -> None:
+    """Every filled tensor against the ORIGINAL safetensors bytes. THE check that matters.
+
+    Correctness of a fill is only visible against the source. Digest equality between two
+    runs of our own code agrees with itself — and did, while a four-component fill was
+    silently corrupting 12 of `text_encoder_2`'s 517 tensors because the staging ring's
+    slots were handed to the next component's stream while their H2D copies were still in
+    flight. This section is what would have caught it on the first run.
+    """
+    import torch
+    from corpus.sdxl_pipeline import SdxlPipelineModel
+    from safetensors.torch import load_file
+
+    from cozy_runtime.author import ModelRegistry
+    from cozy_runtime.author._loader import Artifact, Config
+    from cozy_runtime.internal.derive import Observations, serving_substrate
+    from cozy_runtime.internal.fill import (
+        Checkpoint,
+        ResourceLedger,
+        StreamingFillBackend,
+        topology_of,
+    )
+    from cozy_runtime.internal.fill import _tensors as tensors_of
+
+    require_quiet_card()
+    head("every filled tensor against the original safetensors bytes")
+    sources = {
+        "text_encoder": HF / "text_encoder" / "model.fp16.safetensors",
+        "text_encoder_2": HF / "text_encoder_2" / "model.fp16.safetensors",
+        "vae": WORK / "vae-fp16-fix" / "vae.fp16.safetensors",
+    }
+    have = snapshots()
+    checkpoints = {name: Checkpoint(str(STORE), have[name]) for name in COMPONENTS}
+    rows = [row for name in COMPONENTS for row in checkpoints[name].rows(name)]
+    backend = StreamingFillBackend(
+        checkpoints,
+        rows,
+        ledger=ResourceLedger(budgets={"vram": 7 * GIB, "pinned": 256 * MIB}),
+        window_bytes=4 * MIB,
+        slots=16,
+        readers=16,
+        inflight=8,
+    )
+    # The UNet is parked so this fits beside a neighbour AND so the multi-component stream
+    # crosses a component boundary more than once, which is where the defect lived.
+    backend.resident_budget = 2 * GIB
+    backend.hold_lease = True
+    registry = ModelRegistry(
+        release=RELEASE,
+        backend=backend,
+        substrate=lambda: serving_substrate("sm89", Observations()),
+    )
+    artifact = Artifact(
+        have["unet"],
+        topology_of(rows),
+        Config(json.loads(CONFIG.read_text()), "pipeline.config"),
+        custody="canonical",
+    )
+    backend.expect({n: tuple(r.key for r in checkpoints[n].rows(n)) for n in COMPONENTS})
+    registry.acquire("generate.models.model", SdxlPipelineModel, artifact)
+    total = 0
+    wrong: list[str] = []
+    for name, path in sources.items():
+        member = backend.components.get(name)
+        if member is None:
+            check(f"{name} is parked", True, "not filled at construction, so not compared")
+            continue
+        source = load_file(str(path))
+        filled = {key: tensor for key, tensor in tensors_of(member)}
+        compared = [key for key in filled if key in source]
+        bad = [
+            key
+            for key in compared
+            if not torch.equal(source[key].cuda().view(torch.uint8), filled[key].view(torch.uint8))
+        ]
+        total += len(compared)
+        wrong += [f"{name}.{key}" for key in bad]
+        check(
+            f"{name}: every filled tensor equals its source byte for byte",
+            not bad,
+            f"{len(compared)} compared, {len(bad)} differing{', first ' + bad[0] if bad else ''}",
+        )
+    check(
+        "the multi-component fill is byte-exact end to end",
+        not wrong,
+        f"{total} tensors compared against the original safetensors payloads",
+    )
+    backend.close()
+    for name in list(backend.components):
+        backend.evict(name)
+    torch.cuda.empty_cache()
+
+
 def section_poison(args: argparse.Namespace) -> None:
     """Evict, POISON the freed pages, re-stage, compare. ~350 MiB, so it runs anywhere.
 
@@ -1040,6 +1133,7 @@ def main() -> int:
             "exec",
             "fill",
             "fixtures",
+            "sources",
             "poison",
             "stage",
             "arms",
@@ -1077,6 +1171,7 @@ def main() -> int:
     Path(args.tmp).mkdir(parents=True, exist_ok=True)
     sections = {
         "fixtures": section_fixtures,
+        "sources": section_sources,
         "poison": section_poison,
         "fillbw": section_fillbw,
         "stage": section_stage,
