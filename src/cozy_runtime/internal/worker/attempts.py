@@ -724,6 +724,7 @@ class AttemptEngine:
                     "exec_spec_digest": documents.spell(attempt.digest),
                     "plan_digest": plan_digest,
                     "model_construction_digest": plan.model_construction_digest,
+                    "constructed_generation_digest": plan.constructed_generation_digest,
                     "grant_epoch": int(attempt.grant.credential.epoch),
                     "entrypoint_binding_plan_id": plan_id,
                 },

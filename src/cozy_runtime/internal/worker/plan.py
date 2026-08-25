@@ -54,7 +54,14 @@ class AttemptPlan:
     headroom_bytes: int
     entrypoint_binding_plan_id: str
     model_construction_digest: str
+    """The LOGICAL model: reference variant, topology, config, factory. Identical across
+    every delivery variant of one model, which is what makes it a usable deployment fence."""
     quantified_choice: str
+    constructed_generation_digest: str = ""
+    """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them and the
+    configuration the fill ran under. The logical digest cannot answer "which bytes are
+    resident", so two generations over different artifacts were indistinguishable without
+    this (codex audit, adopted 2026-08-25)."""
     delivery_variant: str = ""
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a coordinator holds, and two plans that read different artifacts of one model
@@ -74,6 +81,7 @@ class AttemptPlan:
             "headroom_bytes": self.headroom_bytes,
             "entrypoint_binding_plan_id": self.entrypoint_binding_plan_id,
             "model_construction_digest": self.model_construction_digest,
+            "constructed_generation_digest": self.constructed_generation_digest,
         }
 
     def digest(self) -> str:
@@ -223,6 +231,10 @@ class BindingPlan:
     the executor's `DeliveryChooser` took. Empty means `verbatim`."""
     delivery_variant: str = ""
     """RESOLVED AT PREPARE: which offered variant the generation actually read."""
+    constructed_generation_digest: str = ""
+    """RESOLVED AT PREPARE: the identity of what was BUILT, selected bytes included. The
+    deployment declares `model_construction_digest` (the logical model) as its fence and
+    never writes this one."""
     max_input_bytes: int = 64 << 20
     """cr-012: the DEPLOYMENT's per-input-asset ceiling, checked pre-accept against the
     grant's declared length. A field's own `AssetBound` narrows it and never widens it, so
@@ -254,9 +266,13 @@ class BindingPlan:
     def construction_key(self) -> str:
         """Two binding plans over the SAME construction share one executor generation.
 
-        The OFFERED variant set and the objective are inside the key because they decide
-        which bytes get filled: two bindings that would make different delivery choices are
-        not one construction, however identical the rest of the record reads.
+        The OFFERED variant set is inside the key BY ITS BYTES — store, snapshot and the
+        per-component snapshot map, not the label somebody typed. A name is a deployment's
+        word for a candidate, and two records offering different artifacts under the same
+        words are two constructions; keying on names alone coalesced them into one
+        generation, so the second binding was served by whichever bytes the first one
+        filled (codex audit, adopted 2026-08-25). The objective belongs here for the same
+        reason: it decides which of the candidates gets filled.
         """
         return canonical.digest(
             {
@@ -268,7 +284,16 @@ class BindingPlan:
                 "model_class": self.model_class,
                 "component": self.component,
                 "components": self.components,
-                "variants": [v.name for v in self.variants],
+                "variants": [
+                    {
+                        "name": v.name,
+                        "store": v.store,
+                        "snapshot": v.snapshot,
+                        "snapshots": v.snapshots,
+                        "reference": v.reference,
+                    }
+                    for v in self.offered()
+                ],
                 "objective": self.objective,
             }
         )
@@ -632,6 +657,7 @@ class PlanChooser:
             headroom_bytes=activations.value,
             entrypoint_binding_plan_id=binding.plan_id,
             model_construction_digest=binding.model_construction_digest,
+            constructed_generation_digest=binding.constructed_generation_digest,
             delivery_variant=binding.delivery_variant,
             quantified_choice=(
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "

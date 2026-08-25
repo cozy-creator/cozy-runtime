@@ -639,6 +639,7 @@ class Supervisor:
                 self.bindings[binding.plan_id] = dataclasses.replace(
                     binding,
                     model_construction_digest=digest,
+                    constructed_generation_digest=str(reply["constructed_generation_digest"]),
                     delivery_rung=str(delivery.get("rung", "")),
                     delivery_variant=str(delivery.get("variant", "")),
                 )
@@ -667,7 +668,8 @@ class Supervisor:
                 f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
                 f"{reply['facts']['filled']} destinations, "
                 f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
-                f"{reply['facts']['fill_ms'] / 1000:.3f} s, construction {digest[:23]}… "
+                f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
+                f"generation {str(reply['constructed_generation_digest'])[:23]}… "
                 f"resident={sorted(reply['facts'].get('resident', {}))} "
                 f"parked={reply['facts'].get('parked', [])}",
             )

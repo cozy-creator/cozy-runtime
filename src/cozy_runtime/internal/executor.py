@@ -107,7 +107,8 @@ class Executor:
         self.discovered: Any = None
         self.ready = False
         self.poisoned = ""
-        self.construction_digest = ""
+        self.logical_model_digest = ""
+        self.constructed_generation_digest = ""
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         self.attempts = 0
@@ -135,6 +136,7 @@ class Executor:
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
         from cozy_runtime.internal.delivery import (
+            ROUTE_KERNEL,
             DeliveryChooser,
             DeliveryFact,
             DeliveryRefusal,
@@ -369,15 +371,16 @@ class Executor:
         self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
-        # `artifact` is the LOGICAL model's identity — the REFERENCE variant's snapshot —
-        # and not the variant this generation happened to read. cr-006 proved that claim on
-        # real bytes: an encoding rung changes no logical keyset and shares its
-        # `topology_digest` byte for byte, so every delivery variant of one model IS one
-        # construction. Which bytes served is a separate journaled fact (`delivery_variant`
-        # on the AttemptPlan), which is what keeps `expect_construction_digest` a usable
-        # fence for a binding that offers several variants.
+        # TWO IDENTITIES, because there are two questions and one digest could only answer
+        # one of them (codex audit, adopted 2026-08-25).
+        #
+        # The LOGICAL MODEL is the REFERENCE variant's snapshot and the topology around it.
+        # cr-006 proved on real bytes that an encoding rung changes no logical keyset and
+        # shares its `topology_digest`, so every delivery variant of one model is one
+        # logical model — which is what keeps `expect_construction_digest` a usable fence
+        # for a deployment that offers several variants.
         reference = next((v for v in offered if v.reference), offered[0])
-        self.construction_digest = canonical.digest(
+        self.logical_model_digest = canonical.digest(
             {
                 "format": "cozy.runtime.ModelConstructionContract/1",
                 "release": binding["release"],
@@ -390,14 +393,39 @@ class Executor:
                 "variant": binding["variant"],
             }
         )
+        # The CONSTRUCTED GENERATION is what actually got filled: the SELECTED bytes, the
+        # route that decodes them, and the configuration the fill ran under. The logical
+        # digest cannot answer "which bytes are resident right now" — it is identical
+        # across every variant by construction — so using it as the generation's identity
+        # made two generations over different artifacts indistinguishable.
+        self.constructed_generation_digest = canonical.digest(
+            {
+                "format": "cozy.runtime.ConstructedGeneration/1",
+                "logical_model_digest": self.logical_model_digest,
+                "store": choice.variant.store,
+                "snapshot": choice.variant.snapshot,
+                "snapshots": choice.variant.snapshot_map(),
+                "delivery_variant": choice.variant.name,
+                "delivery": choice.rung.delivery,
+                "materialization": choice.rung.materialization,
+                "route": choice.rung.route,
+                "kernel": ROUTE_KERNEL[choice.rung.route],
+                "topology_digest": record.topology_digest,
+                "config_digest": record.config_digest,
+                "components": list(record.components),
+                "resident_budget_bytes": int(budgets.get("resident", 0)),
+                "custody": str(binding.get("custody", "canonical")),
+                "strict_keys": bool(binding.get("strict_keys", False)),
+            }
+        )
         expected = command.get("expect_construction_digest") or ""
-        if expected and expected != self.construction_digest:
+        if expected and expected != self.logical_model_digest:
             self.poisoned = "construction digest mismatch"
             return {
                 "ok": False,
                 "code": "construction_digest_mismatch",
                 "detail": f"the plan prices {expected} and this executor constructed "
-                f"{self.construction_digest}: the planner pricing variant A while the "
+                f"{self.logical_model_digest}: the planner pricing variant A while the "
                 "executor serves variant B is unrepresentable",
             }
         free, total = torch.cuda.mem_get_info()
@@ -459,7 +487,8 @@ class Executor:
         return {
             "ok": True,
             "ready": True,
-            "model_construction_digest": self.construction_digest,
+            "model_construction_digest": self.logical_model_digest,
+            "constructed_generation_digest": self.constructed_generation_digest,
             "entrypoints": sorted(self.surface_names),
             "delivery": choice.document(),
             "facts": self.facts,
