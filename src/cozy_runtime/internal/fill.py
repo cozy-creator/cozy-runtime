@@ -1620,11 +1620,14 @@ class StreamingFillBackend:
         # `nn.Module.__setattr__` is the whole reason this is machinery: it accepts the leaf
         # here precisely because the leaf is a Module, and would have refused the payload.
         setattr(owner, attribute, leaf)
-        kept = {id(t.untyped_storage()) for t in leaf.roles().values()}
+        # BY ADDRESS, never by `id()`. `untyped_storage()` builds a fresh Python wrapper on
+        # every call, so the wrappers in a set comprehension are garbage by the time the
+        # next comprehension runs — and CPython reuses the addresses `id()` returns. A role
+        # the leaf kept could therefore test as retired and have its storage freed under a
+        # resident weight, which is the worst possible spelling of this loop.
+        kept = {_data_ptr(t) for t in leaf.roles().values()}
         retired: dict[str, Any] = {
-            role: tensor
-            for role, tensor in parts.items()
-            if id(tensor.untyped_storage()) not in kept
+            role: tensor for role, tensor in parts.items() if _data_ptr(tensor) not in kept
         }
         retired["#destination"] = destination
         module_path = row.key[: -len(".weight")]

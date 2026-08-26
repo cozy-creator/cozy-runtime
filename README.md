@@ -160,6 +160,10 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/quant-live.py arms       # cr-006: the encoding border and its refusals
     corpus/.venv/bin/python scripts/delivery-live.py all     # cr-008c: the delivery ladder, chosen over two real artifacts
     corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
+    corpus/.venv/bin/python scripts/leaf-live.py all         # cr-006: the native-encoded rung — leaf replacement and the ranked chooser
+
+`scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
+735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
