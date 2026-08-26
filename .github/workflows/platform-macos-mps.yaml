@@ -123,6 +123,7 @@ jobs:
 
       - name: weightless lifecycle
         run: |
+          set -o pipefail  # first run's green was tee masking the harness exit code
           export PATH="$HOME/.local/bin:$PATH"
           uv run python scripts/lifecycle-live.py 2>&1 | tee lifecycle.txt
 

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import spawn
+from cozy_runtime.internal import proctree, spawn
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 
@@ -67,21 +67,7 @@ def work(pid: int) -> int:
     -1 is UNREADABLE, never a zero — an unreadable meter decides nothing, so it neither
     rescues a subject nor condemns it.
     """
-    if not pid:
-        return -1
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
-        ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
-    except (OSError, IndexError, ValueError):
-        return -1
-    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
-    try:
-        io = dict(
-            line.split(": ", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines() if line
-        )
-        return burned + int(io["read_bytes"])
-    except (OSError, KeyError, ValueError):
-        return burned  # no `io` for this process; the CPU hand still decides
+    return proctree.progress_burn(pid)
 
 
 def socket_path_refusal(path: str) -> str:
@@ -200,7 +186,7 @@ class Executor:
         """Forceful: the executor AND every grandchild, by process group."""
         killed = 0
         try:
-            os.killpg(os.getpgid(self.pid), sig)
+            proctree.tree_kill(self.pid, sig)
             killed += 1
         except (ProcessLookupError, PermissionError):
             try:
@@ -392,19 +378,8 @@ class ExecutorSupervision:
         sweep can never touch another worker's executor or an unrelated process.
         """
         killed: list[int] = []
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit() or int(entry.name) == exclude:
-                continue
-            try:
-                cmdline = (entry / "cmdline").read_bytes().split(b"\0")
-            except OSError:
-                continue
-            text = b" ".join(cmdline)
-            if b"cozy_runtime.internal.executor" not in text:
-                continue
-            if self.socket_path.encode() not in text:
-                continue
-            pid = int(entry.name)
+        markers = (b"cozy_runtime.internal.executor", self.socket_path.encode())
+        for pid in proctree.pids_with_cmdline_markers(markers, exclude=exclude):
             try:
                 os.kill(pid, signal.SIGKILL)
                 killed.append(pid)

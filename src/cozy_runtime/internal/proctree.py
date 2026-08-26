@@ -46,6 +46,13 @@ def _linux_only(operation: str) -> None:
         raise ProcessTreeUnsupported(operation)
 
 
+def _posix_only(operation: str) -> None:
+    # Process groups are POSIX: linux and darwin share these; only win32 needs its own
+    # implementation (Job Objects, #449).
+    if PLATFORM == "win32":
+        raise ProcessTreeUnsupported(operation)
+
+
 def _prctl(option: int, arg: int = 0) -> int:
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     result = int(libc.prctl(option, arg, 0, 0, 0))
@@ -82,7 +89,7 @@ def raise_own_oom_score(adj: int) -> None:
 
 def own_process_group() -> None:
     """A fresh process group, so one forced kill takes the executor AND every grandchild."""
-    _linux_only("own_process_group")
+    _posix_only("own_process_group")
     os.setpgid(0, 0)
 
 
@@ -93,7 +100,7 @@ def tree_kill(pid: int, sig: int) -> None:
     """Forced kill of `pid`'s whole process group (the executor's own, set at seal time).
 
     The worker control process calls this; the executor never kills anything."""
-    _linux_only("tree_kill")
+    _posix_only("tree_kill")
     os.killpg(os.getpgid(pid), sig)
 
 
@@ -120,6 +127,47 @@ def cpu_seconds(pid: int) -> float:
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
     except (OSError, IndexError, ValueError):
         return -1.0
+
+
+def progress_burn(pid: int) -> int:
+    """The two-handed progress meter: CPU nanoseconds PLUS bytes read from disk — a child
+    can be making progress by computing or by waiting on a cold page cache, and a meter
+    with only the first hand kills the second. THIS process, threads included, unreaped
+    children excluded. -1 is UNREADABLE, never a zero (an unreadable meter decides
+    nothing)."""
+    _linux_only("progress_burn")
+    if not pid:
+        return -1
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+        ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
+    except (OSError, IndexError, ValueError):
+        return -1
+    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
+    try:
+        io = dict(
+            line.split(": ", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines() if line
+        )
+        return burned + int(io["read_bytes"])
+    except (OSError, KeyError, ValueError):
+        return burned  # no `io` for this process; the CPU hand still decides
+
+
+def pids_with_cmdline_markers(markers: tuple[bytes, ...], *, exclude: int = 0) -> list[int]:
+    """Every live pid whose argv contains ALL the markers — the orphan-sweep discovery
+    walk. Identity semantics (which markers make a process OURS) stay with the caller."""
+    _linux_only("pids_with_cmdline_markers")
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == exclude:
+            continue
+        try:
+            text = b" ".join((entry / "cmdline").read_bytes().split(b"\0"))
+        except OSError:
+            continue
+        if all(marker in text for marker in markers):
+            found.append(int(entry.name))
+    return found
 
 
 def rss_bytes(pid: int) -> int:
