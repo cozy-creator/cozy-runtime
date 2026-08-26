@@ -13,6 +13,7 @@ from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli import fit as fit_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import new as new_verb
+from cozy_runtime.cli import pull as pull_verb
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
@@ -30,12 +31,16 @@ BUILT = (
     "list",
     "rm",
     "new",
+    "pull",
     "version",
 )
-#: `pull`/`ingest` PARSE and refuse typed: both are thin invocations of TensorFS's one
-#: fetch+ingest implementation and that border is not a dependency of this build yet
-#: (tfs-002/tfs-003). They are verbs, not unknown words — the refusal names the owner.
-UNAVAILABLE = ("pull", "ingest")
+#: `ingest` PARSES and refuses typed: it is a thin invocation of TensorFS's one INGEST
+#: implementation — the carrier decode, classification and semantic converters — and that
+#: half of the border is not a dependency of this build yet (tfs-003). It is a verb, not an
+#: unknown word, and the refusal names the owner. `pull` is BUILT: the fetch half landed
+#: with tfs-003 row 220, and it invokes TensorFS's `fetch_plan`/`fetch_admit` rather than
+#: carrying any transfer-to-store logic of its own.
+UNAVAILABLE = ("ingest",)
 
 HELP = """cozy-runtime — everything a single endpoint venv can do alone
 
@@ -49,6 +54,7 @@ verbs:
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/CAS/credential facts
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
+  pull <ref> --hub <url>         fetch a hub checkpoint into the local CAS
   list [<ref-prefix>]            CAS-resident checkpoints, one artifact one size
   rm <ref> … --yes               remove artifacts from the local CAS
   new <name>                     scaffold a minimal valid endpoint skeleton
@@ -65,6 +71,14 @@ run/job flags:
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --strict-keys         a local bind's unknown extra keys refuse instead of confessing
   --stream              typed deltas as NDJSON
+
+pull flags:
+  --hub <url>           the tensorhub to resolve and read from (required)
+  --lane <k=v,...>      narrow a release with several lanes
+  --store <dir>         local CAS root (default $COZY_HOME/store)
+  --as <ref>            index the pulled checkpoint under this ref
+  --timeout <dur>       a deadline for the whole pull; absent means none
+  --dry-run             the plan — what would move — without moving it
 
 describe flags:
   --write-descriptor  commit endpoint.descriptor.json (bare describe is read-only)
@@ -179,6 +193,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return host_verbs.bindings(config, opts)
+    if verb == "pull":
+        return pull_verb.run(args, opts, config)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
     if verb == "doctor":

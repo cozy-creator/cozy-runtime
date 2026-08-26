@@ -1,0 +1,235 @@
+"""`cozy-runtime pull` — the verb (cr-016).
+
+Thin by design, and the CLI reference's own words for it: *"thin wiring over TensorFS's one
+fetch/ingest implementation — tokens as parameters, no fetch logic here"*. The wiring is
+four things and none of them touches a byte: resolve the flags, hand the credential over as
+a parameter, drive `internal/pull.py`, and write the local artifact index row that makes the
+pulled checkpoint a `ref` the rest of the CLI already understands.
+
+The exit matrix is the shared one — a private ref with no credential is exit 5 NAMING the
+credential to set, and it is never a prompt.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from cozy_runtime.cli import artifacts
+from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import fill
+from cozy_runtime.internal import pull as transport
+from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.exits import Exit
+
+FLAGS = ("--hub", "--lane", "--store", "--timeout", "--as")
+BOOL_FLAGS = ("--dry-run",)
+
+#: Refusal code -> exit. The codes are `internal/pull.py`'s closed registry, so a new code
+#: cannot appear here without appearing there, and neither can appear alone.
+EXITS: dict[str, Exit] = {
+    "hub_unreachable": Exit.unavailable,
+    "hub_refused": Exit.unavailable,
+    "ref_not_found": Exit.not_found,
+    "credential_required": Exit.credential,
+    "source_not_allowed": Exit.validation,
+    "transfer_failed": Exit.unavailable,
+    "deadline_exceeded": Exit.deadline,
+    "artifact_incomplete": Exit.validation,
+    "border_refused": Exit.validation,
+}
+assert set(EXITS) == set(transport.REFUSALS), "the pull exit table and its refusal registry drifted"
+
+
+def _duration(text: str) -> float:
+    """`<n>ms|s|m|h`, the shared grammar. There is no default — an absent `--timeout` means
+    no deadline, not a number this file picked."""
+    for suffix, scale in (("ms", 0.001), ("s", 1.0), ("m", 60.0), ("h", 3600.0)):
+        if text.endswith(suffix):
+            try:
+                return float(text[: -len(suffix)]) * scale
+            except ValueError:
+                break
+    raise CliError(
+        "usage",
+        f"{text!r} is not a duration",
+        "durations are <n>ms, <n>s, <n>m or <n>h",
+        Exit.usage,
+    )
+
+
+def _parse(args: list[str]) -> tuple[str, dict[str, str], set[str]]:
+    flags: dict[str, str] = {}
+    on: set[str] = set()
+    rest: list[str] = []
+    items = list(args)
+    while items:
+        item = items.pop(0)
+        if item in BOOL_FLAGS:
+            on.add(item)
+        elif item.split("=")[0] in FLAGS:
+            name, _, inline = item.partition("=")
+            if not inline:
+                if not items:
+                    raise CliError(
+                        "usage", f"{name} needs a value", f"pass {name} <value>", Exit.usage
+                    )
+                inline = items.pop(0)
+            flags[name] = inline
+        elif item.startswith("-") and item != "-":
+            raise CliError(
+                "usage",
+                f"unknown flag {item!r}",
+                "pull takes --hub, --lane, --store, --as, --timeout, --dry-run",
+                Exit.usage,
+            )
+        else:
+            rest.append(item)
+    if len(rest) != 1:
+        raise CliError(
+            "usage",
+            f"pull takes exactly one ref, got {len(rest)}",
+            "cozy-runtime pull <org/repo[@release|@sha256:...]> --hub <url>",
+            Exit.usage,
+        )
+    return rest[0], flags, on
+
+
+def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
+    ref, flags, on = _parse(args)
+    hub = flags.get("--hub", "").strip()
+    if not hub:
+        raise CliError(
+            "usage",
+            "--hub is required: this build reads no hub address from the environment",
+            "pass --hub https://<tensorhub> — one config authority per process, and it does "
+            "not carry a hub default",
+            Exit.usage,
+        )
+    store_root = (
+        Path(flags["--store"]).expanduser() if "--store" in flags else config.cozy_home / "store"
+    )
+    timeout = _duration(flags["--timeout"]) if "--timeout" in flags else None
+
+    tensorfs = fill.tensorfs_module()
+    store = _store(tensorfs, store_root)
+
+    try:
+        if "--dry-run" in on:
+            return _preview(tensorfs, store, hub, ref, flags, config, timeout, opts)
+        outcome = transport.pull(
+            tensorfs,
+            store,
+            hub,
+            ref,
+            lane=flags.get("--lane", ""),
+            token=config.credentials.tensorhub or "",
+            timeout=timeout,
+        )
+    except transport.PullRefusal as refusal:
+        raise _refuse(refusal, config) from refusal
+
+    row = artifacts.Artifact(
+        ref=flags.get("--as", ref).split("@sha256:")[0],
+        store=str(store.root),
+        config="",
+        snapshots={"checkpoint": "sha256:" + outcome.snapshot},
+        lane=flags.get("--lane", "") or "plain",
+        bytes=outcome.bytes_total,
+    )
+    artifacts.install(config.cozy_home, row)
+    return Result(
+        document=outcome.document(),
+        rows=(
+            ("ref", row.ref),
+            ("snapshot", "sha256:" + outcome.snapshot),
+            ("store", str(store.root)),
+            (
+                "objects",
+                f"{outcome.declared} declared, {outcome.held} held, {outcome.fetched} fetched",
+            ),
+            ("bytes", f"{outcome.bytes_moved} moved, {outcome.bytes_held} already resident"),
+        ),
+        next=(f"cozy-runtime run <function> --model {row.ref}",),
+    )
+
+
+def _preview(
+    tensorfs: Any,
+    store: Any,
+    hub: str,
+    ref: str,
+    flags: dict[str, str],
+    config: RuntimeConfig,
+    timeout: float | None,
+    opts: Options,
+) -> Result:
+    """`--dry-run`: the plan without the bytes. Every hub read happens, no object moves.
+
+    It is the plan the real pull would use — the same `fetch_plan` call — so what it says
+    about held/wanted is what will happen, not a second estimate of it.
+    """
+    deadline = transport.Deadline.after(timeout)
+    token = config.credentials.tensorhub or ""
+    try:
+        at = transport.resolve(hub, ref, deadline, lane=flags.get("--lane", ""), token=token)
+        declared = transport.reads(hub, at, deadline, token=token)
+        doc = transport.manifest(hub, at, deadline)
+        plan = tensorfs.fetch_plan(
+            store,
+            "dry-" + at.snapshot[:12],
+            at.snapshot,
+            len(doc),
+            [(r.object_id, r.length) for r in declared],
+        )
+    except transport.PullRefusal as refusal:
+        raise _refuse(refusal, config) from refusal
+    return Result(
+        document={
+            "ref": ref,
+            "snapshot": "sha256:" + at.snapshot,
+            "store": str(store.root),
+            "held": len(plan["held"]),
+            "wanted": len(plan["wanted"]),
+            "bytes_to_move": int(plan["wanted_bytes"]),
+            "bytes_held": int(plan["held_bytes"]),
+            "dry_run": True,
+        },
+        rows=(
+            ("snapshot", "sha256:" + at.snapshot),
+            ("would fetch", f"{len(plan['wanted'])} object(s), {plan['wanted_bytes']} B"),
+            ("already held", f"{len(plan['held'])} object(s), {plan['held_bytes']} B"),
+        ),
+        next=(f"cozy-runtime pull {ref} --hub {hub}",),
+    )
+
+
+def _store(tensorfs: Any, root: Path) -> Any:
+    """Open the local store, creating it on first pull. A worker's first pull is the act
+    that gives it a CAS; refusing because the directory is not there yet would be a chore."""
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        return (
+            tensorfs.Store.open(str(root))
+            if (root / "store.json").is_file()
+            else tensorfs.Store.init(str(root))
+        )
+    except Exception as exc:
+        raise CliError(
+            "validation",
+            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
+            "point --store at a v2 store root, or at an empty directory to create one",
+            Exit.validation,
+        ) from exc
+
+
+def _refuse(refusal: transport.PullRefusal, config: RuntimeConfig) -> CliError:
+    remedy = refusal.remedy
+    if refusal.code == "credential_required" and not config.credentials.tensorhub:
+        # NAME the credential, never prompt (cr-016's owed red arm). The env NAME is the
+        # config module's, so the two cannot drift.
+        remedy = (
+            "set TENSORHUB_TOKEN in this process's environment and re-run — cozy-runtime "
+            "never prompts for a credential. " + remedy
+        )
+    return CliError(refusal.code, refusal.message, remedy, EXITS[refusal.code])

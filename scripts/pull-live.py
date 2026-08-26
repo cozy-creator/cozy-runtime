@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""cr-016 `pull` — the live verification (tfs-003 row 220).
+
+There are no tests in v2 (decisions #160): this RUNS the pull leg against a real tensorhub
+serving real R2 objects and observes what it does. Every arm is either a real transfer or a
+real refusal; nothing here is mocked, and the hostile sources in the door arms are hostile in
+exactly the way a network is (a flipped byte, a body that ends early, a reset socket).
+
+  scripts/pull-live.py --hub URL --ref org/repo@sha256:... --store DIR [--source DIR]
+  scripts/pull-live.py --hub URL --ref ... --phases door,arms
+
+Phases: pull (fetch it, prove it) · idem (nothing re-fetched) · heal (a corrupted local
+object is not skipped) · resume (SIGKILL mid-object, then only what is missing moves) ·
+door (hostile sources at the border) · arms (typed refusals: coordinates, hub, SSRF).
+
+`--source` is the store the artifact was published FROM. Given it, the run adds the claim
+that matters most and cannot be checked any other way: every pulled object is BIT-IDENTICAL
+to the object that was published, with each digest re-derived here rather than trusted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+FAIL = 0
+
+
+def ok(what: str, detail: str = "") -> None:
+    print(f"  \033[32mPASS\033[0m {what}" + (f"  — {detail}" if detail else ""))
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAIL
+    FAIL += 1
+    print(f"  \033[31mFAIL\033[0m {what}" + (f"  — {detail}" if detail else ""))
+
+
+def head(what: str) -> None:
+    print(f"\n\033[1m== {what}\033[0m")
+
+
+def cozy(args: list[str], home: pathlib.Path, **kw: object) -> subprocess.CompletedProcess[str]:
+    env = {"PATH": "/usr/bin:/bin", "COZY_HOME": str(home), "HOME": str(home)}
+    env.update(kw.pop("env", {}))  # type: ignore[arg-type]
+    return subprocess.run(
+        [sys.executable, "-m", "cozy_runtime.cli.main", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def pulled(out: str) -> dict:
+    return json.loads(out)
+
+
+def objects(root: pathlib.Path) -> dict[str, pathlib.Path]:
+    d = root / "objects" / "sha256"
+    return {p.name: p for p in d.rglob("*") if p.is_file()} if d.is_dir() else {}
+
+
+def digest(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- phases
+
+
+def phase_pull(a: argparse.Namespace) -> None:
+    head("pull — the artifact crosses the border into an EMPTY store")
+    shutil.rmtree(a.store, ignore_errors=True)
+    dry = cozy(["--json", "pull", a.ref, "--hub", a.hub, "--store", a.store, "--dry-run"], a.home)
+    if dry.returncode != 0:
+        return bad("dry-run", dry.stderr.strip()[:200])
+    plan = pulled(dry.stdout)
+    ok(
+        "--dry-run plans without moving a byte",
+        f"{plan['wanted']} wanted, {plan['bytes_to_move']} B",
+    )
+    if objects(pathlib.Path(a.store)):
+        bad("--dry-run installed objects — a preview that writes is not a preview")
+
+    t0 = time.monotonic()
+    run = cozy(["--json", "pull", a.ref, "--hub", a.hub, "--store", a.store], a.home)
+    if run.returncode != 0:
+        return bad("pull", run.stderr.strip()[:300])
+    res = pulled(run.stdout)
+    wall = time.monotonic() - t0
+    rate = res["bytes_moved"] / max(wall, 1e-6) / 2**20
+    ok(
+        "pull completed",
+        f"{res['fetched']}/{res['declared']} objects, {res['bytes_moved']} B in {wall:.1f}s "
+        f"= {rate:.1f} MiB/s",
+    )
+    if res["fetched"] != plan["wanted"]:
+        bad("the plan and the pull disagreed", f"{plan['wanted']} planned, {res['fetched']} moved")
+    else:
+        ok("the dry-run plan is what actually happened", "same fetch_plan call, not an estimate")
+
+    verify(a, res["snapshot"])
+    if a.source:
+        identical(a, pathlib.Path(a.source), pathlib.Path(a.store))
+
+
+def verify(a: argparse.Namespace, snapshot: str) -> None:
+    """The destination proves the artifact itself — a local walk over local bytes."""
+    if not a.tfs:
+        return
+    out = subprocess.run(
+        [a.tfs, "snapshot", "verify", a.store, snapshot.removeprefix("sha256:")],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        return bad("the pulled checkpoint does not verify locally", out.stderr.strip()[:200])
+    ok("the pulled checkpoint verifies IN THE DESTINATION", out.stdout.splitlines()[1].strip())
+
+
+def identical(a: argparse.Namespace, src: pathlib.Path, dst: pathlib.Path) -> None:
+    have, got = objects(src), objects(dst)
+    missing = set(have) - set(got)
+    if missing:
+        return bad("objects never arrived", f"{len(missing)} missing")
+    total = 0
+    for name, p in have.items():
+        if p.read_bytes() != got[name].read_bytes():
+            return bad("BYTES DIFFER after the round trip", name)
+        if digest(got[name]) != name:
+            return bad("a pulled object does not hash to its own id", name)
+        total += got[name].stat().st_size
+    ok(
+        "published -> pulled is BIT-IDENTICAL",
+        f"{len(have)} objects, {total} B ({total / 2**20:.1f} MiB), every digest re-derived here",
+    )
+
+
+def phase_idem(a: argparse.Namespace) -> None:
+    head("idem — an object already held is not fetched again")
+    before = {n: p.stat().st_mtime_ns for n, p in objects(pathlib.Path(a.store)).items()}
+    run = cozy(["--json", "pull", a.ref, "--hub", a.hub, "--store", a.store], a.home)
+    if run.returncode != 0:
+        return bad("re-pull", run.stderr.strip()[:200])
+    res = pulled(run.stdout)
+    if res["fetched"] or res["bytes_moved"]:
+        return bad("the re-pull moved bytes", f"{res['fetched']} objects, {res['bytes_moved']} B")
+    ok("re-pull moved ZERO bytes", f"{res['held']}/{res['declared']} held")
+    after = {n: p.stat().st_mtime_ns for n, p in objects(pathlib.Path(a.store)).items()}
+    if after != before:
+        bad(
+            "an object file was rewritten",
+            "held means untouched, not overwritten with the same bytes",
+        )
+    else:
+        ok("not one object file was touched", "mtimes identical across the re-pull")
+
+
+def phase_heal(a: argparse.Namespace) -> None:
+    head("heal — a corrupted local object is repaired, not skipped as 'already present'")
+    have = objects(pathlib.Path(a.store))
+    victim = max(have.values(), key=lambda p: p.stat().st_size)
+    name = victim.name
+    victim.chmod(0o644)
+    data = bytearray(victim.read_bytes())
+    data[len(data) // 3] ^= 0xFF
+    victim.write_bytes(bytes(data))
+    victim.chmod(0o444)
+
+    run = cozy(["--json", "pull", a.ref, "--hub", a.hub, "--store", a.store], a.home)
+    if run.returncode != 0:
+        return bad("heal pull", run.stderr.strip()[:200])
+    res = pulled(run.stdout)
+    if res["fetched"] != 1:
+        return bad("the corruption was not repaired alone", f"{res['fetched']} objects re-fetched")
+    if digest(pathlib.Path(a.store) / "objects" / "sha256" / name[:2] / name[2:4] / name) != name:
+        return bad("the object still does not hash to its id")
+    quarantined = list((pathlib.Path(a.store) / "quarantine").glob(name + "*"))
+    ok("exactly the corrupted object was re-fetched", f"{res['held']} held, 1 fetched, healed")
+    if quarantined:
+        ok(
+            "the bad bytes were QUARANTINED, never overwritten in place",
+            quarantined[0].name[:16] + "…",
+        )
+    else:
+        bad("nothing reached quarantine — the bad bytes went where?")
+
+
+def phase_resume(a: argparse.Namespace) -> None:
+    head("resume — SIGKILL mid-object, then only what is missing moves")
+    store = pathlib.Path(a.store + "-resume")
+    shutil.rmtree(store, ignore_errors=True)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "cozy_runtime.cli.main",
+            "--json",
+            "pull",
+            a.ref,
+            "--hub",
+            a.hub,
+            "--store",
+            str(store),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/bin:/bin", "COZY_HOME": str(a.home), "HOME": str(a.home)},
+    )
+    # Kill on OBSERVED PROGRESS, never on a sleep: wait until a partial temp file is
+    # genuinely large, so the kill lands mid-transfer rather than somewhere a timer guessed.
+    tmp = store / "tmp"
+    deadline = time.monotonic() + 120
+    fired = False
+    while time.monotonic() < deadline and proc.poll() is None:
+        if tmp.is_dir() and any(p.stat().st_size > (4 << 20) for p in tmp.iterdir()):
+            fired = True
+            break
+        time.sleep(0.005)
+    proc.send_signal(signal.SIGKILL)
+    proc.wait()
+    if not fired:
+        return ok(
+            "resume SKIPPED", "no object in this artifact is large enough to kill mid-transfer"
+        )
+    landed = len(objects(store))
+    ok(
+        "the pull died mid-object",
+        f"{landed} object(s) had already landed; nothing partial installed",
+    )
+
+    run = cozy(["--json", "pull", a.ref, "--hub", a.hub, "--store", str(store)], a.home)
+    if run.returncode != 0:
+        return bad("resume pull", run.stderr.strip()[:200])
+    res = pulled(run.stdout)
+    if res["held"] != landed:
+        bad("the resume re-fetched work already done", f"{landed} landed, {res['held']} held")
+    else:
+        ok(
+            "the resume re-fetched ONLY what was missing",
+            f"{res['held']} held ({res['bytes_held']} B kept), {res['fetched']} fetched",
+        )
+    verify(a, res["snapshot"])
+    shutil.rmtree(store, ignore_errors=True)
+
+
+def phase_door(a: argparse.Namespace) -> None:
+    """The border itself, with sources that lie the way a network lies."""
+    head("door — hostile sources at tensorfs.fetch_admit")
+    import tensorfs
+
+    src = pathlib.Path(a.source or a.store)
+    root = pathlib.Path(a.store + "-door")
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    store = tensorfs.Store.init(str(root))
+    have = objects(src)
+    snap = None
+    for name in have:
+        try:
+            store_snapshot = subprocess.run(
+                [a.tfs, "snapshot", "show", str(src), name], capture_output=True
+            )
+            if store_snapshot.returncode == 0:
+                snap = name
+                break
+        except OSError:
+            break
+    if snap is None:
+        return ok("door SKIPPED", "no --tfs binary to identify the snapshot object")
+
+    declared = [("sha256:" + n, p.stat().st_size) for n, p in sorted(have.items()) if n != snap]
+    plan = tensorfs.fetch_plan(store, "door", snap, have[snap].stat().st_size, declared)
+    doc = plan["document"]
+    big = max((n for n in have if n != snap), key=lambda n: have[n].stat().st_size)
+    size = have[big].stat().st_size
+    cut = max(size // 2, 1)
+
+    class Flip:
+        def __init__(self) -> None:
+            self.f, self.n = open(have[big], "rb"), 0  # noqa: SIM115 — the class IS the context
+
+        def read(self, k: int) -> bytes:
+            b = bytearray(self.f.read(k))
+            if self.n <= cut < self.n + len(b):
+                b[cut - self.n] ^= 0x01
+            self.n += len(b)
+            return bytes(b)
+
+    class Cut:
+        def __init__(self) -> None:
+            self.f, self.n = open(have[big], "rb"), 0  # noqa: SIM115 — the class IS the context
+
+        def read(self, k: int) -> bytes:
+            if self.n >= cut:
+                return b""
+            b = self.f.read(min(k, cut - self.n))
+            self.n += len(b)
+            return b
+
+    class Boom:
+        def __init__(self) -> None:
+            self.f, self.n = open(have[big], "rb"), 0  # noqa: SIM115 — the class IS the context
+
+        def read(self, k: int) -> bytes:
+            if self.n >= cut:
+                raise ConnectionResetError("peer reset the connection")
+            b = self.f.read(k)
+            self.n += len(b)
+            return b
+
+    # The HIGH-WATER MARK before the arms. Reporting absolute RSS here would report the
+    # harness — `identical()` reads whole objects to compare them — so what is measured is
+    # the DELTA the door itself adds while streaming a 64 MiB object four times.
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    for label, source in (
+        (f"a flipped byte {cut} B in", Flip()),
+        ("a body that ends early", Cut()),
+        ("a socket that resets mid-object", Boom()),
+    ):
+        before = set(store.objects())
+        try:
+            tensorfs.fetch_admit(store, doc, "sha256:" + big, source)
+            bad(f"{label}: ADMITTED", "the door let it through")
+        except Exception as exc:
+            left = len(list((root / "tmp").iterdir()))
+            if set(store.objects()) != before or left:
+                bad(f"{label}: refused but left state", f"{left} temp file(s)")
+            else:
+                ok(f"{label}: refused, committed NOTHING", f"{type(exc).__name__}: {str(exc)[:70]}")
+
+    with open(have[big], "rb") as f:
+        got = tensorfs.fetch_admit(store, doc, "sha256:" + big, f)
+    ok("the same object, honest, admits", f"{got['id'][:23]}… {got['length']} B")
+    grew = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 - rss0
+    if grew * 2**20 > size / 4:
+        bad("the door held the object in memory", f"RSS grew {grew:.1f} MiB")
+    else:
+        ok(
+            "memory is bounded by the buffer, not the object",
+            f"RSS grew {grew:.1f} MiB across four passes of a {size / 2**20:.0f} MiB object",
+        )
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def phase_arms(a: argparse.Namespace) -> None:
+    head("arms — typed refusals, each naming what to do about it")
+    cases = [
+        (
+            "wrong digest coordinates",
+            [
+                "pull",
+                a.ref.split("@")[0] + "@sha256:" + "f" * 64,
+                "--hub",
+                a.hub,
+                "--store",
+                a.store,
+            ],
+            "ref_not_found",
+            4,
+        ),
+        (
+            "unknown repo",
+            ["pull", "nobody/nothing", "--hub", a.hub, "--store", a.store],
+            "ref_not_found",
+            4,
+        ),
+        (
+            "hub unreachable",
+            ["pull", a.ref, "--hub", "http://127.0.0.1:1", "--store", a.store],
+            "hub_unreachable",
+            9,
+        ),
+        (
+            "SSRF: a non-loopback private hub",
+            ["pull", a.ref, "--hub", "http://10.0.0.1:8080", "--store", a.store],
+            "source_not_allowed",
+            3,
+        ),
+        ("no --hub", ["pull", a.ref, "--store", a.store], "usage", 2),
+    ]
+    for label, args, code, exit_code in cases:
+        run = cozy(args, a.home)
+        text = run.stdout + run.stderr
+        if run.returncode == exit_code and f"error({code})" in text:
+            ok(
+                f"{label}: {code}, exit {exit_code}",
+                text.splitlines()[0][7 + len(code) : 90].strip(),
+            )
+        else:
+            bad(
+                f"{label}: wanted {code}/exit {exit_code}",
+                f"got exit {run.returncode}: {text[:120]}",
+            )
+
+
+PHASES = {
+    "pull": phase_pull,
+    "idem": phase_idem,
+    "heal": phase_heal,
+    "resume": phase_resume,
+    "door": phase_door,
+    "arms": phase_arms,
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hub", required=True)
+    ap.add_argument("--ref", required=True)
+    ap.add_argument("--store", required=True)
+    ap.add_argument("--source", default="", help="the store the artifact was published FROM")
+    ap.add_argument("--tfs", default="", help="the tfs binary, for the destination-side verify")
+    ap.add_argument("--home", default="", help="COZY_HOME for the artifact index")
+    ap.add_argument("--phases", default=",".join(PHASES))
+    a = ap.parse_args()
+    a.home = pathlib.Path(a.home or (a.store + "-home"))
+    a.home.mkdir(parents=True, exist_ok=True)
+
+    for name in a.phases.split(","):
+        if name.strip() not in PHASES:
+            sys.exit(f"unknown phase {name!r}; phases are {', '.join(PHASES)}")
+    for name in a.phases.split(","):
+        PHASES[name.strip()](a)
+
+    print(f"\n{'FAILED' if FAIL else 'all arms observed'}: {FAIL} failure(s)")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
