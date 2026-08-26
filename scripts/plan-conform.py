@@ -18,8 +18,16 @@ was load-bearing.
     uv run python scripts/plan-conform.py            # every scenario
     uv run python scripts/plan-conform.py plan cache # two of them
 
-CPU-only by construction: no scenario opens a device, none loads a checkpoint, and the two
-that need torch import it inside themselves. Runs in seconds.
+CPU-only by construction: no scenario opens a device, none loads a checkpoint, no bytes move
+and the one arm that needs torch imports it inside itself. Runs in seconds.
+
+**NOT YET a CI step, and the reason is a dependency rather than a design.** The `checks` job
+installs neither the `tensorfs` wheel nor torch, and this runner needs both — the registry is
+what a reviewed spec DIGEST is reviewed against, so `registry_digests()` is not something a
+fixture can stand in for without the arm becoming a check on the fixture. Wiring it in means
+adding those two to the job (tensorfs is a ~10 MB wheel; torch is not, so the vector-rounding
+arm would have to move to the GPU lane or the job would have to install a CPU-only build).
+That choice belongs to whoever owns the CI budget and is NAMED here rather than claimed.
 """
 
 from __future__ import annotations
