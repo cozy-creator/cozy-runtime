@@ -39,9 +39,19 @@ float route it was not qualified for.
 
 MXFP8 (#469a's preferred H3 DiT lane) takes that same decoded-float route and is BUILT:
 E4M3 elements with one E8M0 power-of-two scale per 32-element block, dequantized into the
-destination's dtype at fill. Its native SM100 door stays named and unbuilt. Producing an
-mxfp8 artifact never made one servable (#469a, #501f); what makes it servable is a
-provider here plus a capability record minted by measured numerics, and nothing else.
+destination's dtype at fill. Producing an mxfp8 artifact never made one servable (#469a,
+#501f); what makes it servable is a provider here plus a capability record minted by
+measured numerics, and nothing else.
+
+Its NATIVE door is no longer a hypothesis. `scripts/mxfp8-native-probe.py` rented an
+RTX 5090 and measured it: on sm120 the block-scaled MXFP8 GEMM is real, its arithmetic is
+bit-identical to `cozy.mxfp8.dequant/1` over the whole format domain, it runs ~2.7x the
+bf16 GEMM, and it is the only route that makes the weights RESIDENT at 8.25 bits. The door
+stays UNBUILT anyway, and for a reason that is not about silicon: the native route
+replaces the LEAF, which is `delivery.py`'s `native_encoded` rung, not a provider here.
+The seam entry carries the measured matrix, the two hazards a builder needs, and what is
+still unmeasured (sm100). No record is minted for a route with no implementation — the
+capability table's whole worth is that a record means something ran.
 """
 
 from __future__ import annotations
@@ -393,13 +403,19 @@ class MicroScaledDequant:
     Rank is 2 because the spec says `logical_rank: 2`.
 
     **Why DECODED FLOAT and not native.** MXFP8's whole point on Blackwell is that the
-    tensor cores consume E4M3 elements and E8M0 block scales DIRECTLY, and that route is
-    real — it is also new kernel work on silicon this fleet does not have, so building it
-    from here would be building against a card nobody can run the arms on. The route that
-    needs no new kernel is this one: dequantize each block into the destination's own float
-    dtype at fill, compute in float. It buys bytes read and load time, NOT VRAM — the
-    resident weights are float either way, exactly as the fp8 route's docstring says of
-    itself. `NAMED_SEAMS` keeps the native door named with the device class that opens it.
+    tensor cores consume E4M3 elements and E8M0 block scales DIRECTLY. That route is real
+    and, since `scripts/mxfp8-native-probe.py`, MEASURED: on an RTX 5090 it needs no new
+    kernel at all — `torch._scaled_mm`'s Blockwise-1x32 recipe already ships it, and it
+    agrees with the decode below bit for bit across the format domain. What it needs is a
+    LEAF that holds the payload instead of a float destination, which is a different plane's
+    machinery (`delivery.py`'s `native_encoded` rung), so the route that is servable TODAY
+    is still this one: dequantize each block into the destination's own float dtype at fill,
+    compute in float. It buys bytes read and load time, NOT VRAM — the resident weights are
+    float either way, exactly as the fp8 route's docstring says of itself, and the native
+    route's measured 8.294 resident bits per element is precisely what this one cannot offer.
+    It is also the more ACCURATE of the two on the same bytes, because it never quantizes an
+    activation: 0.0300 relative Frobenius against bf16 where native w8a8-mx measured 0.0421.
+    `NAMED_SEAMS` carries that whole matrix with the device class it was measured on.
 
     **Why the multiply lands in the DESTINATION dtype.** The alternative — promote the
     PAYLOAD to f32, multiply, cast down — allocates a second full-width copy of every
@@ -576,13 +592,24 @@ def derive_rowwise(
     mult = MicroScaledDequant._multiplier(torch, scale, torch.float32)
     payload = data.view(rows, blocks, block).to(torch.float32)
     # The row's true maximum magnitude, exactly, without ever forming the row.
-    amax = (payload.abs().amax(dim=-1) * mult).amax(dim=-1)
+    #
+    # E8M0's NaN byte is EXCLUDED from the maximum rather than allowed to propagate into
+    # it. A NaN block scale means THAT BLOCK is not a number; letting it set the row scale
+    # turns 32 poisoned elements into a poisoned ROW, which is a strictly larger claim than
+    # the stored bytes make. The NaN still reaches the output — `ratio` carries it, so the
+    # block's own 32 payload elements cast to E4M3's NaN — it just stops there. The
+    # producing job clamps to 254 and never emits the byte; a derivation that is only
+    # correct on its own producer's output is not a derivation.
+    block_peak = payload.abs().amax(dim=-1) * mult
+    amax = torch.nan_to_num(block_peak, nan=0.0).amax(dim=-1)
     zero_rows = int((amax == 0).sum())
     row_scale = (amax / E4M3_MAX).clamp(min=ROW_SCALE_FLOOR)
     ratio = mult / row_scale.unsqueeze(-1)
     rescaled = payload * ratio.unsqueeze(-1)
     magnitude = rescaled.abs()
-    peak = float(magnitude.max())
+    # nan-safe: a NaN block must not erase the peak a reader uses to tell rounding-boundary
+    # clamping from genuinely lost range.
+    peak = float(torch.nan_to_num(magnitude, nan=0.0).max())
     clamped = int((magnitude > E4M3_MAX).sum())
     saturated = int((magnitude > E4M3_MAX * SATURATION_MARGIN).sum())
     derived = rescaled.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).view(rows, cols)
@@ -631,15 +658,36 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
         "scalar one and lands with its first consuming lane (cr-008c)",
     ),
     "mxfp8/1": (
-        "cuda.sm100+",
-        "MXFP8 NATIVE (tensor cores consume E4M3 elements + E8M0 block scales directly), "
-        "or the sm89+ software-scaled arm that applies the 32-block scales in the kernel "
-        "prologue — both NEW kernel work and neither built. The DECODED FLOAT route IS "
-        "built and served by this runtime (`cozy.mxfp8.dequant/1`, device predicate any), "
-        "so this entry names what a card would add, not what is missing: a route that "
-        "keeps the weights in fp8 through the matmul instead of materializing them float. "
-        "What never happens either way is a silent per-channel reinterpretation of block "
-        "scales",
+        "cuda.sm120",
+        "MXFP8 NATIVE — tensor cores consume E4M3 elements + E8M0 block scales directly. "
+        "MEASURED on an RTX 5090 (sm120, torch 2.9.1+cu130, driver 580.126.20), "
+        "`scripts/mxfp8-native-probe.py`: `torch._scaled_mm`'s Blockwise-1x32 recipe DOES "
+        "execute it, and its arithmetic is BIT-IDENTICAL to `cozy.mxfp8.dequant/1` over all "
+        "64,770 non-NaN pairs of the format domain (the 766 NaN-bearing pairs are excluded "
+        "because `0 * NaN` is NaN, which poisons a dot product on BOTH routes — a matmul "
+        "fact, not an encoding one). It runs the real DiT block's GEMMs at 628-674 TFLOP/s "
+        "against bf16's 227-243, and holds the weights at a MEASURED 8.294 bits resident "
+        "(18.60 GiB vs 35.96 GiB for the curve DiT's GEMM weights) — the VRAM claim #511's "
+        "open owner question says the decoded-float route cannot make. "
+        "STILL UNBUILT, and the missing piece is NOT this module: a native route needs the "
+        "LEAF to hold the payload plus its blocked scale and to replace the linear op, "
+        "where `Provider.decode` writes a float destination the contract's dtype named. "
+        'That is `delivery.py`\'s `native_encoded` rung, still `status="unbuilt"` for the '
+        "reason it already gives — LEAF REPLACEMENT — though its `owner` line's \"this card "
+        "is sm89\" is now stale and belongs to that file's lane to correct. "
+        "Two facts a builder needs before starting. (1) The route "
+        "is w8a8-mx, not weight-only: BOTH operands must be mxfp8, so it quantizes "
+        "ACTIVATIONS, measured at 0.0421 relative Frobenius against bf16 where the "
+        "weight-only lane sits at 0.0300 — 2.9 dB lossier, and the kernel itself accounts "
+        "for almost none of it (0.00166 against the same operands in f32). (2) torch "
+        "validates the scale grids' ELEMENT COUNT, not their LAYOUT: a row-major "
+        "`[rows, cols/32]` grid is ACCEPTED in place of the 128x4-tiled one the MMA reads "
+        "and returns wrong numbers at 62,453 of 64,485 finite positions. That is this "
+        "module's silent-wrong-output class living one layer down, and it is why a native "
+        "provider must qualify through `probe.py` on the arch it claims. sm100 (B200) is "
+        "UNMEASURED — no card was rented, so it gets no record and no floor; the "
+        "predicate above is `cuda.sm120` exactly, not `cuda.sm100+`, because a hand-written "
+        "floor is what #511b's fail-closed-by-measurement rule forbids",
     ),
     "nvfp4-w4a4/1": (
         "cuda.sm100+",

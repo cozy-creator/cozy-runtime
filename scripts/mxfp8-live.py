@@ -772,6 +772,24 @@ def derive() -> None:
         f"{derived.zero_rows} zero row(s) held off the divide by ROW_SCALE_FLOOR",
     )
 
+    # E8M0's NaN byte, which the producing job never emits and a derivation must still get
+    # right. It must poison its OWN 32 elements and stop: letting it set the row scale would
+    # turn 32 bad elements into a bad row, a strictly larger claim than the bytes make.
+    data = (torch.randn(8, 128) * 10).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    scale = torch.full((8, 4), 127, dtype=torch.uint8)
+    scale[2, 1] = 255
+    derived = derive_rowwise(torch, data, scale)
+    as_float = derived.data.float() * derived.scale.unsqueeze(-1)
+    poisoned = int(torch.isnan(as_float).sum())
+    check(
+        "an E8M0 NaN block poisons its OWN 32 elements and no more",
+        bool(torch.isfinite(derived.scale).all())
+        and poisoned == BLOCK
+        and int(torch.isnan(as_float[2]).sum()) == BLOCK,
+        f"{poisoned} NaN elements, all in the one block that carried byte 255; every row "
+        "scale stayed finite",
+    )
+
     # A RAGGED mxfp8 tail has no rowwise derivation and says so rather than mis-striding.
     ragged_data = torch.zeros(8, 48, dtype=torch.float8_e4m3fn)
     ragged_scale = torch.full((8, 2), 127, dtype=torch.uint8)
