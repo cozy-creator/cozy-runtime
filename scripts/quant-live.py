@@ -1161,7 +1161,7 @@ def arms() -> None:
 
     # --- the QUALIFICATION arm: a wrong decoder mints NO record --------------------
     broken = dict(providers)
-    broken[scalar] = _WrongScale(scalar)
+    broken[scalar] = (_WrongScale(scalar),)
     caps, evidence = qualify(
         torch,
         {scalar: broken[scalar]},
@@ -1232,6 +1232,7 @@ class _WrongScale:
 
     name = "cozy.PLANTED-wrong-scale/0"
     route = "decoded_float"
+    suite = "fp8-scalar-decode"
     device_predicate = "any"
     required = frozenset({"data", "weight_scale"})
     optional = frozenset({"input_scale"})

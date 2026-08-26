@@ -256,7 +256,13 @@ class Executor:
             release=binding["release"],
             cache=Path(binding["probe_cache"]) if binding.get("probe_cache") else None,
         )
-        selector = Selector(providers, qualified[0], device_facts)
+        # ONE objective for both choices. The delivery chooser picks WHICH artifact and the
+        # selector picks WHICH provider serves its encodings, and #517d's finding is that
+        # those two answers trade against each other on the same two axes — so a deployment
+        # that stated `footprint` and got a footprint variant served by a fidelity-ranked
+        # provider would have had its statement half-honoured.
+        objective = str(binding.get("objective") or "latency")
+        selector = Selector(providers, qualified[0], device_facts, objective)
         candidates = [
             (variant, *survey_routes(surveyed[variant.name][1], selector)) for variant in offered
         ]
@@ -266,7 +272,7 @@ class Executor:
         try:
             choice = DeliveryChooser(table, device_facts).choose(
                 candidates,
-                objective=str(binding.get("objective") or "latency"),
+                objective=objective,
                 steps_basis=int(binding.get("steps_basis") or 20),
             )
         except DeliveryRefusal as exc:
@@ -316,6 +322,7 @@ class Executor:
             # The suite already ran, above, to answer the delivery choice. Running it a
             # second time here would re-measure a device fact that has not changed.
             qualified=qualified,
+            objective=objective,
         )
         # A STAGING generation re-reads the store after construction, so its GC-safe hold
         # must outlive the first commit. `resident_budget` is what makes a parked component

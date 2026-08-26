@@ -198,7 +198,8 @@ def probe() -> None:
     check(
         "the launch provider set CLAIMS mxfp8/1, by digest",
         mx in providers,
-        f"{providers.get(mx, type('x', (), {'name': 'ABSENT'})).name} <- {mx[:26]}…",
+        # digest -> ORDERED CANDIDATES since #517e: one encoding, two routes.
+        f"{[p.name for p in providers.get(mx, ())] or 'ABSENT'} <- {mx[:26]}…",
     )
     capabilities, evidence = qualify(
         torch,
@@ -209,7 +210,14 @@ def probe() -> None:
         cache=None,
     )
     print(f"  device     {device.predicate} ({device.name})")
-    by_dtype = {o["output_dtype"]: o["evidence"] for o in evidence["observations"]}
+    # Keyed on the IMPLEMENTATION as well as the dtype since #517e: one digest now carries
+    # a decode floor and a native leaf, and this section is about the decode one's oracle.
+    # A dtype-only key would silently read whichever observation came last.
+    by_dtype = {
+        o["output_dtype"]: o["evidence"]
+        for o in evidence["observations"]
+        if o["implementation"] == "cozy.mxfp8.dequant/1"
+    }
     for name in ("bfloat16", "float32"):
         n = by_dtype[name]["numerics"]
         check(

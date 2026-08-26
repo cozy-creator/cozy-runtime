@@ -307,9 +307,16 @@ class Backend(Protocol):
     fences the copies. `fill` is deliberately NOT the thing that moves bytes — a plane
     that copies inside the walk cannot refuse a late destination without a partial
     generation to undo.
+
+    `encoded_leaves` is the model class's own `ENCODED_LEAVES` declaration, carried in
+    rather than reached for. It rides `materialize` because that is the first call of the
+    transaction and the last moment before a destination is reserved: an endpoint that did
+    not consent must refuse with nothing to undo, not after its bytes are on the card.
     """
 
-    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]: ...
+    def materialize(
+        self, obj: object, walked: Census, *, encoded_leaves: str
+    ) -> Mapping[str, TensorLike]: ...
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None: ...
 
@@ -322,7 +329,9 @@ class Backend(Protocol):
 class _NullBackend:
     """Derive mode's backend: walk and match run, nothing is allocated or filled."""
 
-    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+    def materialize(
+        self, obj: object, walked: Census, *, encoded_leaves: str
+    ) -> Mapping[str, TensorLike]:
         return walked.live
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
@@ -732,7 +741,16 @@ class Loader:
         done: list[str] = []
         total = 0
         try:
-            live = self._backend.materialize(obj, walked)
+            # The consent the MODEL CLASS declared, read off the generation that owns this
+            # loader. `__encoded_leaves__` is a class attribute with a conservative default
+            # on `Model` itself, so a host that never declared one says "refuse" rather
+            # than raising here — the refusal belongs to the plane that would replace a
+            # leaf, with the artifact's own encoding named in it.
+            live = self._backend.materialize(
+                obj,
+                walked,
+                encoded_leaves=str(getattr(type(self._owner), "__encoded_leaves__", "refuse")),
+            )
             for d in walked.destinations:
                 self._backend.fill(d.key, self._artifact.topology[d.key], live[d.key])
                 done.append(d.key)

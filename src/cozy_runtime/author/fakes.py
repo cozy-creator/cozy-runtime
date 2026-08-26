@@ -205,9 +205,12 @@ class _RecordingBackend:
     def filled_bytes(self) -> int:
         return sum(e.nbytes for e in self.events)
 
-    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+    def materialize(
+        self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
+    ) -> Mapping[str, TensorLike]:
         """These stand-ins place nothing: the destinations the census walked are already
-        the destinations they write through."""
+        the destinations they write through — and a stand-in never replaces a leaf, so the
+        consent it is handed is recorded by its signature and acted on by nothing."""
         return walked.live
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:

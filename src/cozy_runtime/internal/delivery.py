@@ -113,11 +113,14 @@ DELIVERY_RUNGS: tuple[DeliveryRung, ...] = (
         why="the stored roles stay resident and each weight decodes inside the forward "
         "pass, which is the only rung that lowers steady-state residency below float",
         status="unbuilt",
-        owner="needs LEAF REPLACEMENT: a module whose weight is the role set, which is the "
-        "swappable-leaf machinery and its consent arms (cr-006 moved them to the first "
-        "module-replacing provider). On the decoded_float route there is no module to "
-        "replace, so this rung has no implementation here and refuses rather than aliasing "
-        "itself onto aot_decode",
+        owner="the leaf-replacement machinery EXISTS now (encoding.py's `LeafProvider`, "
+        "fill.py's `_install_leaf`) and this rung still cannot use it: a JIT rung would "
+        "hold the roles resident and decode INSIDE the forward, where the native rung holds "
+        "the roles resident and never decodes at all. On the decoded_float route there is "
+        "no encoded kernel to compute with, so a jit leaf would have to dequantize a full "
+        "weight per step — a real thing to build, priced per_step, and NOT what "
+        "`native_encoded` does. This rung refuses rather than aliasing itself onto either "
+        "neighbour",
     ),
     DeliveryRung(
         name="native_encoded",
@@ -125,12 +128,12 @@ DELIVERY_RUNGS: tuple[DeliveryRung, ...] = (
         materialization="",
         route="native_encoded",
         cost_class="none",
-        why="the tensor cores consume the stored elements directly (sm90+ scaled_mm, SM100 "
-        "mxfp8/nvfp4): no decode at all, and the only rung on which an encoded lane is also "
-        "a different kernel",
-        status="unbuilt",
-        owner="cr-006's NAMED_SEAMS carry the device class and the milestone per encoding; "
-        "this card is sm89 and consumes fp8 as storage only",
+        why="the tensor cores consume the stored elements directly: no decode at all, the "
+        "stored roles ARE the resident weight, and the only rung on which an encoded lane "
+        "is also a different kernel. It is therefore the only rung that lowers steady-state "
+        "VRAM — measured at 0.5067x on the fill plane's own ledger — and the only one an "
+        "endpoint has to CONSENT to, because the module that computes is replaced",
+        status="proven",
     ),
 )
 
@@ -362,6 +365,17 @@ def eligible_rungs(routes: Mapping[str, int]) -> list[DeliveryRung]:
     tensors admits the decode rungs. A MIXED artifact — 937 plain and 743 encoded, which
     is exactly what the real fp8 SDXL UNet is — admits the decode rungs, because the plain
     tensors ride the same fill unchanged and the encoded ones decide the rung.
+
+    **A rung is a LABEL over a per-tensor fill, and the two must not be confused.** Since
+    the `quantize-mixed` job kind (#543g) an artifact may carry several ENCODINGS in one
+    component — nvfp4 beside fp8-rowwise beside plain, allocation-map driven — and the fill
+    plane resolves a provider per TENSOR from that tensor's own spec digest, so one module
+    tree legitimately holds a native leaf beside a decoded float weight beside a verbatim
+    copy. This function then reports every route such an artifact reaches, and the chooser
+    ranks the rungs on their MEASURED envelopes; what it must never do is let one rung's
+    label decide how a tensor of a different encoding is filled. It does not: nothing
+    downstream reads the rung to pick a provider — `Selector.select` is called per
+    destination, keyed on that destination's digest, and `_stream`/`_decode` branch per row.
     """
     wanted = {name for name, count in routes.items() if count > 0}
     if not wanted:

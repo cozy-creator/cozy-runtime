@@ -68,6 +68,40 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
     "topology — a structure split enters only on measured need (§1.1)",
 }
 
+#: THE ENCODED-LEAF CONSENT, and the whole of the author's say in the delivery plane.
+#:
+#: Every other rung the runtime can choose is invisible to author code by construction: the
+#: weights arrive as float tensors in the destinations the census named, and which stored
+#: bytes they came from is not a question the endpoint can ask. The `native_encoded` rung is
+#: the one that cannot be invisible. Its leaf has no `.weight` — the payload and its scales
+#: ARE the weight, the module that multiplies by them is REPLACED, and an endpoint that
+#: reaches into `layer.weight`, re-dtypes a submodule, or rebuilds a `nn.Linear` from one
+#: finds something that is not there.
+#:
+#: So it is DECLARED, once, on the class, and the default is REFUSE. This is not a knob and
+#: it is not a request field: it is the author stating whether their code survives having a
+#: linear op swapped underneath it, which is a fact about the code and nobody else can know
+#: it. `EXCLUDED_KEYWORDS` keeps `quantize` out of every method signature for the opposite
+#: and complementary reason — WHICH encoding serves is derived, never authored — and the two
+#: rules meet exactly here: the author never picks the encoding, and the runtime never
+#: replaces a leaf in an endpoint that did not say it could take one.
+#:
+#: A string rather than a bool, and a closed vocabulary rather than an open one, because the
+#: class-keyword plane is uniformly string-valued (the stamps are) and because "refuse" then
+#: has a spelling — an author can state the conservative answer instead of only implying it.
+ENCODED_LEAVES: Mapping[str, str] = {
+    "refuse": "the runtime fills float destinations and never replaces a module; an "
+    "artifact whose only qualified route on this device is native refuses typed",
+    "accept": "this endpoint's code touches its components through their FORWARD only — "
+    "no `.weight` read, no per-module dtype walk, no submodule rebuilt from one — so a "
+    "linear op may be replaced by a module whose weight is the stored role set",
+}
+
+#: Class keywords that are neither stamps nor refusals: the runtime reads them. One entry,
+#: deliberately — the plane exists because `encoded_leaves` needed it, and it is a LIST so
+#: the next one is a reviewed addition rather than an accident of `__init_subclass__`.
+RUNTIME_KEYWORDS: Mapping[str, Mapping[str, str]] = {"encoded_leaves": ENCODED_LEAVES}
+
 #: Names a `Model` subclass may not declare. `model.adapters` is the one people reach for:
 #: the applied stack is REQUEST-local state and lives on `RequestView` (§1.4).
 DELETED_MODEL_MEMBERS: Mapping[str, str] = {
@@ -302,6 +336,14 @@ class Model(Generic[PipelineT]):
 
     __stamps__: Mapping[str, str] = {}
 
+    __encoded_leaves__: str = "refuse"
+    """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
+
+    REFUSE is the default because the absence of a statement is not consent. An endpoint
+    written before the native rung existed cannot have thought about whether its code
+    survives leaf replacement, and reading its silence as "yes" would be the runtime
+    deciding a question only the author can answer."""
+
     checkpoint_ref: str = ""
     """The pinned-ref REPRODUCTION FACT for result structs — an observation, never catalog
     authority. Model-scoped because it is construction identity."""
@@ -320,8 +362,25 @@ class Model(Generic[PipelineT]):
     reason a scope works without one: a test double has no bytes to stage."""
 
     def __init_subclass__(cls, /, **stamps: str) -> None:
-        """The class-keyword plane: one keyword per REQUIRED stamp, open vocabulary."""
+        """The class-keyword plane: one keyword per REQUIRED stamp, open vocabulary.
+
+        Plus the `RUNTIME_KEYWORDS`, which are read by the runtime rather than matched
+        against a checkpoint. They are taken FIRST and out of the stamp dict, so a runtime
+        keyword can never be mistaken for a stamp the platform would then look for in a
+        checkpoint's uploader-minted map and refuse for missing.
+        """
         super().__init_subclass__()
+        for key, vocabulary in RUNTIME_KEYWORDS.items():
+            if key not in stamps:
+                continue
+            value = stamps.pop(key)
+            if value not in vocabulary:
+                raise ConformanceError(
+                    f"class {cls.__name__}({key}={value!r}): the vocabulary is CLOSED — "
+                    + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
+                    code=f"{key}_value",
+                )
+            setattr(cls, f"__{key}__", value)
         inherited = dict(getattr(cls, "__stamps__", {}))
         for key, value in stamps.items():
             if (why := RESERVED_KEYWORDS.get(key)) is not None:

@@ -27,31 +27,42 @@ the numerics evidence that minted it (`probe.py`). An unrecognised device is the
 of evidence, never permission — v1's `DTYPE_MIN_SM` fell OPEN on an unknown card and
 served plausible wrong output.
 
-**The device-honesty split, stated once.** On sm89 (this repo's development card) fp8
-E4M3 is a STORAGE dtype: the tensor cores do not consume it, `torch._scaled_mm` needs
-sm90. So the launch tier's fp8 route is `decoded_float` — dequantize at fill, compute in
-the destination's float dtype, which is what the consumer-card ecosystem does and what
-weight-only quantization means. It buys bytes read and load time, NOT VRAM: the resident
-weights are float either way. The sm90+ scaled-mm route and the SM100 mxfp8 native route
-are NAMED here as seams with their owning milestone; they are not built, and an artifact
-that needs one refuses typed naming the device fact rather than silently taking the
-float route it was not qualified for.
+**The device-honesty split, stated once, and now split BOTH WAYS.** The original reading
+was that on sm89 fp8 E4M3 is a STORAGE dtype and the only servable route is
+`decoded_float` — dequantize at fill, compute in the destination's float dtype. That
+remains the FLOOR and it remains what an unmeasured device gets. What changed is that it
+is no longer the only route this module builds: #517c measured rowwise `torch._scaled_mm`
+WORKING on sm89, which makes v1's `W8A8_ROWWISE_MIN_SM=90` a profitability floor that had
+been mislabelled a capability floor for two years.
 
-MXFP8 (#469a's preferred H3 DiT lane) takes that same decoded-float route and is BUILT:
-E4M3 elements with one E8M0 power-of-two scale per 32-element block, dequantized into the
-destination's dtype at fill. Producing an mxfp8 artifact never made one servable (#469a,
-#501f); what makes it servable is a provider here plus a capability record minted by
-measured numerics, and nothing else.
+So an encoding here can carry TWO providers on one device:
 
-Its NATIVE door is no longer a hypothesis. `scripts/mxfp8-native-probe.py` rented an
-RTX 5090 and measured it: on sm120 the block-scaled MXFP8 GEMM is real, its arithmetic is
-bit-identical to `cozy.mxfp8.dequant/1` over the whole format domain, it runs ~2.7x the
-bf16 GEMM, and it is the only route that makes the weights RESIDENT at 8.25 bits. The door
-stays UNBUILT anyway, and for a reason that is not about silicon: the native route
-replaces the LEAF, which is `delivery.py`'s `native_encoded` rung, not a provider here.
-The seam entry carries the measured matrix, the two hazards a builder needs, and what is
-still unmeasured (sm100). No record is minted for a route with no implementation — the
-capability table's whole worth is that a record means something ran.
+* a **decode** provider (`route="decoded_float"`) — the weights become float at fill. It
+  buys bytes read and load time, NOT VRAM, and it is the more accurate of the two because
+  it never quantizes an activation.
+* a **native LEAF** provider (`route="native_encoded"`) — the stored roles ARE the resident
+  weight and the module that multiplies by them is REPLACED. It buys ~half the VRAM and
+  the fp8 GEMM, and it costs fidelity, because native fp8/mx tensor cores need BOTH
+  operands encoded and the activation is therefore quantized at dispatch (w8a8).
+
+**Those two order OPPOSITELY** (#517d measured 20.82 dB at 1.0x VRAM against 16.72 dB at
+0.5003x), which is why selection among them is a stated OBJECTIVE ranked over measured
+records — `Capabilities.admit` — and never registration order. Both defects #517e named
+are fixed here: `launch_providers` is digest -> ORDERED CANDIDATES, and admission RANKS.
+
+MXFP8 (#469a's preferred H3 DiT lane) has both. The decode route was built first and is
+unchanged. Its native door was measured before it was built: `scripts/mxfp8-native-probe.py`
+rented an RTX 5090 and found that on sm120 the block-scaled MXFP8 GEMM is real, that its
+arithmetic is bit-identical to `cozy.mxfp8.dequant/1` over the whole format domain, that it
+runs ~2.7x the bf16 GEMM, and that it is the only route that makes the weights RESIDENT at
+8.294 bits. What that lane could not do was FILL through it — the native route replaces the
+LEAF, where `Provider.decode` writes a float destination the contract's dtype named. That
+is the half this module's `LeafProvider` and `fill.py`'s leaf-replacement leg are.
+
+A record is still minted only where a probe MEASURED (#511b). The native leaf's oracle runs
+the real kernel on the real arch and compares it to the decode reference, so a card whose
+suite never ran mints nothing and refuses to the floor — which is exactly what an
+sm89 build does with `MicroScaledNativeLeaf` (`cuda.sm120`, and no B200 ever ran either).
 """
 
 from __future__ import annotations
@@ -68,6 +79,11 @@ REFUSALS = frozenset(
         "unknown_encoding",  # the header cites a spec digest no provider claims
         "encoding_unqualified",  # a claimed encoding with no capability record for THIS device
         "role_mismatch",  # the delivered parts are not the roles the provider decodes
+        # Two or more providers of one encoding are qualified on this device and the
+        # deployment's stated objective names no axis that was MEASURED on all of them.
+        # Producible only since #517e's digest -> ORDERED CANDIDATES: with one candidate
+        # there is nothing to rank, and the objective decides nothing.
+        "objective_unranked",
     }
 )
 
@@ -253,8 +269,10 @@ def _nvml(query: str) -> str:
 class Provider(Protocol):
     """One implementation that turns one encoding's stored roles into one destination.
 
-    Providers present a PLAIN compute-dtype tensor at the leaf boundary and need no adapter
-    awareness (cr-006's scope note): the SDK side-branch wraps the leaf, cr-010.
+    DECODING providers present a PLAIN compute-dtype tensor at the leaf boundary and need
+    no adapter awareness (cr-006's scope note): the SDK side-branch wraps the leaf, cr-010.
+    A `native_encoded` provider does not decode at all — it REPLACES the leaf, and its
+    surface is `LeafProvider` below.
     """
 
     @property
@@ -262,11 +280,24 @@ class Provider(Protocol):
 
     @property
     def route(self) -> str:
-        """`verbatim` or `decoded_float` — the delivery route (§3.2)."""
+        """`verbatim`, `decoded_float` or `native_encoded` — the delivery route (§3.2)."""
         ...
 
     @property
     def device_predicate(self) -> str: ...
+
+    @property
+    def suite(self) -> str:
+        """WHICH probe oracle qualifies this implementation.
+
+        Keyed on the DECLARATION and never on the class, so a second implementation of one
+        encoding is checked by the same oracle as the first — which is the only way two
+        implementations' records mean the same thing. It replaced probe.py's role-set key
+        the moment two providers of one encoding declared the SAME role set and different
+        routes (`mxfp8/1`'s decode and its native leaf both take `{data, scale}`), where
+        a role-set key silently hands one provider the other's oracle.
+        """
+        ...
 
     @property
     def required(self) -> frozenset[str]:
@@ -279,6 +310,36 @@ class Provider(Protocol):
         ...
 
     def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None: ...
+
+
+class LeafProvider(Protocol):
+    """A MODULE-REPLACING provider: the stored roles stay stored and the leaf changes.
+
+    `Provider.decode` writes a float destination the contract's dtype named, which is the
+    whole reason the `native_encoded` rung stayed unbuilt through two lanes: on the native
+    route there IS no float destination — the payload and its scales are the resident
+    weight, and what has to change is the module that multiplies by them.
+
+    `leaf()` returns a real `torch.nn.Module`, and it must be one: `nn.Module.__setattr__`
+    refuses to accept anything else as a child, which is what makes leaf replacement
+    machinery rather than a one-line swap (proved by the `_fp8_leaf` prototype in
+    `scripts/mxfp8-pod.py`, which this generalises).
+
+    `resident_bits_per_element` is the FOOTPRINT axis of #515a's split, computed from the
+    role bytes that stay resident rather than declared: on the native route those bytes ARE
+    the weight, which is the residency a decoded-float route structurally cannot offer.
+    """
+
+    @property
+    def output_dtype_rule(self) -> str:
+        """How the leaf's forward picks its output dtype. `contract` is the only rule this
+        build has: the leaf emits the destination dtype the contract named, so a downstream
+        module sees exactly what the float path would have handed it."""
+        ...
+
+    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any: ...
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +363,10 @@ class Verbatim:
     @property
     def device_predicate(self) -> str:
         return "any"
+
+    @property
+    def suite(self) -> str:
+        return "verbatim"
 
     @property
     def required(self) -> frozenset[str]:
@@ -351,6 +416,10 @@ class ScaledScalarDequant:
         # the NATIVE route (`torch._scaled_mm`), which is a different provider and is not
         # built here — see NAMED_SEAMS.
         return "any"
+
+    @property
+    def suite(self) -> str:
+        return "fp8-scalar-decode"
 
     @property
     def required(self) -> frozenset[str]:
@@ -448,8 +517,13 @@ class MicroScaledDequant:
     def device_predicate(self) -> str:
         # A cast plus a broadcast multiply — no matmul, no block-scale kernel. Available
         # wherever torch carries the e4m3 dtype, which is the same argument the scalar fp8
-        # route makes. The sm100 floor belongs to the NATIVE route in NAMED_SEAMS.
+        # route makes. The sm120 floor belongs to the NATIVE LEAF, which is a different
+        # provider under this same digest — see `MicroScaledNativeLeaf`.
         return "any"
+
+    @property
+    def suite(self) -> str:
+        return "mxfp8-decode"
 
     @property
     def required(self) -> frozenset[str]:
@@ -642,6 +716,413 @@ def quantize_rowwise(torch: Any, weight: Any) -> RowwiseDerivation:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RowwiseDequant:
+    """`fp8-rowwise/1` -> float, weight-only: `value[i,j] = data[i,j] * scale[i]`.
+
+    The spec's own equation, transcribed from the registry entry. It serves BOTH physical
+    variants the alias files — rank-1 `[out]` and rank-2 `[out, 1]` — because the value law
+    is identical and the only difference is a trailing unit axis, which `reshape(rows, 1)`
+    resolves for both. That is the same argument `ScaledScalarDequant` makes about its two
+    digests, and the same guard applies: a role set that does not match still refuses.
+
+    This is the DEQUANT FLOOR of #518's Hopper/Ada artifact — the route that serves the
+    fp8-rowwise bytes on a device where nothing measured the native leaf. It exists so that
+    "the chooser picks the leaf where it was measured and the floor where it was not" is a
+    statement about two real providers rather than about a provider and an absence.
+    """
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.fp8-rowwise.dequant/1"
+
+    @property
+    def route(self) -> str:
+        return "decoded_float"
+
+    @property
+    def device_predicate(self) -> str:
+        # A cast and a broadcast multiply, exactly like the other two decode routes.
+        return "any"
+
+    @property
+    def suite(self) -> str:
+        return "fp8-rowwise-decode"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+        data = parts["data"]
+        scale = parts["scale"]
+        rows = int(destination.shape[0])
+        destination.copy_(data.view(destination.shape).to(destination.dtype))
+        destination.mul_(scale.to(destination.dtype).reshape(rows, 1))
+
+
+# ------------------------------------------------------------------- the encoded leaf
+
+#: The activation scale's floor, and the same policy `ROW_SCALE_FLOOR` states for weights:
+#: a row of exact zeros has amax 0, and dividing by it poisons a whole output row with NaN.
+ACT_SCALE_FLOOR = 1e-12
+
+
+def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
+    """`[..., K]` float -> `[M, K]` E4M3 payload + `[M, 1]` f32 per-TOKEN scale.
+
+    v1's proven recipe (`gen_worker/models/w8a8.py::_quant_src`), transcribed: amax over the
+    reduction axis, `.float()` BEFORE the divide so the scale is f32 whatever the activation
+    is, the literal 448.0 rather than `finfo.max`, a floor, and the clamp BEFORE the cast
+    because the cast does not saturate. One scale per ROW of the `[M, K]` operand is what
+    pairs with a per-output-row weight scale: the two scale vectors are the two OUTER
+    dimensions of the product and neither is the reduction axis.
+
+    #515f is banked against this spelling and not hidden by it: unfused, this is six
+    elementwise passes over `[M, K]` around a GEMM that costs `M*K*N`, so the overhead
+    fraction falls as 1/N and only disappears when the quantize is fused into one kernel.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    amax = flat.abs().amax(dim=-1, keepdim=True).float()
+    scale = (amax / E4M3_MAX).clamp(min=ACT_SCALE_FLOOR)
+    return (flat.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
+
+
+def quantize_activation_mx(torch: Any, x: Any) -> tuple[Any, Any]:
+    """`[..., K]` float -> `[M, K]` E4M3 payload + `[M, K/32]` E8M0 byte grid.
+
+    The exponent rule is #517's CEILING one, not the shipped `floor(log2 amax) - 8`. That
+    rule puts a block's maximum at `256*m` for `m` in `[1, 2)`, which exceeds E4M3's 448
+    whenever `m > 1.75` — so the block's own LARGEST element clamps, and #517 measured
+    884,220 saturated elements on `qkv_proj` alone and +1.077 dB recovered by fixing it.
+    The producing JOB owns the same fix for the stored weights (#513/#517); the ACTIVATION
+    quantizer is the runtime's own, so it is simply correct here: `e = ceil(log2(amax/448))`
+    makes `amax / 2**e <= 448` by construction and saturates nothing.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    rows, cols = int(flat.shape[0]), int(flat.shape[1])
+    work = flat.float().view(rows, cols // MX_BLOCK, MX_BLOCK)
+    amax = work.abs().amax(dim=-1)
+    exponent = torch.where(
+        amax > 0, torch.ceil(torch.log2(amax / E4M3_MAX)), torch.full_like(amax, -127.0)
+    )
+    byte = (exponent + E8M0_BIAS).clamp(0.0, 254.0)
+    mult = MicroScaledDequant._multiplier(torch, byte.to(torch.uint8), torch.float32)
+    payload = (work / mult.unsqueeze(-1)).view(rows, cols)
+    quant = payload.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    return quant, byte.to(torch.uint8)
+
+
+def to_blocked(torch: Any, scales: Any) -> Any:
+    """`[rows, cols]` E8M0 bytes -> cuBLASLt's 128x4 blocked ("swizzled") scale layout.
+
+    #515d IS THIS FUNCTION'S REASON TO EXIST, and it is a silent-wrong-output hazard rather
+    than an optimisation: torch validates the MX scale grids' ELEMENT COUNT, not their
+    LAYOUT, so a plain row-major `[rows, cols/32]` grid is ACCEPTED in place of the tiled
+    one the MMA actually reads — and returns wrong numbers at 62,453 of 64,485 finite
+    positions. Nothing raises. The probe oracle is what catches a builder who skips this.
+    """
+    rows, cols = int(scales.shape[0]), int(scales.shape[1])
+    row_blocks = -(-rows // 128)
+    col_blocks = -(-cols // 4)
+    padded = torch.zeros(row_blocks * 128, col_blocks * 4, dtype=scales.dtype, device=scales.device)
+    padded[:rows, :cols] = scales
+    tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
+    return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
+
+
+def _leaf_class(torch: Any) -> Any:
+    """The `nn.Module` subclass every encoded leaf is an instance of, built ONCE, lazily.
+
+    Built inside a function because this module imports no torch — the whole runtime's
+    torch-free-import fence — and because `nn.Module.__setattr__` REFUSES any child that is
+    not a Module, which is precisely why leaf replacement is machinery and not a swap: the
+    payload cannot simply be assigned where the float weight was.
+
+    The roles are BUFFERS, never Parameters. An fp8 Parameter is hostile to every
+    `.to(dtype)` that walks a module (v1's `_Fp8ScaledLinear` carries the same rule for the
+    same reason), and a buffer is what `fill.py`'s `_tensors` census, its VRAM charge and
+    its eviction already walk — so the resident bytes stay ledgered by the machinery that
+    was already counting them.
+    """
+    cached = getattr(_leaf_class, "_cached", None)
+    if cached is not None:
+        return cached
+    from torch import nn
+
+    class EncodedLinear(nn.Module):  # type: ignore[misc]
+        """One linear op whose WEIGHT IS THE ENCODED ROLE SET, computed natively.
+
+        It stands exactly where the module it replaced stood, takes exactly that module's
+        input and returns exactly that module's output dtype and shape. What it does not
+        have is a `.weight`: an endpoint that reaches for one is why author CONSENT is a
+        precondition of this route rather than a courtesy.
+        """
+
+        def __init__(
+            self,
+            forward_fn: Any,
+            roles: Mapping[str, Any],
+            bias: Any,
+            out_dtype: Any,
+            provider: str,
+            encoding: str,
+            in_features: int,
+            out_features: int,
+        ) -> None:
+            super().__init__()
+            self._cozy_forward = forward_fn
+            self._cozy_roles = tuple(sorted(roles))
+            for role, tensor in sorted(roles.items()):
+                self.register_buffer(role, tensor)
+            self.register_buffer("bias", bias)
+            self.out_dtype = out_dtype
+            self.provider = provider
+            self.encoding = encoding
+            self.in_features = in_features
+            self.out_features = out_features
+
+        def roles(self) -> dict[str, Any]:
+            return {role: getattr(self, role) for role in self._cozy_roles}
+
+        def forward(self, x: Any) -> Any:
+            out = self._cozy_forward(self, x)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
+        def extra_repr(self) -> str:
+            return (
+                f"in_features={self.in_features}, out_features={self.out_features}, "
+                f"provider={self.provider!r}, roles={list(self._cozy_roles)}, "
+                f"out_dtype={self.out_dtype}"
+            )
+
+    _leaf_class._cached = EncodedLinear  # type: ignore[attr-defined]
+    return EncodedLinear
+
+
+def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
+    """`(in_features, out_features, bias)` of the module being stood in for.
+
+    Read off the REPLACED module rather than inferred from the payload, because the payload
+    is `[out, in]` for a Linear and the runtime must not assume every consumer of an encoded
+    weight is one. A module whose declared geometry disagrees with the stored payload is a
+    refusal in `fill.py`, not a reshape here.
+    """
+    out_features, in_features = int(data.shape[0]), int(data.shape[1])
+    bias = getattr(replaced, "bias", None)
+    return in_features, out_features, bias
+
+
+@dataclass(frozen=True, slots=True)
+class RowwiseNativeLeaf:
+    """`fp8-rowwise/1` NATIVE: the tensor cores consume the stored E4M3 payload directly.
+
+    #514b's engineering fact decides the shape: fp8 tensor cores need BOTH operands fp8, so
+    the serving form is necessarily **w8a8** — the weight is stored quantized and the
+    ACTIVATION is quantized at dispatch, per token, into the scale geometry that pairs with
+    the weight's per-output-row one. That is not weight-only quantization and this docstring
+    does not pretend it is: #517d measured the derived-w8a8 lane at 16.72 dB against the
+    dequant-bf16 lane's 20.82 dB on identical bytes, of which 1.48-1.63 dB is the activation
+    quantization alone. What it buys is the other half of the same measurement: 0.5003x the
+    resident VRAM, because the payload IS the weight.
+
+    **`use_fast_accum=True` is not a tuning knob here, it is the difference between winning
+    and losing** (#517b): measured on an L40S, the default accumulate path runs the fp8 GEMM
+    at 0.52x bf16 and the fast one at 2.03x, for -0.007 to -0.018 dB. v1 never passes the
+    flag and banked its own lane losing 0.81-0.93x to bf16 on the same shapes.
+
+    **The device predicate is a PROFITABILITY floor stated honestly.** #517c measured rowwise
+    `_scaled_mm` WORKING on sm89, which makes v1's `W8A8_ROWWISE_MIN_SM=90` a profitability
+    floor mislabelled as a capability floor. The floor here is `cuda.sm89+` because that is
+    where the kernel exists; whether it is PROFITABLE on a given card is what the probe
+    measures, and a card no probe ran on mints no record whatever this floor says.
+    """
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.fp8-rowwise.native-leaf/1"
+
+    @property
+    def route(self) -> str:
+        return "native_encoded"
+
+    @property
+    def device_predicate(self) -> str:
+        return "cuda.sm89+"
+
+    @property
+    def suite(self) -> str:
+        return "fp8-rowwise-native"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
+
+    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+        raise AssertionError(
+            "a native_encoded provider REPLACES the leaf; it never writes a float "
+            "destination — see LeafProvider.leaf"
+        )
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * sum(p.nbytes for p in parts.values()) / max(numel, 1)
+
+    @staticmethod
+    def _forward(leaf: Any, x: Any) -> Any:
+        import torch
+
+        payload, scale = leaf.data, leaf.scale
+        xq, xs = quantize_activation_rowwise(torch, x)
+        # `_scaled_mm` wants the second operand COLUMN-major, which `payload.t()` already is
+        # for a contiguous `[out, in]`. `scale_b` is per COLUMN of that operand, which is per
+        # OUTPUT row of the weight — and `reshape(1, -1)` is what serves the alias's rank-1
+        # `[out]` and rank-2 `[out, 1]` variants through one spelling.
+        out = torch._scaled_mm(
+            xq,
+            payload.t(),
+            scale_a=xs,
+            scale_b=scale.to(torch.float32).reshape(1, -1),
+            out_dtype=leaf.out_dtype,
+            use_fast_accum=True,
+        )
+        return out.reshape(*x.shape[:-1], -1)
+
+    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any:
+        data = parts["data"]
+        in_features, out_features, bias = _leaf_geometry(replaced, data)
+        return _leaf_class(torch)(
+            RowwiseNativeLeaf._forward,
+            {"data": data, "scale": parts["scale"]},
+            bias,
+            out_dtype,
+            self.name,
+            self.encoding,
+            in_features,
+            out_features,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MicroScaledNativeLeaf:
+    """`mxfp8/1` NATIVE: block-scaled MXFP8 straight into the tensor cores (#515).
+
+    #515 measured every premise of this provider on real silicon before a line of it
+    existed: on sm120 stock `torch._scaled_mm`'s Blockwise-1x32 recipe executes MXFP8
+    natively, its arithmetic is BIT-IDENTICAL to `cozy.mxfp8.dequant/1` over 64,770 of
+    64,770 non-NaN pairs of the format domain, it runs the real DiT shapes at 2.45-2.75x
+    the bf16 GEMM, and it holds the weights at a MEASURED 8.294 bits per element — 18.60
+    against 35.96 GiB for the curve DiT. What was missing was OUR fill plane, which is what
+    this provider and `fill.py`'s leaf-replacement leg are.
+
+    Two facts a reader should not have to rediscover. It is **w8a8-mx**: both GEMM operands
+    must be mxfp8, so activations are quantized per 32-element block at dispatch, and #515a
+    measured the whole route at 27.5 dB against the dequant lane's 30.4 dB on the same
+    bytes — the kernel contributes ~nothing (55.6 dB against f32), the activation
+    quantization is the cost. And the scale grid must be SWIZZLED: see `to_blocked`.
+
+    The predicate is `cuda.sm120` EXACTLY, not `cuda.sm100+`. No B200 ran, so sm100 gets no
+    floor — #511b's fail-closed-by-measurement rule forbids the hand-written one that would
+    read so plausibly here.
+    """
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.mxfp8.native-leaf/1"
+
+    @property
+    def route(self) -> str:
+        return "native_encoded"
+
+    @property
+    def device_predicate(self) -> str:
+        return "cuda.sm120"
+
+    @property
+    def suite(self) -> str:
+        return "mxfp8-native"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
+
+    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+        raise AssertionError(
+            "a native_encoded provider REPLACES the leaf; it never writes a float "
+            "destination — see LeafProvider.leaf"
+        )
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * sum(p.nbytes for p in parts.values()) / max(numel, 1)
+
+    @staticmethod
+    def _forward(leaf: Any, x: Any) -> Any:
+        import torch
+
+        xq, xbytes = quantize_activation_mx(torch, x)
+        out = torch._scaled_mm(
+            xq,
+            leaf.data.t(),
+            scale_a=to_blocked(torch, xbytes).view(torch.float8_e8m0fnu),
+            scale_b=leaf.scale,
+            out_dtype=leaf.out_dtype,
+        )
+        return out.reshape(*x.shape[:-1], -1)
+
+    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any:
+        if not hasattr(torch, "float8_e8m0fnu"):
+            raise refuse(
+                "encoding_unqualified",
+                "this torch build carries no `float8_e8m0fnu` dtype, so it cannot express "
+                "an MX block-scale operand at all — the native mxfp8 leaf has no way to "
+                "hand the kernel its scales, and refusing beats handing it a u8 grid",
+            )
+        data = parts["data"]
+        in_features, out_features, bias = _leaf_geometry(replaced, data)
+        # The SWIZZLE IS PAID ONCE, at fill, and its result is what stays resident. Paying
+        # it per forward would put a `[out, in/32]` permute in front of every GEMM, which is
+        # the same class of unfused elementwise overhead #515f names on the activation side
+        # — except here it is avoidable, because the weight's grid never changes.
+        blocked = to_blocked(torch, parts["scale"]).view(torch.float8_e8m0fnu)
+        return _leaf_class(torch)(
+            MicroScaledNativeLeaf._forward,
+            {"data": data, "scale": blocked},
+            bias,
+            out_dtype,
+            self.name,
+            self.encoding,
+            in_features,
+            out_features,
+        )
+
+
 #: Encodings this runtime RECOGNISES but does not execute, with the device class that
 #: would and the milestone that owns building it. Data, not machinery: there is no stub
 #: provider object, no empty package and no dormant enum case — the refusal below reads
@@ -652,43 +1133,13 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
         "native fp8 tensor-core execution via torch._scaled_mm — cr-008c's native-provider "
         "leg; on sm89 the qualified route is decoded_float, which this runtime serves",
     ),
-    "fp8-rowwise/1": (
-        "cuda.sm90+",
-        "per-output-row fp8; the decoded_float provider is a small generalisation of the "
-        "scalar one and lands with its first consuming lane (cr-008c)",
-    ),
-    "mxfp8/1": (
-        "cuda.sm120",
-        "MXFP8 NATIVE — tensor cores consume E4M3 elements + E8M0 block scales directly. "
-        "MEASURED on an RTX 5090 (sm120, torch 2.9.1+cu130, driver 580.126.20), "
-        "`scripts/mxfp8-native-probe.py`: `torch._scaled_mm`'s Blockwise-1x32 recipe DOES "
-        "execute it, and its arithmetic is BIT-IDENTICAL to `cozy.mxfp8.dequant/1` over all "
-        "64,770 non-NaN pairs of the format domain (the 766 NaN-bearing pairs are excluded "
-        "because `0 * NaN` is NaN, which poisons a dot product on BOTH routes — a matmul "
-        "fact, not an encoding one). It runs the real DiT block's GEMMs at 628-674 TFLOP/s "
-        "against bf16's 227-243, and holds the weights at a MEASURED 8.294 bits resident "
-        "(18.60 GiB vs 35.96 GiB for the curve DiT's GEMM weights) — the VRAM claim #511's "
-        "open owner question says the decoded-float route cannot make. "
-        "STILL UNBUILT, and the missing piece is NOT this module: a native route needs the "
-        "LEAF to hold the payload plus its blocked scale and to replace the linear op, "
-        "where `Provider.decode` writes a float destination the contract's dtype named. "
-        'That is `delivery.py`\'s `native_encoded` rung, still `status="unbuilt"` for the '
-        "reason it already gives — LEAF REPLACEMENT — though its `owner` line's \"this card "
-        "is sm89\" is now stale and belongs to that file's lane to correct. "
-        "Two facts a builder needs before starting. (1) The route "
-        "is w8a8-mx, not weight-only: BOTH operands must be mxfp8, so it quantizes "
-        "ACTIVATIONS, measured at 0.0421 relative Frobenius against bf16 where the "
-        "weight-only lane sits at 0.0300 — 2.9 dB lossier, and the kernel itself accounts "
-        "for almost none of it (0.00166 against the same operands in f32). (2) torch "
-        "validates the scale grids' ELEMENT COUNT, not their LAYOUT: a row-major "
-        "`[rows, cols/32]` grid is ACCEPTED in place of the 128x4-tiled one the MMA reads "
-        "and returns wrong numbers at 62,453 of 64,485 finite positions. That is this "
-        "module's silent-wrong-output class living one layer down, and it is why a native "
-        "provider must qualify through `probe.py` on the arch it claims. sm100 (B200) is "
-        "UNMEASURED — no card was rented, so it gets no record and no floor; the "
-        "predicate above is `cuda.sm120` exactly, not `cuda.sm100+`, because a hand-written "
-        "floor is what #511b's fail-closed-by-measurement rule forbids",
-    ),
+    # `fp8-rowwise/1` and `mxfp8/1` LEFT THIS TABLE when their native leaves were built
+    # (`RowwiseNativeLeaf`, `MicroScaledNativeLeaf`). A seam entry means "this runtime
+    # recognises the bytes and executes none of them"; both now have TWO providers each, a
+    # decode floor and a native leaf, and the honest answer for a device that serves neither
+    # is the candidate list `Capabilities.admit` prints — which names the implementations
+    # that exist and what each one measured — not a sentence about a door nobody walked.
+    # sm100 (B200) stays UNMEASURED: no card was rented, so it gets no record and no floor.
     "nvfp4-w4a4/1": (
         "cuda.sm100+",
         "the v1 SVDQuant/W4A4 native stack, ported as providers with its layout contracts "
@@ -702,27 +1153,42 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
 }
 
 
-def launch_providers() -> dict[str, Any]:
-    """The LAUNCH TIER provider set, keyed by spec digest.
+def launch_providers() -> dict[str, tuple[Any, ...]]:
+    """The LAUNCH TIER provider set: spec digest -> the ORDERED CANDIDATES for that digest.
 
-    Read from the compiled registry at call time so a digest is never transcribed. The set
-    is deliberately small: `plain/1` plus the encoding proto-001 SELECTED. Everything else
-    the registry knows is in `NAMED_SEAMS` and refuses naming its device class.
+    Read from the compiled registry at call time so a digest is never transcribed.
+
+    **This used to be digest -> ONE provider**, which was true exactly as long as no
+    encoding had a second implementation, and #517e named it as one of the two latent
+    defects that fire the moment one does. Both fired together here: `fp8-rowwise/1` and
+    `mxfp8/1` each now carry a DECODE FLOOR and a NATIVE LEAF, which are two providers of
+    one encoding, on one device, with opposite standings on footprint and fidelity.
+
+    The order in this function is REGISTRATION order and it decides NOTHING. Selection
+    among candidates is `Capabilities.admit`'s ranking under the deployment's stated
+    objective, over records that exist only where a probe measured — which is the other
+    half of #517e, and the reason a first-match read of this dict would have been an
+    order-dependence bug rather than a policy.
     """
-    out: dict[str, Any] = {}
-    for digest in digests_of("plain/1"):
-        out[digest] = Verbatim(digest)
+    out: dict[str, list[Any]] = {}
+
+    def offer(alias: str, *builders: Any) -> None:
+        for digest in digests_of(alias):
+            out.setdefault(digest, []).extend(build(digest) for build in builders)
+
+    offer("plain/1", Verbatim)
     # BOTH role sets one real fp8_scaled artifact carries. They share one value law, so
     # they share one implementation; which digest a given tensor may cite is TensorFS's
     # fact, enforced when the header is parsed against its own encoding closure.
-    for digest in digests_of("fp8-scaled-scalar/1"):
-        out[digest] = ScaledScalarDequant(digest)
-    # #469a's PREFERRED H3 DiT serving lane. One digest under this alias — the block
-    # geometry IS the spec, so a producer variation would be a different spec and a
-    # different provider, not a tolerated role set.
-    for digest in digests_of("mxfp8/1"):
-        out[digest] = MicroScaledDequant(digest)
-    return out
+    offer("fp8-scaled-scalar/1", ScaledScalarDequant)
+    # #518's Hopper/Ada artifact, and the first encoding to carry two routes. BOTH physical
+    # variants of the alias (rank-1 `[out]` and rank-2 `[out, 1]` scales) get both.
+    offer("fp8-rowwise/1", RowwiseDequant, RowwiseNativeLeaf)
+    # #469a's H3 DiT serving lane. One digest under this alias — the block geometry IS the
+    # spec, so a producer variation would be a different spec and a different provider, not
+    # a tolerated role set. Two ROUTES under that one digest since #515.
+    offer("mxfp8/1", MicroScaledDequant, MicroScaledNativeLeaf)
+    return {digest: tuple(candidates) for digest, candidates in out.items()}
 
 
 # ------------------------------------------------------------------- capability records
@@ -735,6 +1201,12 @@ class CapabilityRecord:
     A record cannot exist without `evidence_digest`, which is the digest of the probe
     observation that minted it — so "qualified" always means "something ran and was
     measured", never "someone believed".
+
+    The two MEASURED axes below are what turned this from a membership test into an
+    ORDERING (#517e). They are stored on the record and not derived at admission because
+    they are properties of a probe run: a number the table carries is a number something
+    produced, and one nothing produced is spelled -1.0 rather than defaulted to a value
+    that would win or lose a comparison it was never entitled to enter.
     """
 
     encoding_spec_id: str
@@ -744,6 +1216,34 @@ class CapabilityRecord:
     output_dtype: str
     delivery_route: str
     evidence_digest: str
+    resident_bits_per_element: float = -1.0
+    """FOOTPRINT axis. The bits this route leaves resident per logical element, measured on
+    the probe's own tensor: the destination dtype's width on a decode route (the weights are
+    float either way), the role bytes on a native one. -1.0 means NOT MEASURED."""
+    route_deviation_rel: float = -1.0
+    """FIDELITY axis. Relative Frobenius of the ROUTE's own GEMM output against an f32
+    reference over the exactly-dequantized weights, on identical activations — the one
+    quantity that is comparable across a decode route and a native one, because it prices
+    the whole route rather than one of its halves. -1.0 means NOT MEASURED."""
+
+    def axis(self, objective: str) -> float:
+        """The ranking key for one objective. Lower is better; -1.0 means UNRANKABLE."""
+        if objective == "footprint":
+            return self.resident_bits_per_element
+        if objective == "fidelity":
+            return self.route_deviation_rel
+        return -1.0
+
+
+#: Which MEASURED field each delivery objective ranks providers on. `latency` is absent on
+#: purpose and its absence is a refusal, not a fallback: nothing has measured a quantity
+#: that is comparable between "a decode paid once at fill" and "a GEMM paid every step", so
+#: a latency-stated deployment with two qualified providers is told to state an axis
+#: something measured rather than handed whichever provider was registered first.
+OBJECTIVE_AXIS: dict[str, str] = {
+    "footprint": "resident_bits_per_element",
+    "fidelity": "route_deviation_rel",
+}
 
 
 class Capabilities:
@@ -756,27 +1256,103 @@ class Capabilities:
         self.records.append(record)
 
     def admit(
-        self, encoding: str, device: DeviceFacts, output_dtype: str, alias: str
+        self,
+        encoding: str,
+        device: DeviceFacts,
+        output_dtype: str,
+        alias: str,
+        *,
+        objective: str,
+        among: Mapping[str, Any],
     ) -> CapabilityRecord:
-        for record in self.records:
-            if (
-                record.encoding_spec_id == encoding
-                and record.output_dtype == output_dtype
-                and device.satisfies(record.device_predicate)
-            ):
-                return record
+        """The qualified record for this (encoding, device, dtype), RANKED (#517e).
+
+        `among` is implementation digest -> provider, for exactly the candidates whose
+        declared role set the header satisfies. A record for an implementation this build
+        does not carry admits nothing, and neither does a provider whose declared device
+        floor this card misses — the two filters are separate because they answer different
+        questions ("was this measured here" and "does this implementation claim this card"),
+        and collapsing them would let a stale record select a provider that is gone.
+        """
+        qualified = [
+            record
+            for record in self.records
+            if record.encoding_spec_id == encoding
+            and record.output_dtype == output_dtype
+            and device.satisfies(record.device_predicate)
+            and record.implementation_digest in among
+            and device.satisfies(among[record.implementation_digest].device_predicate)
+        ]
+        if not qualified:
+            raise refuse(
+                "encoding_unqualified",
+                self._why(encoding, device, output_dtype, alias, among),
+                [encoding],
+            )
+        if len(qualified) == 1:
+            # ONE candidate: there is nothing to rank and the objective decides nothing.
+            # Stated so the objective's own refusal below cannot fire on the single-provider
+            # path every encoding took before this lane.
+            return qualified[0]
+        axis = OBJECTIVE_AXIS.get(objective)
+        unranked = [r for r in qualified if r.axis(objective) < 0.0]
+        if axis is None or unranked:
+            raise refuse(
+                "objective_unranked",
+                f"{alias} ({encoding[:23]}…) has {len(qualified)} qualified providers on "
+                f"{device_line(device)} and the deployment's {objective!r} objective "
+                + (
+                    f"names no measured axis (measured axes: {sorted(OBJECTIVE_AXIS)})"
+                    if axis is None
+                    else f"has no {axis} measurement on "
+                    + ", ".join(sorted(among[r.implementation_digest].name for r in unranked))
+                )
+                + ". A number nobody measured may not select a provider, and neither may "
+                "registration order — the two routes order OPPOSITELY on footprint and "
+                "fidelity (#517d), so first-match is a coin flip wearing a ladder's clothes. "
+                "Candidates: "
+                + " | ".join(
+                    f"{among[r.implementation_digest].name} [{r.delivery_route}] "
+                    f"footprint={r.resident_bits_per_element:.3f} b/elt "
+                    f"fidelity={r.route_deviation_rel:.6f} rel"
+                    for r in qualified
+                ),
+                [encoding],
+            )
+        # Lower is better on both axes. The implementation NAME breaks an exact tie, so the
+        # answer is a function of the measurements and not of dict iteration order.
+        return min(
+            qualified, key=lambda r: (r.axis(objective), among[r.implementation_digest].name)
+        )
+
+    def _why(
+        self,
+        encoding: str,
+        device: DeviceFacts,
+        output_dtype: str,
+        alias: str,
+        among: Mapping[str, Any],
+    ) -> str:
         elsewhere = sorted(
             {r.device_predicate for r in self.records if r.encoding_spec_id == encoding}
         )
         seam = NAMED_SEAMS.get(alias)
         alternative = f" The route that WOULD serve it is {seam[0]}: {seam[1]}." if seam else ""
-        raise refuse(
-            "encoding_unqualified",
+        # WHICH implementations exist and what each one's floor is. It replaces the seam
+        # sentence for the encodings that now carry real providers: "no qualified provider"
+        # is the same words whether nothing was built or nothing was measured, and those are
+        # different problems with different remedies.
+        built = " | ".join(
+            f"{p.name} [{p.route}] floor {p.device_predicate}"
+            f"{'' if device.satisfies(p.device_predicate) else ' — this card misses that floor'}"
+            for p in sorted(among.values(), key=lambda p: str(p.name))
+        )
+        return (
             f"{alias} ({encoding[:23]}…) has no qualified provider on "
             f"{device_line(device)} for output dtype {output_dtype}. Qualified device "
-            f"predicates for this encoding: {elsewhere or 'none'}.{alternative} An "
-            "unrecognised device is the ABSENCE of evidence, never permission.",
-            [encoding],
+            f"predicates for this encoding: {elsewhere or 'none'}. Implementations this "
+            f"build carries: {built or 'none'}.{alternative} An unrecognised device is the "
+            "ABSENCE of evidence, never permission."
         )
 
 
@@ -802,19 +1378,37 @@ class Selection:
 
 
 class Selector:
-    """Per-tensor provider selection, by digest, fail-closed, priced at O(1) per key."""
+    """Per-tensor provider selection, by digest, fail-closed, priced at O(1) per key.
+
+    `objective` is the DEPLOYMENT's stated axis, carried down from the binding plan through
+    the same field `DeliveryChooser` reads. It is a constructor argument rather than a
+    per-call one because delivery is decided ONCE per generation (delivery.py's fourth
+    rule): a per-tensor objective would let one component's leaves and another's disagree
+    about what this deployment is for.
+    """
 
     def __init__(
-        self, providers: Mapping[str, Any], capabilities: Capabilities, device: DeviceFacts
+        self,
+        providers: Mapping[str, Any],
+        capabilities: Capabilities,
+        device: DeviceFacts,
+        objective: str = "fidelity",
     ) -> None:
-        self.providers = dict(providers)
+        #: digest -> ORDERED CANDIDATES. A single provider is accepted and wrapped, so a
+        #: caller holding a pre-#517e map still selects — through the ranked path, with one
+        #: candidate, which is where that map was always right.
+        self.providers = {
+            digest: tuple(value) if isinstance(value, tuple | list) else (value,)
+            for digest, value in providers.items()
+        }
         self.capabilities = capabilities
         self.device = device
+        self.objective = objective
         self.aliases = aliases()
 
     def select(self, key: str, encoded: Encoded, output_dtype: str) -> Selection:
-        provider = self.providers.get(encoded.encoding)
-        if provider is None:
+        candidates = self.providers.get(encoded.encoding)
+        if not candidates:
             alias = self.aliases.get(encoded.encoding)
             if alias is None:
                 raise refuse(
@@ -848,34 +1442,61 @@ class Selector:
                 "not qualified for.",
                 [key],
             )
-        missing = sorted(provider.required - encoded.roles)
-        surplus = sorted(encoded.roles - provider.required - provider.optional)
-        if missing or surplus:
+        # THE ROLE FILTER, applied to every candidate before capability. A candidate whose
+        # declared role set the header does not satisfy is not a rejected provider, it is
+        # not a provider OF THESE BYTES at all — so it must not appear in the ranking, and
+        # its absence must not read as "unqualified on this device".
+        among: dict[str, Any] = {}
+        mismatched: list[tuple[Any, list[str], list[str]]] = []
+        for candidate in candidates:
+            missing = sorted(candidate.required - encoded.roles)
+            surplus = sorted(encoded.roles - candidate.required - candidate.optional)
+            if missing or surplus:
+                mismatched.append((candidate, missing, surplus))
+                continue
+            among[implementation_digest(candidate)] = candidate
+        if not among:
             raise refuse(
                 "role_mismatch",
-                f"{key}: the header stores roles {sorted(encoded.roles)}; the provider "
-                f"selected by this tensor's own digest requires {sorted(provider.required)} "
-                f"and tolerates {sorted(provider.optional)} — missing {missing}, "
-                f"unhandled {surplus}. A role a decoder cannot account for is a different "
-                "physical contract, never a tolerated variant",
+                f"{key}: the header stores roles {sorted(encoded.roles)} and no provider "
+                f"registered for this tensor's own digest accounts for them — "
+                + " | ".join(
+                    f"{c.name} requires {sorted(c.required)}, tolerates {sorted(c.optional)} "
+                    f"(missing {m}, unhandled {s})"
+                    for c, m, s in mismatched
+                )
+                + ". A role a decoder cannot account for is a different physical contract, "
+                "never a tolerated variant",
                 [key],
             )
         record = self.capabilities.admit(
-            encoded.encoding, self.device, output_dtype, self.aliases.get(encoded.encoding, "?")
+            encoded.encoding,
+            self.device,
+            output_dtype,
+            self.aliases.get(encoded.encoding, "?"),
+            objective=self.objective,
+            among=among,
         )
-        return Selection(provider, record, encoded)
+        return Selection(among[record.implementation_digest], record, encoded)
 
 
 # ------------------------------------------------------------------------------ digests
 
 
 def implementation_digest(provider: Any) -> str:
-    """The provider's identity: its name, route, device floor and exact role set."""
+    """The provider's identity: its name, route, device floor, oracle and exact role set.
+
+    `suite` joins the key because it is part of what a record MEANS: two implementations
+    checked by different oracles are not interchangeable, and a record whose evidence came
+    from one must not admit the other. It is also the field that keeps the two providers of
+    one encoding apart when everything else about their declaration matches.
+    """
     return canonical.digest(
         {
             "name": provider.name,
             "route": provider.route,
             "device_predicate": provider.device_predicate,
+            "suite": provider.suite,
             "required": sorted(provider.required),
             "optional": sorted(provider.optional),
         }

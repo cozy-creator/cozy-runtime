@@ -61,6 +61,7 @@ from cozy_runtime.internal.encoding import (
     RolePart,
     Selection,
     Selector,
+    device_line,
     launch_providers,
     measure_device,
 )
@@ -117,6 +118,16 @@ REFUSALS = frozenset(
         # rather than fixed, so "the right roles at the wrong shape" is a state that can
         # exist for the first time.
         "carrier_geometry",
+        # cr-006's fourth, added with the FIRST module-replacing provider and spoken here
+        # for the same reason its other three are: one refusal table.
+        "objective_unranked",  # 2+ qualified providers, and no measured axis to order them
+        # The `native_encoded` rung's own two. Distinct on purpose, because they print
+        # different remedies: `leaf_unconsented` says the ENDPOINT must declare that its
+        # code survives a replaced linear op (an author edit), while `leaf_topology` says
+        # the module tree cannot take a leaf where this destination is, or did not end up
+        # holding what the substitution declared (a runtime/artifact disagreement).
+        "leaf_unconsented",
+        "leaf_topology",
     }
 )
 
@@ -551,6 +562,45 @@ def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class LeafReplacement:
+    """One destination that became a MODULE instead of a tensor. The substitution, as data.
+
+    `materialize`'s law is that placement moves bytes and never topology, and it is checked
+    key-for-key. Leaf replacement moves topology, which is why it is not placement and why
+    it cannot simply relax that check: what replaces it is a DECLARED substitution, and
+    this record is the declaration. `commit` re-censuses and requires that the module tree
+    holds exactly `contract_key` gone and `role_keys` arrived — nothing else moved, nothing
+    else vanished. A leaf that quietly dropped a bias, or a provider that registered a
+    buffer nobody expected, is a `leaf_topology` refusal rather than a surprise at the
+    first forward pass.
+    """
+
+    contract_key: str
+    """The logical destination the checkpoint supplies, e.g. `unet.…qkv_proj.weight`."""
+    module_path: str
+    """The module that was REPLACED, e.g. `unet.…qkv_proj` — the parent of the tensor."""
+    was: str
+    now: str
+    role_keys: tuple[str, ...]
+    """The census keys the leaf's own buffers present, fully qualified."""
+    stored_bytes: int
+    freed_bytes: int
+    """Device bytes the float destination gave back. The other half of the VRAM claim: a
+    replacement that freed nothing bought nothing, whatever the payload cost."""
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "key": self.contract_key,
+            "module": self.module_path,
+            "was": self.was,
+            "now": self.now,
+            "roles": list(self.role_keys),
+            "stored_bytes": self.stored_bytes,
+            "freed_bytes": self.freed_bytes,
+        }
+
+
 class StagingRing:
     """A fixed pinned ring, never a residence tier (§3.2): bytes pass through, warm bytes
     are never page-locked, and the ring never grows under pressure.
@@ -694,6 +744,7 @@ class StreamingFillBackend:
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.1",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
+        objective: str = "fidelity",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -788,7 +839,12 @@ class StreamingFillBackend:
                 release=release,
                 cache=Path(probe_cache) if probe_cache else None,
             )
-        self.selector = Selector(self.providers, self.capabilities, self.device_facts)
+        #: The DEPLOYMENT's stated axis, the same field `DeliveryChooser` reads, carried
+        #: down so both choices are made under one objective. Defaulted to `fidelity`
+        #: rather than to `latency`: an unstated objective must not be the one that trades
+        #: output quality for bytes, and #517d measured that trade at 4.1 dB.
+        self.objective = objective
+        self.selector = Selector(self.providers, self.capabilities, self.device_facts, objective)
         #: THE SERVABILITY ANSWER, given here — before `expect` acquires a lease, before a
         #: destination is reserved, before a byte moves. `fill()` re-selects per key and
         #: would refuse too, but one tensor into a 532-tensor artifact is not when a worker
@@ -802,7 +858,39 @@ class StreamingFillBackend:
         #: stream and the decode and never outlive one component's fill.
         self.scratch: dict[str, dict[str, Any]] = {}
         self.decode_scratch_bytes = int(decode_scratch_bytes)
-        self.decoded: dict[str, Any] = {"tensors": 0, "bytes": 0, "flushes": 0, "ms": 0}
+        self.decoded: dict[str, Any] = {
+            "tensors": 0,
+            "bytes": 0,
+            "flushes": 0,
+            "ms": 0,
+            #: Destinations that became a MODULE instead of a decoded tensor, and the
+            #: stored bytes those modules now hold RESIDENT. Counted apart from `bytes`
+            #: because they are the opposite kind of number: decoded bytes passed through
+            #: and these stayed.
+            "leaves": 0,
+            "resident_bytes": 0,
+        }
+        #: The model class's `encoded_leaves=` declaration, handed in by `materialize` and
+        #: `"refuse"` until it is. Not a default the runtime picked — the ABSENCE of a
+        #: materialize call, which is a state no fill reaches.
+        self.encoded_leaves = "refuse"
+        #: What leaf replacement actually did, per replaced destination. It is the
+        #: SUBSTITUTION MAP the census reconciliation is checked against, and the only
+        #: record that a generation's topology moved — so it is data a reader can print,
+        #: not an effect they have to infer from the module tree.
+        self.replaced: dict[str, LeafReplacement] = {}
+        #: Transient `vram` reservations covering the moment a native fill holds BOTH the
+        #: float destinations and the encoded payload. Released when the leaves land and
+        #: the float storages are freed; the ledger's `peak` keeps the real high-water mark.
+        self.leaf_grant: dict[str, int] = {}
+        #: contract key -> the data pointer of the destination a leaf will stand for. It
+        #: exists to catch a TIE: one tensor under two names, where replacing the first
+        #: module frees memory the second still points at.
+        self.leaf_sites: dict[str, int] = {}
+        #: The census key set of each resident component, as of the last time this plane
+        #: agreed with it. `materialize` writes it, `_reconcile_leaves` checks the
+        #: substitution against it and writes the new one.
+        self.census_keys: dict[str, frozenset[str]] = {}
 
     # -- reservation -------------------------------------------------------------
 
@@ -836,17 +924,49 @@ class StreamingFillBackend:
             lease = self.leases[component] = checkpoint.acquire()
         return lease
 
-    def materialize(self, obj: object, walked: Census) -> Mapping[str, TensorLike]:
+    def materialize(
+        self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
+    ) -> Mapping[str, TensorLike]:
         """Reserve ordinary CUDA destinations for the constructed component roots.
 
         Baseline residency is ordinary CUDA allocation and that is sufficient (§3.2); a
         promoted Varena adapter would replace this method and nothing else. The census is
         re-taken afterwards and must agree key-for-key: a materialization that changes the
         topology is not a placement, it is a different construction.
+
+        THE CONSENT GATE IS FIRST, before a byte of device memory is reserved. Every row's
+        route is already known — `__init__` surveyed them for `servability` — so an
+        endpoint that did not declare `encoded_leaves="accept"` and was handed an artifact
+        whose only qualified route replaces modules refuses HERE, with nothing allocated
+        and nothing to undo. Discovering it at the decode, with the component resident,
+        would mean rolling back gigabytes to deliver an answer that was knowable from the
+        header.
         """
         from cozy_runtime.author._loader import _members
         from cozy_runtime.internal.derive import placing
 
+        self.encoded_leaves = encoded_leaves
+        native = sorted(
+            row.key
+            for row in self.plan.values()
+            if self.selector.select(row.key, row.encoded, dtype_name(row.dtype)).provider.route
+            == "native_encoded"
+        )
+        if native and encoded_leaves != "accept":
+            raise _refuse(
+                "leaf_unconsented",
+                f"{len(native)} of this artifact's tensors ({', '.join(native[:3])}…) serve "
+                f"through a NATIVE ENCODED LEAF on {device_line(self.device_facts)}, and this "
+                f"endpoint declares encoded_leaves={encoded_leaves!r}. That route does not "
+                "hand the module a float weight: the stored payload and its scales ARE the "
+                "weight and the linear op is REPLACED, so code that reads `.weight`, walks "
+                "submodule dtypes or rebuilds a Linear from one finds something that is not "
+                'there. The endpoint states `class …(Model[…], encoded_leaves="accept")` '
+                "when its components are touched through their forward only — the runtime "
+                "cannot know that, and reading silence as consent is how a serving path "
+                "starts raising AttributeError in production",
+                native[:6],
+            )
         roots = dict(_members(obj))
         started = time.perf_counter_ns()
         held = 0
@@ -862,6 +982,19 @@ class StreamingFillBackend:
                 # if the capture happens only on the resident branch.
                 derived = self.derived[name] = _derived_values(member)
                 if self.resident_budget and held + size > self.resident_budget:
+                    if any(key.startswith(f"{name}.") for key in native):
+                        raise _refuse(
+                            "leaf_topology",
+                            f"the placement plan would PARK {name!r}, and this component "
+                            "serves through encoded leaves. A parked component is staged in "
+                            "later by re-filling the checkpoint's own keys, which stop being "
+                            "this module's keys the moment a leaf replaces a linear op — so "
+                            "the two plans are incompatible in this build. Raise the resident "
+                            "budget or state an objective whose qualified route is the decode "
+                            "floor; the staged-plus-encoded-leaf combination is a named next "
+                            "increment and is not silently half-served here",
+                            [name],
+                        )
                     # PARKED, not dropped. Its topology is built and its destinations are
                     # known; what it does not have is device bytes, and `stage()` supplies
                     # those on first declared use. A construction that silently skipped it
@@ -901,6 +1034,15 @@ class StreamingFillBackend:
                 "destination_absent",
                 "the census after materialization is not the census before it — "
                 "placement moves bytes, never topology",
+            )
+        # The baseline the SUBSTITUTION law is checked against later. Taken here, from the
+        # census this method just agreed with, so leaf replacement is measured against what
+        # placement actually produced rather than against the plan's own idea of it.
+        for destination in fresh.destinations:
+            self.census_keys.setdefault(destination.component, frozenset())
+        for component in {d.component for d in fresh.destinations}:
+            self.census_keys[component] = frozenset(
+                d.key for d in fresh.destinations if d.component == component
             )
         return fresh.live
 
@@ -966,8 +1108,118 @@ class StreamingFillBackend:
                 f"{row.nbytes} B",
                 [key],
             )
+        if self.selected[key].provider.route == "native_encoded":
+            # THE LEAF'S SITE, resolved before a byte moves and for the same reason every
+            # other check here is: the decode leg has nothing to undo only if the whole
+            # component's destinations were validated first. A native row that has no
+            # module to replace is not a late surprise, it is a refusal at the same moment
+            # a dtype disagreement is.
+            self._leaf_site(key, row, tensor)
         self.enqueued[key] = tensor
         self.state = "staging"
+
+    def _leaf_site(self, key: str, row: PlanRow, tensor: TensorLike) -> tuple[Any, Any, str]:
+        """`(owner, replaced, attribute)` — where a leaf would stand for this destination.
+
+        The unit of replacement is the MODULE, not the tensor: `nn.Module.__setattr__`
+        refuses to accept anything that is not a Module as a child, so the payload cannot
+        be assigned where the float weight was and the linear op has to be swapped whole.
+        That is the machinery the `native_encoded` rung waited on, and this is where it is
+        checked to be possible.
+
+        Four things have to hold, each a different way for a leaf to be wrong:
+        a `.weight` (a leaf stands for a linear op, which its weight names), a rank-2
+        logical shape (a scaled GEMM has two outer dimensions), an OWNER to hold the new
+        child (a component root has no parent to be replaced on), and the module's own
+        declared geometry if it has one (a tied or re-wired weight resolves to a module
+        whose shape is not this tensor's, and installing there would compute a different
+        model in silence).
+        """
+        component, _, local = key.partition(".")
+        if not local.endswith(".weight"):
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: the native route replaces a LINEAR OP and names it by its weight; "
+                f"this destination is not a `.weight`, so there is no module for the stored "
+                "roles to become. The artifact encodes a tensor whose consumer this runtime "
+                "cannot identify",
+                [key],
+            )
+        if len(row.shape) != 2:
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: the native route computes a scaled GEMM, whose operands have two "
+                f"outer dimensions; this destination is rank {len(row.shape)} "
+                f"{row.shape}. A reshape here would be a different model",
+                [key],
+            )
+        owner_local, _, attribute = local[: -len(".weight")].rpartition(".")
+        root = self.components.get(component)
+        if root is None:
+            raise _refuse(
+                "destination_absent",
+                f"{key}: component {component!r} is not resident, so its module tree cannot "
+                "take a leaf",
+                [key],
+            )
+        if not attribute:
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: the weight belongs to the component ROOT, which has no parent to be "
+                "replaced on — a leaf is installed by `setattr` on the module that owns it, "
+                "and the root is owned by the census",
+                [key],
+            )
+        owner: Any = root
+        for step in owner_local.split(".") if owner_local else ():
+            owner = getattr(owner, step, None)
+            if owner is None:
+                raise _refuse(
+                    "leaf_topology",
+                    f"{key}: no module at {component}.{owner_local} to hold a replaced leaf",
+                    [key],
+                )
+        replaced = getattr(owner, attribute, None)
+        held = getattr(replaced, "weight", None)
+        # STORAGE identity, not object identity: the census reads destinations out of
+        # `state_dict()`, which hands back detached views, so the tensor this method is
+        # given is never the same Python object as the module's Parameter. What has to
+        # match is the memory — that is what "this module owns this destination" means.
+        if held is None or _data_ptr(held) != _data_ptr(tensor) or _data_ptr(tensor) == 0:
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: {component}.{local[: -len('.weight')]} does not own the destination "
+                "this key names — a re-wired weight resolves to a module whose `.weight` is "
+                "different memory, and installing a leaf there would compute a different "
+                "model without saying so",
+                [key],
+            )
+        tied = [
+            other
+            for other, site in self.leaf_sites.items()
+            if other != key and site == _data_ptr(tensor)
+        ]
+        if tied:
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: this destination shares storage with {tied[0]}, and both serve "
+                "through a native leaf. A tie is ONE tensor under two names, so replacing "
+                "the first leaf frees memory the second module still points at — the alias "
+                "group has to become one shared leaf, which this build does not do and will "
+                "not fake",
+                [key, tied[0]],
+            )
+        self.leaf_sites[key] = _data_ptr(tensor)
+        declared_out = getattr(replaced, "out_features", None)
+        declared_in = getattr(replaced, "in_features", None)
+        if (declared_out, declared_in) not in ((None, None), (row.shape[0], row.shape[1])):
+            raise _refuse(
+                "leaf_topology",
+                f"{key}: {type(replaced).__name__} declares "
+                f"({declared_out}, {declared_in}) and the checkpoint supplies {row.shape}",
+                [key],
+            )
+        return owner, replaced, attribute
 
     def commit(self) -> None:
         """Move every enqueued destination, fence the copies, then freeze.
@@ -1037,7 +1289,69 @@ class StreamingFillBackend:
         # for — comparing a number that includes it would flatter neither side honestly.
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
         self.stats["decode"] = dict(self.decoded)
+        self._reconcile_leaves()
         self.enqueued.clear()
+
+    def _reconcile_leaves(self) -> None:
+        """The census law for a generation whose topology MOVED, and the ledger's settle.
+
+        `materialize` holds the placement law — the census after is the census before, key
+        for key, because placement moves bytes and never topology. Leaf replacement is not
+        placement and does move topology, so it cannot ride that law and must not relax it
+        either. What holds here instead is the SUBSTITUTION law: the component's census is
+        exactly what it was, minus every replaced destination, plus exactly the role keys
+        each leaf DECLARED. A key that vanished unannounced, a declared role that never
+        arrived, or a replaced weight still standing are all `leaf_topology` — because each
+        one means the module tree is not what the fill plane just told the ledger it is.
+
+        Then the ledger settles to the MEASURED truth rather than to arithmetic: the
+        component's real device bytes, read off its own tensors, exactly as
+        `materialize` read them before the replacement. The transient reservation that
+        covered holding both the float destinations and the payload is released here, and
+        `peak` keeps it — which is what makes the ~0.5x claim a ledger fact and not just an
+        allocator observation.
+        """
+        if not self.replaced:
+            return
+        for name, member in self.components.items():
+            rows = [r for r in self.replaced.values() if r.contract_key.startswith(f"{name}.")]
+            if not rows:
+                continue
+            before = self.census_keys.get(name, frozenset())
+            gone = {r.contract_key for r in rows}
+            arrived = {key for r in rows for key in r.role_keys}
+            present = {f"{name}.{key}" for key in member.state_dict()}
+            want = (before - gone) | arrived
+            if present != want:
+                raise _refuse(
+                    "leaf_topology",
+                    f"{name}: leaf replacement declared {len(gone)} destination(s) replaced "
+                    f"by {len(arrived)} role key(s), and the module tree does not hold that. "
+                    f"Missing {sorted(want - present)[:4]}, unexpected "
+                    f"{sorted(present - want)[:4]}. A substitution the census cannot confirm "
+                    "is a topology the ledger is pricing wrong",
+                    sorted(want ^ present)[:6],
+                )
+            self.census_keys[name] = frozenset(present)
+            self.ledger.release({"vram": self.leaf_grant.pop(name, 0)})
+            after = sum(int(t.numel() * t.element_size()) for _, t in _tensors(member))
+            charged = self.vram_charge.get(name, 0)
+            if after > charged:
+                self.ledger.grant({"vram": after - charged}, f"encoded leaves of {name!r}")
+            elif after < charged:
+                self.ledger.release({"vram": charged - after})
+            self.vram_charge[name] = after
+            self.component_bytes[name] = after
+            self.stage_log.append(
+                {
+                    "component": name,
+                    "action": "leaves",
+                    "count": len(rows),
+                    "bytes": after,
+                    "was": charged,
+                }
+            )
+            del self.stage_log[:-64]
 
     def release_lease(self) -> None:
         """Give the hold back. Idempotent: a rollback and a commit may both reach here.
@@ -1069,6 +1383,20 @@ class StreamingFillBackend:
         copy plus an H2D copy would be. The module is moved to `meta` rather than dropped,
         so its topology survives and the restage is a reservation, not a construction.
         """
+        if any(key.startswith(f"{name}.") for key in self.replaced):
+            raise _refuse(
+                "leaf_topology",
+                f"{name!r} holds replaced ENCODED LEAVES and cannot be evicted by this "
+                "build. Eviction parks the module on `meta` and `stage` RE-FILLS it against "
+                "the checkpoint's own keys — but this component's keys are no longer the "
+                "checkpoint's: `…qkv_proj.weight` is now `…qkv_proj.data` and "
+                "`…qkv_proj.scale`, so the re-fill would walk destinations the header does "
+                "not supply. Staging an encoded-leaf component needs the substitution map "
+                "to drive the re-fill as well as to check it, which is a coherent next "
+                "increment and is NOT half-built here: refusing beats a stage that enqueues "
+                "nothing and commits an allocation full of whatever was in that memory",
+                [name],
+            )
         member = self.components.pop(name, None)
         if member is None:
             return 0
@@ -1222,6 +1550,11 @@ class StreamingFillBackend:
         started = time.perf_counter_ns()
         freed = 0
         spent: list[Any] = []
+        #: Freed behind the same fence and NOT counted against the rolling scratch window:
+        #: a replaced float destination and a swizzled-away scale grid are not decode
+        #: scratch, and subtracting them from a scratch budget would let the next component
+        #: hold more live scratch than the ledger granted.
+        retired: list[Any] = []
         for row in pending:
             selection = self.selected[row.key]
             parts = self.scratch.pop(row.key, {})
@@ -1229,11 +1562,19 @@ class StreamingFillBackend:
             if missing:
                 raise _refuse(
                     "incomplete_fill",
-                    f"{row.key}: role(s) {missing} never arrived, so the decoder has no "
-                    "complete role set — a partially delivered encoded tensor is rolled "
-                    "back, never decoded from what happened to land",
+                    f"{row.key}: role(s) {missing} never arrived, so the {selection.provider.route}"
+                    " provider has no complete role set — a partially delivered encoded tensor "
+                    "is rolled back, never served from what happened to land",
                     missing[:6],
                 )
+            if selection.provider.route == "native_encoded":
+                # THE ROLES DO NOT DECODE, THEY STAY. `spent` is deliberately not extended:
+                # these buffers are the resident weight from here on, and freeing them is
+                # what the whole rung exists not to do.
+                retired.append(self._install_leaf(row, selection, parts))
+                self.decoded["leaves"] += 1
+                self.decoded["resident_bytes"] += row.stored_nbytes
+                continue
             selection.provider.decode(self.torch, parts, self.enqueued[row.key])
             spent.append(parts)
             self.decoded["tensors"] += 1
@@ -1250,10 +1591,53 @@ class StreamingFillBackend:
         self.torch.cuda.current_stream().synchronize()
         for parts in spent:
             freed += self._free_storages(parts.values())
+        for parts in retired:
+            self._free_storages(parts.values())
         pending.clear()
         self.decoded["flushes"] += 1
         self.decoded["ms"] += (time.perf_counter_ns() - started) // 1_000_000
         return freed
+
+    def _install_leaf(
+        self, row: PlanRow, selection: Selection, parts: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Replace one module with the leaf that holds its encoded weight.
+
+        Returns what is now RETIRED — the float destination whose storage the leaf made
+        redundant, plus any role buffer the leaf transformed rather than kept (the mxfp8
+        leaf swizzles its scale grid once at fill and holds the swizzled one). The caller
+        frees them behind the decode's own fence, which is exactly as load-bearing here as
+        it is on the decode path: `to_blocked` ENQUEUES kernels that read the grid, and
+        resizing its storage to zero before they run hands the next H2D that block.
+
+        The float destination is freed rather than dropped, for cr-005's finding-3 reason:
+        a dropped reference frees nothing while the exception's frames, the census's `live`
+        map, or `enqueued` still hold one — and here `enqueued` certainly does.
+        """
+        destination = self.enqueued[row.key]
+        owner, replaced, attribute = self._leaf_site(row.key, row, destination)
+        leaf = selection.provider.leaf(self.torch, parts, replaced, destination.dtype)
+        # `nn.Module.__setattr__` is the whole reason this is machinery: it accepts the leaf
+        # here precisely because the leaf is a Module, and would have refused the payload.
+        setattr(owner, attribute, leaf)
+        kept = {id(t.untyped_storage()) for t in leaf.roles().values()}
+        retired: dict[str, Any] = {
+            role: tensor
+            for role, tensor in parts.items()
+            if id(tensor.untyped_storage()) not in kept
+        }
+        retired["#destination"] = destination
+        module_path = row.key[: -len(".weight")]
+        self.replaced[row.key] = LeafReplacement(
+            contract_key=row.key,
+            module_path=module_path,
+            was=type(replaced).__name__,
+            now=type(leaf).__name__,
+            role_keys=tuple(sorted(f"{module_path}.{role}" for role in leaf.roles())),
+            stored_bytes=row.stored_nbytes,
+            freed_bytes=int(destination.numel() * destination.element_size()),
+        )
+        return retired
 
     def _drop_scratch(self) -> int:
         """Give back every scratch buffer a failed stream left behind. Positive act."""
@@ -1355,7 +1739,11 @@ class StreamingFillBackend:
                     device=self.device,
                 ).reshape(part.shape)
                 self.scratch.setdefault(row.key, {})[role] = buffer
-                held[0] += part.nbytes
+                if self.selected[row.key].provider.route == "decoded_float":
+                    # ONLY a decode route's roles are scratch. A native role's buffer is the
+                    # weight, so counting it toward the rolling flush budget would trigger
+                    # flushes for bytes that are never coming back.
+                    held[0] += part.nbytes
                 view = buffer.view(-1).view(torch.uint8)
             flat[what] = view
             return view
@@ -1434,13 +1822,26 @@ class StreamingFillBackend:
             # pressure). The rolling flush keeps live scratch under the budget, and one
             # tensor may exceed it on its own — so the envelope is the budget plus the
             # largest single tensor, which is the true high-water mark of the walk.
-            encoded = [r for r in group if self.selected[r.key].provider.route != "verbatim"]
+            routes = {r.key: self.selected[r.key].provider.route for r in group}
+            encoded = [r for r in group if routes[r.key] == "decoded_float"]
             envelope = 0
             if encoded:
                 envelope = min(
                     sum(r.stored_nbytes for r in encoded), self.decode_scratch_bytes
                 ) + max(r.stored_nbytes for r in encoded)
                 self.ledger.grant({"decode": envelope}, f"decode scratch for {component!r}")
+            # A NATIVE ROLE IS NOT SCRATCH. `decode` is the class for bytes that exist
+            # between the stream and the decode and never outlive one component's fill;
+            # these bytes ARE the resident weight, so charging them there and releasing
+            # them in the `finally` would tell the ledger the component gave back memory it
+            # is still holding. They are reserved against `vram` instead, up front and
+            # whole (§3.2: no incremental acquisition), covering the window where the float
+            # destinations and the payload are BOTH live — which is this rung's real peak
+            # and the number a plan has to fit.
+            native_bytes = sum(r.stored_nbytes for r in group if routes[r.key] == "native_encoded")
+            if native_bytes:
+                self.ledger.grant({"vram": native_bytes}, f"encoded leaves for {component!r}")
+                self.leaf_grant[component] = self.leaf_grant.get(component, 0) + native_bytes
             # The cursor is per COMPONENT because each component gets its own read plan,
             # and `dest_off` is an offset inside that plan's own logical stream.
             moved[0] += cursor[0]
@@ -1501,6 +1902,15 @@ def dtype_name(dtype: object) -> str:
     own (`torch.float16`), and a fill that guesses which is which is a silent wrong copy."""
     name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
     return TORCH_DTYPES.get(name, name)
+
+
+def _data_ptr(tensor: Any) -> int:
+    """The tensor's own storage address, or 0 when it has none. The one comparison that
+    survives `state_dict()`'s detach and still means "the same memory"."""
+    try:
+        return int(tensor.untyped_storage().data_ptr()) + int(tensor.storage_offset())
+    except Exception:
+        return 0
 
 
 def _tensors(module: Any) -> Iterator[tuple[str, Any]]:

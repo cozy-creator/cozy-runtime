@@ -1058,6 +1058,16 @@ def redarm() -> None:
     head("redarm — a Hopper-class device must not admit the native record")
     major, minor = torch.cuda.get_device_capability(0)
     measured = f"cuda.sm{major * 10 + minor}"
+    # `admit` RANKS candidates since #517e, so it takes the objective and the candidate map
+    # the role filter produced. One candidate here — this arm is about the DEVICE predicate,
+    # and one candidate is exactly where the objective decides nothing.
+    among = {
+        "sha256:native": type(
+            "_Native",
+            (),
+            {"name": "cozy.mxfp8.native-probe/0", "device_predicate": measured},
+        )()
+    }
     caps = Capabilities(
         [
             CapabilityRecord(
@@ -1074,7 +1084,14 @@ def redarm() -> None:
     for sm, name in ((89, "L40S"), (90, "H100")):
         device = DeviceFacts("cuda", name, sm, "13.0", "default")
         try:
-            caps.admit("sha256:mxfp8-native-probe", device, "bfloat16", "mxfp8/1")
+            caps.admit(
+                "sha256:mxfp8-native-probe",
+                device,
+                "bfloat16",
+                "mxfp8/1",
+                objective="footprint",
+                among=among,
+            )
         except EncodingRefusal as exc:
             check(
                 f"sm{sm} ({name}) REFUSES the {measured} native record",
@@ -1086,7 +1103,14 @@ def redarm() -> None:
     name = str(REPORT.get("facts", {}).get("device", "?"))
     device = DeviceFacts("cuda", name, major * 10 + minor, "13.0", "default")
     try:
-        caps.admit("sha256:mxfp8-native-probe", device, "bfloat16", "mxfp8/1")
+        caps.admit(
+            "sha256:mxfp8-native-probe",
+            device,
+            "bfloat16",
+            "mxfp8/1",
+            objective="footprint",
+            among=among,
+        )
     except EncodingRefusal as exc:
         check("the measured arch ADMITS its own record", False, str(exc)[:150])
     else:

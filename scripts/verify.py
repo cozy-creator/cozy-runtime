@@ -591,7 +591,9 @@ def descriptor_sections() -> None:
     head("weights are never loaded — proven by a backend that refuses to be called")
 
     class Refusing(Backend):
-        def materialize(self, obj: object, walked: Any) -> Mapping[str, Any]:
+        def materialize(
+            self, obj: object, walked: Any, *, encoded_leaves: str = "refuse"
+        ) -> Mapping[str, Any]:
             raise AssertionError("describe reached a reservation — nothing may be placed")
 
         def fill(self, key: str, spec: object, destination: object) -> None:

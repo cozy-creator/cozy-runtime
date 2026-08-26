@@ -686,6 +686,7 @@ def arms() -> None:
     import torch
 
     from cozy_runtime.internal.delivery import (
+        ROUTE_KERNEL,
         RUNGS_BY_NAME,
         DeliveryChooser,
         DeliveryRefusal,
@@ -872,12 +873,23 @@ def arms() -> None:
             exc.detail[:160],
         )
 
-    # ARM 8 — the jit_decode rung is NAMED and NOT BUILT, and says so with its blocker.
+    # ARM 8 — the two encoded rungs, and the line between them. `native_encoded` is PROVEN
+    # since the leaf-replacement lane (scripts/leaf-live.py); `jit_decode` is still unbuilt,
+    # and its blocker is no longer "the machinery does not exist" — it is that a per-step
+    # DECODE is a different thing from a per-step encoded KERNEL, and it refuses rather
+    # than aliasing itself onto either neighbour.
     jit = RUNGS_BY_NAME["jit_decode"]
+    native = RUNGS_BY_NAME["native_encoded"]
     check(
         "ARM: the per-step rung refuses as unbuilt and names WHY, not silently aliases",
-        jit.status == "unbuilt" and "LEAF REPLACEMENT" in jit.owner,
+        jit.status == "unbuilt" and "dequantize a full" in jit.owner,
         jit.owner[:200],
+    )
+    check(
+        "the NATIVE rung is proven, and it is the only rung that lowers steady-state VRAM",
+        native.status == "proven" and ROUTE_KERNEL[native.route] == "native_encoded",
+        f"{native.name}: {native.delivery}/{native.materialization or '-'} "
+        f"cost_class={native.cost_class}, kernel={ROUTE_KERNEL[native.route]}",
     )
 
 

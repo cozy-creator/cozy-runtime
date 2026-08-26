@@ -141,7 +141,7 @@ class CountingBackend:
         self.filled: list[str] = []
         self.committed = False
 
-    def materialize(self, obj: Any, walked: Any) -> Any:
+    def materialize(self, obj: Any, walked: Any, *, encoded_leaves: str = "refuse") -> Any:
         return walked.live
 
     def fill(self, key: str, spec: Any, destination: Any) -> None:
