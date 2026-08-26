@@ -28,6 +28,7 @@ import base64
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -41,7 +42,7 @@ from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import canonical, egress, seam
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
-from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
+from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
 from cozy_runtime.internal.worker.plan import (
     AttemptPlan,
@@ -190,6 +191,14 @@ class AttemptRecord:
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
+    executor: Executor | None = None
+    """The exact process incarnation this attempt was accepted against."""
+    executor_generation: int = 0
+    executor_pid: int = 0
+    placement_id: str = ""
+    """The immutable routing identity this attempt was accepted against."""
+    admission_generation: int = 0
+    """The worker admission generation echoed by the offer that created this record."""
     kind: str = "serving"
     """`serving` or `job`. It SURVIVES compaction, because what an attempt was is still a
     fact about it after its heavy state is gone — the run-once recycle disposition and the
@@ -223,6 +232,10 @@ class AttemptRecord:
     payload: dict[str, Any] = dataclasses_field(default_factory=dict)
     canceling: str = ""
     cancel_started: float = 0.0
+    transition_lock: threading.Lock = dataclasses_field(default_factory=threading.Lock)
+    """Arbitrates natural finalization against forceful executor reclaim."""
+    reclaim_done: threading.Event = dataclasses_field(default_factory=threading.Event)
+    """Set only after forceful executor reclaim has external proof."""
     executions: int = 0
     #: every ledger class as it stood BEFORE this attempt's envelope was granted. The
     #: reconciliation at close compares against this line, never against the mid-attempt
@@ -247,10 +260,30 @@ class AttemptRecord:
     subject_id: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
+
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
     #: cr-009's PublicationReceipt document, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
+
+    def begin_reclaim(self) -> bool:
+        """Win the completion race, or report that natural finalization won first."""
+        with self.transition_lock:
+            if self.state in ("finalizing", "outcome", "closed"):
+                return False
+            self.state = "reclaiming"
+            return True
+
+    def await_reclaim_before_finalizing(self) -> None:
+        """A buffered reply cannot finalize across an unproved forceful reclaim."""
+        with self.transition_lock:
+            reclaiming = self.state == "reclaiming"
+            if not reclaiming:
+                self.state = "finalizing"
+                return
+        self.reclaim_done.wait()
+        with self.transition_lock:
+            self.state = "finalizing"
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
@@ -274,6 +307,7 @@ class AttemptRecord:
         self.prepared = None
         self.declared = None
         self.prepared_model = None
+        self.executor = None
         self.job = None
         self.trees = {}
         self.inputs = {}
@@ -352,9 +386,6 @@ class AttemptEngine:
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], AttemptRecord] = {}
         self.boot_id = ""
-        #: which deployment this worker hosts, read live from the worker ("" in job mode).
-        #: Routing only (#446): it rides acceptance and the snapshot, never the digest.
-        self.placement_id: Callable[[], str] = lambda: ""
         self.recovered: list[pb.HeldAttempt] = []
         self.executed = 0
         #: the worker's fault tail. BOUNDED: the Report and the triage bundle each read the
@@ -437,7 +468,7 @@ class AttemptEngine:
                 # the bind refuses a grant whose subject or id sets disagree)
                 held.grant = self._bind(spec, offered)
                 return held  # idempotent: re-send AttemptAccepted, run once
-            if held.state in ("queued", "accepted", "running"):
+            if held.state in ("queued", "accepted", "running", "finalizing"):
                 raise AttemptRefusal(
                     "live_attempt_supersession",
                     f"attempt {offered.attempt_ordinal} arrived while attempt "
@@ -457,6 +488,11 @@ class AttemptEngine:
             digest=offered.invocation_spec_digest,
             spec=spec,
             grant=self._bind(spec, offered),
+            # The stream fence already verified this routing identity before `offer()`.
+            # Capture the offered value itself; rereading the worker's live placement during
+            # admission can observe a concurrently converging successor placement.
+            placement_id=offered.placement_id,
+            admission_generation=offered.admission_generation,
         )
 
     def _bind(self, spec: Mapping[str, Any], offered: pb.AttemptOffer) -> grants.BoundGrant:
@@ -617,7 +653,7 @@ class AttemptEngine:
                 # that names it is the supervision's one signal — invalidate HERE so the
                 # lane's rebuild pass replaces the generation instead of refusing forever
                 # (lifecycle-live §4 caught the wedge).
-                self.supervision.invalidate(str(reply.get("detail", "poisoned"))[:256])
+                self.supervision.invalidate(executor, str(reply.get("detail", "poisoned"))[:256])
             raise AttemptRefusal(
                 code,
                 str(reply.get("detail", ""))[:1024],
@@ -709,6 +745,18 @@ class AttemptEngine:
         attempt.job = binding
         attempt.kind = "job"
         attempt.state = "preparing"
+        executor = self.supervision.current
+        if executor is None or not executor.alive():
+            raise AttemptRefusal(
+                "executor_absent",
+                "no live executor: a job is accepted only against the fresh executor "
+                "created for its directive",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+            )
+        attempt.executor = executor
+        attempt.executor_generation = executor.incarnation
+        attempt.executor_pid = executor.pid
+        attempt.placement_id = ""  # job attempts are not placement-routed
         self._fetch_payload(attempt)
         try:
             attempt.trees = grants.read_trees(attempt.grant, self.authorizer)
@@ -753,23 +801,32 @@ class AttemptEngine:
 
         plan_digest = plan.digest()
         try:
-            self.journal.append(
-                "accepted",
-                {
-                    "request_id": attempt.request_id,
-                    "attempt": attempt.attempt,
-                    "worker_boot_id": self.boot_id,
-                    "instance_id": self.instance_id,
-                    "attempt_kind": "job",
-                    "invocation_spec_digest": documents.spell(attempt.digest),
-                    "plan_digest": plan_digest,
-                    "job_descriptor_id": descriptor_id,
-                    "build_id": binding.build_id,
-                    "grant_epoch": attempt.grant.credential_epoch,
-                    "executor_generation": self.supervision.incarnation,
-                    "input_trees": ",".join(sorted(attempt.trees)),
-                },
-            )
+            with self.supervision.hold(executor) as owned:
+                if not owned:
+                    raise AttemptRefusal(
+                        "executor_replaced_before_acceptance",
+                        "the job executor changed before its acceptance could be committed",
+                        cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                    )
+                self.journal.append(
+                    "accepted",
+                    {
+                        "request_id": attempt.request_id,
+                        "attempt": attempt.attempt,
+                        "worker_boot_id": self.boot_id,
+                        "instance_id": self.instance_id,
+                        "attempt_kind": "job",
+                        "invocation_spec_digest": documents.spell(attempt.digest),
+                        "plan_digest": plan_digest,
+                        "job_descriptor_id": descriptor_id,
+                        "build_id": binding.build_id,
+                        "grant_epoch": attempt.grant.credential_epoch,
+                        "executor_generation": attempt.executor_generation,
+                        "executor_pid": attempt.executor_pid,
+                        "placement_id": attempt.placement_id,
+                        "input_trees": ",".join(sorted(attempt.trees)),
+                    },
+                )
         except Exception:
             self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             raise
@@ -854,6 +911,9 @@ class AttemptEngine:
                 "recovery edge to Ready",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
+        attempt.executor = executor
+        attempt.executor_generation = executor.incarnation
+        attempt.executor_pid = executor.pid
 
         prepared = self._prepare_request(attempt, executor, declared)
         attempt.prepared = prepared
@@ -889,25 +949,33 @@ class AttemptEngine:
 
         plan_digest = plan.digest()
         try:
-            self.journal.append(
-                "accepted",
-                {
-                    "request_id": attempt.request_id,
-                    "attempt": attempt.attempt,
-                    "worker_boot_id": self.boot_id,
-                    "instance_id": self.instance_id,
-                    "invocation_spec_digest": documents.spell(attempt.digest),
-                    "plan_digest": plan_digest,
-                    "model_construction_digest": plan.model_construction_digest,
-                    "constructed_model_digest": plan.constructed_model_digest,
-                    "request_features_digest": plan.request_features_digest,
-                    "preflight_facts_digest": plan.preflight_facts_digest,
-                    "grant_epoch": attempt.grant.credential_epoch,
-                    "placement_id": self.placement_id(),
-                    "executor_generation": self.supervision.incarnation,
-                    "entrypoint_binding_plan_id": plan_id,
-                },
-            )
+            with self.supervision.hold(executor) as owned:
+                if not owned:
+                    raise AttemptRefusal(
+                        "executor_replaced_before_acceptance",
+                        "the prepared executor changed before acceptance could be committed",
+                        cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                    )
+                self.journal.append(
+                    "accepted",
+                    {
+                        "request_id": attempt.request_id,
+                        "attempt": attempt.attempt,
+                        "worker_boot_id": self.boot_id,
+                        "instance_id": self.instance_id,
+                        "invocation_spec_digest": documents.spell(attempt.digest),
+                        "plan_digest": plan_digest,
+                        "model_construction_digest": plan.model_construction_digest,
+                        "constructed_model_digest": plan.constructed_model_digest,
+                        "request_features_digest": plan.request_features_digest,
+                        "preflight_facts_digest": plan.preflight_facts_digest,
+                        "grant_epoch": attempt.grant.credential_epoch,
+                        "placement_id": attempt.placement_id,
+                        "executor_generation": attempt.executor_generation,
+                        "executor_pid": attempt.executor_pid,
+                        "entrypoint_binding_plan_id": plan_id,
+                    },
+                )
         except Exception:
             # The envelope was granted a moment ago and nothing will ever run under it:
             # an unjournaled acceptance must not leave the worker's host ledger charged.
@@ -941,24 +1009,33 @@ class AttemptEngine:
         a dead process's device context, which `nvidia-smi` confirms from outside.
         """
         key = f"{attempt.request_id}#{attempt.attempt}"
-        executor = self.supervision.current
-        if executor is not None and executor.alive() and not executor.poisoned and attempt.spool:
-            try:
-                self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
-                self.ledger.device_process = self.device_process()
-            except ExecutorGone:
+        executor = attempt.executor
+        if executor is None:
+            return self._unavailable_reconciliation(attempt, key)
+        # Keep the generation stable across the probe AND close. Checking ownership and then
+        # mutating the ledger without this hold lets convergence publish E2 between those two
+        # operations; E1's terminal would then mark E2 unreadable or reconcile against E2's
+        # freshly installed baseline.
+        with self.supervision.hold(executor) as owned:
+            if not owned:
+                return self._unavailable_reconciliation(attempt, key)
+            if not executor.poisoned and attempt.spool:
+                try:
+                    self.ledger.observe_probe(
+                        executor.call({"cmd": "probe"}, timeout=30.0, total_timeout=30.0)
+                    )
+                    self.ledger.device_process = self.device_process()
+                except ExecutorGone:
+                    self.ledger.device_unreadable("the executor died before the ledger was read")
+            else:
                 self.ledger.device_unreadable("the executor died before the ledger was read")
-        else:
-            self.ledger.device_unreadable(
-                "no live usable executor: its CUDA context died with the process"
-            )
-        record = self.ledger.close_attempt(key, attempt.opened)
-        attempt.reconciliation = record
-        try:
-            self.journal.append("ledger", record)
-        except JournalError as exc:
-            record["journaled"] = False
-            record["journal_error"] = exc.code
+            record = self.ledger.close_attempt(key, attempt.opened)
+            attempt.reconciliation = record
+            try:
+                self.journal.append("ledger", record)
+            except JournalError as exc:
+                record["journaled"] = False
+                record["journal_error"] = exc.code
         if record["leaks"]:
             self.fault(
                 pb.Fault(
@@ -978,7 +1055,53 @@ class AttemptEngine:
             # lands the chooser refuses typed rather than pricing a rung against drift —
             # which is the difference between a typed answer before acceptance and an OOM
             # halfway through somebody's VAE decode (cl-003).
-            self.supervision.invalidate(f"ledger_unreconciled: {record['leaks'][0][:160]}")
+            self.supervision.invalidate(
+                executor, f"ledger_unreconciled: {record['leaks'][0][:160]}"
+            )
+        return record
+
+    def _unavailable_reconciliation(self, attempt: AttemptRecord, key: str) -> dict[str, Any]:
+        """Record an old generation's unavailable close without touching its successor.
+
+        Host/pinned grants were already released by `outcome()`. Device facts, baselines,
+        unreadable markers and reconciliation counters are generation-scoped, so once this
+        attempt no longer owns `current` they must remain exactly as the successor reported
+        them. The attempt still gets a durable, explicit reconciliation saying why no after
+        measurement exists.
+        """
+        reason = (
+            f"executor generation {attempt.executor_generation} pid {attempt.executor_pid} "
+            "was replaced before reconciliation; successor telemetry was left untouched"
+        )
+        record = {
+            "attempt": key,
+            "executor_generation": attempt.executor_generation,
+            "executor_pid": attempt.executor_pid,
+            "classes": [
+                {
+                    "class": name,
+                    "bytes": -1,
+                    "kind": "unreadable",
+                    "method": reason,
+                    "before": before,
+                    "after": -1,
+                    "reconciled": False,
+                    "verdict": "executor_generation_replaced",
+                }
+                for name, before in attempt.opened.items()
+            ],
+            "leaks": [],
+            "baseline_shifts": [],
+            "declared_residency_delta": int(attempt.residency.get("allocator_delta_bytes", 0)),
+            "unreadable": [reason],
+            "closed": False,
+        }
+        attempt.reconciliation = record
+        try:
+            self.journal.append("ledger", record)
+        except JournalError as exc:
+            record["journaled"] = False
+            record["journal_error"] = exc.code
         return record
 
     # ------------------------------------------------------------------ the job lane
@@ -1121,9 +1244,9 @@ class AttemptEngine:
         durable mid-attempt exchange, and that is one argument to one call.
         """
         job = attempt.job is not None
-        executor = self.supervision.current
-        if executor is None:
-            return self.abandon(attempt, "the executor vanished before dispatch")
+        executor = attempt.executor
+        if executor is None or not self.supervision.owns(executor):
+            return self.abandon(attempt, "its accepted executor vanished before dispatch")
         # The spool already exists — cr-012's hydration made it before acceptance. This
         # stays for the recovered-attempt path, whose acceptance was another process's.
         spool = attempt.spool or self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
@@ -1156,7 +1279,7 @@ class AttemptEngine:
             "dispatched to the executor",
             "info",
             subject=self._subject(attempt),
-            incarnation=self.supervision.incarnation,
+            incarnation=attempt.executor_generation,
             deadline_s=round(seconds, 3) if seconds is not None else None,
         )
         try:
@@ -1172,23 +1295,27 @@ class AttemptEngine:
                 "fault",
                 "the executor died during this attempt",
                 str(exc)[:400],
-                incarnation=self.supervision.incarnation,
+                incarnation=attempt.executor_generation,
                 canceling=attempt.canceling or "no",
             )
             self.monitor.end(key, "executor_died")
             # WHICHEVER THREAD SEES THE DEATH MARKS IT: `waitpid` answers 0 for a few ms
             # on a dying process, so invalidating at the OBSERVATION removes the race with
             # the watchdog's kill instead of narrowing it (cr-007).
-            self.supervision.invalidate("the executor died during an attempt")
+            self.supervision.invalidate(executor, "the executor died during an attempt")
+            # A cancel that ESCALATED killed this executor on purpose: the attempt's
+            # terminal is CANCELED only after the watchdog proves reclaim AND aborts the
+            # spool. Any other death is an invalidation the attempt did not ask for.
+            if attempt.canceling:
+                # The cgroup can be empty before the driver proves every captured birth
+                # absent. Only the watchdog owns that proof/retry; EOF is not permission to
+                # journal CANCELED ahead of it.
+                attempt.reclaim_done.wait()
+                return self.finish_cancel(attempt, attempt.canceling)
             # A job's scratch tree deliberately SURVIVES — it is the run's, not the
             # attempt's — but the attempt SPOOL is aborted on both lanes, so nothing
             # half-written can reach a granted destination.
             grants.abort_outputs(spool)
-            # A cancel that ESCALATED killed this executor on purpose: the attempt's
-            # terminal is CANCELED, and the executor is already provably dead. Any other
-            # death is an invalidation the attempt did not ask for.
-            if attempt.canceling:
-                return self.finish_cancel(attempt, attempt.canceling)
             return self.abandon(attempt, str(exc))
         return self._finish(attempt, reply, spool, key)
 
@@ -1249,9 +1376,12 @@ class AttemptEngine:
         self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
     ) -> pb.AttemptOutcome:
         """Everything after the executor answers. Identical for both lanes, and now once."""
+        # A buffered reply and the watchdog's forceful escalation can arrive together.
+        # Exactly one transition wins: finalization either closes the signal window first,
+        # or waits until cgroup, process and driver reclaim have all been proved.
+        attempt.await_reclaim_before_finalizing()
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
-        self.absorb(attempt, reply)
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -1259,12 +1389,32 @@ class AttemptEngine:
         # THIS attempt's transitions, not the generation's history. Reading the cumulative
         # counters made every attempt after the first staged one claim its activation basis
         # had moved, on attempts that never touched a component.
-        moved = bool(
-            attempt.residency.get("attempt_stages") or attempt.residency.get("attempt_evictions")
-        )
         cell = attempt.plan.shape_cell if attempt.plan else ""
-        self.ledger.observe_attempt(reply.get("metrics", {}), resident_moved=moved, cell=cell)
-        self.bank_demand(attempt, reply.get("metrics", {}), moved)
+        executor = attempt.executor
+        if executor is None:
+            self.absorb(attempt, reply, apply_ledger=False)
+        else:
+            # A reply can race desired-state replacement during finalization. Preserve its
+            # attempt-local observations either way, but apply residency, activation and
+            # demand facts only while this is still the exact generation they describe.
+            with self.supervision.hold(executor) as owned:
+                self.absorb(attempt, reply, apply_ledger=owned)
+                if owned:
+                    moved = bool(
+                        attempt.residency.get("attempt_stages")
+                        or attempt.residency.get("attempt_evictions")
+                    )
+                    self.ledger.observe_attempt(
+                        reply.get("metrics", {}), resident_moved=moved, cell=cell
+                    )
+                    self.bank_demand(attempt, reply.get("metrics", {}), moved)
+                else:
+                    attempt.confess(
+                        "unavailable",
+                        f"executor generation {attempt.executor_generation} was replaced "
+                        "before its terminal telemetry could be applied; successor telemetry "
+                        "was left untouched",
+                    )
 
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
@@ -1281,7 +1431,8 @@ class AttemptEngine:
         if not reply.get("quiescent"):
             # No terminal is journaled while author computation might still mutate GPU or
             # output state. Unproven quiescence is an executor fault, not a success.
-            self.supervision.invalidate("unproven quiescence")
+            if attempt.executor is not None:
+                self.supervision.invalidate(attempt.executor, "unproven quiescence")
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
@@ -1292,7 +1443,8 @@ class AttemptEngine:
                 "that may still be moving",
             )
         if not reply.get("env_intact", True):
-            self.supervision.invalidate("env seal broken")
+            if attempt.executor is not None:
+                self.supervision.invalidate(attempt.executor, "env seal broken")
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
@@ -1313,8 +1465,8 @@ class AttemptEngine:
                     "wire counters are the worker's and this claim is dropped",
                 )
             )
-        if reply.get("poisoned"):
-            self.supervision.invalidate(str(reply["poisoned"]))
+        if reply.get("poisoned") and attempt.executor is not None:
+            self.supervision.invalidate(attempt.executor, str(reply["poisoned"]))
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
@@ -1430,7 +1582,13 @@ class AttemptEngine:
             int(frame.get("at_unix_ms", 0)),
         )
 
-    def absorb(self, attempt: AttemptRecord, reply: Mapping[str, Any]) -> None:
+    def absorb(
+        self,
+        attempt: AttemptRecord,
+        reply: Mapping[str, Any],
+        *,
+        apply_ledger: bool = True,
+    ) -> None:
         """Take the executor's BOUNDED observation tail into the worker's own ring.
 
         The executor's ring already applied every cap and every credential check at the emit
@@ -1456,7 +1614,8 @@ class AttemptEngine:
             # THE DECLARED TRANSITION, into the ledger BEFORE it reconciles. Under a staged
             # rung the attempt moved gigabytes on purpose; the reconciliation subtracts
             # exactly this and holds the remainder to zero.
-            self.ledger.observe_residency(attempt.residency)
+            if apply_ledger:
+                self.ledger.observe_residency(attempt.residency)
             if residency.get("attempt_stages"):
                 attempt.confess(
                     "degraded",
@@ -1733,6 +1892,7 @@ class AttemptEngine:
                 "worker_boot_id": self.boot_id,
                 "instance_id": self.instance_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),
+                "placement_id": attempt.placement_id,
                 "outcome_id": attempt.outcome_id,
                 "outcome_digest": documents.spell(digest),
                 "outcome_canonical_b64": base64.b64encode(canonical_bytes).decode(),
@@ -1767,7 +1927,7 @@ class AttemptEngine:
                 "attempt": attempt.attempt,
                 "worker_boot_id": self.boot_id,
                 "instance_id": self.instance_id,
-                "executor_generation": self.supervision.incarnation,
+                "executor_generation": attempt.executor_generation,
                 "invocation_spec_digest": documents.spell(attempt.digest),
                 "entrypoint": attempt.declared.entrypoint if attempt.declared else "",
                 "executions": attempt.executions,
@@ -1875,13 +2035,13 @@ class AttemptEngine:
             ),
             # ROUTING plus the generation fence the attempt runs under, fixed at
             # acceptance (#446/#454): the attempt never survives its executor generation.
-            placement_id=self.placement_id(),
-            executor_generation=self.supervision.incarnation,
+            placement_id=attempt.placement_id,
+            executor_generation=attempt.executor_generation,
         )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
-        """Wrap the SAME journaled body in the CURRENT session envelope. The body is a byte
-        fact; only the envelope moves across a reconnect.
+        """Wrap the SAME journaled body in the current session envelope. The body and accepted
+        placement are byte facts; only ownership-envelope fields move across a reconnect.
 
         A CLOSED attempt no longer holds those bytes in memory — the journal does, and this
         is the one place that ever needs them again.
@@ -1895,7 +2055,7 @@ class AttemptEngine:
             outcome_id=attempt.outcome_id,
             outcome_digest=attempt.outcome_digest,
             outcome_canonical_bytes=attempt.outcome_bytes,
-            placement_id=self.placement_id(),
+            placement_id=attempt.placement_id,
         )
 
     def _inline_result(
@@ -2004,45 +2164,59 @@ class AttemptEngine:
             return "dropped: no such held attempt"
         if held.digest != message.invocation_spec_digest:
             return "dropped: cancel digest does not match the journaled acceptance"
-        if held.state == "outcome":
-            return "ignored: the attempt already reached a natural terminal"
-        held.canceling = {
-            pb.CancelReason.CANCEL_REASON_CLIENT: "client",
-            pb.CancelReason.CANCEL_REASON_DRAIN: "drain",
-            pb.CancelReason.CANCEL_REASON_SUPERSEDED: "superseded",
-            pb.CancelReason.CANCEL_REASON_POLICY: "policy",
-            pb.CancelReason.CANCEL_REASON_DEADLINE: "deadline",
-        }.get(message.reason, "client")
-        if held.state != "running":
-            # NOTHING OF THIS ATTEMPT IS ON THE DEVICE. The signal is process-wide, so
-            # sending it here would cancel whichever attempt IS running — a different
-            # request's. The mark is enough: the device lane reads it when it reaches this
-            # attempt, and terminates it without dispatching.
-            return f"marked before dispatch ({held.canceling}); nothing signalled"
-        executor = self.supervision.current
-        if executor is None:
+        with held.transition_lock:
+            if held.state in ("finalizing", "outcome", "closed"):
+                return "ignored: the attempt already reached natural finalization"
+            held.canceling = {
+                pb.CancelReason.CANCEL_REASON_CLIENT: "client",
+                pb.CancelReason.CANCEL_REASON_DRAIN: "drain",
+                pb.CancelReason.CANCEL_REASON_SUPERSEDED: "superseded",
+                pb.CancelReason.CANCEL_REASON_POLICY: "policy",
+                pb.CancelReason.CANCEL_REASON_DEADLINE: "deadline",
+            }.get(message.reason, "client")
+            if held.state == "reclaiming":
+                return "forceful executor reclaim is already in progress"
+            if held.state != "running":
+                # NOTHING OF THIS ATTEMPT IS ON THE DEVICE. The signal is process-wide, so
+                # sending it here would cancel whichever attempt IS running — a different
+                # request's. The mark is enough: the device lane reads it when it reaches
+                # this attempt, and terminates it without dispatching.
+                return f"marked before dispatch ({held.canceling}); nothing signalled"
+            executor = held.executor
+        if executor is None or not self.supervision.owns(executor):
             return "executor already gone"
-        executor.cooperative_cancel()
+        self.supervision.cooperative_cancel(executor)
         return f"cooperative cancel signalled ({held.canceling})"
 
     def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output
         abort -> epoch invalidation -> journal CANCELED. Rebuilding readiness happens
         AFTER, off the cancellation critical path."""
-        executor = self.supervision.current
+        executor = attempt.executor
         started = time.perf_counter()
-        killed = executor.kill_group() if executor is not None else 0
-        status = executor.reap() if executor is not None else None
+        evidence = None
+        if not attempt.begin_reclaim():
+            return {
+                "grace_s": grace,
+                "skipped": "natural finalization already owns completion",
+                "executor_generation": attempt.executor_generation,
+            }
+        if executor is not None:
+            # Reclaim failure is not a cancellation result.  Let the watchdog keep the
+            # worker non-dispatchable and retry; swallowing this error would disable the
+            # only actor still able to finish the owned process.
+            evidence = self.supervision.retire_current(executor, "forceful cancel")
         gone_at = time.perf_counter()
         aborted = grants.abort_outputs(attempt.spool) if attempt.spool else 0
-        self.supervision.invalidate("forceful cancel")
+        attempt.reclaim_done.set()
         return {
             "grace_s": grace,
-            "killed": killed,
-            "exit_status": status,
+            "killed": int(evidence is not None),
+            "exit_status": evidence.exit_status if evidence is not None else None,
             "kill_to_gone_ms": round((gone_at - started) * 1000, 2),
             "aborted_outputs": aborted,
-            "executor_generation": self.supervision.incarnation,
+            "executor_generation": attempt.executor_generation,
+            "device_reclaim": evidence.device.state if evidence is not None else "stale",
         }
 
     def finish_cancel(self, attempt: AttemptRecord, reason: str) -> pb.AttemptOutcome:
@@ -2112,6 +2286,7 @@ class AttemptEngine:
                     "worker_boot_id": self.boot_id,
                     "instance_id": self.instance_id,
                     "invocation_spec_digest": documents.spell(attempt.digest),
+                    "placement_id": attempt.placement_id,
                     "outcome_id": attempt.outcome_id,
                     "outcome_digest": documents.spell(digest),
                     "outcome_canonical_b64": base64.b64encode(canonical_bytes).decode(),
@@ -2142,7 +2317,8 @@ class AttemptEngine:
         """An accepted-but-incomplete attempt ALWAYS produces a terminal, never silence."""
         if attempt.spool is not None:
             grants.abort_outputs(attempt.spool)
-        self.supervision.invalidate("executor invalidated")
+        if attempt.executor is not None:
+            self.supervision.invalidate(attempt.executor, "executor invalidated")
         return self.outcome(
             attempt,
             STATUS.OUTCOME_STATUS_ABANDONED,
@@ -2230,6 +2406,9 @@ class AttemptEngine:
                 spec={},
                 state="outcome",
                 kind=str(row.get("attempt_kind", "serving")),
+                executor_generation=int(row.get("executor_generation", 0)),
+                executor_pid=int(row.get("executor_pid", 0)),
+                placement_id=str(row.get("placement_id", "")),
             )
             if foreign != self.instance_id:
                 self.outcome(
@@ -2273,11 +2452,11 @@ class AttemptEngine:
         """One placement-aware `HeldAttempt` (#481: the set holds unacked OUTCOMES too, and
         those are not active — which is what the old `ActiveAttempt` name got wrong).
 
-        A recovered attempt names the placement and executor generation its acceptance
-        journaled; a live one names the current. `ATTEMPT_STATE_HELD_UNDURABLE` is the rev-2
-        state for #494b's hold (#507d/#510d): the frozen wire could only spell it as RUNNING
-        plus a LOCAL_SAFETY fault compound — honest, but compound, and a RecordOwner reading
-        RUNNING could not tell a live execution from an outcome nobody could write down.
+        Recovered and live attempts both name the immutable placement and executor generation
+        captured by acceptance. `ATTEMPT_STATE_HELD_UNDURABLE` is the rev-2 state for #494b's
+        hold (#507d/#510d): the frozen wire could only spell it as RUNNING plus a LOCAL_SAFETY
+        fault compound — honest, but compound, and a RecordOwner reading RUNNING could not tell
+        a live execution from an outcome nobody could write down.
         """
         row = journal_row or {}
         pending = attempt.state in ("outcome", "closed")
@@ -2291,9 +2470,9 @@ class AttemptEngine:
             if attempt.state == "local_fault"
             else pb.AttemptState.ATTEMPT_STATE_RUNNING,
             invocation_spec_digest=attempt.digest,
-            placement_id=str(row.get("placement_id", "")) or self.placement_id(),
+            placement_id=str(row.get("placement_id", "")) or attempt.placement_id,
             executor_generation=int(row.get("executor_generation", 0))
-            or self.supervision.incarnation,
+            or attempt.executor_generation,
         )
         if pending:
             # Set IFF the state is OUTCOME_PENDING_ACK, so the RecordOwner can reconcile the
@@ -2310,7 +2489,7 @@ class AttemptEngine:
     #: sent, so the attempt is still the worker's — the wire has no state for "held, outcome
     #: undurable", and RUNNING plus the LOCAL_SAFETY_REFUSAL fault naming it is the honest
     #: pair. Dropping it would make the snapshot silent about work the worker is holding.
-    HELD = ("accepted", "running", "outcome", "local_fault")
+    HELD = ("accepted", "running", "reclaiming", "finalizing", "outcome", "local_fault")
 
     def snapshot_entries(self) -> list[pb.HeldAttempt]:
         """The recovery snapshot (02 §6): every attempt this worker still HOLDS — accepted,

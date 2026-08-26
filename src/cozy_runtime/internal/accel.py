@@ -19,6 +19,8 @@ hand in their `torch` module; this module imports none.
 
 from __future__ import annotations
 
+import subprocess
+from dataclasses import dataclass
 from typing import Any, Literal
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
@@ -27,6 +29,7 @@ from typing import Any, Literal
 MPS_CHILD_ENV_LAW = ("PYTORCH_ENABLE_MPS_FALLBACK", "0")
 
 BACKENDS = ("cuda", "mps")
+PROCESS_QUERY_SECONDS = 2.0
 
 
 class AcceleratorUnsupported(Exception):
@@ -40,6 +43,55 @@ class AcceleratorUnsupported(Exception):
         )
         self.backend = backend
         self.operation = operation
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessMemory:
+    """The driver's observation of one process, with absence distinct from unreadable."""
+
+    state: Literal["absent", "present", "unreadable"]
+    bytes: int = -1
+
+
+def process_memory(pid: int, kind: str) -> ProcessMemory:
+    """Read per-process device memory from outside the executor.
+
+    A successful query with no row is measured absence. A failed query is unreadable and
+    never masquerades as zero. MPS has no per-process driver query yet.
+    """
+    return process_memories({pid}, kind)[pid]
+
+
+def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
+    """One coherent driver-table read for all requested process IDs."""
+    if not pids:
+        return {}
+    if kind == "mps":
+        return {pid: ProcessMemory("unreadable") for pid in pids}
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_QUERY_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {pid: ProcessMemory("unreadable") for pid in pids}
+    result = {pid: ProcessMemory("absent", 0) for pid in pids}
+    for line in out.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in pids:
+            pid = int(parts[0])
+            try:
+                result[pid] = ProcessMemory("present", int(parts[1]) * 1024 * 1024)
+            except ValueError:
+                result[pid] = ProcessMemory("unreadable")
+    return result
 
 
 def synchronize(torch: Any, kind: str) -> None:

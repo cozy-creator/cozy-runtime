@@ -357,6 +357,40 @@ class Ledger:
 
     # ------------------------------------------------------------------ observation
 
+    def begin_generation(self, executor_pid: int) -> None:
+        """Discard every fact owned by the previous executor generation.
+
+        Host grants and reconciliation history belong to the worker, so they survive an
+        executor replacement. Everything below is either reported by one executor or
+        derived from its resident set and must start unknown or empty. ``executor_pid == 0``
+        represents the interval after retirement and before a successor is published.
+        """
+        self.registered = 0
+        self.pinned_in_flight = 0
+        self.weights_bytes = 0
+        self.weights_destinations = 0
+        self.device_baseline = -1
+        self.device_allocated = -1
+        self.device_reserved = -1
+        self.device_process = -1
+        self.device_free = -1
+        self.device_total = -1
+        self.activations_peak = 0
+        self.accelerator = ""
+        self.activations_by_cell.clear()
+        self.activations_moved = False
+        self.closed_since_baseline = 0
+        self.executor_pid = executor_pid
+        self.unreadable.clear()
+        self.resident.clear()
+        self.evicted.clear()
+        self.parked = ()
+        self.declared_scopes.clear()
+        self.baseline_notes.clear()
+        self.baseline_paid = False
+        self.residency_delta = 0
+        self.unreconciled = ""
+
     def observe_construction(self, facts: dict[str, Any]) -> None:
         """The generation's resident baseline, from the fill that just committed."""
         self.weights_bytes = int(facts.get("filled_bytes", 0))
@@ -371,24 +405,15 @@ class Ledger:
             str(method): tuple(str(name) for name in names)
             for method, names in (facts.get("declared_scopes") or {}).items()
         }
-        self.evicted = {}
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))
         rows = facts.get("ledger", {})
         self.registered = int(rows.get("pinned", {}).get("peak", 0))
         self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
-        self.closed_since_baseline = 0
-        self.activations_by_cell = {}
-        self.baseline_paid = False
-        self.residency_delta = 0
-        self.activations_moved = False
         # A generation is the ONLY thing that re-establishes this ledger. §3.2's rule is that
         # reservations are executor-generation-scoped and the ledger restarts WITH the new
-        # generation, never reconstructed from device state — so a fresh construction is the
-        # one event allowed to clear an unreconciled ledger, and it does it by replacing
-        # every number rather than by forgiving the old ones.
-        self.unreconciled = ""
-        self.unreadable = [c for c in self.unreadable if not c.startswith("device")]
+        # generation, never reconstructed from device state. A successful construction
+        # replaces the new generation's unknown facts; it never repairs the old numbers.
 
     def observe_attempt(
         self, metrics: dict[str, Any], resident_moved: bool = False, cell: str = ""

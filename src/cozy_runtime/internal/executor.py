@@ -137,6 +137,7 @@ class Executor:
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
         self.ready = False
+        self._prepare_consumed = False
         self.poisoned = ""
         self.logical_model_digest = ""
         self.constructed_model_digest = ""
@@ -151,7 +152,33 @@ class Executor:
     # ------------------------------------------------------------------ prepare
 
     def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Construct + fill one binding. THE cold path; serving never accepts before it."""
+        """Consume this incarnation's one construction attempt.
+
+        The latch moves before the first operation deliberately. A preparation that raises
+        after reserving or allocating state is just as terminal for this incarnation as a
+        successful fill: no later command may enter the construction body and stack another
+        generation on whatever the failed attempt retained.
+        """
+        if self._prepare_consumed:
+            return {
+                "ok": False,
+                "code": "generation_already_prepared",
+                "detail": "this executor already consumed its one preparation attempt; "
+                "the worker must reuse a successful generation or replace the process "
+                "before preparing again",
+            }
+        self._prepare_consumed = True
+        try:
+            reply = self._prepare_first(command)
+        except Exception as exc:
+            self.poisoned = self.poisoned or f"prepare raised: {type(exc).__name__}"
+            raise
+        if not reply.get("ok"):
+            self.poisoned = self.poisoned or f"prepare refused: {reply.get('code', 'unknown')}"
+        return reply
+
+    def _prepare_first(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Construct and fill the incarnation's one binding."""
         if self.poisoned:
             return {
                 "ok": False,
@@ -1440,6 +1467,7 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": True,
                     "pid": os.getpid(),
                     "ppid": os.getppid(),
+                    "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
                     "uid": os.getuid(),

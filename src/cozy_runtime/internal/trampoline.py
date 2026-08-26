@@ -15,14 +15,16 @@ Order matters and is the point:
 2. **pdeathsig** — SIGKILL on parent death, then the parent check RUNS AGAIN: between (1)
    and (2) the parent could have died, and pdeathsig only fires on future deaths. The
    re-check is what closes that race.
-3. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
-4. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
+3. **cgroup** — join the worker-created executor scope. Every later process-group/session
+   change remains inside this kernel-owned subtree.
+4. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
+5. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable
    process, and nothing in the worker needs privilege to arrange it.
-5. **uid/gid** — dropped only when this process is privileged enough to drop them; on an
+6. **uid/gid** — dropped only when this process is privileged enough to drop them; on an
    unprivileged box there is nothing to drop and the step is a recorded no-op, never a
    pretended success.
-6. **signals** — default dispositions and an empty mask, so an inherited mask cannot make a
+7. **signals** — default dispositions and an empty mask, so an inherited mask cannot make a
    child unkillable by the cancellation path.
 
 Exit codes are the runtime's shared matrix so a trampoline refusal is distinguishable from
@@ -46,10 +48,12 @@ def _fail(message: str, code: Exit) -> None:
 
 
 def main(argv: list[str]) -> None:
-    """`trampoline --expect-parent PID [--oom-adj N] [--uid U] [--gid G] -- ARGV...`"""
+    """Seal one child and join its pre-created cgroup before executor import."""
     expect_parent = 0
     oom_adj = 0
     uid = gid = -1
+    cgroup_path = ""
+    cgroup_inode = 0
     rest: list[str] = []
     index = 0
     while index < len(argv):
@@ -66,11 +70,17 @@ def main(argv: list[str]) -> None:
             uid = int(value)
         elif flag == "--gid":
             gid = int(value)
+        elif flag == "--cgroup":
+            cgroup_path = value
+        elif flag == "--cgroup-inode":
+            cgroup_inode = int(value)
         else:
             _fail(f"unknown flag {flag!r}", Exit.usage)
         index += 2
     if not rest:
         _fail("no program to exec", Exit.usage)
+    if not cgroup_path or cgroup_inode <= 0:
+        _fail("an exact executor cgroup scope is required", Exit.structural)
 
     if expect_parent and os.getppid() != expect_parent:
         _fail(
@@ -87,6 +97,10 @@ def main(argv: list[str]) -> None:
     if expect_parent and os.getppid() != expect_parent:
         # The parent died in the window above; pdeathsig only covers FUTURE deaths.
         _fail("parent died before pdeathsig was armed", Exit.structural)
+    try:
+        proctree.join_executor_cgroup(proctree.CgroupScope(cgroup_path, cgroup_inode))
+    except (proctree.CgroupUnavailable, proctree.ProcessTreeUnsupported) as exc:
+        _fail(str(exc), Exit.structural)
     try:
         proctree.seal_no_new_privs()
     except OSError as exc:
@@ -109,9 +123,8 @@ def main(argv: list[str]) -> None:
                 Exit.structural,
             )
 
-    # Its own process group, so the worker's forceful path kills the executor AND every
-    # grandchild it spawned (dataloader workers, compile subprocesses) with one `killpg`
-    # instead of leaving orphans behind a dead parent. pdeathsig survives this.
+    # Keep executor-directed signals out of the worker's group. Subtree containment is the
+    # cgroup joined above; process groups alone cannot contain setsid().
     proctree.own_process_group()
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGXFSZ, signal.SIGPIPE):
         signal.signal(number, signal.SIG_DFL)

@@ -16,15 +16,22 @@ primitive. `spawn.py`'s `posix_spawn` call is POSIX-portable and is not wrapped.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import errno
+import hashlib
 import os
+import secrets
 import signal
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 PLATFORM = sys.platform
 
 _PR_SET_PDEATHSIG = 1
+_PR_SET_CHILD_SUBREAPER = 36
 _PR_SET_NO_NEW_PRIVS = 38
 
 
@@ -39,6 +46,39 @@ class ProcessTreeUnsupported(Exception):
         )
         self.operation = operation
         self.lane = lane
+
+
+class CgroupUnavailable(Exception):
+    """Linux cannot provide the executor subtree boundary it promised."""
+
+
+@dataclass(frozen=True, slots=True)
+class CgroupScope:
+    """One exact cgroup-v2 directory, protected against path reuse by its inode.
+
+    This is lifecycle containment for ordinary endpoint process trees: sessions, process
+    groups, double-forks, and nested cgroups stay below it and ``cgroup.kill`` reaches them.
+    It is not a hostile-code sandbox. Same-UID code that can write a delegated ancestor's
+    ``cgroup.procs`` may deliberately migrate out; privilege isolation owns that threat.
+    """
+
+    relative_path: str
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessIdentity:
+    """One Linux process birth, not merely a reusable PID."""
+
+    pid: int
+    started_ticks: int
+
+
+@dataclass(slots=True)
+class WorkerRootLease:
+    """One process-held lease over a worker root."""
+
+    descriptor: int
 
 
 def _linux_only(operation: str) -> None:
@@ -88,20 +128,432 @@ def raise_own_oom_score(adj: int) -> None:
 
 
 def own_process_group() -> None:
-    """A fresh process group, so one forced kill takes the executor AND every grandchild."""
+    """Give executor-directed signals a group boundary separate from the worker."""
     _posix_only("own_process_group")
     os.setpgid(0, 0)
+
+
+def arm_subreaper() -> None:
+    """Make executor descendants orphan to this worker instead of init.
+
+    The executor may create helper processes. Once its cgroup subtree has been killed, those
+    helpers must be waitable here so the worker can prove their PIDs absent before it
+    publishes a successor.
+    """
+    _linux_only("arm_subreaper")
+    _prctl(_PR_SET_CHILD_SUBREAPER, 1)
+
+
+def _cgroup_root() -> Path:
+    root = Path("/sys/fs/cgroup")
+    if not (root / "cgroup.controllers").is_file():
+        raise CgroupUnavailable("a writable unified cgroup-v2 hierarchy is required")
+    return root
+
+
+def _own_cgroup_relative() -> str:
+    try:
+        entries = Path("/proc/self/cgroup").read_text().splitlines()
+        relative = next(line.split("::", 1)[1] for line in entries if line.startswith("0::"))
+    except (OSError, StopIteration, IndexError) as exc:
+        raise CgroupUnavailable("cannot resolve this worker's cgroup-v2 delegation") from exc
+    return "/" + relative.strip("/") if relative.strip("/") else "/"
+
+
+def _scope_path(scope: CgroupScope) -> Path:
+    if not scope.relative_path.startswith("/") or ".." in Path(scope.relative_path).parts:
+        raise CgroupUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
+    path = _cgroup_root() / scope.relative_path.lstrip("/")
+    try:
+        inode = path.stat().st_ino
+    except FileNotFoundError as exc:
+        raise CgroupUnavailable(f"executor cgroup {scope.relative_path} is absent") from exc
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot inspect executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+    if inode != scope.inode:
+        raise CgroupUnavailable(
+            f"executor cgroup {scope.relative_path} was replaced: "
+            f"expected inode {scope.inode}, found {inode}"
+        )
+    return path
+
+
+def executor_cgroup_namespace(worker_root: Path) -> str:
+    """Stable, opaque cgroup namespace for one worker root."""
+    return hashlib.sha256(os.fsencode(str(worker_root.resolve()))).hexdigest()[:16]
+
+
+def validate_executor_cgroup(scope: CgroupScope, namespace: str) -> None:
+    """Refuse a durable record that could name another worker root's scope."""
+    name = Path(scope.relative_path).name
+    if not namespace or not name.startswith(f"cozy-executor-{namespace}-"):
+        raise CgroupUnavailable(
+            f"executor cgroup {scope.relative_path!r} is outside namespace {namespace!r}"
+        )
+
+
+def create_executor_cgroup(namespace: str) -> CgroupScope:
+    """Create and validate a fresh child scope before an executor can allocate."""
+    _linux_only("create_executor_cgroup")
+    root = _cgroup_root()
+    parent = root / _own_cgroup_relative().lstrip("/")
+    if not namespace or any(char not in "0123456789abcdef" for char in namespace):
+        raise CgroupUnavailable(f"invalid executor cgroup namespace {namespace!r}")
+    path = parent / f"cozy-executor-{namespace}-{secrets.token_hex(8)}"
+    try:
+        path.mkdir(mode=0o700)
+        required = ("cgroup.procs", "cgroup.events", "cgroup.freeze", "cgroup.kill")
+        missing = [name for name in required if not (path / name).exists()]
+        if missing:
+            raise CgroupUnavailable(f"executor cgroup {path} lacks required kernel files {missing}")
+        # Opening the two control files catches a non-delegated hierarchy now, before the
+        # trampoline or any executor import exists.
+        for name in ("cgroup.procs", "cgroup.freeze", "cgroup.kill"):
+            descriptor = os.open(path / name, os.O_WRONLY)
+            os.close(descriptor)
+        relative = "/" + str(path.relative_to(root))
+        return CgroupScope(relative_path=relative, inode=path.stat().st_ino)
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            path.rmdir()
+        if isinstance(exc, (CgroupUnavailable, ProcessTreeUnsupported)):
+            raise
+        raise CgroupUnavailable(
+            f"cannot create delegated executor cgroup below {parent}: {exc}"
+        ) from exc
+
+
+def join_executor_cgroup(scope: CgroupScope) -> None:
+    """Move this trampoline into its exact scope before importing the executor."""
+    _linux_only("join_executor_cgroup")
+    path = _scope_path(scope)
+    try:
+        (path / "cgroup.procs").write_text("0\n")
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot join executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+    if _own_cgroup_relative() != scope.relative_path or _scope_path(scope) != path:
+        raise CgroupUnavailable(
+            f"joining executor cgroup {scope.relative_path} did not take effect"
+        )
+
+
+def _cgroup_event(path: Path, name: str) -> int:
+    try:
+        events = dict(line.split() for line in (path / "cgroup.events").read_text().splitlines())
+        return int(events[name])
+    except (OSError, KeyError, ValueError) as exc:
+        raise CgroupUnavailable(f"cannot read {name!r} from {path / 'cgroup.events'}") from exc
+
+
+def _cgroup_processes(path: Path) -> set[ProcessIdentity]:
+    found: set[ProcessIdentity] = set()
+    try:
+        directories = [path, *(item for item in path.rglob("*") if item.is_dir())]
+        for directory in directories:
+            for text in (directory / "cgroup.procs").read_text().splitlines():
+                with contextlib.suppress(ProcessLookupError, ValueError):
+                    found.add(process_identity(int(text)))
+    except OSError as exc:
+        raise CgroupUnavailable(f"cannot enumerate executor cgroup {path}: {exc}") from exc
+    return found
+
+
+def cgroup_contains(scope: CgroupScope, process: ProcessIdentity) -> bool:
+    """Whether one exact process birth is currently inside this exact cgroup subtree."""
+    return process in _cgroup_processes(_scope_path(scope))
+
+
+def executor_cgroup_exists(scope: CgroupScope) -> bool:
+    """Whether the exact scope still exists; path reuse remains a typed failure."""
+    if not scope.relative_path.startswith("/") or ".." in Path(scope.relative_path).parts:
+        raise CgroupUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
+    path = _cgroup_root() / scope.relative_path.lstrip("/")
+    try:
+        inode = path.stat().st_ino
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot inspect executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+    if inode != scope.inode:
+        raise CgroupUnavailable(
+            f"executor cgroup {scope.relative_path} was replaced: "
+            f"expected inode {scope.inode}, found {inode}"
+        )
+    return True
+
+
+def freeze_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) -> set[ProcessIdentity]:
+    """Freeze and census an executor subtree before its durable kill boundary."""
+    path = _scope_path(scope)
+    deadline = time.monotonic() + seconds
+    try:
+        (path / "cgroup.freeze").write_text("1\n")
+        while _cgroup_event(path, "populated") and not _cgroup_event(path, "frozen"):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"could not freeze executor cgroup {scope.relative_path}")
+            time.sleep(0.01)
+        return _cgroup_processes(path)
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot freeze executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+
+
+def kill_frozen_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) -> None:
+    """Kill a frozen subtree whose exact process census is already durable."""
+    path = _scope_path(scope)
+    deadline = time.monotonic() + seconds
+    try:
+        (path / "cgroup.kill").write_text("1\n")
+        while _cgroup_event(path, "populated"):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"executor cgroup {scope.relative_path} remained populated")
+            time.sleep(0.01)
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot reclaim executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+
+
+def remove_executor_cgroup(scope: CgroupScope) -> None:
+    """Remove the exact, proven-empty scope and any empty descendant cgroups."""
+    path = _scope_path(scope)
+    if _cgroup_event(path, "populated"):
+        raise CgroupUnavailable(f"executor cgroup {scope.relative_path} is still populated")
+    try:
+        descendants = sorted(
+            (item for item in path.rglob("*") if item.is_dir()),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+        for descendant in descendants:
+            descendant.rmdir()
+        path.rmdir()
+    except OSError as exc:
+        raise CgroupUnavailable(
+            f"cannot remove executor cgroup {scope.relative_path}: {exc}"
+        ) from exc
+
+
+def acquire_worker_root_lease(path: Path) -> WorkerRootLease:
+    """Acquire the process-lifetime single-supervisor lease for one worker root."""
+    _posix_only("acquire_worker_root_lease")
+    import fcntl
+
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return WorkerRootLease(descriptor)
+
+
+def release_worker_root_lease(lease: WorkerRootLease) -> None:
+    _posix_only("release_worker_root_lease")
+    import fcntl
+
+    if lease.descriptor < 0:
+        return
+    fcntl.flock(lease.descriptor, fcntl.LOCK_UN)
+    os.close(lease.descriptor)
+    lease.descriptor = -1
 
 
 # ------------------------------------------------------------------ worker-side ops
 
 
-def tree_kill(pid: int, sig: int) -> None:
-    """Forced kill of `pid`'s whole process group (the executor's own, set at seal time).
+def process_identity(pid: int) -> ProcessIdentity:
+    """Read the kernel birth marker for `pid`.
 
-    The worker control process calls this; the executor never kills anything."""
-    _posix_only("tree_kill")
-    os.killpg(os.getpgid(pid), sig)
+    `/proc/<pid>/stat` field 22 is the process start time in clock ticks since boot. A PID
+    may be reused; the pair cannot name a later process by accident.
+    """
+    _linux_only("process_identity")
+    try:
+        fields = _linux_stat(pid)
+        return ProcessIdentity(pid=pid, started_ticks=int(fields[19]))
+    except (IndexError, ValueError) as exc:
+        raise ProcessLookupError(pid) from exc
+
+
+def _linux_stat(pid: int) -> list[str]:
+    """The fields after ``comm`` in Linux ``/proc/<pid>/stat``."""
+    _linux_only("process_identity")
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+    except OSError as exc:
+        raise ProcessLookupError(pid) from exc
+
+
+def same_process(process: ProcessIdentity) -> bool:
+    """Whether the PID still names the exact process birth captured by `process`."""
+    try:
+        return process_identity(process.pid) == process
+    except ProcessLookupError:
+        return False
+
+
+def process_state(process: ProcessIdentity) -> str | None:
+    """The exact birth's Linux state, or ``None`` once that birth is absent.
+
+    A zombie remains present.  That distinction lets the worker keep its direct child
+    unreaped while driver reclaim is observed, preventing the PID from being reused under
+    a raw per-process driver query.
+    """
+    try:
+        fields = _linux_stat(process.pid)
+        if int(fields[19]) != process.started_ticks:
+            return None
+        return fields[0]
+    except (ProcessLookupError, IndexError, ValueError):
+        return None
+
+
+def process_group_members(pgid: int) -> list[tuple[ProcessIdentity, str]]:
+    """Every observable birth in process group ``pgid``, including zombies."""
+    _linux_only("process_group_members")
+    found: list[tuple[ProcessIdentity, str]] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            fields = _linux_stat(pid)
+            if int(fields[2]) != pgid:
+                continue
+            found.append((ProcessIdentity(pid=pid, started_ticks=int(fields[19])), fields[0]))
+        except (ProcessLookupError, IndexError, ValueError):
+            continue
+    return found
+
+
+def _open_pidfd(process: ProcessIdentity) -> int:
+    """Open a stable kernel handle for exactly ``process``.
+
+    This Python build does not expose :func:`os.pidfd_open`, but glibc does.  Opening the
+    handle before re-reading the birth marker closes the usual check-then-``kill`` PID
+    reuse race: the handle keeps naming the birth it was opened against.
+    """
+    _linux_only("pidfd_open")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        pidfd_open = libc.pidfd_open
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc has no pidfd_open") from exc
+    pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+    pidfd_open.restype = ctypes.c_int
+    fd = int(pidfd_open(process.pid, 0))
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), process.pid)
+    if not same_process(process):
+        os.close(fd)
+        raise ProcessLookupError(process.pid)
+    return fd
+
+
+def signal_process(process: ProcessIdentity, sig: int) -> None:
+    """Signal one exact process birth through a pidfd, never a reusable numeric PID."""
+    fd = _open_pidfd(process)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            pidfd_send_signal = libc.pidfd_send_signal
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "libc has no pidfd_send_signal") from exc
+        pidfd_send_signal.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        pidfd_send_signal.restype = ctypes.c_int
+        if int(pidfd_send_signal(fd, int(sig), None, 0)) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), process.pid)
+    finally:
+        os.close(fd)
+
+
+def freeze_process_group(leader: ProcessIdentity, *, seconds: float = 10.0) -> set[ProcessIdentity]:
+    """Stop and return every exact birth in an executor's process group.
+
+    There is deliberately no ``killpg`` here.  The leader is stopped first, then every
+    observed member is stopped through a pidfd.  Two equal all-stopped censuses prove that
+    no member can still fork while the caller proceeds to exact per-birth signals.
+
+    The exact leader must still exist.  Its stopped birth pins the numeric group ID while
+    members are enumerated.  An absent or reused leader leaves only a reusable number, so
+    nothing is touched; restart recovery may observe that number but must not signal it.
+    """
+    _linux_only("freeze_process_group")
+    try:
+        current = process_identity(leader.pid)
+    except ProcessLookupError:
+        current = None
+    if current != leader:
+        return set()
+
+    deadline = time.monotonic() + seconds
+    known: set[ProcessIdentity] = set()
+    stable: frozenset[ProcessIdentity] | None = None
+    while True:
+        observed = process_group_members(leader.pid)
+        if same_process(leader) and all(process != leader for process, _ in observed):
+            # A provisional child may not have installed its own group yet.  It is still
+            # safe to stop by exact birth; its inherited worker group is never signalled.
+            state = process_state(leader)
+            if state is not None:
+                observed.append((leader, state))
+        for process, state in observed:
+            known.add(process)
+            if state not in {"T", "t", "Z"}:
+                with contextlib.suppress(ProcessLookupError):
+                    signal_process(process, signal.SIGSTOP)
+
+        census = process_group_members(leader.pid)
+        if same_process(leader) and all(process != leader for process, _ in census):
+            state = process_state(leader)
+            if state is not None:
+                census.append((leader, state))
+        known.update(process for process, _ in census)
+        stopped = all(state in {"T", "t", "Z"} for _, state in census)
+        identities = frozenset(process for process, _ in census)
+        if stopped and identities == stable:
+            return known
+        stable = identities if stopped else None
+        if time.monotonic() >= deadline:
+            states = {process.pid: state for process, state in census}
+            raise TimeoutError(f"could not freeze process group {leader.pid}: states={states}")
+        time.sleep(0.01)
+
+
+def kill_process_group(leader: ProcessIdentity, *, seconds: float = 10.0) -> set[ProcessIdentity]:
+    """Freeze one owned group, then SIGKILL each captured birth through a pidfd."""
+    known = freeze_process_group(leader, seconds=seconds)
+    for process in known:
+        if process_state(process) != "Z":
+            with contextlib.suppress(ProcessLookupError):
+                signal_process(process, signal.SIGKILL)
+    return known
+
+
+def reap_child(process: ProcessIdentity) -> int | None:
+    """Reap one exact child zombie if it belongs to this worker."""
+    if process_state(process) != "Z":
+        return None
+    try:
+        pid, status = os.waitpid(process.pid, os.WNOHANG)
+    except ChildProcessError:
+        return None
+    return status if pid else None
 
 
 def progress_burn(pid: int) -> int:
@@ -128,11 +580,12 @@ def progress_burn(pid: int) -> int:
         return burned  # no `io` for this process; the CPU hand still decides
 
 
-def pids_with_cmdline_markers(markers: tuple[bytes, ...], *, exclude: int = 0) -> list[int]:
-    """Every live pid whose argv contains ALL the markers — the orphan-sweep discovery
-    walk. Identity semantics (which markers make a process OURS) stay with the caller."""
-    _linux_only("pids_with_cmdline_markers")
-    found: list[int] = []
+def processes_with_cmdline_markers(
+    markers: tuple[bytes, ...], *, exclude: int = 0
+) -> list[ProcessIdentity]:
+    """Every live process birth whose argv contains all `markers`."""
+    _linux_only("processes_with_cmdline_markers")
+    found: list[ProcessIdentity] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit() or int(entry.name) == exclude:
             continue
@@ -141,7 +594,8 @@ def pids_with_cmdline_markers(markers: tuple[bytes, ...], *, exclude: int = 0) -
         except OSError:
             continue
         if all(marker in text for marker in markers):
-            found.append(int(entry.name))
+            with contextlib.suppress(ProcessLookupError):
+                found.append(process_identity(int(entry.name)))
     return found
 
 
