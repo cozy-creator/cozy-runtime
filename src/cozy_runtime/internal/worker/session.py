@@ -1087,7 +1087,11 @@ class Supervisor:
                 return
             if self.admit(attempt):
                 self.execute(attempt)
-                self.rebuild_if_needed()
+            # Rebuild on REFUSALS too: a poisoned generation refuses every attempt, so a
+            # rebuild gated on admission could never run again — the refusal that names
+            # the poison is exactly the moment the replacement is owed (lifecycle-live §4
+            # caught the wedge: cooperative cancel -> poison -> refuse forever).
+            self.rebuild_if_needed()
 
     def admit(self, attempt: AttemptRecord) -> bool:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""

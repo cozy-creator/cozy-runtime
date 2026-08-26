@@ -74,6 +74,12 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "thread cap must be set before torch import to bound host CPU in the executor",
     ),
     ProjectedVar(
+        "PYTORCH_ENABLE_MPS_FALLBACK",
+        "accel.MPS_CHILD_ENV_LAW",
+        "FORCED to 0 on MPS executors (#450): the fallback silently runs unsupported "
+        "operations on CPU, which violates the CPU-refusal law",
+    ),
+    ProjectedVar(
         "COZY_HOME",
         "config.cozy_home",
         "store root, so the executor resolves the same CAS as the supervisor",

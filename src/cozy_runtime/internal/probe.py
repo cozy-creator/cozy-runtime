@@ -36,6 +36,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding import (
     Capabilities,
     CapabilityRecord,
@@ -120,13 +121,13 @@ def _micro_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
     parts = {"data": data, "weight_scale": weight_scale}
     provider.decode(torch, parts, destination)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    # The fence goes through the accelerator boundary (#447): timing an MPS queue without
+    # its own synchronize would mint a fictional decode rate, so mps refuses typed there.
+    accel.synchronize(torch, device.type)
     started = time.perf_counter_ns()
     for _ in range(BENCH_REPS):
         provider.decode(torch, parts, destination)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    accel.synchronize(torch, device.type)
     took = (time.perf_counter_ns() - started) / BENCH_REPS
     moved = rows * cols * (1 + destination.element_size())
     return {

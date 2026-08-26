@@ -31,24 +31,12 @@ an executor failure in `waitpid` alone.
 
 from __future__ import annotations
 
-import ctypes
 import os
 import signal
 import sys
 
+from cozy_runtime.internal import proctree
 from cozy_runtime.internal.exits import Exit
-
-PR_SET_PDEATHSIG = 1
-PR_SET_NO_NEW_PRIVS = 38
-PR_GET_NO_NEW_PRIVS = 39
-
-
-def prctl(option: int, arg: int = 0) -> int:
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    result = int(libc.prctl(option, arg, 0, 0, 0))
-    if result < 0:
-        raise OSError(ctypes.get_errno(), f"prctl({option}, {arg})")
-    return result
 
 
 def _fail(message: str, code: Exit) -> None:
@@ -91,19 +79,20 @@ def main(argv: list[str]) -> None:
             Exit.structural,
         )
     try:
-        prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        proctree.arm_parent_death()
+    except proctree.ProcessTreeUnsupported as exc:
+        _fail(str(exc), Exit.structural)
     except OSError as exc:
         _fail(f"PR_SET_PDEATHSIG: {exc}", Exit.internal)
     if expect_parent and os.getppid() != expect_parent:
         # The parent died in the window above; pdeathsig only covers FUTURE deaths.
         _fail("parent died before pdeathsig was armed", Exit.structural)
     try:
-        prctl(PR_SET_NO_NEW_PRIVS, 1)
+        proctree.seal_no_new_privs()
     except OSError as exc:
         _fail(f"PR_SET_NO_NEW_PRIVS: {exc}", Exit.internal)
     try:
-        with open("/proc/self/oom_score_adj", "w") as handle:
-            handle.write(str(oom_adj))
+        proctree.raise_own_oom_score(oom_adj)
     except OSError as exc:
         _fail(f"oom_score_adj={oom_adj}: {exc}", Exit.internal)
 
@@ -123,7 +112,7 @@ def main(argv: list[str]) -> None:
     # Its own process group, so the supervisor's forceful path kills the executor AND every
     # grandchild it spawned (dataloader workers, compile subprocesses) with one `killpg`
     # instead of leaving orphans behind a dead parent. pdeathsig survives this.
-    os.setpgid(0, 0)
+    proctree.own_process_group()
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGXFSZ, signal.SIGPIPE):
         signal.signal(number, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_SETMASK, set())

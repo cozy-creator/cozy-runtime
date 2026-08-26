@@ -33,8 +33,9 @@ check, and here it does not have to — the parent can read the child's kernel-o
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
+
+from cozy_runtime.internal import proctree
 
 #: Every byte class this ledger carries, in report order. A class is added here only when a
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
@@ -129,40 +130,17 @@ METHODS: dict[str, tuple[str, str]] = {
 
 
 def read_host_available() -> int:
-    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+    """The LIVE host budget — §3.2's host-RAM rule, re-read at every grant, -1 UNREADABLE.
 
-    §3.2's host-RAM rule: host needs are MEASURED provisioning facts, and a rented pod
-    cannot guarantee host RAM either way. A budget fixed at boot describes a machine nobody
-    else is on; this is re-read at every grant. -1 means UNREADABLE, never 0.
+    The measurement lives behind the ProcessTree boundary (#447): the ledger's SEMANTICS
+    are platform-neutral, the reader is not.
     """
-    try:
-        relative = Path("/proc/self/cgroup").read_text().strip().splitlines()[0].split("::")[-1]
-        cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-        limit = (cgroup / "memory.max").read_text().strip()
-        if limit != "max":
-            current = int((cgroup / "memory.current").read_text().strip())
-            return max(int(limit) - current, 0)
-    except (OSError, IndexError, ValueError):
-        pass
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
-        return -1
-    return -1
+    return proctree.available_host_bytes()
 
 
 def read_vmrss(pid: int) -> int:
     """Current resident bytes for one pid, or -1 when the process is gone (UNREADABLE)."""
-    try:
-        with open(f"/proc/{pid}/status") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        return -1
-    return -1
+    return proctree.rss_bytes(pid)
 
 
 class LedgerRefusal(Exception):

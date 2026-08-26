@@ -576,6 +576,13 @@ class AttemptEngine:
             ) from exc
         if not reply.get("ok"):
             code = str(reply.get("code", "request_unresolvable"))
+            if code == "poisoned_generation":
+                # The poison can live only executor-side (a cancel's outcome poisons the
+                # CHILD; the cancel-completion path does not absorb replies). The refusal
+                # that names it is the supervision's one signal — invalidate HERE so the
+                # lane's rebuild pass replaces the generation instead of refusing forever
+                # (lifecycle-live §4 caught the wedge).
+                self.supervision.invalidate(str(reply.get("detail", "poisoned"))[:256])
             raise AttemptRefusal(
                 code,
                 str(reply.get("detail", ""))[:1024],
