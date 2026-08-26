@@ -271,6 +271,10 @@ class DeclaredBinding:
     entrypoint_binding_plan_id: str
     entrypoint: str
     project: str
+    """WHERE this machine staged the endpoint tree. It is RESOLUTION, not identity: the
+    coordinator digests the plan id over the record's path-free half (#506a), so two hosts
+    that installed the byte-identical release name the same plan while pointing at
+    different directories. Nothing keyed on identity may read it."""
     model_class: str
     model_binding_path: str
     model_parameter_name: str
@@ -292,6 +296,11 @@ class DeclaredBinding:
     """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
     empty — a record naming none offers exactly the bytes it already named, and that one IS
     the reference because there is nothing to compare it against."""
+    endpoint_release: str = ""
+    """WHICH endpoint release this binding belongs to — `project`'s PATH-FREE counterpart
+    (#506a), and the reason a weightless construction key never has to name a directory.
+    Empty falls back to `release`, which is what a record that names no endpoint release
+    already carried for a weightless binding."""
     objective: str = "latency"
     """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
     fidelity`). A deployment property, not a request knob: delivery decides which bytes are
@@ -361,10 +370,16 @@ class DeclaredBinding:
         reason: it decides which of the candidates gets filled.
         """
         if self.weightless:
-            # Nothing is constructed, so the release and the project ARE the construction:
-            # every weightless binding of one release shares one executor.
+            # Nothing is constructed, so the RELEASES are the construction: every weightless
+            # binding of one endpoint release shares one executor. It keyed on `project` —
+            # this machine's staging directory — which made the key machine-local for no
+            # gain, since the endpoint release names the same thing without a path (#506a).
             return canonical.digest(
-                {"weightless": True, "release": self.release, "project": self.project}
+                {
+                    "weightless": True,
+                    "release": self.release,
+                    "endpoint_release": self.endpoint_release or self.release,
+                }
             )
         return canonical.digest(
             {
@@ -444,6 +459,7 @@ class DeclaredBinding:
             entrypoint_binding_plan_id=str(record["entrypoint_binding_plan_id"]),
             entrypoint=str(record["entrypoint"]),
             project=str(record["project"]),
+            endpoint_release=str(record.get("endpoint_release", "")),
             model_class=str(record.get("model_class", "")),
             model_binding_path=str(record.get("model_binding_path", "")),
             model_parameter_name=str(record.get("model_parameter_name", "")),
@@ -483,10 +499,17 @@ class DeclaredBinding:
 #: this is the only place in the runtime that knows its spellings. The names say what they
 #: name, and the sets in it are REAL SETS — `components` is a list and `snapshots` a map,
 #: because a comma-packed string is a second grammar every reader has to agree about.
+#:
+#: The record is PARTITIONED at the writer (#506a, `internal/plan` on the Creator side):
+#: `project`, `store` and `config` are RESOLUTION — the paths this machine put things at —
+#: and everything else is IDENTITY, which is what the plan id is digested over. This reader
+#: consumes both halves; what changed is that the id no longer depends on the paths, so a
+#: pod installing the byte-identical release computes the coordinator's own plan id.
 RECORD_KEYS = frozenset(
     {
         "entrypoint_binding_plan_id",
         "project",
+        "endpoint_release",
         "model_class",
         "model_binding_path",
         "model_parameter_name",

@@ -149,6 +149,10 @@ _SERVE_FLAGS: dict[str, str] = {
     "--release-id": "--release-id",
     "--git-commit": "--git-commit",
     "--devices": "--devices",
+    # The DECLARED grant roots (#506b): every directory tree a `file://` grant may address
+    # on this machine. A launcher knows its own root and nothing can discover it for one,
+    # which is exactly what puts it in this closed set.
+    "--grant-root": "--grant-root",
     "--threads": "--threads",
     "--grace": "--grace",
     "--host-budget": "--host-budget",

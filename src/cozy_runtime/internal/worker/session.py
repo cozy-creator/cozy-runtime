@@ -137,6 +137,11 @@ class WorkerOptions:
     git_commit: str = ""
     python: str = ""
     devices: str = "0"
+    grant_roots: tuple[str, ...] = ()
+    """Every directory tree a `file://` DeliveryGrant may address on this machine (#506b).
+    A launcher that knows its own root states it — cozy-creator passes its local root, a
+    pod's provisioner passes the media subtree its co-resident server owns — and the
+    Authorizer refuses a grant outside every one of them. Empty declares no fence."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -238,7 +243,7 @@ class Worker:
             pinned_budget=options.pinned_budget,
             supervisor_pid=os.getpid(),
         )
-        self.authorizer = grants.Authorizer()
+        self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         self.supervision = ExecutorSupervision(
             root=self.root,
             python=options.python or sys.executable,
@@ -1810,6 +1815,11 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
     parser.add_argument("--devices", default="0")
+    parser.add_argument(
+        "--grant-root",
+        default="",
+        help="comma-separated directory trees a file:// grant may address (#506b)",
+    )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -1837,6 +1847,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         git_commit=args.git_commit,
         python=args.python,
         devices=args.devices,
+        grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

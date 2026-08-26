@@ -1,14 +1,21 @@
 #!/usr/bin/env python
-"""The REMOTE control leg, live: TLS + bearer owner token on Claim (cl-015, #445).
+"""The REMOTE control leg, live: TLS + bearer owner token on Claim (cl-015, #445), and
+the BYTE boundary that leg implies (#506b).
 
 A weightless worker serves `WorkerControl` over TLS on loopback — the same leg a rented pod
 exposes off-loopback — with a self-signed cert the owner PINS (trusting exactly that PEM is
-the fingerprint pin) and the bearer token checked at Claim, constant-time. Three sections:
+the fingerprint pin) and the bearer token checked at Claim, constant-time. Sections:
 
     1. red arm: a wrong token is refused CLAIM_REJECTION_UNAUTHENTICATED, typed
     2. the real leg: right token over TLS -> Claim -> snapshot -> directive -> READY ->
        one invoke to a SUCCEEDED terminal
     3. red arm: a non-loopback plaintext listener REFUSES to bind at all
+    4. red arm: a non-loopback TLS listener with no bootstrap credential refuses to bind
+    5. the DECLARED GRANT ROOTS: a worker launched with `--grant-root` serves a grant
+       inside them and REFUSES one outside every one of them. That is the byte boundary a
+       remote worker actually has — a `file://` URL is an address on SOME machine, and a
+       pod handed one rooted on the owner's disk would create the directory, write into it
+       and declare outputs nobody can read.
 
     nice -n 19 uv run python scripts/remote-live.py
 """
@@ -93,7 +100,12 @@ def serve_env(home: Path, *, token: str) -> dict[str, str]:
 
 
 def serve_argv(
-    *, listen: str, root: Path, cert: Path | None = None, key: Path | None = None
+    *,
+    listen: str,
+    root: Path,
+    cert: Path | None = None,
+    key: Path | None = None,
+    grant_roots: str = "",
 ) -> list[str]:
     """ONE argv builder, so every arm below differs only in what it is testing."""
     return [
@@ -115,12 +127,13 @@ def serve_argv(
         "--grace",
         "3.0",
         "--no-warm",
+        *(("--grant-root", grant_roots) if grant_roots else ()),
         *(("--tls-cert", str(cert), "--tls-key", str(key)) if cert and key else ()),
     ]
 
 
 def start_remote(
-    tmp: Path, cert: Path, key: Path, *, listen: str, token: str
+    tmp: Path, cert: Path, key: Path, *, listen: str, token: str, grant_roots: str = ""
 ) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str]]:
     """The weightless worker on a TLS listener, its token provisioned via the environment
     (the one channel a launcher hands it through, #449/#463)."""
@@ -131,7 +144,7 @@ def start_remote(
     log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     (root / "control.addr").unlink(missing_ok=True)
     process = subprocess.Popen(
-        serve_argv(listen=listen, root=root, cert=cert, key=key),
+        serve_argv(listen=listen, root=root, cert=cert, key=key, grant_roots=grant_roots),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=serve_env(home, token=token),
@@ -273,6 +286,103 @@ def main() -> int:
     finally:
         authed.terminate()
         authed.wait(timeout=15)
+
+    wl.head("5. the DECLARED GRANT ROOTS: inside is served, outside is refused")
+    # THE BYTE BOUNDARY A REMOTE WORKER ACTUALLY HAS (#506b). This worker is launched the
+    # way a pod's provisioner launches one: it is told the ONE subtree its co-resident
+    # media server owns, and every `file://` grant must address it. The green arm and the
+    # red arm differ in the destination URL and in nothing else.
+    podfs = tmp / "podfs"
+    podfs.mkdir(parents=True, exist_ok=True)
+    fenced, froot, flog, fids = start_remote(
+        tmp / "fenced", cert, key, listen="127.0.0.1:0", token=TOKEN, grant_roots=str(podfs)
+    )
+    (tmp / "fenced").mkdir(parents=True, exist_ok=True)
+    try:
+        faddr = wl.read_addr(froot, fenced)
+        fhub = wl.Hub()
+        fhub.process, fhub.log = fenced, flog
+        fhub.directive = wl.serving_directive(
+            ll.RELEASE, sorted(fids.values()), pb.Posture.POSTURE_ACCEPTING
+        )
+        fhub.connect(faddr, root_cert=root_cert, token=TOKEN)
+        fhub.ready(fids["tick"], 60)
+
+        # The GREEN arm: the payload is staged INSIDE the declared root, which is what a
+        # pod's media server does with an uploaded input — it lands in the subtree the
+        # media server owns and the grant names that path.
+        wl.dispatch(
+            fhub,
+            podfs,
+            fids["tick"],
+            request_id="req-inside",
+            payload={"note": "inside the declared root"},
+            release=ll.RELEASE,
+            outputs=0,
+        )
+        good = wl.terminal_body(
+            fhub.wait(
+                lambda m: (
+                    m.attempt_terminal
+                    if m.WhichOneof("msg") == "attempt_terminal"
+                    and m.attempt_terminal.request_id == "req-inside"
+                    else None
+                ),
+                60,
+                "inside-root terminal",
+            )
+        )
+        wl.check(
+            "a grant INSIDE the declared root is served to SUCCEEDED",
+            good["status"] == 1,
+            f"payload read from under {podfs}",
+        )
+
+        # The RED arm: the same request with the payload staged on the OWNER's disk — the
+        # address a coordinator mints when it forgets there is a boundary (#493.3). Nothing
+        # else moves: same worker, same plan, same declared inputs.
+        elsewhere = tmp / "owner-only"
+        elsewhere.mkdir(parents=True, exist_ok=True)
+        wl.dispatch(
+            fhub,
+            elsewhere,
+            fids["tick"],
+            request_id="req-outside",
+            payload={"note": "outside every declared root"},
+            release=ll.RELEASE,
+            outputs=0,
+        )
+        refused_terminal = wl.terminal_body(
+            fhub.wait(
+                lambda m: (
+                    m.attempt_terminal
+                    if m.WhichOneof("msg") == "attempt_terminal"
+                    and m.attempt_terminal.request_id == "req-outside"
+                    else None
+                ),
+                60,
+                "outside-root terminal",
+            )
+        )
+        said = str(refused_terminal.get("safe_message", "")) + str(
+            refused_terminal.get("cause", {})
+        )
+        wl.check(
+            "a grant OUTSIDE every declared root refuses BY NAME, before the bytes are read",
+            refused_terminal["status"] != 1 and "grant_path_outside_roots" in said,
+            f"status={refused_terminal['status']} {said[:150]}",
+        )
+        wl.check(
+            "the two arms differ ONLY in the granted address",
+            good["status"] == 1 and refused_terminal["status"] != 1,
+            "same worker, same plan id, same payload shape, one path inside the declared "
+            "root and one outside it",
+        )
+        fhub.close()
+    finally:
+        if fenced.poll() is None:
+            fenced.terminate()
+            fenced.wait(timeout=15)
 
     print(f"\nremote leg: {wl.PASS} ok, {wl.FAIL} failed")
     return 1 if wl.FAIL else 0

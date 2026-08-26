@@ -99,6 +99,23 @@ class Authorizer:
 
     refusals: list[dict[str, str]] = field(default_factory=list)
     allowed: int = 0
+    roots: tuple[str, ...] = ()
+    """The DECLARED grant roots: every directory tree a `file://` grant may address on this
+    machine, stated at launch (`serve --grant-root`) and never widened at request time.
+
+    It closes the gap the remote leg made visible. A `file://` URL is an ADDRESS ON SOME
+    MACHINE, and a worker handed one has no way to tell "the owner's attempt directory,
+    which I share" from "a path that exists only on the owner's disk" — a pod handed the
+    second would happily CREATE it, write the outputs into a directory nobody can read, and
+    declare them in a true-looking manifest the owner then cannot mirror. Refusing it here
+    turns that into an observed refusal at the named gate, before a byte moves.
+
+    EMPTY MEANS NO FENCE, and that is the honest default for a launcher that declared none:
+    a one-shot in-memory worker (§8) grants into directories it makes as it goes, and a
+    fence over roots nobody stated would be a fence over a guess. Every launcher that knows
+    its own root states it — cozy-creator passes its local root, a pod passes its media
+    subtree — so the lanes that HAVE a boundary all carry one.
+    """
 
     def authorize(self, name: str, method: str, url: str, params: dict[str, Any]) -> None:
         row = CALLS.get(name)
@@ -112,7 +129,31 @@ class Authorizer:
         extra = sorted(set(params) - set(row.params))
         if extra:
             self._refuse(name, method, url, f"unenumerated params {', '.join(extra)}")
+        self._within_roots(name, method, url)
         self.allowed += 1
+
+    def _within_roots(self, name: str, method: str, url: str) -> None:
+        """A `file://` grant addresses a declared root or it addresses nothing here."""
+        if not self.roots or not url.startswith("file://"):
+            return
+        target = Path(urlparse(url).path)
+        for root in self.roots:
+            try:
+                target.relative_to(Path(root))
+            except ValueError:
+                continue
+            return
+        event = {"call": name, "method": method, "url": url[:200], "why": "outside every root"}
+        self.refusals.append(event)
+        raise GrantRefusal(
+            "grant_path_outside_roots",
+            f"{name}: the grant addresses {str(target)[:120]} and this worker's declared "
+            f"grant roots are {list(self.roots)}. A `file://` URL is an address on SOME "
+            "machine and a worker cannot tell a shared directory from one that exists only "
+            "on the owner's disk — so the roots are declared at launch and a grant outside "
+            "every one of them is refused here, before a byte moves, rather than becoming a "
+            "directory this worker created and nobody else can read",
+        )
 
     def _refuse(self, name: str, method: str, url: str, why: str) -> None:
         event = {"call": name, "method": method, "url": url[:200], "why": why}
