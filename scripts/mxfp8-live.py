@@ -657,9 +657,151 @@ def arms() -> None:
     )
 
 
+# ------------------------------------------------------------------------ the derivation
+
+
+def _mxfp8(torch: Any, weight: Any) -> tuple[Any, Any]:
+    data, scale, _ = _quantize_counting(torch, weight)
+    return data, scale
+
+
+def _quantize_counting(torch: Any, weight: Any) -> tuple[Any, Any, int]:
+    rows, cols = weight.shape
+    work = weight.to(torch.float32)
+    blocks = work.view(rows, cols // BLOCK, BLOCK)
+    amax = blocks.abs().amax(dim=-1)
+    exponent = torch.where(
+        amax > 0, torch.floor(torch.log2(amax)) - 8.0, torch.full_like(amax, -127.0)
+    )
+    byte = (exponent + 127.0).clamp(0.0, 254.0)
+    mult = torch.pow(2.0, byte - 127.0)
+    quant = (blocks / mult.unsqueeze(-1)).view(rows, cols)
+    saturated = int((quant.abs() > E4M3_MAX).sum())
+    return quant.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), byte.to(torch.uint8), saturated
+
+
+def derive() -> None:
+    """#514a: collapsing per-32 block scales into one continuous row scale is a SECOND
+    lossy quantization, and the number that matters is what it costs OVER a direct one."""
+    import torch
+
+    from cozy_runtime.internal.encoding import (
+        MicroScaledDequant,
+        derive_rowwise,
+        digests_of,
+        quantize_rowwise,
+    )
+
+    head("derive — mxfp8 -> fp8-rowwise, and what the SECOND quantization costs (#514a)")
+    provider = MicroScaledDequant(digests_of("mxfp8/1")[0])
+    torch.manual_seed(0x514)
+    print(
+        "  rule       row scale = rowmax|V| / 448 (continuous, f32); each block's payload "
+        "rescaled\n             by mult/scale and RE-ROUNDED to E4M3 round-to-nearest-even, "
+        "clamped at\n             +/-448 BEFORE the cast (the cast does not saturate)"
+    )
+    worst_penalty = 0.0
+    for name, weight in (
+        ("gaussian 256x512", torch.randn(256, 512, dtype=torch.bfloat16)),
+        ("wide 128x4096", torch.randn(128, 4096, dtype=torch.bfloat16) * 0.05),
+        (
+            "heavy-tailed",
+            torch.randn(256, 512, dtype=torch.bfloat16)
+            * torch.exp(torch.randn(256, 512) * 1.5).bfloat16(),
+        ),
+    ):
+        data, scale = _mxfp8(torch, weight)
+        exact = torch.empty(weight.shape, dtype=torch.float32)
+        provider.decode(torch, {"data": data, "scale": scale}, exact)
+        derived = derive_rowwise(torch, data, scale)
+        direct = quantize_rowwise(torch, weight)
+        # The `fp8-rowwise/1` value law, from the registry entry: value = data * scale, one
+        # scale per ROW. Written here rather than reused so the check has its own oracle.
+        as_float = derived.data.float() * derived.scale.unsqueeze(-1)
+        direct_float = direct.data.float() * direct.scale.unsqueeze(-1)
+        original = weight.float()
+
+        def rel(a: Any, b: Any) -> float:
+            return float((a - b).norm() / b.norm().clamp(min=1e-12))
+
+        err_mx, err_der, err_dir = (
+            rel(exact, original),
+            rel(as_float, original),
+            rel(direct_float, original),
+        )
+        penalty = err_der / max(err_dir, 1e-12)
+        worst_penalty = max(worst_penalty, penalty)
+        print(
+            f"  {name:17s} mxfp8 {err_mx:.6f} -> derived {err_der:.6f}   direct "
+            f"{err_dir:.6f}   PENALTY {penalty:.3f}x   (derivation adds "
+            f"{rel(as_float, exact):.6f} over mxfp8)"
+        )
+        check(
+            f"{name}: the derived payload is finite everywhere",
+            bool(torch.isfinite(as_float).all()) and derived.zero_rows == 0,
+            f"peak offered to the cast {derived.max_rescaled:.6f}, {derived.clamped} clamped "
+            f"of which {derived.saturated} beyond rounding",
+        )
+        check(
+            f"{name}: the row scale COVERS its row — no genuine saturation",
+            derived.saturated == 0,
+            "the row maximum is supposed to land exactly on 448; anything materially past "
+            "it means the scale did not cover the row and range was thrown away",
+        )
+        # NO THRESHOLD on the penalty itself — what it is ALLOWED to be is job-009's gate.
+        # The ORDERING is structural and is asserted: one quantization to a target format
+        # cannot be beaten by two quantizations ending at the same format.
+        check(
+            f"{name}: DOUBLE quantization costs more than direct — the penalty is real",
+            err_der >= err_dir,
+            f"{err_der:.6f} >= {err_dir:.6f}; mxfp8 carried a scale per 32 elements and "
+            "fp8-rowwise carries one per row, so the block dynamic range is what is lost",
+        )
+
+    # The ZERO ROW, which is the divide this derivation would otherwise do by zero.
+    weight = torch.randn(64, 128, dtype=torch.bfloat16)
+    weight[7] = 0.0
+    data, scale = _mxfp8(torch, weight)
+    derived = derive_rowwise(torch, data, scale)
+    as_float = derived.data.float() * derived.scale.unsqueeze(-1)
+    check(
+        "a row of exact zeros derives to zeros, not NaN — the scale floor holds",
+        derived.zero_rows == 1
+        and bool(torch.isfinite(as_float).all())
+        and float(as_float[7].abs().max()) == 0.0,
+        f"{derived.zero_rows} zero row(s) held off the divide by ROW_SCALE_FLOOR",
+    )
+
+    # A RAGGED mxfp8 tail has no rowwise derivation and says so rather than mis-striding.
+    ragged_data = torch.zeros(8, 48, dtype=torch.float8_e4m3fn)
+    ragged_scale = torch.full((8, 2), 127, dtype=torch.uint8)
+    refused = ""
+    try:
+        derive_rowwise(torch, ragged_data, ragged_scale)
+    except AssertionError as exc:
+        refused = str(exc)
+    check(
+        "RED: a ragged 48-column mxfp8 tensor refuses derivation rather than mis-striding",
+        "ragged" in refused,
+        f"{refused[:150]} — the producing job refuses non-divisible columns, so no real "
+        "artifact carries one; a decoder that only works on its own producer's output is "
+        "still a gap and is named as one",
+    )
+    print(
+        f"  penalty    worst {worst_penalty:.3f}x over direct rowwise on these shapes. What "
+        f"the\n             derivation is ALLOWED to cost is job-009's gate, not this file's."
+    )
+
+
 def main(argv: list[str]) -> int:
-    for name in argv or ["vectors", "probe", "carrier", "arms"]:
-        {"vectors": vectors, "probe": probe, "carrier": carrier, "arms": arms}[name]()
+    for name in argv or ["vectors", "probe", "carrier", "arms", "derive"]:
+        {
+            "vectors": vectors,
+            "probe": probe,
+            "carrier": carrier,
+            "arms": arms,
+            "derive": derive,
+        }[name]()
     print(f"\n{PASS} ok, {FAIL} failed")
     return 1 if FAIL else 0
 
