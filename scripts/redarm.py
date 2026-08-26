@@ -407,6 +407,36 @@ LIVE_ARMS = (
         "the envelope EXPANDS the fp8 rows",
     ),
     (
+        # THE REPLY THAT COULD NOT BE SENT (#574b's root cause). An oversized PREPARE reply
+        # used to arrive as `{"ok": True}` with none of prepare's keys, because the minimal
+        # fallback was shaped for INVOKE and copied `ok` through. The worker then read a key
+        # that was not there, the control stream died AFTER the fill had 90.84 GiB on the
+        # card, and the re-accepted placement filled a SECOND generation into the same
+        # allocator. A reply this path has to mutilate refuses instead.
+        "an-oversized-reply-refuses-rather-than-inventing-a-success",
+        "from cozy_runtime.internal import executor\n"
+        "from cozy_runtime.internal.seam import MAX_FRAME, SeamError\n"
+        "sent = []\n"
+        "class Cap:\n"
+        "    def send(self, frame):\n"
+        "        import json\n"
+        "        if len(json.dumps(frame)) > MAX_FRAME:\n"
+        "            raise SeamError('frame_too_large', 'over the control cap')\n"
+        "        sent.append(frame)\n"
+        # A prepare-shaped reply whose plan census does not fit one control frame.
+        "executor._send_reply(Cap(), {\n"
+        "    'reply': 'prepare', 'ok': True,\n"
+        "    'model_construction_digest': 'sha256:' + '0' * 64,\n"
+        "    'constructed_model_digest': 'sha256:' + '1' * 64,\n"
+        "    'plan': {'tensors': [{'key': 'k%d' % i, 'route': 'verbatim'} for i in range(4000)]},\n"
+        "    'facts': {'filled': 2651},\n"
+        "})\n"
+        "out = sent[-1]\n"
+        "assert out['ok'] is False, out\n"
+        "raise SystemExit('%s: %s' % (out['code'], out['detail'][:150]))\n",
+        "reply_too_large",
+    ),
+    (
         "witness-boot-record-on-ram",
         "import pathlib\nfrom cozy_runtime.internal.witness import require_durable\n"
         "require_durable(pathlib.Path('/dev/shm/cozy-witness-arm'))\n",

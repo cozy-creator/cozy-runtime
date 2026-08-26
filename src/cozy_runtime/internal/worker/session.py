@@ -71,6 +71,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     UndurableOutcome,
+    safe,
 )
 from cozy_runtime.internal.worker.child import (
     GRACE_SECONDS,
@@ -1273,7 +1274,7 @@ class Worker:
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=f"revision {inner.revision}",
                         reason="desired_state_preparation_failed",
-                        detail=f"{type(exc).__name__}: {exc}"[:1024],
+                        detail=safe(f"{type(exc).__name__}: {exc}"),
                     )
                 )
             return
@@ -1411,7 +1412,7 @@ class Worker:
                         kind=kind,
                         subject=f"revision {desired.revision}",
                         reason=exc.code,
-                        detail=exc.detail[:1024],
+                        detail=safe(exc.detail),
                     )
                 )
                 return
@@ -1616,7 +1617,7 @@ class Worker:
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=plan_id,
                         reason=refusal.code,
-                        detail=refusal.detail,
+                        detail=safe(refusal.detail),
                     )
                 )
                 continue
@@ -1718,6 +1719,26 @@ class Worker:
         self.failed_bindings.clear()
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
         executor = self.supervision.current
+        # A GENERATION IS EXECUTOR-SCOPED, AND AN EXECUTOR HOLDS ONE (#574b). An activation
+        # that reaches a live executor which already prepared a generation used to build a
+        # SECOND one inside it: the same allocator then held both, and on H3 that was 90.84
+        # GiB of a completed fill plus 48.18 GiB of the next one on a 139.81 GiB card — the
+        # OOM that read as "the fill plane allocates 63% more than it accounts for". It was
+        # reachable because a control stream died AFTER a successful prepare and the client
+        # re-accepted the same placement, but nothing about the second prepare is safe even
+        # when the first one is forgotten on purpose: the executor's residency is not
+        # something a re-prepare can subtract. So a re-activation REPLACES the incarnation,
+        # which is the only operation that actually returns the card.
+        if executor is not None and executor.alive() and executor.ready_plans:
+            self.note(
+                "boot",
+                f"generation {executor.incarnation} already holds "
+                f"{len(executor.ready_plans)} prepared binding plan(s); a re-activation "
+                "replaces the incarnation rather than filling a second generation into an "
+                "allocator that is still holding the first",
+            )
+            self.supervision.invalidate("re-activation over a prepared generation")
+            executor = None
         if executor is None or not executor.alive():
             self.note("boot", "spawning the device executor (exec-first trampoline)")
             executor = self.supervision.spawn(imposed=self.imposed())
@@ -1806,7 +1827,12 @@ class Worker:
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=first.entrypoint_binding_plan_id,
                         reason=str(reply.get("code")),
-                        detail=detail,
+                        # SANITIZED, like every other detail that crosses this wire (#574b).
+                        # The document profile is printable ASCII; refusal prose in this
+                        # codebase is written with em dashes, and one of them in a Fault
+                        # made EVERY later claim ack raise `non_ascii_field` — the worker
+                        # became unclaimable over a refusal it could not spell.
+                        detail=safe(detail),
                     )
                 )
                 # AN ACTIVATION FAILURE LATCHES for this desired revision (§8): the worker

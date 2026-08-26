@@ -397,7 +397,7 @@ class Executor:
                     f"({envelope['destination_bytes']} B of logical destinations, "
                     f"{envelope['native_bytes']} B of native encoded leaves, "
                     f"{envelope['decode_peak_bytes']} B of decode scratch at its widest "
-                    f"component) against {allocatable} B allocatable — refused on the "
+                    f"component) against {allocatable} B allocatable - refused on the "
                     f"arithmetic, before a byte moved. The record declared {declared} B, "
                     "which is the artifact's STORED size; bf16 destinations of fp8-stored "
                     "rows expand and the header prices them"
@@ -601,7 +601,9 @@ class Executor:
             },
             "ignored_extra_keys": list(record.ignored_extras),
             "transcribed_markers": list(record.transcribed_markers),
-            "plan": plan.document(),
+            # THE SEAM FORM (#574b). The full document carries a row per destination and a
+            # control frame is 64 KiB; on an N-ary artifact that reply could not be sent.
+            "plan": plan.seam_document(),
             # The WIRE's own document, DERIVED from the plan's route census and placement
             # rather than copied off a chooser's rung. The key set is the worker's — that
             # seam is closed and reads `rung`/`variant` — and `label` rides beside them, so
@@ -643,7 +645,7 @@ class Executor:
             "model_construction_digest": self.logical_model_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
-            "plan": plan.document(),
+            "plan": plan.seam_document(),
             "delivery": self.facts["delivery"],
             "facts": self.facts,
         }
@@ -1228,6 +1230,35 @@ class Executor:
         }
 
 
+#: The keys the minimal reply below actually carries. A reply whose own keys are a subset
+#: of these loses nothing by being reduced; anything else would be silently mutilated.
+_MINIMAL_KEYS = frozenset(
+    {
+        "reply",
+        "ok",
+        "code",
+        "detail",
+        "outcome",
+        "quiescent",
+        "env_intact",
+        "poisoned",
+        "metrics",
+        "outputs",
+        "result_ref",
+        "result_schema_digest",
+        "oversize_result_bytes",
+        "shortfall",
+        "residency",
+        "adjustments",
+        "observations",
+        "observation_caps",
+        "terminal",
+        "origin",
+        "fields",
+    }
+)
+
+
 def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     """Put ONE reply on the seam, and MAKE IT FIT.
 
@@ -1242,6 +1273,17 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     what it gave up is a NUMBER on `observation_caps` — the same rule the ring already
     follows. A reply that does not fit even empty ships the OUTCOME, which is the one thing
     a coordinator cannot reconstruct from anywhere else.
+
+    AND THE FALLBACK NEVER CLAIMS SUCCESS. It was written for INVOKE and used for every
+    command, and it copied `ok` through while dropping every key that makes an ok reply
+    mean anything — so an oversized PREPARE reply arrived as `{"ok": True}` with no
+    construction digest, no plan and no facts, and the worker read a key that was not
+    there. That KeyError killed the control stream AFTER the fill had put 90.84 GiB on the
+    card; the client reconnected, the placement was re-accepted, and prepare ran a SECOND
+    time in the SAME executor — 90.84 + 48.18 GiB on a 139.81 GiB card, which is the whole
+    of the "the fill allocates 63% more than it accounts for" gap (#574b). The fill plane
+    was never wrong. A reply this path had to mutilate is a REFUSAL that names itself, so
+    the caller takes the refusal branch instead of reading a success that is not one.
     """
     held = len(reply.get("observations") or ())
     rows = list(reply.get("observations") or ())
@@ -1258,12 +1300,21 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
                 **(reply.get("observation_caps") or {}),
                 "dropped_for_frame": held - len(rows),
             }
+    reduced = not reply.get("ok") or set(reply) <= _MINIMAL_KEYS
     channel.send(
         {
             "reply": reply.get("reply"),
-            "ok": reply.get("ok"),
-            "code": reply.get("code"),
-            "detail": str(reply.get("detail", ""))[:512],
+            "ok": reply.get("ok") if reduced else False,
+            "code": reply.get("code") if reduced else "reply_too_large",
+            "detail": str(reply.get("detail", ""))[:512]
+            if reduced
+            else (
+                f"the {reply.get('reply')!r} reply does not fit one control frame and the "
+                f"keys it declares ({', '.join(sorted(set(reply) - _MINIMAL_KEYS))[:200]}) "
+                "cannot be dropped without inventing a success. It refuses instead: a "
+                "coordinator acting on a reply that lost its own contents is worse than one "
+                "told the reply could not be sent"
+            ),
             "outcome": reply.get("outcome"),
             "quiescent": reply.get("quiescent"),
             "env_intact": reply.get("env_intact"),

@@ -444,6 +444,30 @@ class ResolvedExecutionPlan:
         """
         return canonical.digest(self.identity())
 
+    def seam_document(self) -> dict[str, Any]:
+        """The plan as ONE CONTROL FRAME — everything but the per-destination census.
+
+        `document()` carries a row per destination because a plan's identity is per-tensor
+        and a reader on disk wants all of it. The executor/worker seam is a 64 KiB CONTROL
+        frame, and 2,651 destinations is about a megabyte: on H3 the prepare reply could not
+        be sent at all, and what the worker got instead was a mutilated success (#574b).
+
+        A control frame carries the DIGEST and the COUNTS; the rows stay where they are
+        written whole. The digest is over the full document either way, so nothing about
+        identity is weakened by not shipping the body of it down a control seam.
+        """
+        whole = self.document()
+        rows = whole.pop("tensors", [])
+        walk = whole.pop("walk", [])
+        whole["tensors_count"] = len(rows)
+        whole["walk_count"] = len(walk)
+        whole["census_elided"] = (
+            "the per-destination rows and the resolution walk are not on this seam: a "
+            "control frame is 64 KiB and this plan resolves "
+            f"{len(rows)} destinations. `plan_digest` is over the WHOLE document"
+        )
+        return whole
+
     def document(self) -> dict[str, Any]:
         return {
             "plan_digest": self.digest(),
