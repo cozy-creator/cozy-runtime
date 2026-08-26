@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -121,6 +122,7 @@ def serve_argv(
     cert: Path | None = None,
     key: Path | None = None,
     grant_roots: str = "",
+    project: str = "",
 ) -> list[str]:
     """ONE argv builder, so every arm below differs only in what it is testing."""
     return [
@@ -143,6 +145,11 @@ def serve_argv(
         "3.0",
         "--no-warm",
         *(("--grant-root", grant_roots) if grant_roots else ()),
+        # A LAUNCHER STATES ITS PROJECT (#563f). The record's own `project` is whoever
+        # wrote it — on a rented pod, a path that is not there — so what resolves the
+        # endpoint is this machine's root, and this harness names it the way cozy-creator
+        # and a pod's provisioner do.
+        *(("--project", project) if project else ()),
         *(("--tls-cert", str(cert), "--tls-key", str(key)) if cert and key else ()),
     ]
 
@@ -156,6 +163,7 @@ def start_remote(
     token: str,
     grant_roots: str = "",
     hashes: str = "",
+    project_override: str = "",
 ) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str]]:
     """The weightless worker on a TLS listener, its token provisioned via the environment
     (the one channel a launcher hands it through, #449/#463)."""
@@ -166,7 +174,14 @@ def start_remote(
     log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     (root / "control.addr").unlink(missing_ok=True)
     process = subprocess.Popen(
-        serve_argv(listen=listen, root=root, cert=cert, key=key, grant_roots=grant_roots),
+        serve_argv(
+            listen=listen,
+            root=root,
+            cert=cert,
+            key=key,
+            grant_roots=grant_roots,
+            project=project_override or str(project),
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=serve_env(home, token=token, hashes=hashes),
@@ -407,6 +422,7 @@ def main() -> int:
             fenced.wait(timeout=15)
 
     rc = hash_set_leg(tmp, cert, key, root_cert)
+    rc |= project_leg(tmp, cert, key, root_cert)
 
     print(f"\nremote leg: {wl.PASS} ok, {wl.FAIL} failed")
     return 1 if (wl.FAIL or rc) else 0
@@ -424,6 +440,115 @@ def claim_verdict(
     )
     hub.close()
     return ack
+
+
+def invoke_once(hub: Any, where: Path, ids: dict[str, str], request: str) -> Any:
+    """One dispatch to its terminal, so an arm reads a verdict rather than a log."""
+    wl.dispatch(
+        hub,
+        where,
+        ids["tick"],
+        request_id=request,
+        payload={"note": request},
+        release=ll.RELEASE,
+        outputs=0,
+    )
+    return wl.terminal_body(
+        hub.wait(
+            lambda m: (
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == request
+                else None
+            ),
+            90,
+            request + " terminal",
+        )
+    )
+
+
+def project_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:
+    """Section 7: RESOLUTION IS THE RESOLVER'S OWN (#563f).
+
+    A binding-plan record splits into IDENTITY and RESOLUTION (#506a). `project` is the
+    resolution half — where the machine that WROTE the record put the release's tree — and
+    a worker that discovered its endpoint from it was reading somebody else's disk. On one
+    machine the two coincide and nothing shows. On a rented pod the record's path is simply
+    not there, and the pod faults `no_endpoint_toml` naming a directory on the owner's
+    laptop. Observed live on a real 4090 before this pair existed.
+    """
+    wl.head("7. the record's `project` is the WRITER's; this worker resolves against its own")
+    home = tmp / "proj"
+    home.mkdir(parents=True, exist_ok=True)
+
+    # THE RED ARM FIRST, and it is the pod's failure reproduced on this desk: a worker whose
+    # OWN project root is not there discovers nothing, whatever the record says.
+    nowhere = str(tmp / "not-a-project")
+    broken, broot, blog, bids = start_remote(
+        home / "red", cert, key, listen="127.0.0.1:0", token=TOKEN, project_override=nowhere
+    )
+    try:
+        baddr = wl.read_addr(broot, broken)
+        bhub = wl.Hub()
+        bhub.process, bhub.log = broken, blog
+        bhub.directive = wl.serving_directive(
+            ll.RELEASE, sorted(bids.values()), pb.Posture.POSTURE_ACCEPTING
+        )
+        bhub.connect(baddr, root_cert=root_cert, token=TOKEN)
+        try:
+            bhub.ready(bids["tick"], 45)
+            reached = True
+        except Exception:
+            reached = False
+        wl.check(
+            "a worker whose OWN project root does not exist never becomes dispatchable",
+            not reached,
+            f"--project {nowhere} — the record's path is fine and it does not help",
+        )
+        bhub.close()
+    finally:
+        if broken.poll() is None:
+            broken.terminate()
+            broken.wait(timeout=15)
+
+    # THE GREEN ARM: the record's `project` is CORRUPTED to a path that does not exist —
+    # exactly what a record written on another machine looks like — and the invoke lands
+    # anyway, because nothing on this side reads it.
+    good = home / "green"
+    process, root, log, ids = start_remote(good, cert, key, listen="127.0.0.1:0", token=TOKEN)
+    try:
+        plans = good / "home" / "binding-plans"
+        rewritten, elsewhere = 0, "/nonexistent/" + os.urandom(6).hex()
+        for record in sorted(plans.glob("*.json")):
+            doc = json.loads(record.read_text())
+            doc["project"] = elsewhere
+            record.write_text(json.dumps(doc))
+            rewritten += 1
+        wl.check(
+            "every staged record now names a project that is not on this machine",
+            rewritten > 0,
+            f"{rewritten} record(s) -> {elsewhere}",
+        )
+        addr = wl.read_addr(root, process)
+        hub = wl.Hub()
+        hub.process, hub.log = process, log
+        hub.directive = wl.serving_directive(
+            ll.RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
+        )
+        hub.connect(addr, root_cert=root_cert, token=TOKEN)
+        hub.ready(ids["tick"], 60)
+        body = invoke_once(hub, good, ids, "req-foreign-project")
+        wl.check(
+            "and the invoke SUCCEEDS: the writer's resolution decides nothing here",
+            body["status"] == 1,
+            "the same worker, the same plan id, a project path belonging to nobody",
+        )
+        hub.close()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=15)
+    return 0
 
 
 def hash_set_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:

@@ -163,6 +163,20 @@ class WorkerOptions:
     A launcher that knows its own root states it — cozy-creator passes its local root, a
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
+    project: Path | None = None
+    """THIS MACHINE's copy of the endpoint release being served (#563f).
+
+    A binding-plan record partitions into IDENTITY and RESOLUTION (#506a), and `project` is
+    the RESOLUTION half: the path the machine that WROTE the record put the release's tree
+    at. On that machine it is also this machine's path and the distinction never shows. On a
+    RENTED POD it is a path that does not exist, and discovering an endpoint from it fails
+    as `no_endpoint_toml` naming a directory on somebody else's disk — observed live.
+
+    So a worker resolves against its own root and never the writer's. `--project` states it;
+    absent, it is the process's working directory, which is what every launcher already sets
+    (cozy-creator runs the worker in the generation's source, and a pod's provisioner runs it
+    in the installed generation's source). The record's own `project` stays as recorded
+    evidence of where the WRITER resolved it, and decides nothing here."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -1690,7 +1704,10 @@ class Worker:
                 {
                     "cmd": "prepare",
                     "binding": {
-                        "project": first.project,
+                        # THIS machine's root, not the record writer's (#563f). See
+                        # WorkerOptions.project: the record's `project` is the resolution of
+                        # whoever wrote it, and on a rented pod that path is not here.
+                        "project": str(self.options.project or Path.cwd()),
                         "model_class": first.model_class,
                         "model_binding_path": first.model_binding_path,
                         "model_parameter_name": first.model_parameter_name,
@@ -2632,6 +2649,13 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         default="",
         help="comma-separated directory trees a file:// grant may address (#506b)",
     )
+    parser.add_argument(
+        "--project",
+        default="",
+        help="THIS machine's copy of the endpoint release tree; defaults to the working "
+        "directory. A binding-plan record's own `project` is the WRITER's resolution and is "
+        "not a path on a rented pod (#563f)",
+    )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -2660,6 +2684,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         python=args.python,
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
+        project=Path(args.project).resolve() if args.project else Path.cwd(),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,
