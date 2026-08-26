@@ -901,7 +901,11 @@ class Worker:
                     return
                 self._dispatch_frame(frame, generation)
         except Exception as exc:
-            self.note("session", f"the control stream ended: {type(exc).__name__}")
+            # THE MESSAGE, not the class name. A typed refusal carries the one sentence that
+            # says what to do about it, and reducing it to `PlanRefusal` produced a log that
+            # repeated forever and named nothing — the refusal had to be reproduced by hand
+            # off the record to find out which key it was about.
+            self.note("session", f"the control stream ended: {type(exc).__name__}: {exc}")
         finally:
             if self.fence.control_stream_generation == generation:
                 self.connected.clear()

@@ -272,7 +272,15 @@ class Executor:
         )
         objective = str(binding.get("objective") or "latency")
         model_cls = getattr(self.discovered.module, binding["model_class"])
-        config_document = json.loads(Path(binding["config"]).read_text())
+        # AN ARTIFACT THAT DECLARES NO CONSTRUCTION CONFIG GETS THE EMPTY DOCUMENT, and `{}`
+        # is that artifact's honest config identity rather than a missing one — it hashes
+        # into the plan like any other, and the construction layers already say what it
+        # means ("an artifact that carries none leaves every field at the release's own
+        # value"). Reading `Path("")` instead turned a legitimate config-less checkpoint
+        # into a file-not-found inside prepare.
+        config_document = (
+            json.loads(Path(binding["config"]).read_text()) if binding.get("config") else {}
+        )
         # The construction half of plan identity, computed from the HEADER and the CONFIG —
         # both available before a line of the model is built. They are the same facts the
         # post-construction record carries, one plane earlier, which is the only place a plan

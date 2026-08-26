@@ -545,6 +545,15 @@ RECORD_REQUIRED = frozenset({"entrypoint_binding_plan_id", "project", "release",
 
 #: The keys that TOGETHER declare one model. A record carries all of them or none of them:
 #: a weightless endpoint declares none and is served without a fill (cl-013).
+#:
+#: `config` IS NOT ONE OF THEM. An artifact's construction config is a document the artifact
+#: may or may not carry — an ingest with no `--config` produces a checkpoint whose header
+#: holds components and encodings and no config at all, and every field then stays at the
+#: release's own value, which is what the endpoints that read one already say. Counting it
+#: here made a whole, servable model read as HALF a declaration and refused it: a real H3
+#: artifact, pulled and verified at 92.42 GiB, was `binding_plan_partial_model` for the one
+#: key that is legitimately absent. An empty `config` is a fact about the artifact, not a
+#: half-written record.
 MODEL_KEYS = frozenset(
     {
         "model_class",
@@ -552,7 +561,6 @@ MODEL_KEYS = frozenset(
         "model_parameter_name",
         "components",
         "store",
-        "config",
         "snapshot",
     }
 )
