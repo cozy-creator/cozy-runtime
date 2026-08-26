@@ -2636,18 +2636,24 @@ class Worker:
                 if attempt.state not in ("running", "reclaiming"):
                     continue
                 deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-                if (
-                    attempt.state == "running"
-                    and deadline_ms
-                    and time.time() * 1000 > deadline_ms
-                    and not attempt.canceling
-                ):
-                    attempt.canceling = "deadline"
+                deadline_expired = False
+                with attempt.transition_lock:
+                    if (
+                        attempt.state == "running"
+                        and deadline_ms
+                        and time.time() * 1000 > deadline_ms
+                        and not attempt.canceling
+                    ):
+                        attempt.canceling = "deadline"
+                        executor = attempt.executor
+                        if executor is not None:
+                            self.supervision.cooperative_cancel(
+                                executor, f"{attempt.request_id}#{attempt.attempt}"
+                            )
+                        attempt.cancel_started = time.perf_counter()
+                        deadline_expired = True
+                if deadline_expired:
                     self.note("cancel", f"deadline expired for {attempt.request_id}")
-                    executor = attempt.executor
-                    if executor is not None and self.supervision.owns(executor):
-                        self.supervision.cooperative_cancel(executor)
-                    attempt.cancel_started = time.perf_counter()
                 if attempt.canceling:
                     started = getattr(attempt, "cancel_started", 0.0) or time.perf_counter()
                     attempt.cancel_started = started

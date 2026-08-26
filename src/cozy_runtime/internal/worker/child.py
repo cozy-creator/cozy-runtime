@@ -266,6 +266,7 @@ class ExecutorSupervision:
         self.current: Executor | None = None
         self.spawns = 0
         self.socket_path = str(root / "executor.sock")
+        self.cancel_path = root / "executor.cancel"
         self._listener: socket.socket | None = None
         self._lifecycle = threading.Lock()
         self._closed = False
@@ -453,18 +454,20 @@ class ExecutorSupervision:
         with self._lifecycle:
             return self.current is executor and executor.alive() and not self._closed
 
-    def cooperative_cancel(self, expected: Executor) -> bool:
-        """Signal only the exact executor still owned at this lifecycle boundary."""
+    def cooperative_cancel(self, expected: Executor, request_id: str) -> bool:
+        """Publish an attempt-keyed marker for only the exact executor still owned."""
         with self._lifecycle:
             if self.current is not expected or self._closed:
                 return False
+            temporary = self.root / f"executor.cancel.tmp.{os.getpid()}.{threading.get_ident()}"
             try:
-                # The lifecycle lock excludes the only code allowed to reap this direct
-                # child, so the checked PID cannot be reused before this signal is sent.
-                proctree.signal_process(expected.process, signal.SIGUSR1)
+                temporary.write_text(request_id)
+                os.replace(temporary, self.cancel_path)
                 return True
-            except ProcessLookupError:
+            except OSError:
                 return False
+            finally:
+                temporary.unlink(missing_ok=True)
 
     @contextlib.contextmanager
     def hold(self, expected: Executor) -> Any:
@@ -542,6 +545,9 @@ class ExecutorSupervision:
                 f"spawn refused: durable executor owner {recorded} remains; restart "
                 "reclamation must prove OS and driver absence first"
             )
+        # Cancellation is scoped to one executor generation as well as one attempt. A
+        # marker from the retired generation cannot become authority in its successor.
+        self.cancel_path.unlink(missing_ok=True)
         if self._listener is None:
             refusal = socket_path_refusal(self.socket_path)
             if refusal:

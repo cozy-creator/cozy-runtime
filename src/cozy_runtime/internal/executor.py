@@ -16,9 +16,10 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     probe     device/host memory facts, for the worker's ledger reconciliation
     shutdown  cooperative exit
 
-Cancellation arrives out of band as SIGUSR1 (cooperative) and SIGKILL (forceful) — the
-worker owns both clocks. `ctx.cancelled` reads the flag the handler is signalled with,
-which is why a cooperative body unwinds and a non-cooperative one gets killed.
+Cancellation is attempt-keyed: `ctx.cancelled` reads the marker the worker publishes for
+this exact request. A stale cancellation therefore cannot cross into the next attempt.
+The worker owns the grace clock and forcefully reclaims the whole executor scope if author
+code does not cooperate.
 
 The env seal is proved, not trusted: the sealed values are snapshotted BEFORE torch is
 imported, and every reply after CUDA init carries `env_intact`. A late imposition (the
@@ -34,7 +35,6 @@ import json
 import math
 import os
 import resource
-import signal
 import sys
 import time
 from pathlib import Path
@@ -68,17 +68,9 @@ INLINE_RESULT_MAX = 4 * 1024 * 1024
 #: worker prepared and then never dispatched.
 PREPARED_HELD = 8
 
-#: Set by SIGUSR1. THE cooperative-cancel signal: `ctx.raise_if_cancelled()` reads it.
-_CANCEL = False
-
 #: The environment as it was when this process started, restricted to the sealed names.
 #: Captured before any import that could initialize CUDA.
 _SEALED: dict[str, str] = {}
-
-
-def _sigusr1(signum: int, frame: object) -> None:
-    global _CANCEL
-    _CANCEL = True
 
 
 def _capture_seal() -> None:
@@ -89,6 +81,14 @@ def _capture_seal() -> None:
 def _env_intact() -> bool:
     """Whether the process environment still equals the seal CUDA initialized under."""
     return seal_snapshot() == _SEALED
+
+
+def _cancelled(root: Path, request_id: str) -> bool:
+    """Whether the worker's one cooperative marker names this exact attempt."""
+    try:
+        return (root / "executor.cancel").read_text() == request_id
+    except (OSError, UnicodeError):
+        return False
 
 
 def _proc_status(field: str) -> str:
@@ -779,8 +779,6 @@ class Executor:
 
     def invoke(self, command: dict[str, Any]) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
-        global _CANCEL
-        _CANCEL = False
         if not self.ready:
             return {
                 "ok": False,
@@ -840,7 +838,7 @@ class Executor:
                 deadline=deadline,
                 boot_warmup=bool(command.get("boot_warmup")),
                 device=self._device(),
-                cancel=lambda: _CANCEL,
+                cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=self.models,
                 progress=progress,
                 # cr-012: the inputs the WORKER already fetched, verified and spooled.
@@ -956,8 +954,6 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
-        global _CANCEL
-        _CANCEL = False
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if self.discovered is None:
@@ -1037,7 +1033,7 @@ class Executor:
                 spool=spool,
                 deadline=_deadline(command["deadline_s"]),
                 device=self._device() if self.torch is not None else Device(),
-                cancel=lambda: _CANCEL,
+                cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=self.models,
                 trees={
                     ref: (Path(root), digest)
@@ -1449,7 +1445,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _capture_seal()
-    signal.signal(signal.SIGUSR1, _sigusr1)
     channel = connect(args.socket)
     executor = Executor(channel, Path(args.root))
 

@@ -2177,16 +2177,15 @@ class AttemptEngine:
             if held.state == "reclaiming":
                 return "forceful executor reclaim is already in progress"
             if held.state != "running":
-                # NOTHING OF THIS ATTEMPT IS ON THE DEVICE. The signal is process-wide, so
-                # sending it here would cancel whichever attempt IS running — a different
-                # request's. The mark is enough: the device lane reads it when it reaches
-                # this attempt, and terminates it without dispatching.
+                # NOTHING OF THIS ATTEMPT IS ON THE DEVICE. The mark is enough: the device
+                # lane reads it when it reaches this attempt and terminates without dispatch.
                 return f"marked before dispatch ({held.canceling}); nothing signalled"
             executor = held.executor
-        if executor is None or not self.supervision.owns(executor):
-            return "executor already gone"
-        self.supervision.cooperative_cancel(executor)
-        return f"cooperative cancel signalled ({held.canceling})"
+            if executor is None or not self.supervision.cooperative_cancel(
+                executor, f"{held.request_id}#{held.attempt}"
+            ):
+                return "executor already gone or cooperative marker unavailable"
+            return f"cooperative cancel marked ({held.canceling})"
 
     def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output

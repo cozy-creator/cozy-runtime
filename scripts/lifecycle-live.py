@@ -1128,7 +1128,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     wl.check(
         "a stale E1 invalidation cannot poison or withdraw E2",
         not supervision.invalidate(first, "stale E1 observation")
-        and not supervision.cooperative_cancel(first)
+        and not supervision.cooperative_cancel(first, "req-stale#1")
         and supervision.current is successor
         and successor.alive()
         and not successor.poisoned,
