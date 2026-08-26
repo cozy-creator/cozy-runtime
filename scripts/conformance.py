@@ -126,9 +126,10 @@ def uses_job_services(payload: In, scratch: Scratch, ckpt: Checkpoints, budget: 
     del payload
     receipt = ckpt.declare("state", b"durable", operation_key="op/1")
     replay = ckpt.declare("state", b"durable", operation_key="op/1")
+    # No fake-green line to guard: `save()` is typed `NoReturn`, so the branch where it
+    # returns a receipt does not exist for a detector to catch (#553a/#563f).
     try:
         ckpt.save("state", b"durable", operation_key="op/2")
-        refusal = "ACCEPTED — save() returned a receipt for bytes nobody stored"
     except Exception as exc:
         refusal = f"{type(exc).__name__}:{getattr(exc, 'code', '')}"
     return JobFacts(

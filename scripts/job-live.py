@@ -105,9 +105,10 @@ def conflicting(payload: ProbeIn, ckpt: Checkpoints) -> ProbeOut:
 def durable_save(payload: ProbeIn, ckpt: Checkpoints) -> ProbeOut:
     """#553a's red arm: the durable-save door is HARD-DISABLED and says why."""
     del payload
+    # The "it returned a receipt" branch is gone because `save()` is typed `NoReturn` —
+    # the type states what this arm used to have to detect (#553a/#563f).
     try:
         ckpt.save("state", b"one", operation_key="op/1")
-        return ProbeOut("Checkpoints.save() RETURNED A RECEIPT for bytes nobody stored")
     except Exception as exc:
         return ProbeOut(f"{type(exc).__name__}:{getattr(exc, 'code', '')}:{exc}")
 
