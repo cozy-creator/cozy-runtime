@@ -24,6 +24,11 @@ jobs:
       # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
       # refuses a stale one (§1.0). A staleness check, not a test suite.
       - run: uv run cozy-runtime describe --check --dir examples
+      # THE WIRE FENCE (#530-A1), recomputed from the vendored descriptor: the schema
+      # digest is DERIVED, so a copy that is not the schema it claims refuses here. It
+      # fires on every push and needs nothing outside this repo. What it does NOT cover —
+      # the generated FILES, byte for byte — is the `drift` job below.
+      - run: uv run python scripts/wire-fence.py
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python scripts/conformance.py
@@ -51,16 +56,36 @@ jobs:
       WORKER_PROTOCOL_SHA: df05c8d6f03603a9e6b5e735522507aa4e3b4638
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and
+      # `github.token` is scoped to THIS repository, so the byte-diff needs a read
+      # credential only the owner can mint. Rather than sit red forever or hide behind a
+      # hand-flipped variable, the job detects the credential and runs the moment it
+      # exists — and says loudly, in the run's annotations, when it does not.
+      #
+      # Nothing is silently unguarded in the meantime: `scripts/wire-fence.py` in `checks`
+      # refuses a vendored binding that is not the pinned schema, on every push. This job
+      # adds what that one structurally cannot see — the generated files themselves,
+      # compared against a regeneration by the pinned toolchain.
+      - id: credential
+        run: |
+          if [ -n "${{ secrets.WORKER_PROTOCOL_TOKEN }}" ]; then
+            echo "present=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=no" >> "$GITHUB_OUTPUT"
+            echo "::warning title=vendored-drift check not run::WORKER_PROTOCOL_TOKEN is not set, so cozy-creator/worker-protocol-v2 cannot be checked out and the byte-for-byte vendored-drift check did not run. scripts/wire-fence.py still fenced the schema itself."
+          fi
+      - if: steps.credential.outputs.present == 'yes'
+        uses: actions/checkout@v4
         with:
           repository: cozy-creator/worker-protocol-v2
           ref: ${{ env.WORKER_PROTOCOL_SHA }}
           path: .worker-protocol
-          # A read token for the sibling private repo. `github.token` is scoped to THIS
-          # repository and cannot reach it.
           token: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-go@v5
+      - if: steps.credential.outputs.present == 'yes'
+        uses: astral-sh/setup-uv@v5
+      - if: steps.credential.outputs.present == 'yes'
+        uses: actions/setup-go@v5
         with:
           go-version: stable
-      - run: .worker-protocol/scripts/vendored-diff.sh src
+      - if: steps.credential.outputs.present == 'yes'
+        run: .worker-protocol/scripts/vendored-diff.sh src

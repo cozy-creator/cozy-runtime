@@ -62,6 +62,13 @@ implicit_reexport = false
 module = ["torch.*", "triton.*", "numpy.*"]
 ignore_missing_imports = true
 
+# `av` is the `media` OPTIONAL extra, exactly like torch: the base package is media-free
+# and the checking venv does not install it. The consequence is recorded rather than
+# papered over — the two modules that touch PyAV are checked with PyAV untyped.
+[[tool.mypy.overrides]]
+module = ["av", "av.*"]
+ignore_missing_imports = true
+
 # `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
 # hand-written `_ext.pyi`), so this is not a case of an untyped dependency: it is simply not
 # installed in the checking venv, exactly like torch, because it is a native extension the
