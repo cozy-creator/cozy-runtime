@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Twelve fences, each provable red by planting the violation (`scripts/redarm.py`):
+Thirteen fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import · package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
-  endpoint-owns-no-residency
+  endpoint-owns-no-residency · reviewed-specs-exist
 """
 
 from __future__ import annotations
@@ -517,8 +517,50 @@ def fence_timing_decides_nothing() -> list[str]:
     return bad
 
 
+def fence_reviewed_specs_exist() -> list[str]:
+    """Every spec digest this build declares reviewed EXISTS in the installed registry.
+
+    A provider's reviewed digest set is its claim about which physical byte contracts it was
+    read against. TensorFS owns those documents, so the two repositories can drift — and
+    they did: tensorfs `940973f` moved both `fp8-scaled-scalar/1` seed specs and this side
+    kept the old pair, which made every fp8-scaled-scalar artifact unservable. The refusal
+    was correct and it fired at PREPARE, on a rented H200, after 92.42 GiB had been pulled.
+    It costs one call to find out at $0 instead.
+
+    An absent `tensorfs` is RED, not skipped: this fence's whole subject is agreement with a
+    registry, and a fence that goes green because it could not look is the fake green the
+    fences exist to prevent.
+    """
+    try:
+        import tensorfs
+    except ImportError as exc:
+        return [
+            f"the tensorfs reader is not installed, so no declared spec digest can be "
+            f"checked against the registry that owns it ({exc}). Install the wheel this "
+            "release pins — an unchecked digest set is not a green one"
+        ]
+    from cozy_runtime.internal.encoding import formats
+
+    carried = {digest: alias for alias, digest in tensorfs.seed_digests()}
+    bad: list[str] = []
+    for name in sorted(n for n in dir(formats) if n.startswith("SPEC_")):
+        declared = getattr(formats, name)
+        if not isinstance(declared, str) or not declared.startswith("sha256:"):
+            continue
+        if declared not in carried:
+            bad.append(
+                f"formats.{name} = {declared[:23]}… is not in the installed registry, which "
+                f"carries {len(carried)} seed spec(s). A registry that moved a spec has "
+                "changed what those bytes mean; inferring the replacement by alias is the "
+                "substitution the launch refusal forbids, so the constant is REVIEWED and "
+                "updated by hand or the wheel is the wrong one"
+            )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
+    "reviewed-specs-exist": fence_reviewed_specs_exist,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "torch-free-import": fence_torch_free_import,

@@ -37,6 +37,14 @@ STATIC_ARMS = (
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
+    # The exact drift that cost a rented H200: a reviewed spec digest this build declares
+    # and the installed registry does not carry. Planted as a well-formed digest of the
+    # right shape, because a malformed one would be caught by looking rather than by asking.
+    Arm(
+        "reviewed-specs-exist",
+        SRC / "internal" / "encoding" / "formats.py",
+        'SPEC_PLANTED_UNREVIEWED = "sha256:' + "de" * 32 + '"\n',
+    ),
     Arm(
         "excluded-keywords",
         SRC / "author" / "_context.py",
