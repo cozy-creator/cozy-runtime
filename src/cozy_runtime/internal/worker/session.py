@@ -1808,15 +1808,22 @@ class Worker:
                 # the fault is typed on the placement.
                 self.latched = f"prepare refused: {reply.get('code')}"
                 self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
+                # #567c's SECOND HALF: a refusal reduced to its class name is a refusal
+                # that does not exist. This line carried the code and four memory numbers
+                # and DROPPED the executor's own message — so an operator watching a boot
+                # fail read "unhandled_exception" beside "the allocator holds -1 B", which
+                # names neither what broke nor where. The detail leads; the memory state
+                # follows it, because on a genuine shortfall those numbers are the answer
+                # and on everything else they are context.
                 self.note(
                     "boot",
                     f"prepare REFUSED for {first.entrypoint_binding_plan_id[:20]}: "
-                    f"{reply.get('code')} - "
-                    f"peak allocator {reply.get('peak_allocator_bytes', 0)} B / ledger "
+                    f"{reply.get('code')} - {detail} "
+                    f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B / ledger "
                     f"{reply.get('peak_ledger_vram_bytes', 0)} B was LIVE when it failed; "
                     f"after rollback the allocator holds "
                     f"{reply.get('allocator_bytes', -1)} B and the device has "
-                    f"{reply.get('device_free_bytes', -1)} B free",
+                    f"{reply.get('device_free_bytes', -1)} B free]",
                 )
                 self.supervision.invalidate(f"prepare refused: {reply.get('code')}")
                 return
