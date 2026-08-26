@@ -401,15 +401,19 @@ class MicroScaledDequant:
     resident weights are float either way, exactly as the fp8 route's docstring says of
     itself. `NAMED_SEAMS` keeps the native door named with the device class that opens it.
 
-    **Why the multiplier is formed in the DESTINATION dtype.** The alternative — promote to
-    f32, multiply, cast down — allocates a second full-width copy of every weight, which
-    this plane prices as decode scratch and would then be carrying unledgered. The scale is
-    a pure power of two, so forming it in bf16 or f32 is EXACT for every byte those dtypes
-    can hold (bf16 carries integers to 255 exactly and subnormals to 2**-133, so
-    `2**(b-127)` is exact for b in 0..254). f16 cannot: `2**(b-127)` flushes to zero below
-    b = 103, so a block whose product WOULD be representable decodes as zero. That is not
-    papered over here — `probe.py` measures the full domain per output dtype and f16 mints
-    no record, so an f16 mxfp8 destination refuses `encoding_unqualified` rather than being
+    **Why the multiply lands in the DESTINATION dtype.** The alternative — promote the
+    PAYLOAD to f32, multiply, cast down — allocates a second full-width copy of every
+    weight, which this plane prices as decode scratch and would then be carrying
+    unledgered. It is also unnecessary: an e4m3 element is exact in bf16 and f32 (4
+    significant bits into 8 or 24), the block multiplier is an exact power of two, so the
+    product carries ONE rounding and the measured error over the whole format domain is
+    ZERO. The multiplier grid itself is 1/32 of the weight, so `_multiplier` builds it in
+    f32 and narrows once — negligible bytes, one exact code path.
+
+    What f16 cannot do is hold the multiplier: `2**(b-127)` leaves f16's range below
+    b = 103, so a block whose PRODUCT would be representable decodes as zero. That is not
+    papered over — `probe.py` measures the full domain per output dtype, f16 mints no
+    record, and an f16 mxfp8 destination refuses `encoding_unqualified` rather than being
     served silently wrong. Widening f16 needs a capability record that can carry a qualified
     exponent RANGE, which the tfs-013 key cannot express today.
     """
@@ -439,6 +443,34 @@ class MicroScaledDequant:
     def optional(self) -> frozenset[str]:
         return frozenset()
 
+    @staticmethod
+    def _multiplier(torch: Any, scale: Any, dtype: Any) -> Any:
+        """One E8M0 byte grid -> the block multipliers, BY BIT CONSTRUCTION.
+
+        An E8M0 byte IS an IEEE binary32 exponent field: `b` in 1..254 denotes exactly the
+        f32 whose bit pattern is `b << 23`, mantissa zero. So the multiplier is built, not
+        computed — no `exp2`, no `pow`, nothing whose accuracy is a property of the backend's
+        math library. That is the whole reason this is written the hard way: measured on an
+        L40S, `torch.exp2` over the same domain is correct in bf16 and off by up to 2.3 ULP
+        in f32 for the smallest scale bytes, which failed 46 of 65,536 pairs against a
+        two-rounding budget. Loosening the budget to admit it would have been the wrong
+        repair — the decode's error should be ZERO, and a transcendental in the path is what
+        made it non-zero. It is also the only spelling that cannot drift between a CPU
+        qualification and the CUDA decode it qualifies.
+
+        Two code points are not exponents and are placed by hand: `b = 0` denotes `2**-127`,
+        one binade below f32's smallest NORMAL, so it is the subnormal `1 << 22`; and
+        `b = 255` is E8M0's NaN, which `b << 23` would spell as a signed infinity.
+        """
+        bits = scale.to(torch.int32) << 23
+        bits = torch.where(scale == 0, torch.full_like(bits, 1 << 22), bits)
+        # f32 first, in one code path, because its exponent range covers the whole byte
+        # domain exactly; narrowing to the destination is then a single exact conversion
+        # wherever the destination can hold the value, and 0 or inf where it cannot — which
+        # is exactly what the probe measures per output dtype.
+        mult = bits.view(torch.float32).to(dtype)
+        return torch.where(scale == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
+
     def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
         data = parts["data"]
         scale = parts["scale"]
@@ -449,14 +481,7 @@ class MicroScaledDequant:
         # and forming it costs nothing worth accounting. `.to(dtype)` on a u8 in 0..255 is
         # exact in every float dtype; the subtraction and the exp2 are exact wherever the
         # result is representable, which is what the probe proves rather than assumes.
-        mult = torch.exp2(scale.to(dtype) - E8M0_BIAS)
-        # E8M0's NaN code point, applied on the SCALE tensor (1/32 of the weight) rather
-        # than element-wise on the payload. `exp2(128)` is `inf` in every dtype here and the
-        # reference decoder says NaN, so without this line a poisoned block would decode to
-        # a signed infinity — a different wrong answer, and one an output-integrity floor
-        # reads differently. The producing job clamps to 254 and never emits this byte;
-        # a decoder that is only correct on its own producer's output is not a decoder.
-        mult = torch.where(scale == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
+        mult = self._multiplier(torch, scale, dtype)
         if cols == blocks * MX_BLOCK and destination.is_contiguous():
             # THE PATH EVERY REAL ARTIFACT TAKES. A 3-D view over both sides broadcasts the
             # block scale with no intermediate at all: no repeat, no f32 copy, one kernel.
