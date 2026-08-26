@@ -27,9 +27,10 @@ from typing import Any
 
 #: Asset kinds with a real, tiny, deterministic fixture. `image` and `file` are producible
 #: because the SDK owns an actual PNG encoder and raw bytes need no encoder at all.
-#: `audio` and `video` have NO encoder in this release (`Outputs.save_audio`/`save_video`
-#: refuse; cr-017 owns the codec plane), so a required one is `skipped` with that reason
-#: rather than warmed with an invented file that no decoder in this build could have made.
+#: `audio` and `video` encoders exist (cr-017's codec plane) but live behind the `media`
+#: extra, which the deciding environment may not have — a fixture that exists only in some
+#: venvs would make boot behavior env-dependent, so a required audio/video input stays
+#: `skipped` with its reason until the warm pass has an unconditional producer.
 _ASSET_FIXTURES = ("image", "file")
 
 #: Bounds for a synthesized number when the schema declares them. Neutral means the

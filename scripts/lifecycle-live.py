@@ -256,8 +256,13 @@ def main() -> int:
         wl.head("2. invoke: tick -> ok terminal")
         t1 = time.perf_counter()
         wl.dispatch(
-            hub, tmp, ids["tick"], request_id="req-tick", payload={"note": "alive"},
-            release=RELEASE, outputs=0,
+            hub,
+            tmp,
+            ids["tick"],
+            request_id="req-tick",
+            payload={"note": "alive"},
+            release=RELEASE,
+            outputs=0,
         )
         terminal = hub.wait(
             lambda m: (
@@ -280,8 +285,13 @@ def main() -> int:
         wl.head("3. cancel: hold(120s plant) stopped cooperatively")
         since = hub.mark()
         _, digest = wl.dispatch(
-            hub, tmp, ids["hold"], request_id="req-cancel", payload={"seconds": 120.0},
-            release=RELEASE, outputs=0,
+            hub,
+            tmp,
+            ids["hold"],
+            request_id="req-cancel",
+            payload={"seconds": 120.0},
+            release=RELEASE,
+            outputs=0,
         )
         hub.wait(
             lambda m: (
@@ -339,8 +349,14 @@ def main() -> int:
                 raise SystemExit("req-crash refused three times — the worker never converged")
             since = hub.mark()
             wl.dispatch(
-                hub, tmp, ids["hold"], request_id="req-crash", attempt=attempt_no,
-                payload={"seconds": 120.0}, release=RELEASE, outputs=0,
+                hub,
+                tmp,
+                ids["hold"],
+                request_id="req-crash",
+                attempt=attempt_no,
+                payload={"seconds": 120.0},
+                release=RELEASE,
+                outputs=0,
             )
             outcome = hub.wait(
                 lambda m: (
@@ -388,8 +404,13 @@ def main() -> int:
         wl.head("5. orphan: SIGKILL the WORKER control process mid-hold; the executor must die")
         since = hub.mark()
         wl.dispatch(
-            hub, tmp, ids["hold"], request_id="req-orphan", payload={"seconds": 120.0},
-            release=RELEASE, outputs=0,
+            hub,
+            tmp,
+            ids["hold"],
+            request_id="req-orphan",
+            payload={"seconds": 120.0},
+            release=RELEASE,
+            outputs=0,
         )
         hub.wait(
             lambda m: (

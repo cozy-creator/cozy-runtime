@@ -40,6 +40,10 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
 }
 # The author surface is import-fenced to stdlib + schema/typing libraries only.
 AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec",)
+# The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
+# the same shape as torch in the harness — importing the author surface never pulls it, and
+# an absent wheel is the typed `encoder_unavailable` refusal, not an ImportError at import.
+AUTHOR_ALLOWED_LAZY = ("av",)
 
 ENV_AUTHORITY = SRC / "internal" / "config.py"
 CONFIG_SYMBOLS = ("RuntimeConfig", "read_config")
@@ -105,7 +109,18 @@ def fence_package_imports() -> list[str]:
         parts = path.relative_to(SRC).parts
         pkg = parts[0] if len(parts) > 1 else ""
         forbidden = PACKAGE_FENCES.get(pkg, ())
-        for name in imports(ast.parse(path.read_text())):
+        tree = ast.parse(path.read_text())
+        module_scope = {
+            a.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import) and node.col_offset == 0
+            for a in node.names
+        } | {
+            (node.module or "").split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.col_offset == 0
+        }
+        for name in imports(tree):
             rel = path.relative_to(ROOT)
             if any(name == f or name.startswith(f + ".") for f in forbidden):
                 bad.append(f"{rel}: {module_of(path)} may not import {name}")
@@ -115,6 +130,7 @@ def fence_package_imports() -> list[str]:
                 and root not in stdlib
                 and root != "cozy_runtime"
                 and root not in AUTHOR_ALLOWED_THIRD_PARTY
+                and not (root in AUTHOR_ALLOWED_LAZY and root not in module_scope)
             ):
                 bad.append(f"{rel}: author surface may not import third-party {name}")
     return bad

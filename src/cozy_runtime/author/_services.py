@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Literal, Protocol, TypeVar, cast, runtime_checkable
 
+from cozy_runtime.author import _codec
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -229,17 +230,26 @@ class Outputs(_Bound):
     def save_image(self, image: object, *, format: str = "png") -> ImageAsset:
         if format != "png":
             raise OutputError(
-                f"format {format!r} has no encoder in this release: png is the one that "
-                "exists; the codec plane (webp/mp4/flac + integrity floor + C2PA) is cr-017",
+                f"image format {format!r} has no encoder: png is the image product "
+                "(mp4/flac live in save_video/save_audio; webp, the integrity floor and "
+                "C2PA are cr-017's remaining half)",
                 code="encoder_unavailable",
             )
         return self._register(encode_png(as_frame(image)), ImageAsset, "image/png")
 
     def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioAsset:
-        raise OutputError(
-            f"audio encode ({format}, {sample_rate} Hz) is cr-017's codec plane",
-            code="encoder_unavailable",
-        )
+        self._attempt.check_open("Outputs.save_audio")
+        _codec.require_encoder()
+        if format != "flac":
+            raise OutputError(
+                f"audio format {format!r} has no encoder: flac is the audio product and "
+                "the codec zoo is a closed door (cr-017)",
+                code="encoder_unavailable",
+            )
+        self._check_rate(sample_rate)
+        planar, clipped = _codec.snapshot_audio(waveform, self._attempt.max_output_bytes)
+        self._clip_row(clipped)
+        return self._register(_codec.encode_flac(planar, sample_rate), AudioAsset, "audio/flac")
 
     def save_video(
         self,
@@ -250,11 +260,52 @@ class Outputs(_Bound):
         sample_rate: int | None = None,
         format: str = "mp4",
     ) -> VideoAsset:
-        raise OutputError(
-            f"video encode ({format}, {fps} fps) — including the A/V mux that makes one "
-            "container out of frames+audio — is cr-017's codec plane",
-            code="encoder_unavailable",
-        )
+        self._attempt.check_open("Outputs.save_video")
+        _codec.require_encoder()
+        if format != "mp4":
+            raise OutputError(
+                f"video format {format!r} has no encoder: the one A/V product is the muxed "
+                "mp4 (h264+aac) and the codec zoo is a closed door (cr-017)",
+                code="encoder_unavailable",
+            )
+        if not (isinstance(fps, (int, float)) and 0 < fps < 1000 and fps == fps):
+            raise OutputError(f"fps {fps!r} is not a positive frame rate", code="frame_rate")
+        video = _codec.snapshot_video(frames, self._attempt.max_output_bytes)
+        planar = None
+        if audio is not None:
+            if sample_rate is None:
+                raise OutputError(
+                    "save_video(audio=...) needs sample_rate: a waveform without its clock "
+                    "is not muxable",
+                    code="audio_rate",
+                )
+            self._check_rate(sample_rate)
+            planar, clipped = _codec.snapshot_audio(audio, self._attempt.max_output_bytes)
+            self._clip_row(clipped)
+        data = _codec.encode_mp4(video, float(fps), planar, sample_rate)
+        return self._register(data, VideoAsset, "video/mp4")
+
+    @staticmethod
+    def _check_rate(sample_rate: object) -> None:
+        if not (isinstance(sample_rate, int) and 0 < sample_rate <= 384_000):
+            raise OutputError(
+                f"sample_rate {sample_rate!r} is not a positive sample rate", code="audio_rate"
+            )
+
+    def _clip_row(self, clipped: int) -> None:
+        """The encoder's clamp is runtime policy, so it is VISIBLE as an adjustment row —
+        never a silent rewrite of the author's waveform."""
+        if clipped:
+            self._attempt.rows.append(
+                AdjustmentRow(
+                    "clamp",
+                    "audio",
+                    f"{clipped} samples outside [-1, 1]",
+                    "clamped to [-1, 1]",
+                    "encoder input range is [-1, 1]; excursions are clamped and counted",
+                    source="policy",
+                )
+            )
 
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
