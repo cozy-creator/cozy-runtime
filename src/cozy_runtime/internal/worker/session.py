@@ -45,7 +45,7 @@ from cozy_runtime.internal import egress, hostfacts
 from cozy_runtime.internal.config import RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import grants, observe, triage
+from cozy_runtime.internal.worker import child, grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -86,12 +86,12 @@ REPORT_SECONDS = 2.0
 #: is the shared CLI/coordinator vocabulary, and this is a worker PROCESS disposition.
 RECYCLE_EXIT = 75
 
-#: How long a StartAttempt that arrives while the executor is being rebuilt WAITS before it
-#: gives up and takes the ordinary not-ready refusal. It is generous because the thing it is
-#: waiting for is a real refill: about 5 s warm on the launch family and ~48 s from a cold
-#: page cache. The alternative is what cl-003 measured — a refusal per dispatch, a requeue
-#: budget of three spent in 1.8 s, and a worker that was serving again four seconds later.
-REBUILD_WAIT_SECONDS = 120.0
+#: How often the rebuild queue LOOKS. A sampling cadence is the resolution of an
+#: observation, never a bound on one: `await_settled` waits for as long as the rebuild is
+#: making progress and stops when it stops, and this only says how finely it can tell.
+#: It is the Report cadence because that is already the rate at which this worker's
+#: non-attempt facts move.
+REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +180,7 @@ class Supervisor:
         # and the journal-backed bundle store. All three outlive the executor, and the
         # bundle store's receipts outlive THIS process too.
         self.boot = observe.BootRecord()
-        self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_cpu)
+        self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.journal)
         self.engine = AttemptEngine(
             journal=self.journal,
@@ -312,25 +312,14 @@ class Supervisor:
                 return int(parts[1]) * 1024 * 1024
         return -1
 
-    def read_device_cpu(self) -> int:
-        """CPU nanoseconds the EXECUTOR has burned, read by the parent from `/proc`.
+    def read_device_work(self) -> int:
+        """How much work the EXECUTOR has done, read by the parent from `/proc`.
 
         Like RSS and the NVML per-process bytes: the child's claim about itself is one this
-        supervisor cannot check, and here it does not have to. -1 is UNREADABLE, never a
-        zero — an unreadable meter decides nothing.
+        supervisor cannot check, and here it does not have to. THE meter — the same one the
+        spawn path waits on — so "busy, not wedged" means the same thing everywhere.
         """
-        pid = self.ledger.executor_pid
-        if not pid:
-            return -1
-        try:
-            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
-        except (OSError, IndexError):
-            return -1
-        try:
-            ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
-        except (ValueError, IndexError):
-            return -1
-        return ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
+        return child.work(self.ledger.executor_pid)
 
     def applied_posture(self) -> dict[str, Any]:
         """The deployment state the worker was in when something happened (§3.6).
@@ -752,7 +741,11 @@ class Supervisor:
                         "cmd": "warm",
                         "request_id": f"warm-{binding.entrypoint}",
                         "entrypoint": binding.entrypoint,
-                        "deadline_s": 300.0,
+                        # NO BOUND, because warm is a BOOT STEP and boot is silence-bounded
+                        # (§3.3: "no boot timeout exists here to be tuned"). A 300 s ceiling
+                        # here said the opposite in the one place a slow first warm would
+                        # meet it. `SilenceMonitor` is what ends a warm that stalls.
+                        "deadline_s": None,
                         "spool": str(spool),
                     },
                     timeout=None,
@@ -965,7 +958,8 @@ class Supervisor:
         self.work.put(attempt)
 
     def await_settled(self, attempt: AttemptRecord) -> None:
-        """QUEUE behind a rebuild instead of refusing through one.
+        """QUEUE behind a rebuild instead of refusing through one — for exactly as long as
+        the rebuild is MAKING PROGRESS.
 
         The alternative is a dispatch/refuse/requeue loop: every attempt landing in a
         rebuild window is refused `executor_not_ready`, which a coordinator can only read as
@@ -973,25 +967,60 @@ class Supervisor:
         coordinator's budget is for (cl-003).
 
         The wait is on the DEVICE LANE, which is the thread that would have been idle anyway.
-        It used to be on the control reader, where 120 s of waiting was 120 s in which no
-        cancel, ack, directive or shutdown could be heard.
+        It used to be on the control reader, where the waiting was time in which no cancel,
+        ack, directive or shutdown could be heard.
+
+        WHAT ENDS THE WAIT is never a wall-clock guess. It used to be `REBUILD_WAIT_SECONDS
+        = 120.0`, derived from nothing but the observation that a cold refill takes ~48 s —
+        which makes it a CEILING on how slow a legitimate refill may be, and the first
+        cold-cache load slower than it turns a working worker into a refusing one. The two
+        things that may end it are the two that mean something:
+
+        * THE CALLER'S OWN BOUND. `admit` cancels an attempt that reached the lane past its
+          deadline, so waiting past that deadline is waiting to throw the answer away. No
+          deadline is no bound, exactly as the output grant reads it (cr-009).
+        * A STALL, observed. Progress is the boot ring's own monotone position or the
+          executor burning CPU — the same two integers `SilenceMonitor` compares, and the
+          same rule: an UNREADABLE meter decides nothing, so it neither rescues the subject
+          nor condemns it. `observe.GIVE_UP_AFTER` consecutive samples that found both
+          still is a rebuild that has stopped, and the attempt takes the ordinary typed
+          not-ready refusal with that observation on the durable Report.
         """
         if self.settled.is_set():
             return
         started = time.perf_counter()
         key = f"{attempt.request_id}#{attempt.attempt}"
+        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
         self.note(
             "readiness",
-            f"{key} reached the lane while the worker is rebuilding: waiting up to "
-            f"{REBUILD_WAIT_SECONDS:g} s rather than refusing it",
+            f"{key} reached the lane while the worker is rebuilding: waiting while the "
+            "rebuild makes progress rather than refusing it",
         )
-        settled = self.settled.wait(REBUILD_WAIT_SECONDS)
+        still = 0
+        position, burned = -1, -1
+        why = ""
+        while not (settled := self.settled.wait(REBUILD_SAMPLE_SECONDS)):
+            if deadline_ms and time.time() * 1000 > deadline_ms:
+                # `admit` is about to cancel it for exactly this. Waiting on a rebuild for
+                # an answer whose caller has stopped waiting spends the card on nobody.
+                why = "the attempt's own deadline expired while it queued"
+                break
+            still += 1
+            (position, before_position) = (self.boot.ring.admitted, position)
+            (burned, before_burned) = (self.read_device_work(), burned)
+            if position > before_position >= 0 or burned > before_burned >= 0:
+                still = 0
+            if still >= observe.GIVE_UP_AFTER:
+                why = (
+                    f"{still} consecutive observations found the rebuild at ring position "
+                    f"{position} having burned {burned} ns: it is stalled, not slow"
+                )
+                break
         waited = (time.perf_counter() - started) * 1000
         self.note(
             "readiness",
             f"{key} waited {waited:.0f} ms; intake is "
-            f"{pb.IntakeState.Name(self.fences.intake)}"
-            + ("" if settled else " (the wait expired)"),
+            f"{pb.IntakeState.Name(self.fences.intake)}" + ("" if settled else f" ({why})"),
         )
 
     def refuse(

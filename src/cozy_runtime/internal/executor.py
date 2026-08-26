@@ -31,6 +31,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import resource
 import signal
@@ -100,6 +101,19 @@ def _proc_status(field: str) -> str:
 
 def _rss() -> int:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+def _deadline(seconds: float | None) -> float:
+    """The monotonic instant this attempt must not outlive — or NO INSTANT AT ALL.
+
+    `None` is "does not expire", and it is deliberately not 0: a duration of zero is a real
+    remaining time, so reading the two as one would hand an attempt whose deadline had just
+    lapsed an unbounded one. An attempt whose caller minted no deadline has no bound to
+    derive one from, and inventing one here would put a ceiling on what an attempt may be
+    that the supervisor's own watchdog does not enforce — two clocks disagreeing about the
+    same attempt (cr-009).
+    """
+    return math.inf if seconds is None else time.monotonic() + seconds
 
 
 # --------------------------------------------------------------------------- state
@@ -643,7 +657,7 @@ class Executor:
                 "(a fresh incarnation holds nothing at all)",
             }
         spool = Path(command["spool"])
-        deadline = time.monotonic() + command["deadline_s"]
+        deadline = _deadline(command["deadline_s"])
         torch = self.torch
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
@@ -862,7 +876,7 @@ class Executor:
             Invocation(
                 request_id=command["request_id"],
                 spool=spool,
-                deadline=time.monotonic() + command["deadline_s"],
+                deadline=_deadline(command["deadline_s"]),
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _CANCEL,
                 models=self.models,

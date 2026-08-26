@@ -1066,9 +1066,18 @@ class AttemptEngine:
         attempt.executions += 1
         self.executed += 1
 
+        # WHAT THE HANDLER IS GIVEN, and it is the caller's own number or nothing at all.
+        # A 0.5 s FLOOR under an already-expired deadline is not a floor, it is 0.5 s of
+        # extension the caller never granted — and `admit` cancels a past-deadline attempt
+        # before the lane, so the only thing the floor ever did was hide the race. An
+        # attempt with NO deadline has no bound to derive one from: 3600 s for a job and
+        # 600 s for a serving attempt were ceilings on what an attempt may BE, invented
+        # here and contradicting the supervisor's own watchdog, which cancels on a deadline
+        # only when the caller minted one (cr-009). NO BOUND is spelled `None` and never 0:
+        # a duration of zero is a real remaining time — the instant a deadline lapses — and
+        # collapsing the two would silently hand an expired attempt an unbounded one.
         deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-        default = 3600.0 if job else 600.0
-        seconds = max(0.5, deadline_ms / 1000 - time.time()) if deadline_ms else default
+        seconds = deadline_ms / 1000 - time.time() if deadline_ms else None
         attempt.dispatched_at = time.perf_counter()
         key = f"{attempt.request_id}#{attempt.attempt}"
         # The SUPERVISOR's own rows. They are the half of the narrative that cannot be lost
@@ -1081,7 +1090,7 @@ class AttemptEngine:
             "info",
             subject=self._subject(attempt),
             incarnation=self.supervision.incarnation,
-            deadline_s=round(seconds, 3),
+            deadline_s=round(seconds, 3) if seconds is not None else None,
         )
         try:
             reply = executor.call(
@@ -1123,7 +1132,7 @@ class AttemptEngine:
         return attempt.declared.entrypoint if attempt.declared else ""
 
     def _command(
-        self, attempt: AttemptRecord, key: str, spool: Path, seconds: float
+        self, attempt: AttemptRecord, key: str, spool: Path, seconds: float | None
     ) -> dict[str, Any]:
         """The ONE thing the two lanes genuinely differ in: what they ask the executor."""
         if attempt.job is not None:

@@ -30,15 +30,17 @@ from typing import Any
 
 from cozy_runtime.internal import spawn
 from cozy_runtime.internal.seam import Channel, SeamError, listener
+from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 
 #: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
 #: short enough that a caller's cancel is not a lifetime. A RUNTIME CONSTANT; `grace_ms` on
 #: CancelAttempt is the operator override door, and no author surface reaches it.
 GRACE_SECONDS = 3.0
 
-#: How long the supervisor waits for a spawned executor to dial back before calling the
-#: incarnation dead. Not a boot timeout for LOADING — that stays silence-bounded (§3.3).
-DIAL_SECONDS = 60.0
+#: How often the supervisor LOOKS while a spawned executor is dialling back. A sampling
+#: cadence, not a bound: `spawn` waits while the child is alive and burning CPU, and this
+#: only says how finely it can tell. Short because the answer is normally milliseconds away.
+DIAL_SAMPLE_SECONDS = 0.5
 
 
 #: `sockaddr_un.sun_path` is 108 bytes on Linux, NUL included. A COZY_HOME deep enough to
@@ -46,6 +48,40 @@ DIAL_SECONDS = 60.0
 #: that exited before advertising a plan (cl-013). The cause is measurable here, so it is
 #: named here.
 SUN_PATH_MAX = 108
+
+
+def work(pid: int) -> int:
+    """How much WORK a process has done, read from `/proc` by whoever is watching it.
+
+    THE PROGRESS METER, and the only thing that separates a slow subject from a wedged one
+    (cr-011). Two monotone counters summed: CPU nanoseconds burned, and bytes actually
+    fetched from storage. Summing is exactly "either one moved", because neither ever
+    falls — and both hands are needed, because the two ways to be busy and silent are to
+    compute (a hash-bound conversion leg) and to wait on the disk (a cold-page-cache import
+    of a multi-gigabyte extension). A meter with only the first hand kills the second.
+
+    THIS PROCESS, threads included, and its unreaped children excluded — which is the right
+    reading because the trampoline EXECS the executor, so the pid that is watched is the pid
+    that does the work, and torch's own parallelism is threads.
+
+    -1 is UNREADABLE, never a zero — an unreadable meter decides nothing, so it neither
+    rescues a subject nor condemns it.
+    """
+    if not pid:
+        return -1
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+        ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
+    except (OSError, IndexError, ValueError):
+        return -1
+    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
+    try:
+        io = dict(
+            line.split(": ", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines() if line
+        )
+        return burned + int(io["read_bytes"])
+    except (OSError, KeyError, ValueError):
+        return burned  # no `io` for this process; the CPU hand still decides
 
 
 def socket_path_refusal(path: str) -> str:
@@ -223,9 +259,18 @@ class ExecutorSupervision:
 
     # ------------------------------------------------------------------ spawn
 
-    def spawn(self, *, imposed: dict[str, str], dial_seconds: float = DIAL_SECONDS) -> Executor:
+    def spawn(self, *, imposed: dict[str, str]) -> Executor:
         """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
-        has no state, so every incarnation bump implies a readiness bump."""
+        has no state, so every incarnation bump implies a readiness bump.
+
+        THE DIAL-BACK IS WAITED OUT BY OBSERVATION, not by a clock. It used to be
+        `DIAL_SECONDS = 60.0`, which got both ends wrong at once: a child that died on its
+        first import still cost a full minute of silence before anyone said so, and a child
+        still legitimately importing on a cold page cache past the minute was killed for it.
+        The two facts that decide are the child's own: it is GONE (nothing will ever dial
+        back — say so now), or it is alive and BURNING CPU (it is working, wait). Alive and
+        burning nothing across `GIVE_UP_AFTER` samples is a stall, and gets a named refusal.
+        """
         if self._listener is None:
             refusal = socket_path_refusal(self.socket_path)
             if refusal:
@@ -259,14 +304,7 @@ class ExecutorSupervision:
             imposed=imposed,
             cwd=str(self.root),
         )
-        self._listener.settimeout(dial_seconds)
-        try:
-            conn, _ = self._listener.accept()
-        except TimeoutError as exc:
-            os.kill(spawned.pid, signal.SIGKILL)
-            raise ExecutorGone(
-                f"incarnation {self.incarnation} never dialled back within {dial_seconds} s"
-            ) from exc
+        conn = self._dial_back(spawned.pid)
         executor = Executor(
             incarnation=self.incarnation,
             pid=spawned.pid,
@@ -274,10 +312,49 @@ class ExecutorSupervision:
             seal_digest=spawned.seal_digest,
             spawned_at=started,
         )
-        executor.hello = executor.call({"cmd": "hello"}, timeout=dial_seconds)
+        # No clock on the hello either: the child has just proved it is alive by dialling
+        # back, and if it dies mid-answer the seam's own EOF is what says so — which is how
+        # every other command on this channel is waited for.
+        executor.hello = executor.call({"cmd": "hello"}, timeout=None)
         executor.ready_at = time.perf_counter()
         self.current = executor
         return executor
+
+    def _dial_back(self, pid: int) -> Any:
+        """The accepted connection from a freshly spawned child, or a NAMED reason there is
+        none. Three answers, and a clock is not one of them."""
+        assert self._listener is not None
+        self._listener.settimeout(DIAL_SAMPLE_SECONDS)
+        still, burned = 0, -1
+        while True:
+            try:
+                conn, _ = self._listener.accept()
+                return conn
+            except TimeoutError:
+                pass
+            try:
+                reaped, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                reaped, status = pid, -1
+            if reaped:
+                # GONE. Nothing will ever dial back, and the old constant spent a full
+                # minute not saying so — the reason is knowable the moment the child exits.
+                raise ExecutorGone(
+                    f"incarnation {self.incarnation} (pid {pid}) exited "
+                    f"(status {status}) before dialling back",
+                    status,
+                )
+            still += 1
+            burned, before = work(pid), burned
+            if burned > before >= 0:
+                still = 0  # importing, and an import on a cold page cache takes what it takes
+            if still >= GIVE_UP_AFTER:
+                os.kill(pid, signal.SIGKILL)
+                raise ExecutorGone(
+                    f"incarnation {self.incarnation} (pid {pid}) is alive and has burned no "
+                    f"CPU across {still} observations while owing a dial-back: it is stalled, "
+                    "not slow"
+                )
 
     def invalidate(self, why: str) -> int:
         """In-place readiness invalidation: the PROCESS may survive, its state did not.

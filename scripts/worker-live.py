@@ -2828,7 +2828,7 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
             f"{len(back)} READY report(s) carrying the plan; recovery gap "
             f"{row['recovery_gap_ms']} ms",
         )
-        waited = [line for line in worker.tail("arrived while the worker is rebuilding", 4)]
+        waited = [line for line in worker.tail("reached the lane while the worker is rebuilding", 4)]
         row["queue_note"] = waited[-1][-160:] if waited else ""
         check(
             "the worker WAITED for it rather than refusing it — one attempt, no refusal",
