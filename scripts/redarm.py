@@ -849,6 +849,25 @@ registry().acquire('g.models.m', h3.Fl2VAModel, Artifact(
         "topology_extra_keys",
     ),
     (
+        # #572d: a HIDDEN entrypoint is declared and not served. It keeps its descriptor
+        # place — it is real code — and the serving set excludes it.
+        "hidden-entrypoint-is-declared-and-not-served",
+        """
+from cozy_runtime.author._signature import analyze
+
+def visible(ctx: Context, payload: In) -> Meta: ...
+def concealed(ctx: Context, payload: In) -> Meta: ...
+
+a = analyze(visible, name='visible', kind='entrypoint')
+b = analyze(concealed, name='concealed', kind='entrypoint', hidden=True)
+assert a.hidden is False and b.hidden is True, (a.hidden, b.hidden)
+serving = [s.name for s in (a, b) if not s.hidden]
+assert serving == ['visible'], serving
+raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surface kept its surface')
+""",
+        "the serving set is ['visible']",
+    ),
+    (
         "stamp-fails-closed",
         "registry().acquire('g.models.m', h3.Ref2VAModel, art.h3(task='fl2va'))\n",
         "stamp_mismatch",

@@ -87,6 +87,9 @@ class Surface:
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
+    hidden: bool = False
+    """DECLARED but NOT SERVED (#572d). Kept in the descriptor — it is real code with a real
+    signature — and excluded from the serving set, so no binding is staged for it."""
 
     @property
     def model_params(self) -> tuple[str, ...]:
@@ -181,6 +184,7 @@ def analyze(
     resources: Resources | None = None,
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
+    hidden: bool = False,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
@@ -257,6 +261,7 @@ def analyze(
         resources=resources,
         demand_bound=demand_bound,
         preflight=spec,
+        hidden=hidden,
     )
 
 

@@ -46,6 +46,7 @@
         "telemetry"
       ],
       "gpu": true,
+      "hidden": false,
       "kind": "entrypoint",
       "models": [
         {
@@ -264,6 +265,7 @@
         "telemetry"
       ],
       "gpu": true,
+      "hidden": false,
       "kind": "entrypoint",
       "models": [
         {
@@ -742,6 +744,7 @@
     },
     "checkpoints": {
       "members": [
+        "declare",
         "save"
       ],
       "service": "Checkpoints"
@@ -791,5 +794,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:56ebd391e06b1703f38008392f5e202a6bfa39d03519843f6dc7b3a4281f8aec"
+  "surface_digest": "sha256:572c7e6c9c7387d9e6c7b4d076248aad791d1bafb6a873447e04dd0b90853458"
 }

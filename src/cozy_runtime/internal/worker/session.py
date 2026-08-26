@@ -535,6 +535,9 @@ class Worker:
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
+        #: plan id -> why THIS binding could not be prepared (#572d). A faulted binding
+        #: refuses its own entrypoints and denies its siblings nothing.
+        self.failed_bindings: dict[str, str] = {}
         self.prepared_models: dict[str, PreparedModel] = {}
         self.jobs: dict[str, JobBinding] = {}
         self.placement: Placement | None = None
@@ -1710,6 +1713,9 @@ class Worker:
         """
         if not self.bindings:
             return
+        # A fresh activation re-earns every verdict; a stale fault must not outlive the
+        # prepare that produced it.
+        self.failed_bindings.clear()
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
         executor = self.supervision.current
         if executor is None or not executor.alive():
@@ -1806,8 +1812,19 @@ class Worker:
                 # AN ACTIVATION FAILURE LATCHES for this desired revision (§8): the worker
                 # does not evict-and-retry forever, `converged_revision` stays behind, and
                 # the fault is typed on the placement.
-                self.latched = f"prepare refused: {reply.get('code')}"
-                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
+                # PREPARE IS PER-BINDING (#572d). This used to latch the whole placement
+                # and `return`, so ONE binding's failure denied every sibling the card —
+                # on H3 a hidden, unbuildable ref2va binding took the working T2VA one
+                # down with it, and the working one never got its turn to try.
+                #
+                # It is #548d's refusal-vs-fault split applied to bindings: a placement can
+                # hold a FAULTED binding and still serve the others. The fault is typed on
+                # the binding that earned it, its entrypoints refuse naming it, and the
+                # loop goes on to the next group.
+                for member in group:
+                    self.failed_bindings[member.entrypoint_binding_plan_id] = (
+                        f"{reply.get('code')}: {detail}"
+                    )
                 # #567c's SECOND HALF: a refusal reduced to its class name is a refusal
                 # that does not exist. This line carried the code and four memory numbers
                 # and DROPPED the executor's own message — so an operator watching a boot
@@ -1825,8 +1842,13 @@ class Worker:
                     f"{reply.get('allocator_bytes', -1)} B and the device has "
                     f"{reply.get('device_free_bytes', -1)} B free]",
                 )
+                # The executor generation is poisoned by the failed construction, so it is
+                # replaced — and the loop CONTINUES onto the next binding group, which gets
+                # the fresh executor it needs.
                 self.supervision.invalidate(f"prepare refused: {reply.get('code')}")
-                return
+                executor = self.supervision.spawn(imposed=self.imposed())
+                self.ledger.executor_pid = executor.pid
+                continue
             digest = reply["model_construction_digest"]
             delivery = reply.get("delivery") or {}
             resolved = PreparedModel(
@@ -1882,6 +1904,18 @@ class Worker:
                     f"on the {delivery['objective']} axis"
                     + (f" — {delivery['confession']}" if delivery.get("confession") else ""),
                 )
+        # A placement with NO working binding has nothing to serve and says so; one with
+        # any working binding becomes dispatchable and refuses only what actually failed.
+        if len(self.failed_bindings) >= len(self.bindings):
+            self.latched = "prepare refused: every binding"
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
+            return
+        if self.failed_bindings:
+            self.note(
+                "boot",
+                f"{len(self.bindings) - len(self.failed_bindings)} of {len(self.bindings)} "
+                f"binding(s) prepared; faulted: " + ", ".join(sorted(self.failed_bindings)),
+            )
         self.run_warm_pass()
         self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
         if not self.latched:

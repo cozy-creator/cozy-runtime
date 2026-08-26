@@ -333,6 +333,10 @@ class AttemptEngine:
         self.supervision = supervision
         self.authorizer = authorizer
         self.bindings = dict(bindings)
+        #: plan id -> why that binding could not be prepared (#572d). A faulted binding
+        #: refuses its OWN entrypoints, naming the fault it earned, and denies its working
+        #: siblings nothing.
+        self.failed_bindings: dict[str, str] = {}
         self.prepared_models = dict(prepared_models)
         self.jobs = dict(jobs)
         self.spool_root = spool_root
@@ -824,6 +828,17 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         if plan_id not in executor.ready_plans:
+            # A binding that FAILED to prepare says so in its own words (#572d). "the
+            # executor is ready for nothing" is true of a faulted binding and tells the
+            # caller nothing about why THIS one cannot serve, while its siblings can.
+            fault = self.failed_bindings.get(plan_id)
+            if fault is not None:
+                raise AttemptRefusal(
+                    "binding_faulted",
+                    f"{plan_id[:24]}… could not be prepared and this placement serves its "
+                    f"other bindings without it: {fault}",
+                    cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                )
             raise AttemptRefusal(
                 "executor_not_ready",
                 f"the executor is ready for {sorted(executor.ready_plans) or 'nothing'}, "

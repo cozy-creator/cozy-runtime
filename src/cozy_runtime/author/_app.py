@@ -47,6 +47,17 @@ class Registration:
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
+    hidden: bool = False
+    """This surface is DECLARED but NOT SERVED (#572d). A hidden entrypoint stays in the
+    descriptor — it is real code with a real signature, and pretending otherwise would make
+    the descriptor lie about the release — but no deployment stages a binding for it and no
+    request reaches it.
+
+    It is an AUTHOR fact, not a deployment one: what makes H3's `reference_to_video` hidden
+    is that its vision-conditioning seam is unbuilt, which only the author knows. A
+    deployment choosing not to offer a working surface is a different thing and belongs in
+    a binding. Hiding was a docs fact until a hidden entrypoint's binding was staged, failed
+    to prepare, and denied its working sibling the card."""
     checked: bool = field(default=False, repr=False)
     """Set once the describe-time conformance layer has passed this surface."""
     _surface: Surface | None = field(default=None, repr=False)
@@ -64,6 +75,7 @@ class Registration:
                 resources=self.resources,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
+                hidden=self.hidden,
             )
         return self._surface
 
@@ -87,6 +99,7 @@ class App:
         preflight: Callable[..., object] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
+        hidden: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -98,8 +111,12 @@ class App:
         preflight: Callable[..., object] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
+        hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register a request-serving callable. BARE is the common case (§1.2)."""
+        """Register a request-serving callable. BARE is the common case (§1.2).
+
+        `hidden=True` declares a surface that is real but NOT READY: it keeps its place in
+        the descriptor and gets no binding staged and no traffic (§1.2, #572d)."""
         return self._register(
             "entrypoint",
             fn,
@@ -108,6 +125,7 @@ class App:
             preflight=preflight,
             resources=resources,
             demand=demand,
+            hidden=hidden,
         )
 
     @overload
@@ -166,6 +184,7 @@ class App:
         resources: Resources | None,
         demand: Bound | None,
         emits_media: bool = False,
+        hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -179,7 +198,15 @@ class App:
                     f"duplicate registration {registered!r}: names are unique per app"
                 )
             self._registry[registered] = Registration(
-                registered, kind, target, publishes, emits_media, resources, demand, preflight
+                registered,
+                kind,
+                target,
+                publishes,
+                emits_media,
+                resources,
+                demand,
+                preflight,
+                hidden=hidden,
             )
             return target
 

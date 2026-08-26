@@ -122,6 +122,13 @@ def _callable(
         "request": schema.render(surface.payload_type),
         "result": schema.render(surface.result_type),
     }
+    if surface.kind == "entrypoint":
+        # DECLARED BUT NOT SERVED (#572d), and only an ENTRYPOINT can be: a job is
+        # dispatched by name through `cozy job` and has no serving set to be absent from.
+        # It stays in the descriptor because it is real code with a real signature and the
+        # descriptor must not lie about the release; the serving set is what excludes it,
+        # so no binding is staged and no request lands.
+        doc["hidden"] = surface.hidden
     models = [_model(binding) for binding in surface.model_bindings]
     if models:
         doc["models"] = models
