@@ -239,7 +239,21 @@ def matrix() -> list[dict[str, Any]]:
         return x.view(torch.float8_e8m0fnu) if hasattr(torch, "float8_e8m0fnu") else x
 
     def described(out: Any) -> str:
-        return f"{tuple(out.shape)} {out.dtype} finite={bool(torch.isfinite(out).all())}"
+        """What this leg asserts is that the CALL was accepted, not that it was correct.
+
+        `finite=False` here is EXPECTED and is not a defect: the random payload spans bytes
+        0..239, which includes 0x7F — e4m3's NaN — so every dot product that touches it is
+        NaN. Whether the accepted call returns the RIGHT numbers is `layout` and `domain`'s
+        question, asked on operands built for it. Printed anyway, because a silent
+        `finite=True` on a call that happened to dodge the NaN would be the more misleading
+        line of the two.
+        """
+        nan = int(torch.isnan(out).sum())
+        return (
+            f"{tuple(out.shape)} {out.dtype}, accepted; {nan} NaN outputs from the "
+            "random payload's e4m3 NaN code point (expected — see layout/domain for "
+            "whether the numbers are RIGHT)"
+        )
 
     rows.append(
         _attempt(
