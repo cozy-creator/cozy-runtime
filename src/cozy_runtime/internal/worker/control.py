@@ -43,7 +43,7 @@ class ControlPlane(Protocol):
     lives behind `serve_stream`; hosts route bytes and decide nothing."""
 
     def serve_stream(
-        self, inbound: Iterator[pb.OwnerFrame], send: Callable[[pb.WorkerFrame], None]
+        self, inbound: Iterator[pb.RecordOwnerFrame], send: Callable[[pb.WorkerFrame], None]
     ) -> None:
         """Run one control stream to its end. Returns when the stream closes or is fenced."""
 
@@ -181,7 +181,7 @@ class InMemoryControlHost:
     persistent = False
 
     def __init__(self) -> None:
-        self.inbound: queue.Queue[pb.OwnerFrame | None] = queue.Queue()
+        self.inbound: queue.Queue[pb.RecordOwnerFrame | None] = queue.Queue()
         self.sent: list[pb.WorkerFrame] = []
         self.on_frame: Callable[[pb.WorkerFrame], None] | None = None
         self.on_progress: Callable[[pb.AttemptProgress], None] | None = None
@@ -197,7 +197,7 @@ class InMemoryControlHost:
 
     # ---------------------------------------------------------------- driving
 
-    def deliver(self, frame: pb.OwnerFrame) -> None:
+    def deliver(self, frame: pb.RecordOwnerFrame) -> None:
         if not self.closed.is_set():
             self.inbound.put(frame)
 
@@ -215,7 +215,7 @@ class InMemoryControlHost:
         if self.on_frame is not None:
             self.on_frame(frame)
 
-    def _iter(self) -> Iterator[pb.OwnerFrame]:
+    def _iter(self) -> Iterator[pb.RecordOwnerFrame]:
         while True:
             frame = self.inbound.get()
             if frame is None:

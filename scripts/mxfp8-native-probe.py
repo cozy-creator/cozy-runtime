@@ -617,9 +617,10 @@ def nan_arm() -> None:
         sa = torch.full((128, k // MX_BLOCK), 127, dtype=torch.uint8, device=device)
         sa[:, 0] = scale
         native = _native(torch, a8, sa, identity, sb, torch.float32)
-        lane = reference_dequant(torch, a8, sa, torch.bfloat16).float() @ reference_dequant(
-            torch, identity, sb, torch.bfloat16
-        ).float().t()
+        lane = (
+            reference_dequant(torch, a8, sa, torch.bfloat16).float()
+            @ reference_dequant(torch, identity, sb, torch.bfloat16).float().t()
+        )
         return float(native[0, 0]), float(lane[0, 0])
 
     banked: dict[str, Any] = {}
@@ -999,9 +1000,7 @@ def vram() -> None:
     # reads. The row-major grid the quantizer produced is not held — swizzling is a load-time
     # step, so keeping both would price a copy no serving worker has any reason to keep.
     before = torch.cuda.memory_allocated()
-    held = [
-        (d.clone(), to_blocked(torch, s).view(torch.float8_e8m0fnu)) for d, s, _ in quantized
-    ]
+    held = [(d.clone(), to_blocked(torch, s).view(torch.float8_e8m0fnu)) for d, s, _ in quantized]
     resident_native = torch.cuda.memory_allocated() - before
     del quantized
     elements = sum(int(d.numel()) for d, _ in held)

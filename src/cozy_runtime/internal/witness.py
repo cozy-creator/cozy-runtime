@@ -1,13 +1,13 @@
 """The out-of-process postmortem witness: it names deaths the dying process cannot report.
 
-Executor death was already covered — the supervisor outlives it, journals a terminal, and
-converges. The supervisor's OWN death was not, and it is the one that matters most: the
+Executor death was already covered — the worker outlives it, journals a terminal, and
+converges. The worker's OWN death was not, and it is the one that matters most: the
 journal owner is the process that says what happened, so when the kernel kills it there is
 nobody left to write the sentence. v1's postmortem gap is exactly this shape, and every
 attempt to close it from inside the dying process failed for the same reason — an OOM kill
 is SIGKILL and SIGKILL runs no handler.
 
-So a WITNESS parent execs the supervisor and outlives it. It is deliberately tiny: no torch,
+So a WITNESS parent execs the worker and outlives it. It is deliberately tiny: no torch,
 no protocol, no journal writes, no threads. It writes a BOOT record before the child starts,
 waits, and writes a DEATH record naming what it saw from outside:
 
@@ -165,7 +165,7 @@ def witness(root: Path, argv: list[str]) -> int:
     before = oom_kills()
     started = time.time()
     child = os.fork()
-    if child == 0:  # the supervisor, in its own process group so a group kill is fenced
+    if child == 0:  # the worker, in its own process group so a group kill is fenced
         os.setpgid(0, 0)
         os.execv(argv[0], argv)
         os._exit(127)
@@ -204,7 +204,7 @@ def read_death(root: Path) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="cozy-runtime supervisor witness")
+    parser = argparse.ArgumentParser(description="cozy-runtime worker witness")
     parser.add_argument("--root", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)

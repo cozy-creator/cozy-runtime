@@ -2,7 +2,7 @@
 """cr-007's live verification: a REAL two-process worker, driven over REAL protocol bytes.
 
 Not a test suite (#160). Every section below starts the actual system — a coordinator
-process (this script), a no-CUDA supervisor process, and a disposable CUDA executor process
+process (this script), a no-CUDA worker process, and a disposable CUDA executor process
 — and prints what it observed. `cl-001` does not exist yet, so the coordinator side of
 th-024 is a scripted gRPC SERVER here: it speaks the committed `cozy.worker.v1` service
 over a unix socket with the copied bindings, and its canonical documents are checked against
@@ -46,7 +46,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from cozy_runtime.protocol import WIRE_MINOR, documents  # noqa: E402
+from cozy_runtime.protocol import (  # noqa: E402
+    SCHEMA_DIGEST,
+    SCHEMA_DIGEST_RAW,
+    WIRE_MINOR,
+    WIRE_SCHEMA_REV,
+    documents,
+)
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc  # noqa: E402
 
@@ -128,8 +134,8 @@ def gpu_used_mib() -> int:
 
 # --------------------------------------------------------------------------- the owner
 
-#: The scripted owner's one deployment routing key (#446). Owner-minted; never identity.
-DEPLOYMENT = "dpl-live"
+#: The scripted RecordOwner's one PLACEMENT routing key. Owner-minted; never identity.
+PLACEMENT = "plc-live"
 
 
 @dataclass
@@ -143,8 +149,14 @@ class Hub:
     lock: threading.Condition = field(default_factory=threading.Condition)
     progress: list[pb.AttemptProgress] = field(default_factory=list)
     boots: list[str] = field(default_factory=list)
-    snapshot: list[pb.ActiveAttempt] = field(default_factory=list)
-    directive: pb.Directive | None = None
+    #: The snapshot document's `held_attempts` rows, as the JSON values they are.
+    #: NOT re-parsed into messages: the document is the subject of the digest, and a
+    #: second representation beside it is free to disagree with the fenced bytes.
+    snapshot: list[dict[str, Any]] = field(default_factory=list)
+    snapshot_document: dict[str, Any] = field(default_factory=dict)
+    #: the admission generation this owner last OBSERVED; every offer echoes it (§6)
+    admission_generation: int = 0
+    directive: pb.DesiredWorkerState | None = None
     withhold_acks: set[str] = field(default_factory=set)
     wrong_ack: set[str] = field(default_factory=set)
     auto_ack: bool = True
@@ -157,8 +169,8 @@ class Hub:
     epoch: int = 1
     generation: int = 0
     boot_id: str = ""
-    controller_id: str = "hub-live"
-    outbound: queue.Queue[pb.OwnerFrame | None] = field(default_factory=queue.Queue)
+    record_owner_id: str = "hub-live"
+    outbound: queue.Queue[pb.RecordOwnerFrame | None] = field(default_factory=queue.Queue)
     channel: Any = None
     watch_channel: Any = None
     call: Any = None
@@ -193,7 +205,7 @@ class Hub:
         # `get()` would take the new stream's Claim and write it to a channel that was
         # closing, and the reconnect then waited forever for an ack to a claim the worker
         # never received. Same defect as the worker's own outbound lane, same shape of fix.
-        outbound: queue.Queue[pb.OwnerFrame | None] = queue.Queue()
+        outbound: queue.Queue[pb.RecordOwnerFrame | None] = queue.Queue()
         self.outbound = outbound
         if self.channel is not None:
             self.channel.close()
@@ -205,12 +217,16 @@ class Hub:
         self.call = stub.Control(self._outbound_iter(outbound))
         threading.Thread(target=self._read, args=(self.call,), daemon=True).start()
         claim = pb.Claim(
-            owner_epoch=self.epoch,
-            controller_id=self.controller_id,
+            record_owner_epoch=self.epoch,
+            record_owner_id=self.record_owner_id,
             wire_minor=WIRE_MINOR,
             proof=token.encode(),
+            # THE SCHEMA FENCE, sent by BOTH ends and checked before any other body field
+            # (#536b). A harness that omitted it would be indistinguishable from a stale
+            # pre-rev-2 RecordOwner, and the worker would refuse it — which is the arm.
+            wire_schema_digest=SCHEMA_DIGEST_RAW,
         )
-        outbound.put(pb.OwnerFrame(claim=claim))
+        outbound.put(pb.RecordOwnerFrame(claim=claim))
         if claim_only:
             return
         # The claim handshake completes on the reader thread (ClaimAck -> snapshot ->
@@ -242,7 +258,7 @@ class Hub:
             return grpc.secure_channel(addr, grpc.ssl_channel_credentials(self.root_cert))
         return grpc.insecure_channel(addr)
 
-    def _outbound_iter(self, outbound: queue.Queue[pb.OwnerFrame | None]) -> Any:
+    def _outbound_iter(self, outbound: queue.Queue[pb.RecordOwnerFrame | None]) -> Any:
         while True:
             frame = outbound.get()
             if frame is None:
@@ -250,8 +266,8 @@ class Hub:
             yield frame
 
     def _env(self, message: Any) -> Any:
-        message.owner_epoch = self.epoch
-        message.control_generation = self.generation
+        message.record_owner_epoch = self.epoch
+        message.control_stream_generation = self.generation
         message.worker_boot_id = self.boot_id
         return message
 
@@ -276,16 +292,18 @@ class Hub:
                 with self.lock:
                     self.seen.append(frame)
                     self.lock.notify_all()
+                if kind == "observed_state":
+                    # THE RECORDOWNER DISPATCHES AGAINST THE GENERATION IT LAST SAW (§6).
+                    # Tracked on EVERY observed state, not only on the ones an arm waits
+                    # for: a fence the owner only reads when it is looking is not a fence
+                    # the owner is actually holding.
+                    self.admission_generation = frame.observed_state.admission_generation
                 if kind == "claim_ack":
                     self._on_claim_ack(frame.claim_ack)
-                elif kind == "snapshot_begin":
-                    self.snapshot = []
-                elif kind == "snapshot_entry":
-                    self.snapshot.append(frame.snapshot_entry.attempt)
-                elif kind == "snapshot_end":
-                    self._on_snapshot_end(frame.snapshot_end)
-                elif kind == "attempt_terminal":
-                    self._on_terminal(frame.attempt_terminal)
+                elif kind == "snapshot":
+                    self._on_snapshot(frame.snapshot)
+                elif kind == "attempt_outcome":
+                    self._on_outcome(frame.attempt_outcome)
         except grpc.RpcError:
             pass
 
@@ -296,55 +314,92 @@ class Hub:
                 flush=True,
             )
             return
-        self.generation = ack.control_generation
+        self.generation = ack.control_stream_generation
         self.boot_id = ack.worker_boot_id
         self.boots.append(ack.worker_boot_id)
+        # THE OTHER DIRECTION OF THE FENCE (#536b): the worker answers with its own digest,
+        # and a RecordOwner that does not check it has only fenced one side.
+        if ack.wire_schema_digest != SCHEMA_DIGEST_RAW:
+            raise RuntimeError(
+                f"the worker speaks schema sha256:{ack.wire_schema_digest.hex()} and this "
+                f"harness speaks {SCHEMA_DIGEST}"
+            )
         print(
-            f"[hub] ClaimAck boot={ack.worker_boot_id} generation={ack.control_generation} "
-            f"minor={ack.wire_minor} device={ack.resources.device_name!r} "
+            f"[hub] ClaimAck boot={ack.worker_boot_id} "
+            f"generation={ack.control_stream_generation} minor={ack.wire_minor} "
+            f"schema_rev={WIRE_SCHEMA_REV} device={ack.resources.device_name!r} "
             f"backend={ack.resources.backend!r} unreadable={list(ack.resources.unreadable)}",
             flush=True,
         )
 
-    def _on_snapshot_end(self, end: pb.SnapshotEnd) -> None:
+    def _on_snapshot(self, snapshot: pb.WorkerSnapshot) -> None:
+        """RECOMPUTE before parsing, ack by id AND digest, then send the desired state.
+
+        There is no entry count to reconcile any more: the snapshot is ONE canonical
+        document bounded by its own digest, so a truncated or re-ordered one cannot match.
+        """
+        recomputed = documents.digest_of(snapshot.snapshot_canonical_bytes)
+        if recomputed != snapshot.snapshot_digest:
+            print(
+                f"[hub] snapshot {snapshot.snapshot_id} DIGEST MISMATCH: carried "
+                f"{snapshot.snapshot_digest.hex()[:16]}, bytes hash to "
+                f"{recomputed.hex()[:16]} — NOT acknowledged, the barrier stays closed",
+                flush=True,
+            )
+            return
+        document = documents.read(snapshot.snapshot_canonical_bytes, pb.WorkerSnapshotBody)
+        self.snapshot_document = document
+        self.snapshot = list(document.get("held_attempts", []))
+        self.admission_generation = int(document.get("admission_generation", 0))
         print(
-            f"[hub] snapshot {end.snapshot_id}: {len(self.snapshot)} entr(y|ies) "
-            f"(end says {end.entry_count})",
+            f"[hub] snapshot {snapshot.snapshot_id}: {len(self.snapshot)} held attempt(s), "
+            f"phase={document.get('worker_phase', 0)} "
+            f"admission={document.get('admission_state', 0)}/"
+            f"{document.get('available_attempt_slots', 0)} slots at generation "
+            f"{self.admission_generation}, {len(snapshot.snapshot_canonical_bytes)} B",
             flush=True,
         )
         self.send(
-            pb.OwnerFrame(snapshot_ack=self._env(pb.SnapshotAck(snapshot_id=end.snapshot_id)))
+            pb.RecordOwnerFrame(
+                snapshot_ack=self._env(
+                    pb.SnapshotAck(
+                        snapshot_id=snapshot.snapshot_id,
+                        snapshot_digest=snapshot.snapshot_digest,
+                    )
+                )
+            )
         )
         if self.directive is not None:
-            directive = pb.Directive()
+            directive = pb.DesiredWorkerState()
             directive.CopyFrom(self.directive)
             self._env(directive)
-            self.send(pb.OwnerFrame(directive=directive))
+            self.send(pb.RecordOwnerFrame(desired_state=directive))
         self.connected.set()
 
-    def _on_terminal(self, terminal: pb.AttemptTerminal) -> None:
-        body = documents.read(terminal.terminal_canonical, pb.TerminalBody)
+    def _on_outcome(self, outcome: pb.AttemptOutcome) -> None:
+        body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         print(
-            f"[hub] AttemptTerminal {terminal.request_id}#{terminal.attempt} "
+            f"[hub] AttemptOutcome {outcome.request_id}#{outcome.attempt_ordinal} "
             f"status={body['status']} cause={body.get('cause', {}).get('code')} "
-            f"id={terminal.terminal_id} digest={terminal.terminal_digest.hex()[:12]}",
+            f"execution_started={body.get('execution_started', False)} "
+            f"id={outcome.outcome_id} digest={outcome.outcome_digest.hex()[:12]}",
             flush=True,
         )
-        key = f"{terminal.request_id}#{terminal.attempt}"
+        key = f"{outcome.request_id}#{outcome.attempt_ordinal}"
         if key in self.withhold_acks or not self.auto_ack:
             return
-        digest = terminal.terminal_digest
+        digest = outcome.outcome_digest
         if key in self.wrong_ack:
             digest = bytes(32)
         self.send(
-            pb.OwnerFrame(
-                terminal_ack=self._env(
-                    pb.TerminalAck(
-                        request_id=terminal.request_id,
-                        attempt=terminal.attempt,
-                        invocation_digest=terminal.invocation_digest,
-                        terminal_id=terminal.terminal_id,
-                        terminal_digest=digest,
+            pb.RecordOwnerFrame(
+                outcome_ack=self._env(
+                    pb.AttemptOutcomeAck(
+                        request_id=outcome.request_id,
+                        attempt_ordinal=outcome.attempt_ordinal,
+                        invocation_spec_digest=outcome.invocation_spec_digest,
+                        outcome_id=outcome.outcome_id,
+                        outcome_digest=digest,
                     )
                 )
             )
@@ -352,7 +407,7 @@ class Hub:
 
     # ------------------------------------------------------------ driving
 
-    def send(self, frame: pb.OwnerFrame | None) -> None:
+    def send(self, frame: pb.RecordOwnerFrame | None) -> None:
         self.outbound.put(frame)
 
     def session(self) -> str:
@@ -360,10 +415,10 @@ class Hub:
         return self.boot_id
 
     def incarnation(self) -> int:
-        """The deployment's executor generation the worker last REPORTED (#446/#454)."""
+        """The placement's executor generation the worker last REPORTED (#446/#454)."""
         for report in reversed(self.reports()):
-            for status in report.deployments:
-                if status.deployment_id == DEPLOYMENT:
+            for status in report.placements:
+                if status.placement_id == PLACEMENT:
                     return int(status.executor_generation)
         return 1
 
@@ -392,17 +447,17 @@ class Hub:
                     raise TimeoutError(f"waiting for {what or predicate}")
                 self.lock.wait(min(remaining, 0.25))
 
-    def terminals(self, request_id: str = "", attempt: int = 0) -> list[pb.AttemptTerminal]:
+    def terminals(self, request_id: str = "", attempt: int = 0) -> list[pb.AttemptOutcome]:
         out = []
         for message in list(self.seen):
-            if message.WhichOneof("msg") != "attempt_terminal":
+            if message.WhichOneof("msg") != "attempt_outcome":
                 continue
-            terminal = message.attempt_terminal
-            if request_id and terminal.request_id != request_id:
+            outcome = message.attempt_outcome
+            if request_id and outcome.request_id != request_id:
                 continue
-            if attempt and terminal.attempt != attempt:
+            if attempt and outcome.attempt_ordinal != attempt:
                 continue
-            out.append(terminal)
+            out.append(outcome)
         return out
 
     def accepted(self, request_id: str = "") -> list[pb.AttemptAccepted]:
@@ -413,28 +468,41 @@ class Hub:
             and (not request_id or m.attempt_accepted.request_id == request_id)
         ]
 
-    def reports(self) -> list[pb.Report]:
-        return [m.report for m in list(self.seen) if m.WhichOneof("msg") == "report"]
+    def reports(self) -> list[pb.ObservedWorkerState]:
+        return [
+            m.observed_state for m in list(self.seen) if m.WhichOneof("msg") == "observed_state"
+        ]
 
-    def deployment(self, report: pb.Report) -> pb.DeploymentStatus:
-        for status in report.deployments:
-            if status.deployment_id == DEPLOYMENT:
+    def deployment(self, report: pb.ObservedWorkerState) -> pb.PlacementStatus:
+        for status in report.placements:
+            if status.placement_id == PLACEMENT:
                 return status
-        return pb.DeploymentStatus()
+        return pb.PlacementStatus()
 
-    def ready(self, plan_id: str, seconds: float = 300.0, since: int = 0) -> pb.Report:
-        report: pb.Report = self.wait(
-            lambda m: (
-                m.report
-                if m.WhichOneof("msg") == "report"
-                and m.report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-                and plan_id in self.deployment(m.report).ready_entrypoint_binding_plan_ids
-                else None
-            ),
-            seconds,
-            "READY",
-            since,
-        )
+    def ready(self, plan_id: str, seconds: float = 300.0, since: int = 0) -> pb.ObservedWorkerState:
+        """DISPATCHABLE, on the two axes plus the one admission fence — not "READY".
+
+        Three facts, checked together because each says something the others do not: the
+        placement's SERVING axis, the plan's presence in `dispatchable_plan_ids`, and an
+        OPEN admission window with a free seat.
+        """
+
+        def dispatchable(m: Any) -> Any:
+            if m.WhichOneof("msg") != "observed_state":
+                return None
+            report = m.observed_state
+            status = self.deployment(report)
+            if (
+                status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                and plan_id in status.dispatchable_plan_ids
+                and report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+                and report.available_attempt_slots > 0
+            ):
+                self.admission_generation = report.admission_generation
+                return report
+            return None
+
+        report: pb.ObservedWorkerState = self.wait(dispatchable, seconds, "DISPATCHABLE", since)
         return report
 
     def close(self) -> None:
@@ -462,23 +530,39 @@ def read_addr(root: Path, process: Any, budget: float = 60.0) -> str:
     raise TimeoutError(f"no control.addr under {root}")
 
 
-def serving_directive(release: str, plan_ids: list[str], posture: Any) -> pb.Directive:
-    """The full-replace Directive with the digest-addressed DeploymentSet (#446)."""
-    deployment_set = pb.DeploymentSet(
-        deployments=[
-            pb.Deployment(
-                deployment_id=DEPLOYMENT,
-                endpoint_release_id=release,
-                entrypoint_binding_plan_ids=sorted(plan_ids),
+def serving_directive(
+    release: str, plan_ids: list[str], posture: Any, revision: int = 1
+) -> pb.DesiredWorkerState:
+    """The full-replace DesiredWorkerState carrying a CONTENT-ADDRESSED DesiredPlacementSet.
+
+    The set travels as its exact canonical `PlacementSet/1` bytes plus their digest; the
+    worker RECOMPUTES before it parses a field (§4). The duplicate structured form the
+    frozen wire carried is deleted, so there is no second place for the set to disagree
+    with itself.
+    """
+    placement_set = pb.PlacementSet(
+        placements=[
+            pb.Placement(
+                placement_id=PLACEMENT,
+                spec=pb.PlacementSpec(
+                    endpoint_release_id=release,
+                    binding_plans=[
+                        pb.ArtifactSubject(subject_id=plan_id, kind="plan")
+                        for plan_id in sorted(plan_ids)
+                    ],
+                ),
             )
         ]
     )
-    _, set_digest = documents.identity(deployment_set)
-    return pb.Directive(
-        revision=1,
+    canonical_bytes, set_digest = documents.identity(placement_set)
+    return pb.DesiredWorkerState(
+        revision=revision,
         posture=posture,
         wire_minor=WIRE_MINOR,
-        deployment_set=pb.DeploymentSetDirective(set_digest=set_digest, set=deployment_set),
+        placement_set=pb.DesiredPlacementSet(
+            placement_set_digest=set_digest,
+            placement_set_canonical_bytes=canonical_bytes,
+        ),
     )
 
 
@@ -518,7 +602,7 @@ def prefill_journal(root: Path, target_bytes: int) -> int:
     """Grow a REAL journal to just under the planted file-size limit, using the real writer.
 
     The ENOSPC plant used to be `RLIMIT_FSIZE=440` against an empty journal, on the reasoning
-    that the journal was the one regular file the supervisor wrote. Since tfs-007 that is no
+    that the journal was the one regular file the worker wrote. Since tfs-007 that is no
     longer true: registering a GC-safe read hold updates the STORE's own state file (502 B),
     so a 440 B limit now kills PREPARATION and the arm never reaches its subject. Growing the
     journal first keeps the limit comfortably above everything else the worker writes while
@@ -716,14 +800,14 @@ def start_worker(
 
     # stdout is a PIPE, not the log file, and this process copies it. RLIMIT_FSIZE (the
     # ENOSPC plant) applies to regular files and not to pipes, so the plant bites exactly
-    # the journal — the one regular file the supervisor writes — instead of also killing
+    # the journal — the one regular file the worker writes — instead of also killing
     # its ability to say what happened.
     def plant_disk_full() -> None:
         """HARNESS-SIDE fault injection: cap the child's file size so the journal's next
         append gets a REAL kernel error (EFBIG), the ENOSPC class. It runs in the harness's
         forked child before exec, so the runtime carries no plant switch of its own. stdout
         is a PIPE and pipes are not subject to RLIMIT_FSIZE, so the plant bites exactly the
-        journal — the one regular file the supervisor writes."""
+        journal — the one regular file the worker writes."""
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         resource.setrlimit(resource.RLIMIT_FSIZE, (rlimit_fsize, rlimit_fsize))
 
@@ -791,7 +875,7 @@ def make_spec(
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
     spec = pb.InvocationSpec(
         endpoint_release_id=release,
-        image_digest="sha256:" + "11" * 32,
+        environment_spec_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
         inputs=[
@@ -840,7 +924,8 @@ def dispatch(
     destination_url: str = "",
     release: str = RELEASE,
     max_bytes: int = 8 * MIB,
-    deployment_id: str = DEPLOYMENT,
+    placement_id: str = PLACEMENT,
+    admission_generation: int = -1,
 ) -> tuple[bytes, bytes]:
     canonical_bytes, digest = spec_override or make_spec(
         plan_id,
@@ -857,8 +942,8 @@ def dispatch(
     out_dir = tmp / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     grant = pb.DeliveryGrant(
-        invocation_digest=digest,
-        credential=pb.Credential(
+        invocation_spec_digest=digest,
+        credential=pb.DeliveryAccessCredential(
             issuer="cozy-live",
             key_id="g1",
             epoch=1,
@@ -877,15 +962,23 @@ def dispatch(
         ],
     )
     hub.send(
-        pb.OwnerFrame(
-            start_attempt=hub._env(
-                pb.StartAttempt(
+        pb.RecordOwnerFrame(
+            attempt_offer=hub._env(
+                pb.AttemptOffer(
                     request_id=request_id,
-                    attempt=attempt,
-                    invocation_digest=digest,
+                    attempt_ordinal=attempt,
+                    invocation_spec_digest=digest,
                     grant=grant,
-                    invocation_canonical=canonical_bytes,
-                    deployment_id=deployment_id,
+                    invocation_spec_canonical_bytes=canonical_bytes,
+                    placement_id=placement_id,
+                    # The generation this owner OBSERVED when it dispatched (§6). -1 means
+                    # "whatever the harness last saw"; an arm that wants a STALE echo passes
+                    # an explicit number.
+                    admission_generation=(
+                        hub.admission_generation
+                        if admission_generation < 0
+                        else admission_generation
+                    ),
                 )
             )
         )
@@ -893,16 +986,33 @@ def dispatch(
     return canonical_bytes, digest
 
 
-def terminal_body(terminal: pb.AttemptTerminal) -> dict[str, Any]:
-    return documents.read(terminal.terminal_canonical, pb.TerminalBody)
+def terminal_body(terminal: pb.AttemptOutcome) -> dict[str, Any]:
+    return documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
 
 
 # --------------------------------------------------------------------------- sections
 
 
 def section_fixtures(args: argparse.Namespace) -> None:
-    """The copied bindings and this writer against worker-protocol's FROZEN corpus."""
-    head("the vendored th-024 bindings decode the frozen fixture corpus")
+    """The copied bindings and this writer against worker-protocol's rev-2 corpus."""
+    head("the SCHEMA FENCE is DERIVED here, not declared (#530-A1/#536b)")
+    derived = documents.wire_schema_document()
+    derived_id = "sha256:" + documents.digest_of(derived).hex()
+    frozen_schema = (FIXTURES / "canonical" / "wire_schema.json").read_bytes()
+    check(
+        "this binding's own descriptor digests to the constant regen.sh wrote",
+        derived_id == SCHEMA_DIGEST,
+        f"derived {derived_id[:30]}… == wire_identity.SCHEMA_DIGEST, schema rev "
+        f"{WIRE_SCHEMA_REV} — a stale copy cannot spell it without BEING the schema",
+    )
+    check(
+        "and reproduces the protocol's frozen WireSchema/1 document byte-for-byte",
+        derived == frozen_schema,
+        f"{len(derived)} B, normalized (source_code_info cleared, json_name stripped) with "
+        f"the document-version map {documents.DOC_VERSION} inside it",
+    )
+
+    head("the vendored rev-2 bindings decode the frozen fixture corpus")
     manifest = json.loads((FIXTURES / "MANIFEST.json").read_text())
     bad = []
     for name, row in manifest["positive"].items():
@@ -918,9 +1028,13 @@ def section_fixtures(args: argparse.Namespace) -> None:
         f"{len(manifest['positive'])} fixtures, {len(bad)} wrong",
     )
 
-    head("canonical DOCUMENT identity: this writer reproduces th-024's frozen bytes")
+    head("canonical DOCUMENT identity: this writer reproduces the frozen bytes")
     wrong = []
     for name, row in manifest["canonical"].items():
+        if row["type"] == "cozy.worker.v1.WireSchema":
+            # NOT a message in worker.proto — a document ABOUT worker.proto. It has no
+            # descriptor to parse a `.bin` into, and the arm above already proved it.
+            continue
         frozen = (FIXTURES / "canonical" / f"{name}.json").read_bytes()
         cls = getattr(pb, row["type"].split(".")[-1])
         message = cls()
@@ -932,8 +1046,9 @@ def section_fixtures(args: argparse.Namespace) -> None:
     check(
         "byte-identical canonical documents and ids",
         not wrong,
-        f"{len(manifest['canonical'])} documents, {len(wrong)} divergent — the worker "
-        "authors the same bytes th-024 froze, with no shared code",
+        f"{len(manifest['canonical']) - 1} message documents + the schema document, "
+        f"{len(wrong)} divergent — the worker authors the same bytes worker-protocol froze, "
+        "with no shared code",
     )
 
     head("the reading side refuses what the writer cannot have produced")
@@ -974,7 +1089,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
     hub = worker.hub
     plan_id = plan_id_for("denoise")
     try:
-        head("boot: supervisor -> exec-first trampoline -> executor -> fill -> warm -> READY")
+        head("boot: worker -> exec-first trampoline -> executor -> fill -> warm -> READY")
         hub.wait(
             lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None, 60, "ClaimAck"
         )
@@ -983,18 +1098,35 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         status = hub.deployment(report)
         ready_at = time.perf_counter()
         check(
-            "the worker reached READY through the ordinary path",
+            "the worker reached DISPATCHABLE through the ordinary path",
             True,
             f"boot->ClaimAck {register_at - boot_started:.2f} s, "
-            f"ClaimAck->READY {ready_at - register_at:.2f} s "
-            f"(executor generation {status.executor_generation}, readiness epoch "
-            f"{status.readiness_epoch})",
+            f"ClaimAck->DISPATCHABLE {ready_at - register_at:.2f} s "
+            f"(executor generation {status.executor_generation}, admission generation "
+            f"{report.admission_generation})",
         )
         check(
-            "READY means first-request-servable, not connected — per-deployment (#446)",
-            plan_id in status.ready_entrypoint_binding_plan_ids and status.attempt_credits > 0,
-            f"{len(status.ready_entrypoint_binding_plan_ids)} ready plan(s), "
-            f"{status.attempt_credits} attempt credit(s)",
+            "the TWO AXES say what one enum could not: materialization x serving",
+            status.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE,
+            f"materialization={pb.MaterializationState.Name(status.materialization)}, "
+            f"serving={pb.ServingState.Name(status.serving)}",
+        )
+        check(
+            "DISPATCHABLE means first-request-servable, not connected — per placement",
+            plan_id in status.dispatchable_plan_ids
+            and report.available_attempt_slots > 0
+            and report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN,
+            f"{len(status.dispatchable_plan_ids)} dispatchable plan(s), "
+            f"{report.available_attempt_slots} attempt slot(s) in an "
+            f"{pb.AdmissionState.Name(report.admission_state)} window",
+        )
+        check(
+            "convergence is a SEPARATE fact from acceptance, and they agree here",
+            report.converged_revision == report.accepted_desired_state_revision,
+            f"accepted {report.accepted_desired_state_revision} == converged "
+            f"{report.converged_revision} — a placement that stopped being DISPATCHABLE "
+            "would pull converged back below it",
         )
 
         warm = (
@@ -1038,9 +1170,9 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         accepted_at = time.perf_counter()
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-1"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-1"
                 else None
             ),
             300,
@@ -1071,8 +1203,8 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         )
         check(
             "terminal_digest is the sha256 of the carried bytes",
-            hashlib.sha256(terminal.terminal_canonical).digest() == terminal.terminal_digest,
-            f"{len(terminal.terminal_canonical)} canonical bytes, id {terminal.terminal_id}",
+            hashlib.sha256(terminal.outcome_canonical_bytes).digest() == terminal.outcome_digest,
+            f"{len(terminal.outcome_canonical_bytes)} canonical bytes, id {terminal.outcome_id}",
         )
 
         head("the output tail: written under the EXACT grant, manifest durable")
@@ -1129,7 +1261,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         metrics = body.get("metrics", {})
         window_ms = (done_at - accepted_at) * 1000
         check(
-            "wall-clock is clamped to the supervisor-observed window",
+            "wall-clock is clamped to the worker-observed window",
             metrics.get("runtime_ms", 0) <= window_ms,
             f"runtime_ms {metrics.get('runtime_ms')} <= observed window {window_ms:.0f} ms "
             f"(handler {metrics.get('handler_ms')}, device lease "
@@ -1145,7 +1277,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
         head("the lossy progress lane")
         check(
-            "progress arrived on its own RPC with supervisor-owned sequence numbers",
+            "progress arrived on its own RPC with worker-owned sequence numbers",
             len(hub.progress) > 0,
             f"{len(hub.progress)} AttemptProgress messages, seq 1..."
             f"{max((p.seq for p in hub.progress), default=0)}, "
@@ -1168,7 +1300,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         return row
     finally:
         summary = _shutdown(worker)
-        print(f"  supervisor summary: {json.dumps(summary)}", flush=True)
+        print(f"  worker summary: {json.dumps(summary)}", flush=True)
         _gpu_clean(idle)
 
 
@@ -1223,9 +1355,9 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         os.kill(pid, signal.SIGKILL)
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-kill"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-kill"
                 else None
             ),
             120,
@@ -1234,7 +1366,7 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         terminal_at = time.perf_counter()
         body = terminal_body(terminal)
         check(
-            "the supervisor journaled a TYPED terminal for the lost attempt",
+            "the worker journaled a TYPED terminal for the lost attempt",
             body["status"] == 5 and body["cause"]["code"] == 16,
             f"ABANDONED/EXECUTOR_INVALIDATED in "
             f"{(terminal_at - killed_at) * 1000:.0f} ms — {body['safe_message'][:70]}",
@@ -1249,10 +1381,11 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         status = hub.deployment(report)
         recovered_at = time.perf_counter()
         check(
-            "a fresh executor generation reloaded BEFORE reporting ready",
-            status.executor_generation >= 2 and status.readiness_epoch >= 3,
-            f"generation {status.executor_generation}, readiness epoch "
-            f"{status.readiness_epoch} — two counters, moved together by a respawn",
+            "a fresh executor generation reloaded BEFORE reporting dispatchable",
+            status.executor_generation >= 2 and report.admission_generation > 1,
+            f"executor generation {status.executor_generation}, admission generation "
+            f"{report.admission_generation} — `readiness_epoch` is DELETED (#486b), and "
+            "the worker-level admission fence is the one counter that moved",
         )
 
         head("the next attempt succeeds on the new incarnation")
@@ -1265,9 +1398,9 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         )
         after = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-after"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-after"
                 else None
             ),
             300,
@@ -1285,12 +1418,12 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
             "kill_to_ready_s": round(recovered_at - killed_at, 2),
             "gpu_used_at_kill_mib": used_before,
             "executor_generation_after": status.executor_generation,
-            "readiness_epoch_after": status.readiness_epoch,
+            "admission_generation_after": report.admission_generation,
         }
         return row
     finally:
         summary = _shutdown(worker)
-        print(f"  supervisor summary: {json.dumps(summary)}", flush=True)
+        print(f"  worker summary: {json.dumps(summary)}", flush=True)
         _gpu_clean(idle)
 
 
@@ -1313,9 +1446,8 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
     try:
         report = hub.wait(
             lambda m: (
-                m.report
-                if m.WhichOneof("msg") == "report"
-                and (m.report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR or m.report.faults)
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state" and m.observed_state.faults
                 else None
             ),
             400,
@@ -1364,7 +1496,7 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
         head("a fresh executor confirms the free memory from inside CUDA")
         dispatch(hub, tmp, plan_id, request_id="req-poisoned")
         terminal = hub.wait(
-            lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
+            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
             120,
             "refusal terminal",
         )
@@ -1388,7 +1520,7 @@ def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
-    """torch stays OUT of the supervisor — proven against the RUNNING process."""
+    """torch stays OUT of the worker — proven against the RUNNING process."""
     tmp = Path(args.tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -1399,11 +1531,11 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
     row: dict[str, Any] = {}
     try:
         hub.ready(plan_id, 400)
-        supervisor_pid = worker.process.pid
+        worker_pid = worker.process.pid
         executor_pid = worker.executor_pid()
 
-        head("the supervisor's mapped libraries, while it is serving")
-        maps = Path(f"/proc/{supervisor_pid}/maps").read_text(errors="replace")
+        head("the worker's mapped libraries, while it is serving")
+        maps = Path(f"/proc/{worker_pid}/maps").read_text(errors="replace")
         cuda_markers = (
             "libtorch",
             "libcuda",
@@ -1422,14 +1554,14 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         check(
-            "no torch/CUDA library is mapped into the supervisor",
+            "no torch/CUDA library is mapped into the worker",
             not offenders,
             f"{len(maps.splitlines())} mappings scanned for "
             f"{len(cuda_markers)} markers, {len(offenders)} hits"
             + (
                 f" — {offenders[:3]}"
                 if offenders
-                else " — the supervisor is a bare "
+                else " — the worker is a bare "
                 "interpreter, which is also what keeps OOM-victim ordering honest"
             ),
         )
@@ -1445,7 +1577,7 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
             "the executor IS the CUDA process", bool(cuda_in_executor), ", ".join(cuda_in_executor)
         )
 
-        head("no CUDA context: the supervisor holds no device memory")
+        head("no CUDA context: the worker holds no device memory")
         contexts = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
             capture_output=True,
@@ -1454,18 +1586,18 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
         ).stdout.strip()
         pids = [int(line.split(",")[0]) for line in contexts.splitlines() if line.strip()]
         check(
-            "the supervisor holds no CUDA context",
-            supervisor_pid not in pids,
+            "the worker holds no CUDA context",
+            worker_pid not in pids,
             f"compute apps on the device: {pids} (executor {executor_pid})",
         )
 
         head("process facts: OOM-victim ordering, privileges, parent death")
-        sup_oom = Path(f"/proc/{supervisor_pid}/oom_score_adj").read_text().strip()
+        sup_oom = Path(f"/proc/{worker_pid}/oom_score_adj").read_text().strip()
         exe_oom = Path(f"/proc/{executor_pid}/oom_score_adj").read_text().strip()
         check(
-            "the executor raised its OWN oom_score_adj above the supervisor's",
+            "the executor raised its OWN oom_score_adj above the worker's",
             int(exe_oom) == 500 and int(exe_oom) > int(sup_oom),
-            f"supervisor {sup_oom} (INHERITED — the runtime never writes its own; this "
+            f"worker {sup_oom} (INHERITED — the runtime never writes its own; this "
             f"box's shells run at 200), executor {exe_oom} (written by the trampoline, "
             "before exec) — the kernel's victim ordering picks the disposable process",
         )
@@ -1478,11 +1610,11 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
             f"pgid {os.getpgid(executor_pid)} — one killpg reaches every grandchild",
         )
 
-        supervisor_rss = (
+        worker_rss = (
             int(
                 next(
                     line
-                    for line in Path(f"/proc/{supervisor_pid}/status").read_text().splitlines()
+                    for line in Path(f"/proc/{worker_pid}/status").read_text().splitlines()
                     if line.startswith("VmRSS")
                 ).split()[1]
             )
@@ -1501,11 +1633,10 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "both process footprints, measured while serving",
             True,
-            f"supervisor RSS {supervisor_rss / MIB:.1f} MiB, executor RSS "
-            f"{executor_rss / MIB:.1f} MiB",
+            f"worker RSS {worker_rss / MIB:.1f} MiB, executor RSS {executor_rss / MIB:.1f} MiB",
         )
 
-        head("supervisor death is child death (pdeathsig), with no cooperation")
+        head("worker death is child death (pdeathsig), with no cooperation")
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=20)
         gone_at = time.perf_counter()
@@ -1514,14 +1645,14 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
                 break
             time.sleep(0.01)
         check(
-            "the executor died with its supervisor",
+            "the executor died with its worker",
             not Path(f"/proc/{executor_pid}").exists(),
             f"within {(time.perf_counter() - gone_at) * 1000:.0f} ms of SIGKILL to the "
-            "supervisor — pdeathsig, armed before exec",
+            "worker — pdeathsig, armed before exec",
         )
         row = {
-            "supervisor_rss_bytes": supervisor_rss,
-            "supervisor_oom_score_adj": int(sup_oom),
+            "worker_rss_bytes": worker_rss,
+            "worker_oom_score_adj": int(sup_oom),
             "executor_oom_score_adj": int(exe_oom),
             "executor_rss_bytes": executor_rss,
         }
@@ -1563,9 +1694,9 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-unready"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-unready"
                     else None
                 ),
                 60,
@@ -1585,9 +1716,9 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-class"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-class"
                     else None
                 ),
                 60,
@@ -1606,9 +1737,9 @@ def section_arms(args: argparse.Namespace) -> None:
         )
         hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-dup"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-dup"
                 else None
             ),
             300,
@@ -1620,13 +1751,13 @@ def section_arms(args: argparse.Namespace) -> None:
         check(
             "two StartAttempts, one execution, one terminal body",
             len(terminals) == 2
-            and terminals[0].terminal_canonical == terminals[1].terminal_canonical,
+            and terminals[0].outcome_canonical_bytes == terminals[1].outcome_canonical_bytes,
             f"{len(terminals)} terminals, byte-identical bodies, terminal_id stable "
-            f"({terminals[0].terminal_id == terminals[1].terminal_id})",
+            f"({terminals[0].outcome_id == terminals[1].outcome_id})",
         )
         replayed = worker.tail("executing NOTHING", 1)
         check(
-            "the supervisor says it replayed rather than re-ran",
+            "the worker says it replayed rather than re-ran",
             bool(replayed),
             replayed[0].split("attempt: ")[-1][:100] if replayed else "",
         )
@@ -1637,10 +1768,10 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-dup"
-                    and m.attempt_terminal.invocation_digest == other_digest
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-dup"
+                    and m.attempt_outcome.invocation_digest == other_digest
                     else None
                 ),
                 60,
@@ -1659,9 +1790,9 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-planted"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-planted"
                     else None
                 ),
                 60,
@@ -1692,10 +1823,10 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-live"
-                    and m.attempt_terminal.attempt == 2
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-live"
+                    and m.attempt_outcome.attempt_ordinal == 2
                     else None
                 ),
                 60,
@@ -1716,13 +1847,13 @@ def section_arms(args: argparse.Namespace) -> None:
         head("a stale cancel digest cannot touch an executor")
         mark = hub.mark()
         hub.send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=hub._env(
                     pb.CancelAttempt(
                         request_id="req-live",
-                        attempt=1,
+                        attempt_ordinal=1,
                         reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                        invocation_digest=bytes(32),
+                        invocation_spec_digest=bytes(32),
                     )
                 )
             )
@@ -1739,23 +1870,23 @@ def section_arms(args: argparse.Namespace) -> None:
         head("a NON-COOPERATIVE handler: cooperative -> grace -> kill, in that order")
         cancel_at = time.perf_counter()
         hub.send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=hub._env(
                     pb.CancelAttempt(
                         request_id="req-live",
-                        attempt=1,
+                        attempt_ordinal=1,
                         reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                        invocation_digest=accepted.invocation_digest,
+                        invocation_spec_digest=accepted.invocation_spec_digest,
                     )
                 )
             )
         )
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-live"
-                and m.attempt_terminal.attempt == 1
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-live"
+                and m.attempt_outcome.attempt_ordinal == 1
                 else None
             ),
             120,
@@ -1790,9 +1921,9 @@ def section_arms(args: argparse.Namespace) -> None:
         dispatch(hub, tmp, plan_id, request_id="req-ack", payload={"steps": 1, "latent": 48})
         hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-ack"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-ack"
                 else None
             ),
             300,
@@ -1812,9 +1943,9 @@ def section_arms(args: argparse.Namespace) -> None:
         dispatch(hub, tmp, plan_id, request_id="req-sat", payload={"steps": 24, "latent": 48})
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-sat"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-sat"
                 else None
             ),
             300,
@@ -1835,9 +1966,9 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-grant"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-grant"
                     else None
                 ),
                 300,
@@ -1863,9 +1994,9 @@ def section_arms(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-offtable"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-offtable"
                     else None
                 ),
                 300,
@@ -1883,19 +2014,19 @@ def section_arms(args: argparse.Namespace) -> None:
         )
     finally:
         summary = _shutdown(worker)
-        print(f"  supervisor summary: {json.dumps(summary)}", flush=True)
+        print(f"  worker summary: {json.dumps(summary)}", flush=True)
         _gpu_clean(idle)
 
 
 def section_journal(args: argparse.Namespace) -> None:
-    """Journal honesty, executor honesty, and the supervisor restart."""
+    """Journal honesty, executor honesty, and the worker restart."""
     tmp = Path(args.tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
 
     head("a journal that cannot durably commit acknowledges NOTHING and executes NOTHING")
-    # 3,600 B leaves room for the supervisor's own boot `session` row (~200 B) under the
+    # 3,600 B leaves room for the worker's own boot `session` row (~200 B) under the
     # 4,096 B limit, and none for the acceptance row after it — which is the write the arm
     # is about. Grown too far, the plant bites at boot and the arm never reaches its subject.
     grown = prefill_journal(tmp / "worker", 3600)
@@ -1941,7 +2072,7 @@ def section_journal(args: argparse.Namespace) -> None:
             payload={"steps": 1, "latent": 48},
         )
         worker.hub.wait(
-            lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
+            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
             300,
             "terminal",
         )
@@ -1966,7 +2097,7 @@ def section_journal(args: argparse.Namespace) -> None:
     finally:
         _gpu_clean(idle)
 
-    head("supervisor restart: a NEW session that reports its recovered journal FIRST")
+    head("worker restart: a NEW session that reports its recovered journal FIRST")
     tmp3 = Path(args.tmp + "-restart")
     shutil.rmtree(tmp3, ignore_errors=True)
     tmp3.mkdir(parents=True)
@@ -1983,11 +2114,11 @@ def section_journal(args: argparse.Namespace) -> None:
             payload={"steps": 1, "latent": 48},
         )
         terminal = hub.wait(
-            lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
+            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
             300,
             "terminal",
         )
-        first_bytes = terminal.terminal_canonical
+        first_bytes = terminal.outcome_canonical_bytes
         first_boot = hub.session()
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=20)
@@ -2003,19 +2134,19 @@ def section_journal(args: argparse.Namespace) -> None:
         )
         check(
             "the recovered journal rides the SNAPSHOT, before any next ordinal (02 §6)",
-            len(hub2.snapshot) == 1 and hub2.snapshot[0].request_id == "req-restart",
+            len(hub2.snapshot) == 1 and hub2.snapshot[0]["request_id"] == "req-restart",
             f"{len(hub2.snapshot)} recovered: state "
-            f"{pb.AttemptState.Name(hub2.snapshot[0].state) if hub2.snapshot else '-'}",
+            + (pb.AttemptState.Name(hub2.snapshot[0]["state"]) if hub2.snapshot else "-"),
         )
         replay = hub2.wait(
-            lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
+            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
             60,
             "replayed terminal",
         )
         check(
             "the SAME body is re-wrapped in a fresh envelope, byte for byte",
-            replay.terminal_canonical == first_bytes and replay.worker_boot_id == hub2.boot_id,
-            f"{len(first_bytes)} identical canonical bytes, id {replay.terminal_id}",
+            replay.outcome_canonical_bytes == first_bytes and replay.worker_boot_id == hub2.boot_id,
+            f"{len(first_bytes)} identical canonical bytes, id {replay.outcome_id}",
         )
         _shutdown(restarted)
         restarted.hub.close()
@@ -2071,7 +2202,7 @@ def section_seal(args: argparse.Namespace) -> None:
 
 
 def section_tripwire(args: argparse.Namespace) -> None:
-    """STRUCTURAL: the supervisor never imports endpoint code, whatever the endpoint does.
+    """STRUCTURAL: the worker never imports endpoint code, whatever the endpoint does.
 
     The endpoint module writes `<pid>.pid` into `corpus/endpoint/imports/` at MODULE SCOPE.
     Any process that imports it leaves a mark it cannot avoid leaving — a friendly endpoint
@@ -2089,13 +2220,13 @@ def section_tripwire(args: argparse.Namespace) -> None:
     try:
         hub.ready(plan_id_for("denoise"), 400)
         head("who imported the endpoint module")
-        supervisor_pid = worker.process.pid
+        worker_pid = worker.process.pid
         executor_pid = worker.executor_pid()
         seen = sorted(int(path.stem) for path in marks.glob("*.pid"))
         check(
             "the endpoint was imported by the EXECUTOR and by nobody else",
             seen == [executor_pid],
-            f"import marks {seen}; executor {executor_pid}, supervisor {supervisor_pid} "
+            f"import marks {seen}; executor {executor_pid}, worker {worker_pid} "
             "— the warm pass synthesizes and runs INSIDE the disposable process, so no "
             "endpoint module scope can ever contaminate the no-CUDA parent",
         )
@@ -2125,7 +2256,7 @@ def section_acceptance(args: argparse.Namespace) -> None:
         head("a granted payload input that is not there")
         canonical_bytes, digest = make_spec(plan_id, outputs=0)
         grant = pb.DeliveryGrant(
-            invocation_digest=digest,
+            invocation_spec_digest=digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
             inputs=[
@@ -2137,15 +2268,16 @@ def section_acceptance(args: argparse.Namespace) -> None:
             outputs=[],
         )
         hub.send(
-            pb.OwnerFrame(
-                start_attempt=hub._env(
-                    pb.StartAttempt(
+            pb.RecordOwnerFrame(
+                attempt_offer=hub._env(
+                    pb.AttemptOffer(
                         request_id="req-nopayload",
-                        attempt=1,
-                        invocation_digest=digest,
+                        attempt_ordinal=1,
+                        invocation_spec_digest=digest,
                         grant=grant,
-                        invocation_canonical=canonical_bytes,
-                        deployment_id=DEPLOYMENT,
+                        invocation_spec_canonical_bytes=canonical_bytes,
+                        placement_id=PLACEMENT,
+                        admission_generation=hub.admission_generation,
                     )
                 )
             )
@@ -2153,9 +2285,9 @@ def section_acceptance(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-nopayload"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-nopayload"
                     else None
                 ),
                 120,
@@ -2180,9 +2312,9 @@ def section_acceptance(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-expired"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-expired"
                     else None
                 ),
                 120,
@@ -2204,22 +2336,23 @@ def section_acceptance(args: argparse.Namespace) -> None:
         # DOCUMENT SHAPE, not the digest — which is the arm.
         mal_bytes, mal_digest = make_spec(plan_id, outputs=0, payload_raw=raw)
         grant = pb.DeliveryGrant(
-            invocation_digest=mal_digest,
+            invocation_spec_digest=mal_digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
             inputs=[pb.InputAccess(input_id="payload", url=f"file://{bad}")],
             outputs=[],
         )
         hub.send(
-            pb.OwnerFrame(
-                start_attempt=hub._env(
-                    pb.StartAttempt(
+            pb.RecordOwnerFrame(
+                attempt_offer=hub._env(
+                    pb.AttemptOffer(
                         request_id="req-malformed",
-                        attempt=1,
-                        invocation_digest=mal_digest,
+                        attempt_ordinal=1,
+                        invocation_spec_digest=mal_digest,
                         grant=grant,
-                        invocation_canonical=mal_bytes,
-                        deployment_id=DEPLOYMENT,
+                        invocation_spec_canonical_bytes=mal_bytes,
+                        placement_id=PLACEMENT,
+                        admission_generation=hub.admission_generation,
                     )
                 )
             )
@@ -2227,9 +2360,9 @@ def section_acceptance(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-malformed"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-malformed"
                     else None
                 ),
                 120,
@@ -2247,9 +2380,9 @@ def section_acceptance(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-good"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-good"
                     else None
                 ),
                 300,
@@ -2268,7 +2401,7 @@ def section_acceptance(args: argparse.Namespace) -> None:
 
 
 def section_abandon(args: argparse.Namespace) -> None:
-    """Supervisor death AFTER acceptance and BEFORE any terminal."""
+    """Worker death AFTER acceptance and BEFORE any terminal."""
     tmp = Path(args.tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -2280,7 +2413,7 @@ def section_abandon(args: argparse.Namespace) -> None:
     stubborn_id = plan_id_for("stubborn")
     try:
         hub.ready(stubborn_id, 400)
-        head("kill -9 the SUPERVISOR while an accepted attempt is running")
+        head("kill -9 the WORKER while an accepted attempt is running")
         dispatch(
             hub,
             tmp,
@@ -2309,7 +2442,7 @@ def section_abandon(args: argparse.Namespace) -> None:
         worker.process.wait(timeout=20)
         worker.hub.close()
 
-        head("the restarted supervisor mints the terminal the dead one owed")
+        head("the restarted worker mints the terminal the dead one owed")
         restarted = start_worker(
             tmp, entrypoints=("denoise", "stubborn"), no_warm=True, instance_id="ins-abandon"
         )
@@ -2317,11 +2450,11 @@ def section_abandon(args: argparse.Namespace) -> None:
         check(
             "the recovered attempt rides the SNAPSHOT as TERMINAL-PENDING-ACK",
             len(hub2.snapshot) == 1
-            and hub2.snapshot[0].state == pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
+            and hub2.snapshot[0]["state"] == pb.AttemptState.ATTEMPT_STATE_OUTCOME_PENDING_ACK,
             "recovery mints a durable terminal, never a live attempt with no plan",
         )
         terminal = hub2.wait(
-            lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
+            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
             60,
             "ABANDONED",
         )
@@ -2346,9 +2479,9 @@ def section_abandon(args: argparse.Namespace) -> None:
         # duplicate waits behind that; it is queued, never lost.
         hub2.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-lost"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-lost"
                 else None
             ),
             400,
@@ -2358,8 +2491,9 @@ def section_abandon(args: argparse.Namespace) -> None:
         replays = hub2.terminals("req-lost")
         check(
             "the recovered terminal replays byte-for-byte; no plan is ever demanded",
-            len(replays) >= 2 and replays[0].terminal_canonical == replays[-1].terminal_canonical,
-            f"{len(replays)} terminals, identical bodies, id {replays[0].terminal_id}",
+            len(replays) >= 2
+            and replays[0].outcome_canonical_bytes == replays[-1].outcome_canonical_bytes,
+            f"{len(replays)} terminals, identical bodies, id {replays[0].outcome_id}",
         )
         _shutdown(restarted)
         restarted.hub.close()
@@ -2385,7 +2519,7 @@ def section_results(args: argparse.Namespace) -> None:
         body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
         spec = pb.InvocationSpec(
             endpoint_release_id=RELEASE,
-            image_digest="sha256:" + "11" * 32,
+            environment_spec_digest="sha256:" + "11" * 32,
             config_digest="sha256:" + "22" * 32,
             payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),
             inputs=[
@@ -2406,7 +2540,7 @@ def section_results(args: argparse.Namespace) -> None:
         spec.serving.attempt_binding_id = pair_id
         canonical_bytes, digest = documents.identity(spec)
         grant = pb.DeliveryGrant(
-            invocation_digest=digest,
+            invocation_spec_digest=digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
             inputs=[pb.InputAccess(input_id="payload", url=f"file://{payload_path}")],
@@ -2417,15 +2551,16 @@ def section_results(args: argparse.Namespace) -> None:
             ],
         )
         hub.send(
-            pb.OwnerFrame(
-                start_attempt=hub._env(
-                    pb.StartAttempt(
+            pb.RecordOwnerFrame(
+                attempt_offer=hub._env(
+                    pb.AttemptOffer(
                         request_id="req-pair",
-                        attempt=1,
-                        invocation_digest=digest,
+                        attempt_ordinal=1,
+                        invocation_spec_digest=digest,
                         grant=grant,
-                        invocation_canonical=canonical_bytes,
-                        deployment_id=DEPLOYMENT,
+                        invocation_spec_canonical_bytes=canonical_bytes,
+                        placement_id=PLACEMENT,
+                        admission_generation=hub.admission_generation,
                     )
                 )
             )
@@ -2433,9 +2568,9 @@ def section_results(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-pair"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-pair"
                     else None
                 ),
                 300,
@@ -2501,9 +2636,9 @@ def section_results(args: argparse.Namespace) -> None:
         body = terminal_body(
             hub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-bloat"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-bloat"
                     else None
                 ),
                 300,
@@ -2606,8 +2741,8 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
         report = hub.ready(plan_id, 900)
         row["ready_s"] = round(time.perf_counter() - boot, 2)
         check(
-            "the four-component pipeline reached READY",
-            plan_id in hub.deployment(report).ready_entrypoint_binding_plan_ids,
+            "the four-component pipeline reached DISPATCHABLE",
+            plan_id in hub.deployment(report).dispatchable_plan_ids,
             f"{row['ready_s']:.1f} s, executor generation "
             f"{hub.deployment(report).executor_generation}",
         )
@@ -2643,9 +2778,9 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
             )
             terminal = hub.wait(
                 lambda m, r=request_id: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == r
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == r
                     else None
                 ),
                 900,
@@ -2796,9 +2931,9 @@ def section_drift(args: argparse.Namespace) -> dict[str, Any]:
         )
         hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-leak"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-leak"
                 else None
             ),
             300,
@@ -2842,9 +2977,9 @@ def section_drift(args: argparse.Namespace) -> dict[str, Any]:
         )
         after = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-after-leak"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-after-leak"
                 else None
             ),
             300,
@@ -2910,10 +3045,10 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         ready = hub.ready(plan_id, 400)
         head("a NON-COOPERATIVE handler, cancelled forcefully")
         check(
-            "the worker starts READY and says which plans it can serve",
-            ready.intake_state == pb.IntakeState.INTAKE_STATE_READY
-            and plan_id in hub.deployment(ready).ready_entrypoint_binding_plan_ids,
-            f"{len(hub.deployment(ready).ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            "the worker starts DISPATCHABLE and says which plans it can serve",
+            hub.deployment(ready).serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+            and plan_id in hub.deployment(ready).dispatchable_plan_ids,
+            f"{len(hub.deployment(ready).dispatchable_plan_ids)} dispatchable plan(s), "
             f"executor generation {hub.deployment(ready).executor_generation}",
         )
         _, digest = dispatch(
@@ -2933,38 +3068,39 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         since = hub.mark()
         cancelled_at = time.perf_counter()
         hub.send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=hub._env(
                     pb.CancelAttempt(
                         request_id="req-stub",
-                        attempt=1,
+                        attempt_ordinal=1,
                         reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                        invocation_digest=digest,
+                        invocation_spec_digest=digest,
                     )
                 )
             )
         )
         dropped = hub.wait(
             lambda m: (
-                m.report
-                if m.WhichOneof("msg") == "report"
-                and m.report.intake_state != pb.IntakeState.INTAKE_STATE_READY
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state"
+                and m.observed_state.admission_state != pb.AdmissionState.ADMISSION_STATE_OPEN
                 else None
             ),
             60,
-            "a Report that stops claiming READY",
+            "an ObservedWorkerState that stops claiming an OPEN window",
             since,
         )
         drop_ms = (time.perf_counter() - cancelled_at) * 1000
         row["capacity_drop_ms"] = round(drop_ms)
         check(
-            "the forceful kill DROPS the advertised capacity at the owner seat",
-            dropped.intake_state != pb.IntakeState.INTAKE_STATE_READY
-            and not list(hub.deployment(dropped).ready_entrypoint_binding_plan_ids),
-            f"{pb.IntakeState.Name(dropped.intake_state)} with "
-            f"{len(hub.deployment(dropped).ready_entrypoint_binding_plan_ids)} ready plan(s), "
-            f"{drop_ms:.0f} ms after the cancel was sent "
-            f"(readiness epoch {hub.deployment(dropped).readiness_epoch})",
+            "the forceful kill CLOSES admission at the RecordOwner seat",
+            dropped.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
+            and not list(hub.deployment(dropped).dispatchable_plan_ids),
+            f"{pb.AdmissionState.Name(dropped.admission_state)} with "
+            f"{len(hub.deployment(dropped).dispatchable_plan_ids)} dispatchable plan(s), "
+            f"{drop_ms:.0f} ms after the cancel was sent (serving "
+            f"{pb.ServingState.Name(hub.deployment(dropped).serving)}, admission generation "
+            f"{dropped.admission_generation})",
         )
         # DISPATCHED INTO THE WINDOW, on purpose and immediately: the executor is dead, the
         # rebuild has not spawned its replacement yet, so the incarnation the coordinator
@@ -2979,9 +3115,9 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
 
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-stub"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-stub"
                 else None
             ),
             120,
@@ -2995,9 +3131,9 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         )
         next_terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-next"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-next"
                 else None
             ),
             300,
@@ -3023,11 +3159,11 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         back = [
             report
             for report in hub.reports()
-            if report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-            and serve_id in hub.deployment(report).ready_entrypoint_binding_plan_ids
+            if hub.deployment(report).serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+            and serve_id in hub.deployment(report).dispatchable_plan_ids
         ]
         check(
-            "and READY came back only once the executor was re-prepared",
+            "and DISPATCHABLE came back only once the executor was re-prepared",
             len(back) >= 2,
             f"{len(back)} READY report(s) carrying the plan; recovery gap "
             f"{row['recovery_gap_ms']} ms",
@@ -3037,7 +3173,7 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "the worker WAITED for it rather than refusing it — one attempt, no refusal",
             bool(waited) and not any("refused" in line for line in worker.tail("req-next", 12)),
-            row["queue_note"] or "no queue note in the supervisor's activity lane",
+            row["queue_note"] or "no queue note in the worker's activity lane",
         )
         row["gpu_after"] = gpu_used_mib()
     finally:
@@ -3104,7 +3240,7 @@ def main() -> int:
     # repository already holds rather than to itself alone.
     parser.add_argument("--prompt", default="a photograph of an astronaut riding a horse")
     args = parser.parse_args()
-    # One workspace per invocation. A supervisor whose harness went away keeps reconnecting
+    # One workspace per invocation. A worker whose harness went away keeps reconnecting
     # to its hub socket, so a shared path would let a previous run's worker register into
     # this run's coordinator — two workers, one hub, and unreadable evidence.
     args.tmp = args.tmp or f"/tmp/cozy-cr007/{args.section}-{os.getpid()}"

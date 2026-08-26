@@ -2,7 +2,7 @@
 
 `corpus/sdxl_real.py` is the MODEL (upstream diffusers, upstream config, 1,680 real
 destinations); this file is the ENDPOINT around it — the request schema, the handlers, and
-the output transaction the supervisor drives an attempt through. It is deliberately in
+the output transaction the worker drives an attempt through. It is deliberately in
 `corpus/` and not in `examples/`: the examples are weightless and run anywhere, this one
 needs an 8 GiB card and a real CAS.
 
@@ -41,7 +41,7 @@ from cozy_runtime.author import (
 from cozy_runtime.author._app import App
 
 # IMPORT TRIPWIRE (cr-007 red arm, deliberate module-scope side effect). Every process
-# that imports this endpoint records its own pid here. The supervisor must never appear:
+# that imports this endpoint records its own pid here. The worker must never appear:
 # it is the long-lived no-CUDA process, and endpoint module scope is exactly where a real
 # endpoint would touch torch. `scripts/worker-live.py tripwire` reads these files.
 _IMPORTS = Path(__file__).resolve().parent / "imports"

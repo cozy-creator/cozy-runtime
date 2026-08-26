@@ -94,7 +94,7 @@ REFUSALS = frozenset(
         "incomplete_fill",  # commit with a DestinationSet key never enqueued
         "lease_live",  # a staging slot reused before its completion event
         "derived_unmaterialized",  # a non-persistent buffer the fill plane cannot supply
-        # cr-006's three, spoken in the SAME vocabulary because the supervisor, the
+        # cr-006's three, spoken in the SAME vocabulary because the worker, the
         # journal and the CLI all read one refusal table. `encoding.py` owns their
         # meaning; this line is what keeps a new code from appearing unnoticed.
         "unknown_encoding",  # the header cites a spec digest no provider claims
@@ -263,7 +263,7 @@ STORE_REFUSALS: dict[str, str] = {
     # asks TensorFS whether every tensor's stored roles ARE the roles its cited spec
     # declares. Both codes were escaping this plane UNTRANSLATED — a raw
     # `tensorfs.errors.Refusal` crossing a boundary whose whole contract is that the
-    # supervisor, the journal and the CLI read ONE refusal table. Same class as #496a, one
+    # worker, the journal and the CLI read ONE refusal table. Same class as #496a, one
     # layer up: the check fired correctly and the answer had nowhere to go.
     "ROLE_SET_MISMATCH": "carrier_geometry",
     "SHAPE_MISMATCH": "carrier_geometry",
@@ -1494,7 +1494,7 @@ class StreamingFillBackend:
         one is the EXCEPTION: a Python traceback retains every frame it passed through,
         including the fill loop's live destination map. Measured here (an interrupted 4.78
         GiB fill "released" 0 bytes until the storages were freed explicitly), and it is
-        the same hazard the moment a supervisor journals a fill failure.
+        the same hazard the moment a worker journals a fill failure.
         """
         from cozy_runtime.internal.derive import placing
 

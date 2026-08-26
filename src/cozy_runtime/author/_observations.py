@@ -23,7 +23,7 @@ typed refusal at `emit`, not a redaction downstream: redaction is a filter someo
 forget to apply, and a refusal is one the author fixes once.
 
 This module is in the AUTHOR package on purpose — the caps must bite where the author code
-emits, and the supervisor imports the same implementation rather than a second one.
+emits, and the worker imports the same implementation rather than a second one.
 """
 
 from __future__ import annotations

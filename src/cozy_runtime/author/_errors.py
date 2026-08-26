@@ -133,7 +133,7 @@ def _is_device_oom(exc: BaseException) -> bool:
     """A torch device OOM, recognized WITHOUT importing torch.
 
     This module is the author kernel's and it is deliberately dependency-free — the
-    supervisor imports it and the supervisor has no torch. The identity is therefore
+    worker imports it and the worker has no torch. The identity is therefore
     structural: the class's own module and name, which `torch.cuda.OutOfMemoryError` has had
     since it was split out of `RuntimeError`.
     """

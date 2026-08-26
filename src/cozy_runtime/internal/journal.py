@@ -1,13 +1,13 @@
-"""The durable attempt/terminal journal — the worker's at-most-once evidence.
+"""The durable attempt/outcome journal — the worker's at-most-once evidence.
 
 Journal-before-send is the non-negotiable order (worker-protocol/02 §2): acceptance persists
-before AttemptAccepted, the terminal persists before AttemptTerminal, closure records only on
-TerminalAck. Everything the supervisor may later CLAIM about an attempt is a line in this
+before AttemptAccepted, the outcome persists before AttemptOutcome, closure records only on
+AttemptOutcomeAck. Everything the worker may later CLAIM about an attempt is a line in this
 file, and a line is written with `fsync` before the claim leaves the process.
 
 Journal honesty (§4): ENOSPC, corruption or I/O uncertainty means NO acknowledgement, NO
 execution, and no further acceptance — at-most-once is never claimed from memory. The
-mechanism is `stopped`: the first failed append latches it, and the supervisor's admission
+mechanism is `stopped`: the first failed append latches it, and the worker's admission
 path reads it before anything else.
 
 Line format is `<sha256 hex> <canonical json>`: the digest is over exactly the canonical
@@ -34,11 +34,15 @@ from cozy_runtime.internal import canonical
 #: Record kinds. Closed on purpose: a new kind is a schema change, not a new string.
 KINDS = (
     "session",  # a new session minted (control-parent boot)
-    "ownership",  # an ACCEPTED (owner_epoch, controller_id), journaled before ClaimAck (#494e)
+    "ownership",  # an ACCEPTED (record_owner_epoch, id), journaled before ClaimAck (#494e)
+    # THE EXACT ACCEPTED SET BYTES (rev-2 §4). Never a re-serialization and never a
+    # structured projection: recovery, status attribution and the snapshot all quote these,
+    # which is what makes "the set this worker accepted" a byte fact.
+    "placement_set",
     "accepted",  # PREPARED acceptance: spec + plan + model-construction digests
-    "terminal",  # the exact canonical TerminalBody bytes, journaled before send
-    "closed",  # TerminalAck bound by terminal_id + terminal_digest
-    "epoch",  # executor incarnation / readiness epoch movement
+    "outcome",  # the exact canonical AttemptOutcomeBody bytes, journaled before send
+    "closed",  # AttemptOutcomeAck bound by outcome_id + outcome_digest
+    "epoch",  # executor incarnation movement
     "warm",  # one boot warm-pass outcome
     "ledger",  # one attempt's byte-class reconciliation at close (cr-008a)
     "triage",  # one WorkerTriageBundle write receipt (cr-011): subject, digest, length
@@ -156,24 +160,24 @@ class Journal:
     def of_kind(self, kind: str) -> list[Record]:
         return [r for r in self.records if r.kind == kind]
 
-    def terminal_bytes(self, key: tuple[str, int]) -> bytes:
-        """One attempt's journaled canonical terminal, re-read.
+    def outcome_bytes(self, key: tuple[str, int]) -> bytes:
+        """One attempt's journaled canonical outcome, re-read.
 
         The DURABLE record is here, so a closed attempt does not have to hold a second copy
-        of it in memory for a replay that may never come — and a terminal can carry a 4 MiB
+        of it in memory for a replay that may never come — and an outcome can carry a 4 MiB
         inline result (codex audit, adopted 2026-08-25). Empty when the journal has no
-        terminal for that ordinal, which the caller must treat as "nothing to replay".
+        outcome for that ordinal, which the caller must treat as "nothing to replay".
         """
         row = self.attempts().get(key)
-        if row is None or "terminal_canonical_b64" not in row:
+        if row is None or "outcome_canonical_b64" not in row:
             return b""
-        return base64.b64decode(row["terminal_canonical_b64"])
+        return base64.b64decode(row["outcome_canonical_b64"])
 
     def attempts(self) -> dict[tuple[str, int], dict[str, Any]]:
-        """Replay into the attempt table: acceptance, terminal body, closure.
+        """Replay into the attempt table: acceptance, outcome body, closure.
 
         `state` is one of `accepted` (accepted-but-incomplete — §2's ABANDONED case),
-        `terminal` (journaled, awaiting TerminalAck) or `closed` (compactable).
+        `outcome` (journaled, awaiting AttemptOutcomeAck) or `closed` (compactable).
         """
         table: dict[tuple[str, int], dict[str, Any]] = {}
         for record in self.records:
@@ -181,14 +185,14 @@ class Journal:
             if record.kind == "accepted":
                 key = (body["request_id"], body["attempt"])
                 table[key] = {"state": "accepted", **body}
-            elif record.kind == "terminal":
+            elif record.kind == "outcome":
                 key = (body["request_id"], body["attempt"])
                 entry = table.get(key)
                 if entry is None:
-                    # A terminal with no journaled assignment cannot be replayed: the
+                    # An outcome with no journaled assignment cannot be replayed: the
                     # three-authorization rule (§2) needs the assignment.
                     entry = table[key] = {"state": "unassigned", **body}
-                entry.update(state="terminal", **body)
+                entry.update(state="outcome", **body)
             elif record.kind == "closed":
                 key = (body["request_id"], body["attempt"])
                 if key in table:

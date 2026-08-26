@@ -264,7 +264,7 @@ def spawn(label: str, spec: dict[str, Any], mode: str = "exec") -> dict[str, Any
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — supervisor, executor, endpoint."""
+    """ONE request through the WHOLE real path — worker, executor, endpoint."""
     import dataclasses
     import os
 
@@ -407,7 +407,7 @@ def calibrate() -> None:
         )
         check(
             f"{record['name']}: a real image through the whole attempt path",
-            outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED" and bool(outputs),
+            outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED" and bool(outputs),
             str(plan.get("quantified_choice", ""))[:160],
         )
     table, _ = load_table()
@@ -609,7 +609,7 @@ def serve() -> None:
         print(f"      {str(plan.get('quantified_choice', ''))[:220]}")
         check(
             f"{objective}: a real image, end to end, on the chosen route",
-            outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED" and bool(outcome.get("outputs")),
+            outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED" and bool(outcome.get("outputs")),
             f"exit {outcome.get('exit_code')}",
         )
     check(
@@ -670,7 +670,7 @@ def staged() -> None:
     )
     check(
         "and the KERNEL did not change with it",
-        outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         "a placement rung changes weight placement only; the delivery stayed float and the "
         "GEMM stayed cuBLAS fp16",
     )
@@ -701,7 +701,7 @@ def arms() -> None:
         DeclaredBinding,
         PlanChooser,
         PlanRefusal,
-        PreparedGeneration,
+        PreparedModel,
         PreparedRequest,
     )
 
@@ -783,7 +783,7 @@ def arms() -> None:
     declared = DeclaredBinding.read(binding_record(variants()))
     # The RESOLVED half is the arm's subject: a generation that chose `aot_decode` on the
     # fp8 variant. A deployment cannot write it any more, so the harness states it directly.
-    generation = PreparedGeneration(delivery_rung="aot_decode", delivery_variant="fp8")
+    generation = PreparedModel(delivery_rung="aot_decode", delivery_variant="fp8")
     chooser = PlanChooser(ledger)
     good = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))
     original = RUNGS_BY_NAME["staged_decode"]

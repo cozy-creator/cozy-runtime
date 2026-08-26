@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Any
 
 FAIL = 0
 
@@ -48,20 +49,28 @@ def head(what: str) -> None:
     print(f"\n\033[1m== {what}\033[0m")
 
 
-def cozy(args: list[str], home: pathlib.Path, **kw: object) -> subprocess.CompletedProcess[str]:
-    env = {"PATH": "/usr/bin:/bin", "COZY_HOME": str(home), "HOME": str(home)}
-    env.update(kw.pop("env", {}))  # type: ignore[arg-type]
-    return subprocess.run(
+def cozy(
+    args: list[str],
+    home: pathlib.Path,
+    *,
+    env: dict[str, str] | None = None,
+    **kw: Any,
+) -> subprocess.CompletedProcess[str]:
+    sealed = {"PATH": "/usr/bin:/bin", "COZY_HOME": str(home), "HOME": str(home)}
+    sealed.update(env or {})
+    completed: subprocess.CompletedProcess[str] = subprocess.run(
         [sys.executable, "-m", "cozy_runtime.cli.main", *args],
         capture_output=True,
         text=True,
-        env=env,
-        **kw,  # type: ignore[arg-type]
+        env=sealed,
+        **kw,
     )
+    return completed
 
 
-def pulled(out: str) -> dict:
-    return json.loads(out)
+def pulled(out: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = json.loads(out)
+    return parsed
 
 
 def objects(root: pathlib.Path) -> dict[str, pathlib.Path]:

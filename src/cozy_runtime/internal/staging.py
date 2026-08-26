@@ -95,7 +95,7 @@ class ComponentResidency:
     last_shortfall: dict[str, Any] | None = None
     #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, MEASURED on the same meter the
     #: ledger reconciles `device_allocated` with (`torch.cuda.memory_allocated()`, read
-    #: either side of the move). The supervisor subtracts exactly this and holds the
+    #: either side of the move). The worker subtracts exactly this and holds the
     #: remainder to zero, so the meter that reports the class must be the meter that
     #: explains it — plan arithmetic would leave the allocator's rounding as "leak"
     #: (cr-008b).

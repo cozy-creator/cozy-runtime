@@ -1,6 +1,6 @@
 """`cozy-runtime run` and `cozy-runtime job` — the git-clone contract's load-bearing verbs.
 
-One-shot UX over an EPHEMERAL LOCAL SUPERVISOR and the same attempt kernel `serve` uses:
+One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` uses:
 `internal.local.run_slice` IS the body, and this module is the LOCAL COORDINATOR adapter
 around it (cozy-runtime-cli.md §Local authority) — it resolves the ref, mints the binding
 plan record, derives the granted output field paths from the descriptor, and maps the
@@ -54,10 +54,10 @@ MIB = 1 << 20
 #: How a terminal status becomes a process exit. The runtime already decided what happened;
 #: this is a table, never a second judgement.
 TERMINAL_EXITS: Mapping[str, Exit] = {
-    "TERMINAL_STATUS_SUCCEEDED": Exit.ok,
-    "TERMINAL_STATUS_FAILED": Exit.failed,
-    "TERMINAL_STATUS_CANCELED": Exit.canceled,
-    "TERMINAL_STATUS_ABANDONED": Exit.failed,
+    "OUTCOME_STATUS_SUCCEEDED": Exit.ok,
+    "OUTCOME_STATUS_FAILED": Exit.failed,
+    "OUTCOME_STATUS_CANCELED": Exit.canceled,
+    "OUTCOME_STATUS_ABANDONED": Exit.failed,
 }
 
 #: A refusal terminal carries a CAUSE, and the cause is what picks the code — a refusal is
@@ -248,7 +248,7 @@ def run(
         org=(flags.get("--org") or ["local"])[0],
     )
     release_id = str(body["application"])
-    # The supervisor narrates itself to stdout, which is the right place for a long-lived
+    # The worker narrates itself to stdout, which is the right place for a long-lived
     # `serve` process and the wrong place for a verb whose stdout IS a result document. The
     # narration is not suppressed — it is a real progress channel — it just goes where
     # progress goes, so `--json` emits exactly the document and nothing else.
@@ -642,7 +642,7 @@ def _name_for(code: Exit) -> str:
 
 
 def _exit_for(status: str, cause: Mapping[str, Any]) -> Exit:
-    if status == "TERMINAL_STATUS_REFUSED":
+    if status == "OUTCOME_STATUS_REFUSED":
         return CAUSE_EXITS.get(_cause_name(cause.get("code")), Exit.validation)
     return TERMINAL_EXITS.get(status, Exit.failed)
 

@@ -1,4 +1,4 @@
-"""The no-CUDA supervisor: protocol session, journal, grants, arbitration, supervision.
+"""The no-CUDA worker: protocol session, journal, grants, arbitration, supervision.
 
 Five modules, one process:
 
@@ -8,7 +8,7 @@ Five modules, one process:
 | `grants.py` | DeliveryGrant reads/writes and the CLOSED hub-call authorization table |
 | `child.py` | the disposable executor: spawn, seal, epochs, cooperative -> forceful kill |
 | `attempts.py` | the attempt state machine, terminals, metric attestation, the warm pass |
-| `session.py` | the `cozy.worker.v1` client and the supervisor entrypoint |
+| `session.py` | the `cozy.worker.v1` client and the worker entrypoint |
 
 Nothing here imports torch, and `scripts/worker-live.py nocuda` proves it against the
 RUNNING process rather than against the import graph.

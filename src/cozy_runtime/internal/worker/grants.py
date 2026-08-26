@@ -18,7 +18,7 @@ Two transports, one reader (cr-012). `file://` is the local deployment's own spo
 `https://` goes out through `internal/egress.py`, which holds a declared allowlist, resolves
 fail-closed and re-applies the whole check on EVERY redirect hop. Both land in one bounded
 reader. The EXECUTOR still has no outbound network at all — every fetch happens here, in the
-supervisor, before acceptance, and the executor is handed verified files in the attempt
+worker, before acceptance, and the executor is handed verified files in the attempt
 spool.
 """
 
@@ -55,7 +55,7 @@ class HubCall:
     why: str
 
 
-#: The COMPLETE set of calls this supervisor may make. Read it as the security boundary it
+#: The COMPLETE set of calls this worker may make. Read it as the security boundary it
 #: is: anything not spelled here cannot be dialled, whoever asks.
 HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
@@ -160,7 +160,7 @@ class Authorizer:
         self.refusals.append(event)
         raise GrantRefusal(
             "hub_call_unauthorized",
-            f"SECURITY EVENT — {method} {url[:120]} as {name!r}: {why}. The supervisor's "
+            f"SECURITY EVENT — {method} {url[:120]} as {name!r}: {why}. The worker's "
             "hub-call table is closed; a refusal is not a 404",
         )
 
@@ -204,15 +204,15 @@ class BoundGrant:
 def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: bytes) -> BoundGrant:
     """JOIN the InvocationSpec document's identities to the grant's access, typed refusals.
 
-    The grant serves exactly one invocation: its `invocation_digest` must name this
+    The grant serves exactly one invocation: its `invocation_spec_digest` must name this
     attempt's. The id SETS must agree exactly — an input the spec declares with no access
     is unfetchable, and access to an id the spec never declared is authority nobody's
     digest covers.
     """
-    if grant.invocation_digest and bytes(grant.invocation_digest) != invocation_digest:
+    if grant.invocation_spec_digest and bytes(grant.invocation_spec_digest) != invocation_digest:
         raise GrantRefusal(
             "grant_subject_mismatch",
-            "the delivery grant names a different invocation_digest than this attempt; a "
+            "the delivery grant names a different invocation_spec_digest than this attempt; a "
             "grant serves exactly one invocation and a refresh can change access only",
         )
     spec_inputs = {str(row["input_id"]): row for row in spec.get("inputs", ())}

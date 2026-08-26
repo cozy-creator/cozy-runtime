@@ -1,6 +1,6 @@
 """Host facts, measured once, tri-state: present / absent / UNREADABLE.
 
-ONE owner for "what is this machine". The supervisor's `Register` and the `doctor` verb are
+ONE owner for "what is this machine". The worker's `Register` and the `doctor` verb are
 two consumers of the same measurement, not two probes that could disagree — a wedged driver
 must read the same to both. Anything that cannot be read WITHOUT a CUDA context is NAMED in
 `unreadable` rather than reported as zero, because a wedged driver is not a CPU host, and
@@ -30,9 +30,9 @@ class HostFacts:
     unreadable: tuple[str, ...] = field(default_factory=tuple)
     backend: str = ""
     """`cuda` / `mps` / "" — which accelerator FAMILY is present. Registration reports an
-    accelerator PRESENT-BUT-UNQUALIFIED (#446): the torch-free supervisor can see that a
+    accelerator PRESENT-BUT-UNQUALIFIED (#446): the torch-free worker can see that a
     device family exists, and only the executor's probe (#430) qualifies what it can DO —
-    the supervisor never reports a capability it did not measure."""
+    the worker never reports a capability it did not measure."""
 
     @property
     def gpu_count(self) -> int:

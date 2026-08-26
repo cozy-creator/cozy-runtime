@@ -1,6 +1,6 @@
 """Device-child environment projection: the reviewed allowlist, as DATA.
 
-cozy-runtime.md §3.5 — the supervisor projects an allowlist to the device executor by
+cozy-runtime.md §3.5 — the worker projects an allowlist to the device executor by
 ERASE known prefixes -> IMPOSE declared values unconditionally -> SEAL, completed BEFORE
 executor CUDA init. This module owns the two data tables and the allowlist gate only.
 **The seal ordering and its execution belong to cr-007** — do not implement spawn here.
@@ -82,12 +82,12 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     ProjectedVar(
         "COZY_HOME",
         "config.cozy_home",
-        "store root, so the executor resolves the same CAS as the supervisor",
+        "store root, so the executor resolves the same CAS as the worker",
     ),
     ProjectedVar(
         "COZY_EXECUTOR_SOCKET",
-        "supervisor.executor_channel",
-        "the supervisor/executor control channel path handed to the child at spawn",
+        "worker.executor_channel",
+        "the worker/executor control channel path handed to the child at spawn",
     ),
 )
 

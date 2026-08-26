@@ -61,7 +61,7 @@ class AdjustmentRow:
 @dataclass(frozen=True, slots=True)
 class ProgressFrame:
     """One frame on the LOSSY live lane. Never retained: its durable form is `Attribution`
-    plus the monotone `position` the supervisor's silence detector reads."""
+    plus the monotone `position` the worker's silence detector reads."""
 
     name: str
     fraction: float
@@ -83,7 +83,7 @@ class Attempt:
     attempt used to grow one row per step, so the longest attempt — the one whose triage
     matters most — was the one that leaked."""
     attribution: Attribution = field(default_factory=Attribution)
-    #: MONOTONE progress position, in completed units. The supervisor's liveness detector
+    #: MONOTONE progress position, in completed units. The worker's liveness detector
     #: reads advance here and nowhere else; it is never a clock.
     position: int = 0
     sink: Callable[[ProgressFrame | Observation], None] | None = None
@@ -92,7 +92,7 @@ class Attempt:
     Best-effort and never authoritative: the lossy lane has no authority over a durable
     fact, and its failure cannot fail an attempt. RETAINED observations ride it too, and
     that is what makes a KILLED executor explainable — a ring that only crosses in the
-    reply crosses never when the process that holds it is `kill -9`ed. The supervisor
+    reply crosses never when the process that holds it is `kill -9`ed. The worker
     dedupes by the executor's own sequence, so nothing is counted twice.
     """
     #: The metric lane's own budget. A training job emits one row per step for tens of
@@ -470,7 +470,7 @@ class EgressResponse:
 
 
 class Egress(_Bound):
-    """Supervisor-brokered outbound HTTP (`net`) — connector endpoints only (§1.3).
+    """Worker-brokered outbound HTTP (`net`) — connector endpoints only (§1.3).
 
     Injection and capability derivation are this issue's; the BROKER is cr-012's and its
     consumer is se-006. With no broker installed the call refuses typed — the executor
@@ -494,7 +494,7 @@ class Egress(_Bound):
         self._attempt.check_open("Egress.fetch")
         if self._broker is None:
             raise CapabilityError(
-                f"no egress broker is installed for {method} {url}: the supervisor-side "
+                f"no egress broker is installed for {method} {url}: the worker-side "
                 "broker, allowlist and SSRF fail-closed path are cr-012",
                 code="egress_broker_unavailable",
             )
@@ -660,7 +660,7 @@ class Checkpoints(_Bound):
         if self._sink is None:
             raise CapabilityError(
                 "no durable checkpoint exchange is installed for this attempt: Checkpoints is "
-                "a JOB service and its exchange is the supervisor's, never a local file write",
+                "a JOB service and its exchange is the worker's, never a local file write",
                 code="checkpoints_unavailable",
             )
         if not logical_key:

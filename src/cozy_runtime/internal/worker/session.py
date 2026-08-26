@@ -9,12 +9,19 @@ durability attributes are the whole design:
 * **WatchProgress** — bounded and LOSSY, owner-opened on its own connection. Saturating it
   can never block Control: a different RPC, a different queue, a different thread.
 
-The conversation on every accepted stream is fixed (02): Claim -> ClaimAck -> snapshot
-(Begin/Entry.../End) -> the owner's SnapshotAck -> dispatch opens. The ownership fence is
-`(owner_epoch, control_generation, worker_boot_id)`, checked on every frame before any body
-field is read. LAUNCH TIER (single-owner): the epoch is a provisioned constant — a claim
-with a strictly higher epoch supersedes, an equal epoch from the same controller is a
-reconnect, anything else refuses typed.
+The conversation on every accepted stream is fixed (02): Claim -> ClaimAck -> ONE
+`WorkerSnapshot` -> the RecordOwner's `SnapshotAck` -> dispatch opens. The ownership fence is
+`(record_owner_epoch, control_stream_generation, worker_boot_id)`, checked on every frame
+before any body field is read. LAUNCH TIER (single-owner): the epoch is a provisioned
+constant — a claim with a strictly higher epoch supersedes, an equal epoch from the same
+RecordOwner is a reconnect, anything else refuses typed.
+
+BEFORE the ownership fence comes the SCHEMA fence (#530-A1/#536): `Claim.wire_schema_digest`
+is compared against this file set's own `SCHEMA_DIGEST` before ANY other body field of the
+Claim is read, and the answering `ClaimAck` carries the worker's digest so the RecordOwner
+can make the same check in the other direction. A mismatch — or an ABSENCE, which is what a
+pre-rev-2 peer has to send — refuses `CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH` and the stream
+closes, instead of a stale peer misparsing a renumbered field several frames later.
 
 Threads, and why each exists: each accepted STREAM runs its conversation on the host's
 thread and must never do slow work (a cancel has to arrive while an attempt runs); the
@@ -30,6 +37,7 @@ RUNNING process's loaded modules and mapped libraries, not against the import gr
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import dataclasses
 import hmac
@@ -45,7 +53,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -79,9 +87,15 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
     PlanChooser,
-    PreparedGeneration,
+    PreparedModel,
 )
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import (
+    SCHEMA_DIGEST,
+    SCHEMA_DIGEST_RAW,
+    WIRE_MINOR,
+    WIRE_SCHEMA_REV,
+    documents,
+)
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -100,18 +114,24 @@ RECYCLE_EXIT = 75
 #: already the rate at which this worker's non-attempt facts move.
 REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 
-#: The worker's accepted-attempt WINDOW behind `attempt_credits` (#441, #494f). ONE.
+#: The worker's accepted-attempt WINDOW — the ONE shared acceptance window behind
+#: `available_attempt_slots` (#472e/#494f). ONE.
 #:
 #: It was 2, on the claim that attempt N+1's CPU phase overlaps attempt N's device phase.
 #: That overlap does not exist: `device_lane()` is a single thread that admits, executes and
 #: reconciles one attempt at a time, so a second admitted attempt could only WAIT — and it
-#: waited in a state (`queued`) the wire cannot spell, invisible to the snapshot and to
-#: `Report.active_attempts`. A worker holding work the owner cannot see breaks the
-#: snapshot-is-complete law, so the false state is DELETED rather than surfaced: a dispatch
-#: arriving while this worker already holds one is a typed REFUSED terminal the owner reads,
-#: never a silent hold. cr-019 may re-open overlap as a resource-fit admission decision; it
-#: does not re-open a hidden queue.
-CREDIT_WINDOW = 1
+#: waited in a state (`queued`) the wire cannot spell, invisible to the snapshot and to the
+#: held-attempt set. A worker holding work the RecordOwner cannot see breaks the
+#: snapshot-is-complete law, so the false state is DELETED rather than surfaced: an offer
+#: arriving while this worker already holds one is a JOURNALED REFUSED outcome the
+#: RecordOwner reads, never a silent hold.
+#:
+#: rev-2 makes the SHAPE of the bound structural rather than advisory (§6): per-placement
+#: `attempt_credits` are gone — N counters over ONE serialized device advertised N x the real
+#: capacity — and the seats here are consumed by running attempts AND by outcomes awaiting
+#: `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own admission instead
+#: of growing this worker's held set.
+ADMISSION_WINDOW = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,12 +148,12 @@ class WorkerOptions:
     worker_id: str = "wrk-local"
     instance_id: str = ""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
-    #: The defaults used to name a real SDXL release and a `sha256:00…00` image, which rode
+    #: The defaults used to name a real SDXL release and a `sha256:00…00` artifact, which rode
     #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
     #: owner reading an empty `release_id` learns the truth, and an owner reading a plausible
     #: lie learns nothing it can act on.
     release_id: str = ""
-    image_digest: str = ""
+    artifact_digest: str = ""
     git_commit: str = ""
     python: str = ""
     devices: str = "0"
@@ -151,82 +171,185 @@ class WorkerOptions:
 
 
 @dataclass(slots=True)
-class Deployment:
-    """The ONE hosted deployment (launch enforces len(set) <= 1, #446). The id is the
-    owner-minted routing + journal key; it is never invocation identity."""
+class Placement:
+    """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
+    RecordOwner-minted routing + journal key; it is never invocation identity.
 
-    deployment_id: str
+    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/1` document
+    nested in the accepted set bytes. A single-placement replace is this SAME `placement_id`
+    carrying a NEW spec digest, which is why routing survives an in-place release rollout.
+    """
+
+    placement_id: str
+    spec_digest: bytes
     endpoint_release_id: str
+    environment_spec_digest: bytes
+    installed_environment_receipt_digest: bytes
+    descriptor_digest: bytes
     plan_ids: tuple[str, ...]
+    #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
+    #: offline" — the exact state an outgoing spec holds under fallback-retention.
+    materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
+    serving: pb.ServingState = pb.ServingState.SERVING_STATE_OFFLINE
+    #: #474/#485c: the predecessor kept for restore. EMPTY means replacement is PAUSED —
+    #: fallback capability is a PRECONDITION of replacement, not a nicety.
+    retained_fallback_spec_digest: bytes = b""
 
 
 @dataclass(slots=True)
-class Fences:
-    """The ownership fence and the directive fences, and who owns each (02 §0).
+class OwnershipFence:
+    """WHO may drive this worker, and on WHICH stream (02 §0/§4).
 
-    `owner_epoch` is authority-granter-minted and durable; `control_generation` is
-    WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at
-    worker boot and never reused. The executor generation is DEPLOYMENT truth
-    (#454) and deliberately not here.
+    Split out of the old single `Fences` bag (#484): ownership and accepted intent are two
+    unrelated lifetimes — a reconnect mints a new `control_stream_generation` and touches no
+    accepted revision at all, and #494a's reconnect defect was exactly that confusion made
+    structural. `activity` lives in NEITHER of the two halves; it is the worker's own
+    narration lane and now sits on the worker.
+
+    `record_owner_epoch` is authority-granter-minted and durable; `control_stream_generation`
+    is WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at
+    worker boot and never reused. The executor generation is PLACEMENT truth (#454) and
+    deliberately not here.
     """
 
-    boot_id: str = ""
-    owner_epoch: int = 0
-    controller_id: str = ""
-    #: TRUE once an (owner_epoch, controller_id) pair has been DURABLY recorded — this boot,
-    #: or by a previous boot whose record recovery replayed (#494e). The claim fence reads
-    #: this and not `generation`: authority survives a restart, so a pre-restart owner at a
-    #: lower epoch must still be refused by a worker that has claimed nobody yet.
-    owner_recorded: bool = False
-    generation: int = 0  # worker-minted; 0 = never claimed
+    worker_boot_id: str = ""
+    record_owner_epoch: int = 0
+    record_owner_id: str = ""
+    #: TRUE once a (record_owner_epoch, record_owner_id) pair has been DURABLY recorded —
+    #: this boot, or by a previous boot whose record recovery replayed (#494e). The claim
+    #: fence reads this and not the generation: authority survives a restart, so a
+    #: pre-restart owner at a lower epoch must still be refused by a worker that has claimed
+    #: nobody yet.
+    record_owner_recorded: bool = False
+    control_stream_generation: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
+    snapshot_digest: bytes = b""  # ...bound by BOTH; an ack naming either alone is not one
     dispatch_open: bool = False
-    revision: int = 0  # owner-owned
-    applied_directive: bytes = b""
-    posture: pb.Posture = pb.Posture.POSTURE_UNSPECIFIED
-    intake: pb.IntakeState = pb.IntakeState.INTAKE_STATE_BOOTING
     wire_minor: int = 0
+
+
+@dataclass(slots=True)
+class AcceptedDesiredState:
+    """WHAT this worker was told to be, and the exact bytes it accepted (§4/§8).
+
+    `accepted_desired_state_revision` advances on ACCEPTANCE — which is all it ever honestly
+    meant — and `converged_revision` (computed, never stored here) advances only when the
+    observed placement state satisfies it. `applied_revision` is retired as dishonest (#473):
+    it advanced on acceptance while claiming to report reality.
+
+    `placement_set_canonical_bytes` is the EXACT accepted bytes, journaled and re-quoted —
+    never a re-serialization and never a structured projection (§4). The snapshot carries
+    these bytes verbatim.
+    """
+
+    accepted_desired_state_revision: int = 0
+    desired_state_body: bytes = b""  # the revision's own desired-state bytes (#494a)
+    accepted_placement_set_digest: bytes = b""
+    placement_set_canonical_bytes: bytes = b""
+    posture: pb.Posture = pb.Posture.POSTURE_UNSPECIFIED
     drain_grace_ms: int = 0
-    activity: list[pb.ActivityEvent] = field(default_factory=list)
-    mode: str = ""  # the Directive `mode` oneof this worker APPLIED
-    applied_set_digest: bytes = b""
+    mode: str = ""  # the DesiredWorkerState `mode` oneof this worker APPLIED
+    #: The revision whose placements are all materially STAGED and DISPATCHABLE. It may NEVER
+    #: advance past a placement that is not — the field is a DERIVED fact, and a worker that
+    #: advances it while observed state disagrees is in breach, not merely optimistic (§8).
+    converged_revision: int = 0
 
 
 #: Every envelope-bearing message type sets the same three fields; the stamp is central so
 #: no constructor can forget one (the fence is checked before any body field is read).
-def _stamped(message: Any, fences: Fences) -> Any:
-    message.owner_epoch = fences.owner_epoch
-    message.control_generation = fences.generation
-    message.worker_boot_id = fences.boot_id
+def _stamped(message: Any, fence: OwnershipFence) -> Any:
+    message.record_owner_epoch = fence.record_owner_epoch
+    message.control_stream_generation = fence.control_stream_generation
+    message.worker_boot_id = fence.worker_boot_id
     return message
 
 
-def desired_state(directive: pb.Directive) -> bytes:
-    """The canonical bytes of a Directive's DESIRED STATE — the envelope excluded (#494a).
+def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
+    """The canonical bytes of a DesiredWorkerState's DESIRED STATE — envelope excluded (#494a).
 
-    A Directive carries two unrelated things: what the owner wants this worker to be
-    (revision, posture, wire minor, drain grace, the mode's set or job), and the per-stream
-    envelope that routes it (owner_epoch, control_generation, worker_boot_id). Only the first
-    is the body §3's same-revision rule is about.
+    A DesiredWorkerState carries two unrelated things: what the RecordOwner wants this worker
+    to be (revision, posture, wire minor, drain grace, the mode's set or job), and the
+    per-stream envelope that routes it (record_owner_epoch, control_stream_generation,
+    worker_boot_id). Only the first is the body §3's same-revision rule is about.
 
-    Hashing the whole message made `control_generation` — which the WORKER mints afresh for
-    every accepted stream, by design — part of the body, so the identical desired revision
-    re-sent after an ordinary reconnect classified as `same_revision_changed_body` and took a
-    permanent CONFIG_REFUSED fault. Same revision + same desired state is now the idempotent
-    re-apply it always was; same revision + genuinely different desired state stays the
-    protocol refusal, because that is the case the rule exists for.
+    Hashing the whole message made `control_stream_generation` — which the WORKER mints
+    afresh for every accepted stream, by design — part of the body, so the identical desired
+    revision re-sent after an ordinary reconnect classified as `same_revision_changed_body`
+    and took a permanent CONFIG_REFUSED fault. Same revision + same desired state is now the
+    idempotent re-apply it always was; same revision + genuinely different desired state
+    stays the protocol refusal, because that is the case the rule exists for.
     """
-    body = pb.Directive()
-    body.CopyFrom(directive)
-    body.owner_epoch = 0
-    body.control_generation = 0
+    body = pb.DesiredWorkerState()
+    body.CopyFrom(desired)
+    body.record_owner_epoch = 0
+    body.control_stream_generation = 0
     body.worker_boot_id = ""
     return documents.canonical_bytes(body)
 
 
+def _digest_field(spelled: Any) -> bytes:
+    """A document spells a digest `sha256:<hex>`; the wire carries the 32 raw bytes. Absent
+    is absent — an empty field is not a zero digest (#494g)."""
+    return documents.raw(str(spelled)) if spelled else b""
+
+
+def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, Any]]:
+    """§4's ORDER OF OPERATIONS, and it is not negotiable.
+
+    RECOMPUTE `sha256(placement_set_canonical_bytes)` and compare BEFORE parsing a single
+    field. The frozen wire "digest-addressed" the set by an ECHOED claim, which is a
+    statement the sender makes about bytes it also sent; this is a fence the receiver
+    computes. Only on a match is the document parsed, under unknown-field REFUSAL — at every
+    depth, because a `PlacementSpec` with an unknown key is a `PlacementSpec/2` and there is
+    no additive versioning inside a digest-fenced document.
+
+    Raises `documents.DocumentError`; the caller turns that into the typed fault and leaves
+    the previous set serving.
+    """
+    recomputed = documents.digest_of(desired_set.placement_set_canonical_bytes)
+    if recomputed != desired_set.placement_set_digest:
+        raise documents.DocumentError(
+            "placement_set_digest_mismatch",
+            f"the set claims {desired_set.placement_set_digest.hex()[:16]}… and its own "
+            f"{len(desired_set.placement_set_canonical_bytes)} B hash to "
+            f"{recomputed.hex()[:16]}… — nothing in it has been parsed",
+        )
+    document = documents.read(desired_set.placement_set_canonical_bytes, pb.PlacementSet)
+    placements = document.get("placements", [])
+    if not isinstance(placements, list):
+        raise documents.DocumentError("wrong_type", "`placements` is a list of Placement")
+    known_placement = {f.name for f in pb.Placement.DESCRIPTOR.fields}
+    known_spec = {f.name for f in pb.PlacementSpec.DESCRIPTOR.fields}
+    known_subject = {f.name for f in pb.ArtifactSubject.DESCRIPTOR.fields}
+    for entry in placements:
+        if not isinstance(entry, dict):
+            raise documents.DocumentError("wrong_type", "a Placement is a JSON object")
+        for key in entry:
+            if key not in known_placement:
+                raise documents.DocumentError("unknown_field", f"Placement: unknown key {key!r}")
+        spec = entry.get("spec", {})
+        if not isinstance(spec, dict):
+            raise documents.DocumentError("wrong_type", "`spec` is a PlacementSpec object")
+        for key in spec:
+            if key not in known_spec:
+                raise documents.DocumentError(
+                    "unknown_field", f"PlacementSpec: unknown key {key!r} (a new key is /2)"
+                )
+        for subject in spec.get("binding_plans", []):
+            if not isinstance(subject, dict):
+                raise documents.DocumentError("wrong_type", "an ArtifactSubject is an object")
+            for key in subject:
+                if key not in known_subject:
+                    raise documents.DocumentError(
+                        "unknown_field", f"ArtifactSubject: unknown key {key!r}"
+                    )
+    return [entry for entry in placements if isinstance(entry, dict)]
+
+
 class Worker:
-    """The no-CUDA control parent — the machine's worker process (#455; formerly the
-    `Supervisor`; "supervision" survives as the verb for its executor management)."""
+    """The no-CUDA control parent — the machine's WORKER process (#455/#484; the name
+    `Supervisor` is retired everywhere, and "supervision" survives only as the verb for its
+    executor management)."""
 
     def __init__(self, config: RuntimeConfig, options: WorkerOptions, host: ControlHost) -> None:
         self.config = config
@@ -234,14 +357,27 @@ class Worker:
         self.host = host
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.fences = Fences(boot_id=f"boot-{uuid.uuid4().hex[:20]}")
+        self.fence = OwnershipFence(worker_boot_id=f"boot-{uuid.uuid4().hex[:20]}")
+        self.accepted = AcceptedDesiredState()
+        #: The non-attempt narration lane. In NEITHER fence half (#484): it is neither an
+        #: authority fact nor accepted intent, it is what this worker has been doing.
+        self.activity: list[pb.ActivityEvent] = []
+        #: MACHINE lifecycle, pulled out of the placement enum (#482). BOOTING until the
+        #: first accepted claim finds a worker that booted; FAILED is terminal for this boot.
+        self.phase: pb.WorkerPhase = pb.WorkerPhase.WORKER_PHASE_BOOTING
+        #: THE ONE WORKER-LEVEL ADMISSION FENCE (§6). It bumps whenever the MEANING of
+        #: admission changes — executor respawn, window resize, phase change, cutover — and
+        #: an `AttemptOffer` echoing anything else refuses DETERMINISTICALLY. Per-placement
+        #: `attempt_credits` are deleted: N counters over ONE serialized device advertise
+        #: N x the real capacity, which is an arithmetic defect, not a tuning problem.
+        self.admission_generation = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.journal = Journal(self.root / "journal.log")
         self.ledger = Ledger(
             host_budget=options.host_budget,
             pinned_budget=options.pinned_budget,
-            supervisor_pid=os.getpid(),
+            worker_pid=os.getpid(),
         )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         self.supervision = ExecutorSupervision(
@@ -252,9 +388,14 @@ class Worker:
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
-        self.generations: dict[str, PreparedGeneration] = {}
+        self.prepared_models: dict[str, PreparedModel] = {}
         self.jobs: dict[str, JobBinding] = {}
-        self.deployment: Deployment | None = None
+        self.placement: Placement | None = None
+        #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
+        self.job_ready = False
+        #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
+        #: worker has stopped retrying and `converged_revision` stays behind on purpose.
+        self.latched = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.journal)
@@ -265,7 +406,7 @@ class Worker:
             supervision=self.supervision,
             authorizer=self.authorizer,
             bindings={},
-            generations={},
+            prepared_models={},
             jobs={},
             spool_root=self.root / "spool",
             scratch_root=self.root.parent / "scratch",
@@ -277,9 +418,9 @@ class Worker:
             posture=self.applied_posture,
             device_process=self.read_device_process,
         )
-        self.engine.boot_id = self.fences.boot_id
-        self.engine.deployment_id = lambda: (
-            self.deployment.deployment_id if self.deployment is not None else ""
+        self.engine.boot_id = self.fence.worker_boot_id
+        self.engine.placement_id = lambda: (
+            self.placement.placement_id if self.placement is not None else ""
         )
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
@@ -309,6 +450,10 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
+        #: The standing ACQUISITION authority this worker last accepted (§3). Echoed on
+        #: every ObservedWorkerState so grant landing is observable with no ack lane.
+        self.grant_id = ""
+        self.grant_revision = 0
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
@@ -320,18 +465,18 @@ class Worker:
         event = pb.ActivityEvent(
             seq=next(self.seq), kind=kind, step=step[:256], at_unix_ms=int(time.time() * 1000)
         )
-        self.fences.activity.append(event)
-        del self.fences.activity[:-64]
+        self.activity.append(event)
+        del self.activity[:-64]
         print(f"[worker] {kind}: {step}", flush=True)
 
     def stamp(self, message: Any) -> Any:
         target = message
-        if message.DESCRIPTOR.name in ("WorkerFrame", "OwnerFrame"):
+        if message.DESCRIPTOR.name in ("WorkerFrame", "RecordOwnerFrame"):
             kind = message.WhichOneof("msg")
             if kind is None:
                 return message
             target = getattr(message, kind)
-        _stamped(target, self.fences)
+        _stamped(target, self.fence)
         return message
 
     def send(self, frame: pb.WorkerFrame) -> None:
@@ -349,24 +494,131 @@ class Worker:
             self.stamp(inner)
             self.outbound.put(frame)
 
-    def intake(self, state: pb.IntakeState) -> None:
-        """Move the intake state and REPORT IT IMMEDIATELY — readiness is an EDGE."""
-        if state == self.fences.intake:
+    def set_serving(self, state: pb.ServingState, why: str = "") -> None:
+        """Move the placement's SERVING axis and REPORT IT IMMEDIATELY — dispatchability is
+        an EDGE, and an ObservedWorkerState that arrives on the next tick is a stale one.
+
+        `IntakeState` is retired with both of its uses (#482/#510b). What it conflated was
+        machine lifecycle (now `worker_phase`), what is on disk (now the MATERIALIZATION
+        axis) and what a placement will take (this one) — and a single enum could not say
+        "staged on disk but offline", which is exactly the state an outgoing spec holds under
+        fallback-retention.
+
+        ADMISSION MEANING MOVES WITH IT, so `admission_generation` bumps here (§6): an offer
+        minted against the old generation refuses deterministically rather than racing a
+        placement that stopped being dispatchable while it was in flight.
+        """
+        if self.placement is None or state == self.placement.serving:
             return
-        self.fences.intake = state
-        if state in (pb.IntakeState.INTAKE_STATE_READY, pb.IntakeState.INTAKE_STATE_ERROR):
+        self.placement.serving = state
+        self.bump_admission(why or f"serving -> {pb.ServingState.Name(state)}")
+        self._settle()
+
+    def set_job_ready(self, ready: bool) -> None:
+        """Job mode has no placement, so its admission edge is its own (cr-009)."""
+        if ready == self.job_ready:
+            return
+        self.job_ready = ready
+        self.bump_admission(f"job_ready={ready}")
+        self._settle()
+
+    def _settle(self) -> None:
+        """`settled` is the device lane's gate: has this worker STOPPED moving? A latched
+        activation failure settles too — the lane must refuse through it, not wait forever."""
+        if self.dispatchable() or self.latched:
             self.settled.set()
         else:
             self.settled.clear()
         if self.connected.is_set():
-            self.send(pb.WorkerFrame(report=self.report()))
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def bump_admission(self, why: str) -> None:
+        """The ONE worker-level admission fence moves (§6). Callers: executor respawn,
+        window resize, phase change, cutover, and every serving-axis edge above."""
+        self.admission_generation += 1
+        self.note("admission", f"generation {self.admission_generation}: {why}"[:256])
+
+    def dispatchable(self) -> bool:
+        """Can this worker take an offer AT ALL right now? Serving asks the placement's
+        axis; job mode asks whether its one build is ready. Neither answer is a SLOT count —
+        `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
+        if self.accepted.mode == "job":
+            return self.job_ready
+        return (
+            self.placement is not None
+            and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+        )
+
+    def admission_state(self) -> pb.AdmissionState:
+        """CLOSED is STRUCTURAL (#486c): before the snapshot barrier, while draining, while
+        the placement is not dispatchable. OPEN with zero slots is TRANSIENT saturation, and
+        a RecordOwner backs off differently for each — so the two never collapse into one
+        counter here either."""
+        if (
+            not self.fence.dispatch_open
+            or self.accepted.posture == pb.Posture.POSTURE_DRAINING
+            or self.phase != pb.WorkerPhase.WORKER_PHASE_ONLINE
+            or not self.dispatchable()
+        ):
+            return pb.AdmissionState.ADMISSION_STATE_CLOSED
+        return pb.AdmissionState.ADMISSION_STATE_OPEN
+
+    def available_attempt_slots(self) -> int:
+        """Free seats in the ONE shared acceptance window, NOW.
+
+        BOUNDEDNESS IS STRUCTURAL, NOT A PROMISE (§5): a seat is held by a running attempt
+        AND by an outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking
+        runs itself out of admission instead of growing this worker's held set.
+        """
+        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
+            return 0
+        held = sum(1 for a in self.engine.history.values() if a.state in self.engine.HELD)
+        return max(0, ADMISSION_WINDOW - held)
+
+    def set_phase(self, phase: pb.WorkerPhase, why: str) -> None:
+        if phase == self.phase:
+            return
+        self.phase = phase
+        self.bump_admission(f"worker_phase -> {pb.WorkerPhase.Name(phase)}: {why}")
+        self._settle()
+
+    def latch(self, fault: pb.Fault) -> None:
+        """An activation failure LATCHES for this desired revision (§8): the worker does not
+        evict-and-retry forever, `converged_revision` stays behind, and the fault is typed on
+        the placement. The previous spec keeps serving (fallback-retention, #474)."""
+        self.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
+        self.engine.fault(fault)
+        self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "activation failed; LATCHED")
+        self._settle()
+
+    def fail_machine(self, why: str) -> None:
+        """A MACHINE-scope failure: this worker can no longer honour journal-before-send.
+
+        `WORKER_PHASE_FAILED` is where that fact lives now (#482) — machine lifecycle is out
+        of the placement enum, because "the placement cannot serve" and "the worker cannot
+        write" are different facts with different remedies, and one `INTAKE_STATE_ERROR`
+        said both.
+        """
+        self.engine.fault(
+            pb.Fault(
+                kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                subject=self.options.worker_id,
+                reason=why[:1024],
+                detail="the worker cannot durably record what it would claim, so it stops "
+                "admitting rather than emitting an outcome it can never replay",
+            )
+        )
+        self.set_phase(pb.WorkerPhase.WORKER_PHASE_FAILED, why)
 
     def capacity_dropped(self, why: str) -> None:
-        """The executor's state was invalidated: STOP ADVERTISING READY, right now."""
-        if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
+        """The executor's state was invalidated: STOP ADVERTISING DISPATCHABLE, right now."""
+        if not self.dispatchable():
             return
-        self.note("readiness", f"capacity withdrawn: {why[:200]}")
-        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
+        self.note("serving", f"capacity withdrawn: {why[:200]}")
+        if self.accepted.mode == "job":
+            self.set_job_ready(False)
+        else:
+            self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
 
     def read_device_process(self) -> int:
         """NVML per-process device bytes for the EXECUTOR, read by the worker parent.
@@ -399,19 +651,33 @@ class Worker:
         return child.work(self.ledger.executor_pid)
 
     def applied_posture(self) -> dict[str, Any]:
-        """The deployment state the worker was in when something happened (§3.6)."""
+        """The state the worker was in when something happened (§3.6). `readiness_epoch` is
+        NOT here: it is DELETED, not renamed (#486b) — the serving axis says what the
+        placement can serve and `admission_generation` says whether an offer is admissible,
+        which is one fence instead of two to keep consistent."""
         return {
-            "posture": pb.Posture.Name(self.fences.posture),
-            "intake_state": pb.IntakeState.Name(self.fences.intake),
-            "applied_revision": self.fences.revision,
-            "owner_epoch": self.fences.owner_epoch,
-            "control_generation": self.fences.generation,
-            "applied_wire_minor": self.fences.wire_minor,
-            "readiness_epoch": self.supervision.readiness_epoch,
+            "posture": pb.Posture.Name(self.accepted.posture),
+            "worker_phase": pb.WorkerPhase.Name(self.phase),
+            "materialization": pb.MaterializationState.Name(
+                self.placement.materialization
+                if self.placement
+                else pb.MaterializationState.MATERIALIZATION_STATE_UNSPECIFIED
+            ),
+            "serving": pb.ServingState.Name(
+                self.placement.serving
+                if self.placement
+                else pb.ServingState.SERVING_STATE_UNSPECIFIED
+            ),
+            "accepted_desired_state_revision": self.accepted.accepted_desired_state_revision,
+            "converged_revision": self.converged_revision(),
+            "record_owner_epoch": self.fence.record_owner_epoch,
+            "control_stream_generation": self.fence.control_stream_generation,
+            "applied_wire_minor": self.fence.wire_minor,
+            "admission_generation": self.admission_generation,
             "executor_generation": self.supervision.incarnation,
-            "deployment_id": self.deployment.deployment_id if self.deployment else "",
+            "placement_id": self.placement.placement_id if self.placement else "",
             "worker_id": self.options.worker_id,
-            "release_id": self.options.release_id,
+            "worker_release_id": self.options.release_id,
             "boot_steps": list(self.boot.steps),
         }
 
@@ -428,13 +694,13 @@ class Worker:
             self.stamp(
                 pb.AttemptProgress(
                     request_id=request_id,
-                    attempt=attempt,
+                    attempt_ordinal=attempt,
                     seq=next(counter),
                     content_type="application/x-cozy-event+json",
                     data=json.dumps(
                         {"type": frame.get("kind", "progress"), "payload": frame.get("value")}
                     ).encode()[:65536],
-                    deployment_id=self.deployment.deployment_id if self.deployment else "",
+                    placement_id=self.placement.placement_id if self.placement else "",
                 )
             )
         )
@@ -442,13 +708,13 @@ class Worker:
     # ------------------------------------------------------------------ the stream
 
     def serve_stream(
-        self, inbound: Iterator[pb.OwnerFrame], send: Callable[[pb.WorkerFrame], None]
+        self, inbound: Iterator[pb.RecordOwnerFrame], send: Callable[[pb.WorkerFrame], None]
     ) -> None:
-        """ONE control stream: Claim -> ClaimAck -> snapshot -> (SnapshotAck) -> frames.
+        """ONE control stream: Claim -> ClaimAck -> WorkerSnapshot -> (SnapshotAck) -> frames.
 
         Runs on the host's thread. The first frame MUST be a Claim; acceptance fences any
-        previous stream by minting the next control_generation, so the superseded stream's
-        sender exits on its next frame and its watches end.
+        previous stream by minting the next `control_stream_generation`, so the superseded
+        stream's sender exits on its next frame and its watches end.
         """
         try:
             first = next(inbound)
@@ -482,16 +748,16 @@ class Worker:
         sender.start()
         try:
             for frame in inbound:
-                if self.fences.generation != generation or self.stop.is_set():
+                if self.fence.control_stream_generation != generation or self.stop.is_set():
                     self.note("fence", "a frame arrived on a superseded stream; ending it")
                     return
                 self._dispatch_frame(frame, generation)
         except Exception as exc:
             self.note("session", f"the control stream ended: {type(exc).__name__}")
         finally:
-            if self.fences.generation == generation:
+            if self.fence.control_stream_generation == generation:
                 self.connected.clear()
-                self.fences.dispatch_open = False
+                self.fence.dispatch_open = False
 
     def accept_claim(
         self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]
@@ -506,13 +772,45 @@ class Worker:
 
         def reject(reason: pb.ClaimRejection, why: str) -> tuple[int, queue.Queue[Any]]:
             self.note("claim", f"REFUSED ({pb.ClaimRejection.Name(reason)}): {why}")
-            ack = pb.ClaimAck(accepted=False, rejection=reason, wire_minor=WIRE_MINOR)
-            ack.owner_epoch = claim.owner_epoch
-            ack.control_generation = self.fences.generation
-            ack.worker_boot_id = self.fences.boot_id
+            ack = pb.ClaimAck(
+                accepted=False,
+                rejection=reason,
+                wire_minor=WIRE_MINOR,
+                # A REFUSAL CARRIES THE DIGEST TOO. The peer has to be able to tell
+                # "you are stale" from "I am stale", and it cannot do that from a
+                # rejection code alone.
+                wire_schema_digest=SCHEMA_DIGEST_RAW,
+            )
+            ack.record_owner_epoch = claim.record_owner_epoch
+            ack.control_stream_generation = self.fence.control_stream_generation
+            ack.worker_boot_id = self.fence.worker_boot_id
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
 
+        # THE SCHEMA FENCE, BEFORE ANY OTHER BODY FIELD (#530-A1/#536b). Not after the
+        # credential and not after the worker id: those are checks whose MEANING depends on
+        # the two ends agreeing what the fields are. A peer whose schema is not this one may
+        # have written `proof` at a number this binding reads as something else, so reading
+        # it first would be reading a field that does not exist.
+        #
+        # ABSENCE IS THE STALE SIGNAL. A pre-rev-2 RecordOwner cannot populate this field at
+        # all, so an empty digest is not a peer that forgot — it is a peer that predates the
+        # fence, and it refuses here rather than misparsing a renumbered field mid-stream.
+        if claim.wire_schema_digest != SCHEMA_DIGEST_RAW:
+            carried = claim.wire_schema_digest
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH,
+                (
+                    "the claim carries NO wire_schema_digest, which is what a pre-rev-2 "
+                    f"binding sends; this worker speaks schema rev {WIRE_SCHEMA_REV} "
+                    f"{SCHEMA_DIGEST}"
+                )
+                if not carried
+                else (
+                    f"the claim speaks schema sha256:{carried.hex()} and this worker speaks "
+                    f"rev {WIRE_SCHEMA_REV} {SCHEMA_DIGEST}; no later frame is worth parsing"
+                ),
+            )
         if self.bootstrap and not hmac.compare_digest(
             claim.proof.decode(errors="replace"), self.bootstrap
         ):
@@ -526,24 +824,27 @@ class Worker:
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
-            # `owner_recorded`, not `generation`: the high-water authority this worker
+            # `record_owner_recorded`, not the generation: the high-water authority this worker
             # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
             # before the restart instead of welcoming it back as the first claim of a fresh
             # process.
-            if self.fences.owner_recorded and claim.owner_epoch < self.fences.owner_epoch:
+            if (
+                self.fence.record_owner_recorded
+                and claim.record_owner_epoch < self.fence.record_owner_epoch
+            ):
                 return reject(
-                    pb.ClaimRejection.CLAIM_REJECTION_STALE_OWNER_EPOCH,
-                    f"epoch {claim.owner_epoch} is older than the accepted "
-                    f"{self.fences.owner_epoch}",
+                    pb.ClaimRejection.CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH,
+                    f"epoch {claim.record_owner_epoch} is older than the accepted "
+                    f"{self.fence.record_owner_epoch}",
                 )
             if (
-                self.fences.owner_recorded
-                and claim.owner_epoch == self.fences.owner_epoch
-                and claim.controller_id != self.fences.controller_id
+                self.fence.record_owner_recorded
+                and claim.record_owner_epoch == self.fence.record_owner_epoch
+                and claim.record_owner_id != self.fence.record_owner_id
             ):
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
-                    "equal epoch, different controller: the epoch is held",
+                    "equal epoch, different RecordOwner: the epoch is held",
                 )
             # RECORD BEFORE ACKNOWLEDGING. The ack is the moment this worker starts obeying
             # an owner, so the authority behind it has to outlive the process that obeys it —
@@ -551,15 +852,19 @@ class Worker:
             # cannot commit it makes this a boot-fatal verdict rather than an ack: accepting
             # an authority the worker will forget is how a superseded owner reclaims.
             if not self.record_ownership(claim):
-                return 0, queue.Queue()
-            superseded = self.fences.generation
-            self.fences.owner_epoch = claim.owner_epoch
-            self.fences.controller_id = claim.controller_id
-            self.fences.owner_recorded = True
-            self.fences.generation += 1
-            self.fences.dispatch_open = False
-            self.fences.wire_minor = min(WIRE_MINOR, claim.wire_minor)
-            generation = self.fences.generation
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                    "the accepted ownership record could not be journaled, so this worker "
+                    "cannot honour journal-before-send and must not accept the stream",
+                )
+            superseded = self.fence.control_stream_generation
+            self.fence.record_owner_epoch = claim.record_owner_epoch
+            self.fence.record_owner_id = claim.record_owner_id
+            self.fence.record_owner_recorded = True
+            self.fence.control_stream_generation += 1
+            self.fence.dispatch_open = False
+            self.fence.wire_minor = min(WIRE_MINOR, claim.wire_minor)
+            generation = self.fence.control_stream_generation
             # A FRESH queue for this stream. The superseded sender keeps its own and drains
             # into a dead call; nothing it still holds was ever this stream's to deliver, and
             # everything the law owes regenerates — terminals replay from the journal after
@@ -571,7 +876,7 @@ class Worker:
             self.note(
                 "claim",
                 f"stream generation {superseded} fenced; generation {generation} claims "
-                f"under epoch {claim.owner_epoch}",
+                f"under epoch {claim.record_owner_epoch}",
             )
         return generation, outbound
 
@@ -579,24 +884,26 @@ class Worker:
         """Journal the authority this claim carries, BEFORE any ClaimAck (#494e).
 
         Called with `claim_lock` held. False means the record could not be committed, and the
-        worker turns boot-fatal rather than obeying an owner it cannot remember obeying.
+        claim is REFUSED rather than accepted — a worker that cannot remember whose authority
+        it accepted must not accept it.
+
+        rev-2 gives that refusal its own name: `CLAIM_REJECTION_UNDURABLE` (#507d/#510d).
+        The frozen wire could only route it to `BootFailure(DISK_SHAPE)`, which was
+        representable and true but less direct — the failure is about this CLAIM's
+        durability, not about a boot that never happened, and a RecordOwner reading
+        DISK_SHAPE could not tell those apart.
         """
         try:
             self.journal.append(
                 "ownership",
                 {
-                    "worker_boot_id": self.fences.boot_id,
+                    "worker_boot_id": self.fence.worker_boot_id,
                     "instance_id": self.options.instance_id,
-                    "owner_epoch": int(claim.owner_epoch),
-                    "controller_id": claim.controller_id,
+                    "record_owner_epoch": int(claim.record_owner_epoch),
+                    "record_owner_id": claim.record_owner_id,
                 },
             )
         except JournalError as exc:
-            self.boot_fatal = self.boot_failure(
-                pb.BootFailureReason.BOOT_FAILURE_REASON_DISK_SHAPE,
-                f"the accepted ownership record could not be journaled ({exc.code}): a worker "
-                "that cannot remember whose authority it accepted must not accept it",
-            )
             self.exit_code = int(Exit.internal)
             self.note("claim", f"REFUSED: ownership is not durable ({exc.code})")
             return False
@@ -613,27 +920,33 @@ class Worker:
         rows = self.journal.of_kind("ownership")
         if not rows:
             return
-        best = max(rows, key=lambda record: int(record.body.get("owner_epoch", 0)))
-        self.fences.owner_epoch = int(best.body.get("owner_epoch", 0))
-        self.fences.controller_id = str(best.body.get("controller_id", ""))
-        self.fences.owner_recorded = True
+        best = max(rows, key=lambda record: int(record.body.get("record_owner_epoch", 0)))
+        self.fence.record_owner_epoch = int(best.body.get("record_owner_epoch", 0))
+        self.fence.record_owner_id = str(best.body.get("record_owner_id", ""))
+        self.fence.record_owner_recorded = True
         self.note(
             "recovery",
-            f"the durable ownership high-water mark is epoch {self.fences.owner_epoch} held "
-            f"by {self.fences.controller_id or '(unnamed)'}; a lower epoch is refused",
+            f"the durable ownership high-water mark is epoch {self.fence.record_owner_epoch} held "
+            f"by {self.fence.record_owner_id or '(unnamed)'}; a lower epoch is refused",
         )
 
     def _send_claim_ack(
         self, claim: pb.Claim, generation: int, send: Callable[[pb.WorkerFrame], None]
     ) -> None:
-        """ClaimAck + the recovery snapshot, for a claim this worker can actually serve."""
+        """ClaimAck + the one recovery snapshot, for a claim this worker can actually serve.
+
+        `worker_artifact_digest` is where SUBSTRATE identity rides and NOWHERE ELSE
+        (#487/#489): it is evidence about a MACHINE, never identity of an ENVIRONMENT, which
+        is why `EndpointEnvironmentSpec` has no substrate key at all.
+        """
         ack = pb.ClaimAck(
             accepted=True,
             wire_minor=WIRE_MINOR,
+            wire_schema_digest=SCHEMA_DIGEST_RAW,
             worker_id=self.options.worker_id,
-            instance_id=self.options.instance_id,
-            release_id=self.options.release_id,
-            image_digest=self.options.image_digest,
+            worker_instance_id=self.options.instance_id,
+            worker_release_id=self.options.release_id,
+            worker_artifact_digest=self.options.artifact_digest,
             git_commit=self.options.git_commit,
             resources=self.resources(),
         )
@@ -641,31 +954,67 @@ class Worker:
         self._send_snapshot(send)
         self.note(
             "session",
-            f"claimed by {claim.controller_id or 'an unnamed owner'} at epoch "
-            f"{claim.owner_epoch}, generation {generation} "
-            f"(wire_minor effective {self.fences.wire_minor})",
+            f"claimed by {claim.record_owner_id or 'an unnamed RecordOwner'} at epoch "
+            f"{claim.record_owner_epoch}, generation {generation} "
+            f"(wire schema rev {WIRE_SCHEMA_REV}, wire_minor effective "
+            f"{self.fence.wire_minor})",
         )
 
-    def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
-        """Begin -> one Entry per held/journaled attempt -> End. Dispatch stays closed
-        until the owner's SnapshotAck names exactly this snapshot (02 §6)."""
-        self.fences.snapshot_id = f"snp-{uuid.uuid4().hex[:16]}"
-        entries = self.engine.snapshot_entries()
-        begin = pb.SnapshotBegin(
-            snapshot_id=self.fences.snapshot_id, journal_highwater=self.journal.appends
+    def snapshot_body(self) -> pb.WorkerSnapshotBody:
+        """The whole of what this worker holds, in ONE document (§5).
+
+        The three-message Begin/Entry/End form could only be bounded by a counted-entries
+        check, and a count is a claim the sender makes about a stream the receiver is
+        reassembling. A single canonical document is bounded by its own digest: a truncated
+        or re-ordered snapshot cannot match, so there is no partial reconciliation to get
+        wrong because there is no partial message.
+        """
+        body = pb.WorkerSnapshotBody(
+            accepted_desired_state_revision=self.accepted.accepted_desired_state_revision,
+            accepted_placement_set_digest=self.accepted.accepted_placement_set_digest,
+            journal_highwater=self.journal.appends,
+            worker_phase=self.phase,
+            converged_revision=self.converged_revision(),
+            admission_generation=self.admission_generation,
+            admission_state=self.admission_state(),
+            available_attempt_slots=self.available_attempt_slots(),
         )
-        send(self.stamp(pb.WorkerFrame(snapshot_begin=begin)))
-        for attempt in entries:
-            entry = pb.SnapshotEntry(snapshot_id=self.fences.snapshot_id, attempt=attempt)
-            send(self.stamp(pb.WorkerFrame(snapshot_entry=entry)))
-        end = pb.SnapshotEnd(snapshot_id=self.fences.snapshot_id, entry_count=len(entries))
-        send(self.stamp(pb.WorkerFrame(snapshot_end=end)))
-        if entries:
-            self.note(
-                "recovery",
-                f"snapshot {self.fences.snapshot_id} reports {len(entries)} attempt(s); "
-                "the owner reconciles them before any dispatch",
+        if self.placement is not None:
+            body.placements.append(self.placement_status())
+        body.held_attempts.extend(self.engine.snapshot_entries())
+        return body
+
+    def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
+        """ONE `WorkerSnapshot`, digest-fenced. Dispatch stays CLOSED until the
+        RecordOwner's `SnapshotAck` names exactly this `snapshot_id` AND this
+        `snapshot_digest` — an ack naming a different one is NOT an ack (02 §6, §5)."""
+        canonical_bytes, digest = documents.identity(self.snapshot_body())
+        self.fence.snapshot_id = f"snp-{uuid.uuid4().hex[:16]}"
+        self.fence.snapshot_digest = digest
+        held = len(self.snapshot_body().held_attempts)
+        send(
+            self.stamp(
+                pb.WorkerFrame(
+                    snapshot=pb.WorkerSnapshot(
+                        snapshot_id=self.fence.snapshot_id,
+                        snapshot_digest=digest,
+                        snapshot_canonical_bytes=canonical_bytes,
+                        # THE EXACT ACCEPTED BYTES, as journaled — never a re-serialization
+                        # and never a structured projection (§4). Its digest lives INSIDE
+                        # the snapshot document, so the two cannot drift apart.
+                        accepted_placement_set_canonical_bytes=(
+                            self.accepted.placement_set_canonical_bytes
+                        ),
+                    )
+                )
             )
+        )
+        self.note(
+            "recovery",
+            f"snapshot {self.fence.snapshot_id} ({len(canonical_bytes)} B, "
+            f"{documents.spell(digest)[:23]}…) reports {held} held attempt(s); the "
+            "RecordOwner reconciles them durably before any dispatch",
+        )
 
     def _pump_outbound(
         self,
@@ -678,7 +1027,7 @@ class Worker:
         The queue is passed in rather than read off `self`: a superseded pump that keeps
         looping for a moment must drain the queue it was born with, never the live stream's.
         """
-        while not self.stop.is_set() and self.fences.generation == generation:
+        while not self.stop.is_set() and self.fence.control_stream_generation == generation:
             try:
                 frame = outbound.get(timeout=REPORT_SECONDS)
             except queue.Empty:
@@ -692,18 +1041,21 @@ class Worker:
 
     def fenced(self, message: Any) -> bool:
         """The three-field envelope, in its fixed order, BEFORE any body field (02 §0)."""
-        if message.owner_epoch != self.fences.owner_epoch:
-            self.note("fence", f"dropped: epoch {message.owner_epoch}")
+        if message.record_owner_epoch != self.fence.record_owner_epoch:
+            self.note("fence", f"dropped: epoch {message.record_owner_epoch}")
             return True
-        if message.control_generation != self.fences.generation:
-            self.note("fence", f"dropped: superseded generation {message.control_generation}")
+        if message.control_stream_generation != self.fence.control_stream_generation:
+            self.note(
+                "fence",
+                f"dropped: superseded generation {message.control_stream_generation}",
+            )
             return True
-        if message.worker_boot_id != self.fences.boot_id:
+        if message.worker_boot_id != self.fence.worker_boot_id:
             self.note("fence", f"dropped: wrong boot {message.worker_boot_id!r}")
             return True
         return False
 
-    def _dispatch_frame(self, frame: pb.OwnerFrame, generation: int) -> None:
+    def _dispatch_frame(self, frame: pb.RecordOwnerFrame, generation: int) -> None:
         kind = frame.WhichOneof("msg")
         if kind is None:
             return
@@ -714,63 +1066,126 @@ class Worker:
         if self.fenced(inner):
             return
         if kind == "snapshot_ack":
-            if inner.snapshot_id != self.fences.snapshot_id:
-                self.note("fence", f"SnapshotAck names {inner.snapshot_id!r}; not this snapshot")
-                return
-            self.fences.dispatch_open = True
-            self.connected.set()
-            self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
-            for attempt in self.engine.pending_terminals():
+            # THE BARRIER IS BOUND BY BOTH (§5). An ack naming a different `snapshot_id` OR
+            # a different `snapshot_digest` is NOT an ack: it would open dispatch against a
+            # reconciliation of some other snapshot, which is the one thing the barrier
+            # exists to prevent.
+            if (
+                inner.snapshot_id != self.fence.snapshot_id
+                or inner.snapshot_digest != self.fence.snapshot_digest
+            ):
                 self.note(
-                    "terminal",
-                    f"replaying the journaled terminal for {attempt.request_id}#"
-                    f"{attempt.attempt} in a fresh envelope ({attempt.terminal_id})",
+                    "fence",
+                    f"SnapshotAck names {inner.snapshot_id!r}/"
+                    f"{inner.snapshot_digest.hex()[:12]} and this snapshot is "
+                    f"{self.fence.snapshot_id!r}/{self.fence.snapshot_digest.hex()[:12]}: "
+                    "not an ack, the barrier stays closed",
                 )
-                self.send(pb.WorkerFrame(attempt_terminal=self.engine.wrap(attempt)))
-            self.send(pb.WorkerFrame(report=self.report()))
+                return
+            self.fence.dispatch_open = True
+            self.connected.set()
+            self.bump_admission(f"snapshot {inner.snapshot_id} acknowledged; dispatch opens")
+            self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
+            for attempt in self.engine.pending_outcomes():
+                self.note(
+                    "outcome",
+                    f"replaying the journaled outcome for {attempt.request_id}#"
+                    f"{attempt.attempt} in a fresh envelope ({attempt.outcome_id})",
+                )
+                self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return
-        if kind == "directive":
+        if kind == "desired_state":
             try:
-                self.apply_directive(inner)
+                self.apply_desired_state(inner)
             except (ExecutorGone, JournalError) as exc:
-                self.note("directive", f"apply failed: {exc}")
-                self.engine.fault(
+                self.note("desired_state", f"apply failed: {exc}")
+                self.latch(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=f"revision {inner.revision}",
-                        reason="directive_preparation_failed",
+                        reason="desired_state_preparation_failed",
                         detail=f"{type(exc).__name__}: {exc}"[:1024],
                     )
                 )
-                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             return
-        if not self.fences.dispatch_open:
+        if kind == "artifact_grant_update":
+            self.apply_artifact_grant(inner)
+            return
+        if not self.fence.dispatch_open:
             self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
             return
-        if kind == "start_attempt":
-            self.on_start(inner)
+        if kind == "attempt_offer":
+            self.on_offer(inner)
         elif kind == "cancel_attempt":
             self.note("cancel", self.engine.cancel(inner))
-        elif kind == "terminal_ack":
-            self.on_terminal_ack(inner)
+        elif kind == "outcome_ack":
+            self.on_outcome_ack(inner)
         elif kind == "checkpoint_receipt":
             self.engine.absorb_receipt(inner)
             ack = pb.JobCheckpointAck(
                 request_id=inner.request_id,
-                attempt=inner.attempt,
+                attempt_ordinal=inner.attempt_ordinal,
                 operation_key=inner.operation_key,
                 receipt_id=inner.receipt_id,
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
 
-    def on_terminal_ack(self, acked: pb.TerminalAck) -> None:
-        self.note("terminal", self.engine.close(acked))
-        closed = self.engine.history.get((acked.request_id, acked.attempt))
+    def apply_artifact_grant(self, update: pb.ArtifactGrantUpdate) -> None:
+        """Standing, refreshable ACQUISITION authority, on its OWN lane (§3, #480a).
+
+        REFRESHING ACCESS NEVER CHANGES IDENTITY. This handler touches no revision, no set
+        digest and no convergence fact — there is no field a refresh could substitute a
+        placement identity into, because the identities live in the set document, which a
+        grant cannot reach. `grant_revision` is monotonic: older is ignored, equal is
+        idempotent.
+
+        A grant MAY PRECEDE its set. Subjects not named by any desired spec are INERT, never
+        a refusal — pre-authorizing an incoming release is the normal rollout order.
+
+        WHAT THIS WORKER DOES WITH IT TODAY, said out loud rather than implied: it RECORDS
+        the standing authority and reports it back on `applied_artifact_grant_id` /
+        `applied_grant_revision`, so grant landing is observable without an ack lane. It
+        FETCHES nothing, because this worker has no environment materializer — cr-023 owns
+        that lane, and a worker that pretended to fetch would be inventing a materialization.
+        """
+        if update.grant_revision < self.grant_revision:
+            self.note("grant", f"grant revision {update.grant_revision} ignored (older)")
+            return
+        self.grant_revision = update.grant_revision
+        self.grant_id = update.grant.grant_id
+        self.note(
+            "grant",
+            f"acquisition authority {update.grant.grant_id or '(unnamed)'} at revision "
+            f"{update.grant_revision}: {len(update.grant.subjects)} authorized subject(s), "
+            f"{len(update.grant.locations)} location(s) — recorded, and this worker fetches "
+            "nothing until cr-023's materializer exists",
+        )
+        if self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
+        """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
+        a change in admission MEANING, so it does NOT bump `admission_generation` (§6).
+
+        The distinction is load-bearing and it cost a live run to find. `admission_generation`
+        moves when the meaning of an offer changes — executor respawn, window resize, phase
+        change, cutover — and a RecordOwner dispatching against a stale one is refused
+        deterministically. Freeing a seat changes neither: bumping here made EVERY
+        steady-state dispatch refuse ADMISSION_GENERATION_STALE, because the ack that freed
+        the seat invalidated the generation the RecordOwner was about to dispatch against.
+        `available_attempt_slots` is the field that carries this, and it is recomputed on
+        every tick.
+        """
+        self.note("outcome", self.engine.close(acked))
+        if self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+        closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
         if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
             self.note(
                 "session",
-                f"job attempt {acked.request_id}#{acked.attempt} is acknowledged and "
+                f"job attempt {acked.request_id}#{acked.attempt_ordinal} is acknowledged and "
                 f"reclaim_on_terminal is set: exiting {RECYCLE_EXIT} (recycle, not a death)",
             )
             self.exit_code = RECYCLE_EXIT
@@ -787,95 +1202,221 @@ class Worker:
         """One WatchProgress call: bound to the fenced control generation (#436)."""
         if self.fenced(opened):
             return iter(())
-        return self.watches.open(opened.request_id, opened.control_generation).frames(self.watches)
+        return self.watches.open(opened.request_id, opened.control_stream_generation).frames(
+            self.watches
+        )
 
-    # ------------------------------------------------------------------ directive
+    # ------------------------------------------------------------- the desired state
 
-    def apply_directive(self, directive: pb.Directive) -> None:
+    def apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
         """FULL REPLACE. A field absent means absent, never unchanged (§3).
 
-        THE LAUNCH CLAMP RUNS FIRST (#446/#454): a deployment set longer than one refuses
-        typed (FAULT_KIND_DEPLOYMENT_SET_UNSUPPORTED) with the directive UNAPPLIED —
-        `applied_revision` does not advance, which is how the owner sees the refusal.
+        ORDER, and none of it is negotiable:
+
+            recompute the set digest over the canonical bytes -> the launch clamp ->
+            revision arithmetic -> JOURNAL the exact accepted bytes -> parse -> converge
+
+        The BYTE FENCE runs before the clamp counts anything, because counting placements
+        means parsing, and §4 forbids parsing a single field of a set whose bytes do not hash
+        to what it claims. A mismatch is `FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH`, the
+        desired state is UNAPPLIED, `accepted_desired_state_revision` does NOT advance, and
+        the previous set keeps serving.
         """
-        mode = directive.WhichOneof("mode") or ""
-        if mode == "deployment_set":
-            entries = list(directive.deployment_set.set.deployments)
-            if len(entries) > 1:
+        mode = desired.WhichOneof("mode") or ""
+        placements: list[dict[str, Any]] = []
+        if mode == "placement_set":
+            try:
+                placements = read_placement_set(desired.placement_set)
+            except documents.DocumentError as exc:
+                kind = (
+                    pb.FaultKind.FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH
+                    if exc.code == "placement_set_digest_mismatch"
+                    else pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
+                )
                 self.note(
-                    "directive",
-                    f"revision {directive.revision} REFUSED: {len(entries)} deployments; "
-                    "launch enforces len(set) <= 1 and the directive is UNAPPLIED",
+                    "desired_state",
+                    f"revision {desired.revision} REFUSED before any field was parsed: "
+                    f"{exc.code} — UNAPPLIED, the previous set keeps serving",
                 )
                 self.engine.fault(
                     pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_DEPLOYMENT_SET_UNSUPPORTED,
-                        subject=f"revision {directive.revision}",
-                        reason="deployment_set_over_launch_clamp",
-                        detail=f"the desired set names {len(entries)} deployments and this "
-                        "worker hosts at most one until multi-deployment supervision lands",
+                        kind=kind,
+                        subject=f"revision {desired.revision}",
+                        reason=exc.code,
+                        detail=exc.detail[:1024],
                     )
                 )
                 return
-        body = desired_state(directive)
-        if directive.revision < self.fences.revision:
-            self.note("directive", f"revision {directive.revision} ignored (older)")
-            return
-        if directive.revision == self.fences.revision:
-            if body != self.fences.applied_directive:
+            if len(placements) > 1:
                 self.note(
-                    "directive",
-                    f"PROTOCOL ERROR: revision {directive.revision} arrived with a different "
+                    "desired_state",
+                    f"revision {desired.revision} REFUSED: {len(placements)} placements; "
+                    "launch enforces len(placements) <= 1 and the desired state is UNAPPLIED",
+                )
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_PLACEMENT_SET_UNSUPPORTED,
+                        subject=f"revision {desired.revision}",
+                        reason="placement_set_over_launch_clamp",
+                        detail=f"the desired set names {len(placements)} placements and this "
+                        "worker hosts at most one until cr-023's reconciler lands; #475 adds "
+                        "that when the clamp lifts, multi-placement serving is CO-FITTING ONLY",
+                    )
+                )
+                return
+        body = desired_state_body(desired)
+        if desired.revision < self.accepted.accepted_desired_state_revision:
+            self.note("desired_state", f"revision {desired.revision} ignored (older)")
+            return
+        if desired.revision == self.accepted.accepted_desired_state_revision:
+            if body != self.accepted.desired_state_body:
+                self.note(
+                    "desired_state",
+                    f"PROTOCOL ERROR: revision {desired.revision} arrived with a different "
                     "desired state; a changed body must carry a new revision",
                 )
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=f"revision {directive.revision}",
+                        subject=f"revision {desired.revision}",
                         reason="same_revision_changed_body",
-                        detail="a Directive body is a complete replacement; changing it "
-                        "without a new revision is unrepresentable",
+                        detail="a DesiredWorkerState body is a complete replacement; changing "
+                        "it without a new revision is unrepresentable",
                     )
                 )
             else:
-                self.note("directive", f"revision {directive.revision} re-applied (idempotent)")
+                self.note("desired_state", f"revision {desired.revision} re-applied (idempotent)")
             return
 
-        self.fences.revision = directive.revision
-        self.fences.applied_directive = body
-        self.fences.posture = directive.posture
-        self.fences.wire_minor = directive.wire_minor
-        self.fences.drain_grace_ms = directive.drain_grace_ms
-        self.fences.mode = "serving" if mode == "deployment_set" else mode
+        self.accepted.accepted_desired_state_revision = desired.revision
+        self.accepted.desired_state_body = body
+        self.accepted.posture = desired.posture
+        # DRAINING is machine lifecycle too: a worker under a draining posture is not a
+        # placement that stopped serving, it is a machine on its way out.
+        if self.phase != pb.WorkerPhase.WORKER_PHASE_FAILED:
+            self.set_phase(
+                pb.WorkerPhase.WORKER_PHASE_DRAINING
+                if desired.posture == pb.Posture.POSTURE_DRAINING
+                else pb.WorkerPhase.WORKER_PHASE_ONLINE,
+                f"posture {pb.Posture.Name(desired.posture)}",
+            )
+        self.fence.wire_minor = desired.wire_minor
+        self.accepted.drain_grace_ms = desired.drain_grace_ms
+        self.accepted.mode = "serving" if mode == "placement_set" else mode
+        self.latched = ""  # a NEW revision un-latches: the latch is per desired revision
         if mode == "job":
-            self.apply_job_directive(directive.job)
+            self.apply_job_directive(desired.job)
             return
-        if mode != "deployment_set":
-            self.note("directive", "no mode: nothing to prepare")
+        if mode != "placement_set":
+            self.note("desired_state", "no mode: nothing to converge to")
             return
 
-        ds = directive.deployment_set
-        self.fences.applied_set_digest = ds.set_digest
-        entries = list(ds.set.deployments)
+        desired_set = desired.placement_set
+        # JOURNAL THE EXACT ACCEPTED BYTES (§4) — never a re-serialization, never a
+        # structured projection. Recovery, status attribution and the snapshot all quote
+        # these, which is what makes "the set this worker accepted" a byte fact rather than
+        # a reconstruction that is free to disagree with itself.
+        self.journal.append(
+            "placement_set",
+            {
+                "worker_boot_id": self.fence.worker_boot_id,
+                "accepted_desired_state_revision": desired.revision,
+                "placement_set_digest": documents.spell(desired_set.placement_set_digest),
+                "placement_set_canonical_b64": base64.b64encode(
+                    desired_set.placement_set_canonical_bytes
+                ).decode(),
+            },
+        )
+        self.accepted.accepted_placement_set_digest = desired_set.placement_set_digest
+        self.accepted.placement_set_canonical_bytes = desired_set.placement_set_canonical_bytes
+
+        previous = self.placement
         self.bindings = {}
-        self.generations = {}
+        self.prepared_models = {}
         self.jobs = {}
         self.engine.jobs = {}
-        if not entries:
-            self.deployment = None
+        if not placements:
+            self.placement = None
             self.engine.bindings = {}
-            self.engine.generations = {}
-            self.note("directive", f"revision {directive.revision} applied: an EMPTY set")
+            self.engine.prepared_models = {}
+            self.accepted.converged_revision = desired.revision
+            self.bump_admission("the accepted set is EMPTY; nothing is dispatchable")
+            self.note("desired_state", f"revision {desired.revision} accepted: an EMPTY set")
             return
-        entry = entries[0]
-        self.deployment = Deployment(
-            deployment_id=entry.deployment_id,
-            endpoint_release_id=entry.endpoint_release_id,
-            plan_ids=tuple(entry.entrypoint_binding_plan_ids),
+        entry = placements[0]
+        placement_id = str(entry.get("placement_id", ""))
+        spec = dict(entry.get("spec", {}))
+        subjects = [dict(row) for row in spec.get("binding_plans", [])]
+        plan_ids = tuple(
+            str(row.get("subject_id", "")) for row in subjects if row.get("subject_id")
         )
-        for plan_id in entry.entrypoint_binding_plan_ids:
+        self.placement = Placement(
+            placement_id=placement_id,
+            # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
+            # reconstructed with its own format tag (#510g) from the bytes already held.
+            spec_digest=documents.embedded_document_digest(spec, "cozy.worker.v1.PlacementSpec"),
+            endpoint_release_id=str(spec.get("endpoint_release_id", "")),
+            environment_spec_digest=_digest_field(spec.get("environment_spec_digest")),
+            installed_environment_receipt_digest=_digest_field(
+                spec.get("installed_environment_receipt_digest")
+            ),
+            descriptor_digest=_digest_field(spec.get("descriptor_digest")),
+            plan_ids=plan_ids,
+            # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
+            # placement_id, new spec digest) retains the outgoing spec as the pin; a fresh
+            # placement has none, and an empty pin means replacement is PAUSED — which is
+            # why the pin is set from the PREVIOUS spec and never invented.
+            retained_fallback_spec_digest=(
+                previous.spec_digest
+                if previous is not None and previous.placement_id == placement_id
+                else b""
+            ),
+        )
+        self.bump_admission(
+            f"placement {self.placement.placement_id or '(unnamed)'} moved to spec "
+            f"{documents.spell(self.placement.spec_digest)[:23]}…"
+        )
+        self.converge_placement(desired.revision)
+
+    def converge_placement(self, revision: int) -> None:
+        """Materialize what this worker CAN materialize, then activate — or refuse to lie.
+
+        THE MATERIALIZATION AXIS HAS ONE HONEST SUBJECT HERE: the placement's binding-plan
+        records, which are the only artifacts this worker stages today. All resolve => STAGED.
+        Some missing => ABSENT with a typed fault, and the previous spec keeps serving
+        (fallback-retention, #474).
+
+        AND ONE HONEST REFUSAL. `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured
+        `InstalledEnvironmentReceipt` equalled `installed_environment_receipt_digest`; the
+        proto says it is unspeakable otherwise. This worker has no environment materializer
+        at all — cr-023 owns that lane — so when a spec NAMES a receipt digest, the worker
+        cannot say STAGED and does not: it reports MATERIALIZING with a typed fault, holds
+        `converged_revision` behind, and leaves the previous spec serving. That is a door,
+        not a defect, and it is named rather than papered over with a fabricated STAGED.
+        """
+        assert self.placement is not None
+        placement = self.placement
+        if placement.installed_environment_receipt_digest:
+            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
+            self.latch(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=placement.placement_id,
+                    reason="environment_materializer_unbuilt",
+                    detail="the spec names installed_environment_receipt_digest "
+                    f"{documents.spell(placement.installed_environment_receipt_digest)[:23]}… "
+                    "and this worker cannot MEASURE an installed environment: STAGED asserts "
+                    "the receipt matched and is unspeakable otherwise, so materialization "
+                    "stays MATERIALIZING and converged_revision stays behind (cr-023 owns "
+                    "the materializer)",
+                )
+            )
+            return
+        missing: list[str] = []
+        for plan_id in placement.plan_ids:
             record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
             if not record.is_file():
+                missing.append(plan_id)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
@@ -886,6 +1427,11 @@ class Worker:
                 )
                 continue
             self.bindings[plan_id] = DeclaredBinding.read(json.loads(record.read_text()))
+        placement.materialization = (
+            pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
+            if missing
+            else pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+        )
         self.engine.bindings = self.bindings
         hosts = sorted(
             {host for binding in self.bindings.values() for host in binding.egress_allowed_hosts}
@@ -896,21 +1442,29 @@ class Worker:
             allow_private=any(b.tenancy == "local" for b in self.bindings.values()),
         )
         self.note(
-            "directive",
-            f"revision {directive.revision} applied: deployment "
-            f"{entry.deployment_id or '(unnamed)'} with {len(self.bindings)} binding plans, "
-            f"posture={pb.Posture.Name(directive.posture)}",
+            "desired_state",
+            f"revision {revision} accepted: placement "
+            f"{placement.placement_id or '(unnamed)'} at spec "
+            f"{documents.spell(placement.spec_digest)[:23]}… with {len(self.bindings)} of "
+            f"{len(placement.plan_ids)} binding plan(s) resolved, materialization="
+            f"{pb.MaterializationState.Name(placement.materialization)}, "
+            f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
         self.prepare_executor()
 
     def apply_job_directive(self, job: pb.JobDirective) -> None:
-        """The JOB lane's directive: resolve the descriptor, spawn a fresh executor, ready."""
+        """The JOB lane: resolve the descriptor, spawn a fresh executor, become dispatchable.
+
+        Job mode carries no placement, so its dispatchability edge is `job_ready` and its
+        capacity is `JobCapacity` — the placement axes are unspeakable here and stay unset
+        rather than being filled with a plausible OFFLINE.
+        """
         self.bindings = {}
-        self.generations = {}
+        self.prepared_models = {}
         self.engine.bindings = {}
-        self.engine.generations = {}
+        self.engine.prepared_models = {}
         self.jobs = {}
-        self.deployment = None
+        self.placement = None
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
         if not record.is_file():
@@ -922,26 +1476,28 @@ class Worker:
                     detail=f"no local record for {job.job_descriptor_id}",
                 )
             )
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.set_job_ready(False)
+            self.latched = "unresolved_job_descriptor"
             return
         self.jobs[job.job_descriptor_id] = JobBinding.read(json.loads(record.read_text()))
         self.engine.jobs = self.jobs
         self.job_caps = job.resource_caps
         self.reclaim_on_terminal = job.reclaim_on_terminal
         self.note(
-            "directive",
-            f"revision {self.fences.revision} applied in JOB mode: "
+            "desired_state",
+            f"revision {self.accepted.accepted_desired_state_revision} accepted in JOB mode: "
             f"{self.jobs[job.job_descriptor_id].job!r}, device floor {job.device_count}, "
             f"reclaim_on_terminal={job.reclaim_on_terminal}",
         )
-        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
+        self.set_job_ready(False)
         executor = self.supervision.current
         if executor is None or not executor.alive():
             try:
                 executor = self.supervision.spawn(imposed=self.imposed())
             except ExecutorGone as exc:
                 self.note("boot", f"the job executor never dialled back: {exc}")
-                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                self.latched = "job_executor_absent"
+                self._settle()
                 return
             self.ledger.executor_pid = executor.pid
             self.note(
@@ -950,15 +1506,21 @@ class Worker:
                 f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
                 f"(torch_loaded={executor.hello.get('torch_loaded')})",
             )
-        self.intake(pb.IntakeState.INTAKE_STATE_READY)
+        self.set_job_ready(True)
 
-    # ------------------------------------------------------------------ readiness
+    # ------------------------------------------------------------- activation
 
     def prepare_executor(self) -> None:
-        """The ExecutorPreparer, at directive time: prepare BEFORE advertising ready."""
+        """ACTIVATION: prepare the executor BEFORE the placement becomes DISPATCHABLE.
+
+        This is the SERVING axis moving OFFLINE -> ACTIVATING -> DISPATCHABLE. Serving never
+        accepts-then-cold-loads, which is the whole reason the axis exists separately from
+        materialization: bytes on disk and a process that will take work are two facts, and
+        one enum could not hold both.
+        """
         if not self.bindings:
             return
-        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
+        self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
         executor = self.supervision.current
         if executor is None or not executor.alive():
             self.note("boot", "spawning the device executor (exec-first trampoline)")
@@ -1042,7 +1604,11 @@ class Worker:
                         detail=detail,
                     )
                 )
-                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                # AN ACTIVATION FAILURE LATCHES for this desired revision (§8): the worker
+                # does not evict-and-retry forever, `converged_revision` stays behind, and
+                # the fault is typed on the placement.
+                self.latched = f"prepare refused: {reply.get('code')}"
+                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
                 self.note(
                     "boot",
                     f"prepare REFUSED for {first.entrypoint_binding_plan_id[:20]}: "
@@ -1057,9 +1623,9 @@ class Worker:
                 return
             digest = reply["model_construction_digest"]
             delivery = reply.get("delivery") or {}
-            resolved = PreparedGeneration(
+            resolved = PreparedModel(
                 logical_model_digest=digest,
-                constructed_generation_digest=str(reply["constructed_generation_digest"]),
+                constructed_model_digest=str(reply["constructed_model_digest"]),
                 delivery_rung=str(delivery.get("rung", "")),
                 delivery_variant=str(delivery.get("variant", "")),
                 weight_bytes=int(reply["facts"]["filled_bytes"]),
@@ -1074,9 +1640,9 @@ class Worker:
                     )
                     continue
                 executor.ready_plans.add(binding.entrypoint_binding_plan_id)
-                self.generations[binding.entrypoint_binding_plan_id] = resolved
+                self.prepared_models[binding.entrypoint_binding_plan_id] = resolved
             self.engine.bindings = self.bindings
-            self.engine.generations = self.generations
+            self.engine.prepared_models = self.prepared_models
             self.ledger.observe_construction(reply["facts"])
             self.monitor.end(subject, "filled")
             self.boot.step(
@@ -1097,7 +1663,7 @@ class Worker:
                 f"{reply['facts']['filled']} destinations, "
                 f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
                 f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
-                f"generation {str(reply['constructed_generation_digest'])[:23]}… "
+                f"generation {str(reply['constructed_model_digest'])[:23]}… "
                 f"resident={sorted(reply['facts'].get('resident', {}))} "
                 f"parked={reply['facts'].get('parked', [])}",
             )
@@ -1111,7 +1677,9 @@ class Worker:
                     + (f" — {delivery['confession']}" if delivery.get("confession") else ""),
                 )
         self.run_warm_pass()
-        self.intake(pb.IntakeState.INTAKE_STATE_READY)
+        self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
+        if not self.latched:
+            self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
 
     def run_warm_pass(self) -> None:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
@@ -1197,89 +1765,132 @@ class Worker:
 
     # ------------------------------------------------------------------ dispatch
 
-    def on_start(self, start: pb.StartAttempt) -> None:
-        """STREAM THREAD: fence, record, enqueue. Nothing here waits, fetches or leases."""
-        if self.fences.mode == "serving":
-            wanted = self.deployment.deployment_id if self.deployment is not None else ""
-            if start.deployment_id != wanted:
-                self.note(
-                    "fence",
-                    f"unknown deployment {start.deployment_id!r} (this worker hosts {wanted!r})",
-                )
+    def on_offer(self, offered: pb.AttemptOffer) -> None:
+        """STREAM THREAD: fence, record, enqueue. Nothing here waits, fetches or leases.
+
+        EVERY OFFER GETS A JOURNALED OUTCOME (§7). The outcome-less third state is closed:
+        an `AttemptOffer` receives either `AttemptAccepted` or a JOURNALED
+        `AttemptOutcome(REFUSED)` — never silence, never an unjournaled soft decline. An
+        unjournaled refusal is unreconcilable after a crash, because the RecordOwner cannot
+        then distinguish "never landed" from "refused", which is precisely the distinction
+        02 §6 is built on.
+
+        The rename is load-bearing: receiving an OFFER begins VALIDATION, not execution, so
+        refusing one is an ordinary outcome rather than an exception. A pre-execution refusal
+        consumes the `attempt_ordinal` and ZERO billed execution budget — `execution_started`
+        stays false — and the RecordOwner may immediately mint `attempt_ordinal + 1` and
+        dispatch it elsewhere.
+        """
+        # THE ADMISSION FENCE FIRST (§6), because it is the cheapest deterministic verdict
+        # and because a stale generation means the RecordOwner dispatched against a picture
+        # of this worker that no longer holds.
+        if offered.admission_generation != self.admission_generation:
+            self.refuse(
+                offered,
+                "admission_generation_stale",
+                f"the offer echoes admission generation {offered.admission_generation} and "
+                f"this worker is at {self.admission_generation}; the verdict is the same on "
+                "every replay of these bytes, and the ordinal is consumed with no budget draw",
+                CAUSE.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+            )
+            return
+        if self.accepted.mode == "serving":
+            wanted = self.placement.placement_id if self.placement is not None else ""
+            if offered.placement_id != wanted:
                 self.engine.fault(
                     pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_UNKNOWN_DEPLOYMENT,
-                        subject=start.deployment_id,
-                        reason="unknown_deployment",
-                        detail=f"the dispatch names deployment {start.deployment_id!r} and "
-                        f"this worker hosts {wanted!r}",
+                        kind=pb.FaultKind.FAULT_KIND_UNKNOWN_PLACEMENT,
+                        subject=offered.placement_id,
+                        reason="unknown_placement",
+                        detail=f"the offer names placement {offered.placement_id!r} and this "
+                        f"worker hosts {wanted!r}",
                     )
                 )
                 self.refuse(
-                    start,
-                    "unknown_deployment",
-                    f"no deployment {start.deployment_id!r} is hosted here",
-                    CAUSE.CAUSE_CODE_PROTOCOL,
+                    offered,
+                    "unknown_placement",
+                    f"no placement {offered.placement_id!r} is hosted here",
+                    CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
                 )
                 return
-        if self.fences.posture == pb.Posture.POSTURE_DRAINING:
-            self.note("intake", f"draining: refusing {start.request_id}")
+            if not self.dispatchable():
+                self.refuse(
+                    offered,
+                    "placement_not_dispatchable",
+                    f"placement {wanted!r} is "
+                    + (pb.ServingState.Name(self.placement.serving) if self.placement else "absent")
+                    + (f" (LATCHED: {self.latched})" if self.latched else ""),
+                    CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+                )
+                return
+        if self.accepted.posture == pb.Posture.POSTURE_DRAINING:
             self.refuse(
-                start,
+                offered,
                 "draining",
                 "the worker is draining and admits no new attempts",
-                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
         try:
-            attempt = self.engine.offer(start)
+            attempt = self.engine.offer(offered)
         except AttemptRefusal as exc:
-            self.note("attempt", f"{start.request_id}#{start.attempt} refused: {exc.code}")
-            self.refuse(start, exc.code, exc.detail, exc.cause, exc.origin)
+            self.note(
+                "attempt", f"{offered.request_id}#{offered.attempt_ordinal} refused: {exc.code}"
+            )
+            self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return
-        if attempt.state in ("terminal", "closed"):
+        if attempt.state in ("outcome", "closed"):
             self.note(
                 "attempt",
-                f"duplicate StartAttempt for {start.request_id}#{start.attempt}: replaying "
-                f"the journaled terminal, executing NOTHING (executions={attempt.executions})",
+                f"duplicate AttemptOffer for {offered.request_id}#{offered.attempt_ordinal}: "
+                f"replaying the journaled outcome, executing NOTHING "
+                f"(executions={attempt.executions})",
             )
-            self.send(pb.WorkerFrame(attempt_terminal=self.engine.wrap(attempt)))
+            self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
             return
         if attempt.state == "queued":
             self.note(
                 "attempt",
-                "duplicate StartAttempt for the attempt currently crossing to the device "
+                "duplicate AttemptOffer for the attempt currently crossing to the device "
                 "lane: it is held, and its acceptance publishes when the lane admits it",
             )
             return
         if attempt.state in ("accepted", "running"):
             self.note(
                 "attempt",
-                "duplicate StartAttempt for a held attempt: re-accepting "
+                "duplicate AttemptOffer for a held attempt: re-accepting "
                 "the SAME acceptance; nothing starts a second time",
             )
             self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
             return
-        # THE WINDOW IS ONE, AND OVER IT THE ANSWER IS A TERMINAL (#494f). The device lane is
-        # a single serialized state machine, so a second held attempt could only wait — and
-        # it would wait in a state the wire cannot spell, absent from the snapshot and from
-        # `Report.active_attempts`. A refusal the owner can read and re-dispatch is strictly
-        # more informative than a hold it cannot see.
-        busy = [
-            held
-            for held in self.engine.live.values()
-            if held is not attempt and held.state in ("queued", "accepted", "running")
-        ]
-        if busy:
-            other = busy[0]
-            self.note("attempt", f"{start.request_id}#{start.attempt} over the admission window")
+        # THE WINDOW IS ONE, AND OVER IT THE ANSWER IS A JOURNALED OUTCOME (#494f/§7). The
+        # device lane is a single serialized state machine, so a second held attempt could
+        # only wait — and it would wait in a state the wire cannot spell, absent from the
+        # snapshot and from the held-attempt set. A refusal the RecordOwner can read and
+        # re-dispatch is strictly more informative than a hold it cannot see.
+        if self.available_attempt_slots() < 1:
+            busy = [
+                held
+                for held in self.engine.history.values()
+                if held is not attempt and held.state in self.engine.HELD
+            ]
+            other = busy[0] if busy else None
+            self.note(
+                "attempt",
+                f"{offered.request_id}#{offered.attempt_ordinal} over the admission window",
+            )
             self.refuse(
-                start,
-                "no_admission_credit",
-                f"this worker admits one attempt at a time and holds "
-                f"{other.request_id}#{other.attempt} ({other.state}); the window is "
-                f"{CREDIT_WINDOW} and `attempt_credits` reports it every tick",
-                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                offered,
+                "no_capacity",
+                f"this worker admits {ADMISSION_WINDOW} attempt at a time and the window is "
+                + (
+                    f"held by {other.request_id}#{other.attempt} ({other.state})"
+                    if other is not None
+                    else "closed"
+                )
+                + "; a seat is held by a running attempt AND by an outcome awaiting "
+                "AttemptOutcomeAck, so acking frees one",
+                CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
         self.engine.hold(attempt)
@@ -1320,41 +1931,50 @@ class Worker:
         waited = (time.perf_counter() - started) * 1000
         self.note(
             "readiness",
-            f"{key} waited {waited:.0f} ms; intake is "
-            f"{pb.IntakeState.Name(self.fences.intake)}" + ("" if settled else f" ({why})"),
+            f"{key} waited {waited:.0f} ms; the placement is "
+            f"{pb.ServingState.Name(self.placement.serving) if self.placement else 'absent'}"
+            + ("" if settled else f" ({why})"),
         )
 
     def refuse(
         self,
-        start: pb.StartAttempt,
+        offered: pb.AttemptOffer,
         code: str,
         detail: str,
         cause: pb.CauseCode,
         origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
     ) -> None:
-        """A typed refusal is a TERMINAL: journaled before send, like any other."""
-        held = self.engine.history.get((start.request_id, start.attempt))
-        if held is not None and held.state in ("terminal", "closed"):
+        """A typed refusal is an OUTCOME: journaled before send, like any other (§7).
+
+        `execution_started` is FALSE here by construction — nothing ran — which is the
+        BILLING FACT stated structurally rather than inferred from a cause-code allowlist
+        (#480c). The RecordOwner reads it and knows the ordinal was consumed and the budget
+        was not.
+        """
+        held = self.engine.history.get((offered.request_id, offered.attempt_ordinal))
+        if held is not None and held.state in ("outcome", "closed"):
             held = None
         attempt = held or AttemptRecord(
-            request_id=start.request_id,
-            attempt=start.attempt,
-            digest=start.invocation_digest,
+            request_id=offered.request_id,
+            attempt=offered.attempt_ordinal,
+            digest=offered.invocation_spec_digest,
             spec={},
         )
         try:
-            terminal = self.engine.terminal(
+            outcome = self.engine.outcome(
                 attempt,
-                STATUS.TERMINAL_STATUS_REFUSED,
+                STATUS.OUTCOME_STATUS_REFUSED,
                 cause,
                 origin,
                 f"{code}: {detail}",
             )
         except JournalError as exc:
+            # ACK-AFTER-JOURNAL HAS NO EXCEPTION FOR A REFUSAL (#494b). An outcome nobody
+            # wrote down cannot be replayed and cannot be acked, so it is not sent.
             self.note("journal", f"cannot journal a refusal ({exc.code}); sending nothing")
             return
         self.engine.history[attempt.key()] = attempt
-        self.send(pb.WorkerFrame(attempt_terminal=terminal))
+        self.send(pb.WorkerFrame(attempt_outcome=outcome))
 
     # ------------------------------------------------------------------ the device lane
 
@@ -1383,7 +2003,7 @@ class Worker:
             self.note("cancel", f"{key} reached the lane past its deadline")
             self.terminate(attempt, self.engine.finish_cancel, "deadline")
             return False
-        if self.fences.posture == pb.Posture.POSTURE_DRAINING:
+        if self.accepted.posture == pb.Posture.POSTURE_DRAINING:
             self.note("intake", f"draining: refusing queued {key}")
             self.terminate(
                 attempt,
@@ -1414,63 +2034,64 @@ class Worker:
                     detail=exc.detail[:1024],
                 )
             )
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)  # fault first, then the edge
+            self.fail_machine(exc.code)  # fault first, then the edge
             return False
         self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
     def execute(self, attempt: AttemptRecord) -> None:
-        """RUN -> TERMINAL -> RECONCILE. The ledger closes inside `terminal()`."""
+        """RUN -> OUTCOME -> RECONCILE. The ledger closes inside `outcome()`."""
         try:
-            terminal = self.engine.execute(attempt)
+            outcome = self.engine.execute(attempt)
         except JournalError as exc:
-            self.note("journal", f"{exc.code}: only a last-resort terminal can be claimed")
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.note("journal", f"{exc.code}: only a last-resort outcome can be claimed")
+            self.fail_machine(exc.code)
             self.terminate(attempt, self.engine.last_resort, f"{exc.code}: {exc.detail}")
             return
         except Exception as exc:
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
-                terminal = self.engine.abandon(
+                outcome = self.engine.abandon(
                     attempt, f"the worker faulted while running this attempt: {exc}"
                 )
             except Exception as inner:
                 self.note("attempt", f"even ABANDONED could not be built: {inner}")
-                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+                self.fail_machine(f"{type(inner).__name__}")
                 self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return
-        self.send(pb.WorkerFrame(attempt_terminal=terminal))
+        self.send(pb.WorkerFrame(attempt_outcome=outcome))
 
     def terminate(
-        self, attempt: AttemptRecord, build: Callable[..., pb.AttemptTerminal], *args: Any
+        self, attempt: AttemptRecord, build: Callable[..., pb.AttemptOutcome], *args: Any
     ) -> None:
-        """Journal ONE terminal for a held attempt and send it.
+        """Journal ONE outcome for a held attempt and send it.
 
         ACK-AFTER-JOURNAL IS THE LAW, INCLUDING HERE (#494b). An outcome that could not be
-        journaled is never sent: the attempt stays HELD in a typed local-fault state and the
-        worker goes INTAKE_STATE_ERROR with a fault naming it. Sending it anyway would hand
-        the owner truth the worker cannot replay after a restart and cannot ack correctly if
-        the owner tries — a durable claim about bytes nobody wrote down.
+        journaled is never sent: the attempt stays HELD, and rev-2 gives that hold its own
+        wire state — `ATTEMPT_STATE_HELD_UNDURABLE` (#507d/#510d) — instead of the frozen
+        wire's RUNNING-plus-a-LOCAL_SAFETY-fault compound. The worker takes the fault, goes
+        `WORKER_PHASE_FAILED`, and the RecordOwner reads a worker that stopped rather than an
+        outcome it can never close.
         """
         why = ""
         try:
-            self.send(pb.WorkerFrame(attempt_terminal=build(attempt, *args)))
+            self.send(pb.WorkerFrame(attempt_outcome=build(attempt, *args)))
             return
         except UndurableOutcome as exc:
             self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.fail_machine("outcome_undurable")
             return
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
-            self.note("attempt", f"the terminal could not be built ({why}); last resort")
+            self.note("attempt", f"the outcome could not be built ({why}); last resort")
         try:
-            self.send(pb.WorkerFrame(attempt_terminal=self.engine.last_resort(attempt, why)))
+            self.send(pb.WorkerFrame(attempt_outcome=self.engine.last_resort(attempt, why)))
         except UndurableOutcome as exc:
             self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.fail_machine("outcome_undurable")
         except Exception as inner:
-            self.note("attempt", f"even the last-resort terminal failed: {inner}")
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.note("attempt", f"even the last-resort outcome failed: {inner}")
+            self.fail_machine("last_resort_failed")
 
     def rebuild_if_needed(self) -> None:
         """The queue starts behind the rebuild because BOTH live on this lane."""
@@ -1483,8 +2104,8 @@ class Worker:
             self.rebuild(f"poisoned: {current.poisoned}")
 
     def rebuild(self, why: str) -> None:
-        """Replace the executor and RELOAD before reporting ready."""
-        self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
+        """Replace the executor and RELOAD before the placement is dispatchable again."""
+        self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING, "executor rebuild")
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
         killed = self.supervision.sweep_orphans(
@@ -1496,17 +2117,20 @@ class Worker:
             self.supervision.replace(imposed=self.imposed())
         except ExecutorGone as exc:
             self.note("recovery", f"respawn failed: {exc}")
-            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            self.latched = f"executor_respawn_failed: {exc}"[:200]
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "respawn failed")
+            self._settle()
             return
+        self.bump_admission("executor respawned")
         self.prepare_executor()
         # Cleared LAST: an invalidation raised by another thread WHILE the rebuild ran is
         # about the executor this rebuild just replaced.
         self.supervision.needs_rebuild = False
         self.note(
             "recovery",
-            f"ready again in {(time.perf_counter() - started) * 1000:.0f} ms at "
-            f"generation {self.supervision.incarnation} / readiness epoch "
-            f"{self.supervision.readiness_epoch}",
+            f"dispatchable again in {(time.perf_counter() - started) * 1000:.0f} ms at "
+            f"executor generation {self.supervision.incarnation} / admission generation "
+            f"{self.admission_generation}",
         )
 
     def watchdog(self) -> None:
@@ -1537,7 +2161,7 @@ class Worker:
                         attempt.cancel_started = time.perf_counter() + 1e9
 
     def reporter(self) -> None:
-        """The Report tick, and the liveness SAMPLE that rides it."""
+        """The ObservedWorkerState tick, and the liveness SAMPLE that rides it."""
         seen: dict[str, str] = {}
         while not self.stop.wait(REPORT_SECONDS):
             for subject in list(self.monitor.cursors):
@@ -1546,48 +2170,91 @@ class Worker:
                     self.note("liveness", f"{subject} is WEDGED by silence (no clock involved)")
                 seen[subject] = verdict
             if self.connected.is_set():
-                self.send(pb.WorkerFrame(report=self.report()))
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
-    def report(self) -> pb.Report:
-        """The Report tick. Serving truth is PER-DEPLOYMENT (#446); job mode reports its
-        capacity credit. Before any directive it reports NEITHER — an honest 'no claim
-        yet' rather than a fabricated zero."""
-        report = pb.Report(
-            applied_revision=self.fences.revision,
-            intake_state=self.fences.intake,
-            active_attempts=self.engine.active(),
-            faults=self.engine.faults[-8:],
-            activity=self.fences.activity[-8:],
-            applied_wire_minor=self.fences.wire_minor,
-        )
-        if self.fences.mode == "job":
-            report.job_capacity.CopyFrom(self.job_capacity())
-        elif self.fences.mode == "serving":
-            report.applied_set_digest = self.fences.applied_set_digest
-            if self.deployment is not None:
-                report.deployments.append(self.deployment_status())
-        return report
+    def observed_state(self) -> pb.ObservedWorkerState:
+        """The observed half of the pair (§8; was `Report`).
 
-    def deployment_status(self) -> pb.DeploymentStatus:
-        """Per-deployment truth (#446): readiness epoch, executor generation, credits.
+        ACCEPTANCE AND CONVERGENCE ARE TWO SEPARATE, CHECKABLE FACTS.
+        `accepted_desired_state_revision` advances when this worker durably accepts intent —
+        which is all `applied_revision` ever honestly meant, while claiming to report
+        reality. `converged_revision` advances ONLY when observed state satisfies the
+        accepted set, and `converged < accepted` is the normal, visible state of a
+        convergence in progress or a latched failure. Never an error; always readable.
 
-        The accelerator qualification is deliberately ABSENT: this torch-free process
-        cannot measure capability facts, and absent IS the present-but-unqualified state
-        (#454 — registration honesty is schema). The executor-measured qualification lands
-        with cr-020/cr-021's lanes.
+        Serving truth is PER PLACEMENT; job mode reports its capacity credit. Before any
+        desired state it reports NEITHER — an honest "no claim yet" rather than a fabricated
+        zero.
         """
-        assert self.deployment is not None
+        observed = pb.ObservedWorkerState(
+            accepted_desired_state_revision=self.accepted.accepted_desired_state_revision,
+            converged_revision=self.converged_revision(),
+            worker_phase=self.phase,
+            held_attempts=self.engine.active(),
+            faults=self.engine.faults[-8:],
+            activity=self.activity[-8:],
+            applied_wire_minor=self.fence.wire_minor,
+            # THE ONE WORKER-LEVEL ADMISSION FENCE (§6). Not per placement: N counters over
+            # ONE serialized device advertise N x the real capacity.
+            admission_generation=self.admission_generation,
+            admission_state=self.admission_state(),
+            available_attempt_slots=self.available_attempt_slots(),
+            # The grant lane is observable without an ack lane of its own (§3).
+            applied_artifact_grant_id=self.grant_id,
+            applied_grant_revision=self.grant_revision,
+        )
+        if self.accepted.mode == "job":
+            observed.job_capacity.CopyFrom(self.job_capacity())
+        elif self.accepted.mode == "serving":
+            observed.accepted_placement_set_digest = self.accepted.accepted_placement_set_digest
+            if self.placement is not None:
+                observed.placements.append(self.placement_status())
+        return observed
+
+    def converged_revision(self) -> int:
+        """A DERIVED fact, recomputed on every read — never a stored optimism.
+
+        It may NEVER advance past a placement whose serving state is not DISPATCHABLE for a
+        desired spec (§8): a worker that advances it while observed state disagrees is in
+        breach, not merely optimistic. So the stored value is the high-water mark
+        `prepare_executor` reached, and this read CLAMPS it back the moment reality moves —
+        a placement that stops being dispatchable un-converges immediately, which is exactly
+        what a RecordOwner watching a cutover needs to see.
+        """
+        if self.accepted.mode == "serving" and not self.dispatchable():
+            return min(
+                self.accepted.converged_revision,
+                max(0, self.accepted.accepted_desired_state_revision - 1),
+            )
+        return self.accepted.converged_revision
+
+    def placement_status(self) -> pb.PlacementStatus:
+        """Per-placement truth on TWO AXES (#473/#482), and `readiness_epoch` is not among
+        them: it is DELETED, not renamed (#486b), because the serving axis plus
+        `dispatchable_plan_ids` already carry what a placement can serve and the worker-level
+        `admission_generation` carries whether an offer is admissible. `attempt_credits` is
+        gone for the same reason, one level up.
+
+        The accelerator qualification is deliberately ABSENT: this torch-free process cannot
+        measure capability facts, and absent IS the present-but-unqualified state (#454 —
+        registration honesty is schema). The executor-measured qualification lands with
+        cr-020/cr-021's lanes.
+        """
+        assert self.placement is not None
         executor = self.supervision.current
-        ready = sorted(executor.ready_plans) if executor is not None else []
-        loadable = sorted(set(self.deployment.plan_ids) - set(ready))
-        return pb.DeploymentStatus(
-            deployment_id=self.deployment.deployment_id,
-            intake_state=self.fences.intake,
-            readiness_epoch=self.supervision.readiness_epoch,
+        dispatchable = sorted(executor.ready_plans) if executor is not None else []
+        # DISJOINT by construction (the proto says so): a plan is either servable now or
+        # still to be materialized, never counted in both.
+        materializable = sorted(set(self.placement.plan_ids) - set(dispatchable))
+        return pb.PlacementStatus(
+            placement_id=self.placement.placement_id,
+            placement_spec_digest=self.placement.spec_digest,
+            materialization=self.placement.materialization,
+            serving=self.placement.serving,
+            retained_fallback_spec_digest=self.placement.retained_fallback_spec_digest,
             executor_generation=self.supervision.incarnation,
-            attempt_credits=self.attempt_credits(),
-            ready_entrypoint_binding_plan_ids=ready,
-            loadable_entrypoint_binding_plan_ids=loadable,
+            dispatchable_plan_ids=dispatchable,
+            materializable_plan_ids=materializable,
             faults=[
                 f
                 for f in self.engine.faults[-8:]
@@ -1596,26 +2263,16 @@ class Worker:
                     pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
                     pb.FaultKind.FAULT_KIND_EXECUTOR_POISONED,
+                    pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
+                    pb.FaultKind.FAULT_KIND_FALLBACK_PIN_MISSING,
                 )
             ],
         )
 
-    def attempt_credits(self) -> int:
-        """Bounded admission credits at this readiness epoch (#441): the window less what
-        this worker already holds. Zero while not READY — credits are a capacity claim."""
-        if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
-            return 0
-        held = sum(
-            1
-            for a in self.engine.live.values()
-            if a.state in ("queued", "accepted", "running", "local_fault")
-        )
-        return max(0, CREDIT_WINDOW - held)
-
     def job_capacity(self) -> pb.JobCapacity:
         """How many JOB attempts this worker can take right now (cr-009)."""
         in_flight = sum(1 for a in self.engine.live.values() if a.job is not None)
-        ready = bool(self.jobs) and self.fences.intake == pb.IntakeState.INTAKE_STATE_READY
+        ready = bool(self.jobs) and self.job_ready
         return pb.JobCapacity(
             jobs_in_flight=in_flight,
             jobs_available=max(0, (1 if ready else 0) - in_flight),
@@ -1668,12 +2325,12 @@ class Worker:
         self.boot.step("load", "boot_failure", 0.0, reason=pb.BootFailureReason.Name(reason))
         return pb.BootFailure(
             worker_id=self.options.worker_id,
-            instance_id=self.options.instance_id,
+            worker_instance_id=self.options.instance_id,
             reason=reason,
             detail=f"{detail} | disk invoice: {json.dumps(invoice, sort_keys=True)}"[:1024],
             resources=self.resources(),
-            release_id=self.options.release_id,
-            image_digest=self.options.image_digest,
+            worker_release_id=self.options.release_id,
+            worker_artifact_digest=self.options.artifact_digest,
         )
 
     def run(self) -> int:
@@ -1683,7 +2340,10 @@ class Worker:
         try:
             self.journal.append(
                 "session",
-                {"worker_boot_id": self.fences.boot_id, "instance_id": self.options.instance_id},
+                {
+                    "worker_boot_id": self.fence.worker_boot_id,
+                    "instance_id": self.options.instance_id,
+                },
             )
         except JournalError as exc:
             self.boot_fatal = self.boot_failure(
@@ -1718,6 +2378,12 @@ class Worker:
                     f"the recovered journal holds {len(recovered)} attempt(s); they ride "
                     "the snapshot and the owner closes them before minting any next ordinal",
                 )
+            # THE MACHINE IS UP (#482). `worker_phase` is machine lifecycle, pulled out of
+            # the placement enum: BOOTING is true only until the journal, the socket, the
+            # orphan sweep, the recovered ownership and the lanes are all real. It moves
+            # here and not at the first claim, because a worker is online whether or not a
+            # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
+            self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
             threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
@@ -1742,10 +2408,10 @@ class Worker:
             "[worker] summary "
             + json.dumps(
                 {
-                    "worker_boot_id": self.fences.boot_id,
-                    "control_generation": self.fences.generation,
+                    "worker_boot_id": self.fence.worker_boot_id,
+                    "control_generation": self.fence.control_stream_generation,
                     "executor_generations": self.supervision.spawns,
-                    "readiness_epoch": self.supervision.readiness_epoch,
+                    "admission_generation": self.admission_generation,
                     "executed": self.engine.executed,
                     "journal_appends": self.journal.appends,
                     "journal_fsync_ms": round(self.journal.fsync_ns / 1e6, 2),
@@ -1764,7 +2430,7 @@ class Worker:
 
 
 #: A provenance digest is `sha256:` plus 64 lowercase hex, or it is not one.
-_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_ARTIFACT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 #: The loopback names a worker may serve plaintext, and without a bootstrap credential.
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
@@ -1808,9 +2474,11 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--instance-id", default="")
     parser.add_argument("--release-id", default="")
     parser.add_argument(
-        "--image-digest",
+        "--artifact-digest",
         default="",
-        help="the worker image's provenance digest, `sha256:<64 hex>`; absent stays absent",
+        help="the worker ARTIFACT's provenance digest, `sha256:<64 hex>`; absent stays "
+        "absent. Was --image-digest: a native worker has no OCI image (#481), and this is "
+        "the one field substrate identity rides (#487/#489)",
     )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
@@ -1830,9 +2498,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
 
-    if args.image_digest and not _IMAGE_DIGEST.fullmatch(args.image_digest):
+    if args.artifact_digest and not _ARTIFACT_DIGEST.fullmatch(args.artifact_digest):
         print(
-            f"[worker] --image-digest {args.image_digest!r} is not `sha256:<64 hex>`: a "
+            f"[worker] --artifact-digest {args.artifact_digest!r} is not `sha256:<64 hex>`: a "
             "provenance digest is measured or it is absent, never approximated",
             file=sys.stderr,
             flush=True,
@@ -1843,7 +2511,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         worker_id=args.worker_id,
         instance_id=args.instance_id or instance_identity(Path(args.root)),
         release_id=args.release_id,
-        image_digest=args.image_digest,
+        artifact_digest=args.artifact_digest,
         git_commit=args.git_commit,
         python=args.python,
         devices=args.devices,

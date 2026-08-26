@@ -1,8 +1,8 @@
-"""The exec-first trampoline: the only code that runs between the supervisor and CUDA.
+"""The exec-first trampoline: the only code that runs between the worker and CUDA.
 
-§3.1 — a threaded supervisor never runs Python between fork and exec (v1: a `preexec_fn`
+§3.1 — a threaded worker never runs Python between fork and exec (v1: a `preexec_fn`
 running in a fork of a process that already has gRPC threads corrupts epoll state; naive
-`posix_spawn` loses the privilege and parent-death setup). So the supervisor uses
+`posix_spawn` loses the privilege and parent-death setup). So the worker uses
 `posix_spawn` with FILE ACTIONS ONLY and execs THIS module, which is a fresh process with no
 inherited threads, no gRPC state and no torch. It sets the process properties that must
 exist before CUDA, then `execv`s the executor — so the interpreter that initializes CUDA is
@@ -10,15 +10,15 @@ the third exec, and it starts with the seal already applied.
 
 Order matters and is the point:
 
-1. **expected parent** — `getppid()` must be the pid the supervisor named. A child that was
+1. **expected parent** — `getppid()` must be the pid the worker named. A child that was
    reparented before it got here is an orphan and exits rather than serving.
 2. **pdeathsig** — SIGKILL on parent death, then the parent check RUNS AGAIN: between (1)
    and (2) the parent could have died, and pdeathsig only fires on future deaths. The
    re-check is what closes that race.
 3. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
-4. **oom_score_adj** — the EXECUTOR raises its OWN score. The supervisor stays a bare
+4. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable
-   process, and nothing in the supervisor needs privilege to arrange it.
+   process, and nothing in the worker needs privilege to arrange it.
 5. **uid/gid** — dropped only when this process is privileged enough to drop them; on an
    unprivileged box there is nothing to drop and the step is a recorded no-op, never a
    pretended success.
@@ -109,7 +109,7 @@ def main(argv: list[str]) -> None:
                 Exit.structural,
             )
 
-    # Its own process group, so the supervisor's forceful path kills the executor AND every
+    # Its own process group, so the worker's forceful path kills the executor AND every
     # grandchild it spawned (dataloader workers, compile subprocesses) with one `killpg`
     # instead of leaving orphans behind a dead parent. pdeathsig survives this.
     proctree.own_process_group()

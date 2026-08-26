@@ -2,7 +2,7 @@
 """cr-008b's live verification: the WHOLE four-component SDXL pipeline, on one 8 GiB card.
 
 Not a test suite (#160). Every section starts the real system — an ephemeral local
-supervisor in its own process, a disposable CUDA executor, cr-005's fill plane reading a
+worker in its own process, a disposable CUDA executor, cr-005's fill plane reading a
 real TensorFS store — and prints what it observed.
 
     corpus/.venv/bin/python scripts/pipeline-live.py stage      component staging + the ladder
@@ -225,7 +225,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     home.mkdir(parents=True, exist_ok=True)
     # The runtime reads the environment ONCE, here, and everything not erased becomes the
     # device child's base env. The throttle has to be in this dict or it stops at the
-    # supervisor — and the supervisor does not read weights, the executor does.
+    # worker — and the worker does not read weights, the executor does.
     environ = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
@@ -422,7 +422,7 @@ def section_stage(args: argparse.Namespace) -> None:
     )
     check(
         "the pipeline served",
-        filled.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        filled.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         f"{filled.get('status')}: {str(filled.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
     rows = residency_of(filled)
@@ -490,7 +490,7 @@ def section_stage(args: argparse.Namespace) -> None:
     )
     check(
         "the pipeline served with only 2 GiB of it filled at construction",
-        parked.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        parked.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         f"{parked.get('status')}: {str(parked.get('terminal', {}).get('safe_message', ''))[:140]}",
     )
     log = residency_of(parked).get("log") or []
@@ -712,7 +712,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "the attempt failed rather than loading a component nobody declared",
-        poison.get("status") in ("TERMINAL_STATUS_FAILED", "TERMINAL_STATUS_REFUSED")
+        poison.get("status") in ("OUTCOME_STATUS_FAILED", "OUTCOME_STATUS_REFUSED")
         or poison.get("ended") == "unbound_entrypoint",
         f"{poison.get('ended')}/{poison.get('status')}: "
         f"{poison.get('error') or str(poison.get('terminal', {}).get('safe_message', ''))[:180]}",
@@ -778,7 +778,7 @@ def section_image(args: argparse.Namespace) -> None:
     )
     ok = check(
         "a real image came out of a cold store",
-        cold.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        cold.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         f"{cold.get('status')}: {str(cold.get('terminal', {}).get('safe_message', ''))[:160]}",
     )
     if not ok:
@@ -865,7 +865,7 @@ def report(outcome: dict[str, Any], label: str, evicted: dict[str, int]) -> None
                 "weights_gib": round(ledger.get("active_weights", 0) / GIB, 3),
                 "activations_mib": round(ledger.get("activations_scratch", 0) / MIB, 1),
                 "rss_executor_mib": round(ledger.get("rss_executor", 0) / MIB, 1),
-                "rss_run_mib": round(ledger.get("rss_supervisor", 0) / MIB, 1),
+                "rss_run_mib": round(ledger.get("rss_worker", 0) / MIB, 1),
                 "component_stages": rows.get("stages", 0),
                 "staged_ms": rows.get("staged_ms", 0),
                 "page_cache_resident_pages_before": evicted.get("resident_pages", -1),
@@ -996,7 +996,7 @@ def ladder_row(outcome: dict[str, Any], label: str, wall: float) -> dict[str, An
     rows = residency_of(outcome)
     return {
         "cap": label,
-        "ok": outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        "ok": outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         "ttfi_s": round(timings["wall_ms"] / 1000, 2),
         "harness_wall_s": round(wall, 2),
         "boot_to_ready_s": round(timings.get("register_to_ready_ms", 0) / 1000, 2),
@@ -1015,7 +1015,7 @@ def ladder_row(outcome: dict[str, Any], label: str, wall: float) -> dict[str, An
             outcome.get("terminal", {}).get("metrics", {}).get("peak_vram_bytes", 0) / MIB, 1
         ),
         "rss_executor_mib": round(ledger.get("rss_executor", 0) / MIB, 1),
-        "rss_run_mib": round(ledger.get("rss_supervisor", 0) / MIB, 1),
+        "rss_run_mib": round(ledger.get("rss_worker", 0) / MIB, 1),
         "digest": (outcome.get("result") or {}).get("digest", "")[:16],
     }
 
@@ -1157,9 +1157,9 @@ static double now_s(void) {
 }
 
 static void setup(void) {
-    /* IO_ rather than COZY_: the supervisor's ERASE pass strips every COZY_-prefixed name
+    /* IO_ rather than COZY_: the worker's ERASE pass strips every COZY_-prefixed name
      * from the device child's environment, and the fill happens in that child — a cap named
-     * COZY_THROTTLE_BPS reaches the supervisor and silently does not reach the reader. */
+     * COZY_THROTTLE_BPS reaches the worker and silently does not reach the reader. */
     const char *value = getenv("IO_THROTTLE_BPS");
     if (!value) value = getenv("COZY_THROTTLE_BPS");
     rate_bps = value ? atof(value) : 0.0;
@@ -1264,7 +1264,7 @@ void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
  *
  * The hubless contract is a claim that a populated local CAS is sufficient — provable only
  * by taking the network away and watching inference finish anyway. AF_UNIX is left alone on
- * purpose: the supervisor/executor control channel is a Unix socket, and cutting THAT would
+ * purpose: the worker/executor control channel is a Unix socket, and cutting THAT would
  * test the harness rather than the contract. */
 int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     if (!real_connect) setup();

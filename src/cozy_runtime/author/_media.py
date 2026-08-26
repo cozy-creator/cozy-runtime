@@ -20,7 +20,7 @@ no signature matches, and the caller decides — which for a typed image field i
 and for a `FileAsset` (the kind that promises nothing about its contents) is not.
 
 It lives under `author/` because the KIND table is a fact about the author surface's own
-types, and both sides need one copy: the supervisor sniffs the fetched bytes before
+types, and both sides need one copy: the worker sniffs the fetched bytes before
 acceptance, the executor checks the sniffed type against the FIELD it is about to fill. Two
 tables would be two contracts. Stdlib only, so the package fence is satisfied in the
 direction that matters (`internal` may import `author`; never the reverse).

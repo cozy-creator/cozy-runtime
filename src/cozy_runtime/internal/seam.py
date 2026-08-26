@@ -1,4 +1,4 @@
-"""The supervisor <-> device-executor seam: CONTROL, not data, byte-accounted.
+"""The worker <-> device-executor seam: CONTROL, not data, byte-accounted.
 
 One `SOCK_STREAM` unix socket carries length-framed canonical-JSON commands and replies:
 a fixed 4-byte big-endian length prefix, then exactly that many body bytes (#448). A byte
@@ -11,7 +11,7 @@ Three properties are structural rather than reviewed:
 * **Control, not data.** Every frame is capped (`MAX_FRAME`) and the declared length is
   refused BEFORE the body is read or allocated. Every wire byte in both directions is
   counted. Output bytes never cross this seam — they land in the attempt spool the
-  supervisor brokered, and the supervisor reads them from there, which is also what keeps
+  worker brokered, and the worker reads them from there, which is also what keeps
   the executor's writable storage to exactly that spool (§3.1).
 * **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
   grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
@@ -41,13 +41,13 @@ MAX_FRAME = 64 * 1024
 HEADER = struct.Struct("!I")
 
 #: Key names that must never appear in a frame, at any depth. Credentials stop at the
-#: supervisor (§3.1); the executor cannot leak what it was never handed.
+#: worker (§3.1); the executor cannot leak what it was never handed.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
 #: The attempt-spool file the executor writes its serialized typed result into. The public
 #: contract admits an inline result up to 4 MiB and this frame admits 64 KiB, so the bytes
 #: take the same road the output blobs already take — the brokered spool — and only their
-#: digest and length cross here. The SUPERVISOR names the file, so no path ever comes off
+#: digest and length cross here. The WORKER names the file, so no path ever comes off
 #: the child (cr-007).
 RESULT_DOCUMENT = "result.canonical"
 
@@ -68,7 +68,7 @@ def _scan(value: Any, path: str = "") -> None:
             if key.lower() in SECRET_KEYS:
                 raise SeamError(
                     "credential_at_seam",
-                    f"{path}{key!r}: credentials never cross the supervisor/executor seam",
+                    f"{path}{key!r}: credentials never cross the worker/executor seam",
                 )
             _scan(item, f"{path}{key}.")
     elif isinstance(value, (list, tuple)):

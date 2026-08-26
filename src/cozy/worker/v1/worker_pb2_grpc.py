@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from cozy_runtime.protocol import worker_pb2 as cozy_dot_worker_dot_v1_dot_worker__pb2
+from cozy.worker.v1 import worker_pb2 as cozy_dot_worker_dot_v1_dot_worker__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
@@ -26,7 +26,7 @@ if _version_not_supported:
 
 
 class WorkerControlStub(object):
-    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
+    """The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
     """
 
     def __init__(self, channel):
@@ -37,7 +37,7 @@ class WorkerControlStub(object):
         """
         self.Control = channel.stream_stream(
                 '/cozy.worker.v1.WorkerControl/Control',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.SerializeToString,
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOwnerFrame.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.FromString,
                 _registered_method=True)
         self.WatchProgress = channel.unary_stream(
@@ -48,24 +48,25 @@ class WorkerControlStub(object):
 
 
 class WorkerControlServicer(object):
-    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
+    """The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
     """
 
     def Control(self, request_iterator, context):
-        """Durable control: the owner's request stream carries OwnerFrames, the worker's response
-        stream carries WorkerFrames. Durable messages are never shed to backpressure. Terminal
-        authority lives only here. gRPC orders each DIRECTION independently — there is no cross-
-        direction causal order; causality is expressed by revisions, snapshot ids, and acks.
+        """Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
+        response stream carries WorkerFrames. Durable messages are never shed to backpressure.
+        Outcome authority lives only here. gRPC orders each DIRECTION independently — there is no
+        cross-direction causal order; causality is expressed by revisions, snapshot ids, and acks.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def WatchProgress(self, request, context):
-        """Bounded LOSSY progress, worker->owner server-streaming. Sequence-numbered, gaps visible,
-        oldest shed first on overflow, no terminal authority. Where the contract promises that
-        progress saturation cannot block control, the owner opens WatchProgress on a PHYSICALLY
-        SEPARATE HTTP/2 connection — separate streams on one TCP connection do not prove it.
+        """Bounded LOSSY progress, worker->RecordOwner server-streaming. Sequence-numbered, gaps
+        visible, oldest shed first on overflow, no outcome authority. Where the contract promises
+        that progress saturation cannot block control, the RecordOwner opens WatchProgress on a
+        PHYSICALLY SEPARATE HTTP/2 connection — separate streams on one TCP connection do not
+        prove it.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -76,7 +77,7 @@ def add_WorkerControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Control': grpc.stream_stream_rpc_method_handler(
                     servicer.Control,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.FromString,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOwnerFrame.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.SerializeToString,
             ),
             'WatchProgress': grpc.unary_stream_rpc_method_handler(
@@ -93,7 +94,7 @@ def add_WorkerControlServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class WorkerControl(object):
-    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
+    """The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
     """
 
     @staticmethod
@@ -111,7 +112,7 @@ class WorkerControl(object):
             request_iterator,
             target,
             '/cozy.worker.v1.WorkerControl/Control',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOwnerFrame.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.FromString,
             options,
             channel_credentials,

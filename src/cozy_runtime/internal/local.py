@@ -51,12 +51,12 @@ from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import SCHEMA_DIGEST_RAW, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The one local deployment's owner-minted routing key (#446). Routing, never identity:
 #: the InvocationSpec digest deliberately excludes it.
-LOCAL_DEPLOYMENT = "dpl-local"
+LOCAL_PLACEMENT = "plc-local"
 
 _M = TypeVar("_M")
 
@@ -157,15 +157,58 @@ class SliceOutcome:
     #: have to pretend a hang was a result.
     ended: str = "unstarted"
     error: str = ""
+    #: The RecordOwner's PROJECTION over (status, cause, origin) — see `redispatchable()`.
+    #: True means the ordinal was consumed and the BUDGET was not, so the next ordinal may
+    #: go elsewhere immediately. It is never a worker wire fact and is computed here.
+    redispatchable: bool = False
+
+
+#: THE REFUSED PROJECTION, SPLIT BY (cause, origin) — rev-2 §7/#480b.
+#:
+#: 02 §2's table used to read "REFUSED => settle refused; never re-dispatch". That was
+#: written when every REFUSED was a judgment about the WORK. These four are judgments about
+#: the WORKER, made before the author ran: the ordinal is consumed, the budget is untouched,
+#: and the RecordOwner may mint `attempt_ordinal + 1` and dispatch it elsewhere immediately —
+#: no cooldown, no budget draw. The author/runtime causes (INVALID_REQUEST,
+#: UNSUPPORTED_INPUT, LOCAL_SAFETY, CONSTRAINT_INFEASIBLE) still settle refused forever.
+#:
+#: Retryability is exactly this: a RecordOwner projection, unrepresentable as a worker wire
+#: fact, which is why the worker sends the neutral triple and this side reads it.
+PRE_EXECUTION_REFUSALS = frozenset(
+    {
+        pb.CauseCode.CAUSE_CODE_NO_CAPACITY,
+        pb.CauseCode.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+        pb.CauseCode.CAUSE_CODE_UNKNOWN_PLACEMENT,
+        pb.CauseCode.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+    }
+)
+
+
+def redispatchable(body: Mapping[str, Any]) -> bool:
+    """Can this attempt's ordinal + 1 go straight to another worker?
+
+    `execution_started` is the BILLING FACT and it is STRUCTURAL (#480c) — the worker states
+    it rather than leaving a RecordOwner to infer it from a cause-code allowlist. Both are
+    checked: the cause says whose judgment it was, and the bit says whether anything ran.
+    """
+    if body.get("status") != pb.OutcomeStatus.OUTCOME_STATUS_REFUSED:
+        return False
+    cause = body.get("cause") or {}
+    return (
+        cause.get("code") in PRE_EXECUTION_REFUSALS
+        and cause.get("origin") == pb.CauseOrigin.CAUSE_ORIGIN_SUPERVISOR
+        and not body.get("execution_started", False)
+    )
 
 
 class LocalCoordinator:
-    """The in-memory OWNER — the record-plane half of th-024, in this process.
+    """The in-memory RECORDOWNER — the record-plane half of th-024, in this process.
 
-    It is a real owner in every way that the worker can observe: it claims first, speaks
-    only `cozy.worker.v1` frames under the three-field envelope, reconciles the snapshot
-    before dispatching, and learns readiness the way a hub does — from a durable Report's
-    per-deployment status, not from a Python attribute.
+    It is a real RecordOwner in every way the worker can observe: it claims first (carrying
+    its `wire_schema_digest`), speaks only `cozy.worker.v1` frames under the three-field
+    envelope, RECOMPUTES the snapshot digest before acknowledging it, dispatches against the
+    admission generation it last saw, and learns dispatchability the way a hub does — from a
+    durable ObservedWorkerState's per-placement axes, not from a Python attribute.
     """
 
     def __init__(
@@ -193,15 +236,17 @@ class LocalCoordinator:
         self.host.on_frame = self._on_frame
         self._on_progress = on_progress
         self.progress_frames: list[pb.AttemptProgress] = []
-        #: the accepted envelope this owner speaks under, learned from ClaimAck
-        self.owner_epoch = 1
+        #: the accepted envelope this RecordOwner speaks under, learned from ClaimAck
+        self.record_owner_epoch = 1
         self.generation = 0
         self.boot_id = ""
-        self.snapshot_entries: list[pb.ActiveAttempt] = []
+        self.held_attempts: list[pb.HeldAttempt] = []
+        #: the fence the worker last advertised; every offer ECHOES it (§6)
+        self.admission_generation = 0
         self.dispatched = False
         self.accepted: pb.AttemptAccepted | None = None
-        self.terminal: pb.AttemptTerminal | None = None
-        self.reports: list[pb.Report] = []
+        self.terminal: pb.AttemptOutcome | None = None
+        self.reports: list[pb.ObservedWorkerState] = []
         self.spec_digest = b""
         self.done = threading.Event()
         self.marks: dict[str, float] = {"start": time.perf_counter()}
@@ -210,11 +255,16 @@ class LocalCoordinator:
         # THE CLAIM IS QUEUED BEFORE THE WORKER SERVES: the worker's stream conversation
         # begins by reading it, exactly as a dialing owner's first frame arrives first.
         claim = pb.Claim(
-            owner_epoch=self.owner_epoch,
-            controller_id="local-run",
+            record_owner_epoch=self.record_owner_epoch,
+            record_owner_id="local-run",
             wire_minor=WIRE_MINOR,
+            # THE SCHEMA FENCE, from BOTH ends (#536b). The local door speaks the same
+            # vendored file set as the worker it drives, so this is trivially equal here —
+            # and it is sent anyway, because a lane that skips the fence when it happens to
+            # be safe is a lane that never proves the fence works.
+            wire_schema_digest=SCHEMA_DIGEST_RAW,
         )
-        self.host.deliver(pb.OwnerFrame(claim=claim))
+        self.host.deliver(pb.RecordOwnerFrame(claim=claim))
         threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()
 
     def destination(self, output_id: str) -> Path:
@@ -244,8 +294,8 @@ class LocalCoordinator:
     def _env(self, message: _M) -> _M:
         """The owner's half of the three-field envelope (02 §0)."""
         inner: Any = message
-        inner.owner_epoch = self.owner_epoch
-        inner.control_generation = self.generation
+        inner.record_owner_epoch = self.record_owner_epoch
+        inner.control_stream_generation = self.generation
         inner.worker_boot_id = self.boot_id
         return message
 
@@ -272,24 +322,20 @@ class LocalCoordinator:
         kind = frame.WhichOneof("msg")
         if kind == "claim_ack":
             self._on_claim_ack(frame.claim_ack)
-        elif kind == "snapshot_begin":
-            self.snapshot_entries = []
-        elif kind == "snapshot_entry":
-            self.snapshot_entries.append(frame.snapshot_entry.attempt)
-        elif kind == "snapshot_end":
-            self._on_snapshot_end(frame.snapshot_end)
+        elif kind == "snapshot":
+            self._on_snapshot(frame.snapshot)
         elif kind == "boot_failure":
             self.ended = "worker_error"
             self.error = f"boot failure: {frame.boot_failure.detail}"[:400]
             self.done.set()
             self.host.close()
-        elif kind == "report":
-            self._on_report(frame.report)
+        elif kind == "observed_state":
+            self._on_observed_state(frame.observed_state)
         elif kind == "attempt_accepted":
             self.accepted = frame.attempt_accepted
             self.marks["accepted"] = time.perf_counter()
-        elif kind == "attempt_terminal":
-            self._on_terminal(frame.attempt_terminal)
+        elif kind == "attempt_outcome":
+            self._on_outcome(frame.attempt_outcome)
         elif kind == "checkpoint_request":
             self._on_checkpoint(frame.checkpoint_request)
 
@@ -300,22 +346,43 @@ class LocalCoordinator:
             self.done.set()
             self.host.close()
             return
-        self.generation = ack.control_generation
+        self.generation = ack.control_stream_generation
         self.boot_id = ack.worker_boot_id
         self.marks["registered"] = time.perf_counter()
 
-    def _on_snapshot_end(self, end: pb.SnapshotEnd) -> None:
-        """Reconcile, ack the EXACT snapshot, and only then send the directive (02 §6).
-        A one-shot run on a fresh root expects an empty snapshot; entries are recorded so
-        a driver can assert on them."""
-        if len(self.snapshot_entries) != end.entry_count:
+    def _on_snapshot(self, snapshot: pb.WorkerSnapshot) -> None:
+        """RECOMPUTE, reconcile, ack the EXACT snapshot, and only then send the desired
+        state (02 §6, §5).
+
+        The digest is recomputed over the bytes the snapshot carries, BEFORE the document is
+        parsed. There is no entry count to reconcile against any more and there does not
+        need to be: a truncated or re-ordered snapshot cannot hash to what it claims, so
+        boundedness is a property of the message rather than a promise the sender makes.
+        """
+        recomputed = documents.digest_of(snapshot.snapshot_canonical_bytes)
+        if recomputed != snapshot.snapshot_digest:
             raise RuntimeError(
-                f"snapshot gap: {len(self.snapshot_entries)} entries, end says {end.entry_count}"
+                f"snapshot digest mismatch: carried {snapshot.snapshot_digest.hex()[:16]} "
+                f"and the bytes hash to {recomputed.hex()[:16]}; NOT acknowledged"
             )
+        body = pb.WorkerSnapshotBody()
+        document = documents.read(snapshot.snapshot_canonical_bytes, pb.WorkerSnapshotBody)
+        self.snapshot_document = document
+        self.admission_generation = int(document.get("admission_generation", 0))
+        del body
         self._send(
-            pb.OwnerFrame(snapshot_ack=self._env(pb.SnapshotAck(snapshot_id=end.snapshot_id)))
+            pb.RecordOwnerFrame(
+                snapshot_ack=self._env(
+                    pb.SnapshotAck(
+                        snapshot_id=snapshot.snapshot_id,
+                        # ECHOED, never recomputed by the worker: the ack binds the exact
+                        # snapshot this owner durably reconciled.
+                        snapshot_digest=snapshot.snapshot_digest,
+                    )
+                )
+            )
         )
-        self._send(pb.OwnerFrame(directive=self._directive()))
+        self._send(pb.RecordOwnerFrame(desired_state=self._desired_state()))
 
     def _plan_id(self) -> str:
         """The binding plan this request runs against, or the typed refusal that it has none.
@@ -335,55 +402,57 @@ class LocalCoordinator:
             )
         return plan_id
 
-    def _on_report(self, report: pb.Report) -> None:
-        """READY is learned from the worker's own durable Report — per-deployment status in
-        serving mode (#446), job capacity in job mode."""
+    def _on_observed_state(self, report: pb.ObservedWorkerState) -> None:
+        """DISPATCHABILITY is learned from the worker's own durable ObservedWorkerState: the
+        placement's SERVING axis plus `dispatchable_plan_ids` in serving mode, job capacity
+        in job mode — and, in BOTH, the one worker-level admission fence (§6). The owner
+        dispatches against the generation it last saw, and echoes it on the offer."""
         self.reports.append(report)
-        if report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR:
-            # The worker said it cannot become ready. That is an answer, and a one-shot run
-            # ends on it instead of waiting for a readiness that will never come.
+        self.admission_generation = report.admission_generation
+        if report.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
+            # The worker said it cannot serve. That is an answer, and a one-shot run ends on
+            # it instead of waiting for a dispatchability that will never come.
             self.marks.setdefault("ready", time.perf_counter())
             if self.terminal is None:
                 self.ended = "worker_error"
             self.done.set()
             self.host.close()
             return
+        open_window = (
+            report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+            and report.available_attempt_slots > 0
+        )
         if self.request.kind == "job":
-            ready = (
-                report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-                and report.job_capacity.jobs_available > 0
-            )
+            ready = open_window and report.job_capacity.jobs_available > 0
         else:
             plan_id = self._plan_id()
-            status = next(
-                (d for d in report.deployments if d.deployment_id == LOCAL_DEPLOYMENT), None
-            )
+            status = next((d for d in report.placements if d.placement_id == LOCAL_PLACEMENT), None)
             ready = (
                 status is not None
-                and status.intake_state == pb.IntakeState.INTAKE_STATE_READY
-                and status.attempt_credits > 0
-                and plan_id in status.ready_entrypoint_binding_plan_ids
+                and open_window
+                and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                and plan_id in status.dispatchable_plan_ids
             )
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
             self.dispatched = True
             self._dispatch()
 
-    def _on_terminal(self, terminal: pb.AttemptTerminal) -> None:
-        self.terminal = terminal
+    def _on_outcome(self, outcome: pb.AttemptOutcome) -> None:
+        self.terminal = outcome
         self.ended = "terminal"
         self.marks["terminal"] = time.perf_counter()
         if not self.auto_ack:
             return
         self._send(
-            pb.OwnerFrame(
-                terminal_ack=self._env(
-                    pb.TerminalAck(
-                        request_id=terminal.request_id,
-                        attempt=terminal.attempt,
-                        invocation_digest=terminal.invocation_digest,
-                        terminal_id=terminal.terminal_id,
-                        terminal_digest=terminal.terminal_digest,
+            pb.RecordOwnerFrame(
+                outcome_ack=self._env(
+                    pb.AttemptOutcomeAck(
+                        request_id=outcome.request_id,
+                        attempt_ordinal=outcome.attempt_ordinal,
+                        invocation_spec_digest=outcome.invocation_spec_digest,
+                        outcome_id=outcome.outcome_id,
+                        outcome_digest=outcome.outcome_digest,
                     )
                 )
             )
@@ -406,9 +475,9 @@ class LocalCoordinator:
             return 0
         return int(time.time()) + self.request.timeout_ms // 1000 + GRANT_TAIL_SECONDS
 
-    def _directive(self) -> pb.Directive:
+    def _desired_state(self) -> pb.DesiredWorkerState:
         directive = self._env(
-            pb.Directive(
+            pb.DesiredWorkerState(
                 revision=1,
                 posture=pb.Posture.POSTURE_ACCEPTING,
                 wire_minor=WIRE_MINOR,
@@ -429,20 +498,36 @@ class LocalCoordinator:
                 )
             )
             return directive
-        # THE ONE-DIGESTER RULE (#454): the owner authors BOTH the structured set and its
-        # canonical document digest; the worker echoes the digest as the set's NAME.
-        deployment_set = pb.DeploymentSet(
-            deployments=[
-                pb.Deployment(
-                    deployment_id=LOCAL_DEPLOYMENT,
-                    endpoint_release_id=self.release_id,
-                    entrypoint_binding_plan_ids=sorted(set(self.bindings.values())),
+        # THE SET IS CONTENT-ADDRESSED, NOT ECHO-ADDRESSED (§4). The one-digester rule
+        # (#454) is retired with the duplicate structured representation it needed: the
+        # RecordOwner authors the canonical `PlacementSet/1` document ONCE and sends its
+        # exact bytes, and the worker RECOMPUTES the digest before parsing a field. There is
+        # no second place for the set to disagree with itself.
+        placement_set = pb.PlacementSet(
+            placements=[
+                pb.Placement(
+                    placement_id=LOCAL_PLACEMENT,
+                    spec=pb.PlacementSpec(
+                        # PROVENANCE only — the worker never resolves it (§1).
+                        endpoint_release_id=self.release_id,
+                        # The local door names NO environment receipt, and that is a
+                        # statement: a bare-venv run has no measured installed environment,
+                        # and a spec that named one would make STAGED unspeakable for a
+                        # placement this door can actually serve.
+                        binding_plans=[
+                            pb.ArtifactSubject(subject_id=plan_id, kind="plan")
+                            for plan_id in sorted(set(self.bindings.values()))
+                        ],
+                    ),
                 )
             ]
         )
-        _, set_digest = documents.identity(deployment_set)
-        directive.deployment_set.CopyFrom(
-            pb.DeploymentSetDirective(set_digest=set_digest, set=deployment_set)
+        canonical_bytes, set_digest = documents.identity(placement_set)
+        directive.placement_set.CopyFrom(
+            pb.DesiredPlacementSet(
+                placement_set_digest=set_digest,
+                placement_set_canonical_bytes=canonical_bytes,
+            )
         )
         return directive
 
@@ -526,9 +611,10 @@ class LocalCoordinator:
                 int(time.time() * 1000) + self.request.timeout_ms if self.request.timeout_ms else 0
             ),
         )
-        # `image_digest` and `config_digest` stay EMPTY on the local door and that is a
-        # statement: a bare-venv run has no container image, and minting a plausible digest
-        # for one would be the fabrication class this runtime exists to prevent.
+        # `environment_spec_digest` and `config_digest` stay EMPTY on the local door and
+        # that is a statement: a bare-venv run has no measured environment document, and
+        # minting a plausible digest for one would be the fabrication class this runtime
+        # exists to prevent.
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
@@ -544,15 +630,18 @@ class LocalCoordinator:
         self.spec_digest = digest
         self.marks["dispatched"] = time.perf_counter()
         self._send(
-            pb.OwnerFrame(
-                start_attempt=self._env(
-                    pb.StartAttempt(
+            pb.RecordOwnerFrame(
+                attempt_offer=self._env(
+                    pb.AttemptOffer(
                         request_id=self.request.request_id,
-                        attempt=self.request.attempt,
-                        invocation_digest=digest,
-                        invocation_canonical=canonical_bytes,
+                        attempt_ordinal=self.request.attempt,
+                        invocation_spec_digest=digest,
+                        invocation_spec_canonical_bytes=canonical_bytes,
                         grant=self._grant(body, digest),
-                        deployment_id="" if self.request.kind == "job" else LOCAL_DEPLOYMENT,
+                        placement_id="" if self.request.kind == "job" else LOCAL_PLACEMENT,
+                        # The generation this owner OBSERVED when it dispatched (§6). A
+                        # stale echo refuses deterministically.
+                        admission_generation=self.admission_generation,
                     )
                 )
             )
@@ -582,8 +671,8 @@ class LocalCoordinator:
             for input_id, source in sorted(self.request.inputs.items())
         ]
         return pb.DeliveryGrant(
-            invocation_digest=invocation_digest,
-            credential=pb.Credential(
+            invocation_spec_digest=invocation_digest,
+            credential=pb.DeliveryAccessCredential(
                 issuer="cozy-runtime-local",
                 key_id="local",
                 epoch=1,
@@ -638,11 +727,11 @@ class LocalCoordinator:
             else pb.CheckpointOutcome.CHECKPOINT_OUTCOME_RECORDED
         )
         self._send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 checkpoint_receipt=self._env(
                     pb.JobCheckpointReceipt(
                         request_id=request.request_id,
-                        attempt=request.attempt,
+                        attempt_ordinal=request.attempt_ordinal,
                         operation_key=request.operation_key,
                         logical_key=request.logical_key,
                         content_digest=request.content_digest,
@@ -658,12 +747,12 @@ class LocalCoordinator:
     def cancel(self, reason: pb.CancelReason = pb.CancelReason.CANCEL_REASON_CLIENT) -> None:
         """Cancel the live attempt — the same frame a hub sends, digest-fenced."""
         self._send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=self._env(
                     pb.CancelAttempt(
                         request_id=self.request.request_id,
-                        attempt=self.request.attempt,
-                        invocation_digest=self.spec_digest,
+                        attempt_ordinal=self.request.attempt,
+                        invocation_spec_digest=self.spec_digest,
                         reason=reason,
                     )
                 )
@@ -673,7 +762,7 @@ class LocalCoordinator:
     def close(self) -> None:
         self.host.close()
 
-    def _send(self, frame: pb.OwnerFrame) -> None:
+    def _send(self, frame: pb.RecordOwnerFrame) -> None:
         self.host.deliver(frame)
 
 
@@ -816,7 +905,7 @@ def _collect(
             "decision_explanation": accepted.plan.decision_explanation,
         }
     if coordinator.terminal is not None:
-        body = documents.read(coordinator.terminal.terminal_canonical, pb.TerminalBody)
+        body = documents.read(coordinator.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         outcome.terminal = body
         # The triage read, exactly as cl-006 will do it: take the opaque subject off the
         # terminal, and read the bundle BY KEY, verified against its journaled receipt.
@@ -830,9 +919,10 @@ def _collect(
                     worker.root / "journal.log",
                 )
                 outcome.triage_explained = triage.explain(outcome.triage)
-        outcome.status = pb.TerminalStatus.Name(
-            body.get("status", pb.TerminalStatus.TERMINAL_STATUS_UNSPECIFIED)
+        outcome.status = pb.OutcomeStatus.Name(
+            body.get("status", pb.OutcomeStatus.OUTCOME_STATUS_UNSPECIFIED)
         )
+        outcome.redispatchable = redispatchable(body)
         envelope = body.get("result") or {}
         inline = envelope.get("inline_result")
         if isinstance(inline, str):

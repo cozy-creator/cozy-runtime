@@ -2,7 +2,7 @@
 """cr-009's live verification: the @job surface, the job services and the runner, run for real.
 
 Not a test suite (#160). Every section below drives the ACTUAL machinery — the ephemeral
-local supervisor, the real seam, the real disposable executor, the real journal — over the
+local worker, the real seam, the real disposable executor, the real journal — over the
 real 6.9 GB cozytensors bench store, and prints what it observed.
 
     corpus/.venv/bin/python scripts/job-live.py e2e       submit -> terminal -> output
@@ -284,7 +284,7 @@ def section_e2e() -> None:
     check("the run produced a terminal", outcome.ended == "terminal", outcome.error)
     check(
         "terminal is SUCCEEDED",
-        outcome.status == "TERMINAL_STATUS_SUCCEEDED",
+        outcome.status == "OUTCOME_STATUS_SUCCEEDED",
         outcome.status + " " + str(outcome.terminal.get("safe_message", ""))[:160],
     )
     result = outcome.result or {}
@@ -315,8 +315,8 @@ def section_e2e() -> None:
         "the journal carries accepted -> job_checkpoint -> terminal -> closed, in that order",
         journal_kinds.count("accepted") == 1
         and journal_kinds.index("job_checkpoint") > journal_kinds.index("accepted")
-        and journal_kinds.index("terminal") > journal_kinds.index("job_checkpoint")
-        and journal_kinds.index("closed") > journal_kinds.index("terminal"),
+        and journal_kinds.index("outcome") > journal_kinds.index("job_checkpoint")
+        and journal_kinds.index("closed") > journal_kinds.index("outcome"),
         " ".join(journal_kinds),
     )
     check(
@@ -336,7 +336,7 @@ def section_e2e() -> None:
     check(
         "the run-once worker exits RECYCLE, a disposition distinct from any death",
         outcome.exit_code == RECYCLE_EXIT,
-        f"supervisor exit {outcome.exit_code} (recycle={RECYCLE_EXIT}, ok=0, internal=1)",
+        f"worker exit {outcome.exit_code} (recycle={RECYCLE_EXIT}, ok=0, internal=1)",
     )
     print(f"  wall {wall:.0f} ms; timings {json.dumps(outcome.timings)}")
     globals()["_E2E_DIGEST"] = result.get("topology_digest", "")
@@ -354,7 +354,7 @@ def section_kill() -> None:
         print(f"  reference (uninterrupted) topology {globals()['_E2E_DIGEST'][:31]}…")
     workspace = fresh("kill")
 
-    def hook(coordinator: Any, supervisor: Any) -> None:
+    def hook(coordinator: Any, worker: Any) -> None:
         """Kill the executor's whole process GROUP once the job is genuinely mid-loop.
 
         Fault injection belongs to the harness, never to a plant switch inside the runtime
@@ -366,9 +366,9 @@ def section_kill() -> None:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 frames = [f for f in coordinator.progress_frames if b'"type": "progress"' in f.data]
-                if len(frames) >= 2 and supervisor.supervision.current is not None:
-                    pid = supervisor.supervision.current.pid
-                    supervisor.supervision.current.kill_group()
+                if len(frames) >= 2 and worker.supervision.current is not None:
+                    pid = worker.supervision.current.pid
+                    worker.supervision.current.kill_group()
                     print(f"  killed executor pid {pid} after {len(frames)} progress frames")
                     return
                 time.sleep(0.02)
@@ -380,7 +380,7 @@ def section_kill() -> None:
     check("the killed attempt still produced a terminal", first.ended == "terminal", first.error)
     check(
         "the terminal is the TYPED abandoned one, not silence",
-        first.status == "TERMINAL_STATUS_ABANDONED",
+        first.status == "OUTCOME_STATUS_ABANDONED",
         f"{first.status}: {str(first.terminal.get('safe_message', ''))[:140]}",
     )
     granted = workspace / "outputs"
@@ -402,7 +402,7 @@ def section_kill() -> None:
     check("the re-run reached a terminal", second.ended == "terminal", second.error)
     check(
         "the re-run SUCCEEDED and RESUMED from the surviving scratch",
-        second.status == "TERMINAL_STATUS_SUCCEEDED"
+        second.status == "OUTCOME_STATUS_SUCCEEDED"
         and int((second.result or {}).get("resumed_from", 0)) == len(survived),
         f"{second.status}, resumed_from={(second.result or {}).get('resumed_from')} "
         f"of {len(survived)} surviving component(s)",
@@ -512,7 +512,7 @@ def section_arms() -> None:
     message = str(narrated.terminal.get("safe_message", ""))
     check(
         "the attempt converges on the ENDPOINT's refusal, not on an executor death",
-        narrated.status == "TERMINAL_STATUS_REFUSED" and "host_unfit" in message,
+        narrated.status == "OUTCOME_STATUS_REFUSED" and "host_unfit" in message,
         f"{narrated.status}: {message[:110]}",
     )
     dropped = int((narrated.triage.get("caps") or {}).get("dropped_for_frame", 0))
@@ -556,7 +556,7 @@ def section_arms() -> None:
     cause = (ungranted.terminal.get("cause") or {}) if ungranted.terminal else {}
     check(
         "a job naming an UNGRANTED tensorfs read refuses typed",
-        ungranted.status == "TERMINAL_STATUS_REFUSED"
+        ungranted.status == "OUTCOME_STATUS_REFUSED"
         and int(cause.get("code", 0)) == pb.CauseCode.CAUSE_CODE_UNSUPPORTED_INPUT
         and "is not granted to this attempt" in str(ungranted.terminal.get("safe_message", "")),
         f"{ungranted.status} / cause "
@@ -577,7 +577,7 @@ def _oversize_arm() -> None:
     """A payload over the CONTROL SEAM cap refuses BEFORE acceptance, and never hangs.
 
     ev-003 measured the defect (decisions #302): 73,721 B was ACCEPTED and then the dispatch
-    frame raised a supervisor-side SeamError, so no terminal was ever produced and the run
+    frame raised a worker-side SeamError, so no terminal was ever produced and the run
     hung until its readiness deadline — which only fires for a run that never dispatched.
     The check moved to the acceptance boundary, where the law already says everything either
     completes or refuses typed. Armed on the JOB lane; the code is shared with serving.
@@ -618,7 +618,7 @@ def _oversize_arm() -> None:
     cause = (outcome.terminal.get("cause") or {}) if outcome.terminal else {}
     check(
         "a payload over the control-seam cap refuses PRE-ACCEPT, and does not hang",
-        outcome.status == "TERMINAL_STATUS_REFUSED"
+        outcome.status == "OUTCOME_STATUS_REFUSED"
         and int(cause.get("code", 0)) == pb.CauseCode.CAUSE_CODE_INVALID_REQUEST
         and elapsed < 60,
         f"{outcome.status} / {pb.CauseCode.Name(int(cause.get('code', 0)))} in {elapsed:.1f} s "
@@ -657,7 +657,7 @@ def _container_asset_arm() -> None:
     staged.mkdir(parents=True, exist_ok=True)
     refs = []
     # cr-012: an input asset is a GRANTED READ CAPABILITY, not a location a request may name.
-    # The supervisor fetches, verifies and spools every one BEFORE acceptance and hands the
+    # The worker fetches, verifies and spools every one BEFORE acceptance and hands the
     # executor identified files; this driver stands in for that half, because the claim under
     # test is what the KERNEL does with a list of them — hydrate every element, or none.
     grants = {}
@@ -771,7 +771,7 @@ def _service_arms() -> None:
 def section_identity() -> None:
     head("observational identity: `cozy-runtime job` == a direct run_slice call")
     direct = run_job(fresh("id-direct"), request_id="id-1")
-    check("the direct run succeeded", direct.status == "TERMINAL_STATUS_SUCCEEDED", direct.error)
+    check("the direct run succeeded", direct.status == "OUTCOME_STATUS_SUCCEEDED", direct.error)
 
     workspace = fresh("id-cli")
     (workspace / "payload.json").write_text(json.dumps(payload()))
@@ -881,8 +881,8 @@ def section_bench() -> None:
     print(f"    runner overhead (spawn+accept+tail): {overhead:7.1f} ms")
     print(f"    {json.dumps(outcome.timings)}")
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    print(f"  harness peak RSS (supervisor in-process): {rss / 2**20:.1f} MiB")
-    check("the benchmark run itself succeeded", outcome.status == "TERMINAL_STATUS_SUCCEEDED")
+    print(f"  harness peak RSS (worker in-process): {rss / 2**20:.1f} MiB")
+    check("the benchmark run itself succeeded", outcome.status == "OUTCOME_STATUS_SUCCEEDED")
     check(
         "runner overhead is a fixed cost, not a per-byte one",
         overhead < 1500,

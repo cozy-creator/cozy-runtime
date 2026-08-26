@@ -137,7 +137,7 @@ def unavailable(verb: str) -> Result:
     )
 
 
-#: `serve` flag -> the supervisor flag it translates to. The set is CLOSED and it is the
+#: `serve` flag -> the worker flag it translates to. The set is CLOSED and it is the
 #: whole launch surface a coordinator needs: who this worker is, what release it serves,
 #: which devices it may touch, and how long a cancel gets before it stops being cooperative.
 #: cl-010 measured the cost of the smaller set — the product could not use `serve` at all

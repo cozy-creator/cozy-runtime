@@ -12,7 +12,8 @@ mapping below is proto3 -> JSON value:
   * enums spell as their NUMBER (R2: numbers are normative, names are not),
   * BYTES NAMING LAW: a `bytes` field named `digest`/`*_digest` is a 32-byte SHA-256 spelled
     `sha256:<hex>`; every other `bytes` field is opaque payload spelled base64,
-  * a `format` tag (`<full.Name>/1`) domain-separates two document kinds with equal fields.
+  * a `format` tag (`<full.Name>/<version>`) domain-separates two document kinds with equal
+    fields, AND two versions of one kind — see `DOC_VERSION` below.
 
 The reading half refuses what the writer cannot have produced: non-canonical encoding, an
 unknown key, a wrong `format`. That is what makes a planted service-class field on an
@@ -54,6 +55,22 @@ _INT_TYPES = frozenset(
     }
 )
 _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
+
+#: A digest-fenced document is NOT additively versioned: an unknown key REFUSES, so A NEW KEY
+#: IS A NEW DOCUMENT VERSION. The version rides the `format` tag, where it domain-separates
+#: two versions of one document exactly as the name domain-separates two documents. Read
+#: independently per language (#510g) — this map is the reader on this side of the wire.
+#:
+#: Everything is /1 except `AttemptOutcomeBody`, which is /2: rev-2 adds `execution_started`
+#: on top of the frozen wire's `TerminalBody/1` lineage (#480c/#481). Without this map the
+#: worker would digest an outcome body under `AttemptOutcomeBody/1` — a tag no peer computes
+#: — and every outcome would fail its ack comparison against a RecordOwner that reads /2.
+DOC_VERSION = {"cozy.worker.v1.AttemptOutcomeBody": 2}
+
+
+def doc_format(full_name: str) -> str:
+    """The `format` tag for a document kind: `<full.Name>/<version>`."""
+    return f"{full_name}/{DOC_VERSION.get(full_name, 1)}"
 
 
 class DocumentError(Exception):
@@ -139,8 +156,82 @@ def document(message: Message) -> dict[str, Any]:
     rendered = body(message)
     if "format" in rendered:
         raise DocumentError("unknown_field", "`format` is reserved for the document tag")
-    rendered["format"] = message.DESCRIPTOR.full_name + "/1"
+    rendered["format"] = doc_format(message.DESCRIPTOR.full_name)
     return rendered
+
+
+#: The `format` tag of the schema's own document. It is not a message in `worker.proto` —
+#: it is a document ABOUT `worker.proto` — so it has no descriptor to read the name off.
+WIRE_SCHEMA_FORMAT = "cozy.worker.v1.WireSchema/1"
+
+
+def _normalize_descriptor(fdp: Any) -> None:
+    """Reduce a rebuilt `FileDescriptorProto` to the facts that are WIRE MEANING (#536c).
+
+    A descriptor handed back by a runtime is the schema PLUS whatever that runtime chose to
+    reconstruct, so two things come out before it is digested or the identity depends on WHO
+    rebuilt it — the one thing a fence may never do:
+
+    * `source_code_info` is comments. A fence that fired on every prose edit would be switched
+      off inside a week.
+    * `json_name` is the protobuf-JSON camelCase mapping, DERIVED mechanically from the field
+      name and carrying no wire meaning. Go's `protodesc.ToFileDescriptorProto` populates it on
+      every field and Python's `CopyToProto` leaves it unset — a 10 KB, 200-field disagreement
+      that would have refused every correct cross-language handshake.
+    """
+    fdp.ClearField("source_code_info")
+
+    def strip(messages: Any) -> None:
+        for message in messages:
+            for field in message.field:
+                field.ClearField("json_name")
+            strip(message.nested_type)
+
+    strip(fdp.message_type)
+
+
+def wire_schema_document() -> bytes:
+    """The canonical bytes of THIS file set's own `cozy.worker.v1.WireSchema/1` (#530-A1).
+
+    THE FENCE IS DERIVED, NOT DECLARED. `SCHEMA_DIGEST` in `wire_identity.py` is a constant
+    regen.sh wrote, and a constant can agree while the bytes disagree — which is the whole of
+    what `WIRE_MINOR` got wrong. This recomputes the identity from the descriptor the vendored
+    binding actually carries, so a stale copy cannot spell the digest without BEING the schema
+    it names.
+
+    The document-version map rides in the document because a document's version IS wire
+    meaning (an `AttemptOutcomeBody/2` is not an `AttemptOutcomeBody/1`) and it lives in the
+    writer rather than the descriptor — the one schema fact the descriptor cannot carry.
+    """
+    from google.protobuf import descriptor_pb2
+
+    from cozy.worker.v1 import worker_pb2
+
+    fdp = descriptor_pb2.FileDescriptorProto()
+    worker_pb2.DESCRIPTOR.CopyToProto(fdp)
+    _normalize_descriptor(fdp)
+    rendered = body(fdp)
+    if "format" in rendered or "document_versions" in rendered:
+        raise DocumentError("unknown_field", "reserved keys collided with descriptor fields")
+    rendered["document_versions"] = [
+        {"document": name, "version": version} for name, version in sorted(DOC_VERSION.items())
+    ]
+    rendered["format"] = WIRE_SCHEMA_FORMAT
+    return canonical.write(rendered)
+
+
+def embedded_document_digest(sub: dict[str, Any], full_name: str) -> bytes:
+    """The raw digest of a document NESTED inside another (#510g).
+
+    A nested document travels WITHOUT its own `format` tag — the tag domain-separates
+    top-level documents, and repeating it inside would put one document's identity in two
+    places. Its identity is the tag-bearing canonical bytes, which the receiver reconstructs
+    from the bytes it already holds. Verifying the ENCLOSING document needs no canonicalizer;
+    naming a nested one does.
+    """
+    if "format" in sub:
+        raise DocumentError("unknown_field", "`format` is reserved for the document tag")
+    return digest_of(canonical.write({**sub, "format": doc_format(full_name)}))
 
 
 def canonical_bytes(message: Message) -> bytes:
@@ -171,7 +262,7 @@ def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
         raise DocumentError(exc.code, exc.detail) from exc
     if not isinstance(value, dict):
         raise DocumentError("wrong_type", "a document is a JSON object")
-    want = cls.DESCRIPTOR.full_name + "/1"
+    want = doc_format(cls.DESCRIPTOR.full_name)
     if value.get("format") != want:
         raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
     known = {f.name for f in cls.DESCRIPTOR.fields} | {"format"}

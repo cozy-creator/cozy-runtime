@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cr-012 live verification: typed INPUT ASSETS, end to end on the real attempt path.
 
-Not a test (tracker README #160): every leg runs the real coordinator, the real supervisor
+Not a test (tracker README #160): every leg runs the real coordinator, the real worker
 hydration, the real executor and the real endpoint, and prints numbers.
 
   roundtrip  a real PNG in -> `retouch` -> a real PNG out, digest-verified both ways
@@ -152,7 +152,7 @@ def spawn(label: str, spec: dict[str, Any], mode: str = "exec") -> dict[str, Any
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — coordinator, supervisor, executor."""
+    """ONE request through the WHOLE real path — coordinator, worker, executor."""
     import dataclasses
 
     from cozy_runtime.internal.config import read_config
@@ -171,7 +171,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         }
     )
 
-    def hook(coordinator: Any, supervisor: Any) -> None:
+    def hook(coordinator: Any, worker: Any) -> None:
         """Harness-side fault injection through the documented seam (decisions #249)."""
         if spec.get("kill_after"):
             import threading
@@ -182,7 +182,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
                 deadline = time.monotonic() + float(spec["kill_after"])
                 while time.monotonic() < deadline:
                     time.sleep(0.02)
-                executor = supervisor.supervision.current
+                executor = worker.supervision.current
                 if executor is not None and executor.alive():
                     os.kill(executor.pid, 9)
 
@@ -265,11 +265,11 @@ def roundtrip() -> None:
     print(f"  status={outcome.get('status')} result={json.dumps(result)[:220]}")
     check(
         "the attempt SUCCEEDED with the image the handler wrote",
-        outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED" and bool(outcome.get("outputs")),
+        outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED" and bool(outcome.get("outputs")),
         refusal_of(outcome)[:200] or "no refusal",
     )
     check(
-        "the handler saw the SUPERVISOR's digest, not one it recomputed",
+        "the handler saw the WORKER's digest, not one it recomputed",
         result.get("source_digest") == "sha256:" + hashlib.sha256(source).hexdigest(),
         f"{result.get('source_digest', '')[:26]}… over {len(source)} B",
     )
@@ -344,8 +344,8 @@ def kill() -> None:
     killed = (
         outcome.get("status")
         in (
-            "TERMINAL_STATUS_FAILED",
-            "TERMINAL_STATUS_ABANDONED",
+            "OUTCOME_STATUS_FAILED",
+            "OUTCOME_STATUS_ABANDONED",
         )
         or "executor" in refusal_of(outcome).lower()
     )
@@ -360,14 +360,14 @@ def kill() -> None:
     rows = [r.get("kind") for r in outcome.get("journal") or ()]
     check(
         "the journal carries the whole acceptance/terminal narrative",
-        "accepted" in rows and any(r in rows for r in ("terminal", "closed")),
+        "accepted" in rows and any(r in rows for r in ("outcome", "closed")),
         f"journal events: {rows}",
     )
     spool = Path(outcome["_workspace"]) / "worker" / "spool"
     leftover = [p for p in spool.rglob("inputs/*") if p.is_file()]
     check(
         "a killed attempt's inputs do not outlive its closure",
-        not leftover or outcome.get("status") != "TERMINAL_STATUS_SUCCEEDED",
+        not leftover or outcome.get("status") != "OUTCOME_STATUS_SUCCEEDED",
         f"{len(leftover)} left; a terminal that is never acknowledged keeps them on purpose",
     )
 
@@ -392,7 +392,7 @@ def arms() -> None:
     check(
         "ARM: an input over the deployment cap refuses PRE-ACCEPT",
         "input_over_cap" in refusal_of(outcome)
-        and outcome.get("status") != "TERMINAL_STATUS_SUCCEEDED",
+        and outcome.get("status") != "OUTCOME_STATUS_SUCCEEDED",
         refusal_of(outcome)[:220],
     )
     accepted = [r for r in outcome.get("journal") or () if r.get("event") == "accepted"]
@@ -704,7 +704,7 @@ def debts() -> None:
     check(
         "DEBT 3: `serve` accepts the protocol's launch flags instead of rejecting them",
         "unknown flag" not in (done.stdout + done.stderr),
-        "it reaches the supervisor and fails on the socket, which is the honest failure",
+        "it reaches the worker and fails on the socket, which is the honest failure",
     )
     # DEBT 2 is proven in `roundtrip`, on a real OutputEntry.
     print("  DEBT 2 (media_type on OutputEntry) is checked in `roundtrip`, on a real write")

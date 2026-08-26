@@ -2,7 +2,7 @@
 """cr-008a's live verification: ONE request, through the whole real path, no network.
 
 Not a test suite (#160). Every section starts the actual system — an ephemeral local
-supervisor in a REAL process, with an in-memory coordinator instead of a gRPC one, and a
+worker in a REAL process, with an in-memory coordinator instead of a gRPC one, and a
 disposable CUDA executor child serving cr-005's real SDXL UNet — and prints what it observed.
 
     nice -n 19 corpus/.venv/bin/python scripts/slice-live.py slice
@@ -206,7 +206,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         no_warm=bool(spec.get("no_warm", True)),
     )
 
-    def arm(coordinator: LocalCoordinator, supervisor: Any) -> None:
+    def arm(coordinator: LocalCoordinator, worker: Any) -> None:
         # SIGINT on a local run CANCELS the attempt — the same CancelAttempt a hub sends,
         # on the same lane. This is the local spelling of Ctrl-C, and it is why the
         # cancellation arms need no hook inside the runtime. SIGTERM is deliberately NOT
@@ -223,10 +223,10 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
             while not coordinator.done.is_set():
                 if coordinator.accepted is not None and not marker.exists():
                     marker.write_text("accepted\n")
-                if supervisor.supervision.current is not None:
+                if worker.supervision.current is not None:
                     executor = workspace / "executor.pid"
                     if not executor.exists():
-                        executor.write_text(f"{supervisor.supervision.current.pid}\n")
+                        executor.write_text(f"{worker.supervision.current.pid}\n")
                 time.sleep(0.005)
 
         threading.Thread(target=watch, daemon=True, name="marks").start()
@@ -411,7 +411,7 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
     )
     check(
         "the terminal SUCCEEDED",
-        outcome["status"] == "TERMINAL_STATUS_SUCCEEDED",
+        outcome["status"] == "OUTCOME_STATUS_SUCCEEDED",
         f"{outcome['status']} — {str(outcome['terminal'].get('safe_message', ''))[:80]}",
     )
     accepted = outcome["accepted"]
@@ -480,12 +480,12 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
     kinds = [row["kind"] for row in rows]
     check(
         "every durable step is journaled, once, in order",
-        kinds == ["session", "accepted", "ledger", "triage", "terminal", "closed"],
+        kinds == ["session", "accepted", "ledger", "triage", "outcome", "closed"],
         " -> ".join(kinds),
     )
     check(
         "the ledger closes and the triage bundle is DURABLE before the terminal names it",
-        kinds.index("ledger") < kinds.index("triage") < kinds.index("terminal"),
+        kinds.index("ledger") < kinds.index("triage") < kinds.index("outcome"),
         "a terminal referencing a bundle nobody wrote is the fabrication class this "
         "runtime exists to prevent",
     )
@@ -542,7 +542,7 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
     for line in outcome["triage_explained"]:
         print(f"    {line}")
 
-    head("no CUDA in the run process — the supervisor half of a local run")
+    head("no CUDA in the run process — the worker half of a local run")
     log = (workspace / "run.log").read_text(errors="replace")
     check(
         "the run process spawned a disposable executor child",
@@ -808,7 +808,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
         process = start(spec_path, out_path, workspace)
         # The payload fetch is INSIDE the atomic acceptance boundary. A FIFO holds it there
-        # deterministically: the supervisor blocks reading the granted input, and the
+        # deterministically: the worker blocks reading the granted input, and the
         # executor it would have accepted against is killed while it waits.
         if not wait_for(workspace / "executor.pid", 900, process):
             return read_outcome(out_path), workspace
@@ -817,7 +817,7 @@ def section_arms(args: argparse.Namespace) -> None:
 
         def feed() -> None:
             with open(fifo, "wb") as handle:
-                time.sleep(1.0)  # the supervisor is now blocked in the fetch
+                time.sleep(1.0)  # the worker is now blocked in the fetch
                 os.kill(pid, signal.SIGKILL)
                 time.sleep(0.5)
                 handle.write(json.dumps(BANKED_PAYLOAD).encode())
@@ -829,14 +829,14 @@ def section_arms(args: argparse.Namespace) -> None:
     outcome, workspace = drive("fetch", fetch_arm)
     check(
         "the attempt refused rather than accepting against a dead executor",
-        outcome.get("status") in ("TERMINAL_STATUS_REFUSED", "TERMINAL_STATUS_ABANDONED"),
+        outcome.get("status") in ("OUTCOME_STATUS_REFUSED", "OUTCOME_STATUS_ABANDONED"),
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
     rows = journal_rows(workspace)
     check(
         "exactly ONE durable terminal",
-        len([r for r in rows if r["kind"] == "terminal"]) == 1,
+        len([r for r in rows if r["kind"] == "outcome"]) == 1,
         f"journal kinds {[r['kind'] for r in rows]}",
     )
     check(
@@ -895,7 +895,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "no terminal was FABRICATED for an attempt that was never accepted",
-        not journal_rows(workspace, "terminal"),
+        not journal_rows(workspace, "outcome"),
         "a worker that owes nothing claims nothing",
     )
     check(
@@ -943,13 +943,13 @@ def section_arms(args: argparse.Namespace) -> None:
     outcome, workspace = drive("cancel", cancel_arm)
     check(
         "a cooperative handler converges to CANCELED",
-        outcome.get("status") == "TERMINAL_STATUS_CANCELED",
+        outcome.get("status") == "OUTCOME_STATUS_CANCELED",
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
     check(
         "exactly ONE durable terminal, journaled before it was sent",
-        len(journal_rows(workspace, "terminal")) == 1,
+        len(journal_rows(workspace, "outcome")) == 1,
         f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
     )
     check(
@@ -991,7 +991,7 @@ def section_arms(args: argparse.Namespace) -> None:
     log = (workspace / "run.log").read_text(errors="replace")
     check(
         "a handler that never checks cancellation is KILLED, not waited for",
-        "forceful" in log and outcome.get("status") == "TERMINAL_STATUS_CANCELED",
+        "forceful" in log and outcome.get("status") == "OUTCOME_STATUS_CANCELED",
         next((ln for ln in log.splitlines() if "forceful:" in ln), "")[:150],
     )
     check(
@@ -1001,7 +1001,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "still exactly ONE durable terminal",
-        len(journal_rows(workspace, "terminal")) == 1,
+        len(journal_rows(workspace, "outcome")) == 1,
         f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
     )
 
@@ -1022,7 +1022,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "a tail that cannot satisfy the grant set fails the attempt",
-        outcome.get("status") == "TERMINAL_STATUS_FAILED"
+        outcome.get("status") == "OUTCOME_STATUS_FAILED"
         and "destination_absent" in str(outcome.get("terminal", {}).get("safe_message", "")),
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:150]}",
@@ -1034,7 +1034,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "one durable terminal, and the ledger still closed",
-        len(journal_rows(workspace, "terminal")) == 1
+        len(journal_rows(workspace, "outcome")) == 1
         and outcome.get("reconciliation", {}).get("closed") is True,
         f"kinds {[r['kind'] for r in journal_rows(workspace)]}",
     )
@@ -1077,7 +1077,7 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "the accepted-but-incomplete attempt is on record with no terminal",
-        bool(journal_rows(workspace, "accepted")) and not journal_rows(workspace, "terminal"),
+        bool(journal_rows(workspace, "accepted")) and not journal_rows(workspace, "outcome"),
         "acceptance is journaled before anything can run, which is what makes recovery "
         "possible without guessing",
     )
@@ -1107,7 +1107,7 @@ def section_arms(args: argparse.Namespace) -> None:
     recovered.wait(timeout=900)
     rows = journal_rows(workspace)
     killed_terminals = [
-        r for r in rows if r["kind"] == "terminal" and r["body"]["request_id"] == "run-killed"
+        r for r in rows if r["kind"] == "outcome" and r["body"]["request_id"] == "run-killed"
     ]
     check(
         "recovery minted exactly one durable terminal for the interrupted attempt",
@@ -1216,7 +1216,7 @@ def section_clone(args: argparse.Namespace) -> None:
     outcome = read_outcome(workspace / "outcome.json")
     check(
         "the clone served one real request end to end",
-        run.returncode == 0 and outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+        run.returncode == 0 and outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED",
         f"exit {run.returncode}, {outcome.get('status')}; "
         f"{run.stdout.strip().splitlines()[-1][:110] if run.stdout.strip() else run.stderr[:110]}",
     )
@@ -1255,7 +1255,7 @@ def section_bench(args: argparse.Namespace) -> None:
         )
         if not check(
             f"run {index} produced a terminal",
-            outcome.get("status") == "TERMINAL_STATUS_SUCCEEDED",
+            outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED",
             f"ended={outcome.get('ended')!r} status={outcome.get('status')!r} "
             f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:120]}",
         ):
@@ -1269,7 +1269,7 @@ def section_bench(args: argparse.Namespace) -> None:
                 "finalization_ms": metrics.get("finalization_ms", 0),
                 "activations_mib": round(ledger.get("activations_scratch", 0) / MIB, 1),
                 "weights_gib": round(ledger.get("active_weights", 0) / GIB, 3),
-                "rss_run_mib": round(ledger.get("rss_supervisor", 0) / MIB, 1),
+                "rss_run_mib": round(ledger.get("rss_worker", 0) / MIB, 1),
                 "rss_executor_mib": round(ledger.get("rss_executor", 0) / MIB, 1),
                 "digest_ok": (outcome.get("result") or {}).get("digest") == BANKED,
             }
@@ -1457,7 +1457,7 @@ def section_triage(args: argparse.Namespace) -> None:
     outcome, workspace = drive("triage-kill", kill_arm)
     check(
         "the attempt reached a terminal despite the executor dying",
-        outcome.get("status") in ("TERMINAL_STATUS_ABANDONED", "TERMINAL_STATUS_CANCELED"),
+        outcome.get("status") in ("OUTCOME_STATUS_ABANDONED", "OUTCOME_STATUS_CANCELED"),
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
@@ -1514,7 +1514,7 @@ def section_triage(args: argparse.Namespace) -> None:
         "a ring that only crossed in the reply would have crossed never",
     )
     check(
-        "the SUPERVISOR's own rows are there too — dispatch, and the death it witnessed",
+        "the WORKER's own rows are there too — dispatch, and the death it witnessed",
         any("dispatched" in row["name"] for row in bundle["events"])
         and any(row["kind"] == "fault" for row in bundle["events"]),
         f"{len(bundle['events'])} rows kept, caps {json.dumps(bundle['caps'])}",
@@ -1594,7 +1594,7 @@ def section_wedge(args: argparse.Namespace) -> None:
 
 
 def section_witness(args: argparse.Namespace) -> None:
-    """cr-011: OOM-kill the SUPERVISOR and name the death from the surviving record."""
+    """cr-011: OOM-kill the WORKER and name the death from the surviving record."""
     head("the postmortem witness — a parent that outlives the journal owner")
     from cozy_runtime.internal import witness as wit
 
@@ -1611,7 +1611,7 @@ def section_witness(args: argparse.Namespace) -> None:
 
     # A REAL kernel OOM kill, in a REAL memory cgroup, without root: the systemd user
     # manager delegates a cgroup subtree, so a scope with MemoryMax set is the actual
-    # mechanism a pod uses. The victim is a stand-in for the supervisor and the witness
+    # mechanism a pod uses. The victim is a stand-in for the worker and the witness
     # cannot tell the difference — it reads a wait status and a kernel counter.
     victim = workspace / "victim.py"
     victim.write_text(

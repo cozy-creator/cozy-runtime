@@ -1,4 +1,4 @@
-"""The supervisor's observation surface: boot steps, confessions, and SILENCE-BOUNDED liveness.
+"""The worker's observation surface: boot steps, confessions, and SILENCE-BOUNDED liveness.
 
 Three things live here because they are one idea — what the worker knows about itself, kept
 bounded and kept honest.
@@ -79,7 +79,7 @@ class SilenceMonitor:
         self.ring = ring
         self.give_up_after = give_up_after
         self.cursors: dict[str, Cursor] = {}
-        #: CPU nanoseconds the device process has burned, read by the SUPERVISOR. A subject
+        #: CPU nanoseconds the device process has burned, read by the WORKER. A subject
         #: that emits nothing while its process burns CPU is BUSY, not wedged: a 20-minute
         #: hash-bound conversion leg has nothing to say and is working the whole time, and
         #: calling it wedged every tick is a flood that describes nothing (job-001).

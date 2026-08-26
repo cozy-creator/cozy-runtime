@@ -172,7 +172,7 @@ class Assembly:
 
 class BundleStore:
     """Bundle bytes on disk plus a journaled write receipt. Survives the executor's death,
-    and — because the receipt is in the control journal — the supervisor's own."""
+    and — because the receipt is in the control journal — the worker's own."""
 
     def __init__(self, root: Path, journal: Journal) -> None:
         self.root = root
@@ -274,11 +274,11 @@ def explain(document: dict[str, Any]) -> list[str]:
         f"attempt   {attempt.get('request_id')}#{attempt.get('attempt')} "
         f"({document.get('subject_id')})",
         f"spec      {str(attempt.get('exec_spec_digest', ''))[:30]}",
-        f"terminal  {terminal.get('status')} / {terminal.get('cause_code')} "
+        f"outcome   {terminal.get('status')} / {terminal.get('cause_code')} "
         f"from {terminal.get('cause_origin')}",
         f"because   {terminal.get('safe_message', '')[:300]}",
         f"executor  incarnation {attempt.get('executor_incarnation')} "
-        f"readiness epoch {attempt.get('readiness_epoch')}",
+        f"admission generation {attempt.get('admission_generation')}",
     ]
     for fault in document.get("faults", ()):
         lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")

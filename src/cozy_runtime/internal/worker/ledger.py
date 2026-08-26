@@ -8,14 +8,14 @@ cr-008b's, and inventing them here would be rows with no producer.
 
 Three things make it a ledger rather than a counter bag:
 
-**Every counter names its method and its kind.** `arithmetic` is the supervisor's own
+**Every counter names its method and its kind.** `arithmetic` is the worker's own
 bookkeeping — a number it computed, not one it observed. `measured` came from a device or
 kernel interface, named exactly. `unreadable` is the honest third state: a class this
 worker could not read right now, kept as a NAMED absence instead of a zero (§3.6's
 present/absent/unreadable rule — a killed executor's device numbers are unreadable, not 0).
 
 **Host grants are atomic over classes.** Host RAM and pinned memory are shared by every
-executor on the worker, so the torch-free supervisor grants each attempt's host needs whole,
+executor on the worker, so the torch-free worker grants each attempt's host needs whole,
 before anything moves. No incremental cross-executor acquisition exists, so no hold-and-wait
 cycle can form, and `allocated` and `registered` stay two numbers (the v1 hostslab lesson).
 
@@ -25,8 +25,8 @@ is. A leak is a typed fact on the terminal path, on success and on failure alike
 finding that an interrupted fill released 0 bytes until rollback freed storages explicitly is
 exactly the class of defect this catches, and it caught it only because someone measured.
 
-RSS is measured by the SUPERVISOR, out of `/proc/<pid>/status`, for both processes. That is
-deliberate: the executor's own report of its footprint is a claim the supervisor cannot
+RSS is measured by the WORKER, out of `/proc/<pid>/status`, for both processes. That is
+deliberate: the executor's own report of its footprint is a claim the worker cannot
 check, and here it does not have to — the parent can read the child's kernel-owned number.
 """
 
@@ -51,7 +51,7 @@ CLASSES = (
     "device_out_of_allocator",
     "device_allocatable",
     "device_free",
-    "rss_supervisor",
+    "rss_worker",
     "rss_executor",
 )
 
@@ -60,7 +60,7 @@ CLASSES = (
 METHODS: dict[str, tuple[str, str]] = {
     "host_ram": (
         "arithmetic",
-        "supervisor grant arithmetic over accepted attempt envelopes; no host allocation "
+        "worker grant arithmetic over accepted attempt envelopes; no host allocation "
         "is observed, so this is bookkeeping and says so",
     ),
     "pinned_allocated": (
@@ -94,13 +94,13 @@ METHODS: dict[str, tuple[str, str]] = {
         "torch.cuda.mem_get_info() - the driver's own free/total, which is the only "
         "number that sees other processes",
     ),
-    "rss_supervisor": (
+    "rss_worker": (
         "measured",
-        "/proc/<pid>/status VmRSS read BY THE SUPERVISOR for itself",
+        "/proc/<pid>/status VmRSS read BY THE WORKER for itself",
     ),
     "rss_executor": (
         "measured",
-        "/proc/<pid>/status VmRSS read BY THE SUPERVISOR for its child - a parent reading "
+        "/proc/<pid>/status VmRSS read BY THE WORKER for its child - a parent reading "
         "the kernel's number, never the child's claim about itself",
     ),
     "host_available": (
@@ -180,7 +180,7 @@ class Counter:
 
 @dataclass(slots=True)
 class Ledger:
-    """The worker's one ledger. Supervisor-owned, torch-free, atomic over host classes."""
+    """The worker's one ledger. Worker-owned, torch-free, atomic over host classes."""
 
     host_budget: int
     pinned_budget: int
@@ -217,7 +217,7 @@ class Ledger:
     #: close is the first on this generation, which is the only one allowed to shift it.
     closed_since_baseline: int = 0
     executor_pid: int = 0
-    supervisor_pid: int = 0
+    worker_pid: int = 0
     #: classes this worker could not read, by name. Never silently zero.
     unreadable: list[str] = field(default_factory=list)
     #: per-component RESIDENT device bytes, by component name. The staging plane's own
@@ -503,7 +503,7 @@ class Ledger:
             "device_out_of_allocator": (self.out_of_allocator, -1, -1),
             "device_allocatable": (self.allocatable, self.device_total, -1),
             "device_free": (self.device_free, self.device_total, -1),
-            "rss_supervisor": (read_vmrss(self.supervisor_pid), -1, -1),
+            "rss_worker": (read_vmrss(self.worker_pid), -1, -1),
             "rss_executor": (read_vmrss(self.executor_pid) if self.executor_pid else -1, -1, -1),
         }
         out = []
@@ -532,7 +532,7 @@ class Ledger:
         }
 
     def rows(self) -> dict[str, Any]:
-        """The compact projection the supervisor summary and the journal carry."""
+        """The compact projection the worker summary and the journal carry."""
         return {
             "host_ram": {
                 "charged": self.host_charged,

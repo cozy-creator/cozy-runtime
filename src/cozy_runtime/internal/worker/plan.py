@@ -10,7 +10,7 @@ acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
   protocol change, no new state, no forward dependency. A probe or a benchmark observed
   inside `choose` is a defect by construction: this function takes no I/O of any kind.
 * **ExecutorPreparer** — applies the chosen plan and DECIDES NOTHING. It is the reason
-  "accepted" never includes seconds of unjournaled preparation: the supervisor prepares
+  "accepted" never includes seconds of unjournaled preparation: the worker prepares
   first, journals second.
 
 The AttemptPlan is a canonical DOCUMENT (tfs-013's writer) so `plan_digest` on
@@ -43,7 +43,7 @@ class PlanRefusal(Exception):
 
 @dataclass(frozen=True, slots=True)
 class PreparedRequest:
-    """ONE request, resolved ONCE by the executor's kernel, as the supervisor holds it.
+    """ONE request, resolved ONCE by the executor's kernel, as the worker holds it.
 
     The resolved payload is an author-typed object and cannot cross a process boundary, so
     it stays in the executor under `request_id` and this carries only what a plan can be
@@ -107,7 +107,7 @@ class AttemptPlan:
     decision_explanation: str
     """WHY this plan, in numbers, for a person reading a terminal. It rides the wire as
     `AttemptPlanSummary.quantified_choice`, which is th-024's name for the field."""
-    constructed_generation_digest: str = ""
+    constructed_model_digest: str = ""
     """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them and the
     configuration the fill ran under. The logical digest cannot answer "which bytes are
     resident", so two generations over different artifacts were indistinguishable without
@@ -142,7 +142,7 @@ class AttemptPlan:
             "headroom_bytes": self.headroom_bytes,
             "entrypoint_binding_plan_id": self.entrypoint_binding_plan_id,
             "model_construction_digest": self.model_construction_digest,
-            "constructed_generation_digest": self.constructed_generation_digest,
+            "constructed_model_digest": self.constructed_model_digest,
             "request_features_digest": self.request_features_digest,
             "preflight_facts_digest": self.preflight_facts_digest,
             "overlay_digest": self.overlay_digest,
@@ -226,7 +226,7 @@ class JobBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedGeneration:
+class PreparedModel:
     """What ONE `prepare` RESOLVED. Output only: a deployment never writes any of it.
 
     It lived on the binding record beside the deployment's own declarations, so one type
@@ -237,7 +237,7 @@ class PreparedGeneration:
 
     logical_model_digest: str = ""
     """The LOGICAL model the fill constructed — identical across every delivery variant."""
-    constructed_generation_digest: str = ""
+    constructed_model_digest: str = ""
     """WHAT WAS BUILT: selected bytes, route, materialization, topology, configuration."""
     delivery_rung: str = ""
     """Which `DELIVERY_RUNGS` entry the executor's `DeliveryChooser` took. Empty means
@@ -733,7 +733,7 @@ class PlanChooser:
     def choose(
         self,
         declared: DeclaredBinding,
-        generation: PreparedGeneration,
+        prepared_model: PreparedModel,
         prepared: PreparedRequest,
     ) -> AttemptPlan:
         self.choices += 1
@@ -904,7 +904,7 @@ class PlanChooser:
             chosen, confession = self._deepen(declared, activations, allocatable, walk)
         else:
             confession = ""
-        rung = self._delivery(generation, chosen, walk)
+        rung = self._delivery(prepared_model, chosen, walk)
         return AttemptPlan(
             delivery=rung.delivery,
             materialization=rung.materialization,
@@ -925,16 +925,16 @@ class PlanChooser:
             reserved_pinned_bytes=declared.pinned_bytes,
             headroom_bytes=activations.value,
             entrypoint_binding_plan_id=declared.entrypoint_binding_plan_id,
-            model_construction_digest=generation.logical_model_digest,
-            constructed_generation_digest=generation.constructed_generation_digest,
+            model_construction_digest=prepared_model.logical_model_digest,
+            constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,
             preflight_facts_digest=prepared.facts_digest,
             overlay_digest=prepared.overlay_digest,
             shape_cell=prepared.cell(),
-            delivery_variant=generation.delivery_variant,
+            delivery_variant=prepared_model.delivery_variant,
             decision_explanation=(
                 f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
-                f"{generation.delivery_variant or declared.variant or 'default'!r} "
+                f"{prepared_model.delivery_variant or declared.variant or 'default'!r} "
                 f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
                 f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
                 f"{weights} B of which {absent_bytes} B is not resident, with "
@@ -944,9 +944,7 @@ class PlanChooser:
             ),
         )
 
-    def _delivery(
-        self, generation: PreparedGeneration, placement: str, walk: dict[str, Any]
-    ) -> Any:
+    def _delivery(self, prepared_model: PreparedModel, placement: str, walk: dict[str, Any]) -> Any:
         """THE CROSS (cr-008c): the resolved delivery rung, crossed with the placement one.
 
         Delivery was chosen ONCE, at prepare, against measured envelopes — this function
@@ -964,7 +962,7 @@ class PlanChooser:
         rather than restated, so a delivery switch arriving as a placement side effect is a
         refusal instead of a silent reinterpretation of the request.
         """
-        name = generation.delivery_rung or "verbatim"
+        name = prepared_model.delivery_rung or "verbatim"
         rung = RUNGS_BY_NAME.get(name)
         if rung is None:
             raise PlanRefusal(
@@ -994,7 +992,7 @@ class PlanChooser:
                 },
             )
         walk["delivery"] = {
-            "variant": generation.delivery_variant,
+            "variant": prepared_model.delivery_variant,
             "rung": crossed.name,
             "delivery": crossed.delivery,
             "materialization": crossed.materialization,

@@ -28,3 +28,39 @@ jobs:
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python scripts/conformance.py
       - run: uv run cozy-runtime version
+
+  # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
+  # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another
+  # repo's generated output, and a copy is only a copy while somebody compares the bytes.
+  #
+  # `wire_schema_digest` closes the same hole at the HANDSHAKE — a stale peer refuses
+  # instead of misparsing — but a handshake refusal is found at run time, by an operator,
+  # on a live stream. This finds it at BUILD time.
+  #
+  # The checker is worker-protocol's own `scripts/vendored-diff.sh`, invoked rather than
+  # reimplemented: a drift checker with its own drifting generator would be its own
+  # punchline. It regenerates from the .proto with the pinned toolchain (grpcio-tools, and
+  # protoc-gen-go for the Go half) and byte-compares against what is vendored here.
+  #
+  # PINNED, not floating: `WORKER_PROTOCOL_SHA` is the protocol commit these bytes were
+  # generated from. Bumping it and re-copying `gen/python/cozy` over `src/cozy` is one
+  # change, and this job is what refuses the half of it that was forgotten.
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      WORKER_PROTOCOL_SHA: df05c8d6f03603a9e6b5e735522507aa4e3b4638
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/worker-protocol-v2
+          ref: ${{ env.WORKER_PROTOCOL_SHA }}
+          path: .worker-protocol
+          # A read token for the sibling private repo. `github.token` is scoped to THIS
+          # repository and cannot reach it.
+          token: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: .worker-protocol/scripts/vendored-diff.sh src

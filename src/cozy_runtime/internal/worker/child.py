@@ -1,16 +1,17 @@
-"""The disposable device executor, from the supervisor's side.
+"""The disposable device executor, from the worker's side.
 
-Two coupled ordinals over one execution context, kept as TWO counters on purpose
-(worker-protocol/02 §0):
+ONE ordinal over one execution context: `executor_incarnation`, the TRANSPORT fence, which
+bumps on child respawn and rides `PlacementStatus.executor_generation`.
 
-* `executor_incarnation` — the TRANSPORT fence. Bumps on child respawn.
-* `readiness_epoch` — the READINESS fence. Bumps on every state invalidation, which
-  includes every incarnation bump AND the in-place case where the process survives but its
-  state did not (an orphan sweep + reload). That in-place case is exactly why one merged
-  counter is not enough: it would force a full respawn — a 5-second refill — for every
-  orphan sweep.
+`readiness_epoch` is GONE — DELETED, not renamed (#482/#486b). It was a second counter for
+in-place state invalidation (an orphan sweep + reload leaves the process alive and its state
+worthless), and rev-2 answers that with the two facts that were actually wanted: the
+placement's SERVING axis says what it can serve, and the worker-level `admission_generation`
+says whether an offer is admissible. One fence, not two to keep consistent. `invalidate()`
+still exists and still withdraws dispatchability; what it no longer does is mint an ordinal
+nobody could reconcile against the other one.
 
-Cancellation is cooperative then forceful and the SUPERVISOR owns both clocks: the grace
+Cancellation is cooperative then forceful and the WORKER owns both clocks: the grace
 budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
 `CancelAttempt.grace_ms`, and never an author knob. The forceful path kills the executor's
 whole process GROUP, so a grandchild cannot outlive the terminal that closed its attempt.
@@ -39,7 +40,7 @@ from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 #: CancelAttempt is the operator override door, and no author surface reaches it.
 GRACE_SECONDS = 3.0
 
-#: How often the supervisor LOOKS while a spawned executor is dialling back. A sampling
+#: How often the worker LOOKS while a spawned executor is dialling back. A sampling
 #: cadence, not a bound: `spawn` waits while the child is alive and burning CPU, and this
 #: only says how finely it can tell. Short because the answer is normally milliseconds away.
 DIAL_SAMPLE_SECONDS = 0.5
@@ -78,7 +79,7 @@ def socket_path_refusal(path: str) -> str:
     if encoded <= SUN_PATH_MAX:
         return ""
     return (
-        f"executor_socket_unbindable: the supervisor/executor control socket would be "
+        f"executor_socket_unbindable: the worker/executor control socket would be "
         f"{path!r}, which is {encoded} B including its terminator and the kernel's "
         f"`sockaddr_un.sun_path` holds {SUN_PATH_MAX} B. Nothing can bind it, so no executor "
         f"can ever dial back. Point COZY_HOME (or `serve --out`) at a shorter directory: "
@@ -229,7 +230,6 @@ class ExecutorSupervision:
         # Both ordinals START at 1 (02 §0): a worker that has not spawned yet is already
         # at incarnation 1, so its Register carries a valid fence rather than a zero.
         self.incarnation = 1
-        self.readiness_epoch = 1
         self.current: Executor | None = None
         self.needs_rebuild = False
         """Set by every invalidation. It exists because `alive()` is a RACE against a
@@ -243,7 +243,7 @@ class ExecutorSupervision:
         """Called AFTER every invalidation, once this object's own state already says the
         executor cannot serve. The session installs the half it owns — dropping the
         advertised intake state — because readiness is a SESSION fact and the process
-        supervisor has no business publishing one. See `invalidate`."""
+        worker has no business publishing one. See `invalidate`."""
         self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]]] = queue.Queue()
         self._launcher: threading.Thread | None = None
         self._launcher_lock = threading.Lock()
@@ -307,7 +307,6 @@ class ExecutorSupervision:
             # A RESPAWN bumps the transport fence, and with it the readiness fence: a fresh
             # executor has no state, so no incarnation bump can leave readiness unmoved.
             self.incarnation += 1
-            self.readiness_epoch += 1
         self.spawns += 1
         imposed = {
             **imposed,
@@ -386,23 +385,21 @@ class ExecutorSupervision:
                     "not slow"
                 )
 
-    def invalidate(self, why: str) -> int:
+    def invalidate(self, why: str) -> None:
         """In-place readiness invalidation: the PROCESS may survive, its state did not.
 
         THE ADVERTISEMENT GOES WITH IT (cr-007, cl-003). A device process that cannot serve
         must stop SAYING it can at the moment it stops, which is here: the ready-plan set
-        empties and `on_invalidate` drops the intake state before this call returns.
+        empties and `on_invalidate` withdraws dispatchability before this call returns.
         Advertising READY until the rebuild started spent a coordinator's whole requeue
         budget on a worker that was about to be healthy.
         """
-        self.readiness_epoch += 1
         self.needs_rebuild = True
         if self.current is not None:
             self.current.ready_plans.clear()
             self.current.poisoned = self.current.poisoned or why
         if self.on_invalidate is not None:
             self.on_invalidate(why)
-        return self.readiness_epoch
 
     def replace(self, *, imposed: dict[str, str]) -> Executor:
         """Kill the current incarnation (group and all) and spawn a fresh one."""
@@ -416,7 +413,7 @@ class ExecutorSupervision:
     # ------------------------------------------------------------------ orphans
 
     def sweep_orphans(self, *, exclude: int = 0) -> list[int]:
-        """Fence or kill leftover executors from before a supervisor restart (§6.2 step 1).
+        """Fence or kill leftover executors from before a worker restart (§6.2 step 1).
 
         Identity is the executor's own argv — it names this worker's socket path — so the
         sweep can never touch another worker's executor or an unrelated process.

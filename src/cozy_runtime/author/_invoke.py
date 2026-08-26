@@ -4,7 +4,7 @@
     invoke    hydrate -> inject -> call -> validate -> finalize
 
 The split is the seam a PLAN is chosen across. A serving attempt prepares BEFORE the
-supervisor admits it, so the normalized features and the preflight digests the planner
+worker admits it, so the normalized features and the preflight digests the planner
 prices against are the exact ones the handler then runs on; a job prepares inside its own
 accepted attempt, because a job has no ladder to price (cr-009). Both call these two
 functions, in this order, and neither resolves a request twice.
@@ -12,7 +12,7 @@ functions, in this order, and neither resolves a request twice.
 Every door runs this. `run`, `job` and a socket-served attempt are user experiences over
 these functions, never second execution implementations (§8) — and the per-service fakes are
 capability adapters over THIS kernel, never a parallel behavioral runtime (§1.6). Where the
-supervisor/executor process boundary, the journal and the device leases go is cr-008a's;
+worker/executor process boundary, the journal and the device leases go is cr-008a's;
 what a call MEANS is here.
 
 Package placement is deliberate: the kernel is pure surface semantics (no device, config,
@@ -97,7 +97,7 @@ class Invocation:
     author surface for a job to reach around it (§2, jobs.md §1).
     """
     assets: Mapping[str, GrantedInput] = field(default_factory=dict)
-    """input_id -> the verified, spooled input asset (cr-012). The supervisor fetched it
+    """input_id -> the verified, spooled input asset (cr-012). The worker fetched it
     under the grant, held it to its declared length through the one bounded reader, checked
     its content digest and sniffed its bytes, all BEFORE acceptance. An `Asset` field whose
     input_id is absent here never hydrates and refuses typed — same law as `trees`, one
@@ -163,7 +163,7 @@ class PreparedRequest:
     facts_digest: str | None
 
     def digests(self) -> dict[str, str]:
-        """What a supervisor can hold, journal and price against — never the payload."""
+        """What a worker can hold, journal and price against — never the payload."""
         return {
             "overlay_digest": self.overlay.digest,
             "features_digest": self.features.digest,
@@ -240,7 +240,7 @@ def run_prepared(
     """The invocation BOUNDARY: one PREPARED attempt in, one neutral terminal out, always.
 
     `invoke` raises typed refusals because author-facing code should; the boundary the
-    supervisor speaks across cannot, because the terminal must still ship when the body
+    worker speaks across cannot, because the terminal must still ship when the body
     fails (§2). What crosses is FACTS — terminal, origin, code — and never a retry command:
     RETRYABLE and FATAL are coordinator projections over these, never observations here.
     """
@@ -258,7 +258,7 @@ def attempt(
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
     """PREPARE then RUN, for the doors that do both at once — a job, and the warm pass.
 
-    A serving attempt prepares BEFORE the supervisor admits it, which is the whole point of
+    A serving attempt prepares BEFORE the worker admits it, which is the whole point of
     the split; a job is accept-then-prepare by design (cr-009) and has nothing to price a
     ladder against. Both call the same two functions, in the same order.
     """
@@ -450,7 +450,7 @@ def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, 
     """The typed gate every input passes before the entrypoint exists to it.
 
     MEDIA-TYPE HONESTY is the first check and it is about the BYTES: `granted.media_type`
-    is what the supervisor sniffed, not what the caller declared, so a `.png` that is a
+    is what the worker sniffed, not what the caller declared, so a `.png` that is a
     zip refuses here rather than inside a decoder the endpoint did not agree to run.
     """
     kind = type(asset).kind
@@ -486,7 +486,7 @@ def _hydrate(payload: object, inv: Invocation) -> None:
     typed refusal here rather than a `FileNotFoundError` deep in the body. What changed at
     cr-012 is where the bytes come from — this used to read the ref as a LOCAL PATH and
     copy it, which made every asset ref a filesystem read of the caller's choosing. Now
-    the supervisor fetches, verifies and spools before acceptance, and the only thing this
+    the worker fetches, verifies and spools before acceptance, and the only thing this
     side does is match an identified input against the FIELD it fills, which is the half
     only this side knows.
     """

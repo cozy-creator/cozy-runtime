@@ -57,7 +57,7 @@ class Asset:
 
     @property
     def hydrated(self) -> bool:
-        """True once the supervisor materialized the bytes into the attempt spool."""
+        """True once the worker materialized the bytes into the attempt spool."""
         return self._local is not None
 
     def read_bytes(self) -> bytes:
@@ -178,7 +178,7 @@ def digest_bytes(data: bytes) -> str:
 
 @dataclass(frozen=True, slots=True)
 class GrantedInput:
-    """ONE input the supervisor already fetched, verified and spooled (cr-012).
+    """ONE input the worker already fetched, verified and spooled (cr-012).
 
     Everything on it was established BEFORE acceptance: the bytes were read under the
     grant through the one bounded reader, checked against the grant's declared length and

@@ -30,7 +30,7 @@ from cozy_runtime.internal import canonical
 from cozy_runtime.internal.child_env import project_child_env
 
 #: The executor raises its own OOM score so the kernel picks the disposable process. The
-#: supervisor never touches its own (it stays a bare interpreter for victim ordering, §3.1).
+#: worker never touches its own (it stays a bare interpreter for victim ordering, §3.1).
 EXECUTOR_OOM_SCORE_ADJ = 500
 
 
@@ -97,5 +97,5 @@ def spawn_executor(
         setsigdef=[],
         setsigmask=[],
     )
-    del cwd  # the executor's cwd is the supervisor's; the spool is passed as a path
+    del cwd  # the executor's cwd is the worker's; the spool is passed as a path
     return Spawned(pid, env, seal_digest(env), tuple(argv))

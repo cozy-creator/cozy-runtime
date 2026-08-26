@@ -7,8 +7,8 @@ exposes off-loopback — with a self-signed cert the owner PINS (trusting exactl
 the fingerprint pin) and the bearer token checked at Claim, constant-time. Sections:
 
     1. red arm: a wrong token is refused CLAIM_REJECTION_UNAUTHENTICATED, typed
-    2. the real leg: right token over TLS -> Claim -> snapshot -> directive -> READY ->
-       one invoke to a SUCCEEDED terminal
+    2. the real leg: right token over TLS -> Claim -> snapshot -> desired state ->
+       DISPATCHABLE -> one invoke to a SUCCEEDED terminal
     3. red arm: a non-loopback plaintext listener REFUSES to bind at all
     4. red arm: a non-loopback TLS listener with no bootstrap credential refuses to bind
     5. the DECLARED GRANT ROOTS: a worker launched with `--grant-root` serves a grant
@@ -185,7 +185,7 @@ def main() -> int:
         )
         bad.close()
 
-        wl.head("2. the real leg: TLS + the right token -> READY -> invoke -> SUCCEEDED")
+        wl.head("2. the real leg: TLS + the right token -> DISPATCHABLE -> invoke -> SUCCEEDED")
         hub = wl.Hub()
         hub.process, hub.log = process, log
         hub.directive = wl.serving_directive(
@@ -195,9 +195,9 @@ def main() -> int:
         hub.connect(addr, root_cert=root_cert, token=TOKEN)
         report = hub.ready(ids["tick"], 60)
         wl.check(
-            "claimed and READY over the TLS leg",
-            bool(hub.deployment(report).attempt_credits),
-            f"{(time.perf_counter() - t0) * 1000:.0f} ms claim->READY at {addr}, "
+            "claimed and DISPATCHABLE over the TLS leg",
+            report.available_attempt_slots > 0,
+            f"{(time.perf_counter() - t0) * 1000:.0f} ms claim->DISPATCHABLE at {addr}, "
             f"boot {hub.boot_id}",
         )
         t1 = time.perf_counter()
@@ -212,9 +212,9 @@ def main() -> int:
         )
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-remote"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-remote"
                 else None
             ),
             60,
@@ -323,9 +323,9 @@ def main() -> int:
         good = wl.terminal_body(
             fhub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-inside"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-inside"
                     else None
                 ),
                 60,
@@ -355,9 +355,9 @@ def main() -> int:
         refused_terminal = wl.terminal_body(
             fhub.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-outside"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-outside"
                     else None
                 ),
                 60,

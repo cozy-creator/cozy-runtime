@@ -49,7 +49,7 @@ STATIC_ARMS = (
     ),
     # §8's one-kernel rule, planted as the exact thing it forbids: a SECOND direct-call
     # path into the author invocation kernel, and a SECOND attempt engine beside the
-    # supervisor's. Both are the v1 failure mode where the developer door and the
+    # worker's. Both are the v1 failure mode where the developer door and the
     # production door ran different lifecycle code.
     Arm(
         "one-attempt-kernel",
@@ -103,7 +103,7 @@ store = triage.BundleStore(root / "triage", journal)
 receipt = store.commit(triage.Assembly(triage.mint_subject(), attempt={"request_id": "r"}))
 path = root / "triage" / (receipt.subject_id + ".json")
 document = json.loads(path.read_text())
-document["terminal"] = {"status": "TERMINAL_STATUS_SUCCEEDED"}
+document["terminal"] = {"status": "OUTCOME_STATUS_SUCCEEDED"}
 path.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
 try:
     triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
@@ -121,7 +121,7 @@ from cozy_runtime.internal.worker import triage
 root = pathlib.Path(tempfile.mkdtemp(prefix="cozy-authority-arm"))
 journal = Journal(root / "journal.log")
 store = triage.BundleStore(root / "triage", journal)
-assembly = triage.Assembly(triage.mint_subject(), terminal={"status": "TERMINAL_STATUS_FAILED"})
+assembly = triage.Assembly(triage.mint_subject(), terminal={"status": "OUTCOME_STATUS_FAILED"})
 assembly.events.append({"kind": "log", "name": "SUCCEEDED", "value": "the handler is done"})
 receipt = store.commit(assembly)
 document = triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
@@ -129,7 +129,7 @@ shutil.rmtree(root, ignore_errors=True)
 claims = [row for row in document["events"] if row.get("kind") not in ("log", "metric",
           "stage", "confession", "boot", "liveness", "fault")]
 assert not claims, claims
-assert document["terminal"]["status"] == "TERMINAL_STATUS_FAILED", document["terminal"]
+assert document["terminal"]["status"] == "OUTCOME_STATUS_FAILED", document["terminal"]
 raise SystemExit(
     "observation only: the bundle's " + str(len(document["events"])) +
     " event row(s) are non-authoritative and the terminal it carries still reads "
@@ -145,12 +145,12 @@ from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     PlanChooser,
-    PreparedGeneration,
+    PreparedModel,
     PreparedRequest,
 )
 
 REQUEST = PreparedRequest.unresolved("generate", {"steps": 20})
-GENERATION = PreparedGeneration()
+GENERATION = PreparedModel()
 ledger = Ledger(host_budget=8 << 30, pinned_budget=512 << 20)
 ledger.resident = {"unet": 5_134_927_368, "vae": 167_307_726}
 ledger.device_free = 878_733_824

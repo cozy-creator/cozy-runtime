@@ -32,7 +32,7 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     PlanChooser,
     PlanRefusal,
-    PreparedGeneration,
+    PreparedModel,
     PreparedRequest,
 )
 
@@ -168,7 +168,7 @@ def _verdict(
     try:
         # NOTHING PREPARED THIS: `fit` estimates before any executor exists, so the
         # resolved half is empty and the estimate says so through the plan document.
-        chosen = chooser.choose(declared, PreparedGeneration(), request)
+        chosen = chooser.choose(declared, PreparedModel(), request)
     except PlanRefusal as exc:
         return {
             "function": surface.name,

@@ -2,7 +2,7 @@
 """The WEIGHTLESS worker lifecycle, live: the platform port's acceptance run (#450).
 
 One run, six sections, no model, no CAS, no GPU: boot -> invoke -> cooperative cancel ->
-executor crash -> supervisor kill + orphan check -> journal recovery. This is the sequence
+executor crash -> worker kill + orphan check -> journal recovery. This is the sequence
 a platform port must pass before it may call itself a port (cr-020 items 1-5, cr-021's
 process half): every section exercises the REAL worker control process, the REAL executor spawn path
 (trampoline seal included), and the REAL protocol bytes — only the endpoint is weightless.
@@ -250,9 +250,9 @@ def faults(hub: Any, kind: Any, since: int = 0) -> list[Any]:
     """Every fault of one kind the worker REPORTED after `since` (the durable lane)."""
     out: list[Any] = []
     for message in list(hub.seen)[since:]:
-        if message.WhichOneof("msg") != "report":
+        if message.WhichOneof("msg") != "observed_state":
             continue
-        out.extend(row for row in message.report.faults if row.kind == kind)
+        out.extend(row for row in message.observed_state.faults if row.kind == kind)
     return out
 
 
@@ -277,9 +277,9 @@ def journal_prefix(journal: Path, kind: str) -> int:
 def terminal_for(hub: Any, request_id: str, seconds: float, since: int = 0) -> Any:
     return hub.wait(
         lambda m: (
-            m.attempt_terminal
-            if m.WhichOneof("msg") == "attempt_terminal"
-            and m.attempt_terminal.request_id == request_id
+            m.attempt_outcome
+            if m.WhichOneof("msg") == "attempt_outcome"
+            and m.attempt_outcome.request_id == request_id
             else None
         ),
         seconds,
@@ -301,7 +301,7 @@ def section_reconnect(args: argparse.Namespace, base: str) -> None:
         since = hub.mark()
         hub.connect(wl.read_addr(worker.root, worker.process))
         report = hub.wait(
-            lambda m: m.report if m.WhichOneof("msg") == "report" else None,
+            lambda m: m.observed_state if m.WhichOneof("msg") == "observed_state" else None,
             args.observe,
             "report on the reconnected stream",
             since,
@@ -309,21 +309,21 @@ def section_reconnect(args: argparse.Namespace, base: str) -> None:
         refused = faults(hub, pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, since)
         wl.check(
             "a reconnect presenting the same revision is accepted as UNCHANGED",
-            not refused and report.applied_revision == 1,
+            not refused and report.accepted_desired_state_revision == 1,
             f"stream {hub.streams}, generation {hub.generation}, applied_revision "
-            f"{report.applied_revision}, {len(refused)} CONFIG_REFUSED faults",
+            f"{report.accepted_desired_state_revision}, {len(refused)} CONFIG_REFUSED faults",
         )
         # RED: same revision, genuinely different desired state (a posture flip).
         since = hub.mark()
         changed = wl.serving_directive(RELEASE, sorted(ids.values()), pb.Posture.POSTURE_DRAINING)
-        hub.send(pb.OwnerFrame(directive=hub._env(changed)))
+        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
         hub.wait(
             lambda m: (
-                m.report
-                if m.WhichOneof("msg") == "report"
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state"
                 and any(
                     row.reason == "same_revision_changed_body"
-                    for row in m.report.faults
+                    for row in m.observed_state.faults
                     if row.kind == pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
                 )
                 else None
@@ -385,7 +385,7 @@ def section_boot_failure(args: argparse.Namespace, base: str) -> None:
     try:
         worker2.hub.ready(ids2["tick"], args.observe * 4)
         wl.check(
-            "the same fixture on a bindable root acks the claim and reaches READY",
+            "the same fixture on a bindable root acks the claim and becomes DISPATCHABLE",
             not [m for m in list(worker2.hub.seen) if m.WhichOneof("msg") == "boot_failure"],
             f"boot {worker2.hub.boot_id}, no BootFailure on the stream",
         )
@@ -455,24 +455,24 @@ def section_undurable(args: argparse.Namespace, base: str) -> None:
         # its typed local fault instead of shipping something it cannot replay.
         held = hub.wait(
             lambda m: (
-                m.report
-                if m.WhichOneof("msg") == "report"
-                and m.report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state"
+                and m.observed_state.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED
                 else None
             ),
             args.observe,
-            "the worker's ERROR edge",
+            "the worker's FAILED edge",
             since,
         )
         # ORDERING, not a clock: the outcome is enqueued on the durable lane immediately
-        # after the ERROR edge, on the same FIFO queue the reporter ticks into. Two report
-        # ticks landing after that edge with no terminal between them is the observation
-        # that no terminal was sent — waiting a wall-clock second would not be.
+        # after the FAILED edge, on the same FIFO queue the reporter ticks into. Two ticks
+        # landing after that edge with no outcome between them is the observation that no
+        # outcome was sent — waiting a wall-clock second would not be.
         for tick in range(2):
             hub.wait(
-                lambda m: m.report if m.WhichOneof("msg") == "report" else None,
+                lambda m: m.observed_state if m.WhichOneof("msg") == "observed_state" else None,
                 args.observe,
-                f"report tick {tick + 1} after the ERROR edge",
+                f"observed-state tick {tick + 1} after the FAILED edge",
                 hub.mark(),
             )
         wl.check(
@@ -484,11 +484,17 @@ def section_undurable(args: argparse.Namespace, base: str) -> None:
         )
         latest = hub.reports()[-1]
         wl.check(
-            "and the attempt is still HELD and still reported, never silently dropped",
-            any(a.request_id == "req-dur" for a in latest.active_attempts)
-            and held.intake_state == pb.IntakeState.INTAKE_STATE_ERROR,
-            f"active_attempts={[a.request_id for a in latest.active_attempts]}, intake "
-            f"{pb.IntakeState.Name(latest.intake_state)}",
+            "and the attempt is HELD in its OWN wire state, never silently dropped",
+            any(
+                a.request_id == "req-dur"
+                and a.state == pb.AttemptState.ATTEMPT_STATE_HELD_UNDURABLE
+                for a in latest.held_attempts
+            )
+            and held.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED,
+            "held_attempts="
+            + str([(a.request_id, pb.AttemptState.Name(a.state)) for a in latest.held_attempts])
+            + f", phase {pb.WorkerPhase.Name(latest.worker_phase)} — rev-2 spells this "
+            "HELD_UNDURABLE (#507d/#510d), not RUNNING plus a compound fault",
         )
     finally:
         worker2.stop()
@@ -526,9 +532,10 @@ def section_identity(args: argparse.Namespace, base: str) -> None:
         replay = terminal_for(hub2, "req-ident", args.observe * 2)
         wl.check(
             "a restart with NO --instance-id reuses the root's identity and replays its own row",
-            replay.terminal_canonical == first.terminal_canonical and len(hub2.snapshot) == 1,
+            replay.outcome_canonical_bytes == first.outcome_canonical_bytes
+            and len(hub2.snapshot) == 1,
             f"identity {minted} persisted; {len(hub2.snapshot)} snapshot entr(y|ies), "
-            f"{len(first.terminal_canonical)} identical canonical bytes",
+            f"{len(first.outcome_canonical_bytes)} identical canonical bytes",
         )
     finally:
         worker2.stop()
@@ -555,11 +562,11 @@ def section_identity(args: argparse.Namespace, base: str) -> None:
 
 
 def section_ownership(args: argparse.Namespace, base: str) -> None:
-    """#494e: the accepted (owner_epoch, controller) survives the process that accepted it."""
+    """#494e: the accepted (record_owner_epoch, id) survives the process that accepted it."""
     wl.head("12. ownership durability: the accepted epoch outlives the process")
     tmp = Path(base + "-ownership")
     hub = wl.Hub()
-    hub.epoch, hub.controller_id = 5, "hub-authority"
+    hub.epoch, hub.record_owner_id = 5, "hub-authority"
     worker, ids = start_weightless(tmp, instance_id="ins-owner", fresh=True, hub=hub)
     try:
         hub.ready(ids["tick"], args.observe * 4)
@@ -571,12 +578,12 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
     addr = wl.read_addr(worker2.root, worker2.process)
     try:
         for epoch, controller, expect in (
-            (4, "hub-superseded", pb.ClaimRejection.CLAIM_REJECTION_STALE_OWNER_EPOCH),
+            (4, "hub-superseded", pb.ClaimRejection.CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH),
             (5, "hub-imposter", pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD),
         ):
             probe = wl.Hub()
             probe.process, probe.log = worker2.process, worker2.log
-            probe.epoch, probe.controller_id = epoch, controller
+            probe.epoch, probe.record_owner_id = epoch, controller
             probe.connect(addr, claim_only=True)
             ack = probe.wait(
                 lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None,
@@ -591,7 +598,7 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
             )
             probe.close()
         keeper = wl.Hub()
-        keeper.epoch, keeper.controller_id = 5, "hub-authority"
+        keeper.epoch, keeper.record_owner_id = 5, "hub-authority"
         keeper.process, keeper.log = worker2.process, worker2.log
         keeper.directive = wl.serving_directive(
             RELEASE, sorted(ids2.values()), pb.Posture.POSTURE_ACCEPTING
@@ -605,7 +612,7 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
         wl.check(
             "and the owner that HELD the epoch reclaims it",
             ack.accepted,
-            f"epoch 5 / hub-authority accepted at generation {ack.control_generation}",
+            f"epoch 5 / hub-authority accepted at generation {ack.control_stream_generation}",
         )
         keeper.close()
     finally:
@@ -625,9 +632,13 @@ def section_window(args: argparse.Namespace, base: str) -> None:
     try:
         report = hub.ready(ids["tick"], args.observe * 4)
         wl.check(
-            "an idle worker advertises exactly one admission credit",
-            hub.deployment(report).attempt_credits == 1,
-            f"attempt_credits={hub.deployment(report).attempt_credits}",
+            "an idle worker advertises exactly one FREE SEAT in one shared window",
+            report.available_attempt_slots == 1
+            and report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN,
+            f"available_attempt_slots={report.available_attempt_slots} in an "
+            f"{pb.AdmissionState.Name(report.admission_state)} window at generation "
+            f"{report.admission_generation} — one WORKER-level fence, not N per-placement "
+            "credits over one serialized device (#472e)",
         )
         since = hub.mark()
         _, digest = wl.dispatch(
@@ -662,9 +673,15 @@ def section_window(args: argparse.Namespace, base: str) -> None:
         )
         body = wl.terminal_body(terminal_for(hub, "req-overflow", args.observe, since))
         wl.check(
-            "a dispatch over the window is a typed REFUSED terminal, not an invisible hold",
-            body["status"] == 2 and "no_admission_credit" in body["safe_message"],
-            f"status={body['status']} cause={body['cause']['code']}: {body['safe_message'][:90]}",
+            "an offer over the window is a JOURNALED REFUSED outcome, not an invisible hold",
+            body["status"] == 2
+            and body["cause"]["code"] == 17  # CAUSE_CODE_NO_CAPACITY
+            and body["cause"]["origin"] == 4  # CAUSE_ORIGIN_SUPERVISOR
+            and not body.get("execution_started", False),
+            f"status={body['status']} cause={body['cause']['code']}/"
+            f"origin={body['cause']['origin']} execution_started="
+            f"{body.get('execution_started', False)} — the ordinal is consumed and the "
+            f"BUDGET is not: {body['safe_message'][:70]}",
         )
         # The completeness half: reconnect while one attempt is held and count. Every
         # attempt this owner dispatched and has not closed must be in the snapshot — the
@@ -674,17 +691,17 @@ def section_window(args: argparse.Namespace, base: str) -> None:
         if not hub.connected.wait(args.observe):
             raise SystemExit("the reconnected stream never opened dispatch")
         report = hub.wait(
-            lambda m: m.report if m.WhichOneof("msg") == "report" else None,
+            lambda m: m.observed_state if m.WhichOneof("msg") == "observed_state" else None,
             args.observe,
             "a report on the reconnected stream",
             since,
         )
         wl.check(
             "the snapshot names every attempt the worker holds, and no others",
-            {a.request_id for a in hub.snapshot} == {"req-holder", "req-overflow"},
-            f"snapshot={sorted(a.request_id for a in hub.snapshot)} "
-            f"reported={sorted(a.request_id for a in report.active_attempts)} "
-            f"credits={hub.deployment(report).attempt_credits}",
+            {a["request_id"] for a in hub.snapshot} == {"req-holder", "req-overflow"},
+            f"snapshot={sorted(a['request_id'] for a in hub.snapshot)} "
+            f"reported={sorted(a.request_id for a in report.held_attempts)} "
+            f"slots={report.available_attempt_slots}",
         )
         # Release the holder. NOT this arm's subject, and recorded because it is real:
         # dropping the control stream while an attempt runs already invalidates the executor
@@ -692,9 +709,13 @@ def section_window(args: argparse.Namespace, base: str) -> None:
         # reconnect above may find req-holder already terminal. This is cleanup, and a
         # cancel the worker answers with "no such held attempt" is a legal answer to it.
         hub.send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=hub._env(
-                    pb.CancelAttempt(request_id="req-holder", attempt=1, invocation_digest=digest)
+                    pb.CancelAttempt(
+                        request_id="req-holder",
+                        attempt_ordinal=1,
+                        invocation_spec_digest=digest,
+                    )
                 )
             )
         )
@@ -792,15 +813,15 @@ def main() -> int:
             # On a platform whose ProcessTree/AcceleratorOps seams are unfilled, boot
             # refuses TYPED in the worker log — surface it, because that refusal is the
             # port's honest status (#447/#450), not a mystery hang.
-            print(f"\nboot never reached READY: {exc}\n--- worker log tail ---")
+            print(f"\nboot never became DISPATCHABLE: {exc}\n--- worker log tail ---")
             for line in worker.tail(lines=40):
                 print(f"  {line}")
             raise SystemExit(1) from exc
         boot_ms = (time.perf_counter() - t0) * 1000
         wl.check(
-            "worker READY with both weightless plans",
-            set(hub.deployment(report).ready_entrypoint_binding_plan_ids) >= set(ids.values()),
-            f"{boot_ms:.0f} ms to READY; executor pid {worker.executor_pid()}",
+            "worker DISPATCHABLE with both weightless plans",
+            set(hub.deployment(report).dispatchable_plan_ids) >= set(ids.values()),
+            f"{boot_ms:.0f} ms to DISPATCHABLE; executor pid {worker.executor_pid()}",
         )
 
         wl.head("2. invoke: tick -> ok terminal")
@@ -816,9 +837,9 @@ def main() -> int:
         )
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-tick"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-tick"
                 else None
             ),
             args.observe,
@@ -856,21 +877,21 @@ def main() -> int:
         )
         t2 = time.perf_counter()
         hub.send(
-            pb.OwnerFrame(
+            pb.RecordOwnerFrame(
                 cancel_attempt=hub._env(
                     pb.CancelAttempt(
                         request_id="req-cancel",
-                        attempt=1,
-                        invocation_digest=digest,
+                        attempt_ordinal=1,
+                        invocation_spec_digest=digest,
                     )
                 )
             )
         )
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-cancel"
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-cancel"
                 else None
             ),
             args.observe,
@@ -884,13 +905,13 @@ def main() -> int:
             f"status={body['status']} cause={body.get('cause', {}).get('code', '')}",
         )
         # A cancel can poison the serving generation; the next dispatch is only owed
-        # acceptance after the worker reports READY again (the rebuild is off the
+        # acceptance after the worker reports DISPATCHABLE again (the rebuild is off the
         # cancellation critical path, so this waits for a FRESH report).
         hub.ready(ids["hold"], args.observe * 2, since=hub.mark())
 
         wl.head("4. executor crash: SIGKILL the executor mid-hold")
         # A refused attempt is the coordinator's to retry: re-dispatch a HIGHER attempt
-        # after a fresh READY (a post-cancel dispatch can race the poison-triggered
+        # after a fresh DISPATCHABLE (a post-cancel dispatch can race the poison-triggered
         # rebuild, and the refusal is typed, not a failure of anything).
         attempt_no = 0
         while True:
@@ -913,10 +934,10 @@ def main() -> int:
                     ("accepted", m.attempt_accepted)
                     if m.WhichOneof("msg") == "attempt_accepted"
                     and m.attempt_accepted.request_id == "req-crash"
-                    else ("refused", m.attempt_terminal)
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-crash"
-                    and wl.terminal_body(m.attempt_terminal)["status"] == 2
+                    else ("refused", m.attempt_outcome)
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-crash"
+                    and wl.terminal_body(m.attempt_outcome)["status"] == 2
                     else None
                 ),
                 args.observe,
@@ -930,11 +951,11 @@ def main() -> int:
         os.kill(executor, signal.SIGKILL)
         terminal = hub.wait(
             lambda m: (
-                m.attempt_terminal
-                if m.WhichOneof("msg") == "attempt_terminal"
-                and m.attempt_terminal.request_id == "req-crash"
-                and m.attempt_terminal.attempt == attempt_no
-                and wl.terminal_body(m.attempt_terminal)["status"] != 2
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-crash"
+                and m.attempt_outcome.attempt_ordinal == attempt_no
+                and wl.terminal_body(m.attempt_outcome)["status"] != 2
                 else None
             ),
             args.observe,
@@ -946,10 +967,10 @@ def main() -> int:
             "executor SIGKILL -> ABANDONED/EXECUTOR_INVALIDATED, worker process survives",
             body["status"] == 5 and body["cause"]["code"] == 16 and alive,
             f"killed pid {executor}; status={body['status']} "
-            f"cause={body.get('cause', {}).get('code', '')} supervisor_alive={alive}",
+            f"cause={body.get('cause', {}).get('code', '')} worker_alive={alive}",
         )
         hub.ready(ids["hold"], args.observe * 2, since=hub.mark())
-        wl.check("readiness rebuilt after the crash", True, "fresh READY observed")
+        wl.check("dispatchability rebuilt after the crash", True, "fresh DISPATCHABLE observed")
 
         wl.head("5. orphan: SIGKILL the WORKER control process mid-hold; the executor must die")
         since = hub.mark()
@@ -974,13 +995,13 @@ def main() -> int:
             since,
         )
         executor = executor_pid_of(worker, args.observe)
-        supervisor = worker.process.pid
+        control_pid = worker.process.pid
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=args.observe)
         wl.check(
             "parent-death containment reaps the executor",
             pid_gone(executor, args.observe, "orphaned executor"),
-            f"worker control process {supervisor} SIGKILLed; executor {executor} gone "
+            f"worker control process {control_pid} SIGKILLed; executor {executor} gone "
             "(pdeathsig on linux; the seam-EOF exit is the portable backstop)",
         )
         hub.close()
@@ -992,9 +1013,9 @@ def main() -> int:
         try:
             terminal = hub2.wait(
                 lambda m: (
-                    m.attempt_terminal
-                    if m.WhichOneof("msg") == "attempt_terminal"
-                    and m.attempt_terminal.request_id == "req-orphan"
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-orphan"
                     else None
                 ),
                 args.observe * 2,
@@ -1008,7 +1029,7 @@ def main() -> int:
                 f"status={body['status']} cause={body.get('cause', {}).get('code', '')}",
             )
             hub2.ready(ids2["tick"], args.observe * 2)
-            wl.check("worker READY again after recovery", True, "second boot serves")
+            wl.check("worker DISPATCHABLE again after recovery", True, "second boot serves")
         finally:
             worker2.stop()
             hub2.close()

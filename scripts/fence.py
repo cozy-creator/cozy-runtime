@@ -391,9 +391,9 @@ def fence_torch_free_import() -> list[str]:
 #: nothing about the other. Two facts hold the shape:
 #:
 #:   * the author invocation kernel is CALLED from exactly one module — the device executor;
-#:   * the attempt engine is CONSTRUCTED in exactly one module — the supervisor session.
+#:   * the attempt engine is CONSTRUCTED in exactly one module — the worker session.
 #:
-#: Anything that wants to run an attempt therefore has to go through the supervisor, over
+#: Anything that wants to run an attempt therefore has to go through the worker, over
 #: the seam, into the executor. A direct-call runner beside it cannot be written without
 #: turning this fence red.
 KERNEL_CALLS = ("attempt", "prepare", "invoke", "run_prepared")

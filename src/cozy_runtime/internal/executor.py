@@ -2,7 +2,7 @@
 
 This is the ONLY process in the worker that imports torch or touches a device. It is
 disposable in the strong sense: `kill -9` at any instant is a supported input, and the
-supervisor converges to a typed terminal and a fresh incarnation from what it journaled.
+worker converges to a typed terminal and a fresh incarnation from what it journaled.
 Nothing durable lives here — no journal, no credential, no monotone wire counter.
 
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
@@ -10,14 +10,14 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
     prepare   construct + fill one binding; report the construction digest and ready facts
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
-              the supervisor prices a plan against the record the handler will actually run
+              the worker prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
     run_job   run ONE @app.job to completion through the SAME kernel, with job services
-    probe     device/host memory facts, for the supervisor's ledger reconciliation
+    probe     device/host memory facts, for the worker's ledger reconciliation
     shutdown  cooperative exit
 
 Cancellation arrives out of band as SIGUSR1 (cooperative) and SIGKILL (forceful) — the
-supervisor owns both clocks. `ctx.cancelled` reads the flag the handler is signalled with,
+worker owns both clocks. `ctx.cancelled` reads the flag the handler is signalled with,
 which is why a cooperative body unwinds and a non-cooperative one gets killed.
 
 The env seal is proved, not trusted: the sealed values are snapshotted BEFORE torch is
@@ -65,7 +65,7 @@ INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: How many PREPARED requests this incarnation holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
-#: supervisor prepared and then never dispatched.
+#: worker prepared and then never dispatched.
 PREPARED_HELD = 8
 
 #: Set by SIGUSR1. THE cooperative-cancel signal: `ctx.raise_if_cancelled()` reads it.
@@ -110,7 +110,7 @@ def _deadline(seconds: float | None) -> float:
     remaining time, so reading the two as one would hand an attempt whose deadline had just
     lapsed an unbounded one. An attempt whose caller minted no deadline has no bound to
     derive one from, and inventing one here would put a ceiling on what an attempt may be
-    that the supervisor's own watchdog does not enforce — two clocks disagreeing about the
+    that the worker's own watchdog does not enforce — two clocks disagreeing about the
     same attempt (cr-009).
     """
     return math.inf if seconds is None else time.monotonic() + seconds
@@ -139,13 +139,13 @@ class Executor:
         self.ready = False
         self.poisoned = ""
         self.logical_model_digest = ""
-        self.constructed_generation_digest = ""
+        self.constructed_model_digest = ""
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
         self.attempts = 0
-        #: the DURABLE exchange counter (cr-009). Supervisor-answered, never sheddable.
+        #: the DURABLE exchange counter (cr-009). Worker-answered, never sheddable.
         self._exchange = 0
 
     # ------------------------------------------------------------------ prepare
@@ -157,7 +157,7 @@ class Executor:
                 "ok": False,
                 "code": "poisoned_generation",
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
-                "generation has no recovery edge to Ready — the supervisor replaces it",
+                "generation has no recovery edge to Ready — the worker replaces it",
             }
         binding = command["binding"]
         budgets = command["budgets"]
@@ -287,7 +287,7 @@ class Executor:
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
-        # supervisor can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
+        # worker can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
         # `started` is published at position 0 before the first byte moves, which is what
         # makes a pre-first-unit wedge render at all.
         def position(mib: int) -> None:
@@ -443,7 +443,7 @@ class Executor:
         # digest cannot answer "which bytes are resident right now" — it is identical
         # across every variant by construction — so using it as the generation's identity
         # made two generations over different artifacts indistinguishable.
-        self.constructed_generation_digest = canonical.digest(
+        self.constructed_model_digest = canonical.digest(
             {
                 "format": "cozy.runtime.ConstructedGeneration/1",
                 "logical_model_digest": self.logical_model_digest,
@@ -497,7 +497,7 @@ class Executor:
             # ignoring is named where a person and a coordinator both see it, so the extras
             # this bind dropped and the markers it transcribed ride the bind result.
             "custody": binding.get("custody", "canonical"),
-            # THE COMPONENT-USE CONTRACT, as a construction fact. The supervisor prices a
+            # THE COMPONENT-USE CONTRACT, as a construction fact. The worker prices a
             # staged rung against it and cannot read it any other way: the declaration lives
             # on the endpoint's class, and that class is only ever imported here.
             "declared_scopes": {
@@ -539,7 +539,7 @@ class Executor:
             "ok": True,
             "ready": True,
             "model_construction_digest": self.logical_model_digest,
-            "constructed_generation_digest": self.constructed_generation_digest,
+            "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
             "delivery": choice.document(),
             "facts": self.facts,
@@ -582,7 +582,7 @@ class Executor:
             "ready": True,
             "weightless": True,
             "model_construction_digest": "",
-            "constructed_generation_digest": "",
+            "constructed_model_digest": "",
             "entrypoints": sorted(self.surface_names),
             "delivery": {},
             "facts": self.facts,
@@ -593,7 +593,7 @@ class Executor:
     def prepare_request(self, command: dict[str, Any]) -> dict[str, Any]:
         """Resolve ONE request through the kernel's pre-admission half, and retain it.
 
-        The supervisor calls this BEFORE it prices a plan, so the normalized features and
+        The worker calls this BEFORE it prices a plan, so the normalized features and
         the preflight digests it journals into the AttemptPlan are the exact ones the
         handler then runs on. The resolved payload is an author-typed object and cannot
         cross the seam, so it stays here under the request id and only its digests travel;
@@ -631,7 +631,7 @@ class Executor:
                 "fields": list(outcome.fields),
             }
         self.prepared[command["request_id"]] = prepared
-        # A prepared request the supervisor never dispatched (a refusal after the plan, a
+        # A prepared request the worker never dispatched (a refusal after the plan, a
         # cancel while it queued) would otherwise be retained for the generation's life.
         for stale in list(self.prepared)[: -PREPARED_HELD or None]:
             del self.prepared[stale]
@@ -679,9 +679,9 @@ class Executor:
         torch = self.torch
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
-        # retained anywhere: its `position` is the monotone unit count the supervisor's
+        # retained anywhere: its `position` is the monotone unit count the worker's
         # silence detector reads, and that is all it is for. A RETAINED observation rides the
-        # same lane so the supervisor holds a copy BEFORE this process can die — a ring that
+        # same lane so the worker holds a copy BEFORE this process can die — a ring that
         # only crosses in the reply crosses never when the process is killed, which is the
         # exact case triage exists for. A seam refusal there is dropped live output, the ONE
         # loss this lane may incur.
@@ -711,7 +711,7 @@ class Executor:
                 cancel=lambda: _CANCEL,
                 models=self.models,
                 progress=progress,
-                # cr-012: the inputs the SUPERVISOR already fetched, verified and spooled.
+                # cr-012: the inputs the WORKER already fetched, verified and spooled.
                 # Every value is a path inside this attempt's own spool; this process has
                 # no outbound network and never resolves an address of its own.
                 assets={
@@ -856,7 +856,7 @@ class Executor:
         from cozy_runtime.author._services import BudgetFacts, CheckpointReceipt, CheckpointSave
 
         def durable_checkpoint(save: CheckpointSave) -> CheckpointReceipt:
-            """Block until the supervisor says the save is DURABLE. Never the lossy lane."""
+            """Block until the worker says the save is DURABLE. Never the lossy lane."""
             answer = self._durable(
                 "checkpoint",
                 {
@@ -962,7 +962,7 @@ class Executor:
         }
 
     def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
-        """One DURABLE mid-attempt exchange. Blocks until the supervisor answers.
+        """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
         separate lane from progress on purpose: a durable fact must not be sheddable, and
@@ -974,7 +974,7 @@ class Executor:
         while True:
             frame = self.channel.recv()
             if frame is None:
-                raise SeamError("seam_closed", f"the supervisor closed during {kind!r}")
+                raise SeamError("seam_closed", f"the worker closed during {kind!r}")
             if frame.get("event") == "answer" and int(frame.get("seq", -1)) == seq:
                 return frame
             raise SeamError(
@@ -1021,8 +1021,8 @@ class Executor:
 
         It runs HERE, in the disposable process, for one reason that is not convenience:
         synthesizing a payload needs the entrypoint's schema, and reading that schema in the
-        supervisor would mean importing endpoint code into the long-lived no-CUDA process.
-        An endpoint whose module scope touches torch would then contaminate the supervisor
+        worker would mean importing endpoint code into the long-lived no-CUDA process.
+        An endpoint whose module scope touches torch would then contaminate the worker
         forever. The executor already imported it and is already disposable.
         """
         from cozy_runtime.internal import schema, warm
@@ -1039,7 +1039,7 @@ class Executor:
         if reason:
             return {"ok": True, "outcome": "skipped", "reason": reason, "payload": {}}
         # THROUGH ORDINARY DISPATCH means through both halves in order. The warm pass has no
-        # supervisor to prepare for it, so it prepares its own request and then invokes the
+        # worker to prepare for it, so it prepares its own request and then invokes the
         # record — the same two calls a served attempt makes across the seam.
         ready = self.prepare_request({**command, "payload": payload})
         if not ready.get("ok"):
@@ -1198,7 +1198,7 @@ def _serialize_result(
     Returns `(result_ref, outputs, oversize_bytes)`. The BYTES land in the attempt spool and
     only their digest and length ride the reply: the public door admits 4 MiB inline and one
     control frame admits 64 KiB, so a result between the two was an executor fault instead of
-    a served result until the bytes moved to the spool the supervisor already brokers.
+    a served result until the bytes moved to the spool the worker already brokers.
     `oversize_bytes` is non-zero when the canonical result exceeds the inline door, which
     cr-007 REFUSES rather than papering over with a receipt for bytes nobody wrote.
     """

@@ -608,7 +608,7 @@ def install_into(root: Path) -> str:
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — supervisor, executor, endpoint."""
+    """ONE request through the WHOLE real path — worker, executor, endpoint."""
     import dataclasses
     import os
 

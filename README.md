@@ -1,6 +1,6 @@
 # cozy-runtime (v2)
 
-The worker runtime: author surface (`cozy_runtime.author`), supervisor, disposable device
+The worker runtime: author surface (`cozy_runtime.author`), worker, disposable device
 executor, and the single-endpoint CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
 `cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.
 
@@ -13,7 +13,7 @@ recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` — th-024's bindings, COPIED, plus the document plane | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 2) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local-coordinator adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -33,12 +33,12 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 ## The two processes, and the two coordinators
 
     a real coordinator ──gRPC───┐
-                                ├──▶ supervisor (no CUDA) ──seam──▶ executor (CUDA)
+                                ├──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
     an in-memory coordinator ───┘        cozy.worker.v1, either way
 
 | module | role |
 |---|---|
-| `internal/worker/session.py` | the protocol client and the supervisor entrypoint |
+| `internal/worker/session.py` | the protocol client and the worker entrypoint |
 | `internal/worker/control.py` | the transport seam: `Link`/`Coordinator`, gRPC and in-memory |
 | `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
 | `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
@@ -49,24 +49,24 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
 | `internal/worker/triage.py` | the `WorkerTriageBundle` schema, its assembler, and the journal-backed store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
-| `internal/witness.py` | the out-of-process postmortem witness: it names the SUPERVISOR's own death |
-| `internal/local.py` | the ephemeral local supervisor: one request, no network |
+| `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
+| `internal/local.py` | the ephemeral local worker: one request, no network |
 | `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
-| `internal/seam.py` | the control-only, byte-accounted supervisor<->executor channel |
+| `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
 | `internal/fill.py` | the fill plane: a TensorFS `Checkpoint`, the pinned ring, the transaction |
 
-The supervisor never imports torch, and that is proved against the RUNNING process
+The worker never imports torch, and that is proved against the RUNNING process
 (`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
 list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
-ephemeral local supervisor whose coordinator is a pair of in-process queues, over the same
+ephemeral local worker whose coordinator is a pair of in-process queues, over the same
 process boundary, journal, acceptance boundary, freeze point and ledger. The rule is
 structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
 exactly one caller (the device executor) and the attempt engine exactly one constructor (the
-supervisor session), so a direct-call runner beside them cannot be written without turning
+worker session), so a direct-call runner beside them cannot be written without turning
 CI red.
 
 **Observability is bounded, or it is not observability.** `author/_observations.py` holds the
@@ -106,7 +106,7 @@ by tenancy: shared reschedules, local deepens to the deepest rung with a quantif
 confession and exits only below the declared physical floor.
 
 **The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
-supervisor's own bookkeeping, `measured` for a named device or kernel interface,
+worker's own bookkeeping, `measured` for a named device or kernel interface,
 `unreadable` for a class this worker genuinely cannot read — never a zero standing in for
 one) and the METHOD that produced it. Every attempt closes by reconciling every class
 against the line taken before its envelope was granted, and the record is journaled.
@@ -190,7 +190,7 @@ bindings. Author code never names an artifact identifier; a fence proves it.
 cr-016 over the real attempt kernel.
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
-`@app.job` over the one invocation kernel, the same supervisor/executor split, the same
+`@app.job` over the one invocation kernel, the same worker/executor split, the same
 journal, the same output transaction. What differs is stated out loud and is short — a
 `JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
 (serving never accepts-then-cold-loads; a job has nothing to be warm for), the three job
