@@ -1,9 +1,11 @@
 name: platform-macos-mps
-# cr-021 hardware probe. MANUALLY TRIGGERED ONLY — never on push/PR/schedule. This is not a
-# test suite: it is a live run on rented Apple Silicon that BANKS what the machine actually
-# exposes (chip class, MPS availability, allocator numbers, which dtypes serve and which
-# refuse) as an uploaded transcript. Every claim in cr-021's AcceleratorFacts record is a
-# line in that transcript or it is not a fact yet.
+# cr-021's two macOS jobs. MANUALLY TRIGGERED ONLY — never on push/PR/schedule.
+# `probe` is the hardware probe: a live run on rented Apple Silicon that BANKS what the
+# machine actually exposes (chip class, MPS availability, allocator numbers, which dtypes
+# serve and which refuse) as an uploaded transcript. Every claim in cr-021's
+# AcceleratorFacts record is a line in that transcript or it is not a fact yet.
+# `lifecycle` is the PORT GATE (#450): the weightless worker lifecycle must pass on this
+# runner before the macOS port may call itself complete.
 on:
   workflow_dispatch:
     inputs:
@@ -100,3 +102,32 @@ jobs:
         with:
           name: macos-mps-transcript-${{ inputs.runner }}
           path: transcript.txt
+
+  lifecycle:
+    # The weightless acceptance run (scripts/lifecycle-live.py): boot -> invoke ->
+    # cooperative cancel -> executor SIGKILL -> worker-kill orphan reap -> recovery, no
+    # model and no device. EXPECTED RED until cr-021's darwin ProcessTree lands: today the
+    # executor seal refuses typed (proctree.arm_parent_death has no darwin implementation),
+    # and that typed refusal in the transcript IS the port's honest status — #450 says the
+    # port is complete when this job is green, not before.
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv + deps (no torch — the lifecycle is weightless)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync
+
+      - name: weightless lifecycle
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run python scripts/lifecycle-live.py 2>&1 | tee lifecycle.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-lifecycle-${{ inputs.runner }}
+          path: lifecycle.txt

@@ -236,7 +236,16 @@ def main() -> int:
     worker, ids = start_weightless(tmp, instance_id="ins-lifecycle", fresh=True)
     hub = worker.hub
     try:
-        report = hub.ready(ids["tick"], args.observe * 4)
+        try:
+            report = hub.ready(ids["tick"], args.observe * 4)
+        except (TimeoutError, RuntimeError) as exc:
+            # On a platform whose ProcessTree/AcceleratorOps seams are unfilled, boot
+            # refuses TYPED in the worker log — surface it, because that refusal is the
+            # port's honest status (#447/#450), not a mystery hang.
+            print(f"\nboot never reached READY: {exc}\n--- worker log tail ---")
+            for line in worker.tail(lines=40):
+                print(f"  {line}")
+            raise SystemExit(1) from exc
         boot_ms = (time.perf_counter() - t0) * 1000
         wl.check(
             "worker READY with both weightless plans",
