@@ -141,11 +141,24 @@ SPEC_ROWWISE = "sha256:2148c93613ec8e563732936e74a585f5623953f3d053dfc12bd72780f
 SPEC_ROWWISE_KEEPDIM = "sha256:6ca5bf0e304655d7338816bc91e73336361e6a4384b4c35d4aed5296f39dad6e"
 
 #: `fp8-scaled-scalar/1` WITH the rank-0 activation `input_scale` (H3's 150 modules).
-SPEC_SCALED_SCALAR = "sha256:c60935ae4df73c7ff8a52348d8611b11aced9b159399f8ef18a0129a062310bb"
+#:
+#: MOVED at tensorfs `940973f`, and this file did not move with it — so from that commit
+#: until now this runtime could not serve ANY fp8-scaled-scalar artifact: `launch_providers`
+#: refused `spec_unreviewed` naming two digests the installed registry does not carry.
+#: Nothing caught it because the only such artifact is H3 and H3 had only ever been driven
+#: through the model path, never through this provider path (#555h's "the SERVING path is
+#: not output-verified", made concrete). The review behind the new digest: same alias, the
+#: same role set (`data`, `input_scale`, `weight_scale`), and — decisively — the vendored
+#: vector document this provider is READ AGAINST is byte-identical to the one the new spec
+#: names (`cac6671a…`). What moved in the spec document is its prose and its acquisition of
+#: those very vectors; the physical byte contract did not.
+SPEC_SCALED_SCALAR = "sha256:1ae27bbdfd44b099cb3081fbd35e46e6bacb5da7a0c611a4cc6f11d90d0c59c0"
 
 #: `fp8-scaled-scalar/1` weight-scale only (H3's 50 `mlp.fc2`). One artifact, two role sets.
+#: Same move, same review: roles (`data`, `weight_scale`) unchanged and the vendored vectors
+#: (`e7bf8223…`) are the ones the new spec names.
 SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
-    "sha256:55f85da3ae53b31c84687c14505fa491ccec704955ea0ff3d5c80f65cfbdc7af"
+    "sha256:3b560936a385ce7971698e8f9b792caaf0339eb77e7856e83e770a9e573a11d0"
 )
 
 #: `mxfp8/1` — E4M3 elements, one E8M0 byte per 32-element block along the last axis.
