@@ -78,8 +78,10 @@ class FillRefusal(Exception):
         self.fields = tuple(fields)
 
 
-#: The complete refusal vocabulary of this plane. Named as a frozen set so a new code
-#: cannot appear without touching this line.
+#: The complete refusal vocabulary of this plane, and EXACTLY the producible codes. Named
+#: as a frozen set so a new code cannot appear without touching this line — and a code
+#: leaves with its last producer, because an entry nothing can raise makes the registry lie
+#: in the same way an unregistered producer does, just in the other direction (#504).
 REFUSALS = frozenset(
     {
         "missing_object",  # the CAS has no object file for a declared segment
@@ -90,7 +92,6 @@ REFUSALS = frozenset(
         "destination_absent",  # a fill for a key the contract does not name
         "incomplete_fill",  # commit with a DestinationSet key never enqueued
         "lease_live",  # a staging slot reused before its completion event
-        "not_ready",  # the generation was read before the fence fired
         "derived_unmaterialized",  # a non-persistent buffer the fill plane cannot supply
         # cr-006's three, spoken in the SAME vocabulary because the supervisor, the
         # journal and the CLI all read one refusal table. `encoding.py` owns their
