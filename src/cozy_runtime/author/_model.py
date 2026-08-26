@@ -521,8 +521,25 @@ class Model(Generic[PipelineT]):
             )
 
     def _cozy_kill(self, why: str) -> NoReturn:
+        # A REFUSAL NAMES WHERE IT CAME FROM (#573). This one says which component was
+        # touched and never who touched it, and the difference is not academic: a guarded
+        # root is reached through `__getattr__`, so the offender is by definition NOT in
+        # the message, and locating one cost a whole investigation that ended in "cause
+        # not located". The author frames are the interesting ones — an endpoint reading a
+        # component outside its scope is the case this guard is FOR — so the runtime's own
+        # frames are kept too, because the other case is the runtime probing a root it
+        # installed, which is exactly what a bare message cannot distinguish.
+        import traceback
+
+        frames = [
+            f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno} {f.name}"
+            for f in traceback.extract_stack()[:-2]
+        ][-6:]
         object.__setattr__(self, "_cozy_poison", why)
-        raise CapabilityError(f"{type(self).__name__}: {why}", code="undeclared_component")
+        raise CapabilityError(
+            f"{type(self).__name__}: {why} — reached from: " + " <- ".join(reversed(frames)),
+            code="undeclared_component",
+        )
 
     def _cozy_require_ready(self, what: str) -> None:
         if self._cozy_poison is not None:
