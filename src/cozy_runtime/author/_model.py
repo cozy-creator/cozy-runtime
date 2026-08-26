@@ -72,7 +72,7 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
 #:
 #: Every other rung the runtime can choose is invisible to author code by construction: the
 #: weights arrive as float tensors in the destinations the census named, and which stored
-#: bytes they came from is not a question the endpoint can ask. The `native_encoded` rung is
+#: bytes they came from is not a question the endpoint can ask. The `encoded_gemm` route is
 #: the one that cannot be invisible. Its leaf has no `.weight` — the payload and its scales
 #: ARE the weight, the module that multiplies by them is REPLACED, and an endpoint that
 #: reaches into `layer.weight`, re-dtypes a submodule, or rebuilds a `nn.Linear` from one
