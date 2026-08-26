@@ -539,20 +539,12 @@ class Executor:
             "ignored_extra_keys": list(record.ignored_extras),
             "transcribed_markers": list(record.transcribed_markers),
             "plan": plan.document(),
-            # The WIRE's own two fields, derived from the plan's route census rather than
-            # copied off a rung. A plan that resolved three routes says `float`/`aot_decode`
-            # here and `mixed(...)` in `plan.label` — the closed vocabulary is satisfied and
-            # nothing claims to be purely native that is not.
-            "delivery": {
-                "label": plan.label(),
-                "delivery": plan.wire_delivery(),
-                "materialization": plan.wire_materialization(),
-                "routes": plan.route_census(),
-                "kernels": plan.kernels(),
-                "objective": plan.objective,
-                "calibrated": plan.measurements is not None,
-                "confession": plan.confession,
-            },
+            # The WIRE's own document, DERIVED from the plan's route census and placement
+            # rather than copied off a chooser's rung. The key set is the worker's — that
+            # seam is closed and reads `rung`/`variant` — and `label` rides beside them, so
+            # a plan that resolved three routes prices as what it COSTS and reports
+            # `mixed(...)` as what it IS.
+            "delivery": plan.wire_document(),
         }
         # BANK WHAT THIS RUN MEASURED, keyed by THIS PLAN'S DIGEST (#549.2), as an
         # IMMUTABLE per-run file. The numbers are the ones this fill actually paid: its wall,
@@ -901,10 +893,19 @@ class Executor:
         if scratch is not None:
             scratch.mkdir(parents=True, exist_ok=True)
 
-        from cozy_runtime.author._services import BudgetFacts, CheckpointReceipt, CheckpointSave
+        from cozy_runtime.author._services import (
+            BudgetFacts,
+            CheckpointDeclaration,
+            CheckpointSave,
+        )
 
-        def durable_checkpoint(save: CheckpointSave) -> CheckpointReceipt:
-            """Block until the worker says the save is DURABLE. Never the lossy lane."""
+        def durable_checkpoint(save: CheckpointSave) -> CheckpointDeclaration:
+            """Block until the worker has JOURNALED the declaration. Never the lossy lane.
+
+            What comes back is a journaled declaration id, not a durability receipt: this
+            frame carries keys, a digest and a length, and the bytes stay in the spool
+            (#553a).
+            """
             answer = self._durable(
                 "checkpoint",
                 {
@@ -922,8 +923,8 @@ class Executor:
                     f"{save.logical_key}: {answer.get('detail', 'the durable exchange refused')}",
                     code=str(answer.get("code", "checkpoint_refused")),
                 )
-            return CheckpointReceipt(
-                receipt_id=str(answer["receipt_id"]),
+            return CheckpointDeclaration(
+                declaration_id=str(answer["receipt_id"]),
                 operation_key=save.operation_key,
                 logical_key=save.logical_key,
                 content_digest=save.content_digest,

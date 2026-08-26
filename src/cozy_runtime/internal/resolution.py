@@ -316,6 +316,58 @@ class ResolvedExecutionPlan:
             return ""
         return "staged_decode" if self.placement == "component_staged" else "aot_decode"
 
+    def wire_rung(self) -> str:
+        """The rung NAME the worker's placement fence prices this plan against.
+
+        The worker seam is closed and it needs one: `worker/plan.py` looks the name up in
+        the rung table to decide whether a walk to `component_staged` would change the
+        compute KERNEL, which is §3.2's fence and is exactly the check that must keep
+        working. So this is a DERIVATION, not a chooser's answer: it names the rung whose
+        (delivery, materialization) pair equals this plan's own derived wire fields.
+
+        A mixed plan therefore prices as what it COSTS — one decoded tensor makes the
+        generation pay a decode, which is `aot_decode` or `staged_decode` — and it still
+        REPORTS `label()`, which is the honest name. That is the split #549.1 asked for:
+        the wire's closed vocabulary is satisfied by derivation, and nothing claims to be a
+        single-route generation that is not.
+        """
+        # Imported HERE, not at module scope: `delivery.py` imports `ROUTE_KERNEL` from this
+        # module, so a top-level import back would close the cycle. The dependency is one
+        # way by design — resolution decides, the rung table describes.
+        from cozy_runtime.internal.delivery import DELIVERY_RUNGS
+
+        delivery, materialization = self.wire_delivery(), self.wire_materialization()
+        for rung in DELIVERY_RUNGS:
+            if (
+                rung.status == "proven"
+                and rung.delivery == delivery
+                and rung.materialization == materialization
+            ):
+                return rung.name
+        return "verbatim"
+
+    def wire_document(self) -> dict[str, Any]:
+        """The `delivery` document the worker reads off a prepare reply.
+
+        Its KEY SET is the worker's, not this module's: `session.py` reads `rung` and
+        `variant` and prints `delivery`/`materialization`/`confession`, and that seam is
+        closed. Every value is derived from the resolution, and `label` and `plan_digest`
+        ride along so a reader of the reply sees the honest name beside the wire's one.
+        """
+        return {
+            "rung": self.wire_rung(),
+            "variant": self.variant,
+            "delivery": self.wire_delivery(),
+            "materialization": self.wire_materialization(),
+            "label": self.label(),
+            "plan_digest": self.digest(),
+            "routes": self.route_census(),
+            "kernels": self.kernels(),
+            "objective": self.objective,
+            "calibrated": self.measurements is not None,
+            "confession": self.confession,
+        }
+
     def kernels(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for route, n in self.route_census().items():

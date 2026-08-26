@@ -324,12 +324,26 @@ def plan() -> None:
     )
     import dataclasses
 
+    staged = dataclasses.replace(resolved, placement="component_staged")
     check(
         "a STAGED placement derives `staged_decode` from the same census (#549 delivery.py)",
-        dataclasses.replace(resolved, placement="component_staged").wire_materialization()
-        == "staged_decode",
+        staged.wire_materialization() == "staged_decode",
         "WHEN a decode is paid is a fact about the route AND the placement, and it is the "
         "one thing the rung table still owns",
+    )
+
+    # THE CLOSED WORKER SEAM still gets a rung name, and it is DERIVED.
+    document = resolved.wire_document()
+    check(
+        "the wire document carries the worker's own key set, every value derived",
+        document["rung"] == "aot_decode"
+        and staged.wire_document()["rung"] == "staged_decode"
+        and document["variant"] == resolved.variant
+        and document["label"] == resolved.label()
+        and document["plan_digest"] == resolved.digest(),
+        f"rung={document['rung']} beside label={document['label']} — `worker/plan.py`'s "
+        "kernel fence prices a plan against a rung, so a mixed plan prices as what it COSTS "
+        "and reports what it IS; the two used to be one field and it was the label that won",
     )
 
     # Per-tensor truth is IN the plan, with the reason.
