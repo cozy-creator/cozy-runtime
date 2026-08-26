@@ -69,7 +69,22 @@ class RuntimeConfig:
     """The launcher's per-spawn control credential (#449/#463): a Claim must present it as
     `proof`. STRUCTURALLY SECRET — never logged, never in a Report, and never inherited by
     the device child (it is stripped from `child_base_env` below: the executor has no
-    business holding the control plane's credential)."""
+    business holding the control plane's credential).
+
+    This is the SELF-SPAWNED launch mode: the launcher minted the credential, so it knows
+    it. A RENTED pod is the other mode — see `access_token_hashes`."""
+    access_token_hashes: str = ""
+    """The RENTED-POD launch mode (#495e/#560g): the sha256 hash SET a Claim's `proof` is
+    verified against, or the path of the file that holds it, in the format cozy-media
+    already reads (`sha256:<64 hex>`, one per line or comma-separated).
+
+    NOT a secret and that is the whole point: whoever launched this worker holds only
+    hashes, so it can provision a pod it can never authenticate to. The renter minted the
+    token and nobody else was ever told it. A path is re-read per claim, so a rotation of
+    the set converges on the control plane the way it already converges on the byte plane.
+
+    Mutually exclusive with `bootstrap_credential`: two credential authorities over one
+    door is an ambiguity, not a fallback, and it refuses here."""
     child_base_env: tuple[tuple[str, str], ...] = ()
     """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal).
 
@@ -126,11 +141,27 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             f"set COZY_HOME to an absolute directory (default {COZY_HOME_DEFAULT})",
         )
     creds = Credentials(**{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV})
+    bootstrap = env.get("COZY_BOOTSTRAP_CREDENTIAL", "").strip()
+    hashes = env.get("COZY_ACCESS_TOKEN_SHA256", "").strip()
+    if bootstrap and hashes:
+        # TWO AUTHORITIES OVER ONE DOOR (#560g). These are the two launch modes, not a
+        # value and its fallback: a self-spawned worker's launcher MINTED the credential
+        # and a rented pod's launcher only ever held hashes of one it will never see.
+        # A worker handed both cannot say which authority its owner is, and a worker that
+        # cannot say that must not open the door — so this refuses before anything binds.
+        raise ConfigError(
+            "config",
+            "COZY_BOOTSTRAP_CREDENTIAL and COZY_ACCESS_TOKEN_SHA256 are both set",
+            "set exactly one: COZY_BOOTSTRAP_CREDENTIAL for a worker whose launcher minted "
+            "its credential, or COZY_ACCESS_TOKEN_SHA256 for a rented pod whose renter did "
+            "(#495e — the two are launch modes, not a value and a fallback)",
+        )
     _read = True
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        bootstrap_credential=env.get("COZY_BOOTSTRAP_CREDENTIAL", ""),
+        bootstrap_credential=bootstrap,
+        access_token_hashes=hashes,
         child_base_env=tuple(
             sorted(
                 (k, v)

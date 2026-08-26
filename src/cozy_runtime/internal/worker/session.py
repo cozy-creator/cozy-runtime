@@ -40,6 +40,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import hashlib
 import hmac
 import itertools
 import json
@@ -58,7 +59,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import egress, hostfacts
-from cozy_runtime.internal.config import RuntimeConfig, read_config
+from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import child, grants, observe, triage
@@ -346,6 +347,135 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
     return [entry for entry in placements if isinstance(entry, dict)]
 
 
+HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class AccessTokenError(Exception):
+    """A malformed COZY_ACCESS_TOKEN_SHA256 value, refused before anything binds."""
+
+
+class AccessTokenSet:
+    """The RENTED-POD claim credential (#495e/#560g): a set of sha256 hashes a Claim's
+    `proof` is checked against by hashing it.
+
+    The inversion is the whole design. A launcher that holds only hashes can provision a
+    pod and can never authenticate to it — the renter minted the token and told nobody,
+    so the hash the hub holds is not a credential and presenting it proves nothing. That
+    is why this class only ever hashes what it was shown and never renders what it holds.
+
+    Two value shapes, told apart by the value itself rather than by a flag:
+
+      * `sha256:<hex>` entries (comma- or newline-separated) — the LITERAL set, frozen at
+        launch. This is what a provider's create body carries into a pod's environment.
+      * anything else — a PATH to a file of those same entries, re-stat'd on every claim.
+        Rotation is only real if it CONVERGES (#560d), and an environment variable cannot
+        rotate: a hash added after launch admits nobody and a hash removed after launch
+        revokes nothing. A provisioner that intends to rotate delivers the path.
+
+    Everything about the path form is FAIL-CLOSED, exactly as cozy-media's reader is: an
+    unreadable file, a file holding no usable entry, or an mtime that moved BACKWARD
+    leaves the loaded set in place and admits nobody until it reads clean again.
+    """
+
+    def __init__(self, entries: tuple[str, ...] = (), path: Path | None = None) -> None:
+        self.path = path
+        self.entries = entries
+        self.size = -1
+        self.stamp = -1.0
+        self.lock = threading.Lock()
+        self.unreadable = ""
+
+    @classmethod
+    def parse(cls, value: str) -> AccessTokenSet | None:
+        """Build the set from the configured VALUE, or None when there is none."""
+        raw = value.strip()
+        if not raw:
+            return None
+        parts = [p.strip() for p in raw.replace(",", "\n").splitlines() if p.strip()]
+        literal = [p for p in parts if p.startswith("sha256:")]
+        if literal:
+            bad = [p for p in literal if not HASH_ENTRY.match(p)]
+            if bad or len(literal) != len(parts):
+                raise AccessTokenError(
+                    "COZY_ACCESS_TOKEN_SHA256 mixes hash entries with something that is not "
+                    "one; every entry must be `sha256:<64 lowercase hex>`, or the whole "
+                    "value must be a single path to a file of them"
+                )
+            return cls(entries=tuple(literal))
+        if len(parts) != 1:
+            raise AccessTokenError(
+                "COZY_ACCESS_TOKEN_SHA256 holds several entries and none is a "
+                "`sha256:<64 lowercase hex>` hash, so it is neither a hash set nor a path"
+            )
+        return cls(path=Path(parts[0]))
+
+    def reload(self) -> None:
+        """Re-read the hash file iff its (size, mtime) MOVED, refusing a move backward."""
+        if self.path is None:
+            return
+        try:
+            info = self.path.stat()
+        except OSError as err:
+            self.unreadable = f"{self.path} cannot be read: {err}"
+            self.entries = ()
+            return
+        with self.lock:
+            same = info.st_size == self.size and info.st_mtime == self.stamp
+            older = self.stamp >= 0 and info.st_mtime < self.stamp
+        if same:
+            return
+        if older:
+            # The credential epoch is monotone. A file that went backward is a restore
+            # or a clock, and either way it is not the rotation this worker last saw.
+            self.unreadable = f"{self.path} has an mtime older than the loaded set"
+            self.entries = ()
+            return
+        try:
+            text = self.path.read_text()
+        except OSError as err:
+            self.unreadable = f"{self.path} cannot be read: {err}"
+            self.entries = ()
+            return
+        found = tuple(
+            line.strip()
+            for line in text.replace(",", "\n").splitlines()
+            if HASH_ENTRY.match(line.strip())
+        )
+        if not found:
+            self.unreadable = f"{self.path} holds no `sha256:<64 hex>` entry"
+            self.entries = ()
+            return
+        with self.lock:
+            self.entries, self.size, self.stamp = found, info.st_size, info.st_mtime
+        self.unreadable = ""
+
+    def admits(self, presented: str) -> bool:
+        """Hash what was presented and compare it into the live set, constant-time.
+
+        One-directional on purpose: this answers whether a token is one of ours and can
+        never produce one. The hub-side hash presented AS the proof therefore refuses —
+        it is a hash, not a preimage, and `sha256("sha256:…")` is not in any set.
+        """
+        self.reload()
+        with self.lock:
+            entries = self.entries
+        digest = "sha256:" + hashlib.sha256(presented.strip().encode()).hexdigest()
+        admitted = False
+        for entry in entries:
+            if hmac.compare_digest(digest, entry):
+                admitted = True
+        return admitted
+
+    def why_not(self) -> str:
+        """The refusal's cause, naming the unreadable set without rendering any of it."""
+        if self.unreadable:
+            return (
+                "this worker cannot read its own token-hash set, so it admits nobody: "
+                + self.unreadable
+            )
+        return "the presented proof is not a token this worker was provisioned with"
+
+
 class Worker:
     """The no-CUDA control parent — the machine's WORKER process (#455/#484; the name
     `Supervisor` is retired everywhere, and "supervision" survives only as the verb for its
@@ -450,6 +580,10 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
+        #: The OTHER launch mode (#560g): a rented pod, whose launcher was given the hash
+        #: SET of a token the RENTER minted and that the launcher will never see. Config
+        #: already refused a worker handed both, so at most one of these is live.
+        self.access = AccessTokenSet.parse(config.access_token_hashes)
         #: The standing ACQUISITION authority this worker last accepted (§3). Echoed on
         #: every ObservedWorkerState so grant landing is observable with no ack lane.
         self.grant_id = ""
@@ -811,7 +945,17 @@ class Worker:
                     f"rev {WIRE_SCHEMA_REV} {SCHEMA_DIGEST}; no later frame is worth parsing"
                 ),
             )
-        if self.bootstrap and not hmac.compare_digest(
+        # THE CREDENTIAL CHECK, in whichever of the two launch modes this worker was
+        # started in (#560g). A rented pod verifies BY HASH — it holds no copy of the
+        # token, so neither does whoever provisioned it — and a self-spawned worker
+        # compares against the credential its own launcher minted. Both are constant-time
+        # and neither ever renders what it holds into a refusal.
+        if self.access is not None:
+            if not self.access.admits(claim.proof.decode(errors="replace")):
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED, self.access.why_not()
+                )
+        elif self.bootstrap and not hmac.compare_digest(
             claim.proof.decode(errors="replace"), self.bootstrap
         ):
             return reject(
@@ -2546,7 +2690,27 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             flush=True,
         )
         return int(Exit.structural)
-    if remote and not config.bootstrap_credential:
+    # THE HASH SET, VALIDATED BEFORE ANYTHING BINDS (#560g). A malformed value is a
+    # provisioning mistake, and a worker that binds with an unusable credential set would
+    # discover it one claim later — at which point a port is open.
+    try:
+        access = AccessTokenSet.parse(config.access_token_hashes)
+    except AccessTokenError as exc:
+        print(f"[worker] refusing to bind {listen}: {exc}", file=sys.stderr, flush=True)
+        return int(Exit.structural)
+    if remote and access is not None and access.path is not None:
+        # The path form, proven READABLE at launch rather than at the first claim: a pod
+        # whose hash file never arrived admits nobody, and saying so now beats answering
+        # UNAUTHENTICATED to the renter who just paid for it.
+        access.reload()
+        if access.unreadable:
+            print(
+                f"[worker] refusing to bind {listen}: {access.why_not()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return int(Exit.structural)
+    if remote and not config.bootstrap_credential and access is None:
         # THE OTHER HALF OF THE SAME REFUSAL (#493 item 10). One-way TLS authenticates the
         # WORKER to the dialer and says nothing about the dialer, and the Claim check is
         # conditional on a credential being configured — so a TLS listener with no credential
@@ -2557,8 +2721,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         # must not open the door at all.
         print(
             f"[worker] refusing to bind {listen} without a bootstrap credential: a "
-            "non-loopback listener authenticates its owner (COZY_BOOTSTRAP_CREDENTIAL) or it "
-            "does not serve — one-way TLS proves nothing about the dialer",
+            "non-loopback listener authenticates its owner (COZY_BOOTSTRAP_CREDENTIAL when "
+            "the launcher minted the credential, COZY_ACCESS_TOKEN_SHA256 when a renter did) "
+            "or it does not serve — one-way TLS proves nothing about the dialer",
             file=sys.stderr,
             flush=True,
         )
@@ -2584,8 +2749,19 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The PROCESS entrypoint: read the ONE config here, then serve."""
-    return serve_worker(read_config(), argv)
+    """The PROCESS entrypoint: read the ONE config here, then serve.
+
+    A configuration refusal is the worker's own verdict, printed the way every other
+    pre-bind refusal is: a launcher reading this process's output must see WHY nothing
+    bound, and a traceback is not that.
+    """
+    try:
+        config = read_config()
+    except ConfigError as err:
+        print(f"[worker] {err.message}", file=sys.stderr, flush=True)
+        print(f"[worker] remedy: {err.remedy}", file=sys.stderr, flush=True)
+        return int(err.code)
+    return serve_worker(config, argv)
 
 
 if __name__ == "__main__":

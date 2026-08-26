@@ -16,6 +16,13 @@ the fingerprint pin) and the bearer token checked at Claim, constant-time. Secti
        remote worker actually has — a `file://` URL is an address on SOME machine, and a
        pod handed one rooted on the owner's disk would create the directory, write into it
        and declare outputs nobody can read.
+    6. THE HASH-SET LAUNCH MODE (#495e/#560g), the rented-pod credential: the worker is
+       given only sha256 hashes of a token the RENTER minted, and it verifies a Claim by
+       hashing the presented proof into that set. The launcher can provision the pod and
+       can never authenticate to it. Arms: the minted token is admitted; a wrong token is
+       refused; the HASH ITSELF presented as proof is refused (it is a hash, not a
+       preimage); a rotation of the hash FILE converges without a restart; both credential
+       envs at once refuse before anything binds.
 
     nice -n 19 uv run python scripts/remote-live.py
 """
@@ -23,6 +30,7 @@ the fingerprint pin) and the bearer token checked at Claim, constant-time. Secti
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -31,6 +39,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -85,9 +94,13 @@ def mint_cert(tmp: Path) -> tuple[Path, Path]:
     return cert, key
 
 
-def serve_env(home: Path, *, token: str) -> dict[str, str]:
+def serve_env(home: Path, *, token: str, hashes: str = "") -> dict[str, str]:
     """The launch environment. An EMPTY token means the launcher provisioned none, which
-    is the whole subject of section 4 — the variable is absent, not empty-but-present."""
+    is the whole subject of section 4 — the variable is absent, not empty-but-present.
+
+    `hashes` is the OTHER launch mode (#560g): the sha256 set, or the path of the file
+    holding it. Passing both is what section 6's ambiguity arm does on purpose.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
@@ -96,6 +109,8 @@ def serve_env(home: Path, *, token: str) -> dict[str, str]:
     }
     if token:
         env["COZY_BOOTSTRAP_CREDENTIAL"] = token
+    if hashes:
+        env["COZY_ACCESS_TOKEN_SHA256"] = hashes
     return env
 
 
@@ -133,7 +148,14 @@ def serve_argv(
 
 
 def start_remote(
-    tmp: Path, cert: Path, key: Path, *, listen: str, token: str, grant_roots: str = ""
+    tmp: Path,
+    cert: Path,
+    key: Path,
+    *,
+    listen: str,
+    token: str,
+    grant_roots: str = "",
+    hashes: str = "",
 ) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str]]:
     """The weightless worker on a TLS listener, its token provisioned via the environment
     (the one channel a launcher hands it through, #449/#463)."""
@@ -147,7 +169,7 @@ def start_remote(
         serve_argv(listen=listen, root=root, cert=cert, key=key, grant_roots=grant_roots),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=serve_env(home, token=token),
+        env=serve_env(home, token=token, hashes=hashes),
         bufsize=0,
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
@@ -384,8 +406,188 @@ def main() -> int:
             fenced.terminate()
             fenced.wait(timeout=15)
 
+    rc = hash_set_leg(tmp, cert, key, root_cert)
+
     print(f"\nremote leg: {wl.PASS} ok, {wl.FAIL} failed")
-    return 1 if wl.FAIL else 0
+    return 1 if (wl.FAIL or rc) else 0
+
+
+def claim_verdict(
+    addr: str, root_cert: bytes, token: str, process: subprocess.Popen[bytes], log: Path
+) -> Any:
+    """One claim-only connection, returning the ClaimAck — accepted or refused."""
+    hub = wl.Hub()
+    hub.process, hub.log = process, log
+    hub.connect(addr, claim_only=True, root_cert=root_cert, token=token)
+    ack = hub.wait(
+        lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None, 30, "the verdict"
+    )
+    hub.close()
+    return ack
+
+
+def hash_set_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:
+    """Section 6: THE RENTED-POD LAUNCH MODE (#495e/#560g).
+
+    The renter mints the token here — the way `cozy rent` mints it client-side — and the
+    worker is launched with nothing but the hash FILE. Everything the launcher holds is in
+    that file, and none of it is the token.
+    """
+    wl.head("6. the HASH-SET launch mode: the launcher holds hashes, the renter holds the token")
+    minted = "rent-" + os.urandom(24).hex()
+    digest = "sha256:" + hashlib.sha256(minted.encode()).hexdigest()
+    retired = "rent-" + os.urandom(24).hex()
+    retired_digest = "sha256:" + hashlib.sha256(retired.encode()).hexdigest()
+
+    pod = tmp / "podhash"
+    pod.mkdir(parents=True, exist_ok=True)
+    tokens = pod / "tokens"
+    # EXACTLY the file the hub's provisioning pass writes: `sha256:<hex>` lines, 0600, and
+    # the minted token appears nowhere in it.
+    tokens.write_text(retired_digest + "\n" + digest + "\n")
+    tokens.chmod(0o600)
+    wl.check(
+        "the on-pod hash file holds hashes and NOT the token",
+        minted not in tokens.read_text() and digest in tokens.read_text(),
+        f"{tokens} carries {len(tokens.read_text().strip().splitlines())} sha256: lines, 0600",
+    )
+
+    process, root, log, ids = start_remote(
+        pod, cert, key, listen="127.0.0.1:0", token="", hashes=str(tokens)
+    )
+    try:
+        addr = wl.read_addr(root, process)
+
+        # RED FIRST. A wrong token is refused before the green arm proves anything, so the
+        # green arm cannot be a worker that admits everyone.
+        wrong = claim_verdict(addr, root_cert, "rent-" + os.urandom(24).hex(), process, log)
+        wl.check(
+            "a WRONG token is refused CLAIM_REJECTION_UNAUTHENTICATED against the hash set",
+            not wrong.accepted
+            and wrong.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+            f"rejection={pb.ClaimRejection.Name(wrong.rejection)}",
+        )
+
+        # THE INVERSION, as an arm. What the HUB holds is the hash. Presenting it is the
+        # impersonation #495e deletes, and it fails because a hash is not a preimage.
+        as_hash = claim_verdict(addr, root_cert, digest, process, log)
+        wl.check(
+            "the HUB-SIDE HASH presented as proof is refused — a hash is not a preimage",
+            not as_hash.accepted
+            and as_hash.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+            f"presented {digest[:19]}… and it hashes to something in no set",
+        )
+
+        # GREEN: the token the renter minted, which the launcher never saw.
+        hub = wl.Hub()
+        hub.process, hub.log = process, log
+        hub.directive = wl.serving_directive(
+            ll.RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
+        )
+        t0 = time.perf_counter()
+        hub.connect(addr, root_cert=root_cert, token=minted)
+        report = hub.ready(ids["tick"], 60)
+        wl.check(
+            "the RENTER-MINTED token is admitted and the worker is DISPATCHABLE",
+            report.available_attempt_slots > 0,
+            f"{(time.perf_counter() - t0) * 1000:.0f} ms claim->DISPATCHABLE with no "
+            "COZY_BOOTSTRAP_CREDENTIAL in this process's environment at all",
+        )
+        wl.dispatch(
+            hub,
+            pod,
+            ids["tick"],
+            request_id="req-hashset",
+            payload={"note": "claimed by hash set"},
+            release=ll.RELEASE,
+            outputs=0,
+        )
+        body = wl.terminal_body(
+            hub.wait(
+                lambda m: (
+                    m.attempt_outcome
+                    if m.WhichOneof("msg") == "attempt_outcome"
+                    and m.attempt_outcome.request_id == "req-hashset"
+                    else None
+                ),
+                60,
+                "hash-set terminal",
+            )
+        )
+        wl.check(
+            "one invoke lands a SUCCEEDED terminal on the hash-set leg",
+            body["status"] == 1,
+            "the whole claim->dispatch->terminal path, authenticated by hash",
+        )
+        hub.close()
+
+        # ROTATION CONVERGES ON THE CONTROL PLANE (#560d). The hub's ConvergeTokens
+        # rewrites this exact file; nothing restarts, and the next claim sees the new set.
+        rotated = "rent-" + os.urandom(24).hex()
+        rotated_digest = "sha256:" + hashlib.sha256(rotated.encode()).hexdigest()
+        time.sleep(1.1)  # a filesystem mtime this worker can distinguish from the loaded one
+        tokens.write_text(rotated_digest + "\n")
+        before = claim_verdict(addr, root_cert, minted, process, log)
+        wl.check(
+            "after the file is rotated the RETIRED token is refused, with no restart",
+            not before.accepted
+            and before.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+            "the same worker process, the same port, a re-read hash file",
+        )
+        after = claim_verdict(addr, root_cert, rotated, process, log)
+        wl.check(
+            "and the token the rotation ADDED is admitted by that same process",
+            after.accepted,
+            "a rotation that never reached the pod would have revoked nothing (#560d)",
+        )
+
+        # FAIL CLOSED. A hash file that becomes unreadable admits nobody — it does not
+        # fall back to the set it happened to be holding.
+        tokens.unlink()
+        gone = claim_verdict(addr, root_cert, rotated, process, log)
+        wl.check(
+            "an UNREADABLE hash file admits nobody — fail-closed, not last-known-good",
+            not gone.accepted
+            and gone.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+            "the token that worked one call ago is refused because the set cannot be read",
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=15)
+
+    # AMBIGUOUS AUTHORITY. Two credential authorities over one door is not a fallback.
+    both = subprocess.run(
+        serve_argv(listen="0.0.0.0:0", root=tmp / "both", cert=cert, key=key),
+        env=serve_env(tmp / "home", token=TOKEN, hashes=digest),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    out = (both.stderr + both.stdout).strip()
+    wl.check(
+        "a worker handed BOTH credential envs refuses before it binds",
+        both.returncode != 0 and "both set" in out,
+        out.splitlines()[0][:150] if out else f"exit {both.returncode}",
+    )
+
+    # And the INLINE set — what a provider's create body carries into a pod's environment
+    # — is the same credential by a different delivery.
+    inline = start_remote(tmp / "inline", cert, key, listen="127.0.0.1:0", token="", hashes=digest)
+    process2, root2, log2, _ = inline
+    try:
+        addr2 = wl.read_addr(root2, process2)
+        ack = claim_verdict(addr2, root_cert, minted, process2, log2)
+        wl.check(
+            "the INLINE `sha256:` set in the environment admits the same minted token",
+            ack.accepted,
+            "the provider create body's delivery, verified the same way",
+        )
+    finally:
+        if process2.poll() is None:
+            process2.terminate()
+            process2.wait(timeout=15)
+    return 0
 
 
 if __name__ == "__main__":
