@@ -29,6 +29,7 @@ import contextlib
 import json
 import socket
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,9 +81,10 @@ def _scan(value: Any, path: str = "") -> None:
 class Channel:
     """One end of the seam, with its own byte accounting.
 
-    `recv(timeout)` is a per-read stall clock, not a whole-frame budget: the clock resets
-    every time bytes arrive, so a slow frame that keeps moving never times out and a stalled
-    peer does (#434 — progress observation, not a magic total).
+    `recv(timeout)` is a per-read stall clock: the clock resets every time bytes arrive, so
+    a slow frame that keeps moving never times out and a stalled peer does (#434). Lifecycle
+    handshakes can additionally provide `total_timeout`; that one bounds the entire frame so
+    a peer cannot retain executor ownership forever by dripping bytes.
     """
 
     sock: socket.socket
@@ -106,10 +108,14 @@ class Channel:
         self.sent_bytes += HEADER.size + len(data)
         self.frames_out += 1
 
-    def recv(self, timeout: float | None = None) -> dict[str, Any] | None:
+    def recv(
+        self, timeout: float | None = None, *, total_timeout: float | None = None
+    ) -> dict[str, Any] | None:
         """One frame, or None when the peer is gone (a disposable executor's normal end)."""
-        self.sock.settimeout(timeout)
-        head = self._read_exact(HEADER.size, boundary=True)
+        deadline = time.monotonic() + total_timeout if total_timeout is not None else None
+        head = self._read_exact(
+            HEADER.size, boundary=True, stall_timeout=timeout, deadline=deadline
+        )
         if head is None:
             return None
         (length,) = HEADER.unpack(head)
@@ -122,7 +128,7 @@ class Channel:
                 f"declared {length} B against the {MAX_FRAME} B control cap — refused "
                 "before allocation; the channel is not recoverable past a lying header",
             )
-        body = self._read_exact(length, boundary=False)
+        body = self._read_exact(length, boundary=False, stall_timeout=timeout, deadline=deadline)
         assert body is not None  # boundary=False never yields None
         self.recv_bytes += HEADER.size + length
         self.frames_in += 1
@@ -130,7 +136,14 @@ class Channel:
         assert isinstance(value, dict)
         return value
 
-    def _read_exact(self, want: int, *, boundary: bool) -> bytes | None:
+    def _read_exact(
+        self,
+        want: int,
+        *,
+        boundary: bool,
+        stall_timeout: float | None,
+        deadline: float | None,
+    ) -> bytes | None:
         """Exactly `want` bytes, looping over short reads.
 
         `boundary=True` marks the frame boundary (the first header byte): EOF or a peer
@@ -139,12 +152,27 @@ class Channel:
         buf = bytearray()
         while len(buf) < want:
             at_boundary = boundary and not buf
+            read_timeout = stall_timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SeamError(
+                        "seam_total_timeout",
+                        f"frame deadline expired with {len(buf)}/{want} B read",
+                    )
+                read_timeout = remaining if read_timeout is None else min(read_timeout, remaining)
+            self.sock.settimeout(read_timeout)
             try:
                 chunk = self.sock.recv(want - len(buf))
             except TimeoutError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise SeamError(
+                        "seam_total_timeout",
+                        f"frame deadline expired with {len(buf)}/{want} B read",
+                    ) from None
                 raise SeamError(
                     "seam_timeout",
-                    f"no bytes for {self.sock.gettimeout()} s with {len(buf)}/{want} B read",
+                    f"no bytes for {read_timeout} s with {len(buf)}/{want} B read",
                 ) from None
             except OSError as exc:
                 if exc.errno in _GONE_ERRNOS:

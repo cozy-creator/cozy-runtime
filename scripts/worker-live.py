@@ -792,6 +792,7 @@ def start_worker(
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
+    project = Path(str((overrides or {}).get("project") or ROOT / "corpus" / "endpoint"))
     hub = hub or Hub()
     hub.directive = serving_directive(release, sorted(ids.values()), posture)
     hub.revision = 1
@@ -820,6 +821,8 @@ def start_worker(
         f"unix:{socket_path}",
         "--root",
         str(root),
+        "--project",
+        str(project),
         "--instance-id",
         instance_id or f"ins-{uuid.uuid4().hex[:12]}",
         "--release-id",

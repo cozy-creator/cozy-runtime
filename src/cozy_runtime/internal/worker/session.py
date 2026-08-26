@@ -48,7 +48,6 @@ import os
 import queue
 import re
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -58,7 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import child_env, config, egress, hostfacts
+from cozy_runtime.internal import accel, child_env, config, egress, hostfacts, proctree
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -534,6 +533,11 @@ class Worker:
             base_env=config.child_base_env,
             cozy_home=config.cozy_home,
         )
+        self.supervision.on_change = self.executor_changed
+        # One accepted stream at a time may mutate control state. Claims take this through
+        # their snapshot, so ownership cannot move in the middle of convergence and a frame
+        # from the superseded stream cannot finish under its successor's generation.
+        self.control_lock = threading.RLock()
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
         #: plan id -> why THIS binding could not be prepared (#572d). A faulted binding
@@ -570,9 +574,6 @@ class Worker:
             device_process=self.read_device_process,
         )
         self.engine.boot_id = self.fence.worker_boot_id
-        self.engine.placement_id = lambda: (
-            self.placement.placement_id if self.placement is not None else ""
-        )
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -775,35 +776,32 @@ class Worker:
         else:
             self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
 
+    def executor_changed(self, executor: child.Executor | None) -> None:
+        """Move the ledger at the same boundary that publishes executor ownership.
+
+        A job generation has no construction report, so resetting only in the serving fill
+        path lets it inherit the previous serving process's baseline and residency. The
+        supervision callback covers every spawn and retirement before either can be
+        observed through the session.
+        """
+        self.ledger.begin_generation(executor.pid if executor is not None else 0)
+
     def read_device_process(self) -> int:
-        """NVML per-process device bytes for the EXECUTOR, read by the worker parent.
-        -1 is UNREADABLE and never a zero."""
-        pid = self.ledger.executor_pid
-        if not pid:
+        """NVML bytes for the current executor; -1 remains UNREADABLE/ABSENT here.
+
+        The ledger's legacy scalar cannot express absence separately. Lifecycle reclaim uses
+        AcceleratorOps' tri-state observation directly, where that distinction is authoritative.
+        """
+        executor = self.supervision.current
+        if executor is None:
             return -1
-        try:
-            out = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return -1
-        for line in out.stdout.strip().splitlines():
-            parts = [part.strip() for part in line.split(",")]
-            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
-                return int(parts[1]) * 1024 * 1024
-        return -1
+        observed = accel.process_memory(executor.pid, accel.host_backend_family())
+        return observed.bytes if observed.state == "present" else -1
 
     def read_device_work(self) -> int:
         """How much work the EXECUTOR has done, read by the parent — THE meter."""
-        return child.work(self.ledger.executor_pid)
+        executor = self.supervision.current
+        return child.work(executor.pid if executor is not None else 0)
 
     def applied_posture(self) -> dict[str, Any]:
         """The state the worker was in when something happened (§3.6). `readiness_epoch` is
@@ -879,20 +877,21 @@ class Worker:
         if claim is None:
             self.note("claim", "dropped a stream whose first frame is not a Claim")
             return
-        generation, outbound = self.accept_claim(claim, send)
-        if generation == 0:
-            return  # refused; the rejection already went out and the stream ends
-        if self.boot_fatal is not None:
-            # The boot-fatal verdict INSTEAD of ClaimAck (01, #494c): the claim was
-            # AUTHENTICATED and FENCED above — that is what makes the verdict deliverable to
-            # this dialer — and then the worker says the one true thing it has to say. It
-            # used to ack the claim, send a snapshot, and only then confess it never booted,
-            # which is an owner told it holds a working worker and corrected afterwards.
-            send(self.stamp(pb.WorkerFrame(boot_failure=self.boot_fatal)))
-            self.note("boot", "boot failure delivered INSTEAD of ClaimAck; stopping")
-            self.shutdown_from_stream()
-            return
-        self._send_claim_ack(claim, generation, send)
+        # Acceptance and the snapshot are one control transition. In particular, the claim
+        # cannot snapshot half of a desired-state replacement running on another stream.
+        with self.control_lock:
+            generation, outbound = self.accept_claim(claim, send)
+            if generation == 0:
+                return  # refused; the rejection already went out and the stream ends
+            if self.boot_fatal is not None:
+                # The boot-fatal verdict INSTEAD of ClaimAck (01, #494c): the claim was
+                # AUTHENTICATED and FENCED above — that is what makes the verdict deliverable
+                # to this dialer — and then the worker says the one true thing it has to say.
+                send(self.stamp(pb.WorkerFrame(boot_failure=self.boot_fatal)))
+                self.note("boot", "boot failure delivered INSTEAD of ClaimAck; stopping")
+                self.shutdown_from_stream()
+                return
+            self._send_claim_ack(claim, generation, send)
 
         sender = threading.Thread(
             target=self._pump_outbound,
@@ -1225,6 +1224,19 @@ class Worker:
         return False
 
     def _dispatch_frame(self, frame: pb.RecordOwnerFrame, generation: int) -> None:
+        """Apply one frame while its stream still owns the worker.
+
+        The stream generation is checked inside the same lock claims take. Trusting only the
+        frame envelope left a check/use window in which a new claim could supersede this
+        stream and the old handler could then mutate state and stamp replies as the new one.
+        """
+        with self.control_lock:
+            if generation != self.fence.control_stream_generation:
+                self.note("fence", f"dropped a frame from superseded stream {generation}")
+                return
+            self._dispatch_current_frame(frame)
+
+    def _dispatch_current_frame(self, frame: pb.RecordOwnerFrame) -> None:
         kind = frame.WhichOneof("msg")
         if kind is None:
             return
@@ -1266,7 +1278,7 @@ class Worker:
             return
         if kind == "desired_state":
             try:
-                self.apply_desired_state(inner)
+                self._apply_desired_state(inner)
             except (ExecutorGone, JournalError) as exc:
                 self.note("desired_state", f"apply failed: {exc}")
                 self.latch(
@@ -1377,7 +1389,7 @@ class Worker:
 
     # ------------------------------------------------------------- the desired state
 
-    def apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
+    def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
         """FULL REPLACE. A field absent means absent, never unchanged (§3).
 
         ORDER, and none of it is negotiable:
@@ -1478,6 +1490,19 @@ class Worker:
             return
         if mode != "placement_set":
             self.note("desired_state", "no mode: nothing to converge to")
+            executor = self.supervision.current
+            if executor is not None:
+                try:
+                    self.supervision.retire_current(executor, "empty desired state")
+                except ExecutorGone as exc:
+                    self.latched = f"executor_reclaim_failed: {exc}"[:200]
+                    self.note("recovery", self.latched)
+            self.placement = None
+            self.bindings = {}
+            self.prepared_models = {}
+            self.engine.bindings = {}
+            self.engine.prepared_models = {}
+            self.set_job_ready(False)
             return
 
         desired_set = desired.placement_set
@@ -1505,6 +1530,16 @@ class Worker:
         self.jobs = {}
         self.engine.jobs = {}
         if not placements:
+            executor = self.supervision.current
+            if executor is not None:
+                try:
+                    self.supervision.retire_current(executor, "accepted placement set is empty")
+                except ExecutorGone as exc:
+                    self.latched = f"executor_reclaim_failed: {exc}"[:200]
+                    self.note("recovery", self.latched)
+                    self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+                    self._settle()
+                    return
             self.placement = None
             self.engine.bindings = {}
             self.engine.prepared_models = {}
@@ -1659,6 +1694,18 @@ class Worker:
         self.engine.prepared_models = {}
         self.jobs = {}
         self.placement = None
+        self.set_job_ready(False)
+        previous = self.supervision.current
+        if previous is not None:
+            try:
+                self.supervision.retire_current(
+                    previous, "entering job mode retires the serving generation"
+                )
+            except ExecutorGone as exc:
+                self.note("boot", f"the serving executor could not be reclaimed: {exc}")
+                self.latched = "job_executor_reclaim_failed"
+                self._settle()
+                return
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
         if not record.is_file():
@@ -1670,7 +1717,6 @@ class Worker:
                     detail=f"no local record for {job.job_descriptor_id}",
                 )
             )
-            self.set_job_ready(False)
             self.latched = "unresolved_job_descriptor"
             return
         self.jobs[job.job_descriptor_id] = JobBinding.read(json.loads(record.read_text()))
@@ -1683,23 +1729,20 @@ class Worker:
             f"{self.jobs[job.job_descriptor_id].job!r}, device floor {job.device_count}, "
             f"reclaim_on_terminal={job.reclaim_on_terminal}",
         )
-        self.set_job_ready(False)
-        executor = self.supervision.current
-        if executor is None or not executor.alive():
-            try:
-                executor = self.supervision.spawn(imposed=self.imposed())
-            except ExecutorGone as exc:
-                self.note("boot", f"the job executor never dialled back: {exc}")
-                self.latched = "job_executor_absent"
-                self._settle()
-                return
-            self.ledger.executor_pid = executor.pid
-            self.note(
-                "boot",
-                f"job executor generation {executor.incarnation} pid {executor.pid} dialled "
-                f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
-                f"(torch_loaded={executor.hello.get('torch_loaded')})",
-            )
+        try:
+            executor = self.supervision.spawn(imposed=self.imposed())
+        except ExecutorGone as exc:
+            self.note("boot", f"the job executor never dialled back: {exc}")
+            self.latched = "job_executor_absent"
+            self._settle()
+            return
+        executor.purpose = "job"
+        self.note(
+            "boot",
+            f"job executor generation {executor.incarnation} pid {executor.pid} dialled "
+            f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
+            f"(torch_loaded={executor.hello.get('torch_loaded')})",
+        )
         self.set_job_ready(True)
 
     # ------------------------------------------------------------- activation
@@ -1713,36 +1756,109 @@ class Worker:
         one enum could not hold both.
         """
         if not self.bindings:
+            executor = self.supervision.current
+            if executor is not None:
+                try:
+                    self.supervision.retire_current(executor, "placement has no bindings")
+                except ExecutorGone as exc:
+                    self.latched = f"executor_reclaim_failed: {exc}"[:200]
+                    self.note("recovery", self.latched)
+                    self._settle()
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "no bindings")
             return
         # A fresh activation re-earns every verdict; a stale fault must not outlive the
         # prepare that produced it.
         self.failed_bindings.clear()
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
+        by_construction: dict[str, list[DeclaredBinding]] = {}
+        for binding in self.bindings.values():
+            by_construction.setdefault(binding.construction_key(), []).append(binding)
+        if len(by_construction) != 1:
+            detail = (
+                f"the launch worker received {len(by_construction)} distinct model "
+                "constructions, but one executor can own exactly one prepared generation"
+            )
+            for binding in self.bindings.values():
+                self.failed_bindings[binding.entrypoint_binding_plan_id] = detail
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=binding.entrypoint_binding_plan_id,
+                        reason="multiple_constructions_unsupported",
+                        detail=detail,
+                    )
+                )
+            executor = self.supervision.current
+            if executor is not None:
+                try:
+                    self.supervision.retire_current(executor, detail)
+                except ExecutorGone as exc:
+                    self.note("recovery", f"multi-construction reclaim failed: {exc}")
+            self.latched = "multiple_constructions_unsupported"
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+            self._settle()
+            return
+
+        construction_key, group = next(iter(by_construction.items()))
+        binding_set = frozenset(binding.entrypoint_binding_plan_id for binding in group)
         executor = self.supervision.current
-        # A GENERATION IS EXECUTOR-SCOPED, AND AN EXECUTOR HOLDS ONE (#574b). An activation
-        # that reaches a live executor which already prepared a generation used to build a
-        # SECOND one inside it: the same allocator then held both, and on H3 that was 90.84
-        # GiB of a completed fill plus 48.18 GiB of the next one on a 139.81 GiB card — the
-        # OOM that read as "the fill plane allocates 63% more than it accounts for". It was
-        # reachable because a control stream died AFTER a successful prepare and the client
-        # re-accepted the same placement, but nothing about the second prepare is safe even
-        # when the first one is forgotten on purpose: the executor's residency is not
-        # something a re-prepare can subtract. So a re-activation REPLACES the incarnation,
-        # which is the only operation that actually returns the card.
-        if executor is not None and executor.alive() and executor.ready_plans:
+        if (
+            executor is not None
+            and executor.alive()
+            and not executor.poisoned
+            and executor.construction_key == construction_key
+            and executor.prepared_binding_set == binding_set
+            and executor.prepared_model is not None
+        ):
+            executor.ready_plans.clear()
+            for binding in group:
+                if binding.expected_logical_model_digest and (
+                    binding.expected_logical_model_digest
+                    != executor.prepared_model.logical_model_digest
+                ):
+                    self.failed_bindings[binding.entrypoint_binding_plan_id] = (
+                        "logical model digest mismatch"
+                    )
+                    continue
+                executor.ready_plans.add(binding.entrypoint_binding_plan_id)
+                self.prepared_models[binding.entrypoint_binding_plan_id] = executor.prepared_model
+            self.engine.bindings = self.bindings
+            self.engine.prepared_models = self.prepared_models
             self.note(
                 "boot",
-                f"generation {executor.incarnation} already holds "
-                f"{len(executor.ready_plans)} prepared binding plan(s); a re-activation "
-                "replaces the incarnation rather than filling a second generation into an "
-                "allocator that is still holding the first",
+                f"reused generation {executor.incarnation} pid {executor.pid} for the same "
+                f"construction ({len(executor.ready_plans)} binding plan(s))",
             )
-            self.supervision.invalidate("re-activation over a prepared generation")
-            executor = None
-        if executor is None or not executor.alive():
-            self.note("boot", "spawning the device executor (exec-first trampoline)")
-            executor = self.supervision.spawn(imposed=self.imposed())
-            self.ledger.executor_pid = executor.pid
+            if executor.ready_plans:
+                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
+                self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+            else:
+                self.latched = "logical model digest mismatch"
+                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+            return
+
+        try:
+            if executor is None:
+                self.note("boot", "spawning the device executor (exec-first trampoline)")
+                executor = self.supervision.spawn(imposed=self.imposed())
+            elif (
+                executor.alive()
+                and not executor.poisoned
+                and executor.purpose == "fresh"
+                and not executor.ready_plans
+                and executor.prepared_model is None
+            ):
+                self.note(
+                    "boot",
+                    f"preparing fresh generation {executor.incarnation} pid {executor.pid}",
+                )
+            else:
+                self.note("boot", "replacing the device executor for a new construction")
+                executor = self.supervision.replace(
+                    executor,
+                    imposed=self.imposed(),
+                    why="desired construction changed",
+                )
             self.note(
                 "boot",
                 f"generation {executor.incarnation} pid {executor.pid} dialled back in "
@@ -1751,59 +1867,82 @@ class Worker:
                 f"oom_score_adj={executor.hello.get('oom_score_adj')}, "
                 f"torch_loaded={executor.hello.get('torch_loaded')})",
             )
-        by_construction: dict[str, list[DeclaredBinding]] = {}
-        for binding in self.bindings.values():
-            by_construction.setdefault(binding.construction_key(), []).append(binding)
+        except ExecutorGone as exc:
+            self.latched = f"executor_activation_failed: {exc}"[:200]
+            self.note("boot", self.latched)
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "executor absent")
+            self._settle()
+            return
+
         for group in by_construction.values():
             first = group[0]
             started = time.perf_counter()
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
-            reply = executor.call(
-                {
-                    "cmd": "prepare",
-                    "binding": {
-                        # THIS machine's root, not the record writer's (#563f). See
-                        # WorkerOptions.project: the record's `project` is the resolution of
-                        # whoever wrote it, and on a rented pod that path is not here.
-                        "project": str(self.options.project or Path.cwd()),
-                        "model_class": first.model_class,
-                        "model_binding_path": first.model_binding_path,
-                        "model_parameter_name": first.model_parameter_name,
-                        "component": first.components[0] if first.components else "",
-                        "components": list(first.components),
-                        "snapshots": dict(first.snapshots),
-                        "store": first.store,
-                        "config": first.config,
-                        "snapshot": first.reference_snapshot,
-                        "release": first.release,
-                        "variant": first.variant,
-                        # THE STAMP PLANE'S LAST HOP (#567d). The index row carries what the
-                        # hub verified at publish; the executor hands it to `Artifact`, and
-                        # a model class's keywords join it there. Dropping it here is what
-                        # made `artifact.stamps` unconditionally `{}` and refused every
-                        # stamped class on every checkpoint.
-                        "stamps": {k: list(v) for k, v in first.stamps.items()},
-                        "custody": first.custody,
-                        "strict_keys": first.strict_keys,
-                        "probe_cache": str(self.config.cozy_home / "probe"),
-                        "variants": [dataclasses.asdict(offer) for offer in first.offered],
-                        "objective": first.objective,
-                        "steps_basis": first.steps_basis,
-                        "delivery_cache": str(self.config.cozy_home / "probe"),
+            try:
+                reply = executor.call(
+                    {
+                        "cmd": "prepare",
+                        "binding": {
+                            # THIS machine's root, not the record writer's (#563f). See
+                            # WorkerOptions.project: the record's `project` is the resolution of
+                            # whoever wrote it, and on a rented pod that path is not here.
+                            "project": str(self.options.project or Path.cwd()),
+                            "model_class": first.model_class,
+                            "model_binding_path": first.model_binding_path,
+                            "model_parameter_name": first.model_parameter_name,
+                            "component": first.components[0] if first.components else "",
+                            "components": list(first.components),
+                            "snapshots": dict(first.snapshots),
+                            "store": first.store,
+                            "config": first.config,
+                            "snapshot": first.reference_snapshot,
+                            "release": first.release,
+                            "variant": first.variant,
+                            # THE STAMP PLANE'S LAST HOP (#567d). The index row carries what the
+                            # hub verified at publish; the executor hands it to `Artifact`, and
+                            # a model class's keywords join it there. Dropping it here is what
+                            # made `artifact.stamps` unconditionally `{}` and refused every
+                            # stamped class on every checkpoint.
+                            "stamps": {k: list(v) for k, v in first.stamps.items()},
+                            "custody": first.custody,
+                            "strict_keys": first.strict_keys,
+                            "probe_cache": str(self.config.cozy_home / "probe"),
+                            "variants": [dataclasses.asdict(offer) for offer in first.offered],
+                            "objective": first.objective,
+                            "steps_basis": first.steps_basis,
+                            "delivery_cache": str(self.config.cozy_home / "probe"),
+                        },
+                        "budgets": {
+                            "vram": first.model_weight_bytes,
+                            "pinned": first.pinned_bytes,
+                            "resident": first.resident_budget_bytes,
+                        },
+                        "expect_construction_digest": first.expected_logical_model_digest,
                     },
-                    "budgets": {
-                        "vram": first.model_weight_bytes,
-                        "pinned": first.pinned_bytes,
-                        "resident": first.resident_budget_bytes,
-                    },
-                    "expect_construction_digest": first.expected_logical_model_digest,
-                },
-                timeout=None,
-                on_progress=lambda frame: self.monitor.advance(
-                    f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
-                ),
-            )
+                    timeout=None,
+                    on_progress=lambda frame: self.monitor.advance(
+                        f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
+                    ),
+                )
+            except ExecutorGone as exc:
+                self.monitor.end(subject, "executor_gone")
+                detail = f"executor disappeared during prepare: {exc}"[:1024]
+                for member in group:
+                    self.failed_bindings[member.entrypoint_binding_plan_id] = detail
+                    self.engine.fault(
+                        pb.Fault(
+                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            subject=member.entrypoint_binding_plan_id,
+                            reason="executor_gone_during_prepare",
+                            detail=safe(detail),
+                        )
+                    )
+                try:
+                    self.supervision.retire_current(executor, detail)
+                except ExecutorGone as reclaim:
+                    self.note("recovery", f"prepare-loss reclaim failed: {reclaim}")
+                continue
             took = (time.perf_counter() - started) * 1000
             if not reply.get("ok"):
                 self.monitor.end(subject, str(reply.get("code")))
@@ -1884,12 +2023,14 @@ class Worker:
                     )
                     + "]",
                 )
-                # The executor generation is poisoned by the failed construction, so it is
-                # replaced — and the loop CONTINUES onto the next binding group, which gets
-                # the fresh executor it needs.
-                self.supervision.invalidate(f"prepare refused: {reply.get('code')}")
-                executor = self.supervision.spawn(imposed=self.imposed())
-                self.ledger.executor_pid = executor.pid
+                # A failed construction owns no retry policy. Retire its possibly retained
+                # allocations and remain offline; convergence decides whether to try again.
+                try:
+                    self.supervision.retire_current(
+                        executor, f"prepare refused: {reply.get('code')}"
+                    )
+                except ExecutorGone as exc:
+                    self.note("recovery", f"prepare refusal reclaim failed: {exc}")
                 continue
             digest = reply["model_construction_digest"]
             delivery = reply.get("delivery") or {}
@@ -1900,6 +2041,10 @@ class Worker:
                 delivery_variant=str(delivery.get("variant", "")),
                 weight_bytes=int(reply["facts"]["filled_bytes"]),
             )
+            executor.construction_key = construction_key
+            executor.prepared_binding_set = binding_set
+            executor.prepared_model = resolved
+            executor.purpose = "serving"
             for binding in group:
                 if binding.expected_logical_model_digest and (
                     binding.expected_logical_model_digest != digest
@@ -1958,18 +2103,23 @@ class Worker:
                 f"{len(self.bindings) - len(self.failed_bindings)} of {len(self.bindings)} "
                 f"binding(s) prepared; faulted: " + ", ".join(sorted(self.failed_bindings)),
             )
-        self.run_warm_pass()
+        if not self.run_warm_pass():
+            self.latched = "executor_lost_during_warm"
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+            self._settle()
+            return
         self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
         if not self.latched:
             self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
 
-    def run_warm_pass(self) -> None:
+    def run_warm_pass(self) -> bool:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
         if self.options.no_warm:
-            return
+            executor = self.supervision.current
+            return executor is not None and self.supervision.owns(executor)
         executor = self.supervision.current
         if executor is None:
-            return
+            return False
         for plan_id, binding in self.bindings.items():
             if plan_id not in executor.ready_plans:
                 continue
@@ -1995,12 +2145,13 @@ class Worker:
                     "boot_warmup_observed": bool(reply.get("boot_warmup_observed", False)),
                 }
             except ExecutorGone as exc:
-                outcome = {
-                    "entrypoint": binding.entrypoint,
-                    "outcome": "failed",
-                    "reason": str(exc)[:200],
-                    "boot_warmup_observed": False,
-                }
+                self.supervision.invalidate(executor, "executor died during warmup")
+                try:
+                    self.supervision.retire_current(executor, "executor died during warmup")
+                except ExecutorGone as reclaim:
+                    self.note("recovery", f"warmup reclaim failed: {reclaim}")
+                self.note("warm", f"{binding.entrypoint}: executor lost: {exc}"[:200])
+                return False
             outcome["ms"] = round((time.perf_counter() - started) * 1000, 1)
             outcome["demand_evidence"] = False
             self.boot.step(
@@ -2031,11 +2182,19 @@ class Worker:
                 )
         if self.warm and executor.alive():
             try:
-                self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
+                self.ledger.observe_probe(
+                    executor.call({"cmd": "probe"}, timeout=30.0, total_timeout=30.0)
+                )
             except ExecutorGone:
-                return
+                self.supervision.invalidate(executor, "executor died during warmup probe")
+                try:
+                    self.supervision.retire_current(executor, "executor died during warmup probe")
+                except ExecutorGone as reclaim:
+                    self.note("recovery", f"warmup probe reclaim failed: {reclaim}")
+                return False
             shift = self.ledger.rebaseline("boot warm pass")
             self.note("warm", f"the resident device baseline moved {shift:+d} B on the warm pass")
+        return self.supervision.owns(executor)
 
     def imposed(self) -> dict[str, str]:
         """The IMPOSE half of the seal. Every name here is in the reviewed allowlist."""
@@ -2144,7 +2303,7 @@ class Worker:
                 "lane: it is held, and its acceptance publishes when the lane admits it",
             )
             return
-        if attempt.state in ("accepted", "running"):
+        if attempt.state in ("accepted", "running", "finalizing"):
             self.note(
                 "attempt",
                 "duplicate AttemptOffer for a held attempt: re-accepting "
@@ -2283,48 +2442,96 @@ class Worker:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
         key = f"{attempt.request_id}#{attempt.attempt}"
         self.await_settled(attempt)
-        if attempt.canceling:
-            self.note("cancel", f"{key} was cancelled before admission")
-            self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
-            return False
-        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-        if deadline_ms and time.time() * 1000 > deadline_ms:
-            self.note("cancel", f"{key} reached the lane past its deadline")
-            self.terminate(attempt, self.engine.finish_cancel, "deadline")
-            return False
-        if self.accepted.posture == pb.Posture.POSTURE_DRAINING:
-            self.note("intake", f"draining: refusing queued {key}")
-            self.terminate(
-                attempt,
-                self.engine.refuse_held,
-                "draining",
-                "the worker began draining while this attempt was queued",
-                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-            return False
-        try:
-            accepted = self.engine.prepare_and_accept(attempt)
-        except AttemptRefusal as exc:
-            self.note("attempt", f"{key} refused: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
-            return False
-        except JournalError as exc:
-            self.note(
-                "journal",
-                f"{exc.code}: acknowledging nothing and executing nothing for {key}",
-            )
-            self.engine.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=key,
-                    reason=exc.code,
-                    detail=exc.detail[:1024],
+        # Desired-state convergence and executor rebuilds take this same lock. Recheck the
+        # offer's immutable routing facts under it, then hold it through the acceptance
+        # journal: a queued offer cannot be accepted on the far side of a placement or
+        # admission-generation change merely because it passed `on_offer()` earlier.
+        with self.control_lock:
+            if attempt.canceling:
+                self.note("cancel", f"{key} was cancelled before admission")
+                self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
+                return False
+            deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
+            if deadline_ms and time.time() * 1000 > deadline_ms:
+                self.note("cancel", f"{key} reached the lane past its deadline")
+                self.terminate(attempt, self.engine.finish_cancel, "deadline")
+                return False
+            if attempt.admission_generation != self.admission_generation:
+                self.note(
+                    "admission",
+                    f"refusing queued {key}: offered generation "
+                    f"{attempt.admission_generation}, current {self.admission_generation}",
                 )
-            )
-            self.fail_machine(exc.code)  # fault first, then the edge
-            return False
+                self.terminate(
+                    attempt,
+                    self.engine.refuse_held,
+                    "admission_generation_stale",
+                    f"the queued offer echoes admission generation "
+                    f"{attempt.admission_generation} and this worker is now at "
+                    f"{self.admission_generation}",
+                    CAUSE.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+                )
+                return False
+            if self.accepted.mode == "serving":
+                wanted = self.placement.placement_id if self.placement is not None else ""
+                if attempt.placement_id != wanted:
+                    self.note(
+                        "admission",
+                        f"refusing queued {key}: placement {attempt.placement_id!r} is no "
+                        f"longer {wanted!r}",
+                    )
+                    self.terminate(
+                        attempt,
+                        self.engine.refuse_held,
+                        "unknown_placement",
+                        f"the queued offer names placement {attempt.placement_id!r} and "
+                        f"this worker now hosts {wanted!r}",
+                        CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
+                    )
+                    return False
+            if not self.dispatchable():
+                self.note("admission", f"refusing queued {key}: worker is not dispatchable")
+                self.terminate(
+                    attempt,
+                    self.engine.refuse_held,
+                    "placement_not_dispatchable",
+                    "the worker stopped being dispatchable while this offer was queued",
+                    CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+                )
+                return False
+            if self.accepted.posture == pb.Posture.POSTURE_DRAINING:
+                self.note("intake", f"draining: refusing queued {key}")
+                self.terminate(
+                    attempt,
+                    self.engine.refuse_held,
+                    "draining",
+                    "the worker began draining while this attempt was queued",
+                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                )
+                return False
+            try:
+                accepted = self.engine.prepare_and_accept(attempt)
+            except AttemptRefusal as exc:
+                self.note("attempt", f"{key} refused: {exc.code}")
+                self.terminate(
+                    attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+                )
+                return False
+            except JournalError as exc:
+                self.note(
+                    "journal",
+                    f"{exc.code}: acknowledging nothing and executing nothing for {key}",
+                )
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                        subject=key,
+                        reason=exc.code,
+                        detail=exc.detail[:1024],
+                    )
+                )
+                self.fail_machine(exc.code)  # fault first, then the edge
+                return False
         self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
@@ -2384,26 +2591,29 @@ class Worker:
 
     def rebuild_if_needed(self) -> None:
         """The queue starts behind the rebuild because BOTH live on this lane."""
-        current = self.supervision.current
-        if self.supervision.needs_rebuild:
-            self.rebuild("readiness was invalidated during the attempt")
-        elif current is None or not current.alive():
-            self.rebuild("the executor is gone")
-        elif current.poisoned:
-            self.rebuild(f"poisoned: {current.poisoned}")
+        with self.control_lock:
+            current = self.supervision.current
+            if current is None or not current.alive():
+                self._rebuild_locked("the executor is gone")
+            elif current.poisoned:
+                self._rebuild_locked(f"poisoned: {current.poisoned}")
 
     def rebuild(self, why: str) -> None:
         """Replace the executor and RELOAD before the placement is dispatchable again."""
+        with self.control_lock:
+            self._rebuild_locked(why)
+
+    def _rebuild_locked(self, why: str) -> None:
+        """Rebuild while desired-state convergence is excluded."""
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING, "executor rebuild")
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
-        killed = self.supervision.sweep_orphans(
-            exclude=self.supervision.current.pid if self.supervision.current else 0
-        )
-        if killed:
-            self.note("recovery", f"fenced {len(killed)} orphan executor(s): {killed}")
+        current = self.supervision.current
         try:
-            self.supervision.replace(imposed=self.imposed())
+            if current is None:
+                self.supervision.spawn(imposed=self.imposed())
+            else:
+                self.supervision.replace(current, imposed=self.imposed(), why=why)
         except ExecutorGone as exc:
             self.note("recovery", f"respawn failed: {exc}")
             self.latched = f"executor_respawn_failed: {exc}"[:200]
@@ -2412,9 +2622,6 @@ class Worker:
             return
         self.bump_admission("executor respawned")
         self.prepare_executor()
-        # Cleared LAST: an invalidation raised by another thread WHILE the rebuild ran is
-        # about the executor this rebuild just replaced.
-        self.supervision.needs_rebuild = False
         self.note(
             "recovery",
             f"dispatchable again in {(time.perf_counter() - started) * 1000:.0f} ms at "
@@ -2426,15 +2633,27 @@ class Worker:
         """The deadline and the grace clock — both the WORKER's, never author code's."""
         while not self.stop.wait(0.05):
             for attempt in list(self.engine.live.values()):
-                if attempt.state != "running":
+                if attempt.state not in ("running", "reclaiming"):
                     continue
                 deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-                if deadline_ms and time.time() * 1000 > deadline_ms and not attempt.canceling:
-                    attempt.canceling = "deadline"
+                deadline_expired = False
+                with attempt.transition_lock:
+                    if (
+                        attempt.state == "running"
+                        and deadline_ms
+                        and time.time() * 1000 > deadline_ms
+                        and not attempt.canceling
+                    ):
+                        attempt.canceling = "deadline"
+                        executor = attempt.executor
+                        if executor is not None:
+                            self.supervision.cooperative_cancel(
+                                executor, f"{attempt.request_id}#{attempt.attempt}"
+                            )
+                        attempt.cancel_started = time.perf_counter()
+                        deadline_expired = True
+                if deadline_expired:
                     self.note("cancel", f"deadline expired for {attempt.request_id}")
-                    if self.supervision.current is not None:
-                        self.supervision.current.cooperative_cancel()
-                    attempt.cancel_started = time.perf_counter()
                 if attempt.canceling:
                     started = getattr(attempt, "cancel_started", 0.0) or time.perf_counter()
                     attempt.cancel_started = started
@@ -2444,7 +2663,21 @@ class Worker:
                             f"grace of {self.options.grace:g} s expired: escalating to a "
                             "forceful kill (the handler never asked whether it was cancelled)",
                         )
-                        facts = self.engine.escalate(attempt, self.options.grace)
+                        try:
+                            facts = self.engine.escalate(attempt, self.options.grace)
+                        except Exception as exc:
+                            # A failed reclaim is NOT a cancellation result. Keep the
+                            # executor owned, withdraw machine admission, and leave this
+                            # watchdog as the retrying owner. A one-shot exception here used
+                            # to kill the watchdog thread and strand the executor forever.
+                            self.note(
+                                "cancel",
+                                f"forceful reclaim failed; retrying after the grace window: "
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                            self.capacity_dropped("executor reclaim is not proved")
+                            attempt.cancel_started = time.perf_counter()
+                            continue
                         self.note("cancel", f"forceful: {json.dumps(facts)}")
                         attempt.canceling = attempt.canceling or "client"
                         attempt.cancel_started = time.perf_counter() + 1e9
@@ -2626,6 +2859,9 @@ class Worker:
         """Serve until stopped. The worker outlives any one stream: an owner that drops
         the connection re-dials and re-claims the SAME boot; the in-memory host ending its
         one stream is the run ending."""
+        # Executor grandchildren orphan here, so retirement can reap every group member
+        # and prove its exact PID absent before publishing a successor.
+        proctree.arm_subreaper()
         try:
             self.journal.append(
                 "session",
@@ -2691,8 +2927,13 @@ class Worker:
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
-        self.supervision.close()
-        self.journal.close()
+        try:
+            self.supervision.close()
+        except ExecutorGone as exc:
+            self.exit_code = int(Exit.internal)
+            self.note("shutdown", f"executor reclaim failed: {exc}")
+        finally:
+            self.journal.close()
         print(
             "[worker] summary "
             + json.dumps(

@@ -23,7 +23,9 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -174,6 +176,8 @@ def start_weightless(
         f"unix:{socket_path}",
         "--root",
         str(root),
+        "--project",
+        str(project),
         *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
         RELEASE,
@@ -789,6 +793,522 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
         hub.close()
 
 
+def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None:
+    """A claim waits for convergence; an old stream never finishes under the new fence."""
+    wl.head("15. claim, snapshot, and convergence are one ownership transition")
+    tmp = Path(base + "-claim-convergence")
+    worker, ids = start_weightless(tmp, instance_id="ins-claim-convergence", fresh=True)
+    old = worker.hub
+    successor = wl.Hub()
+    successor.process, successor.log = worker.process, worker.log
+    successor.directive = wl.serving_directive(
+        RELEASE, [ids["tick"]], pb.Posture.POSTURE_ACCEPTING, revision=2
+    )
+    entered = tmp / "replacement-entered"
+    release = tmp / "replacement-release"
+    connected = threading.Event()
+    connect_error: list[BaseException] = []
+
+    def claim() -> None:
+        try:
+            successor.connect(wl.read_addr(worker.root, worker.process))
+        except BaseException as exc:
+            connect_error.append(exc)
+        finally:
+            connected.set()
+
+    try:
+        old.ready(ids["tick"], args.observe * 4)
+        old_generation = old.generation
+
+        # The changed binding set forces a fresh executor. Its real endpoint import records
+        # that it entered, then waits for the harness to release it; the worker is therefore
+        # blocked inside the actual prepare RPC, halfway through revision-2 convergence.
+        gate = (
+            "import time as _time\n"
+            "from pathlib import Path as _Path\n"
+            f"_Path({str(entered)!r}).write_text('entered')\n"
+            f"while not _Path({str(release)!r}).exists(): _time.sleep(0.01)\n"
+        )
+        (tmp / "project" / "lifecycle_endpoint.py").write_text(gate + ENDPOINT_SOURCE)
+        old.send(pb.RecordOwnerFrame(desired_state=old._env(successor.directive)))
+        deadline = time.monotonic() + args.observe
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not entered.exists():
+            raise TimeoutError("the replacement executor never entered its endpoint import")
+
+        claimant = threading.Thread(target=claim, daemon=True, name="claim-during-convergence")
+        claimant.start()
+        time.sleep(0.5)
+        early_acks = [m for m in list(successor.seen) if m.WhichOneof("msg") == "claim_ack"]
+        wl.check(
+            "a successor claim cannot acknowledge while the previous stream is converging",
+            not early_acks and not connected.is_set(),
+            f"convergence is blocked in a real prepare RPC; successor emitted {len(early_acks)} "
+            "ClaimAck frame(s)",
+        )
+
+        release.touch()
+        claimant.join(args.observe * 4)
+        if claimant.is_alive():
+            raise TimeoutError("the successor claim did not complete after convergence")
+        if connect_error:
+            raise connect_error[0]
+        if not successor.connected.wait(args.observe):
+            raise TimeoutError("the successor never acknowledged its snapshot")
+
+        snapshot = successor.snapshot_document
+        wl.check(
+            "the successor snapshot is wholly after convergence, never an intermediate state",
+            int(snapshot.get("accepted_desired_state_revision", 0)) == 2
+            and int(snapshot.get("converged_revision", 0)) == 2,
+            f"snapshot accepted={snapshot.get('accepted_desired_state_revision')} "
+            f"converged={snapshot.get('converged_revision')}",
+        )
+
+        old_generations = {
+            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
+            for frame in list(old.seen)
+            if frame.WhichOneof("msg") is not None
+        }
+        successor_generations = {
+            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
+            for frame in list(successor.seen)
+            if frame.WhichOneof("msg") is not None
+        }
+        wl.check(
+            "each stream's outgoing frames retain that stream's generation",
+            successor.generation > old_generation
+            and old_generations <= {old_generation}
+            and successor_generations <= {successor.generation},
+            f"old stream generations={sorted(old_generations)}, successor generations="
+            f"{sorted(successor_generations)}",
+        )
+    finally:
+        release.touch()
+        successor.close()
+        worker.stop()
+        old.close()
+
+
+def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
+    """cr-024: exact set reuse, changed set replacement, then empty-set retirement."""
+    wl.head("16. executor generations: reuse exact, replace changed, retire empty")
+    tmp = Path(base + "-generation")
+    worker, ids = start_weightless(tmp, instance_id="ins-generation", fresh=True)
+    hub = worker.hub
+    try:
+        first_report = hub.ready(ids["tick"], args.observe * 2)
+        first_pid = executor_pid_of(worker, args.observe)
+        first_generation = hub.deployment(first_report).executor_generation
+
+        since = hub.mark()
+        exact = wl.serving_directive(
+            RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING, revision=2
+        )
+        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(exact)))
+        exact_report = hub.ready(ids["tick"], args.observe * 2, since=since)
+        exact_pid = executor_pid_of(worker, args.observe)
+        exact_generation = hub.deployment(exact_report).executor_generation
+        wl.check(
+            "reapplying the exact prepared construction/binding set reuses its process",
+            (exact_pid, exact_generation) == (first_pid, first_generation),
+            f"pid {first_pid}->{exact_pid}, generation {first_generation}->{exact_generation}",
+        )
+
+        since = hub.mark()
+        changed = wl.serving_directive(
+            RELEASE, [ids["tick"]], pb.Posture.POSTURE_ACCEPTING, revision=3
+        )
+        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
+        changed_report = hub.ready(ids["tick"], args.observe * 2, since=since)
+        changed_pid = executor_pid_of(worker, args.observe)
+        changed_generation = hub.deployment(changed_report).executor_generation
+        wl.check(
+            "a changed binding set publishes one successor only after the old PID is gone",
+            changed_pid != first_pid
+            and changed_generation == first_generation + 1
+            and pid_gone(first_pid, args.observe, "replaced executor"),
+            f"pid {first_pid}->{changed_pid}, generation {first_generation}->{changed_generation}",
+        )
+
+        since = hub.mark()
+        empty_set = pb.PlacementSet()
+        empty_bytes, empty_digest = wl.documents.identity(empty_set)
+        empty = pb.DesiredWorkerState(
+            revision=4,
+            posture=pb.Posture.POSTURE_ACCEPTING,
+            wire_minor=wl.WIRE_MINOR,
+            placement_set=pb.DesiredPlacementSet(
+                placement_set_digest=empty_digest,
+                placement_set_canonical_bytes=empty_bytes,
+            ),
+        )
+        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(empty)))
+        hub.wait(
+            lambda m: (
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state"
+                and m.observed_state.accepted_desired_state_revision == 4
+                else None
+            ),
+            args.observe * 2,
+            "empty desired state applied",
+            since,
+        )
+        wl.check(
+            "an explicit empty placement set retires without spawning an unused successor",
+            pid_gone(changed_pid, args.observe, "empty-state executor"),
+            f"pid {changed_pid} is absent and the worker owns no executor child",
+        )
+    finally:
+        worker.stop()
+        hub.close()
+
+
+def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
+    """cr-024: exercise supervision directly, including races the wire serializes."""
+    from cozy_runtime.internal import accel, proctree
+    from cozy_runtime.internal.worker import child as child_module
+    from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
+    from cozy_runtime.internal.worker.child import (
+        ExecutorGone,
+        ExecutorSupervision,
+        OwnerRecord,
+    )
+
+    wl.head("16. executor supervision: refuse stacking, single-flight replacement")
+    tmp = Path(base + "-supervision")
+    shutil.rmtree(tmp, ignore_errors=True)
+    home, root, project = tmp / "home", tmp / "worker", tmp / "project"
+    home.mkdir(parents=True)
+    root.mkdir(parents=True)
+    stage_weightless(home, project, ("tick",))
+    detached_file = tmp / "detached.pid"
+    endpoint = project / "lifecycle_endpoint.py"
+    endpoint.write_text(
+        endpoint.read_text()
+        + f"""\
+
+# Plant a real executor descendant which defeats process-group containment twice: it
+# creates a new session and moves into a nested cgroup. The executor's parent cgroup must
+# still kill it, and cleanup must remove its now-empty nested cgroup.
+_detached = os.fork()
+if _detached == 0:
+    os.setsid()
+    _relative = next(
+        line.split("::", 1)[1]
+        for line in open("/proc/self/cgroup").read().splitlines()
+        if line.startswith("0::")
+    )
+    _nested = __import__("pathlib").Path("/sys/fs/cgroup") / _relative.lstrip("/") / "nested"
+    _nested.mkdir()
+    (_nested / "cgroup.procs").write_text("0\\n")
+    __import__("pathlib").Path({str(detached_file)!r}).write_text(str(os.getpid()))
+    while True:
+        time.sleep(60)
+_deadline = time.monotonic() + 10
+while not __import__("pathlib").Path({str(detached_file)!r}).exists():
+    if time.monotonic() >= _deadline:
+        raise RuntimeError("detached descendant did not start")
+    time.sleep(0.01)
+"""
+    )
+    base_env = tuple(
+        sorted(
+            {
+                "HOME": os.environ["HOME"],
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
+            }.items()
+        )
+    )
+    imposed = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "PYTORCH_CUDA_ALLOC_CONF": "",
+        "OMP_NUM_THREADS": "1",
+    }
+    supervision = ExecutorSupervision(
+        root=root,
+        python=sys.executable,
+        base_env=base_env,
+        cozy_home=home,
+        device_process=lambda _pid: accel.ProcessMemory("absent", 0),
+    )
+    first = supervision.spawn(imposed=imposed)
+    intruder_code = (
+        "from pathlib import Path\n"
+        "from cozy_runtime.internal.worker.child import ExecutorGone,ExecutorSupervision\n"
+        "try:\n"
+        f" ExecutorSupervision(root=Path({str(root)!r}),python={sys.executable!r},"
+        f"base_env=(),cozy_home=Path({str(home)!r}))\n"
+        "except ExecutorGone:\n"
+        " raise SystemExit(73)\n"
+    )
+    intruder = subprocess.run(
+        [sys.executable, "-c", intruder_code],
+        env=dict(base_env),
+        capture_output=True,
+        text=True,
+        timeout=args.observe,
+        check=False,
+    )
+    wl.check(
+        "a concurrent supervision on the same worker root refuses before sweep or spawn",
+        intruder.returncode == 73
+        and supervision.current is first
+        and first.alive()
+        and proctree.cgroup_contains(first.cgroup, first.process),
+        f"first pid {first.pid} remains the exact live cgroup owner",
+    )
+    refused = False
+    try:
+        supervision.spawn(imposed=imposed)
+    except ExecutorGone:
+        refused = True
+    wl.check(
+        "spawn refuses while an exact current child is still owned",
+        refused and supervision.current is first and first.alive(),
+        f"incarnation {first.incarnation} pid {first.pid} remains current and live",
+    )
+
+    first_reply = first.call(
+        {
+            "cmd": "prepare",
+            "binding": {"project": str(project), "model_class": ""},
+            "budgets": {},
+        }
+    )
+    second_reply = first.call({"cmd": "prepare", "binding": {}, "budgets": {}})
+    wl.check(
+        "the child refuses a second prepare before another construction can allocate",
+        first_reply.get("ok") is True and second_reply.get("code") == "generation_already_prepared",
+        f"first={first_reply.get('ok')} second={second_reply.get('code')}",
+    )
+
+    detached = proctree.process_identity(int(detached_file.read_text()))
+
+    barrier = threading.Barrier(3)
+    successors: list[Any] = []
+    errors: list[BaseException] = []
+
+    def replace() -> None:
+        barrier.wait()
+        try:
+            successors.append(supervision.replace(first, imposed=imposed, why="concurrent test"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=replace) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(args.observe)
+    successor = supervision.current
+    wl.check(
+        "two concurrent replacements of E1 publish exactly one E2",
+        len(errors) == 1
+        and isinstance(errors[0], ExecutorGone)
+        and len(successors) == 1
+        and successor is not None
+        and successors[0] is successor
+        and supervision.spawns == 2
+        and pid_gone(first.pid, args.observe, "concurrently replaced executor"),
+        f"results={len(successors)} errors={errors} spawns={supervision.spawns} "
+        f"successor_pid={successor.pid if successor else 0}",
+    )
+    wl.check(
+        "replacement kills a setsid descendant in a nested cgroup and proves it absent",
+        pid_gone(detached.pid, args.observe, "detached executor descendant"),
+        f"setsid descendant birth {detached} is absent before E2 is used",
+    )
+    assert successor is not None
+    wl.check(
+        "a stale E1 invalidation cannot poison or withdraw E2",
+        not supervision.invalidate(first, "stale E1 observation")
+        and not supervision.cooperative_cancel(first, "req-stale#1")
+        and supervision.current is successor
+        and successor.alive()
+        and not successor.poisoned,
+        f"current pid {successor.pid}, poisoned={successor.poisoned!r}",
+    )
+    successor_pid = successor.pid
+    supervision.close()
+    wl.check(
+        "shutdown reaps the one executor supervision still owns",
+        supervision.current is None and pid_gone(successor_pid, args.observe, "shutdown executor"),
+        f"successor pid {successor_pid} absent after close",
+    )
+
+    broken_root = tmp / "broken"
+    broken_root.mkdir()
+    broken = ExecutorSupervision(
+        root=broken_root,
+        python="/bin/false",
+        base_env=base_env,
+        cozy_home=home,
+    )
+    failed_cleanly = False
+    try:
+        broken.spawn(imposed=imposed)
+    except ExecutorGone:
+        failed_cleanly = broken.current is None
+    finally:
+        broken.close()
+    wl.check(
+        "a child that exits before dial-back is reaped and never published",
+        failed_cleanly,
+        f"spawn attempts={broken.spawns}, current={broken.current}",
+    )
+
+    reclaim_proven = False
+
+    def reclaim_observation(_pid: int) -> accel.ProcessMemory:
+        return accel.ProcessMemory("absent" if reclaim_proven else "unreadable")
+
+    unreadable_root = tmp / "unreadable"
+    unreadable_root.mkdir()
+    guarded = ExecutorSupervision(
+        root=unreadable_root,
+        python=sys.executable,
+        base_env=base_env,
+        cozy_home=home,
+        device_process=reclaim_observation,
+    )
+    guarded_executor = guarded.spawn(imposed=imposed)
+    failed_prepare = guarded_executor.call(
+        {
+            "cmd": "prepare",
+            "binding": {"project": str(tmp / "missing-project"), "model_class": ""},
+            "budgets": {},
+        }
+    )
+    refused_retry = guarded_executor.call({"cmd": "prepare", "binding": {}, "budgets": {}})
+    wl.check(
+        "a failed first prepare still consumes and poisons the generation",
+        not failed_prepare.get("ok") and refused_retry.get("code") == "generation_already_prepared",
+        f"first={failed_prepare.get('code')} second={refused_retry.get('code')}",
+    )
+    previous_reclaim_seconds = child_module.RECLAIM_SECONDS
+    child_module.RECLAIM_SECONDS = 0.2
+    refused_unproven = False
+    blocked_detail = "reclaim unexpectedly returned"
+    cancel = AttemptRecord("req-reclaim", 1, b"digest", {}, executor=guarded_executor)
+    cancel.state = "running"
+    cancel.canceling = "client"
+    cancel.executor_generation = guarded_executor.incarnation
+    cancel_engine: Any = AttemptEngine.__new__(AttemptEngine)
+    cancel_engine.supervision = guarded
+    try:
+        cancel_engine.escalate(cancel, 0.2)
+    except ExecutorGone:
+        retained_owner = guarded._read_owner()
+        refused_unproven = (
+            guarded.current is guarded_executor
+            and cancel.state == "reclaiming"
+            and not cancel.reclaim_done.wait(0.05)
+            and retained_owner is not None
+            and bool(retained_owner.members)
+        )
+        blocked_detail = (
+            f"state={cancel.state} done={cancel.reclaim_done.is_set()} "
+            f"owner_retained={guarded.current is guarded_executor} "
+            f"durable_members={len(retained_owner.members) if retained_owner else 0} "
+            f"pid={guarded_executor.pid}"
+        )
+    finally:
+        reclaim_proven = True
+        child_module.RECLAIM_SECONDS = previous_reclaim_seconds
+    finalization_finished = threading.Event()
+
+    def buffered_reply() -> None:
+        cancel.await_reclaim_before_finalizing()
+        finalization_finished.set()
+
+    reply_thread = threading.Thread(target=buffered_reply, daemon=True)
+    reply_thread.start()
+    buffered_reply_blocked = not finalization_finished.wait(0.05)
+    completed_after_proof = False
+    try:
+        cancel_engine.escalate(cancel, 0.2)
+        reply_thread.join(1)
+        completed_after_proof = (
+            cancel.reclaim_done.is_set()
+            and finalization_finished.is_set()
+            and cancel.state == "finalizing"
+            and guarded.current is None
+        )
+    finally:
+        guarded.close()
+    wl.check(
+        "an unreadable driver observation blocks cancel and a buffered final reply",
+        refused_unproven and buffered_reply_blocked,
+        blocked_detail,
+    )
+    wl.check(
+        "the same cancel completes only after a retry proves exact driver reclaim",
+        completed_after_proof,
+        f"done={cancel.reclaim_done.is_set()} current={guarded.current}",
+    )
+
+    # A restart can find the durable leader gone while a detached descendant remains. The
+    # exact cgroup, unlike a numeric PGID, is still safe authority to reclaim that subtree.
+    orphan_root = tmp / "leaderless-owner"
+    orphan_root.mkdir()
+    leaderless = ExecutorSupervision(
+        root=orphan_root,
+        python=sys.executable,
+        base_env=base_env,
+        cozy_home=home,
+        device_process=lambda _pid: accel.ProcessMemory("absent", 0),
+    )
+    owner = OwnerRecord(
+        proctree.create_executor_cgroup(proctree.executor_cgroup_namespace(orphan_root))
+    )
+    leaderless._write_owner(owner)
+    helper_file = orphan_root / "helper.pid"
+    release_file = orphan_root / "release-leader"
+    leader_code = (
+        "import os,time,pathlib\n"
+        f"scope=pathlib.Path('/sys/fs/cgroup') / {owner.cgroup.relative_path.lstrip('/')!r}\n"
+        "(scope/'cgroup.procs').write_text('0\\n')\n"
+        "child=os.fork()\n"
+        "if child == 0:\n"
+        " os.setsid()\n"
+        " time.sleep(60)\n"
+        " os._exit(0)\n"
+        f"open({str(helper_file)!r},'w').write(str(child))\n"
+        f"while not os.path.exists({str(release_file)!r}): time.sleep(0.01)\n"
+        "os._exit(0)\n"
+    )
+    leader_pid = os.posix_spawn(
+        sys.executable,
+        [sys.executable, "-c", leader_code],
+        os.environ,
+        setpgroup=0,
+    )
+    leader = proctree.process_identity(leader_pid)
+    owner = leaderless._bind_owner(owner, leader)
+    deadline = time.monotonic() + args.observe
+    while not helper_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    helper = proctree.process_identity(int(helper_file.read_text()))
+    release_file.touch()
+    os.waitpid(leader_pid, 0)
+
+    try:
+        killed = leaderless.sweep_orphans()
+    finally:
+        leaderless.close()
+    wl.check(
+        "restart recovery reclaims a detached descendant after its exact leader is gone",
+        killed == [] and pid_gone(helper.pid, args.observe, "leaderless descendant"),
+        f"leader {leader.pid} absent; detached helper birth {helper} was reclaimed by scope",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmp", default="/tmp/cozy-lifecycle")
@@ -1045,6 +1565,9 @@ def main() -> int:
         section_ownership,
         section_window,
         section_live_delivery,
+        section_claim_convergence_fence,
+        section_generation_replacement,
+        section_supervision_atomicity,
     ):
         section(args, args.tmp)
 

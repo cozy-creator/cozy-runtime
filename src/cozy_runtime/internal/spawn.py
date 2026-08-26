@@ -26,7 +26,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, proctree
 from cozy_runtime.internal.child_env import project_child_env
 
 #: The executor raises its own OOM score so the kernel picks the disposable process. The
@@ -58,7 +58,7 @@ def seal_digest(env: Mapping[str, str]) -> str:
     """
     from cozy_runtime.internal.child_env import ALLOWLIST
 
-    return canonical.digest({name: env[name] for name in sorted(ALLOWLIST) if name in env})
+    return canonical.digest({name: env.get(name, "") for name in sorted(ALLOWLIST)})
 
 
 def spawn_executor(
@@ -68,6 +68,7 @@ def spawn_executor(
     base_env: tuple[tuple[str, str], ...],
     imposed: Mapping[str, str],
     cwd: str,
+    cgroup: proctree.CgroupScope,
     uid: int = -1,
     gid: int = -1,
 ) -> Spawned:
@@ -85,6 +86,10 @@ def spawn_executor(
         str(uid),
         "--gid",
         str(gid),
+        "--cgroup",
+        cgroup.relative_path,
+        "--cgroup-inode",
+        str(cgroup.inode),
         "--",
         python,
         *module_argv,
