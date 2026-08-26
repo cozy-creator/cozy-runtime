@@ -124,7 +124,6 @@ def binding_record(**overrides: Any) -> dict[str, Any]:
         "artifact_ref": RELEASE,
         "components": list(COMPONENTS),
         "release": RELEASE,
-        "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,
         "entrypoint": "generate",

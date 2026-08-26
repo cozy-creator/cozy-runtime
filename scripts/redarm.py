@@ -175,6 +175,7 @@ FACTS = ArtifactFacts(
     store="s", config="c", components=("unet",),
     snapshots={"unet": "sha256:" + "0" * 64},
     reference_snapshot="sha256:" + "0" * 64, variant="sm89",
+    weight_bytes=6 << 30,
 )
 
 
@@ -186,7 +187,7 @@ def binding(**over):
         entrypoint_binding_plan_id="sha256:" + "0" * 64, project="x", model_class="M",
         model_binding_path="b", model_parameter_name="m",
         artifact_ref="acme/m@v1", components=["unet"],
-        release="r", vram_bytes=7 << 30, host_bytes=1 << 30,
+        release="r", host_bytes=1 << 30,
         pinned_bytes=256 << 20, entrypoint="generate",
     )
     row.update(over)

@@ -140,7 +140,6 @@ def binding_record(entrypoint: str) -> dict[str, Any]:
         "artifact_ref": RELEASE,
         "components": [COMPONENT],
         "release": RELEASE,
-        "vram_bytes": 6 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,  # tfs-007 measured shape: 16 slots x 16 MiB
         "entrypoint": entrypoint,

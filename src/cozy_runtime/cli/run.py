@@ -474,7 +474,6 @@ def _binding_record(
         # hold, never the artifact's component list. `resolve` intersects them.
         "components": sorted({c for names in slot.components.values() for c in names}),
         "release": chosen.ref,
-        "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,
         "entrypoint": function,

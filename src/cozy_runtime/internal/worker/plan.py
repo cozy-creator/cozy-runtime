@@ -279,6 +279,12 @@ class ArtifactFacts:
     variant: str = ""
     custody: str = "canonical"
     vram_floor_bytes: int = 0
+    weight_bytes: int = 0
+    """WHAT THIS ARTIFACT WEIGHS, from the header the border already counted (#569b). It is
+    the fill's declared ceiling, and it is an ARTIFACT fact like every other one here: a
+    coordinator that has never held the bytes cannot state it, and the one that tried
+    stated 7 GiB against a 92.42 GiB model and refused `budget_overrun` on a healthy card
+    with 149 GB free."""
     stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
     """The checkpoint's uploader-minted stamp set (#567d), carried from the index row the
     pull wrote. A model class's keywords join it by membership and fail closed on absence."""
@@ -364,7 +370,10 @@ class DeclaredBinding:
     is a LABEL on the arithmetic, not a claim about any one request."""
     model_weight_bytes: int = 0
     """The DECLARED total weight of this model. Not what is resident, and not what an
-    attempt reserves."""
+    attempt reserves. RESOLUTION (#569b): it is the artifact's own byte total, read from the
+    index row on the machine that holds it. A launcher constant here was the ninth field of
+    the same mistake — `vramBudget = 7 * gib` priced every model ever bound, and the fill
+    of a 92.42 GiB artifact refused `budget_overrun` against it."""
     host_bytes: int = 0
     pinned_bytes: int = 0
     vram_floor_bytes: int = 0
@@ -512,7 +521,6 @@ class DeclaredBinding:
             ),
             objective=str(record.get("objective", "latency")),
             steps_basis=int(record.get("steps_basis", 20)),
-            model_weight_bytes=int(record.get("vram_bytes", 0)),
             host_bytes=int(record.get("host_bytes", 0)),
             pinned_bytes=int(record.get("pinned_bytes", 0)),
             resident_budget_bytes=int(record.get("resident_budget_bytes", 0)),
@@ -590,6 +598,7 @@ class DeclaredBinding:
             components=components,
             snapshots=snapshots,
             stamps={k: tuple(v) for k, v in facts.stamps.items()},
+            model_weight_bytes=facts.weight_bytes,
             custody=facts.custody,
             vram_floor_bytes=facts.vram_floor_bytes,
             offered=tuple(_normalize(v) for v in offered),
@@ -627,7 +636,6 @@ RECORD_KEYS = frozenset(
         "variants",
         "objective",
         "steps_basis",
-        "vram_bytes",
         "host_bytes",
         "pinned_bytes",
         "resident_budget_bytes",
@@ -709,6 +717,7 @@ def artifact_facts(cozy_home: Path, ref: str) -> ArtifactFacts | None:
         variant=row.variant,
         custody=row.custody,
         vram_floor_bytes=row.vram_floor_bytes,
+        weight_bytes=row.bytes,
         stamps={k: tuple(v) for k, v in row.stamps.items()},
     )
 
