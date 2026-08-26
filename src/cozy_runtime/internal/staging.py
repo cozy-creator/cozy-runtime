@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend
 
 
@@ -104,6 +105,13 @@ class ComponentResidency:
     attempt_staged_ms: float = 0.0
     attempt_evicted_ms: float = 0.0
 
+    @property
+    def kind(self) -> str:
+        """The BACKEND this residency plane is operating, taken from the device the fill
+        backend actually bound. Every device operation below goes through `accel` with it,
+        so a second backend needs an implementation there and nothing here (#447)."""
+        return str(self.backend.device.type)
+
     # ------------------------------------------------------------------ the contract
 
     def open_attempt(self, placement: str, headroom: int) -> None:
@@ -154,7 +162,7 @@ class ComponentResidency:
                     exc.code,
                     f"{method}() declares component {name!r} and it could not be staged: {exc}",
                 ) from exc
-            except self.torch.cuda.OutOfMemoryError as exc:
+            except accel.oom_error(self.torch, self.kind) as exc:
                 refusal = self._shortfall(method, name, str(exc))
                 self.last_shortfall = refusal.shortfall
                 self.refusals.append(refusal.detail[:400])
@@ -169,8 +177,7 @@ class ComponentResidency:
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         """Record the fence and drop the refcount. Nothing is evicted here."""
-        event = self.torch.cuda.Event()
-        event.record(self.torch.cuda.current_stream())
+        event = accel.completion_event(self.torch, self.kind)
         for name in components:
             lease = self.leases.get(name)
             if lease is None:
@@ -250,14 +257,14 @@ class ComponentResidency:
         self.evictions += 1
         self.attempt_evictions += 1
         self.backend.evict(victim)
-        self.torch.cuda.empty_cache()
+        accel.release_cached(self.torch, self.kind)
         self.allocator_delta_bytes += self._allocated() - allocated
         took = (time.perf_counter() - started) * 1000
         self.evicted_ms += took
         self.attempt_evicted_ms += took
 
     def _allocated(self) -> int:
-        return int(self.torch.cuda.memory_allocated())
+        return accel.allocated(self.torch, self.kind)
 
     def _size(self, name: str) -> int:
         """The component's DECLARED bytes, from the read plan — resident or not.
@@ -273,9 +280,9 @@ class ComponentResidency:
 
     def _fits(self, need: int) -> bool:
         """ALLOCATABLE capacity, from the allocator's own view (§3.2), never arithmetic."""
-        free, _ = self.torch.cuda.mem_get_info()
-        slack = self.torch.cuda.memory_reserved() - self.torch.cuda.memory_allocated()
-        return int(free) + max(int(slack), 0) >= need
+        rows = accel.allocation(self.torch, self.kind)
+        slack = rows["reserved_bytes"] - rows["allocated_bytes"]
+        return rows["driver_free_bytes"] + max(slack, 0) >= need
 
     def _victim(self, declared: tuple[str, ...]) -> str | None:
         victims = self._victims(declared)
@@ -283,7 +290,8 @@ class ComponentResidency:
 
     def _shortfall(self, method: str, name: str, detail: str) -> ResidencyRefusal:
         need = sum(row.nbytes for row in self.backend.plan.values() if row.component == name)
-        free, total = self.torch.cuda.mem_get_info()
+        rows = accel.allocation(self.torch, self.kind)
+        free, total = rows["driver_free_bytes"], rows["driver_total_bytes"]
         resident = {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components}
         return ResidencyRefusal(
             "device_shortfall",

@@ -46,6 +46,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from cozy_runtime.internal import accel
+
 #: This module's own refusal codes, added to cr-005's matrix. Closed, like that one.
 REFUSALS = frozenset(
     {
@@ -201,15 +203,15 @@ def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
     version. An unreadable knob is SPELLED into the key rather than defaulted, so a probe
     minted while NVML was mute cannot be reused as one minted while it answered.
     """
-    if not torch.cuda.is_available():
+    kind = accel.host_backend_family()
+    if not accel.present(torch, kind):
         return DeviceFacts("cpu", "cpu", 0, "", "default")
-    major, minor = torch.cuda.get_device_capability(index)
-    props = torch.cuda.get_device_properties(index)
+    identity = accel.device_identity(torch, kind, index)
     return DeviceFacts(
-        kind="cuda",
-        name=str(props.name),
-        sm=major * 10 + minor,
-        driver=str(torch.version.cuda or "unknown"),
+        kind=kind,
+        name=str(identity["name"]),
+        sm=int(identity["sm"]),
+        driver=str(identity["driver"]),
         configuration=f"{_nvml('power.limit')}W/{_nvml('mig.mode.current')}",
     )
 

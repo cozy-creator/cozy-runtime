@@ -51,7 +51,7 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
@@ -126,6 +126,10 @@ class Executor:
         self.channel = channel
         self.root = root
         self.torch: Any = None
+        #: The BACKEND this incarnation serves. Every device operation below goes through
+        #: `accel` with it, so the whole process holds exactly one backend conditional and
+        #: it is this line (#447). A weightless executor never reaches a device at all.
+        self.device_kind = accel.host_backend_family()
         self.registry: Any = None
         self.backend: Any = None
         self.residency: Any = None
@@ -189,8 +193,8 @@ class Executor:
         from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.staging import ComponentResidency
 
-        torch.cuda.init()
-        torch.cuda.reset_peak_memory_stats()
+        accel.initialize(torch, self.device_kind)
+        accel.reset_peak(torch, self.device_kind)
         cuda_ms = (time.perf_counter() - started) * 1000
         if not _env_intact():
             return {
@@ -345,13 +349,19 @@ class Executor:
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in names}
             )
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
-        except (FillRefusal, torch.cuda.OutOfMemoryError) as exc:
+        except Exception as exc:
+            # The two failures this path owns, and nothing else: a typed fill refusal, or
+            # the backend's own OOM — which is asked of the accelerator boundary rather
+            # than named here, so a second backend spells its allocator error once (#447).
+            refusal = exc if isinstance(exc, FillRefusal) else None
+            if refusal is None and not accel.is_oom(torch, exc):
+                raise
             # The generation is already rolled back, so the numbers that matter are the
             # HIGH-WATER marks beside the after state — "released 0 B" would be true and
             # useless. A device OOM here is a RESOURCE SHORTFALL, not a crash: it is the
             # ordinary outcome of a neighbour holding the card, and it carries the two
             # numbers an operator needs (cr-005).
-            oom = not isinstance(exc, FillRefusal)
+            oom = refusal is None
             if oom:
                 # A device OOM must roll back like any other fill failure. cr-005's
                 # transaction unwinds on a typed FillRefusal, which an allocator error is
@@ -363,19 +373,20 @@ class Executor:
                 # process dies is a worker whose ledger tells the truth about a lie.
                 backend.rollback(())
             backend.release_lease()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            free, total = torch.cuda.mem_get_info()
-            code = "device_shortfall" if oom else exc.code
+            accel.synchronize(torch, self.device_kind)
+            accel.release_cached(torch, self.device_kind)
+            memory = accel.allocation(torch, self.device_kind)
+            free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
+            code = "device_shortfall" if refusal is None else refusal.code
             self.poisoned = f"fill refused: {code}"
             reply: dict[str, Any] = {
                 "ok": False,
                 "code": code,
                 "detail": str(exc).splitlines()[0][:400],
                 "state": backend.state,
-                "peak_allocator_bytes": torch.cuda.max_memory_allocated(),
+                "peak_allocator_bytes": accel.peak_allocated(torch, self.device_kind),
                 "peak_ledger_vram_bytes": ledger.peak["vram"],
-                "allocator_bytes": torch.cuda.memory_allocated(),
+                "allocator_bytes": memory["allocated_bytes"],
                 "device_free_bytes": free,
                 "device_total_bytes": total,
                 "ledger": ledger.rows(),
@@ -455,7 +466,7 @@ class Executor:
                 f"{self.logical_model_digest}: the planner pricing variant A while the "
                 "executor serves variant B is unrepresentable",
             }
-        free, total = torch.cuda.mem_get_info()
+        memory = accel.allocation(torch, self.device_kind)
         self.ready = True
         self.facts = {
             "cuda_init_ms": round(cuda_ms, 2),
@@ -463,16 +474,16 @@ class Executor:
             "fill_ms": backend.stats["fill_ms"],
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
-            "device_free_bytes": free,
-            "device_total_bytes": total,
-            "allocator_bytes": torch.cuda.memory_allocated(),
-            "reserved_bytes": torch.cuda.memory_reserved(),
+            "device_free_bytes": memory["driver_free_bytes"],
+            "device_total_bytes": memory["driver_total_bytes"],
+            "allocator_bytes": memory["allocated_bytes"],
+            "reserved_bytes": memory["reserved_bytes"],
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
             "rss_bytes": _rss(),
             "ledger": ledger.rows(),
             "store": backend.stats.get("store", {}),
-            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
@@ -678,8 +689,8 @@ class Executor:
                 int(command.get("headroom_bytes", 0)),
             )
         if torch is not None:
-            torch.cuda.reset_peak_memory_stats()
-        allocated_at_start = torch.cuda.memory_allocated() if torch is not None else 0
+            accel.reset_peak(torch, self.device_kind)
+        allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
         envelope, outcome, record = run_prepared(
@@ -718,9 +729,9 @@ class Executor:
         # nothing that could still be moving.
         d2h_started = time.perf_counter()
         if torch is not None:
-            torch.cuda.synchronize()
+            accel.synchronize(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
-        peak_vram = torch.cuda.max_memory_allocated() if torch is not None else 0
+        peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         # step 3: the lease releases here, and nothing after this line touches the device.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
@@ -869,7 +880,7 @@ class Executor:
         started = time.perf_counter()
         started_wall = time.time()
         if self.torch is not None:
-            self.torch.cuda.reset_peak_memory_stats()
+            accel.reset_peak(self.torch, self.device_kind)
         envelope, outcome, record = attempt(
             registration,
             command["payload"],
@@ -898,8 +909,8 @@ class Executor:
         handler_ms = (time.perf_counter() - started) * 1000
         peak_vram = 0
         if self.torch is not None:
-            self.torch.cuda.synchronize()
-            peak_vram = self.torch.cuda.max_memory_allocated()
+            accel.synchronize(self.torch, self.device_kind)
+            peak_vram = accel.peak_allocated(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         pre_entry = ("invalid_request", "unsupported_input", "default_resolution", "tree_ungranted")
@@ -1070,25 +1081,24 @@ class Executor:
 
     def _device(self) -> Device:
         """No torch in this process means no device to name (cl-013)."""
-        return Device("cuda", 0) if self.torch is not None else Device()
+        return Device(self.device_kind, 0) if self.torch is not None else Device()
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
         journaled. The proof is the device's own: every stream is complete."""
-        torch = self.torch
-        return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
+        return accel.streams_idle(self.torch, self.device_kind)
 
     def probe(self) -> dict[str, Any]:
         if self.torch is None:
             return {"ok": True, "torch": False, "rss_bytes": _rss()}
-        free, total = self.torch.cuda.mem_get_info()
+        memory = accel.allocation(self.torch, self.device_kind)
         return {
             "ok": True,
             "torch": True,
-            "device_free_bytes": free,
-            "device_total_bytes": total,
-            "allocator_bytes": self.torch.cuda.memory_allocated(),
-            "reserved_bytes": self.torch.cuda.memory_reserved(),
+            "device_free_bytes": memory["driver_free_bytes"],
+            "device_total_bytes": memory["driver_total_bytes"],
+            "allocator_bytes": memory["allocated_bytes"],
+            "reserved_bytes": memory["reserved_bytes"],
             "residency": self.residency.document() if self.residency else {},
             "rss_bytes": _rss(),
             "attempts": self.attempts,

@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, census
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
@@ -97,6 +98,13 @@ REFUSALS = frozenset(
         "unknown_encoding",  # the header cites a spec digest no provider claims
         "encoding_unqualified",  # a claimed encoding, unqualified on THIS device
         "role_mismatch",  # the stored roles are not the roles the decoder accounts for
+        # The store's own lifecycle and header refusals, spoken here because
+        # `STORE_REFUSALS` already routes TensorFS codes to them. They were being spoken
+        # WITHOUT being declared, so `_refuse`'s guard turned every one of them into an
+        # AssertionError abort — the guard catching exactly what it exists to catch.
+        "lease_revoked",  # the read lease covering these bytes was revoked mid-fill
+        "checkpoint_unreadable",  # the snapshot's header/document bytes do not parse
+        "reader_unavailable",  # the tfs-007 `tensorfs` facade is not installed here
     }
 )
 
@@ -228,6 +236,13 @@ STORE_REFUSALS: dict[str, str] = {
     "UNKNOWN_FORMAT": "checkpoint_unreadable",
     "MISSING_FIELD": "checkpoint_unreadable",
 }
+
+#: The table's codomain is CHECKED against the vocabulary at import, not at the moment a
+#: store refusal happens to fire. A translation to an undeclared code is a defect in this
+#: file, and finding it on the failure path means finding it during an outage.
+_undeclared = sorted(set(STORE_REFUSALS.values()) - REFUSALS)
+if _undeclared:
+    raise AssertionError(f"STORE_REFUSALS translates to undeclared codes: {_undeclared}")
 
 
 @contextlib.contextmanager
@@ -617,6 +632,10 @@ class StreamingFillBackend:
         self.order = [row.key for row in rows]
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
+        #: The BACKEND this generation is filled on. Memory metering and reclaim go through
+        #: `accel` with it (#447); the stream/event machinery below is this boundary's CUDA
+        #: IMPLEMENTATION, which the MPS lane replaces behind the same names (cr-021).
+        self.kind = str(self.device.type)
         # The window is the store's PLANNING unit and the slot is this plane's staging unit;
         # tfs-007 measured 4 MiB windows into 16 MiB slots as the shape that works.
         self.window_bytes = int(window_bytes)
@@ -915,7 +934,7 @@ class StreamingFillBackend:
                     ring.track(tensor)
                 windows = self._stream(ring)
                 ring.finish()
-                self.torch.cuda.synchronize()
+                accel.synchronize(self.torch, self.kind)
                 self.stats["windows"] = windows
                 self.stats["waits"] = ring.waits
             finally:
@@ -1077,7 +1096,7 @@ class StreamingFillBackend:
                 member.to_empty(device=self.torch.device("meta"), recurse=True)
                 self.ledger.release({"vram": self.vram_charge.pop(name, 0)})
         self.components.clear()
-        self.torch.cuda.empty_cache()
+        accel.release_cached(self.torch, self.kind)
         self.state = "rolled_back"
 
     def _free_storages(self, tensors: Any) -> int:
@@ -1171,15 +1190,15 @@ class StreamingFillBackend:
             )
         from cozy_runtime.internal.derive import placing
 
-        before = int(self.torch.cuda.memory_allocated(self.device))
+        before = accel.allocated(self.torch, self.kind, self.device)
         with placing():
             self._free_storages(t for _, t in _tensors(member))
             member.to_empty(device=self.torch.device("meta"), recurse=True)
         for key in [k for k in self.enqueued if k.split(".")[0] == component]:
             del self.enqueued[key]
-        self.torch.cuda.empty_cache()
+        accel.release_cached(self.torch, self.kind)
         self.ledger.release({"vram": self.vram_charge.pop(component, 0)})
-        return before - int(self.torch.cuda.memory_allocated(self.device))
+        return before - accel.allocated(self.torch, self.kind, self.device)
 
     def require_ready(self, what: str) -> None:
         if self.state != "ready":

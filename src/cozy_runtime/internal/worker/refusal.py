@@ -34,9 +34,14 @@ ORIGIN = pb.CauseOrigin
 CALLER = "caller"
 PLATFORM = "platform"
 
-#: Which side of a read is wrong. `data` = the bytes; `reader` = this runtime.
+#: Which side of a read is wrong. `data` = the bytes; `reader` = this runtime. `lease` is
+#: the third answer the DATA/READER split cannot give: the bytes were admissible and the
+#: reader had a path, and the HOLD over them went away underneath the read. Claiming either
+#: of the other two for it sends the operator to rebuild an artifact that is fine or to
+#: patch a runtime that is fine, which is the exact cost this module exists to avoid.
 DATA = "data"
 READER = "reader"
+LEASE = "lease"
 
 #: The fill/store refusal vocabulary split by side. A code absent here has no classification
 #: and must be added deliberately — an unclassified refusal cannot claim either sentence.
@@ -53,6 +58,14 @@ SIDE: dict[str, str] = {
     "encoder_unavailable": READER,
     "result_too_large": READER,
     "unsupported_encoding": READER,
+    # The fill plane's store-refusal translations (`internal/fill.py::STORE_REFUSALS`).
+    # `checkpoint_unreadable` is DATA for three of the four store codes behind it
+    # (MALFORMED_JSON, NONCANONICAL_ENCODING, MISSING_FIELD are all "the stored header is
+    # not what it claims"); UNKNOWN_FORMAT is the one reader-shaped member, and the fill
+    # plane collapses it into the same code, so the sentence names the majority remedy.
+    "checkpoint_unreadable": DATA,
+    "reader_unavailable": READER,
+    "lease_revoked": LEASE,
 }
 
 _SENTENCE = {
@@ -64,6 +77,11 @@ _SENTENCE = {
     READER: (
         "the READER is at fault: the bytes are admissible and THIS runtime has no path for "
         "them, so the fix is in the runtime, not in the artifact and not in the request"
+    ),
+    LEASE: (
+        "neither the data nor the reader is at fault: the store hold covering these bytes "
+        "was released while the read was in flight, so the remedy is to re-acquire and "
+        "retry - the artifact is intact and the runtime needs no change"
     ),
 }
 
