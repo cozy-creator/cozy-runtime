@@ -169,8 +169,7 @@ def phase_row(a: argparse.Namespace) -> None:
     assertion would have passed the old row too.
     """
     head("row — the local index row, against the fill plane that reads it")
-    from cozy_runtime.cli import artifacts
-    from cozy_runtime.internal import fill
+    from cozy_runtime.internal import artifacts, fill
 
     home = pathlib.Path(a.home)
     snapshot = ""

@@ -36,15 +36,22 @@ def h3(
 ) -> Artifact:
     """A narrow role artifact, or the DUAL package carrying both transformer roles.
 
-    The `task` stamp is the SELECTED LANE's, not the package's: one snapshot carries both
-    role lanes, and a slot resolves to exactly one of them. Two slots on the dual artifact
-    therefore share a snapshot and config yet keep distinct construction identities,
-    because identity includes the model class (§1.1).
+    STAMPS ARE A CHECKPOINT FACT, NOT A LANE FACT (#567d). The dual package carries both
+    task-role transformers, each with its own evidence, so its stamp key holds BOTH values
+    and its contract renders `task=fl2va+ref2va`; a class keyword joins that set by
+    membership. The previous fixture stamped the dual artifact with whichever single task
+    the caller asked for, which is the one shape the hub cannot produce — stamps live per
+    snapshot, so every lane over one checkpoint reads the same set.
+
+    `task=` therefore selects the TOPOLOGY of a narrow package and is ignored for the stamp
+    of a dual one. Two slots on the dual artifact share a snapshot and config yet keep
+    distinct construction identities, because identity includes the model class (§1.1).
     """
     data = dict(BAKED_CONFIG if baked else H3_CONFIG)
     config = Config(data)
     topology: dict[str, TensorSpec] = {}
-    for role in ("fl2va", "ref2va") if dual else (task,):
+    roles: tuple[Task, ...] = ("fl2va", "ref2va") if dual else (task,)
+    for role in roles:
         topology.update(topology_of(_build_h3(config, task=role)))
     label = "h3-dual" if dual else f"h3-{task}"
     lane = "adaln-baked" if baked else "full"
@@ -52,7 +59,7 @@ def h3(
         snapshot=snapshot or f"cozy/{label}@v1/{lane}#c3d4",
         topology=topology,
         config=config,
-        stamps={"task": task, "family": "h3"},
+        stamps={"task": roles, "family": ("h3",)},
     )
 
 

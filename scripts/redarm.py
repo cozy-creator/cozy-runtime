@@ -149,8 +149,11 @@ raise SystemExit(
 #: Every number below is one the ledger would have MEASURED; the arms move them and observe
 #: which rung the walk picks and what it refuses.
 LADDER = """
+import dataclasses
+
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
+    ArtifactFacts,
     DeclaredBinding,
     PlanChooser,
     PreparedModel,
@@ -168,16 +171,26 @@ ledger.device_reserved = 5_400_000_000
 chooser = PlanChooser(ledger)
 
 
+FACTS = ArtifactFacts(
+    store="s", config="c", components=("unet",),
+    snapshots={"unet": "sha256:" + "0" * 64},
+    reference_snapshot="sha256:" + "0" * 64, variant="sm89",
+)
+
+
 def binding(**over):
+    # The record names the REF; the artifact facts are the RESOLVER's (#567e), so a floor
+    # override rides the facts and never the document.
+    facts = dataclasses.replace(FACTS, vram_floor_bytes=over.pop("vram_floor_bytes", 0))
     row = dict(
         entrypoint_binding_plan_id="sha256:" + "0" * 64, project="x", model_class="M",
         model_binding_path="b", model_parameter_name="m",
-        components=["unet"], store="s", config="c", snapshot="sha256:" + "0" * 64,
-        release="r", variant="sm89", vram_bytes=7 << 30, host_bytes=1 << 30,
+        artifact_ref="acme/m@v1", components=["unet"],
+        release="r", vram_bytes=7 << 30, host_bytes=1 << 30,
         pinned_bytes=256 << 20, entrypoint="generate",
     )
     row.update(over)
-    return DeclaredBinding.read(row)
+    return DeclaredBinding.read(row).resolve(facts)
 
 
 def choose(**over):
@@ -238,6 +251,41 @@ LIVE_ARMS = (
         "from cozy_runtime.internal.worker.plan import Coefficient\n"
         "Coefficient('activations', 1 << 30, 'measured')\n",
         "coefficient_unsourced",
+    ),
+    (
+        # #567e: a record that names a STORE is naming a disk it may not be on. The eight
+        # artifact facts left the closed key set, so a writer that still resolves the ref
+        # for somebody else is refused by name rather than believed.
+        "record-may-not-carry-the-writers-artifact-facts",
+        LADDER + "binding(store='/owner/cozy/store')\n",
+        "binding_plan_unknown_field",
+    ),
+    (
+        # The MORNING-LOOP refusal, at its true clock. A ref this machine does not hold is
+        # a typed refusal on the machine that would serve, naming what its own index holds
+        # — not exit 4 on the owner's box before a request ever leaves it.
+        "artifact-absent-refuses-naming-this-machines-index",
+        LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
+        "row = dict(entrypoint_binding_plan_id='sha256:' + '0' * 64, project='x',\n"
+        "           model_class='M', model_binding_path='b', model_parameter_name='m',\n"
+        "           artifact_ref='cozy/minimax-h3@se-001', release='r',\n"
+        "           entrypoint='generate')\n"
+        "try:\n"
+        "    DeclaredBinding.read(row).resolve(None, held=('acme/other@v1',))\n"
+        "except PlanRefusal as exc:\n"
+        "    assert exc.code == 'artifact_absent', exc.code\n"
+        "    raise SystemExit(exc.detail[-200:])\n",
+        "index holds: acme/other@v1",
+    ),
+    (
+        # A slot that declares a component the artifact does not carry keeps the NAME so
+        # the fill refuses it by name; narrowing it away silently would serve a graph the
+        # class never declared.
+        "declared-component-the-artifact-lacks-is-not-narrowed-away",
+        LADDER + "b = binding(components=['unet', 'refiner'])\n"
+        "assert 'refiner' in b.components, b.components\n"
+        "raise SystemExit('kept the undeliverable component: ' + repr(b.components))\n",
+        "kept the undeliverable component",
     ),
     (
         "uncalibrated-cannot-refuse",
@@ -803,6 +851,31 @@ registry().acquire('g.models.m', h3.Fl2VAModel, Artifact(
         "stamp-fails-closed",
         "registry().acquire('g.models.m', h3.Ref2VAModel, art.h3(task='fl2va'))\n",
         "stamp_mismatch",
+    ),
+    (
+        # #567d: MEMBERSHIP is not looseness. The DUAL artifact — the canonical N-ary
+        # packaging every multi-task family ships — carries `task=fl2va+ref2va` and admits
+        # both role classes; a stamp set that does NOT contain the class's value still
+        # refuses, and so does a set that is missing entirely.
+        "stamp-membership-still-refuses-a-foreign-task",
+        "dual = art.h3(task='fl2va', dual=True)\n"
+        "assert dual.stamp_set('task') == ('fl2va', 'ref2va'), dual.stamp_set('task')\n"
+        "registry().acquire('a.models.m', h3.Fl2VAModel, dual)\n"
+        "registry().acquire('b.models.m', h3.Ref2VAModel, dual)\n"
+        "foreign = Artifact(snapshot=dual.snapshot, topology=dual.topology,\n"
+        "                   config=dual.config, stamps={'task': ('fl2va', 't2va')})\n"
+        "registry().acquire('c.models.m', h3.Ref2VAModel, foreign)\n",
+        "stamp_mismatch",
+    ),
+    (
+        # #567d, the other half: the serving path used to pass NO stamps at all, so this
+        # was the state of EVERY checkpoint on EVERY binding.
+        "unstamped-artifact-fails-every-stamped-class-closed",
+        "bare = Artifact(snapshot='cozy/h3@v1#bare',\n"
+        "                topology=art.h3(task='fl2va').topology,\n"
+        "                config=art.h3(task='fl2va').config)\n"
+        "registry().acquire('g.models.m', h3.Fl2VAModel, bare)\n",
+        "carries task=nothing",
     ),
     (
         "persistent-allocation",

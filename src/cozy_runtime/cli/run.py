@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.cli import artifacts
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import artifacts
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import descriptor as desc
 from cozy_runtime.internal.canonical import Json
@@ -387,6 +387,9 @@ def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, An
                 "store": str(config.cozy_home) if installed else "",
                 "snapshots": dict(installed.snapshots) if installed else {},
                 "custody": installed.custody if installed else "",
+                "stamps": (
+                    {k: list(v) for k, v in sorted(installed.stamps.items())} if installed else {}
+                ),
                 "installed": installed is not None,
             }
         )
@@ -455,32 +458,29 @@ def _binding_record(
             "and confessed on the attempt record — pass --strict-keys to refuse instead"
         )
 
-    declared = {c for names in slot.components.values() for c in names}
-    components = tuple(n for n in installed.components if not declared or n in declared) or (
-        installed.components
-    )
+    # THE RECORD NAMES THE REF, NOT WHAT THIS HOST RESOLVED IT TO (#567e). The index lookup
+    # above stays because it is what makes a miss refuse HERE, before a worker is spawned,
+    # with the pull that fixes it named — but its answer is not copied into the document.
+    # The worker resolves the ref against its own index, which on a local run is this same
+    # index reached by the same reader, so the local answer is unchanged by construction.
     return {
         "entrypoint_binding_plan_id": _plan_id(found.application, function),
         "project": str(found.project),
         "model_class": slot.class_key,
         "model_binding_path": slot.path,
         "model_parameter_name": slot.param,
-        "components": list(components),
-        "store": installed.store,
-        "config": installed.config,
-        "snapshot": installed.snapshots[components[0]],
-        "snapshots": dict(sorted(installed.snapshots.items())),
+        "artifact_ref": chosen.ref,
+        # The CLASS's declared component names — a code fact from the release both machines
+        # hold, never the artifact's component list. `resolve` intersects them.
+        "components": sorted({c for names in slot.components.values() for c in names}),
         "release": chosen.ref,
-        "variant": installed.variant,
         "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,
         "entrypoint": function,
         "model_construction_digest": "",
         "resident_budget_bytes": 0,
-        "vram_floor_bytes": installed.vram_floor_bytes or 1 * GIB,
         "tenancy": "local",
-        "custody": installed.custody,
         "strict_keys": strict,
     }, warnings
 

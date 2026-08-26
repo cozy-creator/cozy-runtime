@@ -261,6 +261,13 @@ class Resolved:
     #: agree: `snapshot` is what an ObjectRef holds, `path_id` is what the hub's routes take.
     snapshot: str
     lane: str = ""
+    stamps: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    """THE RESOLVED LANE'S STAMPED-FACT SET (#567d) — the third coordinate of the contract
+    the hub just matched, beside `structure` and `encoding`. It comes down with the
+    resolution because it is a fact about the checkpoint the ref named, and the pod that
+    installs those bytes is the machine whose model classes have to join against it. A hub
+    that answers no stamps leaves this empty, and an unstamped artifact fails every stamped
+    class closed — which is the honest outcome, not a default."""
 
     @property
     def path_id(self) -> str:
@@ -302,7 +309,26 @@ def resolve(
         release=str(doc.get("release") or ""),
         snapshot=snapshot.removeprefix("sha256:"),
         lane=lane,
+        stamps=_stamps(doc.get("stamps")),
     )
+
+
+def _stamps(raw: object) -> dict[str, tuple[str, ...]]:
+    """The hub's `key -> [values]` stamp map, read defensively and never invented.
+
+    Anything that is not a map of string keys to string lists is DROPPED rather than
+    coerced: a half-read stamp set would fail a class closed for the wrong reason, and an
+    absent one already fails it closed for the right one.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for key, values in raw.items():
+        if isinstance(values, str):
+            out[str(key)] = (values,)
+        elif isinstance(values, list):
+            out[str(key)] = tuple(str(v) for v in values if isinstance(v, str))
+    return {k: v for k, v in out.items() if v}
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +398,8 @@ class PullResult:
     #: hub therefore named none. It is carried because the local index row is keyed by a ref
     #: and a row that dropped the release names a different artifact than the one pulled.
     release: str = ""
+    #: The resolved lane's stamped-fact set, carried into the local index row (#567d).
+    stamps: dict[str, tuple[str, ...]] = field(default_factory=dict)
     streams: int = 1
     declared: int = 0
     held: int = 0
@@ -464,6 +492,7 @@ def pull(
         snapshot=at.snapshot,
         store=str(store.root),
         release=at.release,
+        stamps=dict(at.stamps),
         streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
         held=len(plan["held"]),

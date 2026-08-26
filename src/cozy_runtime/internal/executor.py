@@ -384,6 +384,14 @@ class Executor:
             # to canonical keeps the strict reading for any record that does not say.
             custody=binding.get("custody", "canonical"),
             strict_keys=bool(binding.get("strict_keys", False)),
+            # THE STAMPS THE CHECKPOINT ACTUALLY CARRIES (#567d). `Artifact.stamps` was
+            # never once populated by the serving path: no caller passed it, the default
+            # `{}` rode every binding, and `_admit` therefore refused every stamped model
+            # class on every artifact — a whole admission plane that could only ever say no.
+            stamps={
+                str(key): tuple(str(v) for v in values)
+                for key, values in (binding.get("stamps") or {}).items()
+            },
         )
         seen = Observations()
         registry = ModelRegistry(

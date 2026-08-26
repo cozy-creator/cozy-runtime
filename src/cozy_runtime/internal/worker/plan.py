@@ -24,8 +24,10 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import artifacts as index
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME
 from cozy_runtime.internal.resolution import ROUTE_KERNEL, Variant
@@ -252,6 +254,37 @@ class PreparedModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactFacts:
+    """WHAT ONE MACHINE'S ARTIFACT INDEX SAYS ABOUT ONE REF (#567e).
+
+    A binding record names an artifact by REF, which is identity: `cozy/minimax-h3@se-001`
+    is the same artifact on every machine that holds it. Everything in here is the
+    RESOLUTION of that ref — where the bytes are on THIS disk, which snapshot digest each
+    component reads from, what the border classified, what the hub stamped — and it is
+    produced by the machine that is going to serve, never carried from the one that asked.
+
+    That is #565b's rule (RESOLUTION IS THE RESOLVER'S OWN) applied to `store`, which is
+    `project`'s exact twin: the record used to carry the OWNER's store root and the OWNER's
+    snapshot map, resolved out of the OWNER's index, so a rented pod holding the artifact
+    perfectly was dispatched a record describing a disk it has never seen. The owner could
+    not even mint the record — `cozy run --worker` exited 4 naming its own empty index
+    before a request left the box.
+    """
+
+    store: str
+    config: str
+    components: tuple[str, ...]
+    snapshots: Mapping[str, str]
+    reference_snapshot: str
+    variant: str = ""
+    custody: str = "canonical"
+    vram_floor_bytes: int = 0
+    stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    """The checkpoint's uploader-minted stamp set (#567d), carried from the index row the
+    pull wrote. A model class's keywords join it by membership and fail closed on absence."""
+
+
+@dataclass(frozen=True, slots=True)
 class DeclaredBinding:
     """What a DEPLOYMENT DECLARES for one `entrypoint_binding_plan_id`. Input only.
 
@@ -279,24 +312,44 @@ class DeclaredBinding:
     model_class: str
     model_binding_path: str
     model_parameter_name: str
-    store: str
-    config: str
+    artifact_ref: str
+    """THE MODEL'S WHOLE IDENTITY (#567e): `org/repo[@release]`, the same string on every
+    machine that holds the artifact. It is what the deployment DECLARES; the store root, the
+    per-component snapshot map, the construction config and the stamps are what a machine
+    RESOLVES it to, and those arrive through `resolve` from the serving machine's own index.
+
+    An empty ref with a declared class is not expressible: `read` refuses a half-declared
+    model, and `resolve` refuses a ref the resolver's index does not hold, NAMING what it
+    holds instead. Nothing here ever names a directory, so the plan id is path-free by
+    construction rather than by a writer remembering to partition."""
     release: str
-    variant: str
-    reference_snapshot: str
-    """The record's own `snapshot`: the artifact its `variant` names, and the fallback for
-    any component the snapshot map omits."""
-    components: tuple[str, ...]
-    """The ORDERED component set this binding constructs."""
-    snapshots: Mapping[str, str]
+    store: str = ""
+    config: str = ""
+    variant: str = ""
+    reference_snapshot: str = ""
+    """The RESOLVED reference snapshot: the artifact the `variant` names, and the fallback
+    for any component the snapshot map omits. Resolution, not identity."""
+    declared_components: tuple[str, ...] = ()
+    """The component names the bound CLASS declares — a fact about the endpoint release's
+    CODE, which both machines hold, so it is identity and it rides the record. It narrows
+    what gets filled: H3's `Fl2VAModel` declares four of the dual artifact's five, and the
+    unbound sibling transformer is simply outside this construction (§1.1). Empty takes the
+    artifact whole."""
+    components: tuple[str, ...] = ()
+    """The ORDERED component set this binding actually constructs: `declared_components`
+    intersected with what the resolver's index says the artifact carries. Resolution —
+    which components an artifact HAS is a fact about the artifact, read where it lives."""
+    snapshots: Mapping[str, str] = dataclasses.field(default_factory=dict)
     """component -> snapshot digest. A read plan is COMPLETE over its header (tfs-007), so a
     component cannot be read out of a whole-pipeline snapshot without reading the pipeline;
     per-component snapshots make a partial fill the store's ordinary complete read, and the
     objects dedup so it costs nothing."""
-    offered: tuple[Variant, ...]
+    stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    """The checkpoint's stamped-fact set (#567d), resolved with the rest of it."""
+    offered: tuple[Variant, ...] = ()
     """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
-    empty — a record naming none offers exactly the bytes it already named, and that one IS
-    the reference because there is nothing to compare it against."""
+    empty after `resolve` — a record naming none offers exactly the bytes the ref resolved
+    to, and that one IS the reference because there is nothing to compare it against."""
     endpoint_release: str = ""
     """WHICH endpoint release this binding belongs to — `project`'s PATH-FREE counterpart
     (#506a), and the reason a weightless construction key never has to name a directory.
@@ -315,8 +368,10 @@ class DeclaredBinding:
     host_bytes: int = 0
     pinned_bytes: int = 0
     vram_floor_bytes: int = 0
-    """The PHYSICAL FLOOR the deployment declares: activations + scratch + one component
-    chunk. Below it there is no rung, and a local capacity refusal is the honest answer."""
+    """The PHYSICAL FLOOR: activations + scratch + one component chunk. Below it there is no
+    rung, and a local capacity refusal is the honest answer. RESOLUTION — the border
+    measured it and the index row carries it, so it comes from the resolver's own index
+    with the rest of the artifact's facts; 0 takes the conservative default."""
     resident_budget_bytes: int = 0
     """The DECLARED construction ceiling: components past it are parked and staged in on
     first declared use. 0 means every component stays resident."""
@@ -327,7 +382,9 @@ class DeclaredBinding:
     custody: str = "canonical"
     """`canonical` (the border classified every key: a serve-time extra is drift and
     refuses) or `local` (an un-bordered local bind: markers transcribe or refuse, unknown
-    extras warn, are ignored and are confessed — §1.1's custody tier)."""
+    extras warn, are ignored and are confessed — §1.1's custody tier). RESOLUTION: custody
+    is how THIS machine came to hold these bytes, which is exactly what an index row
+    records and what a record-writer on another machine cannot know."""
     strict_keys: bool = False
     """`--strict-keys`: a local bind's unknown extras refuse instead of confessing."""
     expected_logical_model_digest: str = ""
@@ -421,16 +478,16 @@ class DeclaredBinding:
                 "write at all",
             )
         # A record either declares a MODEL or declares none. Half a declaration — a class
-        # with no store, a store with no class — is a deployment that cannot be served
+        # with no artifact ref, a ref with no class — is a deployment that cannot be served
         # either way, so it refuses here rather than at the fill.
         declares = {key for key in MODEL_KEYS if str(record.get(key, ""))}
         if declares and declares != MODEL_KEYS:
             raise PlanRefusal(
                 "binding_plan_partial_model",
                 f"binding plan record declares {sorted(declares)} and omits "
-                f"{sorted(MODEL_KEYS - declares)}: a binding names a whole model or names "
-                "none. A WEIGHTLESS binding is served (no class, no store, no artifact); "
-                "half of one is a deployment nothing can construct",
+                f"{sorted(MODEL_KEYS - declares)}: a binding names a slot and the ref that "
+                "fills it, or names neither. A WEIGHTLESS binding is served (no class, no "
+                "artifact); half of one is a deployment nothing can construct",
             )
         missing = sorted(RECORD_REQUIRED - set(record))
         if missing:
@@ -438,24 +495,6 @@ class DeclaredBinding:
                 "binding_plan_incomplete",
                 f"binding plan record is missing {', '.join(missing)}",
             )
-        snapshot = _digest(str(record.get("snapshot", "")), "snapshot")
-        components = tuple(str(name) for name in record.get("components") or ())
-        offered = tuple(
-            _normalize(v if isinstance(v, Variant) else Variant.read(v))
-            for v in record.get("variants") or ()
-        ) or (
-            (
-                Variant(
-                    name=str(record.get("variant") or "default"),
-                    store=str(record["store"]),
-                    snapshot=snapshot,
-                    snapshots=dict(record.get("snapshots") or {}),
-                    reference=True,
-                ),
-            )
-            if declares
-            else ()
-        )
         return cls(
             entrypoint_binding_plan_id=str(record["entrypoint_binding_plan_id"]),
             entrypoint=str(record["entrypoint"]),
@@ -464,26 +503,20 @@ class DeclaredBinding:
             model_class=str(record.get("model_class", "")),
             model_binding_path=str(record.get("model_binding_path", "")),
             model_parameter_name=str(record.get("model_parameter_name", "")),
-            store=str(record.get("store", "")),
-            config=str(record.get("config", "")),
+            artifact_ref=str(record.get("artifact_ref", "")),
             release=str(record["release"]),
-            variant=str(record.get("variant", "")),
-            reference_snapshot=snapshot,
-            components=components,
-            snapshots={
-                str(name): _digest(str(value), f"snapshots[{name}]")
-                for name, value in (record.get("snapshots") or {}).items()
-            },
-            offered=offered,
+            declared_components=tuple(str(n) for n in record.get("components") or ()),
+            offered=tuple(
+                _normalize(v if isinstance(v, Variant) else Variant.read(v))
+                for v in record.get("variants") or ()
+            ),
             objective=str(record.get("objective", "latency")),
             steps_basis=int(record.get("steps_basis", 20)),
             model_weight_bytes=int(record.get("vram_bytes", 0)),
             host_bytes=int(record.get("host_bytes", 0)),
             pinned_bytes=int(record.get("pinned_bytes", 0)),
-            vram_floor_bytes=int(record.get("vram_floor_bytes", 0)),
             resident_budget_bytes=int(record.get("resident_budget_bytes", 0)),
             tenancy=str(record.get("tenancy", "local")),
-            custody=str(record.get("custody", "canonical")),
             strict_keys=bool(record.get("strict_keys", False)),
             expected_logical_model_digest=_digest(
                 str(record.get("model_construction_digest", "")), "model_construction_digest"
@@ -495,17 +528,91 @@ class DeclaredBinding:
             ),
         )
 
+    def resolve(
+        self, facts: ArtifactFacts | None, *, held: tuple[str, ...] = ()
+    ) -> DeclaredBinding:
+        """Bind this record's artifact REF to the facts THIS machine holds about it (#567e).
+
+        A weightless binding resolves to itself: there is no artifact and nothing to look
+        up. A model binding whose ref the resolver's index does not hold is a typed refusal
+        naming what the index DOES hold — the same answer whichever machine asks, because
+        the question is finally being asked on the machine that would serve.
+
+        Everything the executor is handed downstream is exact by the time it leaves here:
+        one store root, one snapshot per component, one config path, one stamp set. That
+        contract — the core is handed exact facts and never resolves a ref — is unchanged;
+        what moved is WHICH machine does the resolving.
+        """
+        if self.weightless:
+            return self
+        if facts is None:
+            raise PlanRefusal(
+                "artifact_absent",
+                f"{self.artifact_ref} is not in this machine's artifact index, and a binding "
+                "record names an artifact by REF because the store root, the snapshot map "
+                "and the components are the SERVING machine's to resolve (#567e). The "
+                "record's writer cannot answer this question for a machine it is not. This "
+                f"index holds: {', '.join(held) or 'nothing'}",
+                {"artifact_ref": self.artifact_ref, "held": list(held)},
+            )
+        indexed = {
+            str(name): _digest(str(value), f"snapshots[{name}]")
+            for name, value in facts.snapshots.items()
+        }
+        carried = facts.components or tuple(sorted(indexed))
+        # THE INTERSECTION, in the ARTIFACT's order. A class that declares a component the
+        # artifact does not carry is not narrowed silently into working — it keeps the name
+        # and the fill refuses `destination_absent` naming it, which is the one clock where
+        # a mis-declared slot is legible.
+        wanted = set(self.declared_components)
+        components = tuple(n for n in carried if n in wanted) if wanted else carried
+        if wanted - set(carried):
+            components = components + tuple(sorted(wanted - set(carried)))
+        snapshots = {name: indexed[name] for name in components if name in indexed}
+        reference = _digest(facts.reference_snapshot, "snapshot") or (
+            snapshots.get(components[0], "") if components else ""
+        )
+        offered = self.offered or (
+            Variant(
+                name=facts.variant or "default",
+                store=facts.store,
+                snapshot=reference,
+                snapshots=dict(snapshots),
+                reference=True,
+            ),
+        )
+        return dataclasses.replace(
+            self,
+            store=facts.store,
+            config=facts.config,
+            variant=facts.variant,
+            reference_snapshot=reference,
+            components=components,
+            snapshots=snapshots,
+            stamps={k: tuple(v) for k, v in facts.stamps.items()},
+            custody=facts.custody,
+            vram_floor_bytes=facts.vram_floor_bytes,
+            offered=tuple(_normalize(v) for v in offered),
+        )
+
 
 #: The binding-plan record's CLOSED key set. A two-sided document: cozy-creator writes it and
-#: this is the only place in the runtime that knows its spellings. The names say what they
-#: name, and the sets in it are REAL SETS — `components` is a list and `snapshots` a map,
-#: because a comma-packed string is a second grammar every reader has to agree about.
+#: this is the only place in the runtime that knows its spellings.
 #:
-#: The record is PARTITIONED at the writer (#506a, `internal/plan` on the Creator side):
-#: `project`, `store` and `config` are RESOLUTION — the paths this machine put things at —
-#: and everything else is IDENTITY, which is what the plan id is digested over. This reader
-#: consumes both halves; what changed is that the id no longer depends on the paths, so a
-#: pod installing the byte-identical release computes the coordinator's own plan id.
+#: THE RECORD IS NOW IDENTITY ALMOST THROUGHOUT (#567e). #506a partitioned it once and moved
+#: three PATHS (`project`, `store`, `config`) out of the digested half; what it left behind
+#: was the rest of the writer's resolution wearing identity's clothes — `snapshot`,
+#: `snapshots`, `components`, `variant`, `custody`, `vram_floor_bytes` are all answers the
+#: writer got by looking the ref up in ITS OWN artifact index. They are path-free, so the
+#: plan id was fine; they are still unanswerable by a machine that does not hold the
+#: artifact, which is every rented pod. `store` was `project`'s twin and nobody had said so.
+#:
+#: So the model half of the record is now the REF and nothing else, and the eight artifact
+#: facts are gone from the document entirely — not moved to a resolution half, deleted,
+#: because the machine that serves already knows them and reads them from its own index
+#: (`DeclaredBinding.resolve`). `project` stays as recorded evidence of where the WRITER
+#: resolved the endpoint tree and decides nothing (#563f).
+
 RECORD_KEYS = frozenset(
     {
         "entrypoint_binding_plan_id",
@@ -514,25 +621,19 @@ RECORD_KEYS = frozenset(
         "model_class",
         "model_binding_path",
         "model_parameter_name",
+        "artifact_ref",
         "components",
-        "store",
-        "config",
-        "snapshot",
-        "snapshots",
         "release",
-        "variant",
         "variants",
         "objective",
         "steps_basis",
         "vram_bytes",
         "host_bytes",
         "pinned_bytes",
-        "vram_floor_bytes",
         "resident_budget_bytes",
         "entrypoint",
         "model_construction_digest",
         "tenancy",
-        "custody",
         "strict_keys",
         "max_input_bytes",
         "max_inputs_total_bytes",
@@ -546,22 +647,24 @@ RECORD_REQUIRED = frozenset({"entrypoint_binding_plan_id", "project", "release",
 #: The keys that TOGETHER declare one model. A record carries all of them or none of them:
 #: a weightless endpoint declares none and is served without a fill (cl-013).
 #:
-#: `config` IS NOT ONE OF THEM. An artifact's construction config is a document the artifact
-#: may or may not carry — an ingest with no `--config` produces a checkpoint whose header
-#: holds components and encodings and no config at all, and every field then stays at the
-#: release's own value, which is what the endpoints that read one already say. Counting it
-#: here made a whole, servable model read as HALF a declaration and refused it: a real H3
-#: artifact, pulled and verified at 92.42 GiB, was `binding_plan_partial_model` for the one
-#: key that is legitimately absent. An empty `config` is a fact about the artifact, not a
-#: half-written record.
+#: FOUR KEYS, and none of them is an artifact FACT (#567e). The slot (class, path,
+#: parameter) plus the artifact's REF is the whole declaration — everything a deployment
+#: can honestly state about a model it may not hold. The old set counted `components`,
+#: `store` and `snapshot`, which is why a record could be complete only on a machine that
+#: had already pulled the artifact: completeness was accidentally being defined as "the
+#: writer resolved it".
+#:
+#: `config` was never in this set and the reason generalizes to all three of its former
+#: neighbours: an artifact's construction config is a document the artifact may or may not
+#: carry, and an absent one is a fact about the artifact rather than half a record. Counting
+#: it made a whole, servable 92.42 GiB H3 artifact read as `binding_plan_partial_model`
+#: (#567c). The same trap with the same shape is what this set is now free of.
 MODEL_KEYS = frozenset(
     {
         "model_class",
         "model_binding_path",
         "model_parameter_name",
-        "components",
-        "store",
-        "snapshot",
+        "artifact_ref",
     }
 )
 
@@ -585,6 +688,34 @@ def _digest(value: str, what: str) -> str:
         f"{what}: {value[:80]!r} is not a sha256 digest. Both spellings are accepted — "
         "`sha256:<64 lowercase hex>` and the bare hex — and the runtime speaks the first",
     )
+
+
+def artifact_facts(cozy_home: Path, ref: str) -> ArtifactFacts | None:
+    """Resolve one artifact REF against THIS machine's own index (#567e).
+
+    The index's layout belongs to `internal/artifacts.py` and is read through it, never
+    re-parsed here: a second reader of those files would be a second layout to keep in step,
+    which is the rule that module states about itself.
+    """
+    row = index.find(cozy_home, ref)
+    if row is None:
+        return None
+    return ArtifactFacts(
+        store=row.store,
+        config=row.config,
+        components=tuple(row.components),
+        snapshots=dict(row.snapshots),
+        reference_snapshot=row.primary if row.snapshots else "",
+        variant=row.variant,
+        custody=row.custody,
+        vram_floor_bytes=row.vram_floor_bytes,
+        stamps={k: tuple(v) for k, v in row.stamps.items()},
+    )
+
+
+def held_refs(cozy_home: Path) -> tuple[str, ...]:
+    """What this machine's index DOES hold — the remedy half of an `artifact_absent`."""
+    return tuple(sorted(row.ref for row in index.rows(cozy_home)))
 
 
 def _normalize(variant: Variant) -> Variant:

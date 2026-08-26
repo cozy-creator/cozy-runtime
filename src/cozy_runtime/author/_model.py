@@ -897,13 +897,33 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
 
 
 def _admit(cls: type[Model[Any]], artifact: Artifact) -> None:
-    """The class's stamps join the checkpoint's VERIFIED stamp set, fail-closed."""
+    """The class's stamps JOIN THE CHECKPOINT'S VERIFIED STAMP SET BY MEMBERSHIP, fail-closed.
+
+    A stamp key carries a SET of values, not a scalar, and that is not a loosening — it is
+    the ratified law (tensorhub.md §lane: "an endpoint `task=` requirement joins by set
+    membership"), and the N-ARY PACKAGING RULE cannot be served without it. Stamps are a
+    CHECKPOINT fact: the dual H3 artifact carries one `transformer` stamped `task=fl2va` and
+    one `transformer_ref` stamped `task=ref2va`, so its lane contract is
+    `task=fl2va+ref2va`. Under scalar equality that artifact — the canonical production
+    packaging for every multi-task family — admits NEITHER role class, which is the shape
+    the serving path actually refused on real H3 weights (#567d).
+
+    Absence still fails closed, and a present-but-wrong value still refuses: unstamped means
+    "nobody looked", never "false". What the membership reading does NOT check is that the
+    matching value was evidenced on the component THIS class binds — the hub's stamp rows
+    carry that component and the lane contract drops it. Binding the wrong transformer is
+    already refused one clock earlier by exact-binding topology validation (the class's
+    factory constructs only the components it declares), so the per-component tightening is
+    a recorded door, not a hole: it needs the evidence rows carried down beside the contract.
+    """
     for key, value in cls.__stamps__.items():
-        actual = artifact.stamps.get(key)
-        if actual != value:
+        actual = artifact.stamp_set(key)
+        if value not in actual:
+            carried = "+".join(actual) if actual else "nothing"
             raise ConformanceError(
                 f"{cls.__name__} requires stamp {key}={value!r}; {artifact.snapshot} "
-                f"carries {key}={actual!r} — stamps fail closed on absence (§1.1)",
+                f"carries {key}={carried} — a class keyword joins the checkpoint's stamp "
+                "set by membership and fails closed on absence (§1.1)",
                 code="stamp_mismatch",
                 fields=[key],
             )

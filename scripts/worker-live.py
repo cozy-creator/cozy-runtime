@@ -584,18 +584,36 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
         "model_class": "SdxlUnetModel",
         "model_binding_path": f"{entrypoint}.models.model",
         "model_parameter_name": "model",
+        "artifact_ref": RELEASE,
         "components": [COMPONENT],
-        "store": working_store(WORK / "store"),
-        "config": str(CONFIG),
-        "snapshot": snapshot(),
         "release": RELEASE,
-        "variant": "sm89",
         "vram_bytes": 6 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,  # tfs-007 measured shape: 16 slots x 16 MiB
         "entrypoint": entrypoint,
         "model_construction_digest": "",
     }
+
+
+def install_row(home: Path, facts: dict[str, Any]) -> None:
+    """This harness's artifact index (#567e): the ref the record names, resolved HERE.
+
+    A binding record carries no store root any more, because a store root is a fact about
+    the machine that serves and the record's writer may not be it. These arms therefore
+    install the row the way `pull` installs it in production, and the worker looks the ref
+    up in the index of the COZY_HOME it was launched under.
+    """
+    from cozy_runtime.internal import artifacts
+
+    artifacts.install(
+        home,
+        artifacts.Artifact(
+            ref=str(facts.get("ref", RELEASE)),
+            store=str(facts.get("store") or working_store(WORK / "store")),
+            config=str(facts.get("config", CONFIG)),
+            snapshots=dict(facts.get("snapshots") or {COMPONENT: snapshot()}),
+        ),
+    )
 
 
 def prefill_journal(root: Path, target_bytes: int) -> int:
@@ -717,20 +735,35 @@ def stage(
     overrides: dict[str, Any] | None = None,
     release: str = RELEASE,
 ) -> dict[str, str]:
-    """Write one binding-plan record per entrypoint. `overrides` is how a DIFFERENT fixture
-    is driven through the same coordinator: the four-component pipeline is the same worker,
-    the same protocol and the same records with another project, store and component set."""
+    """Write one binding-plan record per entrypoint, and install the artifact row they name.
+
+    `overrides` is how a DIFFERENT fixture is driven through the same coordinator: the
+    four-component pipeline is the same worker, the same protocol and the same records with
+    another project and component set. Its ARTIFACT half (store, config, snapshots) goes
+    into the index row rather than the record — #567e moved those facts to the resolver.
+    """
     (tmp / "binding-plans").mkdir(parents=True, exist_ok=True)
+    over = dict(overrides or {})
+    facts = {
+        "ref": over.pop("artifact_ref", release),
+        "store": over.pop("store", "") or store,
+        "config": over.pop("config", CONFIG),
+        "snapshots": over.pop("snapshots", None),
+    }
+    over.pop("snapshot", None)
+    over.pop("variant", None)
+    over.pop("custody", None)
+    over.pop("vram_floor_bytes", None)
+    install_row(tmp, facts)
     ids = {}
     for entrypoint in entrypoints:
         plan_id = plan_id_for(entrypoint, release)
         record = binding_record(plan_id, entrypoint)
-        if store:
-            record["store"] = store
-        record.update(overrides or {})
+        record.update(over)
         record["entrypoint_binding_plan_id"] = plan_id
         record["entrypoint"] = entrypoint
         record["release"] = release
+        record["artifact_ref"] = str(facts["ref"] or release)
         (tmp / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
             json.dumps(record, indent=2)
         )

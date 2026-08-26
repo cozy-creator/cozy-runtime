@@ -287,12 +287,41 @@ class Artifact:
     snapshot: str
     topology: Mapping[str, TensorSpec]
     config: Config
-    stamps: Mapping[str, str] = field(default_factory=dict)
+    stamps: Mapping[str, str | Sequence[str]] = field(default_factory=dict)
+    """The checkpoint's OPEN uploader-minted stamp map, as its catalog lane carries it: one
+    key to a canonically ordered SET of values (tensorhub.md §lane). A class keyword joins
+    it by MEMBERSHIP and fails closed on absence — which is what makes the N-ary packaging
+    rule servable at all: the dual H3 artifact carries `task=fl2va+ref2va` because both
+    task-role transformers are in it, and a scalar equality could never admit either class.
+    Stamps are per CHECKPOINT, so every lane over one snapshot carries the same set.
+
+    A bare string is the one-element set and is accepted verbatim: `__post_init__`
+    normalizes, so `stamp_set` is the one reading and nothing downstream branches on which
+    spelling a caller used."""
     variant: str = "plain"
     custody: Custody = "canonical"
     strict_keys: bool = False
     """`--strict-keys`: a LOCAL bind's unknown extra keys refuse instead of confessing.
     Meaningless on a canonical lane, where every extra already refuses."""
+
+    def __post_init__(self) -> None:
+        # ONE STAMP SPELLING INSIDE, ACCEPTED EITHER WAY AT THE DOOR. A narrow artifact's
+        # stamp is a one-element set and every caller that writes `task="fl2va"` means
+        # exactly that; normalizing here is what keeps `_admit` a single membership test
+        # instead of two readings that can disagree.
+        normalized: dict[str, str | Sequence[str]] = {
+            key: (value,) if isinstance(value, str) else tuple(value)
+            for key, value in self.stamps.items()
+        }
+        object.__setattr__(self, "stamps", normalized)
+
+    def stamp_set(self, key: str) -> tuple[str, ...]:
+        """This checkpoint's values for one stamp key. Absent is the EMPTY set, which is
+        what "unstamped means nobody looked" spells — never a value."""
+        value = self.stamps.get(key)
+        if value is None:
+            return ()
+        return (value,) if isinstance(value, str) else tuple(value)
 
 
 # --------------------------------------------------------------------------- backend
@@ -708,11 +737,16 @@ class Loader:
             else:
                 marked.append((key, *rule))
         for key, stamp, value in marked:
-            declared = self._artifact.stamps.get(stamp)
-            if declared is not None and declared != value:
+            # A CONTRADICTION IS NON-MEMBERSHIP IN A NON-EMPTY SET, not inequality with a
+            # scalar: a checkpoint stamped `objective=v_prediction+epsilon` (a package
+            # carrying both regimes) is not contradicted by a `v_pred` marker key. An
+            # UNSTAMPED key is nobody having looked, and the marker is what transcribes it.
+            declared = self._artifact.stamp_set(stamp)
+            if declared and value not in declared:
                 raise ConformanceError(
                     f"{self._artifact.snapshot} carries the marker key {key!r}, which means "
-                    f"{stamp}={value}, but the artifact is stamped {stamp}={declared!r} — a "
+                    f"{stamp}={value}, but the artifact is stamped "
+                    f"{stamp}={'+'.join(declared)} — a "
                     "known marker is never ignored, so a contradiction refuses NAMING it",
                     code="marker_conflict",
                     fields=[key],

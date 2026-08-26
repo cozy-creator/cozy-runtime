@@ -102,7 +102,7 @@ def cli_retry(live: Any, *args: str, **kwargs: Any) -> tuple[int, str, str]:
 
 
 def install_artifact(home: Path, ref: str = REF, **overrides: Any) -> None:
-    from cozy_runtime.cli import artifacts
+    from cozy_runtime.internal import artifacts
 
     snapshots = json.loads(Path("/tmp/cozy-sdxl4/snapshots.json").read_text())
     row = artifacts.Artifact(

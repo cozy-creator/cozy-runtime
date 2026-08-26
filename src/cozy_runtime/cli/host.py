@@ -19,9 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cozy_runtime.cli import artifacts
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import artifacts, hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 

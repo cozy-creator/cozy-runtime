@@ -1,15 +1,23 @@
-"""The LOCAL artifact index — the CLI layer's "install local snapshot refs" power.
+"""THE LOCAL ARTIFACT INDEX — this machine's inventory of installed checkpoints.
 
-cozy-runtime-cli.md §Local authority names this as a CLI-layer capability the runtime CORE
-does not have: the core is handed exact store roots and snapshot digests and never resolves
-a ref. This module is where a ref (`org/repo[@release]`) becomes those exact facts, and it
-is the one vocabulary `list`, `rm` and `run` share.
+It answers ONE question: what does the ref `org/repo[@release]` mean on THIS disk — which
+store root, which snapshot per component, which construction config, which custody, which
+uploader-minted stamps. A row is a projection of what TensorFS's ingest border hands back,
+never a second description of the bytes: `bytes` is copied from the header, and the index
+holds no tensor facts of its own.
 
-A row is a projection of what TensorFS's ingest border hands back, never a second
-description of the bytes: store root, one snapshot digest per component, the immutable
-construction config, and the byte total the header already counted. The index holds no
-tensor facts of its own — `bytes` is copied from the header, and `list` reports one artifact
-size exactly as the CLI vocabulary requires.
+IT MOVED OUT OF THE CLI LAYER (#567e), and that is a correction rather than a shuffle. The
+old header called ref resolution "a CLI-layer capability the runtime CORE does not have",
+because the only resolver that had ever existed was the one that also wrote the record. On
+a rented pod those are different machines: the owner's index cannot answer what a ref means
+on the pod's disk, and the worker — which is `internal` — is the thing that has to ask.
+#565b's rule is RESOLUTION IS THE RESOLVER'S OWN, and an index only the record-WRITER may
+read is a resolver bolted to the wrong machine.
+
+What the law protected is still true and is unmoved: the fill plane and the author surface
+are handed exact store roots and exact snapshot digests, and neither can name a ref. The
+resolving happens once, at the boundary where a binding record becomes a prepare — one
+layer below where it used to, on the machine that is actually going to serve.
 """
 
 from __future__ import annotations
@@ -20,8 +28,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal.exits import Exit
+
+
+class ArtifactRefError(ValueError):
+    """A string that is not a ref reached the index. It carries the CLI's own words so the
+    one caller that can be handed a human's typo renders them without inventing a second
+    message for one refusal."""
+
+    def __init__(self, message: str, remedy: str, exit_code: Exit = Exit.usage) -> None:
+        super().__init__(message)
+        self.remedy = remedy
+        self.exit_code = exit_code
+
 
 SCHEMA = "cozy.runtime.LocalArtifact/1"
 DIRECTORY = "artifacts"
@@ -53,6 +72,18 @@ class Artifact:
     extra_key_markers: tuple[str, ...] = field(default_factory=tuple)
     """Known marker rules an extra key may match, e.g. `v_pred`. A match is transcribed or
     refused NAMING the marker; it is never ignored."""
+    stamps: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """THE CHECKPOINT'S UPLOADER-MINTED STAMP SET, as the hub's catalog lane carries it
+    (#567d). Key -> the canonically ordered set of values, verified at publish against the
+    border's own derivations; the runtime interprets none of them and only JOINS a model
+    class's declared keywords against them, failing closed on absence.
+
+    It lives HERE — beside store, snapshots and custody — because a stamp is a fact about
+    the checkpoint that the resolver of a ref has to hand over with the rest of them. The
+    tensor bytes never carried it and never should: `cozytensors/1` holds configs,
+    encodings and components, and a fact the hub verifies is not a fact the header can
+    assert. Absent means this row was written before its lane had stamps, which fails every
+    stamped model class closed — exactly as unstamped should."""
 
     @property
     def components(self) -> tuple[str, ...]:
@@ -77,6 +108,7 @@ class Artifact:
             "custody": self.custody,
             "vram_floor_bytes": self.vram_floor_bytes,
             "extra_key_markers": list(self.extra_key_markers),
+            "stamps": {k: list(v) for k, v in sorted(self.stamps.items())},
         }
 
 
@@ -91,12 +123,10 @@ def directory(cozy_home: Path) -> Path:
 def install(cozy_home: Path, artifact: Artifact) -> Path:
     """Record one installed artifact. Idempotent: identical facts rewrite the same bytes."""
     if not REF.match(artifact.ref):
-        raise CliError(
-            "usage",
+        raise ArtifactRefError(
             f"{artifact.ref!r} is not a ref: org/repo[@release]",
             "refs are org/repo with an optional @release; a filesystem path is admitted "
             "through `cozy-runtime ingest` first",
-            Exit.usage,
         )
     target = directory(cozy_home)
     target.mkdir(parents=True, exist_ok=True)
@@ -129,6 +159,9 @@ def rows(cozy_home: Path, prefix: str = "") -> list[Artifact]:
                 custody=str(doc.get("custody", "canonical")),
                 vram_floor_bytes=int(doc.get("vram_floor_bytes", 0)),
                 extra_key_markers=tuple(doc.get("extra_key_markers", ())),
+                stamps={
+                    str(k): tuple(str(x) for x in v) for k, v in (doc.get("stamps") or {}).items()
+                },
             )
         )
     return out

@@ -123,34 +123,47 @@ def variants() -> list[dict[str, Any]]:
 def binding_record(
     offered: list[dict[str, Any]], objective: str = "latency", resident_budget: int = 0
 ) -> dict[str, Any]:
-    """The deployment record. `variants` is the only new field, and it is ADDITIVE: a
-    record that omits it offers exactly what `store`/`snapshot` already named."""
-    reference = next(v for v in offered if v["reference"])
+    """The deployment record. `variants` is the deployment's OFFER — several artifacts for
+    one logical model — and it stays in the record; what left it (#567e) are the single
+    artifact's own facts, which the index row below carries instead."""
     return {
         "entrypoint_binding_plan_id": Q.plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
         "model_binding_path": "generate.models.model",
         "model_parameter_name": "model",
+        "artifact_ref": RELEASE,
         "components": list(COMPONENTS),
-        "store": str(PLAIN_STORE),
-        "config": str(Q.PIPE_CONFIG),
-        "snapshot": reference["snapshot"],
-        "snapshots": reference["snapshots"],
         "release": RELEASE,
-        "variant": "sm89",
         "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,
         "entrypoint": "generate",
         "model_construction_digest": "",
         "resident_budget_bytes": resident_budget,
-        "vram_floor_bytes": 1 * GIB,
         "tenancy": "local",
         "variants": offered,
         "objective": objective,
         "steps_basis": 20,
     }
+
+
+def install_row(offered: list[dict[str, Any]] | None = None) -> None:
+    """The artifact index row the record's ref resolves against (#567e)."""
+    from cozy_runtime.internal import artifacts
+
+    reference = next(v for v in (offered or variants()) if v["reference"])
+    HOME.mkdir(parents=True, exist_ok=True)
+    artifacts.install(
+        HOME,
+        artifacts.Artifact(
+            ref=RELEASE,
+            store=str(PLAIN_STORE),
+            config=str(Q.PIPE_CONFIG),
+            snapshots=dict(reference["snapshots"]),
+            vram_floor_bytes=1 * GIB,
+        ),
+    )
 
 
 def survey() -> None:
@@ -256,6 +269,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     spec = json.loads(spec_path.read_text())
     workspace = Path(spec["workspace"])
     HOME.mkdir(parents=True, exist_ok=True)
+    install_row(spec["binding"].get("variants"))
     config = read_config(
         {
             "PATH": os.environ["PATH"],

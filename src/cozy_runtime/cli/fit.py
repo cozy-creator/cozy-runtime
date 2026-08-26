@@ -18,15 +18,15 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.cli import artifacts
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import artifacts, hostfacts
 from cozy_runtime.internal import descriptor as desc
-from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.worker import plan as worker_plan
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -159,7 +159,13 @@ def _verdict(
     ledger.device_total = facts.vram_total_bytes
     share = installed.bytes // max(len(installed.components), 1)
     ledger.resident = dict.fromkeys(installed.components, share)
-    declared = DeclaredBinding.read(dict(record))
+    # `fit` prices a real plan, so it needs the artifact FACTS the record no longer carries
+    # (#567e) — and it resolves them the same way the worker will, against this machine's
+    # own index. A local `fit` and a local `run` therefore price the identical binding.
+    declared = DeclaredBinding.read(dict(record)).resolve(
+        worker_plan.artifact_facts(config.cozy_home, str(record["artifact_ref"])),
+        held=worker_plan.held_refs(config.cozy_home),
+    )
     chooser = PlanChooser(ledger)
     # `fit` prices a HYPOTHETICAL: there is no endpoint process to prepare the request, so
     # the shape axes are normalized from the document by the one normalizer and the record

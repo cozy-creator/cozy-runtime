@@ -109,19 +109,37 @@ def plan_id_for(entrypoint: str) -> str:
     return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
 
 
-def binding_record(entrypoint: str, store: str = "") -> dict[str, Any]:
+def install_row(home: Path, store: str = "") -> None:
+    """Put this bench artifact in the run's OWN artifact index (#567e).
+
+    The record names a ref and the worker resolves it against this machine's index, so a
+    harness that hands the worker a store root without an index row is handing it a fact
+    the product path never carries. Installing the row is what makes these arms run the
+    shape production runs: pull writes a row, and the binding names what the row is called.
+    """
+    from cozy_runtime.internal import artifacts
+
+    artifacts.install(
+        home,
+        artifacts.Artifact(
+            ref=RELEASE,
+            store=store or working_store(Path(WORK) / "store"),
+            config=str(CONFIG),
+            snapshots={COMPONENT: snapshot()},
+        ),
+    )
+
+
+def binding_record(entrypoint: str) -> dict[str, Any]:
     return {
         "entrypoint_binding_plan_id": plan_id_for(entrypoint),
         "project": str(ROOT / "corpus" / "endpoint"),
         "model_class": "SdxlUnetModel",
         "model_binding_path": f"{entrypoint}.models.model",
         "model_parameter_name": "model",
+        "artifact_ref": RELEASE,
         "components": [COMPONENT],
-        "store": store or working_store(Path(WORK) / "store"),
-        "config": str(CONFIG),
-        "snapshot": snapshot(),
         "release": RELEASE,
-        "variant": "sm89",
         "vram_bytes": 6 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,  # tfs-007 measured shape: 16 slots x 16 MiB
@@ -182,6 +200,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(spec["workspace"])
     home = workspace / "home"
     home.mkdir(parents=True, exist_ok=True)
+    install_row(home, spec.get("store", ""))
     config = read_config(
         {
             "PATH": os.environ["PATH"],
@@ -234,7 +253,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     outcome = run_slice(
         config,
         request,
-        [binding_record(spec["entrypoint"], spec.get("store", ""))],
+        [binding_record(spec["entrypoint"])],
         workspace=workspace,
         release_id=RELEASE,
         options=options,

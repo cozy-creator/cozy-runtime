@@ -112,9 +112,7 @@ def fixtures() -> dict[str, Path]:
 
 
 def binding(entrypoint: str = "retouch", **extra: Any) -> dict[str, Any]:
-    record: dict[str, Any] = dict(
-        S.binding_record(entrypoint, store=S.working_store(WORK / "store"))
-    )
+    record: dict[str, Any] = dict(S.binding_record(entrypoint))
     record.update(extra)
     return record
 
@@ -162,6 +160,8 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     spec = json.loads(spec_path.read_text())
     workspace = Path(spec["workspace"])
     HOME.mkdir(parents=True, exist_ok=True)
+    # The record names a ref; THIS machine says what it means (#567e).
+    S.install_row(HOME, S.working_store(WORK / "store"))
     config = read_config(
         {
             "PATH": os.environ["PATH"],

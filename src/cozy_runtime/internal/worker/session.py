@@ -88,7 +88,10 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
     PlanChooser,
+    PlanRefusal,
     PreparedModel,
+    artifact_facts,
+    held_refs,
 )
 from cozy_runtime.protocol import (
     SCHEMA_DIGEST,
@@ -1588,7 +1591,32 @@ class Worker:
                     )
                 )
                 continue
-            self.bindings[plan_id] = DeclaredBinding.read(json.loads(record.read_text()))
+            # THE REF RESOLVES HERE, AGAINST THIS MACHINE'S OWN INDEX (#567e) — the same
+            # rule `project` already follows (#563f), applied to `store`, which is its
+            # twin. The record names `cozy/minimax-h3@se-001`; what that ref means on disk
+            # is a question only the machine about to serve it can answer, and it is
+            # answered before the placement can call itself STAGED. An absent artifact is a
+            # typed BINDING_UNAVAILABLE naming what this index does hold, not a fill-time
+            # surprise after a card is already rented and warm.
+            try:
+                declared = DeclaredBinding.read(json.loads(record.read_text()))
+                self.bindings[plan_id] = declared.resolve(
+                    artifact_facts(self.config.cozy_home, declared.artifact_ref)
+                    if declared.artifact_ref
+                    else None,
+                    held=held_refs(self.config.cozy_home),
+                )
+            except PlanRefusal as refusal:
+                missing.append(plan_id)
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=plan_id,
+                        reason=refusal.code,
+                        detail=refusal.detail,
+                    )
+                )
+                continue
         placement.materialization = (
             pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
             if missing
@@ -1723,6 +1751,12 @@ class Worker:
                         "snapshot": first.reference_snapshot,
                         "release": first.release,
                         "variant": first.variant,
+                        # THE STAMP PLANE'S LAST HOP (#567d). The index row carries what the
+                        # hub verified at publish; the executor hands it to `Artifact`, and
+                        # a model class's keywords join it there. Dropping it here is what
+                        # made `artifact.stamps` unconditionally `{}` and refused every
+                        # stamped class on every checkpoint.
+                        "stamps": {k: list(v) for k, v in first.stamps.items()},
                         "custody": first.custody,
                         "strict_keys": first.strict_keys,
                         "probe_cache": str(self.config.cozy_home / "probe"),

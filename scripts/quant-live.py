@@ -548,29 +548,42 @@ def pipeline_snapshots(unet: str) -> dict[str, str]:
 
 
 def binding_record(unet: str) -> dict[str, Any]:
-    have = pipeline_snapshots(unet)
+    del unet  # the artifact's snapshot map is the index row's, not the record's (#567e)
     return {
         "entrypoint_binding_plan_id": plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
         "model_binding_path": "generate.models.model",
         "model_parameter_name": "model",
+        "artifact_ref": RELEASE,
         "components": list(COMPONENTS),
-        "store": str(PLAIN_STORE),
-        "config": str(PIPE_CONFIG),
-        "snapshot": have["unet"],
-        "snapshots": dict(sorted(have.items())),
         "release": RELEASE,
-        "variant": "sm89",
         "vram_bytes": 7 * GIB,
         "host_bytes": 2 * GIB,
         "pinned_bytes": 256 * MIB,
         "entrypoint": "generate",
         "model_construction_digest": "",
         "resident_budget_bytes": 2 * GIB,
-        "vram_floor_bytes": 1 * GIB,
         "tenancy": "local",
     }
+
+
+def install_row(home: Path, unet: str) -> None:
+    """The artifact index row the record's ref resolves against (#567e). The fp16/fp8 arms
+    differ in the SNAPSHOT MAP this row carries, which is where an encoding choice has
+    always lived — a fact about the artifact, resolved where the artifact is."""
+    from cozy_runtime.internal import artifacts
+
+    artifacts.install(
+        home,
+        artifacts.Artifact(
+            ref=RELEASE,
+            store=str(PLAIN_STORE),
+            config=str(PIPE_CONFIG),
+            snapshots=dict(sorted(pipeline_snapshots(unet).items())),
+            vram_floor_bytes=1 * GIB,
+        ),
+    )
 
 
 def install_into(root: Path) -> str:
@@ -620,6 +633,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     workspace = Path(spec["workspace"])
     home = workspace / "home"
     home.mkdir(parents=True, exist_ok=True)
+    install_row(home, spec["unet"])
     config = read_config(
         {
             "PATH": os.environ["PATH"],

@@ -16,9 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.cli import artifacts
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import artifacts, fill
 from cozy_runtime.internal import pull as transport
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
@@ -147,8 +146,18 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         lane=flags.get("--lane", "") or "plain",
         bytes=facts.stored_bytes,
         tensors=facts.tensors,
+        # THE STAMP PLANE'S READER HALF (#567d). The hub verified these at publish against
+        # the border's own derivations and they are the third coordinate of the lane
+        # contract this pull just matched — carrying structure and encoding down while
+        # dropping the stamps is what left every stamped model class with `task=None`.
+        stamps=dict(outcome.stamps),
     )
-    artifacts.install(config.cozy_home, row)
+    try:
+        artifacts.install(config.cozy_home, row)
+    except artifacts.ArtifactRefError as bad:
+        # The one place a HUMAN's string reaches the index: `--as`. The index states the
+        # refusal and this renders it — one message, two layers, no second wording.
+        raise CliError("usage", str(bad), bad.remedy, bad.exit_code) from bad
     return Result(
         document={**outcome.document(), "components": list(facts.components)},
         rows=(
@@ -156,6 +165,11 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
             ("snapshot", "sha256:" + outcome.snapshot),
             ("store", str(store.root)),
             ("components", f"{', '.join(facts.components)} — {facts.tensors} tensors"),
+            (
+                "stamps",
+                ", ".join(f"{k}={'+'.join(v)}" for k, v in sorted(row.stamps.items()))
+                or "none — a stamped model class will refuse this artifact",
+            ),
             (
                 "objects",
                 f"{outcome.declared} declared, {outcome.held} held, {outcome.fetched} fetched"
