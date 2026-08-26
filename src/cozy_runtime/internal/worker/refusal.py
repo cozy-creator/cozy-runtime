@@ -66,6 +66,21 @@ SIDE: dict[str, str] = {
     "checkpoint_unreadable": DATA,
     "reader_unavailable": READER,
     "lease_revoked": LEASE,
+    # The stored carrier is not the encoding it cites — the header's role set or a role's
+    # geometry disagrees with the spec object the tensor names (TensorFS `ROLE_SET_MISMATCH`
+    # / `SHAPE_MISMATCH`, raised where the worker re-checks the header against its own
+    # encoding closure). DATA: the bytes are wrong and the artifact must be rebuilt by its
+    # producer. Every other side would send someone to fix a system that is fine.
+    "carrier_geometry": DATA,
+    # cr-006's three, which had no classification and therefore no fault sentence at all.
+    # All READER, and each for the same reason: the header was VALIDATED against its own
+    # cited specs before any of them can fire, so what is left in every case is that THIS
+    # BUILD has no path for admissible bytes — no provider for a registered spec, no
+    # capability record on this card, or a provider registered against a spec whose role set
+    # it does not implement. None of the three is fixed by touching the artifact.
+    "unknown_encoding": READER,
+    "encoding_unqualified": READER,
+    "role_mismatch": READER,
 }
 
 _SENTENCE = {

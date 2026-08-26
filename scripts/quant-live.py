@@ -1113,11 +1113,24 @@ def arms() -> None:
         f"[{code}] {detail[:190]}",
     )
 
-    mxfp8 = digests_of("mxfp8/1")[0]
-    code, detail = refusal(Encoded(mxfp8, "mxfp8/1", parts))
+    # #469a: mxfp8 IS built now (`cozy.mxfp8.dequant/1`), so the SM100 arm moved to an
+    # encoding that is still only NAMED. The mxfp8 digest keeps an arm of its own here,
+    # because handing it THIS artifact's role set — a rank-0 f32 `weight_scale` where the
+    # block spec declares a u8 `scale` grid — is the way a per-tensor selector goes wrong
+    # quietly, and it must refuse on the ROLES rather than be tolerated as a variant.
+    nvfp4 = digests_of("nvfp4-w4a4/1")[0]
+    code, detail = refusal(Encoded(nvfp4, "nvfp4-w4a4/1", parts))
     check(
         "an SM100-only encoding refuses TYPED, naming this card's facts",
         code == "encoding_unqualified" and f"sm{device.sm}" in detail and "sm100" in detail,
+        f"[{code}] {detail[:260]}",
+    )
+
+    mxfp8 = digests_of("mxfp8/1")[0]
+    code, detail = refusal(Encoded(mxfp8, "mxfp8/1", parts))
+    check(
+        "the mxfp8 provider refuses this artifact's fp8 role set on the ROLES, not silently",
+        code == "role_mismatch" and "scale" in detail,
         f"[{code}] {detail[:260]}",
     )
 

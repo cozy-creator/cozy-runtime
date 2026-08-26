@@ -36,6 +36,12 @@ weights are float either way. The sm90+ scaled-mm route and the SM100 mxfp8 nati
 are NAMED here as seams with their owning milestone; they are not built, and an artifact
 that needs one refuses typed naming the device fact rather than silently taking the
 float route it was not qualified for.
+
+MXFP8 (#469a's preferred H3 DiT lane) takes that same decoded-float route and is BUILT:
+E4M3 elements with one E8M0 power-of-two scale per 32-element block, dequantized into the
+destination's dtype at fill. Its native SM100 door stays named and unbuilt. Producing an
+mxfp8 artifact never made one servable (#469a, #501f); what makes it servable is a
+provider here plus a capability record minted by measured numerics, and nothing else.
 """
 
 from __future__ import annotations
@@ -358,6 +364,115 @@ class ScaledScalarDequant:
         destination.mul_(weight_scale.to(destination.dtype).reshape(()))
 
 
+#: The OCP microscaling block: one shared power-of-two scale per this many elements along
+#: the LAST axis. Transcribed from the registry's `mxfp8/1` spec relation
+#: (`ceil_div(axis 1, by 32)`) and from nothing else; the provider below asserts the
+#: delivered scale grid against it rather than against a number spelled twice.
+MX_BLOCK = 32
+
+#: E8M0's bias: a scale byte `b` denotes exactly `2**(b - 127)`.
+E8M0_BIAS = 127
+
+#: E8M0's ONE non-numeric code point. The registry entry's prose says only "scale byte b
+#: means 2^(b-127)", which at `b = 255` reads as `2**128`; the encoding's own NORMATIVE
+#: decoder — the conform corpus this spec is qualified against — returns NaN there, which
+#: is OCP's reading. Prose and reference disagree and the REFERENCE wins, because the
+#: corpus is what a decoder is checked against bit-for-bit. `2**128` would also be a
+#: plausible finite-looking overflow, and serving a poisoned block as `inf` where the
+#: contract says NaN is the silent-wrong-output class this whole module exists to prevent.
+E8M0_NAN = 255
+
+
+@dataclass(frozen=True, slots=True)
+class MicroScaledDequant:
+    """`mxfp8/1` -> float, weight-only: `value = data * 2**(scale - 127)` per 32-block.
+
+    The registry's spec is the whole contract and is transcribed from it: E4M3 elements in
+    a `data` role shaped exactly like the logical tensor, and one E8M0 exponent byte per
+    32-element block along the LAST axis in a `scale` role shaped `[rows, ceil(cols/32)]`.
+    Rank is 2 because the spec says `logical_rank: 2`.
+
+    **Why DECODED FLOAT and not native.** MXFP8's whole point on Blackwell is that the
+    tensor cores consume E4M3 elements and E8M0 block scales DIRECTLY, and that route is
+    real — it is also new kernel work on silicon this fleet does not have, so building it
+    from here would be building against a card nobody can run the arms on. The route that
+    needs no new kernel is this one: dequantize each block into the destination's own float
+    dtype at fill, compute in float. It buys bytes read and load time, NOT VRAM — the
+    resident weights are float either way, exactly as the fp8 route's docstring says of
+    itself. `NAMED_SEAMS` keeps the native door named with the device class that opens it.
+
+    **Why the multiplier is formed in the DESTINATION dtype.** The alternative — promote to
+    f32, multiply, cast down — allocates a second full-width copy of every weight, which
+    this plane prices as decode scratch and would then be carrying unledgered. The scale is
+    a pure power of two, so forming it in bf16 or f32 is EXACT for every byte those dtypes
+    can hold (bf16 carries integers to 255 exactly and subnormals to 2**-133, so
+    `2**(b-127)` is exact for b in 0..254). f16 cannot: `2**(b-127)` flushes to zero below
+    b = 103, so a block whose product WOULD be representable decodes as zero. That is not
+    papered over here — `probe.py` measures the full domain per output dtype and f16 mints
+    no record, so an f16 mxfp8 destination refuses `encoding_unqualified` rather than being
+    served silently wrong. Widening f16 needs a capability record that can carry a qualified
+    exponent RANGE, which the tfs-013 key cannot express today.
+    """
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.mxfp8.dequant/1"
+
+    @property
+    def route(self) -> str:
+        return "decoded_float"
+
+    @property
+    def device_predicate(self) -> str:
+        # A cast plus a broadcast multiply — no matmul, no block-scale kernel. Available
+        # wherever torch carries the e4m3 dtype, which is the same argument the scalar fp8
+        # route makes. The sm100 floor belongs to the NATIVE route in NAMED_SEAMS.
+        return "any"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+        data = parts["data"]
+        scale = parts["scale"]
+        dtype = destination.dtype
+        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        blocks = int(scale.shape[-1])
+        # The block multiplier: one value per block, so this tensor is 1/32 of the weight
+        # and forming it costs nothing worth accounting. `.to(dtype)` on a u8 in 0..255 is
+        # exact in every float dtype; the subtraction and the exp2 are exact wherever the
+        # result is representable, which is what the probe proves rather than assumes.
+        mult = torch.exp2(scale.to(dtype) - E8M0_BIAS)
+        # E8M0's NaN code point, applied on the SCALE tensor (1/32 of the weight) rather
+        # than element-wise on the payload. `exp2(128)` is `inf` in every dtype here and the
+        # reference decoder says NaN, so without this line a poisoned block would decode to
+        # a signed infinity — a different wrong answer, and one an output-integrity floor
+        # reads differently. The producing job clamps to 254 and never emits this byte;
+        # a decoder that is only correct on its own producer's output is not a decoder.
+        mult = torch.where(scale == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
+        if cols == blocks * MX_BLOCK and destination.is_contiguous():
+            # THE PATH EVERY REAL ARTIFACT TAKES. A 3-D view over both sides broadcasts the
+            # block scale with no intermediate at all: no repeat, no f32 copy, one kernel.
+            view = destination.view(rows, blocks, MX_BLOCK)
+            view.copy_(data.view(rows, blocks, MX_BLOCK).to(dtype))
+            view.mul_(mult.unsqueeze(-1))
+            return
+        # The RAGGED tail (`ceil_div` admits a last block shorter than 32) and the
+        # non-contiguous destination, both handled by widening the multiplier instead of
+        # viewing the weight. It costs one destination-sized temporary and is written as the
+        # slow path on purpose: a 3-D view cannot span a partial block or a strided slice,
+        # and quietly taking the fast path anyway would mis-stride the scales.
+        destination.copy_(data.view(destination.shape).to(dtype))
+        destination.mul_(mult.repeat_interleave(MX_BLOCK, dim=-1)[..., :cols])
+
+
 #: Encodings this runtime RECOGNISES but does not execute, with the device class that
 #: would and the milestone that owns building it. Data, not machinery: there is no stub
 #: provider object, no empty package and no dormant enum case — the refusal below reads
@@ -375,14 +490,14 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
     ),
     "mxfp8/1": (
         "cuda.sm100+",
-        "MXFP8 native (tensor cores consume E4M3 elements + E8M0 block scales directly), "
-        "or the sm89+ software-scaled arm that applies the 32-block E8M0 scales in the "
-        "kernel prologue — both NEW kernel work. The route that needs no new kernel is "
-        "DECODED FLOAT: element * 2^(scale-127) per 32-element block into the logical "
-        "dtype, the same shape as this build's fp8 provider and not built because no lane "
-        "selects mxfp8 (proto-001 measured it 1.06 dB BEHIND per-tensor fp8 for 3.1% more "
-        "bytes, throughput ABSENT on SM90 silicon). What never happens is a silent "
-        "per-channel reinterpretation of block scales",
+        "MXFP8 NATIVE (tensor cores consume E4M3 elements + E8M0 block scales directly), "
+        "or the sm89+ software-scaled arm that applies the 32-block scales in the kernel "
+        "prologue — both NEW kernel work and neither built. The DECODED FLOAT route IS "
+        "built and served by this runtime (`cozy.mxfp8.dequant/1`, device predicate any), "
+        "so this entry names what a card would add, not what is missing: a route that "
+        "keeps the weights in fp8 through the matmul instead of materializing them float. "
+        "What never happens either way is a silent per-channel reinterpretation of block "
+        "scales",
     ),
     "nvfp4-w4a4/1": (
         "cuda.sm100+",
@@ -412,6 +527,11 @@ def launch_providers() -> dict[str, Any]:
     # fact, enforced when the header is parsed against its own encoding closure.
     for digest in digests_of("fp8-scaled-scalar/1"):
         out[digest] = ScaledScalarDequant(digest)
+    # #469a's PREFERRED H3 DiT serving lane. One digest under this alias — the block
+    # geometry IS the spec, so a producer variation would be a different spec and a
+    # different provider, not a tolerated role set.
+    for digest in digests_of("mxfp8/1"):
+        out[digest] = MicroScaledDequant(digest)
     return out
 
 

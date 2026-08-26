@@ -106,6 +106,17 @@ REFUSALS = frozenset(
         "lease_revoked",  # the read lease covering these bytes was revoked mid-fill
         "checkpoint_unreadable",  # the snapshot's header/document bytes do not parse
         "reader_unavailable",  # the tfs-007 `tensorfs` facade is not installed here
+        # The stored carrier does not match the encoding spec it CITES: a role set that is
+        # not the spec's exact set, or a role whose shape is not what the spec's relation
+        # derives. Distinct from `role_mismatch` on purpose — that one says THIS RUNTIME's
+        # decoder does not account for the roles (a runtime gap, READER side), and this one
+        # says the stored bytes are not the encoding they claim (DATA side, rebuild the
+        # artifact). Collapsing them would print the wrong remedy, which is the exact cost
+        # `worker/refusal.py` exists to avoid (#503b). It becomes producible with mxfp8: a
+        # block scale is the first role whose geometry is DERIVED (`ceil_div(cols, 32)`)
+        # rather than fixed, so "the right roles at the wrong shape" is a state that can
+        # exist for the first time.
+        "carrier_geometry",
     }
 )
 
@@ -236,6 +247,15 @@ STORE_REFUSALS: dict[str, str] = {
     "MALFORMED_JSON": "checkpoint_unreadable",
     "UNKNOWN_FORMAT": "checkpoint_unreadable",
     "MISSING_FIELD": "checkpoint_unreadable",
+    # The header re-check against its own encoding closure (`Checkpoint.__init__`), which is
+    # law 18 made mechanical: a coordinator's authority is not worker safety, so the worker
+    # asks TensorFS whether every tensor's stored roles ARE the roles its cited spec
+    # declares. Both codes were escaping this plane UNTRANSLATED — a raw
+    # `tensorfs.errors.Refusal` crossing a boundary whose whole contract is that the
+    # supervisor, the journal and the CLI read ONE refusal table. Same class as #496a, one
+    # layer up: the check fired correctly and the answer had nowhere to go.
+    "ROLE_SET_MISMATCH": "carrier_geometry",
+    "SHAPE_MISMATCH": "carrier_geometry",
 }
 
 #: The table's codomain is CHECKED against the vocabulary at import, not at the moment a
@@ -455,6 +475,66 @@ def survey_routes(rows: Sequence[PlanRow], selector: Selector) -> tuple[dict[str
             return routes, str(exc)
         routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
     return routes, ""
+
+
+@dataclass(frozen=True, slots=True)
+class Servability:
+    """This runtime's OWN answer to "can I serve these bytes", given before any of them move.
+
+    #501f's runtime twin. That ruling makes a PRODUCER declare, in its artifact's manifest,
+    that its encoding has no runtime provider. This is the other half, and it is the half
+    that cannot be gamed: the runtime never reads an encoding CLAIM. It reads the per-tensor
+    spec DIGESTS the header cites, looks each one up in the provider set this build was
+    compiled with, and asks the capability table — whose records exist only where measured
+    numerics minted them — whether this device serves it. A manifest that says "servable"
+    changes nothing here, and neither does a manifest that says nothing at all.
+
+    `serves` is therefore never a claim about the artifact; it is a claim about THIS worker
+    standing on THIS card, which is the only thing a worker is entitled to claim.
+    """
+
+    serves: bool
+    by_alias: dict[str, int]
+    """Every encoding alias the header actually cites, and how many tensors cite it."""
+    routes: dict[str, int]
+    refusal: str
+    code: str
+
+    def line(self) -> str:
+        cited = ", ".join(f"{alias} x{n}" for alias, n in sorted(self.by_alias.items()))
+        if self.serves:
+            served = ", ".join(f"{route} x{n}" for route, n in sorted(self.routes.items()))
+            return f"serves {cited} via {served}"
+        return f"CANNOT serve {cited}: [{self.code}] {self.refusal}"
+
+    def require(self) -> None:
+        """Raise the refusal, in the fill plane's vocabulary. A caller that wants to CHOOSE
+        another variant reads `serves` instead — which is what the delivery lane does."""
+        if not self.serves:
+            raise _refuse(self.code, self.refusal)
+
+
+def servability(rows: Sequence[PlanRow], selector: Selector) -> Servability:
+    """Answer for a whole component set, from the header alone. No I/O, no tensor bytes.
+
+    `survey_routes` already walks these rows for the delivery lane's variant arithmetic and
+    returns the same refusal verbatim; this adds the two things an HONESTY answer needs and
+    a route census does not — WHICH encodings were cited (so the answer names the artifact's
+    actual encoding rather than a route count) and the refusal's CODE (so it can be spoken
+    as a typed refusal rather than printed as a sentence).
+    """
+    by_alias: dict[str, int] = {}
+    routes: dict[str, int] = {}
+    for row in rows:
+        alias = row.encoded.alias
+        by_alias[alias] = by_alias.get(alias, 0) + 1
+    for row in rows:
+        try:
+            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype))
+        except EncodingRefusal as exc:
+            return Servability(False, by_alias, routes, str(exc), exc.code)
+        routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
+    return Servability(True, by_alias, routes, "", "")
 
 
 def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
@@ -709,6 +789,13 @@ class StreamingFillBackend:
                 cache=Path(probe_cache) if probe_cache else None,
             )
         self.selector = Selector(self.providers, self.capabilities, self.device_facts)
+        #: THE SERVABILITY ANSWER, given here — before `expect` acquires a lease, before a
+        #: destination is reserved, before a byte moves. `fill()` re-selects per key and
+        #: would refuse too, but one tensor into a 532-tensor artifact is not when a worker
+        #: should discover it cannot serve the encoding it was handed, and a per-key refusal
+        #: names a key where the honest answer names the ENCODING (#501f's runtime twin).
+        self.servability = servability(rows, self.selector)
+        self.servability.require()
         #: The provider chosen for each destination, resolved in `fill` before a byte moves.
         self.selected: dict[str, Selection] = {}
         #: Transient device buffers holding STORED role bytes. They exist between the

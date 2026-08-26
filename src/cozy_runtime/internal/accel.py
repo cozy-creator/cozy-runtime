@@ -187,7 +187,18 @@ def child_env_law(kind: str) -> dict[str, str]:
 def qualification_gate(kind: str) -> None:
     """Refuses qualification on a backend whose probe suite does not exist yet. cr-006's
     suite is CUDA; the MPS suite must qualify the ACTUAL endpoint graph, not one matmul
-    (#450), and lands with cr-021."""
+    (#450), and lands with cr-021.
+
+    `cpu` PASSES, and it is the same reading `present` already takes: a torch-bearing
+    process with no card is a legitimate weightless executor, not a refusal, and cr-006's
+    decode arithmetic is the identical arithmetic there — the suite qualifies it honestly
+    and mints records predicated on `cpu`, which no CUDA fill can then satisfy. The whole
+    point of this gate is that a backend with no measured suite mints NO records rather
+    than inheriting someone else's, and that is a statement about `mps`, not about the
+    absence of an accelerator.
+    """
+    if kind == "cpu":
+        return
     if kind not in BACKENDS:
         raise AcceleratorUnsupported(kind, "qualification")
     if kind == "mps":
