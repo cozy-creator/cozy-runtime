@@ -868,6 +868,23 @@ raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surfac
         "the serving set is ['visible']",
     ),
     (
+        # #573: a GENERIC attribute probe over a guarded root refuses. This is the shape
+        # that poisoned H3's first successful fill — the runtime's own scheduler scan
+        # `hasattr`-probing a component it had just guarded — and it is armed here so the
+        # class of bug is caught by a test rather than by a rented card.
+        "generic-attribute-probe-over-a-guarded-root",
+        """
+from cozy_runtime.author._model import GuardedComponent
+
+class M(Model): pass
+m = M.__new__(M)
+object.__setattr__(m, '_cozy_active', None)
+object.__setattr__(m, '_cozy_poison', None)
+hasattr(GuardedComponent('transformer', object(), m), 'clone')
+""",
+        "undeclared_component",
+    ),
+    (
         "stamp-fails-closed",
         "registry().acquire('g.models.m', h3.Ref2VAModel, art.h3(task='fl2va'))\n",
         "stamp_mismatch",

@@ -872,9 +872,29 @@ class ModelRegistry:
             record = records[0] if len(records) == 1 else _merge(records)
             _prove_components(cls, record)
             constructed = loader.constructed()
+            # THE SCHEDULER SCAN READS THE RAW TABLE, BEFORE THE GUARDS GO ON (#573).
+            #
+            # `Scheduler` is a @runtime_checkable Protocol, so `isinstance(member,
+            # Scheduler)` asks `hasattr` for each of its members — and `hasattr` on a
+            # GuardedComponent runs `__getattr__`, which checks the active component-use
+            # scope. There is no scope during construction, so the RUNTIME'S OWN generic
+            # probe tripped the RUNTIME'S OWN guard and poisoned the generation with
+            # `undeclared_component` naming a component no endpoint had touched.
+            #
+            # Read off the failing path itself once the refusal learned to name its caller:
+            #     __getattr__ <- typing <genexpr> <- __instancecheck__ <- _schedulers
+            #                 <- _construct <- acquire
+            #
+            # It stayed hidden because `install_guards` installs nothing unless the
+            # constructed object exposes a real `components` dict, and H3Pipeline is the
+            # first endpoint that does — so H3 is the first construction ever to be guarded
+            # at all. Both facts are facts about the CONSTRUCTED objects, and the ordering
+            # is the whole fix: infrastructure reads them raw, and the guards go on
+            # afterwards for the author code they were built for.
+            schedulers = _schedulers(constructed, {})
             for obj in constructed:
                 install_guards(obj, model, record.components)
-            object.__setattr__(model, "_cozy_schedulers", _schedulers(constructed, {}))
+            object.__setattr__(model, "_cozy_schedulers", schedulers)
             object.__setattr__(model, "_cozy_caches", loader.caches())
             object.__setattr__(model, "checkpoint_ref", artifact.snapshot)
             object.__setattr__(model, "_cozy_record", record)
