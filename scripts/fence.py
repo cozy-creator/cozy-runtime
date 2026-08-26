@@ -10,6 +10,7 @@ Thirteen fences, each provable red by planting the violation (`scripts/redarm.py
 
 from __future__ import annotations
 
+import argparse
 import ast
 import pathlib
 import re
@@ -575,9 +576,20 @@ FENCES = {
 }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="run the runtime's architecture fences")
+    parser.add_argument("--only", action="append", choices=FENCES, default=[])
+    parser.add_argument("--exclude", action="append", choices=FENCES, default=[])
+    args = parser.parse_args(argv)
+    if args.only and args.exclude:
+        parser.error("--only and --exclude are mutually exclusive")
+    selected = {
+        name: check
+        for name, check in FENCES.items()
+        if (not args.only or name in args.only) and name not in args.exclude
+    }
     red = 0
-    for name, check in FENCES.items():
+    for name, check in selected.items():
         violations = check()
         if violations:
             red += 1
@@ -586,7 +598,7 @@ def main() -> int:
                 print("  " + v, file=sys.stderr)
         else:
             print(f"fence green — {name}")
-    print(f"{len(FENCES) - red}/{len(FENCES)} fences green over {len(py_files())} modules")
+    print(f"{len(selected) - red}/{len(selected)} fences green over {len(py_files())} modules")
     return 1 if red else 0
 
 
