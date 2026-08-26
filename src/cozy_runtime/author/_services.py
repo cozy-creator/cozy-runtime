@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Generic, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
 from cozy_runtime.author._assets import (
@@ -528,14 +528,20 @@ class Secrets(Generic[S]):
 
 
 @dataclass(frozen=True, slots=True)
-class CheckpointReceipt:
-    """Proof one durable checkpoint save completed (suffix law: a Receipt, never a Decision).
+class CheckpointDeclaration:
+    """One attempt DECLARED a checkpoint, and the declaration is journaled.
 
-    `replayed` says the identity was already durable and this call returned the SAME
-    receipt — the idempotency fact a resumed job needs, and never a second write.
+    NOT A DURABILITY RECEIPT, and the name is the fix (#553a). The type this replaces was
+    called `CheckpointReceipt` and carried a `receipt_id`, which is what a caller reads when
+    it decides the bytes survive an executor kill. Nothing stores the bytes: the worker
+    fsyncs a metadata row and the protocol's `JobCheckpointRequest.artifact` field goes out
+    empty, so the only true fact in the exchange is that an attempt said it had a checkpoint,
+    with this digest, at this length. That fact is what this carries.
+
+    `replayed` says the identity was already journaled and this call added nothing.
     """
 
-    receipt_id: str
+    declaration_id: str
     operation_key: str
     logical_key: str
     content_digest: str
@@ -547,6 +553,19 @@ class CheckpointConflict(CapabilityError):
     """One logical/operation key, two different contents. Never a replacement (§2)."""
 
     default_code = "checkpoint_conflict"
+
+
+class CheckpointSinkUnbuilt(CapabilityError):
+    """`Checkpoints.save()` is HARD-DISABLED: no ArtifactSink exists to store the bytes.
+
+    The dependency is named because it is the whole answer — #552 adopted ONE ARTIFACT
+    TRANSACTION, in which a runtime-owned ArtifactSink writes TensorFS objects and returns a
+    durable receipt, and checkpoints use that same sink. Until it exists there is no
+    representation of a durable checkpoint, so there is no representation of a receipt for
+    one either. `declare()` is what remains true in the meantime.
+    """
+
+    default_code = "checkpoint_sink_unbuilt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,28 +654,45 @@ class Scratch(_Bound):
 
 
 class Checkpoints(_Bound):
-    """Job service (§2) — DURABLE idempotent saves over a distinct exchange.
+    """Job service (§2) — checkpoint DECLARATIONS. `save()` is hard-disabled (#553a).
 
-    Identity is (run, attempt, operation key, logical key, content digest). Repeating the
-    same identity returns the durable receipt; the same logical/operation key with different
-    bytes is a CONFLICT, never a replacement. The write is journaled and acknowledged before
-    this call reports success, over the durable control exchange — never the lossy stream,
-    which has no authority over a durable fact.
+    What this service could honestly do and what it CLAIMED to do had come apart. The claim
+    was that `save()` made bytes durable and returned only once they were. The mechanism was
+    a metadata row: the worker fsyncs (run, attempt, operation key, logical key, content
+    digest, length) into its journal and the coordinator records a second copy, while the
+    protocol's `JobCheckpointRequest.artifact` field — the only place bytes could ride — goes
+    out empty and no component anywhere copies or stores them. A killed executor took every
+    checkpoint with it, and the receipt said otherwise.
+
+    So the identity, the idempotency and the CONFLICT rule are all real and all kept — they
+    are properties of the declaration, and repeating one adds nothing while the same keys
+    with different bytes stay a conflict, never a replacement. The DURABILITY is the part
+    that was not real, and `save()` now refuses `checkpoint_sink_unbuilt` naming the
+    ArtifactSink #552 adopted. When that sink exists, `save()` gets a body again and the
+    acceptance test is the one #553a names: kill executor and worker, recover BYTES by
+    receipt, never a journal entry.
     """
 
     __slots__ = ("_sink",)
 
     def __init__(
-        self, attempt: Attempt, sink: Callable[[CheckpointSave], CheckpointReceipt] | None = None
+        self,
+        attempt: Attempt,
+        sink: Callable[[CheckpointSave], CheckpointDeclaration] | None = None,
     ) -> None:
         super().__init__(attempt)
         self._sink = sink
 
-    def save(
+    def declare(
         self, logical_key: str, data: bytes | Path, *, operation_key: str = ""
-    ) -> CheckpointReceipt:
-        """Make one checkpoint durable, and return only once it IS."""
-        self._attempt.check_open("Checkpoints.save")
+    ) -> CheckpointDeclaration:
+        """Journal that this attempt HAS a checkpoint: its keys, digest and length.
+
+        Everything this returns is true. The bytes stay exactly where the caller put them —
+        the attempt spool, or the run's `Scratch.checkpoint_dir(key=)` tree, which is what
+        actually survives into the next attempt today.
+        """
+        self._attempt.check_open("Checkpoints.declare")
         if self._sink is None:
             raise CapabilityError(
                 "no durable checkpoint exchange is installed for this attempt: Checkpoints is "
@@ -676,11 +712,28 @@ class Checkpoints(_Bound):
                 operation_key=operation_key or logical_key,
                 logical_key=logical_key,
                 # SHA-256, the one identity spelling the platform uses for content (law 1),
-                # so the receipt the coordinator holds is addressable by the same digest.
+                # so the declaration the coordinator holds is addressable by the same digest.
                 content_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
                 length=len(raw),
                 path=blob,
             )
+        )
+
+    def save(self, logical_key: str, data: bytes | Path, *, operation_key: str = "") -> NoReturn:
+        """HARD-DISABLED. Refuses `checkpoint_sink_unbuilt` — see the class docstring.
+
+        `NoReturn` is the point: there is no value this can hand back, so no caller can be
+        holding a receipt for bytes nobody stored. `declare()` is the honest half.
+        """
+        del data, operation_key
+        self._attempt.check_open("Checkpoints.save")
+        raise CheckpointSinkUnbuilt(
+            f"{logical_key or '<unkeyed>'}: Checkpoints.save() is disabled because the "
+            "ArtifactSink it needs is UNBUILT — nothing in this runtime stores checkpoint "
+            "bytes, and the durable receipt this used to return was a claim about a metadata "
+            "row. Use Checkpoints.declare() for the fact that IS true (an attempt declared "
+            "this checkpoint), and Scratch.checkpoint_dir(key=) for bytes a retried attempt "
+            "of the same run can read back."
         )
 
 

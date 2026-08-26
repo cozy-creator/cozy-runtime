@@ -57,7 +57,7 @@ from cozy_runtime.author._services import (
     Attempt,
     Budget,
     BudgetFacts,
-    CheckpointReceipt,
+    CheckpointDeclaration,
     Checkpoints,
     CheckpointSave,
     Egress,
@@ -108,9 +108,10 @@ class Invocation:
     scratch: Path | None = None
     """The RUN's scratch tree — the same directory across attempts of one run, which is what
     makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
-    checkpoints: Callable[[CheckpointSave], CheckpointReceipt] | None = None
-    """The DURABLE checkpoint exchange. Distinct from the lossy progress lane on purpose:
-    the lossy lane has no authority over a durable fact."""
+    checkpoints: Callable[[CheckpointSave], CheckpointDeclaration] | None = None
+    """The checkpoint DECLARATION exchange. Distinct from the lossy progress lane on
+    purpose: the lossy lane has no authority over a journaled fact. It carries no bytes —
+    see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
     max_output_bytes: int = MAX_OUTPUT_BYTES

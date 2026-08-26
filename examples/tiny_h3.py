@@ -698,12 +698,14 @@ def distill(
         loss *= 1.0 - payload.learning_rate
         tel.training_metric("loss", loss, step=step)
         marker.write_text(str(step + 1))
-    receipt = ckpt.save("final", f"{loss:.9f}".encode(), operation_key=f"distill/{payload.steps}")
+    receipt = ckpt.declare(
+        "final", f"{loss:.9f}".encode(), operation_key=f"distill/{payload.steps}"
+    )
     return DistillResult(
         steps_run=payload.steps - start,
         resumed_at=start,
         final_loss=loss,
-        receipt=receipt.receipt_id,
+        receipt=receipt.declaration_id,
         manifest=out.save_bytes(
             f"{base.checkpoint_ref} {payload.steps} {loss:.9f}\n".encode(),
             media_type="text/plain",

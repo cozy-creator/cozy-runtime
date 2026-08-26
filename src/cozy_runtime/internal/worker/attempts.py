@@ -971,13 +971,22 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Answer ONE durable mid-attempt request from the executor (cr-009's checkpoints).
 
-        Identity is (run, attempt, operation key, logical key, content digest). The write is
+        Identity is (run, attempt, operation key, logical key, content digest). The row is
         JOURNALED — and fsynced, because that is what `Journal.append` does — before this
-        returns, so `Checkpoints.save()` reports success only after the fact is durable.
+        returns.
+
+        WHAT IS DURABLE HERE IS THE DECLARATION, NOT THE BYTES (#553a). This handler is where
+        the false promise was measurable: it fsyncs a metadata row and sends a
+        `JobCheckpointRequest` whose `artifact` field it never fills, so no component on
+        either side ever copies the checkpoint. `Checkpoints.save()` used to report success
+        on this answer; it now refuses `checkpoint_sink_unbuilt`, and `Checkpoints.declare()`
+        is what reaches here. The row keeps landing because it is TRUE — an attempt declared
+        a checkpoint with this digest and this length — and it is what the ArtifactSink will
+        attach real object references to when #552's transaction lands.
 
         Three answers and no fourth:
-          * a NEW identity is journaled and gets a fresh receipt;
-          * the SAME identity replays its receipt and writes nothing a second time;
+          * a NEW identity is journaled and gets a fresh declaration id;
+          * the SAME identity replays it and writes nothing a second time;
           * the same key with DIFFERENT bytes is a CONFLICT, never a replacement.
         """
         if str(frame.get("kind")) != "checkpoint":
@@ -1034,12 +1043,14 @@ class AttemptEngine:
                 "ok": False,
                 "code": "checkpoint_not_durable",
                 "detail": f"the journal cannot commit ({exc.code}); this worker acknowledges "
-                "no checkpoint it cannot make durable",
+                "no checkpoint declaration it cannot make durable",
             }
         self.receipts[key] = record
         # The coordinator's copy rides the DURABLE control lane, after the worker's own
-        # journal — worker-local durability is what `save()` returned on, and the hub's copy
-        # is at-least-once like every other durable message (law 9).
+        # journal, at-least-once like every other durable message (law 9). `artifact` stays
+        # UNSET, and that is the honest state of this frame: no ArtifactSink exists to fill
+        # it, so the coordinator is being told an attempt DECLARED a checkpoint and nothing
+        # more (#552/#553a).
         # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
         # stamp — no constructor can forget one).
         self.send(
@@ -1056,20 +1067,20 @@ class AttemptEngine:
         )
         attempt.ring.emit(
             "log",
-            f"checkpoint {logical_key!r} is durable",
+            f"checkpoint {logical_key!r} DECLARED (bytes not stored: no artifact sink)",
             "info",
-            receipt=receipt_id,
+            declaration=receipt_id,
             bytes=int(frame.get("length", 0)),
         )
         return {"ok": True, "receipt_id": receipt_id, "replayed": False}
 
     def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
-        """Record the COORDINATOR's verdict on a checkpoint this worker already made durable.
+        """Record the COORDINATOR's verdict on a checkpoint this worker already journaled.
 
-        It is a second observer, not a second authority: `save()` already returned on the
-        worker's own journal. A coordinator CONFLICT is a real fact and is journaled as a
-        fault, because it means the run's identity is contested upstream — but it cannot
-        retroactively un-write bytes that are durable here.
+        It is a second observer, not a second authority: the declaration is already in this
+        worker's journal. A coordinator CONFLICT is a real fact and is journaled as a fault,
+        because it means the run's identity is contested upstream — but it cannot
+        retroactively un-write a declaration that is durable here.
         """
         if receipt.outcome == pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT:
             self.fault(

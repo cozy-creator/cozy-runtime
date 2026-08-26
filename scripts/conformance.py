@@ -34,7 +34,7 @@ from cozy_runtime.author import (  # noqa: E402
     Budget,
     BudgetFacts,
     Cancelled,
-    CheckpointReceipt,
+    CheckpointDeclaration,
     Checkpoints,
     CheckpointSave,
     Context,
@@ -108,8 +108,9 @@ class JobFacts(msgspec.Struct):
     checkpoint_dir: str
     mktemp: str
     materialize_blob: str
-    receipt: str
+    declaration: str
     replayed: bool
+    save_refusal: str
     rate: float
     cap: float
     spent_is_positive: bool
@@ -117,16 +118,26 @@ class JobFacts(msgspec.Struct):
 
 @probe.job
 def uses_job_services(payload: In, scratch: Scratch, ckpt: Checkpoints, budget: Budget) -> JobFacts:
-    """Every member of the three JOB services, called from inside author code (cr-009)."""
+    """Every member of the three JOB services, called from inside author code (cr-009).
+
+    `save()` is one of them and it is HARD-DISABLED (#553a): its refusal is the member's
+    conformance fact, exactly as a returned value is for the others.
+    """
     del payload
-    receipt = ckpt.save("state", b"durable", operation_key="op/1")
-    replay = ckpt.save("state", b"durable", operation_key="op/1")
+    receipt = ckpt.declare("state", b"durable", operation_key="op/1")
+    replay = ckpt.declare("state", b"durable", operation_key="op/1")
+    try:
+        ckpt.save("state", b"durable", operation_key="op/2")
+        refusal = "ACCEPTED — save() returned a receipt for bytes nobody stored"
+    except Exception as exc:
+        refusal = f"{type(exc).__name__}:{getattr(exc, 'code', '')}"
     return JobFacts(
         checkpoint_dir=scratch.checkpoint_dir(key="resume").name,
         mktemp=scratch.mktemp(suffix=".raw").suffix,
         materialize_blob=str(scratch.materialize_blob(b"bytes", name="blob.bin").name),
-        receipt=receipt.receipt_id,
+        declaration=receipt.declaration_id,
         replayed=replay.replayed,
+        save_refusal=refusal,
         rate=budget.gpu_rate_usd_per_hour,
         cap=budget.cap_usd,
         spent_is_positive=budget.spent_usd() > 0.0,
@@ -216,12 +227,12 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
     def _job_facts() -> JobFacts:
         saved: list[CheckpointSave] = []
 
-        def sink(save: CheckpointSave) -> CheckpointReceipt:
+        def sink(save: CheckpointSave) -> CheckpointDeclaration:
             held = next((s for s in saved if s.operation_key == save.operation_key), None)
             if held is None:
                 saved.append(save)
-            return CheckpointReceipt(
-                receipt_id=f"ckpt-{len(saved)}",
+            return CheckpointDeclaration(
+                declaration_id=f"ckpt-{len(saved)}",
                 operation_key=save.operation_key,
                 logical_key=save.logical_key,
                 content_digest=save.content_digest,
@@ -257,8 +268,14 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
 
     def checkpoints() -> Observation:
         facts = _job_facts()
-        assert facts.replayed, "the same identity did not replay its receipt"
-        return f"save -> {facts.receipt}, and the same identity REPLAYED it"
+        assert facts.replayed, "the same identity did not replay its declaration"
+        assert facts.save_refusal == "CheckpointSinkUnbuilt:checkpoint_sink_unbuilt", (
+            "Checkpoints.save() did not refuse: " + facts.save_refusal
+        )
+        return (
+            f"declare -> {facts.declaration}, and the same identity REPLAYED it; "
+            f"save() refuses {facts.save_refusal} (#553a — no ArtifactSink stores the bytes)"
+        )
 
     def budget() -> Observation:
         facts = _job_facts()

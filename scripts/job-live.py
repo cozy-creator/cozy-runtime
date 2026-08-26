@@ -92,13 +92,24 @@ def no_grant(payload: ProbeIn, scratch: Scratch, budget: Budget) -> ProbeOut:
 def conflicting(payload: ProbeIn, ckpt: Checkpoints) -> ProbeOut:
     """Same identity replays; same key with different bytes conflicts. Never a replacement."""
     del payload
-    first = ckpt.save("state", b"one", operation_key="op/1")
-    replay = ckpt.save("state", b"one", operation_key="op/1")
+    first = ckpt.declare("state", b"one", operation_key="op/1")
+    replay = ckpt.declare("state", b"one", operation_key="op/1")
     try:
-        ckpt.save("state", b"two", operation_key="op/1")
-        return ProbeOut("a conflicting save was ACCEPTED")
+        ckpt.declare("state", b"two", operation_key="op/1")
+        return ProbeOut("a conflicting declaration was ACCEPTED")
     except Exception as exc:
-        return ProbeOut(f"{first.receipt_id}|replayed={replay.replayed}|{type(exc).__name__}")
+        return ProbeOut(f"{first.declaration_id}|replayed={replay.replayed}|{type(exc).__name__}")
+
+
+@PROBE.job
+def durable_save(payload: ProbeIn, ckpt: Checkpoints) -> ProbeOut:
+    """#553a's red arm: the durable-save door is HARD-DISABLED and says why."""
+    del payload
+    try:
+        ckpt.save("state", b"one", operation_key="op/1")
+        return ProbeOut("Checkpoints.save() RETURNED A RECEIPT for bytes nobody stored")
+    except Exception as exc:
+        return ProbeOut(f"{type(exc).__name__}:{getattr(exc, 'code', '')}:{exc}")
 
 
 class OneAsset(msgspec.Struct):
@@ -306,7 +317,7 @@ def section_e2e() -> None:
         json.dumps(outcome.manifest[:1])[:200],
     )
     check(
-        "one DURABLE checkpoint receipt reached the coordinator",
+        "one checkpoint DECLARATION reached the coordinator",
         len(outcome.checkpoints) == 1 and outcome.checkpoints[0]["outcome"] == "RECORDED",
         json.dumps(outcome.checkpoints)[:220],
     )
@@ -695,7 +706,13 @@ def _container_asset_arm() -> None:
 def _service_arms() -> None:
     """The job services' own refusals, exercised through the ONE kernel's public boundary."""
     head("red arms: the job services refuse outside their capability")
-    from cozy_runtime.author import BudgetFacts, CheckpointConflict, CheckpointReceipt, attempt
+    from cozy_runtime.author import (
+        BudgetFacts,
+        CheckpointConflict,
+        CheckpointDeclaration,
+        attempt,
+    )
+    from cozy_runtime.author import _services as services
     from cozy_runtime.author._invoke import Invocation
 
     spool = fresh("services") / "spool"
@@ -722,8 +739,8 @@ def _service_arms() -> None:
         replayed = held is not None
         if not replayed:
             seen.append(save)
-        return CheckpointReceipt(
-            receipt_id=f"ckpt-{len(seen)}",
+        return CheckpointDeclaration(
+            declaration_id=f"ckpt-{len(seen)}",
             operation_key=save.operation_key,
             logical_key=save.logical_key,
             content_digest=save.content_digest,
@@ -738,9 +755,29 @@ def _service_arms() -> None:
     )
     note = envelope.result.note if envelope else f"{outcome.code}: {outcome.message}"
     check(
-        "the same identity REPLAYS its receipt; the same key with different bytes CONFLICTS",
+        "the same identity REPLAYS its declaration; the same key with different bytes CONFLICTS",
         "replayed=True" in note and "CheckpointConflict" in note,
         note[:190],
+    )
+
+    # #553a: the durability CLAIM is gone and the declaration is what remains.
+    envelope, outcome, _ = attempt(
+        PROBE.get("durable_save"),
+        {},
+        Invocation(request_id="ckpt-save", spool=spool, deadline=1e18, checkpoints=sink),
+    )
+    note = envelope.result.note if envelope else f"{outcome.code}: {outcome.message}"
+    check(
+        "Checkpoints.save() REFUSES checkpoint_sink_unbuilt and names the ArtifactSink",
+        "CheckpointSinkUnbuilt:checkpoint_sink_unbuilt:" in note and "ArtifactSink" in note,
+        note[:190],
+    )
+    check(
+        "and no receipt type survives for a caller to hold",
+        not hasattr(services, "CheckpointReceipt")
+        and Checkpoints.save.__annotations__.get("return") == "NoReturn",
+        f"author exports CheckpointDeclaration={hasattr(services, 'CheckpointDeclaration')}, "
+        f"save() -> {Checkpoints.save.__annotations__.get('return')}",
     )
 
     envelope, outcome, _ = attempt(
@@ -829,11 +866,11 @@ def section_identity() -> None:
         f"{receipt.get('total_bytes')} B",
     )
     check(
-        "and the scope and the durable checkpoints beside it",
+        "and the scope and the checkpoint declarations beside it",
         document.get("publication_scope") == receipt.get("grant_id")
         and len(document.get("checkpoints") or []) >= 1,
         f"scope {document.get('publication_scope')} · "
-        f"{len(document.get('checkpoints') or [])} checkpoint receipt(s)",
+        f"{len(document.get('checkpoints') or [])} checkpoint declaration(s)",
     )
 
 

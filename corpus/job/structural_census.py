@@ -152,7 +152,10 @@ def census(
     projection = {name: [[row["key"], row["shape"]] for row in done[name]] for name in sorted(done)}
     body = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
     topology = "sha256:" + hashlib.sha256(body).hexdigest()
-    receipts.append(ckpt.save("topology", body, operation_key="census/topology").receipt_id)
+    # DECLARED, not saved: the durable-save door is disabled while the ArtifactSink is
+    # unbuilt (#553a). The component trees under `scratch.checkpoint_dir` are what a
+    # retried attempt of this run actually reads back, and they are written above.
+    receipts.append(ckpt.declare("topology", body, operation_key="census/topology").declaration_id)
 
     document = {
         "format": "cozy.jobs.StructuralCensus/1",
