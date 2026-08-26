@@ -154,20 +154,14 @@ def binding_record(
 
 
 def survey() -> None:
-    head("variants — what each artifact's HEADER demands, and which rungs that admits")
-    import torch
+    head("variants — what each artifact's HEADER demands, and what plan that resolves to")
 
-    from cozy_runtime.internal.delivery import DELIVERY_RUNGS, Variant, eligible_rungs
-    from cozy_runtime.internal.encoding import (
-        Selector,
-        device_line,
-        launch_providers,
-        measure_device,
-    )
-    from cozy_runtime.internal.fill import Checkpoint, dtype_name, survey_routes
-    from cozy_runtime.internal.probe import qualify
+    from cozy_runtime.internal.delivery import DELIVERY_RUNGS
+    from cozy_runtime.internal.encoding import Selector, device_line
+    from cozy_runtime.internal.fill import survey_routes
+    from cozy_runtime.internal.resolution import route_label
 
-    print("  the CLOSED delivery ladder:")
+    print("  the delivery routes, and WHEN each one is paid (data, not a chooser):")
     for rung in DELIVERY_RUNGS:
         mark = "built" if rung.status == "proven" else "NAMED, NOT BUILT"
         print(
@@ -175,44 +169,31 @@ def survey() -> None:
             f"{rung.cost_class:<16}{mark}"
         )
 
-    device = measure_device(torch, 0)
+    context = resolved()
+    device, probe = context["device"], context["probe"]
     print(f"  device: {device_line(device)}")
-    providers = launch_providers()
-    surveyed: dict[str, Any] = {}
-    for record in variants():
-        variant = Variant.read(record)
-        vmap = variant.snapshot_map()
-        books = {
-            name: Checkpoint(variant.store, vmap.get(name, variant.snapshot)) for name in COMPONENTS
-        }
-        rows = [r for name in COMPONENTS for r in books[name].rows(name)]
-        surveyed[variant.name] = (variant, rows)
-    dtypes = sorted({dtype_name(r.dtype) for _, rows in surveyed.values() for r in rows})
-    capabilities, probe = qualify(
-        torch, providers, device, dtypes, release=RELEASE, cache=HOME / "probe"
-    )
-    selector = Selector(providers, capabilities, device)
-    for name, (_variant, rows) in surveyed.items():
+    selector = Selector(context["providers"], context["capabilities"], device)
+    labels: dict[str, str] = {}
+    for name, rows in context["rows_for"].items():
         routes, refusal = survey_routes(rows, selector)
-        rungs = [r.name for r in eligible_rungs(routes)]
+        labels[name] = route_label(routes)
         aliases = sorted({r.encoded.alias for r in rows})
         print(
             f"  {name:<6}{len(rows):>5} tensors  {sum(r.stored_nbytes for r in rows) / GIB:>7.3f} "
             f"GiB stored  routes={routes}  encodings={aliases}"
         )
-        print(f"         eligible rungs: {rungs}  qualification: {refusal or 'every encoding'}")
+        print(f"         plan label: {labels[name]}  qualification: {refusal or 'every encoding'}")
     check(
         "the two variants are the SAME logical model",
-        [r.key for r in surveyed["fp16"][1]] == [r.key for r in surveyed["fp8"][1]],
-        f"{len(surveyed['fp16'][1])} destinations, key for key",
+        [r.key for r in context["rows_for"]["fp16"]] == [r.key for r in context["rows_for"]["fp8"]],
+        f"{len(context['rows_for']['fp16'])} destinations, key for key",
     )
     check(
-        "the encoded variant admits the DECODE rungs and the plain one does not",
-        [r.name for r in eligible_rungs(survey_routes(surveyed["fp8"][1], selector)[0])]
-        == ["aot_decode", "staged_decode", "jit_decode"]
-        and [r.name for r in eligible_rungs(survey_routes(surveyed["fp16"][1], selector)[0])]
-        == ["verbatim"],
-        "route eligibility comes from the header's own per-tensor encodings",
+        "each variant's plan LABEL derives from its own per-tensor route census (#549.1)",
+        labels["fp8"] == "aot_decode" and labels["fp16"] == "verbatim",
+        f"fp8 -> {labels['fp8']}, fp16 -> {labels['fp16']}; a rung name used to be CHOSEN "
+        "artifact-wide and is now DERIVED, so a census with more than one route is "
+        "unnameable as a single rung and says `mixed(...)` instead",
     )
     check(
         "the probe suite is milliseconds and ran once for BOTH variants",
@@ -350,23 +331,128 @@ def exec_conform(spec_path: Path, out_path: Path) -> None:
 # ------------------------------------------------------------------------ calibrate
 
 
-def table_path() -> Path:
+def plan_facts() -> Any:
+    """The #549.2 store, rooted where the executor roots it. NOT the old delivery table:
+    those rows were keyed by `(variant, rung)`, which bound neither the snapshot bytes nor
+    the runtime build nor the provider map, and they are INVALID rather than migrated."""
+    from cozy_runtime.internal.planfacts import PlanFacts
+
+    return PlanFacts(HOME / "probe")
+
+
+def resolved() -> Any:
+    """Resolve every offered variant into plans, exactly as the executor does.
+
+    ONE call, one decision. The old shape needed three (`survey_routes` per variant, then a
+    `DeliveryChooser` over a rung table, then a `Selector` per tensor at fill), and the
+    second of those could not see what the third would do.
+    """
     import torch
 
-    from cozy_runtime.internal.delivery import DeliveryTable
-    from cozy_runtime.internal.encoding import measure_device
-
-    return DeliveryTable.path_for(HOME / "probe", measure_device(torch, 0))
-
-
-def load_table() -> Any:
-    import torch
-
-    from cozy_runtime.internal.delivery import DeliveryTable
-    from cozy_runtime.internal.encoding import measure_device
+    from cozy_runtime.internal import canonical
+    from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
+    from cozy_runtime.internal.fill import Checkpoint, dtype_name, topology_of
+    from cozy_runtime.internal.probe import qualify
+    from cozy_runtime.internal.resolution import ConstructionFacts, Variant
 
     device = measure_device(torch, 0)
-    return DeliveryTable.load(DeliveryTable.path_for(HOME / "probe", device), device), device
+    runtime = measure_runtime(torch, RELEASE)
+    providers = launch_providers()
+    offered = [Variant.read(record) for record in variants()]
+    rows_for: dict[str, list[Any]] = {}
+    for variant in offered:
+        vmap = variant.snapshot_map()
+        rows_for[variant.name] = [
+            r
+            for name in COMPONENTS
+            for r in Checkpoint(variant.store, vmap.get(name, variant.snapshot)).rows(name)
+        ]
+    capabilities, probe = qualify(
+        torch,
+        providers,
+        device,
+        sorted({dtype_name(r.dtype) for rows in rows_for.values() for r in rows}),
+        release=RELEASE,
+        cache=HOME / "probe",
+        runtime=runtime,
+    )
+    reference = offered[0]
+    construction = ConstructionFacts(
+        release=RELEASE,
+        model_class="corpus.sdxl_pipeline:Pipeline",
+        config_digest=canonical.digest({"fixture": "delivery-live"}),
+        topology_digest=canonical.digest(
+            {
+                key: [list(spec.shape), spec.dtype, spec.encoding]
+                for key, spec in sorted(topology_of(rows_for[reference.name]).items())
+            }
+        ),
+        components=tuple(COMPONENTS),
+    )
+    return {
+        "device": device,
+        "runtime": runtime,
+        "providers": providers,
+        "capabilities": capabilities,
+        "probe": probe,
+        "offered": offered,
+        "rows_for": rows_for,
+        "construction": construction,
+        "dtype_name": dtype_name,
+    }
+
+
+def plan_for(name: str, objective: str = "latency") -> Any:
+    """The plan ONE offered variant resolves to, alone. What `calibrate` banks against.
+
+    Resolving the variant on its own forces the choice, so what comes back is that variant's
+    own plan and its own digest — which is the key its measurements belong under.
+    """
+    import dataclasses
+
+    from cozy_runtime.internal.resolution import resolve
+
+    context = resolved()
+    only = next(
+        dataclasses.replace(v, reference=True) for v in context["offered"] if v.name == name
+    )
+    return resolve(
+        variants=[only],
+        rows_for={name: context["rows_for"][name]},
+        providers=context["providers"],
+        capabilities=context["capabilities"],
+        device=context["device"],
+        runtime=context["runtime"],
+        construction=context["construction"],
+        facts=plan_facts(),
+        objective=objective,
+        dtype_name=context["dtype_name"],
+    )
+
+
+def banked_plans() -> dict[str, Any]:
+    """Every plan digest this rig has banked a fact for, folded. One directory per plan."""
+    store = plan_facts()
+    root = HOME / "probe" / "plan-facts"
+    out: dict[str, Any] = {}
+    if not root.is_dir():
+        return out
+    for folder in sorted(root.iterdir()):
+        runs = [r for path in folder.glob("*.json") for r in _read_run(path)]
+        if runs:
+            out[runs[0].plan_digest] = store.get(runs[0].plan_digest)
+    return out
+
+
+def _read_run(path: Path) -> list[Any]:
+    from cozy_runtime.internal.planfacts import RunFact
+
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    record = RunFact.read(data) if isinstance(data, dict) else None
+    return [record] if record is not None else []
 
 
 def calibrate() -> None:
@@ -410,22 +496,24 @@ def calibrate() -> None:
             outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED" and bool(outputs),
             str(plan.get("quantified_choice", ""))[:160],
         )
-    table, _ = load_table()
-    for key in sorted(table.rows):
-        row = table.rows[key]
+    banked = banked_plans()
+    for digest, fact in sorted(banked.items()):
         print(
-            f"  banked {row.variant:<6}{row.rung:<15}stored {row.stored_bytes / GIB:>7.3f}G  "
-            f"fill {row.fill_ms:>6} ms  decode {row.decode_ms:>5} ms  "
-            f"resident {row.resident_bytes / GIB:>6.3f}G  scratch {row.scratch_bytes / MIB:>6.0f}M"
+            f"  banked {digest[:19]}… stored {fact.stored_bytes / GIB:>7.3f}G  "
+            f"fill {fact.fill_ms:>6} ms  decode {fact.decode_ms:>5} ms  "
+            f"resident {fact.resident_bytes / GIB:>6.3f}G  "
+            f"scratch {fact.scratch_bytes / MIB:>6.0f}M  samples {fact.samples}"
         )
     check(
-        "both variants banked a MEASURED fill envelope",
-        len(table.rows) >= 2,
-        f"{len(table.rows)} rows in {table_path().name}",
+        "both variants banked a MEASURED fill envelope, keyed by PLAN DIGEST (#549.2)",
+        len(banked) >= 2,
+        f"{len(banked)} plan directories — a `(variant, rung)` key bound neither the "
+        "snapshot bytes nor the runtime build, so a re-pointed variant name reused "
+        "measurements taken over unrelated bytes",
     )
     check(
         "a prepare INVENTS no step time and no deviation",
-        all(row.step_ms != 0.0 for row in table.rows.values()),
+        all(fact.step_ms != 0.0 for fact in banked.values()),
         "a prepare measures a load; the step wall and the deviation stay whatever a real "
         "forward pass banked (-1.0 until one has), because a zero would win every latency "
         "comparison it was never entitled to enter",
@@ -434,7 +522,7 @@ def calibrate() -> None:
 
 def conform() -> None:
     head("conform — one denoise step per variant: the step wall, and the deviation")
-    from cozy_runtime.internal.delivery import DeliveryFact
+    from cozy_runtime.internal.planfacts import RunFact, run_id
 
     offered = variants()
     # BOTH ORDERS, in two processes. The first pass measured the second-filled arm 12%
@@ -458,35 +546,31 @@ def conform() -> None:
             for name in ("fp16", "fp8")
         }
     }
-    table, _device = load_table()
+    store = plan_facts()
     for name, row in sorted(result["rows"].items()):
         print(
             f"  {name:<6}step {row['step_ms']:>7.1f} ms   unet fill {row['unet_fill_ms']:>6} ms   "
             f"decode {row['unet_decode_ms']:>4} ms   deviation {row['deviation_rel_l2']:.5f}   "
             f"cosine {row['cosine']:.6f}"
         )
-        for key in [k for k in table.rows if k[0] == name]:
-            prior = table.rows[key]
-            table.put(
-                DeliveryFact(
-                    variant=prior.variant,
-                    rung=prior.rung,
-                    stored_bytes=prior.stored_bytes,
-                    resident_bytes=prior.resident_bytes,
-                    scratch_bytes=prior.scratch_bytes,
-                    fill_ms=prior.fill_ms,
-                    decode_ms=prior.decode_ms,
-                    step_ms=row["step_ms"],
-                    deviation_rel_l2=row["deviation_rel_l2"],
-                    samples=prior.samples,
-                    evidence=(
-                        f"{prior.evidence}; step + deviation from one denoise step on "
-                        f"identical inputs (delivery-live conform, SINGLE SAMPLE)"
-                    ),
-                    encodings=prior.encodings,
-                )
+        # A SECOND, IMMUTABLE FACT FILE against the same plan digest — never an edit of the
+        # prepare's. The prepare measured a fill and this measured a step; they are two
+        # observations of one plan, and the fold takes each field from whichever runs
+        # measured it. The old shape read the prepare's row, copied six fields out of it and
+        # wrote the merged result back, which is exactly the lost-update the per-run files
+        # remove (#549.2).
+        digest = plan_for(name).digest()
+        store.bank(
+            RunFact(
+                plan_digest=digest,
+                run_id=run_id(digest, "delivery-live-conform", RELEASE),
+                step_ms=row["step_ms"],
+                reference_deviation_rel_l2=row["deviation_rel_l2"],
+                evidence="step + deviation from one denoise step on identical inputs "
+                "(delivery-live conform, SINGLE SAMPLE)",
+                at_ns=time.time_ns(),
             )
-    table.save(table_path())
+        )
     fp8 = result["rows"]["fp8"]
     fp16 = result["rows"]["fp16"]
     check(
@@ -511,67 +595,75 @@ def conform() -> None:
 
 
 def choose() -> None:
-    head("choose — the chooser over the banked table, under each objective")
-    import torch
+    head("choose — ONE plan resolution over the banked facts, under each objective")
+    from cozy_runtime.internal.resolution import resolve
 
-    from cozy_runtime.internal.delivery import DeliveryChooser, Variant
-    from cozy_runtime.internal.encoding import Selector, launch_providers
-    from cozy_runtime.internal.fill import Checkpoint, dtype_name, survey_routes
-    from cozy_runtime.internal.probe import qualify
+    context = resolved()
+    facts = plan_facts()
+    if not banked_plans():
+        raise SystemExit("no banked plan facts — run `calibrate` and `conform` first")
 
-    table, device = load_table()
-    if not table.rows:
-        raise SystemExit("no delivery table — run `calibrate` and `conform` first")
-    providers = launch_providers()
-    candidates = []
-    all_rows = []
-    for record in variants():
-        variant = Variant.read(record)
-        vmap = variant.snapshot_map()
-        rows = [
-            r
-            for name in COMPONENTS
-            for r in Checkpoint(variant.store, vmap.get(name, variant.snapshot)).rows(name)
-        ]
-        all_rows.append((variant, rows))
-    capabilities, _ = qualify(
-        torch,
-        providers,
-        device,
-        sorted({dtype_name(r.dtype) for _, rows in all_rows for r in rows}),
-        release=RELEASE,
-        cache=HOME / "probe",
-    )
-    selector = Selector(providers, capabilities, device)
-    candidates = [(variant, *survey_routes(rows, selector)) for variant, rows in all_rows]
-
-    picked: dict[str, str] = {}
-    for objective in ("latency", "footprint", "fidelity"):
-        choice = DeliveryChooser(table, device).choose(candidates, objective=objective)
-        picked[objective] = choice.variant.name
-        print(f"  {objective:<10}-> {choice.variant.name} / {choice.rung.name}")
-        for row in choice.walk:
+    picked: dict[str, Any] = {}
+    for objective in ("latency", "footprint", "kernel_numeric_error"):
+        plan = resolve(
+            variants=context["offered"],
+            rows_for=context["rows_for"],
+            providers=context["providers"],
+            capabilities=context["capabilities"],
+            device=context["device"],
+            runtime=context["runtime"],
+            construction=context["construction"],
+            facts=facts,
+            objective=objective,
+            dtype_name=context["dtype_name"],
+        )
+        picked[objective] = plan
+        print(f"  {objective:<22}-> {plan.summary()}")
+        for row in plan.walk:
             score = f"{row['score']:>14.3f}" if "score" in row else " " * 14
-            print(f"      {row['variant']:<6}{row.get('rung', '-'):<15}{row['verdict']:<20}{score}")
-        if choice.confession:
-            print(f"      confession: {choice.confession}")
+            print(
+                f"      {row.get('variant', '-'):<6}{row.get('policy', '-'):<14}"
+                f"{row['verdict']:<20}{score}  "
+                + str(row.get("provenance") or row.get("why", ""))[:70]
+            )
+        if plan.confession:
+            print(f"      confession: {plan.confession[:180]}")
     check(
-        "the LATENCY axis takes the encoded rung — it reads fewer bytes for the same step",
-        picked["latency"] == "fp8",
-        f"{table.get('fp8', 'aot_decode').fill_ms} ms cold fill against "
-        f"{table.get('fp16', 'verbatim').fill_ms} ms",
+        "the LATENCY axis takes the encoded variant — it reads fewer bytes for the same step",
+        picked["latency"].variant == "fp8",
+        f"latency is scored from a WHOLE-PLAN fill+step wall, which is the measurement the "
+        f"old per-provider admission had nothing of — and refused for (#549.3). "
+        f"{picked['latency'].summary()}",
     )
     check(
-        "the FIDELITY axis takes the reference — nothing beats zero deviation",
-        picked["fidelity"] == "fp16",
-        "an encoded rung is admitted by a conformance observation and ordered by it",
+        "the KERNEL_NUMERIC_ERROR axis takes the reference — nothing beats zero deviation",
+        picked["kernel_numeric_error"].variant == "fp16",
+        "renamed from `fidelity` (#549.11): it is a kernel diagnostic over one GEMM, and "
+        "model quality is a paired video+audio eval the eval plane owns",
     )
     check(
-        "the FOOTPRINT axis is the DEVICE-HONEST one and does NOT take the encoded rung",
-        picked["footprint"] == "fp16",
+        "the FOOTPRINT axis is the DEVICE-HONEST one and does NOT take the encoded variant",
+        picked["footprint"].variant == "fp16",
         "weight-only fp8 on sm89 is decoded to float at fill: resident bytes are equal and "
-        "the decode scratch is a real extra, so the encoded rung LOSES this axis. The rung "
-        "that would win it is jit_decode, which is named and not built",
+        "the decode scratch is a real extra, so the encoded plan LOSES this axis. The route "
+        "that would win it is the encoded GEMM, whose leaf this card does not qualify for "
+        "these bytes",
+    )
+    check(
+        "every chosen plan's LABEL derives from its own route census, not from a rung name",
+        all(
+            plan.label() == ("aot_decode" if plan.variant == "fp8" else "verbatim")
+            for plan in picked.values()
+        ),
+        ", ".join(f"{o}:{p.label()}" for o, p in sorted(picked.items())),
+    )
+    check(
+        "the plan DIGEST is what enters generation identity, and it moves with the BYTES",
+        picked["latency"].digest() != picked["footprint"].digest()
+        and picked["footprint"].digest() == picked["kernel_numeric_error"].digest(),
+        "two objectives that landed on the same variant, same policy and same providers "
+        "resolve the SAME plan; the one that landed elsewhere does not. A rung name could "
+        "not tell those apart",
     )
 
 
@@ -590,7 +682,7 @@ def serve() -> None:
         "seed": 1005,
     }
     seen: dict[str, dict[str, Any]] = {}
-    for objective in ("latency", "fidelity"):
+    for objective in ("latency", "kernel_numeric_error"):
         outcome = spawn(
             f"serve-{objective}",
             {
@@ -615,15 +707,15 @@ def serve() -> None:
     check(
         "the SAME binding on two axes serves two different artifacts",
         seen["latency"]["plan"].get("delivery") == "float"
-        and seen["fidelity"]["plan"].get("delivery") == "native",
+        and seen["kernel_numeric_error"]["plan"].get("delivery") == "native",
         f"latency -> {seen['latency']['plan'].get('delivery')}/"
         f"{seen['latency']['plan'].get('materialization')}, fidelity -> "
-        f"{seen['fidelity']['plan'].get('delivery')}",
+        f"{seen['kernel_numeric_error']['plan'].get('delivery')}",
     )
     check(
         "the chosen VARIANT is named on the plan a coordinator holds",
         "'fp8'" in str(seen["latency"]["plan"].get("quantified_choice"))
-        and "'fp16'" in str(seen["fidelity"]["plan"].get("quantified_choice")),
+        and "'fp16'" in str(seen["kernel_numeric_error"]["plan"].get("quantified_choice")),
         "the AttemptPlan document carries `delivery_variant`, so `plan_digest` binds WHICH "
         "bytes served",
     )
@@ -683,19 +775,11 @@ def arms() -> None:
     head("arms — the red arms, each planted for real")
     import dataclasses
 
-    import torch
-
-    from cozy_runtime.internal.delivery import (
-        ROUTE_KERNEL,
-        RUNGS_BY_NAME,
-        DeliveryChooser,
-        DeliveryRefusal,
-        DeliveryTable,
-        Variant,
-    )
-    from cozy_runtime.internal.encoding import Capabilities, Selector, launch_providers
-    from cozy_runtime.internal.fill import Checkpoint, dtype_name, survey_routes
-    from cozy_runtime.internal.probe import qualify
+    from cozy_runtime.internal.delivery import ROUTE_KERNEL, RUNGS_BY_NAME
+    from cozy_runtime.internal.encoding import Capabilities, Selector
+    from cozy_runtime.internal.planfacts import PlanFacts, RunFact, run_id
+    from cozy_runtime.internal.resolution import PlanRefusal as ResolutionRefusal
+    from cozy_runtime.internal.resolution import Variant, resolve
     from cozy_runtime.internal.worker.ledger import Ledger
     from cozy_runtime.internal.worker.plan import (
         DeclaredBinding,
@@ -705,75 +789,114 @@ def arms() -> None:
         PreparedRequest,
     )
 
-    table, device = load_table()
-    providers = launch_providers()
-    prepared = []
-    for record in variants():
-        variant = Variant.read(record)
-        vmap = variant.snapshot_map()
-        rows = [
-            r
-            for name in COMPONENTS
-            for r in Checkpoint(variant.store, vmap.get(name, variant.snapshot)).rows(name)
-        ]
-        prepared.append((variant, rows))
-    capabilities, _ = qualify(
-        torch,
-        providers,
-        device,
-        sorted({dtype_name(r.dtype) for _, rows in prepared for r in rows}),
-        release=RELEASE,
-        cache=HOME / "probe",
-    )
-    selector = Selector(providers, capabilities, device)
+    context = resolved()
+    device = context["device"]
+    facts = plan_facts()
+
+    def resolve_with(**changes: Any) -> Any:
+        base: dict[str, Any] = {
+            "variants": context["offered"],
+            "rows_for": context["rows_for"],
+            "providers": context["providers"],
+            "capabilities": context["capabilities"],
+            "device": device,
+            "runtime": context["runtime"],
+            "construction": context["construction"],
+            "facts": facts,
+            "objective": "latency",
+            "dtype_name": context["dtype_name"],
+        }
+        base.update(changes)
+        return resolve(**base)
 
     # ARM 1 — an execution-oriented artifact with no qualified route on this card.
-    # The plant is REAL: the fp8 artifact's own rows, surveyed against an EMPTY capability
+    # The plant is REAL: the fp8 artifact's own rows, resolved against an EMPTY capability
     # table, which is exactly the state of a device whose probe minted no record.
-    blind = Selector(providers, Capabilities(), device)
-    encoded_variant, encoded_rows = prepared[1]
-    routes, refusal = survey_routes(encoded_rows, blind)
+    encoded = next(v for v in context["offered"] if v.name == "fp8")
     try:
-        DeliveryChooser(DeliveryTable(device.tuple_key()), device).choose(
-            [(dataclasses.replace(encoded_variant, reference=True), routes, refusal)],
-            objective="latency",
+        resolve_with(
+            variants=[dataclasses.replace(encoded, reference=True)],
+            rows_for={"fp8": context["rows_for"]["fp8"]},
+            capabilities=Capabilities(),
         )
         check("ARM: no qualified route refuses", False, "it did not refuse")
-    except DeliveryRefusal as exc:
+    except ResolutionRefusal as exc:
         check(
-            "ARM: an artifact with no qualified provider refuses NO VALID EXECUTION PLAN",
-            exc.code == "no_qualified_delivery" and "topology is known" in exc.detail,
+            "ARM: an artifact with no qualified provider refuses NO EXECUTABLE PLAN",
+            exc.code == "no_qualified_plan" and "topology is known" in exc.detail,
             exc.detail[:230],
         )
 
-    # ARM 2 — a registered encoding this build does not execute. `mxfp8/1` is real in the
-    # registry and named-not-built here, so the refusal must name the DEVICE, not the
-    # registry: "unknown topology" would send a reader to the wrong question entirely.
+    # ARM 2 — REARMED BY #549.4, and it is the arm that had gone stale. It used to plant an
+    # `mxfp8/1` digest and expect a named-not-built CAPABILITY refusal; `mxfp8/1` acquired
+    # two real providers in #547, so the plant stopped reaching the branch it was aimed at
+    # and the arm has been red ever since (`role_mismatch`, not `encoding_unqualified`).
+    #
+    # The plant that reaches the same QUESTION now is a spec digest the registry carries and
+    # NO provider in this build reviewed: `svdq-microscale/1`. Under the old alias-keyed
+    # launch table a new digest under a REVIEWED alias inherited its sibling's decoder, which
+    # is the substitution #549.4 forbids; here it acquires nothing and says which of the two
+    # things went wrong.
     import tensorfs
 
     from cozy_runtime.internal.encoding import Encoded, EncodingRefusal, RolePart
 
-    mx = next(d for a, d in tensorfs.seed_digests() if a == "mxfp8/1")
+    selector = Selector(context["providers"], context["capabilities"], device)
+    unreviewed = next(d for a, d in tensorfs.seed_digests() if a == "svdq-microscale/1")
     try:
         selector.select(
             "unet.planted.weight",
-            Encoded(mx, "mxfp8/1", (RolePart("data", "f8_e4m3fn", (16, 16), 256),)),
+            Encoded(
+                unreviewed, "svdq-microscale/1", (RolePart("data", "f8_e4m3fn", (16, 16), 256),)
+            ),
             "float16",
         )
-        check("ARM: a named-not-built encoding refuses", False, "it did not refuse")
+        check("ARM: an unreviewed spec digest refuses", False, "it did not refuse")
     except EncodingRefusal as exc:
         check(
-            "ARM: a REGISTERED unbuilt encoding refuses in the CAPABILITY vocabulary",
-            exc.code == "encoding_unqualified" and "sm89" in str(exc),
+            "ARM: a REGISTERED, NAMED-NOT-BUILT encoding refuses in the CAPABILITY vocabulary",
+            exc.code == "encoding_unqualified" and "sm100" in str(exc),
             str(exc)[:230],
         )
 
-    # ARM 3 — a delivery switch as a PLACEMENT SIDE EFFECT. The plant mutates the closed
-    # ladder so the staged cross lands on a rung with a DIFFERENT kernel, which is exactly
+    # ARM 2b — #549.4's own arm: a digest under an alias this build DOES serve, that no
+    # provider reviewed. Planted by lying to the selector's provider map, which is exactly
+    # the state a registry that grew a new `mxfp8/1` spec would put this build in.
+    planted_digest = "sha256:" + "de" * 32
+    naive = Selector(context["providers"], context["capabilities"], device)
+    naive.aliases = dict(naive.aliases)
+    naive.aliases[planted_digest] = "mxfp8/1"
+    try:
+        naive.select(
+            "unet.planted.weight",
+            Encoded(
+                planted_digest,
+                "mxfp8/1",
+                (
+                    RolePart("data", "f8_e4m3fn", (16, 64), 1024),
+                    RolePart("scale", "u8", (16, 2), 32),
+                ),
+            ),
+            "float16",
+        )
+        check("ARM: a new digest under a served alias refuses", False, "it did not refuse")
+    except EncodingRefusal as exc:
+        check(
+            "ARM: a NEW digest filed under a SERVED alias acquires NO provider (#549.4)",
+            exc.code == "spec_unreviewed" and "claims DIGESTS" in str(exc),
+            str(exc)[:260],
+        )
+
+    # ARM 3 — a delivery switch as a PLACEMENT SIDE EFFECT. The plant mutates the route
+    # table so the staged cross lands on a rung with a DIFFERENT kernel, which is exactly
     # the §3.2 violation the fence exists for. Planted, observed, removed.
-    # A ledger posed so the placement ladder REACHES the staged rung: 4 GiB resident, a
-    # MEASURED 2 GiB activation envelope, and 1 GiB allocatable. all_resident is short by
-    # 1 GiB; component_staged can free the UNet and raise 5 GiB, so the cross fires.
+    #
+    # THE LEDGER POSE IS THE ARM'S SECOND RED, AND IT IS NOT FIXED HERE. The pose below
+    # never reaches `component_staged` — the ladder answers `all_resident` — so the cross
+    # never runs and the guard branch prints FAIL. That is a fact about `worker/plan.py`'s
+    # placement ladder, which this lane did not touch and cannot verify from a header: the
+    # numbers that would reach the staged rung have to come from a real prepare's ledger,
+    # not from a hand-posed one. LEFT RED AND NAMED (#549 report), not papered over.
     ledger = Ledger(host_budget=8 * GIB, pinned_budget=256 * MIB)
     ledger.resident = {"unet": 4 * GIB}
     ledger.activations_peak = 2 * GIB
@@ -781,8 +904,6 @@ def arms() -> None:
     ledger.device_reserved = 0
     ledger.device_allocated = 0
     declared = DeclaredBinding.read(binding_record(variants()))
-    # The RESOLVED half is the arm's subject: a generation that chose `aot_decode` on the
-    # fp8 variant. A deployment cannot write it any more, so the harness states it directly.
     generation = PreparedModel(delivery_rung="aot_decode", delivery_variant="fp8")
     chooser = PlanChooser(ledger)
     good = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))
@@ -791,7 +912,7 @@ def arms() -> None:
         name=original.name,
         delivery="native",
         materialization="",
-        route="native_encoded",
+        route="encoded_gemm",
         cost_class=original.cost_class,
         why=original.why,
         status=original.status,
@@ -802,7 +923,9 @@ def arms() -> None:
             check(
                 "ARM: the plant needs the staged cross to fire",
                 False,
-                f"the ladder chose {planted.placement}, so the cross never ran",
+                f"the ladder chose {planted.placement}, so the cross never ran — a "
+                "PRE-EXISTING red this lane did not subsume; the pose needs a real prepare's "
+                "ledger, not a hand-written one",
             )
         else:
             check("ARM: a delivery side effect refuses", False, "it did not refuse")
@@ -821,73 +944,103 @@ def arms() -> None:
         f"{after.delivery}/{after.materialization}",
     )
 
-    # ARM 4 — an unmeasured rung may not be SELECTED. Empty table, both variants offered.
-    empty = DeliveryChooser(DeliveryTable(device.tuple_key()), device)
-    candidates = [(variant, *survey_routes(rows, selector)) for variant, rows in prepared]
-    choice = empty.choose(candidates, objective="latency")
+    # ARM 4 — an unmeasured plan may not be SELECTED. Empty fact store, both variants.
+    plan = resolve_with(facts=PlanFacts(None))
     check(
-        "ARM: with NOTHING measured the ladder takes the reference and confesses",
-        choice.variant.name == "fp16" and not choice.calibrated,
-        choice.confession[:200],
+        "ARM: with NOTHING measured resolution takes the reference FLOOR and CONFESSES",
+        plan.variant == "fp16" and plan.measurements is None and "UNCALIBRATED" in plan.confession,
+        plan.confession[:200],
     )
 
-    # ARM 5 — a variant with a fill envelope but NO conformance observation is ineligible.
-    from cozy_runtime.internal.delivery import DeliveryFact
-
-    partial = DeliveryTable(device.tuple_key())
-    partial.put(DeliveryFact("fp16", "verbatim", 1, 1, 0, 3500, 0, 128.0, 0.0, 1, "planted"))
-    partial.put(DeliveryFact("fp8", "aot_decode", 1, 1, 0, 2000, 79, 128.0, -1.0, 1, "planted"))
-    choice = DeliveryChooser(partial, device).choose(candidates, objective="latency")
+    # ARM 5 — #549.3's OWN ARM, and the one the old design could not pass. Two qualified
+    # implementations for one tensor plus the DEFAULT objective used to refuse
+    # `objective_unranked` at admission — one layer above the store that holds the latency
+    # measurements. It now resolves, because the objective ranks WHOLE PLANS.
     check(
-        "ARM: a FASTER variant with no conformance observation is not selected",
-        choice.variant.name == "fp16",
-        "arithmetic fit admits nothing: 2000 ms beats 3500 ms and still loses, because an "
-        "encoded rung is admitted by evidence that it is still this model",
+        "ARM: the DEFAULT objective + a multi-provider encoding no longer REFUSES (#549.3)",
+        plan.objective == "latency" and bool(plan.tensors),
+        f"{plan.summary()} — an axis with no per-record number is not a dead end, it is a "
+        "confession; refusing here is what the two-chooser split forced",
     )
 
-    # ARM 6 — a candidate set with no fidelity reference has no scale to measure on.
+    # ARM 6 — a faster plan with NO conformance observation still loses to the reference.
+    partial = PlanFacts(WORK / "arm-partial")
+    shutil.rmtree(WORK / "arm-partial", ignore_errors=True)
+    fp16_digest = plan_for("fp16").digest()
+    fp8_digest = plan_for("fp8").digest()
+    partial.bank(
+        RunFact(
+            plan_digest=fp16_digest,
+            run_id=run_id(fp16_digest, "arm", RELEASE),
+            resident_bytes=1,
+            scratch_bytes=0,
+            fill_ms=3500,
+            step_ms=128.0,
+            reference_deviation_rel_l2=0.0,
+            evidence="planted",
+        )
+    )
+    partial.bank(
+        RunFact(
+            plan_digest=fp8_digest,
+            run_id=run_id(fp8_digest, "arm", RELEASE),
+            resident_bytes=1,
+            scratch_bytes=0,
+            fill_ms=2000,
+            step_ms=-1.0,
+            evidence="planted",
+        )
+    )
+    picked = resolve_with(facts=partial)
+    check(
+        "ARM: a FASTER plan with no measured STEP WALL is not selected",
+        picked.variant == "fp16",
+        "arithmetic fit admits nothing: a 2000 ms fill beats 3500 ms and still loses, "
+        "because latency is fill PLUS step and nothing measured this plan's step",
+    )
+
+    # ARM 7 — a candidate set with no deviation reference has no scale to measure on.
     try:
-        DeliveryChooser(table, device).choose(
-            [
-                (Variant(v.name, v.store, v.snapshot, v.snapshots, False), r, q)
-                for (v, r, q) in candidates
+        resolve_with(
+            variants=[
+                Variant(v.name, v.store, v.snapshot, v.snapshots, False) for v in context["offered"]
             ],
-            objective="fidelity",
+            objective="kernel_numeric_error",
         )
         check("ARM: a set with no reference refuses", False, "it did not refuse")
-    except DeliveryRefusal as exc:
+    except ResolutionRefusal as exc:
         check(
-            "ARM: a candidate set with no fidelity REFERENCE refuses",
+            "ARM: a candidate set with no deviation REFERENCE refuses",
             exc.code == "reference_variant_unresolved",
             exc.detail[:200],
         )
 
-    # ARM 7 — an unknown objective. The axis has to be one something measured.
+    # ARM 8 — an unknown objective. The axis has to be one something measured.
     try:
-        DeliveryChooser(table, device).choose(candidates, objective="cheapest")
+        resolve_with(objective="cheapest")
         check("ARM: an unmeasured objective refuses", False, "it did not refuse")
-    except DeliveryRefusal as exc:
+    except ResolutionRefusal as exc:
         check(
             "ARM: an objective no measurement supports refuses",
             exc.code == "unknown_objective",
             exc.detail[:160],
         )
 
-    # ARM 8 — the two encoded rungs, and the line between them. `native_encoded` is PROVEN
-    # since the leaf-replacement lane (scripts/leaf-live.py); `jit_decode` is still unbuilt,
-    # and its blocker is no longer "the machinery does not exist" — it is that a per-step
-    # DECODE is a different thing from a per-step encoded KERNEL, and it refuses rather
-    # than aliasing itself onto either neighbour.
+    # ARM 9 — the two encoded routes, and the line between them. `encoded_gemm` is PROVEN
+    # since the leaf-replacement lane; `jit_decode` is still unbuilt, and its blocker is no
+    # longer "the machinery does not exist" — it is that a per-step DECODE is a different
+    # thing from a per-step encoded KERNEL, and it refuses rather than aliasing itself onto
+    # either neighbour.
     jit = RUNGS_BY_NAME["jit_decode"]
-    native = RUNGS_BY_NAME["native_encoded"]
+    native = RUNGS_BY_NAME["encoded_gemm"]
     check(
         "ARM: the per-step rung refuses as unbuilt and names WHY, not silently aliases",
         jit.status == "unbuilt" and "dequantize a full" in jit.owner,
         jit.owner[:200],
     )
     check(
-        "the NATIVE rung is proven, and it is the only rung that lowers steady-state VRAM",
-        native.status == "proven" and ROUTE_KERNEL[native.route] == "native_encoded",
+        "the ENCODED-GEMM route is proven, and it is the only one that lowers steady-state VRAM",
+        native.status == "proven" and ROUTE_KERNEL[native.route] == "encoded_gemm",
         f"{native.name}: {native.delivery}/{native.materialization or '-'} "
         f"cost_class={native.cost_class}, kernel={ROUTE_KERNEL[native.route]}",
     )

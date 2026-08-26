@@ -524,12 +524,8 @@ def derive() -> None:
     import torch
     from safetensors import safe_open
 
-    from cozy_runtime.internal.encoding import (
-        MicroScaledDequant,
-        derive_rowwise,
-        digests_of,
-        quantize_rowwise,
-    )
+    from cozy_runtime.internal.encoding import MicroScaledDequant, digests_of
+    from cozy_runtime.internal.instruments import derive_rowwise, quantize_rowwise
 
     head("derive — mxfp8 -> fp8-rowwise on the real H3 block-0 GEMMs (#514a)")
     provider = MicroScaledDequant(digests_of("mxfp8/1")[0])
@@ -697,7 +693,7 @@ def w8a8() -> None:
     import torch
     from safetensors import safe_open
 
-    from cozy_runtime.internal.encoding import derive_rowwise
+    from cozy_runtime.internal.instruments import derive_rowwise
 
     head("w8a8 — the derived rowwise weights through a real scaled-fp8 GEMM (#514b)")
     capability = torch.cuda.get_device_capability(0)
@@ -883,7 +879,7 @@ def w8a8() -> None:
 
 
 def _fp8_leaf(torch: Any, weight: Any, scale: Any, fast_accum: bool) -> Any:
-    """A LEAF REPLACEMENT, standing in for the machinery `delivery.py`'s `native_encoded`
+    """A LEAF REPLACEMENT, standing in for the machinery `delivery.py`'s `encoded_gemm`
     rung has been waiting on since cr-006. Held in this harness, not in `src/`: a leaf the
     fill plane cannot reserve, charge or evict is not a runtime provider, and shipping one
     that merely looked like a provider is what #504 closes.
@@ -915,7 +911,7 @@ def blockforward() -> None:
     the ratified lane's banked 20.817 dB, differing only in how the weights compute."""
     import torch
 
-    from cozy_runtime.internal.encoding import derive_rowwise
+    from cozy_runtime.internal.instruments import derive_rowwise
 
     head("blockforward — dequant-bf16 vs derived-w8a8, same block, same protocol")
     pipe_ref = H3BlockLike(None)

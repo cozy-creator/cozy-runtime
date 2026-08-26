@@ -27,7 +27,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.delivery import ROUTE_KERNEL, RUNGS_BY_NAME, Variant
+from cozy_runtime.internal.delivery import RUNGS_BY_NAME
+from cozy_runtime.internal.resolution import ROUTE_KERNEL, Variant
 from cozy_runtime.internal.worker.ledger import Ledger
 
 

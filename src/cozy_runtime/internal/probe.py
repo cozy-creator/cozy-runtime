@@ -56,10 +56,15 @@ from typing import Any
 
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
+    SPEC_VECTORS,
+    TORCH_DTYPES,
     Capabilities,
     CapabilityRecord,
     DeviceFacts,
+    RuntimeIdentity,
+    geometry_class,
     implementation_digest,
+    measure_runtime,
 )
 
 #: One decode of this many elements is the micro-benchmark's unit — a realistic attention
@@ -451,7 +456,8 @@ def _weight_roles(torch: Any, provider: Any, device: Any) -> tuple[Any, dict[str
     comparable; and quantized by the encoding's OWN equation, so what the routes are then
     compared on is a real carrier rather than random bytes that no producer would emit.
     """
-    from cozy_runtime.internal.encoding import MX_BLOCK, quantize_rowwise
+    from cozy_runtime.internal.encoding import MX_BLOCK
+    from cozy_runtime.internal.instruments import quantize_rowwise
 
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
@@ -541,7 +547,7 @@ def _route_axes(
     """
     weight, roles = _weight_roles(torch, provider, device)
     numel = int(weight.numel())
-    if provider.route == "native_encoded":
+    if provider.route == "encoded_gemm":
         if native is None or not native.get("passed"):
             return {"deviation_rel": -1.0, "resident_bits_per_element": -1.0}
         parts = {
@@ -576,6 +582,154 @@ class _RolePartLike:
 
     def __init__(self, nbytes: int) -> None:
         self.nbytes = nbytes
+
+
+# ------------------------------------------------------- the reviewed spec's own vectors
+
+
+#: Where the vendored vector documents live. They ship INSIDE the package, so an installed
+#: wheel qualifies exactly as the repo does; a suite whose subject is only present in a
+#: source checkout qualifies nothing in production.
+VECTOR_ROOT = Path(__file__).resolve().parent / "encoding" / "vectors"
+
+
+def _from_bits(torch: Any, blob: Mapping[str, Any], device: Any) -> Any:
+    """One vector role/logical field -> the tensor it encodes.
+
+    `bits` is base64 of the LITTLE-ENDIAN raw bytes, exactly as the carrier stores them, so
+    this is a `frombuffer` and a `view` and never a parse. A dtype the runtime has no torch
+    binding for is a refusal rather than a guess, for the same reason the fill plane refuses
+    one: landing the wrong number of bytes is worse than not landing them.
+    """
+    import base64
+
+    name = str(blob["dtype"])
+    torch_name = TORCH_DTYPES.get(name)
+    if torch_name is None:
+        raise AssertionError(
+            f"the vendored vectors cite carrier dtype {name!r} and this "
+            "runtime has no torch binding for it"
+        )
+    raw = bytearray(base64.b64decode(blob["bits"]))
+    shape = [int(n) for n in blob["shape"]]
+    flat = torch.frombuffer(raw, dtype=torch.uint8)
+    tensor = flat.view(getattr(torch, torch_name))
+    return tensor.reshape(shape).to(device)
+
+
+def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
+    """The vendored vector document this SPEC DIGEST names, or None if it names none.
+
+    #549.4's substance. A provider declares reviewed spec DIGESTS; each reviewed digest maps
+    to the producer-mined vector document the registry's own seed attaches to that spec, and
+    this is what the qualification suite decodes. `plain/1` has no entry: its route decodes
+    nothing and its evidence is the fill plane's byte-identity proof.
+
+    **The residual gap, stated rather than hidden.** The tensorfs Python facade exposes
+    `seed_digests()` and no way to read a seed's `vectors` ObjectRef, so this build PINS the
+    document by digest-to-filename and cannot yet PROVE, from Python, that the vendored bytes
+    are the ones the spec object references. `tensorfs.seed_vectors(digest) -> bytes` is the
+    one facade addition that would close it, and it is named as a cross-repo follow-up. What
+    IS proved today is stronger than what preceded it, which proved nothing: the exact
+    producer-mined cases now run through the exact provider.
+    """
+    name = SPEC_VECTORS.get(spec_digest)
+    if name is None:
+        return None
+    path = VECTOR_ROOT / name
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("format") == VECTOR_FORMAT else None
+
+
+#: The vendored documents' own format id, checked rather than assumed.
+VECTOR_FORMAT = "tensorfs.encoding_vectors/1"
+
+
+def _spec_vectors(
+    torch: Any, provider: Any, device: Any, dtype: Any, dtype_name: str
+) -> dict[str, Any]:
+    """Decode the REVIEWED SPEC's own producer-mined cases, BIT-FOR-BIT (#549.4).
+
+    The synthetic oracles above sweep a format's whole domain against arithmetic written from
+    the OCP spec — they prove the decoder's numbers. This proves something they cannot: that
+    the decoder reads the exact ROLE LAYOUT a real producer emits, at the exact rank and
+    stride the reviewed spec digest pins, on bytes that came out of the producer rather than
+    out of this repo.
+
+    The comparison is on RAW BITS, not on a tolerance. These cases carry the producer's own
+    expected logical output for the producer's own carrier; a decoder that is one ULP away
+    from it has made a different choice than the producer did (`fp8-scaled-scalar/1`'s doc
+    calls that out explicitly: narrowing the scale before the multiply differs from
+    multiplying in f32 by a full ulp on 132 of 512 bf16 elements). A tolerance here would
+    admit exactly the drift the vectors were mined to catch.
+
+    A spec with no vendored document, or a document with no case at this output dtype, is
+    reported as SKIPPED and neither passes nor fails: it must not mint a record on the
+    strength of a check that did not run, and it must not fail a provider for a case the
+    producer never emitted.
+    """
+    cases: list[dict[str, Any]] = []
+    document = spec_vector_document(str(provider.encoding))
+    if document is None:
+        return {
+            "kind": "spec-vectors",
+            "skipped": True,
+            "note": f"no vendored vector document for spec {str(provider.encoding)[:30]}…",
+            "passed": True,
+        }
+    for case in document.get("cases", ()):
+        logical = case.get("logical") or {}
+        if TORCH_DTYPES.get(str(logical.get("dtype"))) != dtype_name:
+            continue
+        roles = {role: _from_bits(torch, blob, device) for role, blob in case["roles"].items()}
+        missing = sorted(provider.required - set(roles))
+        surplus = sorted(set(roles) - provider.required - provider.optional)
+        if missing or surplus:
+            cases.append(
+                {
+                    "name": case.get("name"),
+                    "passed": False,
+                    "why": f"the mined case stores roles {sorted(roles)} and this provider "
+                    f"requires {sorted(provider.required)} (missing {missing}, "
+                    f"unhandled {surplus})",
+                }
+            )
+            continue
+        shape = [int(n) for n in logical["shape"]]
+        why = provider.supports(shape)
+        if why:
+            cases.append({"name": case.get("name"), "skipped": True, "why": why, "passed": True})
+            continue
+        destination = torch.empty(*shape, dtype=dtype, device=device)
+        provider.decode(torch, roles, destination)
+        want = _from_bits(torch, {**logical, "bits": case["expect_logical_bits"]}, device)
+        got_bits = destination.reshape(-1).view(torch.uint8).cpu()
+        want_bits = want.reshape(-1).view(torch.uint8).cpu()
+        differing = int((got_bits != want_bits).sum())
+        cases.append(
+            {
+                "name": case.get("name"),
+                "elements": int(want.numel()),
+                "differing_bytes": differing,
+                "passed": differing == 0,
+            }
+        )
+    if not cases:
+        return {
+            "kind": "spec-vectors",
+            "skipped": True,
+            "note": f"the vendored document carries no {dtype_name} case",
+            "passed": True,
+        }
+    return {
+        "kind": "spec-vectors",
+        "document": SPEC_VECTORS.get(str(provider.encoding), ""),
+        "cases": cases,
+        "passed": all(c["passed"] for c in cases),
+    }
 
 
 #: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`).
@@ -683,6 +837,7 @@ def qualify(
     *,
     release: str,
     cache: Path | str | None = None,
+    runtime: RuntimeIdentity | None = None,
 ) -> tuple[Capabilities, dict[str, Any]]:
     """Run the suite (or read the persisted fact) and return the admission table.
 
@@ -697,8 +852,18 @@ def qualify(
     device predicate claims a card the suite never ran on. Refusing here is #501f's runtime
     twin — the capability answer is typed and it happens BEFORE any fill, not after a
     manifest has been believed.
+
+    `runtime` is #549.9's other half. A capability record is a claim about an IMPLEMENTATION
+    on a device, and only the device half used to have an identity: two runtime builds with
+    different arithmetic in `encoding/` minted records that were indistinguishable and
+    therefore interchangeable. The runtime's source digest and torch build now key the cache
+    and ride every record, so an edit to a decode invalidates the records that measured the
+    old one instead of inheriting them. Defaulted rather than required so a caller that has
+    torch and a release can still probe; the default MEASURES, it does not fabricate.
     """
     accel.qualification_gate(device.kind)
+    if runtime is None:
+        runtime = measure_runtime(torch, release)
     candidates = {
         digest: (tuple(value) if isinstance(value, tuple | list) else (value,))
         for digest, value in providers.items()
@@ -707,6 +872,10 @@ def qualify(
         {
             "tuple": device.tuple_key(),
             "release": release,
+            # #549.9: the BUILD, not just its version string. `runtime_source_digest` is over
+            # the modules whose bytes decide what a record MEANS, so a rewritten decode gets
+            # a new key and a re-probe rather than the old decode's persisted verdict.
+            "runtime": runtime.document(),
             # The IMPLEMENTATIONS, not just the encodings. A build that grows a second
             # provider for an encoding it already served has the same digest set and a
             # different capability answer, so an encoding-keyed cache would serve the old
@@ -774,7 +943,7 @@ def qualify(
                             "implementation is not a qualified one",
                             "passed": False,
                         }
-                    elif provider.route == "native_encoded":
+                    elif provider.route == "encoded_gemm":
                         evidence = {"kind": "native"}
                         evidence["numerics"] = suite(torch, provider, target, dtype)
                         evidence["passed"] = bool(evidence["numerics"]["passed"])
@@ -784,8 +953,17 @@ def qualify(
                     else:
                         evidence = {"kind": "decode"}
                         evidence["numerics"] = suite(torch, provider, target, dtype)
+                        # #549.4: the REVIEWED SPEC's own producer-mined cases, decoded
+                        # bit-for-bit. The synthetic sweep proves the arithmetic; this proves
+                        # the provider reads the layout a real producer emits at the rank and
+                        # stride THIS digest pins. Both must pass to mint.
+                        evidence["spec_vectors"] = _spec_vectors(
+                            torch, provider, target, dtype, name
+                        )
                         evidence["micro_bench"] = _micro_bench(torch, provider, target, dtype)
-                        evidence["passed"] = bool(evidence["numerics"]["passed"])
+                        evidence["passed"] = bool(
+                            evidence["numerics"]["passed"] and evidence["spec_vectors"]["passed"]
+                        )
                         if evidence["passed"]:
                             axes = _route_axes(torch, provider, target, dtype, None)
                 evidence["route_axes"] = axes
@@ -794,8 +972,14 @@ def qualify(
                         "encoding_spec_id": encoding,
                         "implementation": provider.name,
                         "implementation_digest": implementation_digest(provider),
+                        "implementation_revision": str(provider.code_revision),
                         "device_predicate": device.predicate,
                         "output_dtype": name,
+                        # WHAT SHAPE THIS WAS MEASURED AT (#549.9). Evidence, not a filter:
+                        # `Provider.supports` gates a tensor's geometry, and filtering
+                        # admission on this string too would refuse the decode floor for the
+                        # ragged tensor it is the only route for.
+                        "geometry_class": geometry_class(BENCH_SHAPE),
                         "delivery_route": provider.route,
                         "evidence": evidence,
                     }
@@ -803,8 +987,10 @@ def qualify(
     result = {
         "format": "cozy.runtime.probe/1",
         "tuple": device.tuple_key(),
+        "device": device.document(),
         "device_predicate": device.predicate,
         "runtime_release": release,
+        "runtime": runtime.document(),
         "suite_ms": (time.perf_counter_ns() - started) // 1_000_000,
         "observations": observations,
     }
@@ -815,6 +1001,8 @@ def qualify(
 def _table(result: Mapping[str, Any]) -> Capabilities:
     """Observations -> the admission table. A FAILED observation mints no record."""
     caps = Capabilities()
+    runtime = dict(result.get("runtime") or {})
+    facts = dict(result.get("device") or {})
     for observation in result["observations"]:
         if not observation["evidence"]["passed"]:
             continue
@@ -833,7 +1021,18 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
                 # discipline `DeliveryFact.step_ms` applies one plane over, and for the same
                 # reason: a zero would win every comparison it was never entitled to enter.
                 resident_bits_per_element=float(axes.get("resident_bits_per_element", -1.0)),
-                route_deviation_rel=float(axes.get("deviation_rel", -1.0)),
+                kernel_numeric_error=float(axes.get("deviation_rel", -1.0)),
+                # #549.9's identity, carried onto every record it minted. A record read back
+                # from a probe file written before these existed carries empty strings, which
+                # is honest — the file genuinely did not record what it ran on.
+                runtime_source_digest=str(runtime.get("source_digest", "")),
+                torch_build=str(runtime.get("torch_build", "")),
+                os_arch=str(facts.get("os_arch", "")),
+                device_index=int(facts.get("index", 0)),
+                device_driver=str(facts.get("driver", "")),
+                cuda_runtime=str(facts.get("cuda_runtime", "")),
+                geometry_class=str(observation.get("geometry_class", "")),
+                implementation_revision=str(observation.get("implementation_revision", "")),
             )
         )
     return caps

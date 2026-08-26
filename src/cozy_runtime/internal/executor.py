@@ -171,26 +171,24 @@ class Executor:
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
         from cozy_runtime.author._model import component_use
-        from cozy_runtime.internal.delivery import (
-            ROUTE_KERNEL,
-            DeliveryChooser,
-            DeliveryFact,
-            DeliveryRefusal,
-            DeliveryTable,
-            Variant,
-        )
         from cozy_runtime.internal.derive import Observations, serving_substrate
-        from cozy_runtime.internal.encoding import Selector, launch_providers, measure_device
+        from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import (
             Checkpoint,
             FillRefusal,
             ResourceLedger,
             StreamingFillBackend,
             dtype_name,
-            survey_routes,
             topology_of,
         )
+        from cozy_runtime.internal.planfacts import PlanFacts, RunFact, run_id
         from cozy_runtime.internal.probe import qualify
+        from cozy_runtime.internal.resolution import (
+            ConstructionFacts,
+            PlanRefusal,
+            Variant,
+            resolve,
+        )
         from cozy_runtime.internal.staging import ComponentResidency
 
         accel.initialize(torch, self.device_kind)
@@ -220,13 +218,23 @@ class Executor:
         names: list[str] = list(binding.get("components") or [binding["component"]])
         per_component: dict[str, str] = dict(binding.get("snapshots") or {})
 
-        # ------------------------------------------------------------ the delivery choice
+        # --------------------------------------------------------- PLAN RESOLUTION (#549.1)
         #
-        # cr-008c. WHICH stored bytes this generation reads, decided once, here, before a
-        # destination is reserved — because delivery decides what is resident and that is a
-        # property of the construction, not of a request. Every candidate is surveyed from
-        # its HEADER (no tensor bytes), the qualification suite runs once for the union of
-        # logical dtypes, and the chooser is pure arithmetic over measured envelopes.
+        # ONE decision, made once, here, before a destination is reserved — because what a
+        # generation reads decides what is resident, and that is a property of the
+        # construction rather than of a request.
+        #
+        # This used to be TWO decisions that could not see each other: a `DeliveryChooser`
+        # picking one artifact-wide RUNG, and a `Selector` picking a provider per tensor. A
+        # mixed artifact reported the rung and contained the tensors, and the rung was hashed
+        # into generation identity while having no execution authority at all. What is
+        # resolved here is the whole plan — the exact snapshot map, every tensor's provider,
+        # route and validated geometry, the device and runtime identity, the placement and
+        # the objective — and its digest is what enters identity. The LABEL derives from it.
+        #
+        # Every candidate is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
+        # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so offering
+        # four variants costs four header reads and no load.
         offered = [
             v if isinstance(v, Variant) else Variant.read(v)
             for v in (binding.get("variants") or ())
@@ -246,7 +254,12 @@ class Executor:
                 name: Checkpoint(variant.store, vmap.get(name, variant.snapshot)) for name in names
             }
             surveyed[variant.name] = (books, [r for name in names for r in books[name].rows(name)])
-        device_facts = measure_device(torch, 0)
+        # THE SELECTED DEVICE, not card zero (#549.9). `device_index` is the binding's, and
+        # NVML is queried with it — a multi-GPU pod used to mint every record against GPU 0's
+        # power cap and MIG profile whatever card the fill was about to use.
+        device_index = int(binding.get("device_index") or 0)
+        device_facts = measure_device(torch, device_index)
+        runtime_identity = measure_runtime(torch, binding["release"])
         providers = launch_providers()
         qualified = qualify(
             torch,
@@ -255,35 +268,59 @@ class Executor:
             sorted({dtype_name(r.dtype) for _, rs in surveyed.values() for r in rs}),
             release=binding["release"],
             cache=Path(binding["probe_cache"]) if binding.get("probe_cache") else None,
+            runtime=runtime_identity,
         )
-        # ONE objective for both choices. The delivery chooser picks WHICH artifact and the
-        # selector picks WHICH provider serves its encodings, and #517d's finding is that
-        # those two answers trade against each other on the same two axes — so a deployment
-        # that stated `footprint` and got a footprint variant served by a fidelity-ranked
-        # provider would have had its statement half-honoured.
         objective = str(binding.get("objective") or "latency")
-        selector = Selector(providers, qualified[0], device_facts, objective)
-        candidates = [
-            (variant, *survey_routes(surveyed[variant.name][1], selector)) for variant in offered
-        ]
-        table_root = Path(binding.get("delivery_cache") or binding.get("probe_cache") or ".")
-        table_path = DeliveryTable.path_for(table_root, device_facts)
-        table = DeliveryTable.load(table_path, device_facts)
+        model_cls = getattr(self.discovered.module, binding["model_class"])
+        config_document = json.loads(Path(binding["config"]).read_text())
+        # The construction half of plan identity, computed from the HEADER and the CONFIG —
+        # both available before a line of the model is built. They are the same facts the
+        # post-construction record carries, one plane earlier, which is the only place a plan
+        # that has to be resolved BEFORE construction can read them.
+        construction = ConstructionFacts(
+            release=str(binding["release"]),
+            model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
+            config_digest=canonical.digest(config_document),
+            topology_digest=canonical.digest(
+                {
+                    key: [list(spec.shape), spec.dtype, spec.encoding]
+                    for key, spec in sorted(topology_of(surveyed[offered[0].name][1]).items())
+                }
+            ),
+            components=tuple(names),
+            custody=str(binding.get("custody", "canonical")),
+            strict_keys=bool(binding.get("strict_keys", False)),
+        )
+        # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
+        # the plan already chosen and the endpoint already imported; a plan whose route the
+        # endpoint cannot consent to is not a candidate, so it is never built.
+        consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
+        facts = PlanFacts(binding.get("delivery_cache") or binding.get("probe_cache") or ".")
         try:
-            choice = DeliveryChooser(table, device_facts).choose(
-                candidates,
+            plan = resolve(
+                variants=offered,
+                rows_for={name: rows for name, (_, rows) in surveyed.items()},
+                providers=providers,
+                capabilities=qualified[0],
+                device=device_facts,
+                runtime=runtime_identity,
+                construction=construction,
+                facts=facts,
                 objective=objective,
+                placement=str(binding.get("placement") or "all_resident"),
+                encoded_leaves=consent,
                 steps_basis=int(binding.get("steps_basis") or 20),
+                dtype_name=dtype_name,
             )
-        except DeliveryRefusal as exc:
-            self.poisoned = f"delivery refused: {exc.code}"
+        except PlanRefusal as exc:
+            self.poisoned = f"plan refused: {exc.code}"
             return {
                 "ok": False,
                 "code": exc.code,
                 "detail": str(exc).splitlines()[0][:900],
-                "delivery": {"walk": exc.walk, "objective": binding.get("objective")},
+                "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
-        checkpoints, rows = surveyed[choice.variant.name]
+        checkpoints, rows = surveyed[plan.variant]
         ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
@@ -319,8 +356,8 @@ class Executor:
             # rig has already probed skips the suite entirely.
             probe_cache=binding.get("probe_cache"),
             release=binding["release"],
-            # The suite already ran, above, to answer the delivery choice. Running it a
-            # second time here would re-measure a device fact that has not changed.
+            # The suite already ran, above, to resolve the plan. Running it a second time
+            # here would re-measure a device fact that has not changed.
             qualified=qualified,
             objective=objective,
         )
@@ -330,9 +367,9 @@ class Executor:
         backend.resident_budget = int(budgets.get("resident", 0))
         backend.hold_lease = backend.resident_budget > 0
         artifact = Artifact(
-            choice.variant.snapshot,
+            next(v for v in offered if v.name == plan.variant).snapshot,
             topology_of(rows),
-            Config(json.loads(Path(binding["config"]).read_text()), "unet.config"),
+            Config(config_document, "unet.config"),
             # CUSTODY is a BINDING fact, not a runtime constant: a checkpoint that came
             # through the border is canonical and a serve-time extra key is drift, while a
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
@@ -346,7 +383,6 @@ class Executor:
             backend=backend,
             substrate=lambda: serving_substrate(binding["variant"], seen),
         )
-        model_cls = getattr(self.discovered.module, binding["model_class"])
         try:
             # `expect` is INSIDE the handler because it now takes the verified read lease:
             # a corrupt artifact refuses here, before construction and before a single
@@ -438,29 +474,26 @@ class Executor:
                 "variant": binding["variant"],
             }
         )
-        # The CONSTRUCTED GENERATION is what actually got filled: the SELECTED bytes, the
-        # route that decodes them, and the configuration the fill ran under. The logical
-        # digest cannot answer "which bytes are resident right now" — it is identical
-        # across every variant by construction — so using it as the generation's identity
-        # made two generations over different artifacts indistinguishable.
+        # The CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
+        # THE RESOLVED PLAN'S OWN DIGEST that says so. The old spelling hashed a delivery
+        # RUNG NAME — an artifact-wide label chosen by a chooser with no per-tensor knowledge
+        # — so two materially different fills of a mixed artifact could share a constructed
+        # digest, and the field a reader trusted most was the one nothing executed from.
+        #
+        # The plan digest binds the exact snapshot map, every tensor's implementation digest
+        # and route, the device identity, the runtime source digest and the construction
+        # contract. `logical_model_digest` stays what it was: the question "which MODEL is
+        # this" has a different answer from "which BYTES are resident", and one digest could
+        # only ever answer one of them.
+        self.plan = plan
         self.constructed_model_digest = canonical.digest(
             {
-                "format": "cozy.runtime.ConstructedGeneration/1",
+                "format": "cozy.runtime.ConstructedGeneration/2",
                 "logical_model_digest": self.logical_model_digest,
-                "store": choice.variant.store,
-                "snapshot": choice.variant.snapshot,
-                "snapshots": choice.variant.snapshot_map(),
-                "delivery_variant": choice.variant.name,
-                "delivery": choice.rung.delivery,
-                "materialization": choice.rung.materialization,
-                "route": choice.rung.route,
-                "kernel": ROUTE_KERNEL[choice.rung.route],
+                "plan_digest": plan.digest(),
                 "topology_digest": record.topology_digest,
                 "config_digest": record.config_digest,
-                "components": list(record.components),
                 "resident_budget_bytes": int(budgets.get("resident", 0)),
-                "custody": str(binding.get("custody", "canonical")),
-                "strict_keys": bool(binding.get("strict_keys", False)),
             }
         )
         expected = command.get("expect_construction_digest") or ""
@@ -505,43 +538,58 @@ class Executor:
             },
             "ignored_extra_keys": list(record.ignored_extras),
             "transcribed_markers": list(record.transcribed_markers),
-            "delivery": choice.document(),
+            "plan": plan.document(),
+            # The WIRE's own two fields, derived from the plan's route census rather than
+            # copied off a rung. A plan that resolved three routes says `float`/`aot_decode`
+            # here and `mixed(...)` in `plan.label` — the closed vocabulary is satisfied and
+            # nothing claims to be purely native that is not.
+            "delivery": {
+                "label": plan.label(),
+                "delivery": plan.wire_delivery(),
+                "materialization": plan.wire_materialization(),
+                "routes": plan.route_census(),
+                "kernels": plan.kernels(),
+                "objective": plan.objective,
+                "calibrated": plan.measurements is not None,
+                "confession": plan.confession,
+            },
         }
-        # BANK WHAT THIS RUN MEASURED (cr-008c). The envelope the next choice reads is the
-        # one this fill actually paid: its wall, its decode share, the destinations that
-        # ended up resident and the decode scratch high-water the ledger saw. `step_ms` and
-        # the deviation are NOT measurable here — they need a forward pass and a comparison
-        # against the reference — so an existing row's values are preserved and a fresh row
-        # is written UNCONFORMED (-1.0), which makes it ineligible for selection until
-        # something measures them. A rung admitted by fill numbers alone is exactly what
-        # "arithmetic fit admits nothing" forbids.
-        prior = table.get(choice.variant.name, choice.rung.name)
-        table.put(
-            DeliveryFact(
-                variant=choice.variant.name,
-                rung=choice.rung.name,
+        # BANK WHAT THIS RUN MEASURED, keyed by THIS PLAN'S DIGEST (#549.2), as an
+        # IMMUTABLE per-run file. The numbers are the ones this fill actually paid: its wall,
+        # its decode share, the destinations that ended up resident and the decode scratch
+        # high-water the ledger saw. `step_ms` and the reference deviation are NOT measurable
+        # here — they need a forward pass and a comparison against the reference — so they
+        # are written -1 and stay -1 until something measures them.
+        #
+        # No merge, no read-modify-write, no `.partial`: the old `DeliveryTable.save` loaded
+        # the shared file, merged one row and replaced it, so two concurrent prepares each
+        # dropped the other's row with nothing detecting it. One run writes one O_EXCL file
+        # and every observation survives, which is also what makes the sample count auditable.
+        plan_digest = plan.digest()
+        facts.bank(
+            RunFact(
+                plan_digest=plan_digest,
+                run_id=run_id(plan_digest, device_facts.tuple_key(), binding["release"]),
                 stored_bytes=sum(r.stored_nbytes for r in rows),
                 resident_bytes=sum(backend.vram_charge.values()),
                 scratch_bytes=int(ledger.peak.get("decode", 0)),
                 fill_ms=int(backend.stats["fill_ms"]),
                 decode_ms=int(backend.decoded["ms"]),
-                step_ms=prior.step_ms if prior else -1.0,
-                deviation_rel_l2=(
-                    0.0 if choice.variant.reference else (prior.deviation_rel_l2 if prior else -1.0)
+                reference_deviation_rel_l2=(
+                    0.0 if plan.variant == plan.reference_variant else -1.0
                 ),
-                samples=(prior.samples + 1) if prior else 1,
                 evidence=f"prepare on {device_facts.tuple_key()} at {binding['release']}",
-                encodings=tuple(sorted({r.encoded.alias for r in rows})),
+                at_ns=time.time_ns(),
             )
         )
-        table.save(table_path)
         return {
             "ok": True,
             "ready": True,
             "model_construction_digest": self.logical_model_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
-            "delivery": choice.document(),
+            "plan": plan.document(),
+            "delivery": self.facts["delivery"],
             "facts": self.facts,
         }
 

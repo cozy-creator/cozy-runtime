@@ -139,16 +139,14 @@ def providers() -> None:
         "BOTH physical variants of fp8-rowwise/1 carry a decode floor AND a native leaf",
         len(rowwise) == 2
         and all(
-            sorted(p.route for p in table[d]) == ["decoded_float", "native_encoded"]
-            for d in rowwise
+            sorted(p.route for p in table[d]) == ["decoded_float", "encoded_gemm"] for d in rowwise
         ),
         f"{len(rowwise)} digests: "
         + " | ".join(f"{d[7:19]} -> {[p.route for p in table[d]]}" for d in rowwise),
     )
     check(
         "mxfp8/1 carries both routes under its ONE digest",
-        len(mx) == 1
-        and sorted(p.route for p in table[mx[0]]) == ["decoded_float", "native_encoded"],
+        len(mx) == 1 and sorted(p.route for p in table[mx[0]]) == ["decoded_float", "encoded_gemm"],
         f"{[p.name for p in table[mx[0]]]}",
     )
     everything = [p for group in table.values() for p in group]
@@ -183,7 +181,7 @@ def _record(implementation: Any, predicate: str, footprint: float, fidelity: flo
         delivery_route=implementation.route,
         evidence_digest="sha256:fixture-evidence",
         resident_bits_per_element=footprint,
-        route_deviation_rel=fidelity,
+        kernel_numeric_error=fidelity,
     )
 
 
@@ -218,7 +216,7 @@ def rank() -> None:
             _record(native, "cuda.sm89", 8.286, 0.01459),
         ]
     )
-    for objective, want in (("footprint", native.name), ("fidelity", decode.name)):
+    for objective, want in (("footprint", native.name), ("kernel_numeric_error", decode.name)):
         record = caps.admit(
             "sha256:fixture", sm89, "bfloat16", "fp8-rowwise/1", objective=objective, among=among
         )
@@ -227,7 +225,7 @@ def rank() -> None:
             among[record.implementation_digest].name == want,
             f"{among[record.implementation_digest].name} [{record.delivery_route}] "
             f"footprint {record.resident_bits_per_element:.3f} b/elt, "
-            f"fidelity {record.route_deviation_rel:.5f} rel",
+            f"fidelity {record.kernel_numeric_error:.5f} rel",
         )
     # ORDER-INDEPENDENCE, proved rather than asserted: the same two candidates in the other
     # registration order must give the same two answers.
@@ -240,7 +238,7 @@ def rank() -> None:
         == caps.admit(
             "sha256:fixture", sm89, "bfloat16", "fp8-rowwise/1", objective=o, among=among
         ).implementation_digest
-        for o in ("footprint", "fidelity")
+        for o in ("footprint", "kernel_numeric_error")
     )
     check(
         "reversing BOTH the record order and the candidate order changes nothing",
@@ -315,11 +313,8 @@ def leaf() -> None:
     import torch
     from torch import nn
 
-    from cozy_runtime.internal.encoding import (
-        RowwiseDequant,
-        RowwiseNativeLeaf,
-        quantize_rowwise,
-    )
+    from cozy_runtime.internal.encoding import RowwiseDequant, RowwiseNativeLeaf
+    from cozy_runtime.internal.instruments import quantize_rowwise
 
     head("leaf — a real nn.Module whose weight is the encoded role set")
     torch.manual_seed(0x517E)
@@ -501,14 +496,14 @@ def mixed() -> None:
     check(
         "ONE component resolves THREE providers on THREE routes, keyed per tensor's digest",
         {s.provider.route for s in chosen.values()}
-        == {"verbatim", "decoded_float", "native_encoded"},
+        == {"verbatim", "decoded_float", "encoded_gemm"},
         "the capability lookup takes the TENSOR's spec digest, never the artifact's or the "
         "component's — a mixed carrier is not a special case, it is the ordinary path with "
         "more than one answer",
     )
     check(
         "the NATIVE leaf and the DECODED float sit side by side under one objective",
-        chosen["block.attn.out_proj.weight"].provider.route == "native_encoded"
+        chosen["block.attn.out_proj.weight"].provider.route == "encoded_gemm"
         and chosen["block.mlp.fc1.weight"].provider.route == "decoded_float",
         "fp8-rowwise has a qualified leaf on this card and mxfp8's leaf is cuda.sm120, so "
         "the SAME objective lands on different routes for different tensors — which is "
@@ -518,14 +513,26 @@ def mixed() -> None:
     answer = servability(rows, selector)
     print(f"  survey     {routes}  refusal={refusal or 'none'}")
     print(f"  servable   {answer.line()}")
-    from cozy_runtime.internal.delivery import eligible_rungs
 
-    rungs = eligible_rungs(routes)
+    # #549.1's ARM, replacing the old `eligible_rungs` one. That arm asked whether a mixed
+    # artifact's route census REACHED both encoded rungs — which it did, and the plan then
+    # reported ONE of them as what the generation was. The honest question is what the plan
+    # CALLS ITSELF, and a label that derives from the census cannot answer it with a single
+    # rung name.
+    from cozy_runtime.internal.resolution import route_label
+
+    census: dict[str, int] = {}
+    for selection in chosen.values():
+        census[selection.provider.route] = census.get(selection.provider.route, 0) + 1
+    label = route_label(census)
     check(
-        "a MIXED artifact's route census reaches BOTH encoded rungs, and says so",
-        {r.name for r in rungs} >= {"aot_decode", "native_encoded"} and answer.serves,
-        f"eligible rungs {[r.name for r in rungs]} — a rung is a LABEL over a per-tensor "
-        "fill; nothing downstream reads it to pick a provider",
+        "a MIXED plan LABELS ITSELF MIXED — the rung name cannot survive three routes",
+        label.startswith("mixed(")
+        and "encoded_gemm x1" in label
+        and "decoded_float x1" in label
+        and "verbatim x1" in label,
+        f"{label} — the old artifact-wide rung reported one route for all three, and it was "
+        "hashed into generation identity while having no execution authority at all",
     )
 
 
@@ -537,7 +544,7 @@ def carrier() -> None:
     import torch
     from safetensors.torch import save_file
 
-    from cozy_runtime.internal.encoding import quantize_rowwise
+    from cozy_runtime.internal.instruments import quantize_rowwise
 
     head("carrier — a real fp8-rowwise artifact, ingested by the real border")
     WORK.mkdir(parents=True, exist_ok=True)
@@ -761,12 +768,12 @@ def qualify() -> None:
         "every minted record carries BOTH measured ranking axes",
         bool(caps.records)
         and all(
-            r.resident_bits_per_element > 0 and r.route_deviation_rel >= 0 for r in caps.records
+            r.resident_bits_per_element > 0 and r.kernel_numeric_error >= 0 for r in caps.records
         ),
         f"{len(caps.records)} records, "
         + ", ".join(
             f"{names[r.implementation_digest].rsplit('.', 2)[-2]}="
-            f"{r.resident_bits_per_element:.2f}b/{r.route_deviation_rel:.5f}"
+            f"{r.resident_bits_per_element:.2f}b/{r.kernel_numeric_error:.5f}"
             for r in caps.records
         ),
     )
@@ -811,7 +818,7 @@ def fill() -> None:
     backend, rows = _backend("footprint")
     if not any(
         backend.selector.select(r.key, r.encoded, dtype_name(r.dtype)).provider.route
-        == "native_encoded"
+        == "encoded_gemm"
         for r in rows
     ):
         check(
@@ -929,11 +936,11 @@ def arms() -> None:
         MicroScaledNativeLeaf,
         RowwiseNativeLeaf,
         implementation_digest,
-        quantize_rowwise,
     )
     from cozy_runtime.internal.fill import FillRefusal, PlanRow
+    from cozy_runtime.internal.instruments import quantize_rowwise
 
-    head("arms — the rung's laws, each planted")
+    head("arms — the route's laws, each planted")
 
     backend = globals().get("_FILLED")
     if backend is None:

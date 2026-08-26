@@ -693,12 +693,8 @@ def derive() -> None:
     lossy quantization, and the number that matters is what it costs OVER a direct one."""
     import torch
 
-    from cozy_runtime.internal.encoding import (
-        MicroScaledDequant,
-        derive_rowwise,
-        digests_of,
-        quantize_rowwise,
-    )
+    from cozy_runtime.internal.encoding import MicroScaledDequant, digests_of
+    from cozy_runtime.internal.instruments import derive_rowwise, quantize_rowwise
 
     head("derive — mxfp8 -> fp8-rowwise, and what the SECOND quantization costs (#514a)")
     provider = MicroScaledDequant(digests_of("mxfp8/1")[0])

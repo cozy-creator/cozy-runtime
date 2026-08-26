@@ -54,6 +54,7 @@ from typing import Any, Literal
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, census
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding import (
+    TORCH_DTYPES,
     Capabilities,
     DeviceFacts,
     Encoded,
@@ -118,10 +119,23 @@ REFUSALS = frozenset(
         # rather than fixed, so "the right roles at the wrong shape" is a state that can
         # exist for the first time.
         "carrier_geometry",
-        # cr-006's fourth, added with the FIRST module-replacing provider and spoken here
-        # for the same reason its other three are: one refusal table.
-        "objective_unranked",  # 2+ qualified providers, and no measured axis to order them
-        # The `native_encoded` rung's own two. Distinct on purpose, because they print
+        # #549.4 and #549.5, spoken here for the same reason cr-006's other codes are:
+        # one refusal table. `spec_unreviewed` says the registry knows this exact spec
+        # digest and no provider in this build was ever read against it (remedy: review a
+        # provider, or stop citing the spec) — the alias-keyed launch table could not
+        # produce it, because it handed the digest a sibling's decoder. `geometry_unsupported`
+        # says every implementation refuses this tensor's own SHAPE (remedy: the artifact's
+        # geometry, or a provider with declared padding semantics); the device and the bytes
+        # are both fine, which is why it is not `encoding_unqualified`.
+        "spec_unreviewed",
+        "geometry_unsupported",
+        # RETIRED with #549.3: `objective_unranked`. It fired when two providers qualified
+        # and the deployment's objective named no per-record axis — which was `latency`, the
+        # DEFAULT, so the default path refused as soon as a second implementation existed.
+        # The axis was never missing; it lived one layer up, in the measured envelopes of
+        # whole plans, and the chooser that held them never ran. `resolution.py` makes the
+        # joint decision now and CONFESSES uncalibrated instead of refusing.
+        # The `encoded_gemm` route's own two. Distinct on purpose, because they print
         # different remedies: `leaf_unconsented` says the ENDPOINT must declare that its
         # code survives a replaced linear op (an author edit), while `leaf_topology` says
         # the module tree cannot take a leaf where this destination is, or did not end up
@@ -481,7 +495,7 @@ def survey_routes(rows: Sequence[PlanRow], selector: Selector) -> tuple[dict[str
     routes: dict[str, int] = {}
     for row in rows:
         try:
-            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype))
+            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype), row.shape)
         except EncodingRefusal as exc:
             return routes, str(exc)
         routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
@@ -541,7 +555,7 @@ def servability(rows: Sequence[PlanRow], selector: Selector) -> Servability:
         by_alias[alias] = by_alias.get(alias, 0) + 1
     for row in rows:
         try:
-            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype))
+            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype), row.shape)
         except EncodingRefusal as exc:
             return Servability(False, by_alias, routes, str(exc), exc.code)
         routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
@@ -744,7 +758,7 @@ class StreamingFillBackend:
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.1",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
-        objective: str = "fidelity",
+        objective: str = "kernel_numeric_error",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -840,9 +854,11 @@ class StreamingFillBackend:
                 cache=Path(probe_cache) if probe_cache else None,
             )
         #: The DEPLOYMENT's stated axis, the same field `DeliveryChooser` reads, carried
-        #: down so both choices are made under one objective. Defaulted to `fidelity`
-        #: rather than to `latency`: an unstated objective must not be the one that trades
-        #: output quality for bytes, and #517d measured that trade at 4.1 dB.
+        #: down so both choices are made under one objective. Defaulted to
+        #: `kernel_numeric_error` rather than to `latency`: an unstated objective must not be
+        #: the one that trades numerics for bytes, and #517d measured that trade at 4.1 dB.
+        #: RENAMED from `fidelity` (#549.11) — the axis is a kernel diagnostic, and quality
+        #: is a paired video+audio eval the eval plane owns.
         self.objective = objective
         self.selector = Selector(self.providers, self.capabilities, self.device_facts, objective)
         #: THE SERVABILITY ANSWER, given here — before `expect` acquires a lease, before a
@@ -949,8 +965,10 @@ class StreamingFillBackend:
         native = sorted(
             row.key
             for row in self.plan.values()
-            if self.selector.select(row.key, row.encoded, dtype_name(row.dtype)).provider.route
-            == "native_encoded"
+            if self.selector.select(
+                row.key, row.encoded, dtype_name(row.dtype), row.shape
+            ).provider.route
+            == "encoded_gemm"
         )
         if native and encoded_leaves != "accept":
             raise _refuse(
@@ -1087,11 +1105,14 @@ class StreamingFillBackend:
                 [key],
             )
         # SELECTION, before a byte moves. The provider comes from this tensor's own
-        # encoding digest and the device's qualification record; an unregistered encoding,
-        # an unqualified device or a role set no decoder accounts for all refuse HERE,
-        # where the generation has nothing to undo.
+        # encoding digest, this tensor's own GEOMETRY (#549.5) and the device's qualification
+        # record; an unregistered encoding, an unreviewed spec, a shape no implementation
+        # consumes, an unqualified device or a role set no decoder accounts for all refuse
+        # HERE, where the generation has nothing to undo.
         try:
-            self.selected[key] = self.selector.select(key, row.encoded, dtype_name(row.dtype))
+            self.selected[key] = self.selector.select(
+                key, row.encoded, dtype_name(row.dtype), row.shape
+            )
         except EncodingRefusal as exc:
             raise _refuse(exc.code, str(exc), exc.fields) from exc
         if str(getattr(tensor, "device", "")) != self.device_str:
@@ -1108,7 +1129,7 @@ class StreamingFillBackend:
                 f"{row.nbytes} B",
                 [key],
             )
-        if self.selected[key].provider.route == "native_encoded":
+        if self.selected[key].provider.route == "encoded_gemm":
             # THE LEAF'S SITE, resolved before a byte moves and for the same reason every
             # other check here is: the decode leg has nothing to undo only if the whole
             # component's destinations were validated first. A native row that has no
@@ -1124,7 +1145,7 @@ class StreamingFillBackend:
         The unit of replacement is the MODULE, not the tensor: `nn.Module.__setattr__`
         refuses to accept anything that is not a Module as a child, so the payload cannot
         be assigned where the float weight was and the linear op has to be swapped whole.
-        That is the machinery the `native_encoded` rung waited on, and this is where it is
+        That is the machinery the `encoded_gemm` route waited on, and this is where it is
         checked to be possible.
 
         Four things have to hold, each a different way for a leaf to be wrong:
@@ -1567,7 +1588,7 @@ class StreamingFillBackend:
                     "is rolled back, never served from what happened to land",
                     missing[:6],
                 )
-            if selection.provider.route == "native_encoded":
+            if selection.provider.route == "encoded_gemm":
                 # THE ROLES DO NOT DECODE, THEY STAY. `spent` is deliberately not extended:
                 # these buffers are the resident weight from here on, and freeing them is
                 # what the whole rung exists not to do.
@@ -1822,16 +1843,28 @@ class StreamingFillBackend:
                     missing[:6],
                 )
             # THE DECODE ENVELOPE, granted once (§3.2: no incremental acquisition under
-            # pressure). The rolling flush keeps live scratch under the budget, and one
-            # tensor may exceed it on its own — so the envelope is the budget plus the
-            # largest single tensor, which is the true high-water mark of the walk.
+            # pressure), and CORRECTED by #549.10.
+            #
+            # The walk accumulates scratch until `held >= budget`, then flushes, so live
+            # scratch peaks at just under the budget plus whatever single tensor pushed it
+            # over — `budget + largest` — and it can never exceed the TOTAL, because that is
+            # all the scratch there is. The envelope is therefore `min(total, budget +
+            # largest)`.
+            #
+            # It used to read `min(total, budget) + largest`, which DOUBLE-COUNTS the largest
+            # tensor whenever `total < budget`: a component whose whole scratch fits under
+            # the budget never flushes at all, so its true high-water mark is exactly
+            # `total`, and the old expression reserved `total + largest`. On a component
+            # whose largest tensor is a big share of its scratch that is close to double the
+            # real envelope, charged against a `decode` budget that can refuse a fill for
+            # want of memory nothing was going to use.
             routes = {r.key: self.selected[r.key].provider.route for r in group}
             encoded = [r for r in group if routes[r.key] == "decoded_float"]
             envelope = 0
             if encoded:
-                envelope = min(
-                    sum(r.stored_nbytes for r in encoded), self.decode_scratch_bytes
-                ) + max(r.stored_nbytes for r in encoded)
+                total = sum(r.stored_nbytes for r in encoded)
+                largest = max(r.stored_nbytes for r in encoded)
+                envelope = min(total, self.decode_scratch_bytes + largest)
                 self.ledger.grant({"decode": envelope}, f"decode scratch for {component!r}")
             # A NATIVE ROLE IS NOT SCRATCH. `decode` is the class for bytes that exist
             # between the stream and the decode and never outlive one component's fill;
@@ -1841,7 +1874,7 @@ class StreamingFillBackend:
             # whole (§3.2: no incremental acquisition), covering the window where the float
             # destinations and the payload are BOTH live — which is this rung's real peak
             # and the number a plan has to fit.
-            native_bytes = sum(r.stored_nbytes for r in group if routes[r.key] == "native_encoded")
+            native_bytes = sum(r.stored_nbytes for r in group if routes[r.key] == "encoded_gemm")
             if native_bytes:
                 self.ledger.grant({"vram": native_bytes}, f"encoded leaves for {component!r}")
                 self.leaf_grant[component] = self.leaf_grant.get(component, 0) + native_bytes
@@ -1879,25 +1912,11 @@ class StreamingFillBackend:
 # ------------------------------------------------------------------------- helpers
 
 
-#: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
-#: is a fact about torch, and TensorFS has no business knowing torch exists. What the store
-#: DOES own is the set of names and their widths, so this map is CHECKED against
-#: `tensorfs.DTYPES` rather than trusted — a name the store knows and this map does not is a
-#: refusal, not a silent passthrough that would land the wrong number of bytes.
-TORCH_DTYPES: dict[str, str] = {
-    "f16": "float16",
-    "bf16": "bfloat16",
-    "f32": "float32",
-    "f64": "float64",
-    "f8_e4m3fn": "float8_e4m3fn",
-    "f8_e5m2": "float8_e5m2",
-    "i64": "int64",
-    "i32": "int32",
-    "i16": "int16",
-    "i8": "int8",
-    "u8": "uint8",
-    "bool": "bool",
-}
+#: TensorFS dtype name -> torch dtype name, imported from the FORMAT seam rather than kept
+#: here (#549.10): `probe.py` needs the same map to build role tensors out of the vendored
+#: spec vectors, and two copies of one dtype table is the #497-class duplication.
+#: `Checkpoint.rows` still CHECKS it against `tensorfs.DTYPES` in both directions, and every
+#: consumer imports it from `cozy_runtime.internal.encoding` now — one definition, one door.
 
 
 def dtype_name(dtype: object) -> str:

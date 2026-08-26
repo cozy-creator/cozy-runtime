@@ -112,7 +112,7 @@ def fetch() -> None:
     import torch
     from safetensors.torch import save_file
 
-    from cozy_runtime.internal.encoding import quantize_rowwise
+    from cozy_runtime.internal.instruments import quantize_rowwise
 
     head("fetch — block 0 of the real H3 curve DiT, by range over the pinned revision")
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -403,7 +403,7 @@ def fill() -> None:
     # THE SAME ARTIFACT, the SAME card, the OTHER objective. This is the whole of #517d's
     # ruling made operational: fidelity and footprint order oppositely, so the deployment's
     # stated axis is what decides, and both answers are served from one set of stored bytes.
-    float_backend, float_model = fill_arm("rowwise", "fidelity")
+    float_backend, float_model = fill_arm("rowwise", "kernel_numeric_error")
     float_block = float_backend.components["block"]
     float_resident = sum(int(t.numel() * t.element_size()) for _, t in _tensors(float_block))
     check(
@@ -474,7 +474,7 @@ def forward() -> None:
         check("forward needs the fill leg", False, "run `fill` first")
         return
     leaf_backend, leaf_model, _, float_model = arms
-    _, reference_model = fill_arm("bf16", "fidelity")
+    _, reference_model = fill_arm("bf16", "kernel_numeric_error")
 
     torch.manual_seed(0x517E)
     x = torch.randn(1, 512, 5376, dtype=torch.bfloat16, device="cuda") * 0.5
@@ -547,17 +547,17 @@ def choose() -> None:
     caps, _ = qualify(torch, table, device, ["bfloat16"], release=RELEASE, cache=ROOT / "probe")
     rows = Checkpoint(str(STORE), (ROOT / "snapshot-rowwise.txt").read_text().strip()).rows("block")
     subject = next(r for r in rows if r.encoded.alias == "fp8-rowwise/1")
-    for objective in ("footprint", "fidelity"):
+    for objective in ("footprint", "kernel_numeric_error"):
         selection = Selector(table, caps, device, objective).select(
             subject.key, subject.encoded, dtype_name(subject.dtype)
         )
-        want = "native_encoded" if objective == "footprint" else "decoded_float"
+        want = "encoded_gemm" if objective == "footprint" else "decoded_float"
         check(
             f"on {device.predicate} the {objective!r} objective takes {want}",
             selection.provider.route == want,
             f"{selection.provider.name}: footprint "
             f"{selection.record.resident_bits_per_element:.3f} b/elt, fidelity "
-            f"{selection.record.route_deviation_rel:.6f} rel",
+            f"{selection.record.kernel_numeric_error:.6f} rel",
         )
     # An UNMEASURED device: the same build, the same artifact, and a table that carries a
     # DECODE record for that card and no native one — which is exactly the state of a card

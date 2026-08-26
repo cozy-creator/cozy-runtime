@@ -940,7 +940,8 @@ def fill_once(component: str) -> dict[str, Any]:
     import torch
 
     from cozy_runtime.author._loader import TensorSpec
-    from cozy_runtime.internal.fill import TORCH_DTYPES, Checkpoint, ResourceLedger
+    from cozy_runtime.internal.encoding import TORCH_DTYPES
+    from cozy_runtime.internal.fill import Checkpoint, ResourceLedger
     from cozy_runtime.internal.fill import StreamingFillBackend as Backend
 
     spellings = {name: getattr(torch, torch_name) for name, torch_name in TORCH_DTYPES.items()}
