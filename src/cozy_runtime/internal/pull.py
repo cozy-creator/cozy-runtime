@@ -23,6 +23,14 @@ grid, so the recovery unit is an object.
 
 **No magic timeouts.** A deadline arrives from the caller or there is none; the socket
 timeout is whatever is LEFT of that deadline. Nothing here invents a number of seconds.
+
+**The wanted list is walked by N streams, not one.** An artifact is already cut on the
+object grid, so the objects are independent and the serial loop was leaving the whole link
+on the table — measured, not supposed: at 92.42 GiB on a rented pod the serial loop moved
+49.8 MB/s against a 141 MB/s transport ceiling on the same pods and the same presigned GETs,
+and a 16-way walk through this same door landed 117.6 MB/s. Concurrency changes the ORDER
+objects are asked for and nothing else: the plan is still `fetch_plan`'s, every byte still
+enters at `fetch_admit`, and the proof is still `fetch_complete`.
 """
 
 from __future__ import annotations
@@ -30,13 +38,23 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any
+
+#: How many objects are in flight by default. It is a MEASURED number, not a taste: #566b
+#: swept the same pods, the same bucket and the same presigned GETs and found the per-stream
+#: rate flat and the aggregate rate saturating by 16 (49.8 MB/s at 1, 117.6 MB/s at 16,
+#: against a 141 MB/s ceiling the pod's own transport probe reached). It is a flag because
+#: the right number is a property of the LINK, and this file has no way to measure the
+#: caller's.
+STREAMS = 16
 
 #: The closed refusal registry for this leg. Every code here has a producer below, and the
 #: import-time check at the bottom of this module is the #503/#504 invariant: a code with no
@@ -350,6 +368,11 @@ class PullResult:
     ref: str
     snapshot: str
     store: str
+    #: The release the HUB resolved this ref to, or "" when the ref pinned a digest and the
+    #: hub therefore named none. It is carried because the local index row is keyed by a ref
+    #: and a row that dropped the release names a different artifact than the one pulled.
+    release: str = ""
+    streams: int = 1
     declared: int = 0
     held: int = 0
     fetched: int = 0
@@ -370,6 +393,7 @@ class PullResult:
             "bytes_moved": self.bytes_moved,
             "bytes_held": self.bytes_held,
             "bytes_total": self.bytes_total,
+            "streams": self.streams,
         }
 
 
@@ -408,6 +432,7 @@ def pull(
     token: str = "",
     timeout: float | None = None,
     session: str = "",
+    streams: int = STREAMS,
     on_object: Callable[[str, int, bool], None] | None = None,
 ) -> PullResult:
     """Pull one hub checkpoint into this machine's local CAS.
@@ -415,7 +440,11 @@ def pull(
     `tensorfs` and `store` are injected rather than imported so the caller owns the facade
     lookup and its typed absent-reader refusal (`fill.tensorfs_module`), and so this module
     stays testable against a real store with no hub in sight.
+
+    `streams` objects are in flight at once. One is the serial walk this leg used to be and
+    it stays reachable, because a link where concurrency does not help is a real link.
     """
+    streams = max(1, int(streams))
     deadline = Deadline.after(timeout)
     at = resolve(base, ref, deadline, lane=lane, token=token)
     declared = reads(base, at, deadline, token=token)
@@ -434,6 +463,8 @@ def pull(
         ref=ref,
         snapshot=at.snapshot,
         store=str(store.root),
+        release=at.release,
+        streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
         held=len(plan["held"]),
         bytes_held=int(plan["held_bytes"]),
@@ -442,8 +473,10 @@ def pull(
     )
     urls = {r.object_id: r.url for r in declared}
     allow_local = local_hub(base)
+    ledger = threading.Lock()
 
-    for object_id, length in plan["wanted"]:
+    def one(item: tuple[str, int]) -> None:
+        object_id, length = item
         if object_id == "sha256:" + at.snapshot and object_id not in urls:
             # The root travels on its own route. Its bytes are already in hand and still go
             # through the door, so a hub that served a manifest for a different checkpoint
@@ -460,11 +493,34 @@ def pull(
                     "object is a catalog defect, not a client error",
                 )
             _fetch(tensorfs, store, plan["document"], object_id, url, deadline, allow_local)
-        result.fetched += 1
-        result.bytes_moved += length
-        result.objects.append(object_id)
-        if on_object is not None:
-            on_object(object_id, length, True)
+        # The counters are the RESULT, so they are taken once under one lock rather than
+        # incremented from N threads — a byte total that raced would be the one number in
+        # this document nobody could check.
+        with ledger:
+            result.fetched += 1
+            result.bytes_moved += length
+            result.objects.append(object_id)
+            if on_object is not None:
+                on_object(object_id, length, True)
+
+    wanted = [(str(o), int(n)) for o, n in plan["wanted"]]
+    with ThreadPoolExecutor(max_workers=streams, thread_name_prefix="pull") as pool:
+        futures = [pool.submit(one, item) for item in wanted]
+        done, pending = wait(futures, return_when=FIRST_EXCEPTION)
+        failed = next((f for f in done if f.exception() is not None), None)
+        if failed is not None:
+            # STOP ASKING. Every object already in flight still finishes at the door (a
+            # thread cannot be interrupted mid-admit and a half-admitted object is exactly
+            # what the border refuses to leave behind), but nothing new is started and the
+            # first refusal is the one the caller sees.
+            for f in pending:
+                f.cancel()
+            for f in futures:
+                if not f.cancelled():
+                    f.exception()
+            first = failed.exception()
+            assert first is not None
+            raise first
 
     # The PROOF, and it is not "every GET returned 200": every declared object is installed
     # and this store's own verification record vouches for it.

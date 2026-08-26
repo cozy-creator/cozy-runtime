@@ -12,6 +12,7 @@ credential to set, and it is never a prompt.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ from cozy_runtime.internal import pull as transport
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 
-FLAGS = ("--hub", "--lane", "--store", "--timeout", "--as")
+FLAGS = ("--hub", "--lane", "--store", "--timeout", "--as", "--streams")
 BOOL_FLAGS = ("--dry-run",)
 
 #: Refusal code -> exit. The codes are `internal/pull.py`'s closed registry, so a new code
@@ -80,7 +81,7 @@ def _parse(args: list[str]) -> tuple[str, dict[str, str], set[str]]:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
-                "pull takes --hub, --lane, --store, --as, --timeout, --dry-run",
+                "pull takes --hub, --lane, --store, --as, --streams, --timeout, --dry-run",
                 Exit.usage,
             )
         else:
@@ -110,6 +111,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         Path(flags["--store"]).expanduser() if "--store" in flags else config.cozy_home / "store"
     )
     timeout = _duration(flags["--timeout"]) if "--timeout" in flags else None
+    streams = _streams(flags.get("--streams", ""))
 
     tensorfs = fill.tensorfs_module()
     store = _store(tensorfs, store_root)
@@ -125,33 +127,126 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
             lane=flags.get("--lane", ""),
             token=config.credentials.tensorhub or "",
             timeout=timeout,
+            streams=streams,
         )
     except transport.PullRefusal as refusal:
         raise _refuse(refusal, config) from refusal
 
+    facts = _header_facts(tensorfs, store, outcome.snapshot)
     row = artifacts.Artifact(
-        ref=flags.get("--as", ref).split("@sha256:")[0],
+        ref=_installed_ref(flags.get("--as", ""), ref, outcome.release),
         store=str(store.root),
         config="",
-        snapshots={"checkpoint": "sha256:" + outcome.snapshot},
+        # THE COMPONENTS THE PULLED HEADER DECLARES, not one invented key. The fill plane
+        # indexes `snapshots` by real component name and refuses `destination_absent` for a
+        # name that is not there, so a row saying `{"checkpoint": …}` describes bytes that
+        # arrived perfectly and cannot be served. An N-ary checkpoint carries every
+        # component under one digest, which is what this map says and why it is read from
+        # the header rather than assumed to be one.
+        snapshots={name: "sha256:" + outcome.snapshot for name in facts.components},
         lane=flags.get("--lane", "") or "plain",
-        bytes=outcome.bytes_total,
+        bytes=facts.stored_bytes,
+        tensors=facts.tensors,
     )
     artifacts.install(config.cozy_home, row)
     return Result(
-        document=outcome.document(),
+        document={**outcome.document(), "components": list(facts.components)},
         rows=(
             ("ref", row.ref),
             ("snapshot", "sha256:" + outcome.snapshot),
             ("store", str(store.root)),
+            ("components", f"{', '.join(facts.components)} — {facts.tensors} tensors"),
             (
                 "objects",
-                f"{outcome.declared} declared, {outcome.held} held, {outcome.fetched} fetched",
+                f"{outcome.declared} declared, {outcome.held} held, {outcome.fetched} fetched"
+                f" on {outcome.streams} stream(s)",
             ),
             ("bytes", f"{outcome.bytes_moved} moved, {outcome.bytes_held} already resident"),
         ),
         next=(f"cozy-runtime run <function> --model {row.ref}",),
     )
+
+
+def _streams(text: str) -> int:
+    """`--streams <n>`: how many objects move at once. Absent takes the transport leg's
+    measured default; zero or a non-number is a usage refusal, never a silent 1."""
+    if not text:
+        return transport.STREAMS
+    try:
+        count = int(text)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise CliError(
+            "usage",
+            f"{text!r} is not a stream count",
+            f"--streams takes a positive integer; the default is {transport.STREAMS}, "
+            "measured against a saturated link",
+            Exit.usage,
+        )
+    return count
+
+
+def _installed_ref(named: str, ref: str, release: str) -> str:
+    """The ref the local index files this artifact under.
+
+    `--as` wins verbatim — it is the operator saying what to call it. Otherwise the pulled
+    ref keeps its RELEASE and loses only its digest pin: `org/repo@v2` installed as
+    `org/repo` would be a row for a different artifact under a name that already means
+    something else. A digest-pinned ref names no release, so the hub's resolved one is used
+    when the hub had one to give.
+    """
+    if named:
+        return named
+    base, _, pin = ref.partition("@")
+    if pin and not pin.startswith("sha256:"):
+        return ref
+    return f"{base}@{release}" if release else base
+
+
+@dataclass(frozen=True, slots=True)
+class _Facts:
+    components: tuple[str, ...]
+    tensors: int
+    stored_bytes: int
+
+
+def _header_facts(tensorfs: Any, store: Any, snapshot: str) -> _Facts:
+    """What the PULLED snapshot's own header says it holds.
+
+    Read here rather than taken from the transport because the transport counts OBJECTS and
+    the index row is about TENSORS: `bytes_total` includes the manifest and the encoding
+    spec documents, and no object knows which component it belongs to. This is a header
+    read — no tensor byte is touched — and it is the same parse the fill plane does, so a
+    row this writes is a row that plane can resolve.
+    """
+    try:
+        header_bytes = store.snapshot("sha256:" + snapshot)["header"]
+        closure = tensorfs.Closure()
+        for spec in tensorfs.parse_header(header_bytes)["encodings"]:
+            closure.insert(store.document(str(spec["sha256"])))
+        header = tensorfs.parse_header(header_bytes, closure)
+    except Exception as exc:
+        raise CliError(
+            "validation",
+            f"sha256:{snapshot}: the pulled snapshot's header did not parse — "
+            f"{type(exc).__name__}: {exc}",
+            "the objects landed and verified; the header this build reads is not the header "
+            "the hub published. Re-pull, and if it repeats the catalog's header is suspect",
+            Exit.validation,
+        ) from exc
+    widths = tensorfs.DTYPES
+    tensors = 0
+    stored = 0
+    for table in header["components"].values():
+        tensors += len(table)
+        for entry in table.values():
+            for part in entry["parts"].values():
+                nbytes = int(widths[str(part["dtype"])])
+                for extent in part["shape"]:
+                    nbytes *= int(extent)
+                stored += nbytes
+    return _Facts(tuple(sorted(header["components"])), tensors, stored)
 
 
 def _preview(

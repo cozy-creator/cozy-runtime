@@ -9,9 +9,11 @@ exactly the way a network is (a flipped byte, a body that ends early, a reset so
   scripts/pull-live.py --hub URL --ref org/repo@sha256:... --store DIR [--source DIR]
   scripts/pull-live.py --hub URL --ref ... --phases door,arms
 
-Phases: pull (fetch it, prove it) · idem (nothing re-fetched) · heal (a corrupted local
-object is not skipped) · resume (SIGKILL mid-object, then only what is missing moves) ·
-door (hostile sources at the border) · arms (typed refusals: coordinates, hub, SSRF).
+Phases: pull (fetch it, prove it) · row (the index row the fill plane can actually serve,
+red-armed against the row this leg used to write) · streams (the concurrent walk moves the
+same bytes and no others) · idem (nothing re-fetched) · heal (a corrupted local object is
+not skipped) · resume (SIGKILL mid-object, then only what is missing moves) · door (hostile
+sources at the border) · arms (typed refusals: coordinates, hub, SSRF).
 
 `--source` is the store the artifact was published FROM. Given it, the run adds the claim
 that matters most and cannot be checked any other way: every pulled object is BIT-IDENTICAL
@@ -125,12 +127,12 @@ def phase_pull(a: argparse.Namespace) -> None:
         identical(a, pathlib.Path(a.source), pathlib.Path(a.store))
 
 
-def verify(a: argparse.Namespace, snapshot: str) -> None:
+def verify(a: argparse.Namespace, snapshot: str, root: str = "") -> None:
     """The destination proves the artifact itself — a local walk over local bytes."""
     if not a.tfs:
         return
     out = subprocess.run(
-        [a.tfs, "snapshot", "verify", a.store, snapshot.removeprefix("sha256:")],
+        [a.tfs, "snapshot", "verify", root or a.store, snapshot.removeprefix("sha256:")],
         capture_output=True,
         text=True,
     )
@@ -155,6 +157,130 @@ def identical(a: argparse.Namespace, src: pathlib.Path, dst: pathlib.Path) -> No
         "published -> pulled is BIT-IDENTICAL",
         f"{len(have)} objects, {total} B ({total / 2**20:.1f} MiB), every digest re-derived here",
     )
+
+
+def phase_row(a: argparse.Namespace) -> None:
+    """The row `pull` files locally, judged by the plane that has to READ it.
+
+    RED FIRST, and the red is the row this leg actually wrote until #566c: `{"checkpoint":
+    <digest>}` for an artifact whose header declares real component names. The bytes were
+    perfect and the artifact was unservable, which is why the arm is the FILL PREFLIGHT
+    (`Checkpoint.rows`, header-only, no device) and not a shape assertion — a shape
+    assertion would have passed the old row too.
+    """
+    head("row — the local index row, against the fill plane that reads it")
+    from cozy_runtime.cli import artifacts
+    from cozy_runtime.internal import fill
+
+    home = pathlib.Path(a.home)
+    snapshot = ""
+    for row in artifacts.rows(home):
+        if row.store == a.store:
+            snapshot = row.primary
+    if not snapshot:
+        return bad("no row was installed by the pull", f"nothing in {home / 'artifacts'}")
+
+    checkpoint = fill.Checkpoint(a.store, snapshot)
+    declared = sorted(checkpoint.header["components"])
+
+    # RED: the pre-fix row, constructed here so the refusal is observed rather than recalled.
+    try:
+        fill.Checkpoint(a.store, snapshot).rows("checkpoint")
+        bad("the pre-fix row's component RESOLVED", "'checkpoint' is a real component here?")
+    except Exception as exc:
+        if getattr(exc, "code", "") == "destination_absent":
+            ok(
+                "RED: snapshots={'checkpoint': …} is unservable",
+                f"destination_absent — the header has {', '.join(declared)}",
+            )
+        else:
+            bad("the pre-fix row refused for the wrong reason", f"{type(exc).__name__}: {exc}")
+
+    # GREEN: the row the landed code wrote, resolved key-exact, component by component.
+    installed = [r for r in artifacts.rows(home) if r.store == a.store][-1]
+    if sorted(installed.snapshots) != declared:
+        return bad(
+            "the row's components are not the header's",
+            f"row {sorted(installed.snapshots)} vs header {declared}",
+        )
+    ok("the row names the header's components", ", ".join(declared))
+    tensors = 0
+    stored = 0
+    for name in declared:
+        rows_ = fill.Checkpoint(a.store, installed.snapshots[name]).rows(name)
+        tensors += len(rows_)
+        stored += sum(r.stored_nbytes for r in rows_)
+        if not rows_:
+            bad(f"component {name} resolved to zero tensors")
+    ok(
+        "every component resolves key-exact from the PULLED store",
+        f"{tensors} tensors, {stored} B stored",
+    )
+    if installed.tensors != tensors or installed.bytes != stored:
+        bad(
+            "the row's counts are not the header's",
+            f"row {installed.tensors} tensors/{installed.bytes} B vs {tensors}/{stored}",
+        )
+    else:
+        ok("the row's tensors and bytes are the header's own", "copied, never re-derived")
+    if "@" in a.ref and not a.ref.split("@")[1].startswith("sha256:"):
+        release = a.ref.split("@")[1]
+        if installed.ref.endswith("@" + release):
+            ok("the release survived into the row", installed.ref)
+        else:
+            bad("the row dropped the release", f"{a.ref} installed as {installed.ref}")
+
+
+def phase_streams(a: argparse.Namespace) -> None:
+    """The concurrent walk moves the same objects the serial one does, and no others.
+
+    The point is not the clock — this box's uplink is not the link the default was measured
+    on — it is that `--streams` changes ORDER and nothing else: same plan, same object set,
+    same digests, same `fetch_complete`.
+    """
+    head("streams — N in flight is the same artifact as one in flight")
+    serial = pathlib.Path(a.store + "-s1")
+    wide = pathlib.Path(a.store + "-s8")
+    got = {}
+    for label, root, n in (("serial", serial, 1), ("concurrent", wide, 8)):
+        shutil.rmtree(root, ignore_errors=True)
+        t0 = time.monotonic()
+        run = cozy(
+            ["--json", "pull", a.ref, "--hub", a.hub, "--store", str(root), "--streams", str(n)],
+            a.home,
+        )
+        if run.returncode != 0:
+            bad(f"{label} pull", run.stderr.strip()[:200])
+            return
+        res = pulled(run.stdout)
+        wall = time.monotonic() - t0
+        if res["streams"] != n:
+            bad(f"{label}: the result reports {res['streams']} streams, not {n}")
+        got[label] = (res, sorted(objects(root)), wall)
+        ok(
+            f"{label} ({n} stream(s))",
+            f"{res['fetched']} objects, {res['bytes_moved']} B in {wall:.1f}s "
+            f"= {res['bytes_moved'] / max(wall, 1e-6) / 2**20:.1f} MiB/s",
+        )
+    if got["serial"][1] != got["concurrent"][1]:
+        bad("the two walks produced different stores", "concurrency changed WHAT arrived")
+    else:
+        ok(
+            "byte-for-byte the same store either way",
+            f"{len(got['serial'][1])} objects, identical id set",
+        )
+    if got["serial"][0]["bytes_moved"] != got["concurrent"][0]["bytes_moved"]:
+        bad("the two walks moved different byte totals")
+    verify(a, got["concurrent"][0]["snapshot"], str(wide))
+    shutil.rmtree(serial, ignore_errors=True)
+    shutil.rmtree(wide, ignore_errors=True)
+
+    run = cozy(["pull", a.ref, "--hub", a.hub, "--store", a.store, "--streams", "0"], a.home)
+    text = run.stdout + run.stderr
+    if run.returncode == 2 and "error(usage)" in text:
+        ok("--streams 0: usage, exit 2", "a stream count of zero is a refusal, not a silent 1")
+    else:
+        bad("--streams 0 was accepted", f"exit {run.returncode}: {text[:120]}")
 
 
 def phase_idem(a: argparse.Namespace) -> None:
@@ -231,10 +357,23 @@ def phase_resume(a: argparse.Namespace) -> None:
     # Kill on OBSERVED PROGRESS, never on a sleep: wait until a partial temp file is
     # genuinely large, so the kill lands mid-transfer rather than somewhere a timer guessed.
     tmp = store / "tmp"
+
+    def big() -> bool:
+        # A temp file the border finished with disappears WHILE this loop reads it, and with
+        # N streams in flight that is the common case rather than a rare one. A vanished
+        # candidate is progress, not an error.
+        for p in tmp.iterdir() if tmp.is_dir() else ():
+            try:
+                if p.stat().st_size > (4 << 20):
+                    return True
+            except FileNotFoundError:
+                continue
+        return False
+
     deadline = time.monotonic() + 120
     fired = False
     while time.monotonic() < deadline and proc.poll() is None:
-        if tmp.is_dir() and any(p.stat().st_size > (4 << 20) for p in tmp.iterdir()):
+        if big():
             fired = True
             break
         time.sleep(0.005)
@@ -417,6 +556,8 @@ def phase_arms(a: argparse.Namespace) -> None:
 
 PHASES = {
     "pull": phase_pull,
+    "row": phase_row,
+    "streams": phase_streams,
     "idem": phase_idem,
     "heal": phase_heal,
     "resume": phase_resume,
