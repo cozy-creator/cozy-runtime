@@ -131,8 +131,13 @@ DELIVERY_RUNGS: tuple[DeliveryRung, ...] = (
         why="the tensor cores consume the stored elements directly: no decode at all, the "
         "stored roles ARE the resident weight, and the only rung on which an encoded lane "
         "is also a different kernel. It is therefore the only rung that lowers steady-state "
-        "VRAM — measured at 0.5067x on the fill plane's own ledger — and the only one an "
-        "endpoint has to CONSENT to, because the module that computes is replaced",
+        "VRAM — MEASURED at 0.5003x of the decode floor on a real H3 curve-DiT block "
+        "(367.8 vs 735.0 MiB, 8.005 resident bits per GEMM element, on the fill plane's own "
+        "ledger; results/leaf-native-report.json) — and the only one an endpoint has to "
+        "CONSENT to, because the module that computes is replaced. It costs 3.203 dB "
+        "against the decode floor on identical stored bytes, which is the activation "
+        "quantization a w8a8 route necessarily pays: this rung is a TRADE, and which side "
+        "of it a deployment wants is what OBJECTIVES is for",
         status="proven",
     ),
 )
