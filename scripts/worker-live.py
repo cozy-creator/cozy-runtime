@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import hashlib
 import json
 import os
@@ -127,18 +126,24 @@ def gpu_used_mib() -> int:
     return int(out)
 
 
-# --------------------------------------------------------------------------- the hub
+# --------------------------------------------------------------------------- the owner
+
+#: The scripted owner's one deployment routing key (#446). Owner-minted; never identity.
+DEPLOYMENT = "dpl-live"
 
 
 @dataclass
-class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servicer is untyped
-    """The coordinator side of th-024, scripted. cl-001 will be the real one."""
+class Hub:
+    """The scripted OWNER of th-024 — it DIALS the worker's hosted `WorkerControl` (#436;
+    the worker-dials arrangement this class used to serve is retired). cl-001's real local
+    client speaks the same conversation: Claim -> ClaimAck -> snapshot -> SnapshotAck ->
+    directive -> dispatch, under the three-field envelope."""
 
-    outbound: queue.Queue[pb.CoordinatorMessage | None] = field(default_factory=queue.Queue)
-    seen: list[pb.WorkerMessage] = field(default_factory=list)
+    seen: list[pb.WorkerFrame] = field(default_factory=list)
     lock: threading.Condition = field(default_factory=threading.Condition)
     progress: list[pb.AttemptProgress] = field(default_factory=list)
-    sessions: list[str] = field(default_factory=list)
+    boots: list[str] = field(default_factory=list)
+    snapshot: list[pb.ActiveAttempt] = field(default_factory=list)
     directive: pb.Directive | None = None
     withhold_acks: set[str] = field(default_factory=set)
     wrong_ack: set[str] = field(default_factory=set)
@@ -148,70 +153,167 @@ class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servic
     revision: int = 0
     process: Any = None
     log: Any = None
+    #: the owner's accepted envelope, learned from ClaimAck
+    epoch: int = 1
+    generation: int = 0
+    boot_id: str = ""
+    controller_id: str = "hub-live"
+    outbound: queue.Queue[pb.OwnerFrame | None] = field(default_factory=queue.Queue)
+    channel: Any = None
+    watch_channel: Any = None
+    call: Any = None
+    root_cert: bytes | None = None
+    token: str = ""
+    connected: threading.Event = field(default_factory=threading.Event)
 
-    # ------------------------------------------------------------ servicer
+    # ------------------------------------------------------------ dialing
 
-    def Control(self, request_iterator: Any, context: Any) -> Any:
+    def connect(
+        self,
+        addr: str,
+        *,
+        claim_only: bool = False,
+        root_cert: bytes | None = None,
+        token: str = "",
+    ) -> None:
+        """Dial the worker and CLAIM it. Reconnecting (a new worker on the same address, or
+        the same worker after a stream drop) is the same call again: `seen` accumulates, so
+        `since` cursors stay valid across a restart.
+
+        THE REMOTE LEG (cl-015/#445): `root_cert` pins the worker's own (self-signed)
+        certificate — trusting exactly that PEM IS the fingerprint pin — and `token` is the
+        bearer owner token, presented as `Claim.proof` and checked worker-side against the
+        provisioned credential, constant-time. Never mTLS.
+        """
         self.streams += 1
-        stream = self.streams
-        threading.Thread(target=self._read, args=(request_iterator, stream), daemon=True).start()
-        while True:
-            message = self.outbound.get()
-            if message is None:
-                break
-            yield message
-
-    def StreamProgress(self, request_iterator: Any, context: Any) -> Any:
-        from google.protobuf import empty_pb2
-
-        for item in request_iterator:
-            # The saturation arm holds this lane still. Control must not notice.
-            while self.block_progress.is_set():
-                time.sleep(0.05)
-            with self.lock:
-                self.progress.append(item)
-                self.lock.notify_all()
-        return empty_pb2.Empty()
-
-    def _read(self, request_iterator: Any, stream: int) -> None:
+        self.connected.clear()
+        self.outbound = queue.Queue()
+        if self.channel is not None:
+            self.channel.close()
+        if self.watch_channel is not None:
+            self.watch_channel.close()
+        self.root_cert, self.token = root_cert, token
+        self.channel = self._dial(addr)
+        stub = pb_grpc.WorkerControlStub(self.channel)
+        self.call = stub.Control(self._outbound_iter())
+        threading.Thread(target=self._read, args=(self.call,), daemon=True).start()
+        claim = pb.Claim(
+            owner_epoch=self.epoch,
+            controller_id=self.controller_id,
+            wire_minor=WIRE_MINOR,
+            proof=token.encode(),
+        )
+        self.outbound.put(pb.OwnerFrame(claim=claim))
+        if claim_only:
+            return
+        # The claim handshake completes on the reader thread (ClaimAck -> snapshot ->
+        # SnapshotAck -> directive); dispatch is open once `connected` sets. Observed, not
+        # timed: the worker process dying is the only failing shape, and wait() names it.
+        # A BootFailure INSTEAD of ClaimAck (01) ends the dial: the verdict is delivered
+        # and the worker's exit code is the section's to observe.
         try:
-            for message in request_iterator:
-                kind = message.WhichOneof("msg")
+            outcome = self.wait(
+                lambda m: m if m.WhichOneof("msg") in ("claim_ack", "boot_failure") else None,
+                120,
+                "ClaimAck",
+                len(self.seen),
+            )
+        except RuntimeError:
+            return  # the worker died before claiming — its exit IS the observation
+        if outcome.WhichOneof("msg") == "boot_failure":
+            return
+        # WatchProgress rides a PHYSICALLY separate connection (01): a second channel.
+        self.watch_channel = self._dial(addr)
+        watch_stub = pb_grpc.WorkerControlStub(self.watch_channel)
+        opened = self._env(pb.ProgressOpen())
+        threading.Thread(
+            target=self._watch, args=(watch_stub.WatchProgress(opened),), daemon=True
+        ).start()
+
+    def _dial(self, addr: str) -> Any:
+        if self.root_cert is not None:
+            return grpc.secure_channel(addr, grpc.ssl_channel_credentials(self.root_cert))
+        return grpc.insecure_channel(addr)
+
+    def _outbound_iter(self) -> Any:
+        while True:
+            frame = self.outbound.get()
+            if frame is None:
+                return
+            yield frame
+
+    def _env(self, message: Any) -> Any:
+        message.owner_epoch = self.epoch
+        message.control_generation = self.generation
+        message.worker_boot_id = self.boot_id
+        return message
+
+    def _watch(self, frames: Any) -> None:
+        try:
+            for item in frames:
+                # The saturation arm holds this lane still: the client stops READING, gRPC
+                # flow control backs the stream up, and the worker's watch ring sheds oldest
+                # frames — Control must not notice.
+                while self.block_progress.is_set():
+                    time.sleep(0.05)
                 with self.lock:
-                    self.seen.append(message)
+                    self.progress.append(item)
                     self.lock.notify_all()
-                if kind == "register":
-                    self._on_register(message.register)
-                elif kind == "attempt_terminal":
-                    self._on_terminal(message.attempt_terminal)
         except grpc.RpcError:
             pass
 
-    def _on_register(self, register: pb.Register) -> None:
-        self.sessions.append(register.session_id)
+    def _read(self, call: Any) -> None:
+        try:
+            for frame in call:
+                kind = frame.WhichOneof("msg")
+                with self.lock:
+                    self.seen.append(frame)
+                    self.lock.notify_all()
+                if kind == "claim_ack":
+                    self._on_claim_ack(frame.claim_ack)
+                elif kind == "snapshot_begin":
+                    self.snapshot = []
+                elif kind == "snapshot_entry":
+                    self.snapshot.append(frame.snapshot_entry.attempt)
+                elif kind == "snapshot_end":
+                    self._on_snapshot_end(frame.snapshot_end)
+                elif kind == "attempt_terminal":
+                    self._on_terminal(frame.attempt_terminal)
+        except grpc.RpcError:
+            pass
+
+    def _on_claim_ack(self, ack: pb.ClaimAck) -> None:
+        if not ack.accepted:
+            print(
+                f"[hub] Claim REFUSED: {pb.ClaimRejection.Name(ack.rejection)}",
+                flush=True,
+            )
+            return
+        self.generation = ack.control_generation
+        self.boot_id = ack.worker_boot_id
+        self.boots.append(ack.worker_boot_id)
         print(
-            f"[hub] Register session={register.session_id} incarnation="
-            f"{register.executor_incarnation} minor={register.wire_minor} "
-            f"recovered={len(register.recovered_attempts)} "
-            f"gpu={register.resources.gpu_name!r} "
-            f"unreadable={list(register.resources.unreadable)}",
+            f"[hub] ClaimAck boot={ack.worker_boot_id} generation={ack.control_generation} "
+            f"minor={ack.wire_minor} device={ack.resources.device_name!r} "
+            f"backend={ack.resources.backend!r} unreadable={list(ack.resources.unreadable)}",
+            flush=True,
+        )
+
+    def _on_snapshot_end(self, end: pb.SnapshotEnd) -> None:
+        print(
+            f"[hub] snapshot {end.snapshot_id}: {len(self.snapshot)} entr(y|ies) "
+            f"(end says {end.entry_count})",
             flush=True,
         )
         self.send(
-            pb.CoordinatorMessage(
-                register_ack=pb.RegisterAck(
-                    session_id=register.session_id,
-                    executor_incarnation=register.executor_incarnation,
-                    wire_minor=WIRE_MINOR,
-                    accepted=True,
-                )
-            )
+            pb.OwnerFrame(snapshot_ack=self._env(pb.SnapshotAck(snapshot_id=end.snapshot_id)))
         )
         if self.directive is not None:
             directive = pb.Directive()
             directive.CopyFrom(self.directive)
-            directive.session_id = register.session_id
-            self.send(pb.CoordinatorMessage(directive=directive))
+            self._env(directive)
+            self.send(pb.OwnerFrame(directive=directive))
+        self.connected.set()
 
     def _on_terminal(self, terminal: pb.AttemptTerminal) -> None:
         body = documents.read(terminal.terminal_canonical, pb.TerminalBody)
@@ -228,36 +330,38 @@ class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servic
         if key in self.wrong_ack:
             digest = bytes(32)
         self.send(
-            pb.CoordinatorMessage(
-                terminal_ack=pb.TerminalAck(
-                    session_id=terminal.session_id,
-                    executor_incarnation=terminal.executor_incarnation,
-                    request_id=terminal.request_id,
-                    attempt=terminal.attempt,
-                    exec_spec_digest=terminal.exec_spec_digest,
-                    terminal_id=terminal.terminal_id,
-                    terminal_digest=digest,
+            pb.OwnerFrame(
+                terminal_ack=self._env(
+                    pb.TerminalAck(
+                        request_id=terminal.request_id,
+                        attempt=terminal.attempt,
+                        invocation_digest=terminal.invocation_digest,
+                        terminal_id=terminal.terminal_id,
+                        terminal_digest=digest,
+                    )
                 )
             )
         )
 
     # ------------------------------------------------------------ driving
 
-    def send(self, message: pb.CoordinatorMessage | None) -> None:
-        self.outbound.put(message)
+    def send(self, frame: pb.OwnerFrame | None) -> None:
+        self.outbound.put(frame)
 
     def session(self) -> str:
-        return self.sessions[-1] if self.sessions else ""
+        """The claimed worker's BOOT identity (the old session_id's successor, #437)."""
+        return self.boot_id
 
     def incarnation(self) -> int:
-        """The executor_incarnation the worker last REPORTED. A real coordinator echoes
-        what the worker told it; a hard-coded 1 is dropped by the §0 stale fence the moment
-        the executor respawns, which is that fence working."""
-        reports = self.reports()
-        return int(reports[-1].executor_incarnation) if reports else 1
+        """The deployment's executor generation the worker last REPORTED (#446/#454)."""
+        for report in reversed(self.reports()):
+            for status in report.deployments:
+                if status.deployment_id == DEPLOYMENT:
+                    return int(status.executor_generation)
+        return 1
 
     def mark(self) -> int:
-        """A cursor into the observed stream, so a wait can require a FRESH message."""
+        """A cursor into the observed stream, so a wait can require a FRESH frame."""
         return len(self.seen)
 
     def wait(self, predicate: Any, seconds: float = 120.0, what: str = "", since: int = 0) -> Any:
@@ -273,7 +377,7 @@ class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servic
                     if self.log is not None:
                         tail = "\n".join(self.log.read_text(errors="replace").splitlines()[-12:])
                     raise RuntimeError(
-                        f"the supervisor exited {self.process.returncode} while waiting for "
+                        f"the worker exited {self.process.returncode} while waiting for "
                         f"{what}\n{tail}"
                     )
                 remaining = deadline - time.monotonic()
@@ -305,13 +409,19 @@ class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servic
     def reports(self) -> list[pb.Report]:
         return [m.report for m in list(self.seen) if m.WhichOneof("msg") == "report"]
 
+    def deployment(self, report: pb.Report) -> pb.DeploymentStatus:
+        for status in report.deployments:
+            if status.deployment_id == DEPLOYMENT:
+                return status
+        return pb.DeploymentStatus()
+
     def ready(self, plan_id: str, seconds: float = 300.0, since: int = 0) -> pb.Report:
         report: pb.Report = self.wait(
             lambda m: (
                 m.report
                 if m.WhichOneof("msg") == "report"
                 and m.report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-                and plan_id in m.report.serving_capacity.ready_entrypoint_binding_plan_ids
+                and plan_id in self.deployment(m.report).ready_entrypoint_binding_plan_ids
                 else None
             ),
             seconds,
@@ -320,15 +430,49 @@ class Hub(pb_grpc.WorkerServicer):  # type: ignore[misc]  # the generated servic
         )
         return report
 
+    def close(self) -> None:
+        self.send(None)
+        if self.channel is not None:
+            self.channel.close()
+        if self.watch_channel is not None:
+            self.watch_channel.close()
 
-def serve_hub(path: str) -> tuple[grpc.Server, Hub]:
-    hub = Hub()
-    server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=8))
-    pb_grpc.add_WorkerServicer_to_server(hub, server)
-    Path(path).unlink(missing_ok=True)
-    server.add_insecure_port(f"unix:{path}")
-    server.start()
-    return server, hub
+
+def read_addr(root: Path, process: Any, budget: float = 60.0) -> str:
+    """The worker publishes its bound address to `control.addr` (file handoff); the owner
+    reads exactly that. Observed, never guessed: the wait ends on the file appearing or the
+    process dying, and `budget` bounds a FAILING run only."""
+    addr_file = root / "control.addr"
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        if addr_file.is_file():
+            text = addr_file.read_text().strip()
+            if text:
+                return text
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"the worker exited {process.returncode} before binding")
+        time.sleep(0.02)
+    raise TimeoutError(f"no control.addr under {root}")
+
+
+def serving_directive(release: str, plan_ids: list[str], posture: Any) -> pb.Directive:
+    """The full-replace Directive with the digest-addressed DeploymentSet (#446)."""
+    deployment_set = pb.DeploymentSet(
+        deployments=[
+            pb.Deployment(
+                deployment_id=DEPLOYMENT,
+                endpoint_release_id=release,
+                entrypoint_binding_plan_ids=sorted(plan_ids),
+            )
+        ]
+    )
+    _, set_digest = documents.identity(deployment_set)
+    return pb.Directive(
+        revision=1,
+        posture=posture,
+        wire_minor=WIRE_MINOR,
+        deployment_set=pb.DeploymentSetDirective(set_digest=set_digest, set=deployment_set),
+    )
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -422,13 +566,12 @@ def plan_id_for(entrypoint: str, release: str = RELEASE) -> str:
 
 @dataclass
 class Worker:
-    """One live worker: the supervisor process and everything staged for it."""
+    """One live worker: the worker control process and everything staged for it."""
 
     home: Path
     root: Path
     process: subprocess.Popen[bytes]
     hub: Hub
-    server: grpc.Server
     log: Path
 
     def stop(self, sig: int = signal.SIGTERM) -> int | None:
@@ -510,7 +653,6 @@ def start_worker(
     entrypoints: tuple[str, ...] = ("denoise",),
     instance_id: str = "",
     hub: Hub | None = None,
-    server: grpc.Server | None = None,
     no_warm: bool = False,
     grace: float = 3.0,
     posture: pb.Posture = pb.Posture.POSTURE_ACCEPTING,
@@ -519,43 +661,30 @@ def start_worker(
     store: str = "",
     overrides: dict[str, Any] | None = None,
     release: str = RELEASE,
+    connect: bool = True,
 ) -> Worker:
-    """Boot the coordinator (if needed) and the supervisor, and issue the first Directive."""
+    """Spawn the worker (which SERVES the protocol, #436), then dial and claim it."""
     home = tmp / "home"
     root = tmp / "worker"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
-    socket_path = str(tmp / "hub.sock")
-    if hub is None or server is None:
-        server, hub = serve_hub(socket_path)
-    hub.directive = pb.Directive(
-        revision=1,
-        posture=posture,
-        wire_minor=WIRE_MINOR,
-        credential=pb.Credential(
-            issuer="cozy-live",
-            key_id="k1",
-            epoch=1,
-            expires_at_unix=int(time.time()) + 3600,
-            token=b"never-crosses-the-seam",
-        ),
-        serving=pb.ServingDirective(
-            endpoint_release_id=release,
-            entrypoint_binding_plan_ids=sorted(ids.values()),
-        ),
-    )
+    hub = hub or Hub()
+    hub.directive = serving_directive(release, sorted(ids.values()), posture)
     hub.revision = 1
     # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
     # neighbour holds 5 GiB fails with a device shortfall that is true and uninformative.
     require_quiet_card()
-    log = tmp / "supervisor.log"
+    log = tmp / "worker.log"
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "COZY_HOME": str(home),
         "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
     }
+    (root / "control.addr").unlink(missing_ok=True)
+    socket_path = str(tmp / "control.sock")
+    Path(socket_path).unlink(missing_ok=True)
     argv = [
         "nice",
         "-n",
@@ -564,7 +693,7 @@ def start_worker(
         "-c",
         "import sys; from cozy_runtime.internal.worker.session import main; "
         "raise SystemExit(main(sys.argv[1:]))",
-        "--hub",
+        "--listen",
         f"unix:{socket_path}",
         "--root",
         str(root),
@@ -601,7 +730,9 @@ def start_worker(
     )
     threading.Thread(target=_pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
-    return Worker(home, root, process, hub, server, log)
+    if connect:
+        hub.connect(read_addr(root, process))
+    return Worker(home, root, process, hub, log)
 
 
 def _pump(process: subprocess.Popen[bytes], log: Path) -> None:
@@ -615,27 +746,60 @@ def _pump(process: subprocess.Popen[bytes], log: Path) -> None:
 # --------------------------------------------------------------------------- dispatch
 
 
-def payload_input(tmp: Path, name: str, payload: dict[str, Any]) -> pb.InputLocation:
+#: The default payload every dispatch (and therefore every default spec) binds. The spec
+#: carries the payload's identity INSIDE the digest (#439), so the two must agree.
+DEFAULT_PAYLOAD = {"steps": 2, "latent": 64}
+
+
+def stage_payload(tmp: Path, name: str, payload: dict[str, Any]) -> tuple[bytes, Path]:
     data = json.dumps(payload).encode()
     path = tmp / "grants" / f"{name}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    return pb.InputLocation(
-        digest=hashlib.sha256(data).digest(),
-        url=f"file://{path}",
-        length=len(data),
-        input_id="payload",
-        kind_mime="application/json",
-    )
+    return data, path
+
+
+def output_ids(outputs: int, output_id: str) -> list[str]:
+    return [output_id if index == 0 else f"{output_id}-{index}" for index in range(outputs)]
 
 
 def make_spec(
-    plan_id: str, *, deadline_ms: int = 0, extra_key: str = "", release: str = RELEASE
+    plan_id: str,
+    *,
+    deadline_ms: int = 0,
+    extra_key: str = "",
+    release: str = RELEASE,
+    payload: dict[str, Any] | None = None,
+    payload_raw: bytes | None = None,
+    outputs: int = 1,
+    output_id: str = "image",
+    max_bytes: int = 8 * MIB,
 ) -> tuple[bytes, bytes]:
-    spec = pb.ExecutionSpec(
+    """The InvocationSpec document: input identities, output contracts and the deadline all
+    INSIDE the digest (#439). Defaults mirror `dispatch`'s so a spec built here and a grant
+    built there agree on the bound sets."""
+    if payload_raw is not None:
+        body = payload_raw
+    else:
+        body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
+    spec = pb.InvocationSpec(
         endpoint_release_id=release,
         image_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
+        payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
+        inputs=[
+            pb.InputBinding(
+                input_id="payload",
+                digest="sha256:" + hashlib.sha256(body).hexdigest(),
+                length=len(body),
+                kind_mime="application/json",
+                order=0,
+            )
+        ],
+        outputs=[
+            pb.OutputBinding(output_id=name, max_bytes=max_bytes)
+            for name in sorted(output_ids(outputs, output_id))
+        ],
         deadline_unix_ms=deadline_ms,
     )
     spec.serving.entrypoint_binding_plan_id = plan_id
@@ -667,16 +831,26 @@ def dispatch(
     grant_expires: int = 0,
     output_id: str = "image",
     destination_url: str = "",
-    incarnation: int = 0,
     release: str = RELEASE,
     max_bytes: int = 8 * MIB,
+    deployment_id: str = DEPLOYMENT,
 ) -> tuple[bytes, bytes]:
     canonical_bytes, digest = spec_override or make_spec(
-        plan_id, deadline_ms=deadline_ms, extra_key=extra_key, release=release
+        plan_id,
+        deadline_ms=deadline_ms,
+        extra_key=extra_key,
+        release=release,
+        payload=payload,
+        outputs=outputs,
+        output_id=output_id,
+        max_bytes=max_bytes,
     )
+    body, path = stage_payload(tmp, request_id, payload or DEFAULT_PAYLOAD)
+    del body
     out_dir = tmp / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     grant = pb.DeliveryGrant(
+        invocation_digest=digest,
         credential=pb.Credential(
             issuer="cozy-live",
             key_id="g1",
@@ -686,26 +860,26 @@ def dispatch(
         ),
         file_base_url=f"file://{tmp / 'grants'}",
         expires_at_unix=grant_expires or int(time.time()) + 600,
-        inputs=[payload_input(tmp, request_id, payload or {"steps": 2, "latent": 64})],
+        inputs=[pb.InputAccess(input_id="payload", url=f"file://{path}")],
         outputs=[
-            pb.OutputDestination(
-                output_id=output_id if index == 0 else f"{output_id}-{index}",
+            pb.OutputAccess(
+                output_id=name,
                 url=destination_url or f"file://{out_dir / f'{request_id}-{index}.bin'}",
-                max_bytes=max_bytes,
             )
-            for index in range(outputs)
+            for index, name in enumerate(output_ids(outputs, output_id))
         ],
     )
     hub.send(
-        pb.CoordinatorMessage(
-            start_attempt=pb.StartAttempt(
-                session_id=hub.session(),
-                executor_incarnation=incarnation or hub.incarnation(),
-                request_id=request_id,
-                attempt=attempt,
-                exec_spec_digest=digest,
-                grant=grant,
-                exec_spec_canonical=canonical_bytes,
+        pb.OwnerFrame(
+            start_attempt=hub._env(
+                pb.StartAttempt(
+                    request_id=request_id,
+                    attempt=attempt,
+                    invocation_digest=digest,
+                    grant=grant,
+                    invocation_canonical=canonical_bytes,
+                    deployment_id=deployment_id,
+                )
             )
         )
     )
@@ -758,7 +932,7 @@ def section_fixtures(args: argparse.Namespace) -> None:
     head("the reading side refuses what the writer cannot have produced")
     from cozy_runtime.internal import canonical
 
-    frozen = (FIXTURES / "canonical" / "exec_spec_serving.json").read_bytes()
+    frozen = (FIXTURES / "canonical" / "invocation_spec_serving.json").read_bytes()
 
     def planted(data: bytes) -> bytes:
         """A service-class key, written CANONICALLY — sorted, no whitespace, its own digest.
@@ -776,7 +950,7 @@ def section_fixtures(args: argparse.Namespace) -> None:
         ),
     ):
         try:
-            documents.read(mutate(frozen), pb.ExecutionSpec)
+            documents.read(mutate(frozen), pb.InvocationSpec)
             check(label, False, "did NOT refuse")
         except documents.DocumentError as exc:
             check(label, True, f"refused [{exc.code}]")
@@ -795,23 +969,25 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
     try:
         head("boot: supervisor -> exec-first trampoline -> executor -> fill -> warm -> READY")
         hub.wait(
-            lambda m: m.register if m.WhichOneof("msg") == "register" else None, 60, "Register"
+            lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None, 60, "ClaimAck"
         )
         register_at = time.perf_counter()
         report = hub.ready(plan_id, 400)
+        status = hub.deployment(report)
         ready_at = time.perf_counter()
         check(
             "the worker reached READY through the ordinary path",
             True,
-            f"boot->Register {register_at - boot_started:.2f} s, "
-            f"Register->READY {ready_at - register_at:.2f} s "
-            f"(incarnation {report.executor_incarnation}, readiness epoch "
-            f"{report.readiness_epoch})",
+            f"boot->ClaimAck {register_at - boot_started:.2f} s, "
+            f"ClaimAck->READY {ready_at - register_at:.2f} s "
+            f"(executor generation {status.executor_generation}, readiness epoch "
+            f"{status.readiness_epoch})",
         )
         check(
-            "READY means first-request-servable, not connected",
-            plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids,
-            f"{len(report.serving_capacity.ready_entrypoint_binding_plan_ids)} ready plan(s)",
+            "READY means first-request-servable, not connected — per-deployment (#446)",
+            plan_id in status.ready_entrypoint_binding_plan_ids and status.attempt_credits > 0,
+            f"{len(status.ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            f"{status.attempt_credits} attempt credit(s)",
         )
 
         warm = (
@@ -868,7 +1044,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
         check(
             "acceptance carries the digests it JOURNALED",
-            accepted.exec_spec_digest == digest
+            accepted.invocation_digest == digest
             and len(accepted.plan_digest) == 32
             and len(accepted.model_construction_digest) == 32,
             f"plan {accepted.plan_digest.hex()[:16]}… construction "
@@ -879,7 +1055,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
             accepted.plan.delivery == "native" and accepted.plan.placement == "all_resident",
             f"{accepted.plan.delivery}/{accepted.plan.materialization}/"
             f"{accepted.plan.placement} {accepted.plan.compute_dtype}, "
-            f"{accepted.plan.reserved_vram_bytes / GIB:.2f} GiB vram reserved",
+            f"{accepted.plan.reserved_device_memory_bytes / GIB:.2f} GiB device reserved",
         )
         check(
             "the terminal SUCCEEDED",
@@ -956,7 +1132,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "structurally unverifiable fields are NAMED",
             metrics.get("unverified_fields")
-            == ["input_tokens", "output_tokens", "peak_vram_bytes"],
+            == ["input_tokens", "output_tokens", "peak_device_memory_bytes"],
             str(metrics.get("unverified_fields")),
         )
 
@@ -978,7 +1154,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
             "handler_ms": metrics.get("handler_ms"),
             "device_lease_ms": metrics.get("device_lease_ms"),
             "finalization_ms": metrics.get("finalization_ms"),
-            "peak_vram_bytes": metrics.get("peak_vram_bytes"),
+            "peak_device_memory_bytes": metrics.get("peak_device_memory_bytes"),
             "gpu_idle_mib": idle,
             "progress_messages": len(hub.progress),
         }
@@ -991,7 +1167,7 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
 
 def _shutdown(worker: Worker) -> dict[str, Any]:
     worker.stop()
-    worker.server.stop(0)
+    worker.hub.close()
     for line in worker.log.read_text(errors="replace").splitlines():
         if "summary " in line:
             return dict(json.loads(line.split("summary ", 1)[1]))
@@ -1063,12 +1239,13 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         report = hub.ready(plan_id, 400, since=mark)
+        status = hub.deployment(report)
         recovered_at = time.perf_counter()
         check(
-            "a fresh incarnation reloaded BEFORE reporting ready",
-            report.executor_incarnation >= 2 and report.readiness_epoch >= 3,
-            f"incarnation {report.executor_incarnation}, readiness epoch "
-            f"{report.readiness_epoch} — two counters, moved together by a respawn",
+            "a fresh executor generation reloaded BEFORE reporting ready",
+            status.executor_generation >= 2 and status.readiness_epoch >= 3,
+            f"generation {status.executor_generation}, readiness epoch "
+            f"{status.readiness_epoch} — two counters, moved together by a respawn",
         )
 
         head("the next attempt succeeds on the new incarnation")
@@ -1100,8 +1277,8 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
             "kill_to_terminal_ms": round((terminal_at - killed_at) * 1000, 1),
             "kill_to_ready_s": round(recovered_at - killed_at, 2),
             "gpu_used_at_kill_mib": used_before,
-            "incarnation_after": report.executor_incarnation,
-            "readiness_epoch_after": report.readiness_epoch,
+            "executor_generation_after": status.executor_generation,
+            "readiness_epoch_after": status.readiness_epoch,
         }
         return row
     finally:
@@ -1343,7 +1520,7 @@ def section_nocuda(args: argparse.Namespace) -> dict[str, Any]:
         }
         return row
     finally:
-        worker.server.stop(0)
+        worker.hub.close()
         _gpu_clean(idle)
 
 
@@ -1365,10 +1542,11 @@ def section_arms(args: argparse.Namespace) -> None:
     plan_id = plan_id_for("denoise")
     stubborn_id = plan_id_for("stubborn")
     try:
-        # A StartAttempt before Register lands is dropped by the §0 session fence, which is
-        # correct and is not the arm being planted here.
+        # A StartAttempt before the snapshot is acknowledged is dropped by the dispatch
+        # gate (02 §6), which is correct and is not the arm being planted here — connect()
+        # already completed the handshake.
         hub.wait(
-            lambda m: m.register if m.WhichOneof("msg") == "register" else None, 60, "Register"
+            lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None, 60, "ClaimAck"
         )
         head("an attempt before the executor is Ready for that plan")
         # `stubborn` shares the construction, so both are prepared together; a plan the
@@ -1455,7 +1633,7 @@ def section_arms(args: argparse.Namespace) -> None:
                     m.attempt_terminal
                     if m.WhichOneof("msg") == "attempt_terminal"
                     and m.attempt_terminal.request_id == "req-dup"
-                    and m.attempt_terminal.exec_spec_digest == other_digest
+                    and m.attempt_terminal.invocation_digest == other_digest
                     else None
                 ),
                 60,
@@ -1468,7 +1646,7 @@ def section_arms(args: argparse.Namespace) -> None:
             body["safe_message"][:110],
         )
 
-        head("a planted exec_spec_digest that does not hash the carried bytes")
+        head("a planted invocation_digest that does not hash the carried bytes")
         good, _ = make_spec(plan_id)
         dispatch(hub, tmp, plan_id, request_id="req-planted", spec_override=(good, bytes(32)))
         body = terminal_body(
@@ -1485,7 +1663,7 @@ def section_arms(args: argparse.Namespace) -> None:
         )
         check(
             "the receiver RECOMPUTES over the resident bytes",
-            "exec_spec_digest_mismatch" in body["safe_message"],
+            "invocation_digest_mismatch" in body["safe_message"],
             body["safe_message"][:110],
         )
 
@@ -1531,14 +1709,14 @@ def section_arms(args: argparse.Namespace) -> None:
         head("a stale cancel digest cannot touch an executor")
         mark = hub.mark()
         hub.send(
-            pb.CoordinatorMessage(
-                cancel_attempt=pb.CancelAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-live",
-                    attempt=1,
-                    reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                    exec_spec_digest=bytes(32),
+            pb.OwnerFrame(
+                cancel_attempt=hub._env(
+                    pb.CancelAttempt(
+                        request_id="req-live",
+                        attempt=1,
+                        reason=pb.CancelReason.CANCEL_REASON_CLIENT,
+                        invocation_digest=bytes(32),
+                    )
                 )
             )
         )
@@ -1554,14 +1732,14 @@ def section_arms(args: argparse.Namespace) -> None:
         head("a NON-COOPERATIVE handler: cooperative -> grace -> kill, in that order")
         cancel_at = time.perf_counter()
         hub.send(
-            pb.CoordinatorMessage(
-                cancel_attempt=pb.CancelAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-live",
-                    attempt=1,
-                    reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                    exec_spec_digest=accepted.exec_spec_digest,
+            pb.OwnerFrame(
+                cancel_attempt=hub._env(
+                    pb.CancelAttempt(
+                        request_id="req-live",
+                        attempt=1,
+                        reason=pb.CancelReason.CANCEL_REASON_CLIENT,
+                        invocation_digest=accepted.invocation_digest,
+                    )
                 )
             )
         )
@@ -1738,7 +1916,7 @@ def section_journal(args: argparse.Namespace) -> None:
             "that could not be journaled releases what it reserved",
         )
     finally:
-        worker.server.stop(0)
+        worker.hub.close()
         _gpu_clean(idle)
 
     head("a corrupted journal refuses to serve rather than guessing")
@@ -1761,14 +1939,14 @@ def section_journal(args: argparse.Namespace) -> None:
             "terminal",
         )
         _shutdown(worker)
-        worker.server.stop(0)
+        worker.hub.close()
         journal = tmp2 / "worker" / "journal.log"
         data = bytearray(journal.read_bytes())
         target = len(data) // 2
         data[target] = data[target] ^ 0x20
         journal.write_bytes(bytes(data))
         restarted = start_worker(
-            tmp2, entrypoints=("denoise",), no_warm=True, instance_id="ins-fixed"
+            tmp2, entrypoints=("denoise",), no_warm=True, instance_id="ins-fixed", connect=False
         )
         code = restarted.process.wait(timeout=60)
         check(
@@ -1777,7 +1955,7 @@ def section_journal(args: argparse.Namespace) -> None:
             f"exit {code}: "
             f"{restarted.log.read_text(errors='replace').strip().splitlines()[-1][:120]}",
         )
-        restarted.server.stop(0)
+        restarted.hub.close()
     finally:
         _gpu_clean(idle)
 
@@ -1803,28 +1981,24 @@ def section_journal(args: argparse.Namespace) -> None:
             "terminal",
         )
         first_bytes = terminal.terminal_canonical
-        first_session = hub.session()
+        first_boot = hub.session()
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=20)
-        worker.server.stop(0)
+        worker.hub.close()
         restarted = start_worker(
             tmp3, entrypoints=("denoise",), no_warm=True, instance_id="ins-stable"
         )
         hub2 = restarted.hub
-        register = hub2.wait(
-            lambda m: m.register if m.WhichOneof("msg") == "register" else None, 60, "Register"
+        check(
+            "the restart minted a NEW worker boot id, never an epoch bump",
+            hub2.boot_id != first_boot and hub2.epoch == 1,
+            f"{first_boot} -> {hub2.boot_id} (owner epoch still {hub2.epoch})",
         )
         check(
-            "the restart minted a NEW session, never an epoch bump",
-            register.session_id != first_session,
-            f"{first_session} -> {register.session_id}",
-        )
-        check(
-            "the recovered journal rides Register, before any next ordinal",
-            len(register.recovered_attempts) == 1
-            and register.recovered_attempts[0].request_id == "req-restart",
-            f"{len(register.recovered_attempts)} recovered: state "
-            f"{pb.AttemptState.Name(register.recovered_attempts[0].state)}",
+            "the recovered journal rides the SNAPSHOT, before any next ordinal (02 §6)",
+            len(hub2.snapshot) == 1 and hub2.snapshot[0].request_id == "req-restart",
+            f"{len(hub2.snapshot)} recovered: state "
+            f"{pb.AttemptState.Name(hub2.snapshot[0].state) if hub2.snapshot else '-'}",
         )
         replay = hub2.wait(
             lambda m: m.attempt_terminal if m.WhichOneof("msg") == "attempt_terminal" else None,
@@ -1833,11 +2007,11 @@ def section_journal(args: argparse.Namespace) -> None:
         )
         check(
             "the SAME body is re-wrapped in a fresh envelope, byte for byte",
-            replay.terminal_canonical == first_bytes and replay.session_id == register.session_id,
+            replay.terminal_canonical == first_bytes and replay.worker_boot_id == hub2.boot_id,
             f"{len(first_bytes)} identical canonical bytes, id {replay.terminal_id}",
         )
         _shutdown(restarted)
-        restarted.server.stop(0)
+        restarted.hub.close()
     finally:
         _gpu_clean(idle)
 
@@ -1925,7 +2099,7 @@ def section_tripwire(args: argparse.Namespace) -> None:
         )
     finally:
         _shutdown(worker)
-        worker.server.stop(0)
+        worker.hub.close()
         _gpu_clean(idle)
 
 
@@ -1942,30 +2116,30 @@ def section_acceptance(args: argparse.Namespace) -> None:
         hub.ready(plan_id, 400)
 
         head("a granted payload input that is not there")
-        canonical_bytes, digest = make_spec(plan_id)
+        canonical_bytes, digest = make_spec(plan_id, outputs=0)
         grant = pb.DeliveryGrant(
+            invocation_digest=digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
             inputs=[
-                pb.InputLocation(
+                pb.InputAccess(
                     input_id="payload",
                     url=f"file://{tmp / 'grants' / 'absent.json'}",
-                    length=17,
-                    digest=bytes(32),
                 )
             ],
             outputs=[],
         )
         hub.send(
-            pb.CoordinatorMessage(
-                start_attempt=pb.StartAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-nopayload",
-                    attempt=1,
-                    exec_spec_digest=digest,
-                    grant=grant,
-                    exec_spec_canonical=canonical_bytes,
+            pb.OwnerFrame(
+                start_attempt=hub._env(
+                    pb.StartAttempt(
+                        request_id="req-nopayload",
+                        attempt=1,
+                        invocation_digest=digest,
+                        grant=grant,
+                        invocation_canonical=canonical_bytes,
+                        deployment_id=DEPLOYMENT,
+                    )
                 )
             )
         )
@@ -2017,23 +2191,29 @@ def section_acceptance(args: argparse.Namespace) -> None:
         head("a malformed payload document")
         bad = tmp / "grants" / "malformed.json"
         bad.parent.mkdir(parents=True, exist_ok=True)
-        bad.write_bytes(b"[1, 2, 3]")
+        raw = b"[1, 2, 3]"
+        bad.write_bytes(raw)
+        # The spec binds THESE bytes (the digest matches), so the refusal is about the
+        # DOCUMENT SHAPE, not the digest — which is the arm.
+        mal_bytes, mal_digest = make_spec(plan_id, outputs=0, payload_raw=raw)
         grant = pb.DeliveryGrant(
+            invocation_digest=mal_digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
-            inputs=[pb.InputLocation(input_id="payload", url=f"file://{bad}")],
+            inputs=[pb.InputAccess(input_id="payload", url=f"file://{bad}")],
             outputs=[],
         )
         hub.send(
-            pb.CoordinatorMessage(
-                start_attempt=pb.StartAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-malformed",
-                    attempt=1,
-                    exec_spec_digest=digest,
-                    grant=grant,
-                    exec_spec_canonical=canonical_bytes,
+            pb.OwnerFrame(
+                start_attempt=hub._env(
+                    pb.StartAttempt(
+                        request_id="req-malformed",
+                        attempt=1,
+                        invocation_digest=mal_digest,
+                        grant=grant,
+                        invocation_canonical=mal_bytes,
+                        deployment_id=DEPLOYMENT,
+                    )
                 )
             )
         )
@@ -2076,7 +2256,7 @@ def section_acceptance(args: argparse.Namespace) -> None:
         )
     finally:
         _shutdown(worker)
-        worker.server.stop(0)
+        worker.hub.close()
         _gpu_clean(idle)
 
 
@@ -2120,21 +2300,17 @@ def section_abandon(args: argparse.Namespace) -> None:
         )
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=20)
-        worker.server.stop(0)
+        worker.hub.close()
 
         head("the restarted supervisor mints the terminal the dead one owed")
         restarted = start_worker(
             tmp, entrypoints=("denoise", "stubborn"), no_warm=True, instance_id="ins-abandon"
         )
         hub2 = restarted.hub
-        register = hub2.wait(
-            lambda m: m.register if m.WhichOneof("msg") == "register" else None, 60, "Register"
-        )
         check(
-            "the recovered attempt rides Register as TERMINAL-PENDING-ACK",
-            len(register.recovered_attempts) == 1
-            and register.recovered_attempts[0].state
-            == pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
+            "the recovered attempt rides the SNAPSHOT as TERMINAL-PENDING-ACK",
+            len(hub2.snapshot) == 1
+            and hub2.snapshot[0].state == pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
             "recovery mints a durable terminal, never a live attempt with no plan",
         )
         terminal = hub2.wait(
@@ -2179,7 +2355,7 @@ def section_abandon(args: argparse.Namespace) -> None:
             f"{len(replays)} terminals, identical bodies, id {replays[0].terminal_id}",
         )
         _shutdown(restarted)
-        restarted.server.stop(0)
+        restarted.hub.close()
     finally:
         _gpu_clean(idle)
 
@@ -2198,33 +2374,52 @@ def section_results(args: argparse.Namespace) -> None:
         head("two outputs, nested, granted in the WRONG order")
         out_dir = tmp / "outputs"
         out_dir.mkdir(parents=True, exist_ok=True)
-        canonical_bytes, digest = make_spec(pair_id)
+        pair_payload = {"steps": 1, "latent": 48}
+        body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
+        spec = pb.InvocationSpec(
+            endpoint_release_id=RELEASE,
+            image_digest="sha256:" + "11" * 32,
+            config_digest="sha256:" + "22" * 32,
+            payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),
+            inputs=[
+                pb.InputBinding(
+                    input_id="payload",
+                    digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),
+                    length=len(body_bytes),
+                    kind_mime="application/json",
+                    order=0,
+                )
+            ],
+            outputs=[
+                pb.OutputBinding(output_id="detail.thumb", max_bytes=8 * MIB),
+                pb.OutputBinding(output_id="preview", max_bytes=8 * MIB),
+            ],
+        )
+        spec.serving.entrypoint_binding_plan_id = pair_id
+        spec.serving.attempt_binding_id = pair_id
+        canonical_bytes, digest = documents.identity(spec)
         grant = pb.DeliveryGrant(
+            invocation_digest=digest,
             file_base_url=f"file://{tmp / 'grants'}",
             expires_at_unix=int(time.time()) + 600,
-            inputs=[payload_input(tmp, "req-pair", {"steps": 1, "latent": 48})],
+            inputs=[pb.InputAccess(input_id="payload", url=f"file://{payload_path}")],
             outputs=[
                 # deliberately NOT in the order the handler produced them
-                pb.OutputDestination(
-                    output_id="detail.thumb",
-                    url=f"file://{out_dir / 'thumb.png'}",
-                    max_bytes=8 * MIB,
-                ),
-                pb.OutputDestination(
-                    output_id="preview", url=f"file://{out_dir / 'preview.png'}", max_bytes=8 * MIB
-                ),
+                pb.OutputAccess(output_id="detail.thumb", url=f"file://{out_dir / 'thumb.png'}"),
+                pb.OutputAccess(output_id="preview", url=f"file://{out_dir / 'preview.png'}"),
             ],
         )
         hub.send(
-            pb.CoordinatorMessage(
-                start_attempt=pb.StartAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-pair",
-                    attempt=1,
-                    exec_spec_digest=digest,
-                    grant=grant,
-                    exec_spec_canonical=canonical_bytes,
+            pb.OwnerFrame(
+                start_attempt=hub._env(
+                    pb.StartAttempt(
+                        request_id="req-pair",
+                        attempt=1,
+                        invocation_digest=digest,
+                        grant=grant,
+                        invocation_canonical=canonical_bytes,
+                        deployment_id=DEPLOYMENT,
+                    )
                 )
             )
         )
@@ -2315,7 +2510,7 @@ def section_results(args: argparse.Namespace) -> None:
         )
     finally:
         _shutdown(worker)
-        worker.server.stop(0)
+        worker.hub.close()
         _gpu_clean(idle)
 
 
@@ -2405,8 +2600,9 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
         row["ready_s"] = round(time.perf_counter() - boot, 2)
         check(
             "the four-component pipeline reached READY",
-            plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids,
-            f"{row['ready_s']:.1f} s, incarnation {report.executor_incarnation}",
+            plan_id in hub.deployment(report).ready_entrypoint_binding_plan_ids,
+            f"{row['ready_s']:.1f} s, executor generation "
+            f"{hub.deployment(report).executor_generation}",
         )
 
         head(f"{args.repeat} CONSECUTIVE {args.size}px requests on that one worker")
@@ -2460,8 +2656,8 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
                     "cause": str(body.get("cause", {}).get("code", "")),
                     "message": str(body.get("safe_message", ""))[:200],
                     "placement": accepted.plan.placement,
-                    "reserved_vram_bytes": int(accepted.plan.reserved_vram_bytes),
-                    "choice": accepted.plan.quantified_choice,
+                    "reserved_vram_bytes": int(accepted.plan.reserved_device_memory_bytes),
+                    "choice": accepted.plan.decision_explanation,
                     "digest": str(result.get("digest", "")),
                     "png_bytes": int(outputs[0].get("length", 0)),
                 }
@@ -2659,12 +2855,13 @@ def section_drift(args: argparse.Namespace) -> dict[str, Any]:
         # Both are checked as ONE claim, because "either" is only weak if the alternative is
         # unspecified: it either refused, or it was priced against a ledger that reconciles.
         refused = body["status"] != 1 and "ledger_unreconciled" in message
-        reused = bool(accepted) and accepted[0].executor_incarnation <= ready.executor_incarnation
+        ready_generation = hub.deployment(ready).executor_generation
+        reused = bool(accepted) and accepted[0].executor_generation <= ready_generation
         check(
             "the drifted generation is NEVER reused: refused typed, or replaced first",
             refused or (bool(accepted) and not reused),
-            f"status {body['status']} · incarnation {ready.executor_incarnation} -> "
-            f"{accepted[0].executor_incarnation if accepted else '(never accepted)'} · "
+            f"status {body['status']} · generation {ready_generation} -> "
+            f"{accepted[0].executor_generation if accepted else '(never accepted)'} · "
             f"{message[:120]}",
         )
         closed = _ledger_rows(worker)[-1]
@@ -2708,9 +2905,9 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "the worker starts READY and says which plans it can serve",
             ready.intake_state == pb.IntakeState.INTAKE_STATE_READY
-            and plan_id in ready.serving_capacity.ready_entrypoint_binding_plan_ids,
-            f"{len(ready.serving_capacity.ready_entrypoint_binding_plan_ids)} ready plan(s), "
-            f"incarnation {ready.executor_incarnation}",
+            and plan_id in hub.deployment(ready).ready_entrypoint_binding_plan_ids,
+            f"{len(hub.deployment(ready).ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            f"executor generation {hub.deployment(ready).executor_generation}",
         )
         _, digest = dispatch(
             hub, tmp, plan_id, request_id="req-stub", payload={"steps": 400, "latent": 64}
@@ -2729,14 +2926,14 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         since = hub.mark()
         cancelled_at = time.perf_counter()
         hub.send(
-            pb.CoordinatorMessage(
-                cancel_attempt=pb.CancelAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-stub",
-                    attempt=1,
-                    reason=pb.CancelReason.CANCEL_REASON_CLIENT,
-                    exec_spec_digest=digest,
+            pb.OwnerFrame(
+                cancel_attempt=hub._env(
+                    pb.CancelAttempt(
+                        request_id="req-stub",
+                        attempt=1,
+                        reason=pb.CancelReason.CANCEL_REASON_CLIENT,
+                        invocation_digest=digest,
+                    )
                 )
             )
         )
@@ -2754,13 +2951,13 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         drop_ms = (time.perf_counter() - cancelled_at) * 1000
         row["capacity_drop_ms"] = round(drop_ms)
         check(
-            "the forceful kill DROPS the advertised capacity at the coordinator seat",
+            "the forceful kill DROPS the advertised capacity at the owner seat",
             dropped.intake_state != pb.IntakeState.INTAKE_STATE_READY
-            and not list(dropped.serving_capacity.ready_entrypoint_binding_plan_ids),
+            and not list(hub.deployment(dropped).ready_entrypoint_binding_plan_ids),
             f"{pb.IntakeState.Name(dropped.intake_state)} with "
-            f"{len(dropped.serving_capacity.ready_entrypoint_binding_plan_ids)} ready plan(s), "
+            f"{len(hub.deployment(dropped).ready_entrypoint_binding_plan_ids)} ready plan(s), "
             f"{drop_ms:.0f} ms after the cancel was sent "
-            f"(readiness epoch {dropped.readiness_epoch})",
+            f"(readiness epoch {hub.deployment(dropped).readiness_epoch})",
         )
         # DISPATCHED INTO THE WINDOW, on purpose and immediately: the executor is dead, the
         # rebuild has not spawned its replacement yet, so the incarnation the coordinator
@@ -2812,15 +3009,15 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "on a genuinely re-spawned executor, not the dead one",
             bool(accepted_next)
-            and accepted_next[0].executor_incarnation > ready.executor_incarnation,
-            f"incarnation {ready.executor_incarnation} -> "
-            f"{accepted_next[0].executor_incarnation if accepted_next else '?'}",
+            and accepted_next[0].executor_generation > hub.deployment(ready).executor_generation,
+            f"generation {hub.deployment(ready).executor_generation} -> "
+            f"{accepted_next[0].executor_generation if accepted_next else '?'}",
         )
         back = [
             report
             for report in hub.reports()
             if report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-            and serve_id in report.serving_capacity.ready_entrypoint_binding_plan_ids
+            and serve_id in hub.deployment(report).ready_entrypoint_binding_plan_ids
         ]
         check(
             "and READY came back only once the executor was re-prepared",

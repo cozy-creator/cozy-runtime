@@ -65,6 +65,11 @@ class RuntimeConfig:
 
     cozy_home: Path
     credentials: Credentials
+    bootstrap_credential: str = ""
+    """The launcher's per-spawn control credential (#449/#463): a Claim must present it as
+    `proof`. STRUCTURALLY SECRET — never logged, never in a Report, and never inherited by
+    the device child (it is stripped from `child_base_env` below: the executor has no
+    business holding the control plane's credential)."""
     child_base_env: tuple[tuple[str, str], ...] = ()
     """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal).
 
@@ -125,5 +130,12 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        child_base_env=tuple(sorted((k, v) for k, v in env.items() if not child_env.erased(k))),
+        bootstrap_credential=env.get("COZY_BOOTSTRAP_CREDENTIAL", ""),
+        child_base_env=tuple(
+            sorted(
+                (k, v)
+                for k, v in env.items()
+                if not child_env.erased(k) and k != "COZY_BOOTSTRAP_CREDENTIAL"
+            )
+        ),
     )

@@ -1,20 +1,27 @@
-"""The `cozy.worker.v1` client, and the supervisor entrypoint.
+"""The `cozy.worker.v1` WORKER: the machine's one control process, hosting `WorkerControl`.
 
-The worker is the gRPC CLIENT; the coordinator is the server (worker-protocol/01). Two RPCs
-run at launch and their durability attributes are the whole design:
+The worker is the gRPC SERVER; the record-plane owner dials it (worker-protocol/01,
+decisions #436/#454 — the 2026-08-25 re-landing). Two RPCs run at launch and their
+durability attributes are the whole design:
 
-* **Control** — one durable bidi stream, one causal order, one fence. Durable messages are
-  never shed. Terminal authority lives only here.
-* **StreamProgress** — bounded and LOSSY, worker->hub, oldest shed first. Saturating it can
-  never block Control, because it is a different RPC with a different queue and a different
-  thread; there is no shared buffer for backpressure to travel through.
+* **Control** — one durable bidi stream per accepted claim, fenced by the three-field
+  envelope. Durable frames are never shed. Terminal authority lives only here.
+* **WatchProgress** — bounded and LOSSY, owner-opened on its own connection. Saturating it
+  can never block Control: a different RPC, a different queue, a different thread.
 
-Threads, and why each exists: the READER blocks on the response iterator and must never do
-work (a cancel has to arrive while an attempt is running); the ATTEMPT WORKER holds the
-single device lease and therefore serializes attempts in arrival order — that is the whole
-of worker-local arbitration, and it invents no global precedence; the REPORTER ticks the
-durable Report; the WATCHDOG owns the deadline and the grace clock, because the deadline is
-supervisor-enforced and never merely handed to author code.
+The conversation on every accepted stream is fixed (02): Claim -> ClaimAck -> snapshot
+(Begin/Entry.../End) -> the owner's SnapshotAck -> dispatch opens. The ownership fence is
+`(owner_epoch, control_generation, worker_boot_id)`, checked on every frame before any body
+field is read. LAUNCH TIER (single-owner): the epoch is a provisioned constant — a claim
+with a strictly higher epoch supersedes, an equal epoch from the same controller is a
+reconnect, anything else refuses typed.
+
+Threads, and why each exists: each accepted STREAM runs its conversation on the host's
+thread and must never do slow work (a cancel has to arrive while an attempt runs); the
+DEVICE LANE holds the single device lease and serializes attempts in arrival order — the
+whole of worker-local arbitration; the REPORTER ticks the durable Report; the WATCHDOG owns
+the deadline and the grace clock, because the deadline is worker-enforced and never merely
+handed to author code.
 
 This process never imports torch. `scripts/worker-live.py nocuda` proves that against the
 RUNNING process's loaded modules and mapped libraries, not against the import graph.
@@ -23,9 +30,9 @@ RUNNING process's loaded modules and mapped libraries, not against the import gr
 from __future__ import annotations
 
 import argparse
-import collections
 import contextlib
 import dataclasses
+import hmac
 import itertools
 import json
 import os
@@ -36,7 +43,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -60,7 +67,11 @@ from cozy_runtime.internal.worker.child import (
     ExecutorSupervision,
     socket_path_refusal,
 )
-from cozy_runtime.internal.worker.control import Coordinator, GrpcCoordinator, Link, LinkError
+from cozy_runtime.internal.worker.control import (
+    ControlHost,
+    GrpcControlHost,
+    WatchFanout,
+)
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -71,40 +82,38 @@ from cozy_runtime.internal.worker.plan import (
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-#: The lossy lane's depth. Oldest is shed first; a durable message never enters here.
+#: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
 PROGRESS_QUEUE = 256
 
-#: Report cadence. Report is DURABLE and carries the applied baseline, so the hub can always
-#: see a directive it issued but the worker did not apply.
+#: Report cadence. Report is DURABLE and carries the applied baseline, so the owner can
+#: always see a directive it issued but the worker did not apply.
 REPORT_SECONDS = 2.0
 
 #: The RUN-ONCE RECYCLE exit (cr-009, v1 rc 75). A job worker that completed its one attempt
-#: and had its terminal acknowledged asks to be RECLAIMED, and that is not a death: a
-#: supervisor exiting 0 on completion is indistinguishable from one that exited 0 because its
-#: coordinator went away, which is exactly the ambiguity that makes a pod either leak or get
-#: killed while it still had work. It is deliberately NOT in `internal/exits.py`: that matrix
-#: is the shared CLI/coordinator vocabulary, and this is a worker PROCESS disposition.
+#: and had its terminal acknowledged asks to be RECLAIMED, and that is not a death.
 RECYCLE_EXIT = 75
 
 #: How often the rebuild queue LOOKS. A sampling cadence is the resolution of an
-#: observation, never a bound on one: `await_settled` waits for as long as the rebuild is
-#: making progress and stops when it stops, and this only says how finely it can tell.
-#: It is the Report cadence because that is already the rate at which this worker's
-#: non-attempt facts move.
+#: observation, never a bound on one (#434); it is the Report cadence because that is
+#: already the rate at which this worker's non-attempt facts move.
 REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
+
+#: The worker's accepted-attempt WINDOW behind `attempt_credits` (#441, th-024's stated
+#: launch window): one GPU-active attempt plus at most one admitted tail, so the next
+#: attempt's CPU phase can overlap the current one's device phase and the deep queue stays
+#: at the owner. cr-019's credit accounting refines this; the number is the protocol's own
+#: window, not a tuning choice.
+CREDIT_WINDOW = 2
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerOptions:
     """One worker's settings, as a typed value rather than a parser's leftovers.
 
-    The supervisor has two entrances — the long-lived `serve` process and the ephemeral
-    local supervisor a one-shot `run` builds in memory (§8) — and only one of them has a
-    command line. A frozen dataclass is what makes the second one possible without a fake
-    `argparse.Namespace`, and what makes every setting typed at the point it is read.
-
-    The coordinator is NOT here: who drives this worker is a transport (`worker/control.py`),
-    not a setting.
+    The worker has two entrances — the long-lived `serve` process and the ephemeral local
+    worker a one-shot `run` builds in memory (§8) — and only one of them has a command
+    line. The owner is NOT here: who drives this worker is a transport
+    (`worker/control.py`), not a setting.
     """
 
     root: Path
@@ -123,37 +132,63 @@ class WorkerOptions:
 
 
 @dataclass(slots=True)
-class Fences:
-    """The five fence ordinals, and who owns each (worker-protocol/02 §0)."""
+class Deployment:
+    """The ONE hosted deployment (launch enforces len(set) <= 1, #446). The id is the
+    owner-minted routing + journal key; it is never invocation identity."""
 
-    session_id: str = ""  # CP-minted at parent boot; a restart mints a NEW one
-    revision: int = 0  # hub-owned
-    credential_epoch: int = 0  # hub-owned, echoed by Report
-    applied_directive: bytes = b""  # canonical bytes of the applied Directive, for §3's
-    #                                 "same revision + different body is a protocol error"
+    deployment_id: str
+    endpoint_release_id: str
+    plan_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class Fences:
+    """The ownership fence and the directive fences, and who owns each (02 §0).
+
+    `owner_epoch` is authority-granter-minted and durable; `control_generation` is
+    WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at
+    worker boot and never reused. The executor generation is DEPLOYMENT truth
+    (#454) and deliberately not here.
+    """
+
+    boot_id: str = ""
+    owner_epoch: int = 0
+    controller_id: str = ""
+    generation: int = 0  # worker-minted; 0 = never claimed
+    snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
+    dispatch_open: bool = False
+    revision: int = 0  # owner-owned
+    applied_directive: bytes = b""
     posture: pb.Posture = pb.Posture.POSTURE_UNSPECIFIED
     intake: pb.IntakeState = pb.IntakeState.INTAKE_STATE_BOOTING
     wire_minor: int = 0
+    drain_grace_ms: int = 0
     activity: list[pb.ActivityEvent] = field(default_factory=list)
-    mode: str = ""  # the Directive `mode` oneof this worker APPLIED: "serving", "job", or
-    #                 "" before any directive. READ from `WhichOneof`, never inferred from
-    #                 what happens to be in `bindings`/`jobs` — the schema already carries
-    #                 the discriminator and a second derivation of it is free to disagree.
+    mode: str = ""  # the Directive `mode` oneof this worker APPLIED
+    applied_set_digest: bytes = b""
 
 
-class Supervisor:
-    """The no-CUDA control parent."""
+#: Every envelope-bearing message type sets the same three fields; the stamp is central so
+#: no constructor can forget one (the fence is checked before any body field is read).
+def _stamped(message: Any, fences: Fences) -> Any:
+    message.owner_epoch = fences.owner_epoch
+    message.control_generation = fences.generation
+    message.worker_boot_id = fences.boot_id
+    return message
 
-    def __init__(
-        self, config: RuntimeConfig, options: WorkerOptions, coordinator: Coordinator
-    ) -> None:
+
+class Worker:
+    """The no-CUDA control parent — the machine's worker process (#455; formerly the
+    `Supervisor`; "supervision" survives as the verb for its executor management)."""
+
+    def __init__(self, config: RuntimeConfig, options: WorkerOptions, host: ControlHost) -> None:
         self.config = config
         self.options = options
-        self.coordinator = coordinator
+        self.host = host
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.fences = Fences(session_id=f"ses-{uuid.uuid4().hex[:20]}")
-        self.seq = itertools.count(1)  # SUPERVISOR-owned monotone counter
+        self.fences = Fences(boot_id=f"boot-{uuid.uuid4().hex[:20]}")
+        self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.journal = Journal(self.root / "journal.log")
         self.ledger = Ledger(
@@ -170,15 +205,9 @@ class Supervisor:
         )
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
-        #: plan id -> what THIS worker's `prepare` resolved for it. Kept apart from the
-        #: declaration above because a deployment writes one and never the other.
         self.generations: dict[str, PreparedGeneration] = {}
-        #: job_descriptor_id -> the local job plan record. A JOB directive fills this and
-        #: leaves `bindings` empty: the two modes are alternatives, never a union.
         self.jobs: dict[str, JobBinding] = {}
-        # cr-011: the worker's own bounded record, the silence-bounded liveness detector,
-        # and the journal-backed bundle store. All three outlive the executor, and the
-        # bundle store's receipts outlive THIS process too.
+        self.deployment: Deployment | None = None
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.journal)
@@ -201,27 +230,31 @@ class Supervisor:
             posture=self.applied_posture,
             device_process=self.read_device_process,
         )
-        self.engine.session_id = self.fences.session_id
-        self.outbound: queue.Queue[pb.WorkerMessage | None] = queue.Queue()
-        self.progress: collections.deque[pb.AttemptProgress] = collections.deque(
-            maxlen=PROGRESS_QUEUE
+        self.engine.boot_id = self.fences.boot_id
+        self.engine.deployment_id = lambda: (
+            self.deployment.deployment_id if self.deployment is not None else ""
         )
-        self.progress_shed = 0
-        self.progress_sent = 0
+        self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
+        self.watches = WatchFanout(PROGRESS_QUEUE)
         self.work: queue.Queue[AttemptRecord | None] = queue.Queue()
         self.stop = threading.Event()
-        #: SET when the intake state is a verdict (READY or ERROR), CLEAR while the worker is
-        #: still becoming one. `on_start` waits on it so a request that arrives during a
-        #: rebuild queues instead of being refused for a condition that is ending.
         self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
         self.connected = threading.Event()
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
-        self.link: Link | None = None  # the live control link, so shutdown can end it
         self.job_caps = pb.ResourceCaps()
         self.reclaim_on_terminal = False
+        self.boot_fatal: pb.BootFailure | None = None
+        #: The per-spawn bootstrap credential (#449/#463): the launcher that spawned this
+        #: worker handed it through the environment — read by the ONE config authority,
+        #: never here — and a Claim must present it as `proof`. The check is constant-time;
+        #: the value never appears in a log. Where no launcher minted one (a hand-started
+        #: serve), the fence is the socket's own filesystem authority and it is absent.
+        self.bootstrap = config.bootstrap_credential
+        #: serializes claim acceptance: one fence, whichever host thread observes the claim
+        self.claim_lock = threading.Lock()
 
     # ------------------------------------------------------------------ plumbing
 
@@ -233,62 +266,48 @@ class Supervisor:
         )
         self.fences.activity.append(event)
         del self.fences.activity[:-64]
-        print(f"[supervisor] {kind}: {step}", flush=True)
+        print(f"[worker] {kind}: {step}", flush=True)
 
-    def send(self, message: pb.WorkerMessage) -> None:
-        """Durable. Queued, never shed, and replayed after a reconnect if unacknowledged."""
-        self.outbound.put(message)
+    def stamp(self, message: Any) -> Any:
+        target = message
+        if message.DESCRIPTOR.name in ("WorkerFrame", "OwnerFrame"):
+            kind = message.WhichOneof("msg")
+            if kind is None:
+                return message
+            target = getattr(message, kind)
+        _stamped(target, self.fences)
+        return message
+
+    def send(self, frame: pb.WorkerFrame) -> None:
+        """Durable. Queued, never shed; the inner message is stamped with the CURRENT fence
+        so a frame authored before a re-claim still leaves under the live envelope, and an
+        unacknowledged terminal is replayed after a reconnect."""
+        inner = getattr(frame, frame.WhichOneof("msg"))
+        self.stamp(inner)
+        self.outbound.put(frame)
 
     def intake(self, state: pb.IntakeState) -> None:
-        """Move the intake state and REPORT IT IMMEDIATELY.
-
-        Readiness is an EDGE, not a poll. The Report ticker exists so a coordinator can
-        always see a directive the worker did not apply; it is not a way to learn that
-        loading finished. Publishing on the transition costs one durable message and takes
-        the cost of learning "ready" from up to a full report period down to the seam
-        round-trip — which is the difference between a one-shot local `run` paying a
-        two-second tax and paying none.
-        """
+        """Move the intake state and REPORT IT IMMEDIATELY — readiness is an EDGE."""
         if state == self.fences.intake:
             return
         self.fences.intake = state
-        # SETTLED means the worker has finished deciding what it is: READY (it serves) or
-        # ERROR (it does not, and said why). LOADING and BOOTING are transitional — an
-        # attempt that arrives in one of them WAITS for the answer instead of being refused
-        # for a condition that is about to end. `on_start` is the only reader.
         if state in (pb.IntakeState.INTAKE_STATE_READY, pb.IntakeState.INTAKE_STATE_ERROR):
             self.settled.set()
         else:
             self.settled.clear()
         if self.connected.is_set():
-            self.send(pb.WorkerMessage(report=self.report()))
+            self.send(pb.WorkerFrame(report=self.report()))
 
     def capacity_dropped(self, why: str) -> None:
-        """The executor's state was invalidated: STOP ADVERTISING READY, right now.
-
-        Installed on `ExecutorSupervision.on_invalidate`, so it runs on whichever thread
-        observed the death — the watchdog on a forceful cancel, the attempt thread on a seam
-        close — and before that call returns. The ready-plan set is already empty by then, so
-        the Report this publishes carries both halves of the same fact: no ready plans, and
-        an intake state that is not READY.
-
-        Only a READY worker is moved. An invalidation that arrives while preparation already
-        failed must not overwrite the ERROR state with a LOADING that says less.
-        """
+        """The executor's state was invalidated: STOP ADVERTISING READY, right now."""
         if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
             return
         self.note("readiness", f"capacity withdrawn: {why[:200]}")
         self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
 
     def read_device_process(self) -> int:
-        """NVML per-process device bytes for the EXECUTOR, read by the supervisor.
-
-        The out-of-allocator meter needs a number the allocator structurally cannot see —
-        the CUDA context and the cuDNN/cuBLAS workspaces — and the only place it exists is
-        the driver's own per-process accounting. Read by the PARENT, like RSS: the child's
-        claim about its own footprint is one the supervisor cannot check, and here it does
-        not have to. -1 is UNREADABLE and never a zero.
-        """
+        """NVML per-process device bytes for the EXECUTOR, read by the worker parent.
+        -1 is UNREADABLE and never a zero."""
         pid = self.ledger.executor_pid
         if not pid:
             return -1
@@ -313,69 +332,350 @@ class Supervisor:
         return -1
 
     def read_device_work(self) -> int:
-        """How much work the EXECUTOR has done, read by the parent from `/proc`.
-
-        Like RSS and the NVML per-process bytes: the child's claim about itself is one this
-        supervisor cannot check, and here it does not have to. THE meter — the same one the
-        spawn path waits on — so "busy, not wedged" means the same thing everywhere.
-        """
+        """How much work the EXECUTOR has done, read by the parent — THE meter."""
         return child.work(self.ledger.executor_pid)
 
     def applied_posture(self) -> dict[str, Any]:
-        """The deployment state the worker was in when something happened (§3.6).
-
-        A triage bundle that cannot say which directive was applied, which credential epoch
-        was live and whether intake was accepting explains half of what went wrong — the
-        other half is always "under what configuration".
-        """
+        """The deployment state the worker was in when something happened (§3.6)."""
         return {
             "posture": pb.Posture.Name(self.fences.posture),
             "intake_state": pb.IntakeState.Name(self.fences.intake),
             "applied_revision": self.fences.revision,
-            "credential_epoch": self.fences.credential_epoch,
+            "owner_epoch": self.fences.owner_epoch,
+            "control_generation": self.fences.generation,
             "applied_wire_minor": self.fences.wire_minor,
             "readiness_epoch": self.supervision.readiness_epoch,
-            "executor_incarnation": self.supervision.incarnation,
+            "executor_generation": self.supervision.incarnation,
+            "deployment_id": self.deployment.deployment_id if self.deployment else "",
             "worker_id": self.options.worker_id,
             "release_id": self.options.release_id,
             "boot_steps": list(self.boot.steps),
         }
 
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
-        """The LOSSY lane. Bounded, oldest-first shed, supervisor-owned sequence numbers."""
+        """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
         key = (request_id, attempt)
-        # Liveness reads the MONOTONE position off this lane and nothing else. The lane is
-        # lossy, which is exactly why silence is measured as "the position did not move"
-        # rather than "no frame arrived" — a dropped frame is not a wedge.
         position = frame.get("position")
         if isinstance(position, int):
             self.monitor.advance(f"{request_id}#{attempt}", position)
-        # A RETAINED observation is held HERE the moment it arrives, so the supervisor owns
-        # a copy before the executor can die. The reply's ring fills whatever the lossy lane
-        # dropped; the executor's own sequence keeps the two from double-counting.
         if frame.get("kind") != "progress":
             self.engine.forward(request_id, attempt, frame)
         counter = self.progress_seq.setdefault(key, itertools.count(1))
-        if len(self.progress) == PROGRESS_QUEUE:
-            self.progress_shed += 1
-        self.progress.append(
-            pb.AttemptProgress(
-                session_id=self.fences.session_id,
-                executor_incarnation=self.supervision.incarnation,
-                request_id=request_id,
-                attempt=attempt,
-                seq=next(counter),
-                content_type="application/x-cozy-event+json",
-                data=json.dumps(
-                    {"type": frame.get("kind", "progress"), "payload": frame.get("value")}
-                ).encode()[:65536],
+        self.watches.publish(
+            self.stamp(
+                pb.AttemptProgress(
+                    request_id=request_id,
+                    attempt=attempt,
+                    seq=next(counter),
+                    content_type="application/x-cozy-event+json",
+                    data=json.dumps(
+                        {"type": frame.get("kind", "progress"), "payload": frame.get("value")}
+                    ).encode()[:65536],
+                    deployment_id=self.deployment.deployment_id if self.deployment else "",
+                )
             )
         )
+
+    # ------------------------------------------------------------------ the stream
+
+    def serve_stream(
+        self, inbound: Iterator[pb.OwnerFrame], send: Callable[[pb.WorkerFrame], None]
+    ) -> None:
+        """ONE control stream: Claim -> ClaimAck -> snapshot -> (SnapshotAck) -> frames.
+
+        Runs on the host's thread. The first frame MUST be a Claim; acceptance fences any
+        previous stream by minting the next control_generation, so the superseded stream's
+        sender exits on its next frame and its watches end.
+        """
+        try:
+            first = next(inbound)
+        except (StopIteration, Exception):
+            return
+        claim = first.claim if first.WhichOneof("msg") == "claim" else None
+        if claim is None:
+            self.note("claim", "dropped a stream whose first frame is not a Claim")
+            return
+        generation = self.accept_claim(claim, send)
+        if generation == 0:
+            return  # refused; the rejection already went out and the stream ends
+        if self.boot_fatal is not None:
+            # The boot-fatal verdict INSTEAD of ClaimAck (01): authenticated, delivered
+            # once, and the worker's run ends with its mapped exit code.
+            send(self.stamp(pb.WorkerFrame(boot_failure=self.boot_fatal)))
+            self.note("boot", "boot failure delivered to the claiming owner; stopping")
+            self.shutdown_from_stream()
+            return
+
+        sender = threading.Thread(
+            target=self._pump_outbound,
+            args=(generation, send),
+            daemon=True,
+            name=f"control-send-{generation}",
+        )
+        sender.start()
+        try:
+            for frame in inbound:
+                if self.fences.generation != generation or self.stop.is_set():
+                    self.note("fence", "a frame arrived on a superseded stream; ending it")
+                    return
+                self._dispatch_frame(frame, generation)
+        except Exception as exc:
+            self.note("session", f"the control stream ended: {type(exc).__name__}")
+        finally:
+            if self.fences.generation == generation:
+                self.connected.clear()
+                self.fences.dispatch_open = False
+
+    def accept_claim(self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]) -> int:
+        """The ownership fence (02 §4). Returns the minted generation, or 0 on refusal."""
+
+        def reject(reason: pb.ClaimRejection, why: str) -> int:
+            self.note("claim", f"REFUSED ({pb.ClaimRejection.Name(reason)}): {why}")
+            ack = pb.ClaimAck(accepted=False, rejection=reason, wire_minor=WIRE_MINOR)
+            ack.owner_epoch = claim.owner_epoch
+            ack.control_generation = self.fences.generation
+            ack.worker_boot_id = self.fences.boot_id
+            send(pb.WorkerFrame(claim_ack=ack))
+            return 0
+
+        if self.bootstrap and not hmac.compare_digest(
+            claim.proof.decode(errors="replace"), self.bootstrap
+        ):
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+                "the bootstrap credential is absent or wrong",
+            )
+        if claim.worker_id and claim.worker_id != self.options.worker_id:
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
+                f"this worker is {self.options.worker_id!r}",
+            )
+        with self.claim_lock:
+            if self.fences.generation and claim.owner_epoch < self.fences.owner_epoch:
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_STALE_OWNER_EPOCH,
+                    f"epoch {claim.owner_epoch} is older than the accepted "
+                    f"{self.fences.owner_epoch}",
+                )
+            if (
+                self.fences.generation
+                and claim.owner_epoch == self.fences.owner_epoch
+                and claim.controller_id != self.fences.controller_id
+            ):
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
+                    "equal epoch, different controller: the epoch is held",
+                )
+            superseded = self.fences.generation
+            self.fences.owner_epoch = claim.owner_epoch
+            self.fences.controller_id = claim.controller_id
+            self.fences.generation += 1
+            self.fences.dispatch_open = False
+            self.fences.wire_minor = min(WIRE_MINOR, claim.wire_minor)
+            generation = self.fences.generation
+        if superseded:
+            self.watches.end_generation(superseded)
+            self.note(
+                "claim",
+                f"stream generation {superseded} fenced; generation {generation} claims "
+                f"under epoch {claim.owner_epoch}",
+            )
+        # Everything queued for the dead stream regenerates or replays under the law:
+        # terminals replay from the journal after SnapshotAck; reports re-tick.
+        self._drain_outbound()
+
+        ack = pb.ClaimAck(
+            accepted=True,
+            wire_minor=WIRE_MINOR,
+            worker_id=self.options.worker_id,
+            instance_id=self.options.instance_id,
+            release_id=self.options.release_id,
+            image_digest="sha256:" + "00" * 32,
+            git_commit=self.options.git_commit,
+            resources=self.resources(),
+        )
+        send(self.stamp(pb.WorkerFrame(claim_ack=ack)))
+        self._send_snapshot(send)
+        self.note(
+            "session",
+            f"claimed by {claim.controller_id or 'an unnamed owner'} at epoch "
+            f"{claim.owner_epoch}, generation {generation} "
+            f"(wire_minor effective {self.fences.wire_minor})",
+        )
+        return generation
+
+    def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
+        """Begin -> one Entry per held/journaled attempt -> End. Dispatch stays closed
+        until the owner's SnapshotAck names exactly this snapshot (02 §6)."""
+        self.fences.snapshot_id = f"snp-{uuid.uuid4().hex[:16]}"
+        entries = self.engine.snapshot_entries()
+        begin = pb.SnapshotBegin(
+            snapshot_id=self.fences.snapshot_id, journal_highwater=self.journal.appends
+        )
+        send(self.stamp(pb.WorkerFrame(snapshot_begin=begin)))
+        for attempt in entries:
+            entry = pb.SnapshotEntry(snapshot_id=self.fences.snapshot_id, attempt=attempt)
+            send(self.stamp(pb.WorkerFrame(snapshot_entry=entry)))
+        end = pb.SnapshotEnd(snapshot_id=self.fences.snapshot_id, entry_count=len(entries))
+        send(self.stamp(pb.WorkerFrame(snapshot_end=end)))
+        if entries:
+            self.note(
+                "recovery",
+                f"snapshot {self.fences.snapshot_id} reports {len(entries)} attempt(s); "
+                "the owner reconciles them before any dispatch",
+            )
+
+    def _pump_outbound(self, generation: int, send: Callable[[pb.WorkerFrame], None]) -> None:
+        while not self.stop.is_set() and self.fences.generation == generation:
+            try:
+                frame = self.outbound.get(timeout=REPORT_SECONDS)
+            except queue.Empty:
+                continue  # the generation check above is this thread's fence
+            if frame is None:
+                return
+            if self.fences.generation != generation:
+                # Superseded while holding a frame: put it back for the live stream's
+                # pump — the frame is stamped at send() time... it was stamped with the
+                # OLD fence. Regenerate-or-replay covers it; drop with a note.
+                self.note("fence", "an outbound frame outlived its stream; dropped (replay law)")
+                return
+            try:
+                send(frame)
+            except Exception:
+                return
+
+    def _drain_outbound(self) -> None:
+        with contextlib.suppress(queue.Empty):
+            while True:
+                self.outbound.get_nowait()
+
+    def fenced(self, message: Any) -> bool:
+        """The three-field envelope, in its fixed order, BEFORE any body field (02 §0)."""
+        if message.owner_epoch != self.fences.owner_epoch:
+            self.note("fence", f"dropped: epoch {message.owner_epoch}")
+            return True
+        if message.control_generation != self.fences.generation:
+            self.note("fence", f"dropped: superseded generation {message.control_generation}")
+            return True
+        if message.worker_boot_id != self.fences.boot_id:
+            self.note("fence", f"dropped: wrong boot {message.worker_boot_id!r}")
+            return True
+        return False
+
+    def _dispatch_frame(self, frame: pb.OwnerFrame, generation: int) -> None:
+        kind = frame.WhichOneof("msg")
+        if kind is None:
+            return
+        inner = getattr(frame, kind)
+        if kind == "claim":
+            self.note("claim", "PROTOCOL: a second Claim on an established stream; ignored")
+            return
+        if self.fenced(inner):
+            return
+        if kind == "snapshot_ack":
+            if inner.snapshot_id != self.fences.snapshot_id:
+                self.note("fence", f"SnapshotAck names {inner.snapshot_id!r}; not this snapshot")
+                return
+            self.fences.dispatch_open = True
+            self.connected.set()
+            self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
+            for attempt in self.engine.pending_terminals():
+                self.note(
+                    "terminal",
+                    f"replaying the journaled terminal for {attempt.request_id}#"
+                    f"{attempt.attempt} in a fresh envelope ({attempt.terminal_id})",
+                )
+                self.send(pb.WorkerFrame(attempt_terminal=self.engine.wrap(attempt)))
+            self.send(pb.WorkerFrame(report=self.report()))
+            return
+        if kind == "directive":
+            try:
+                self.apply_directive(inner)
+            except (ExecutorGone, JournalError) as exc:
+                self.note("directive", f"apply failed: {exc}")
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=f"revision {inner.revision}",
+                        reason="directive_preparation_failed",
+                        detail=f"{type(exc).__name__}: {exc}"[:1024],
+                    )
+                )
+                self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
+            return
+        if not self.fences.dispatch_open:
+            self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
+            return
+        if kind == "start_attempt":
+            self.on_start(inner)
+        elif kind == "cancel_attempt":
+            self.note("cancel", self.engine.cancel(inner))
+        elif kind == "terminal_ack":
+            self.on_terminal_ack(inner)
+        elif kind == "checkpoint_receipt":
+            self.engine.absorb_receipt(inner)
+            ack = pb.JobCheckpointAck(
+                request_id=inner.request_id,
+                attempt=inner.attempt,
+                operation_key=inner.operation_key,
+                receipt_id=inner.receipt_id,
+                content_digest=inner.content_digest,
+            )
+            self.send(pb.WorkerFrame(checkpoint_ack=ack))
+
+    def on_terminal_ack(self, acked: pb.TerminalAck) -> None:
+        self.note("terminal", self.engine.close(acked))
+        closed = self.engine.history.get((acked.request_id, acked.attempt))
+        if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
+            self.note(
+                "session",
+                f"job attempt {acked.request_id}#{acked.attempt} is acknowledged and "
+                f"reclaim_on_terminal is set: exiting {RECYCLE_EXIT} (recycle, not a death)",
+            )
+            self.exit_code = RECYCLE_EXIT
+            self.shutdown_from_stream()
+
+    def shutdown_from_stream(self) -> None:
+        self.stop.set()
+        self.outbound.put(None)
+        self.work.put(None)
+        self.watches.end_all()
+        self.host.stop()
+
+    def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
+        """One WatchProgress call: bound to the fenced control generation (#436)."""
+        if self.fenced(opened):
+            return iter(())
+        return self.watches.open(opened.request_id, opened.control_generation).frames(self.watches)
 
     # ------------------------------------------------------------------ directive
 
     def apply_directive(self, directive: pb.Directive) -> None:
-        """FULL REPLACE. A field absent means absent, never unchanged (§3)."""
+        """FULL REPLACE. A field absent means absent, never unchanged (§3).
+
+        THE LAUNCH CLAMP RUNS FIRST (#446/#454): a deployment set longer than one refuses
+        typed (FAULT_KIND_DEPLOYMENT_SET_UNSUPPORTED) with the directive UNAPPLIED —
+        `applied_revision` does not advance, which is how the owner sees the refusal.
+        """
+        mode = directive.WhichOneof("mode") or ""
+        if mode == "deployment_set":
+            entries = list(directive.deployment_set.set.deployments)
+            if len(entries) > 1:
+                self.note(
+                    "directive",
+                    f"revision {directive.revision} REFUSED: {len(entries)} deployments; "
+                    "launch enforces len(set) <= 1 and the directive is UNAPPLIED",
+                )
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_DEPLOYMENT_SET_UNSUPPORTED,
+                        subject=f"revision {directive.revision}",
+                        reason="deployment_set_over_launch_clamp",
+                        detail=f"the desired set names {len(entries)} deployments and this "
+                        "worker hosts at most one until multi-deployment supervision lands",
+                    )
+                )
+                return
         body = documents.canonical_bytes(directive)
         if directive.revision < self.fences.revision:
             self.note("directive", f"revision {directive.revision} ignored (older)")
@@ -404,29 +704,35 @@ class Supervisor:
         self.fences.applied_directive = body
         self.fences.posture = directive.posture
         self.fences.wire_minor = directive.wire_minor
-        if directive.HasField("credential"):
-            self.fences.credential_epoch = directive.credential.epoch
-        # THE MODE, taken from the schema's own discriminator. A Directive is a
-        # discriminated COMPLETE replacement, so the mode it carries is the mode this
-        # worker is in until the next revision — and the Report's capacity oneof is scoped
-        # by exactly this value.
-        self.fences.mode = directive.WhichOneof("mode") or ""
-        if directive.HasField("job"):
+        self.fences.drain_grace_ms = directive.drain_grace_ms
+        self.fences.mode = "serving" if mode == "deployment_set" else mode
+        if mode == "job":
             self.apply_job_directive(directive.job)
             return
-        if not directive.HasField("serving"):
-            self.note("directive", "no serving mode: nothing to prepare")
+        if mode != "deployment_set":
+            self.note("directive", "no mode: nothing to prepare")
             return
 
+        ds = directive.deployment_set
+        self.fences.applied_set_digest = ds.set_digest
+        entries = list(ds.set.deployments)
         self.bindings = {}
         self.generations = {}
-        # SYMMETRIC with `apply_job_directive` clearing `bindings`. A serving directive
-        # replaces the job lane too: leaving a previous revision's job plans behind would
-        # leave the worker advertising job capacity it will not honour, and "complete
-        # replacement" has to mean complete in both directions.
         self.jobs = {}
         self.engine.jobs = {}
-        for plan_id in directive.serving.entrypoint_binding_plan_ids:
+        if not entries:
+            self.deployment = None
+            self.engine.bindings = {}
+            self.engine.generations = {}
+            self.note("directive", f"revision {directive.revision} applied: an EMPTY set")
+            return
+        entry = entries[0]
+        self.deployment = Deployment(
+            deployment_id=entry.deployment_id,
+            endpoint_release_id=entry.endpoint_release_id,
+            plan_ids=tuple(entry.entrypoint_binding_plan_ids),
+        )
+        for plan_id in entry.entrypoint_binding_plan_ids:
             record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
             if not record.is_file():
                 self.engine.fault(
@@ -440,10 +746,6 @@ class Supervisor:
                 continue
             self.bindings[plan_id] = DeclaredBinding.read(json.loads(record.read_text()))
         self.engine.bindings = self.bindings
-        # cr-012: the EGRESS boundary is a deployment fact, rebuilt from the applied
-        # directive's bindings and from nothing else. A revision that names no host leaves
-        # it empty, which means no egress — the fail-closed state is the default state, and
-        # nothing at request time can widen it.
         hosts = sorted(
             {host for binding in self.bindings.values() for host in binding.egress_allowed_hosts}
         )
@@ -454,25 +756,20 @@ class Supervisor:
         )
         self.note(
             "directive",
-            f"revision {directive.revision} applied: {len(self.bindings)} binding plans, "
+            f"revision {directive.revision} applied: deployment "
+            f"{entry.deployment_id or '(unnamed)'} with {len(self.bindings)} binding plans, "
             f"posture={pb.Posture.Name(directive.posture)}",
         )
         self.prepare_executor()
 
     def apply_job_directive(self, job: pb.JobDirective) -> None:
-        """The JOB lane's directive: resolve the descriptor, spawn a fresh executor, ready.
-
-        No binding plan, no fill, no warm pass and no residency — a job has none of those,
-        and inventing them so the two lanes look alike would mean holding weights a job
-        never asked for. What the worker DOES prepare is the disposable process the attempt
-        will run in; the job's own preparation (its typed inputs, its read-only Model if it
-        declares one) happens after acceptance, bounded by the attempt deadline (cr-009).
-        """
+        """The JOB lane's directive: resolve the descriptor, spawn a fresh executor, ready."""
         self.bindings = {}
         self.generations = {}
         self.engine.bindings = {}
         self.engine.generations = {}
         self.jobs = {}
+        self.deployment = None
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
         if not record.is_file():
@@ -493,7 +790,7 @@ class Supervisor:
         self.note(
             "directive",
             f"revision {self.fences.revision} applied in JOB mode: "
-            f"{self.jobs[job.job_descriptor_id].job!r}, gpu floor {job.gpu_count}, "
+            f"{self.jobs[job.job_descriptor_id].job!r}, device floor {job.device_count}, "
             f"reclaim_on_terminal={job.reclaim_on_terminal}",
         )
         self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
@@ -508,7 +805,7 @@ class Supervisor:
             self.ledger.executor_pid = executor.pid
             self.note(
                 "boot",
-                f"job executor incarnation {executor.incarnation} pid {executor.pid} dialled "
+                f"job executor generation {executor.incarnation} pid {executor.pid} dialled "
                 f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
                 f"(torch_loaded={executor.hello.get('torch_loaded')})",
             )
@@ -517,8 +814,7 @@ class Supervisor:
     # ------------------------------------------------------------------ readiness
 
     def prepare_executor(self) -> None:
-        """The ExecutorPreparer, at directive time: prepare BEFORE advertising ready, and
-        before any attempt may be accepted against this executor."""
+        """The ExecutorPreparer, at directive time: prepare BEFORE advertising ready."""
         if not self.bindings:
             return
         self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
@@ -529,7 +825,7 @@ class Supervisor:
             self.ledger.executor_pid = executor.pid
             self.note(
                 "boot",
-                f"incarnation {executor.incarnation} pid {executor.pid} dialled back in "
+                f"generation {executor.incarnation} pid {executor.pid} dialled back in "
                 f"{(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
                 f"(no_new_privs={executor.hello.get('no_new_privs')}, "
                 f"oom_score_adj={executor.hello.get('oom_score_adj')}, "
@@ -541,9 +837,6 @@ class Supervisor:
         for group in by_construction.values():
             first = group[0]
             started = time.perf_counter()
-            # The LOAD leg gets a liveness subject and `started` at position 0. There is no
-            # boot timeout here and there will not be one: a multi-GB load is slow, and the
-            # only honest question is whether its integral-MiB position is still moving.
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
             reply = executor.call(
@@ -564,15 +857,7 @@ class Supervisor:
                         "variant": first.variant,
                         "custody": first.custody,
                         "strict_keys": first.strict_keys,
-                        # cr-006's persisted probe fact: a DEVICE property, so it is keyed
-                        # by the device tuple under cozy_home and shared across every
-                        # binding this rig serves.
                         "probe_cache": str(self.config.cozy_home / "probe"),
-                        # cr-008c: the OFFERED artifact variants and the measured axis to
-                        # order them on. The choice is made in the executor because that is
-                        # where the device and the capability table live — this process
-                        # never imports torch — and it comes back on the reply as a fact
-                        # this supervisor journals and reports.
                         "variants": [dataclasses.asdict(offer) for offer in first.offered],
                         "objective": first.objective,
                         "steps_basis": first.steps_basis,
@@ -581,10 +866,6 @@ class Supervisor:
                     "budgets": {
                         "vram": first.model_weight_bytes,
                         "pinned": first.pinned_bytes,
-                        # The DECLARED construction ceiling. Components past it are PARKED
-                        # and staged in on first declared use; 0 means every component
-                        # stays resident. Construction is priced against the declaration so
-                        # it reproduces; the attempt-time ladder is what reads measurement.
                         "resident": first.resident_budget_bytes,
                     },
                     "expect_construction_digest": first.expected_logical_model_digest,
@@ -607,12 +888,6 @@ class Supervisor:
                 detail = str(reply.get("detail"))[:1024]
                 shortfall = reply.get("shortfall") or {}
                 if shortfall:
-                    # `Fault` has no structured shortfall slot — only `TerminalCause` does
-                    # (worker-protocol/01), and that schema is th-024's, not this repo's. So
-                    # the two numbers go into `detail` in a fixed shape rather than being
-                    # lost: what was needed, what was measured free, on which resource. A
-                    # Fault-level ResourceShortfall is a protocol change and is named as a
-                    # seam, not smuggled in.
                     detail = (
                         f"{shortfall['resource']} shortfall at {shortfall['scope']}: "
                         f"needed {shortfall['needed_bytes']} B, "
@@ -626,9 +901,6 @@ class Supervisor:
                         detail=detail,
                     )
                 )
-                # RECORD THE FAULT, THEN MOVE THE STATE: the transition publishes a Report
-                # immediately, so moving first says "I failed" in a message that does not
-                # yet carry why, and the next Report is a full period away.
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.note(
                     "boot",
@@ -643,10 +915,6 @@ class Supervisor:
                 self.supervision.invalidate(f"prepare refused: {reply.get('code')}")
                 return
             digest = reply["model_construction_digest"]
-            # THE DELIVERY CHOICE, ABSORBED (cr-008c). It is resolved exactly once, here,
-            # and every attempt served by this generation prices against it — the
-            # PlanChooser reads these two fields and structurally cannot re-choose, which
-            # is what keeps a delivery switch from arriving as a placement side effect.
             delivery = reply.get("delivery") or {}
             resolved = PreparedGeneration(
                 logical_model_digest=digest,
@@ -668,11 +936,6 @@ class Supervisor:
                 self.generations[binding.entrypoint_binding_plan_id] = resolved
             self.engine.bindings = self.bindings
             self.engine.generations = self.generations
-            # The generation's RESIDENT BASELINE enters the ledger here: the destinations the
-            # fill actually committed, the allocator's live bytes behind them, and the ring's
-            # page-locked PEAK (a closed ring has charged nothing while the budget it held is
-            # exactly what the driver had pinned — §3.2's two-number rule). Every later
-            # attempt reconciles against this line.
             self.ledger.observe_construction(reply["facts"])
             self.monitor.end(subject, "filled")
             self.boot.step(
@@ -710,20 +973,7 @@ class Supervisor:
         self.intake(pb.IntakeState.INTAKE_STATE_READY)
 
     def run_warm_pass(self) -> None:
-        """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch.
-
-        The pass is DRIVEN here and RUN in the executor. That split is a fence, not a
-        layering preference: synthesizing a payload needs the entrypoint's schema, and the
-        supervisor must never import endpoint code — an endpoint whose module scope touches
-        torch would contaminate this long-lived no-CUDA process permanently. The executor
-        has the schema because it has the endpoint, and it is disposable.
-
-        The tax lands on boot, never on a paying request. Every attempt lands one durable
-        outcome — `warmed`, `skipped` or `failed` — with a typed reason; a failed pass emits
-        `serve_degrade` and the worker still serves. Nothing observed here may ever seed,
-        fit or arm cr-008b's demand coefficients (se#715), which is why every outcome record
-        carries `demand_evidence: false` and the chooser never reads this list.
-        """
+        """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
         if self.options.no_warm:
             return
         executor = self.supervision.current
@@ -741,10 +991,7 @@ class Supervisor:
                         "cmd": "warm",
                         "request_id": f"warm-{binding.entrypoint}",
                         "entrypoint": binding.entrypoint,
-                        # NO BOUND, because warm is a BOOT STEP and boot is silence-bounded
-                        # (§3.3: "no boot timeout exists here to be tuned"). A 300 s ceiling
-                        # here said the opposite in the one place a slow first warm would
-                        # meet it. `SilenceMonitor` is what ends a warm that stalls.
+                        # NO BOUND: warm is a BOOT STEP and boot is silence-bounded (§3.3).
                         "deadline_s": None,
                         "spool": str(spool),
                     },
@@ -765,9 +1012,6 @@ class Supervisor:
                 }
             outcome["ms"] = round((time.perf_counter() - started) * 1000, 1)
             outcome["demand_evidence"] = False
-            # A warm invoke is a BENCHMARK OVERRIDE: it runs a synthetic payload at a
-            # cheapened schedule, so everything it observes is marked and can never pollute
-            # a measurement (§3.6, se#715).
             self.boot.step(
                 "warm",
                 str(outcome["outcome"]),
@@ -794,12 +1038,6 @@ class Supervisor:
                         f"{outcome['reason']} - the worker still serves",
                     )
                 )
-        # The warm pass IS execution: it allocates the library workspaces the first kernel
-        # launch needs, and those belong to the generation rather than to the first paying
-        # request. Re-reading the device here is what makes the first paying attempt
-        # reconcile to zero — the first-call tax landing on boot, measured rather than
-        # asserted. Nothing observed in the warm pass may seed cr-008b's demand
-        # coefficients (se#715); a resident BASELINE is not a demand coefficient.
         if self.warm and executor.alive():
             try:
                 self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=30.0))
@@ -816,106 +1054,33 @@ class Supervisor:
             "OMP_NUM_THREADS": str(self.options.threads),
         }
 
-    # ------------------------------------------------------------------ the loops
-
-    def reader(self, responses: Any) -> None:
-        for message in responses:
-            kind = message.WhichOneof("msg")
-            if kind == "register_ack":
-                if not message.register_ack.accepted:
-                    self.note(
-                        "session",
-                        f"Register REFUSED: "
-                        f"{pb.RegisterRejection.Name(message.register_ack.rejection)}",
-                    )
-                    self.exit_code = int(Exit.credential)
-                    self.stop.set()
-                    return
-                self.fences.wire_minor = min(WIRE_MINOR, message.register_ack.wire_minor)
-                self.note(
-                    "session",
-                    f"registered as {self.fences.session_id} "
-                    f"(wire_minor effective {self.fences.wire_minor})",
-                )
-                self.connected.set()
-            elif kind == "directive":
-                try:
-                    self.apply_directive(message.directive)
-                except (ExecutorGone, JournalError) as exc:
-                    # A directive whose PREPARATION dies must say so DURABLY. Leaving intake
-                    # at LOADING means the worker never becomes ready and the coordinator
-                    # has no way to learn it (cr-008a arm 2).
-                    self.note("directive", f"apply failed: {exc}")
-                    self.engine.fault(
-                        pb.Fault(
-                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            subject=f"revision {message.directive.revision}",
-                            reason="directive_preparation_failed",
-                            detail=f"{type(exc).__name__}: {exc}"[:1024],
-                        )
-                    )
-                    self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
-            elif kind == "start_attempt":
-                self.on_start(message.start_attempt)
-            elif kind == "cancel_attempt":
-                self.note("cancel", self.engine.cancel(message.cancel_attempt))
-            elif kind == "terminal_ack":
-                acked = message.terminal_ack
-                self.note("terminal", self.engine.close(acked))
-                closed = self.engine.history.get((acked.request_id, acked.attempt))
-                if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
-                    # RUN-ONCE: one immutable build, one bounded attempt, terminal, reclaim.
-                    # The worker stops HERE, after the terminal is durably acknowledged, with
-                    # the recycle disposition rather than a death.
-                    self.note(
-                        "session",
-                        f"job attempt {acked.request_id}#{acked.attempt} is acknowledged and "
-                        f"reclaim_on_terminal is set: exiting {RECYCLE_EXIT} (recycle, not a "
-                        "death)",
-                    )
-                    self.exit_code = RECYCLE_EXIT
-                    self.stop.set()
-                    self.outbound.put(None)
-                    if self.link is not None:
-                        self.link.cancel()
-                    return
-            elif kind == "checkpoint_receipt":
-                # The COORDINATOR's copy of a checkpoint that is already durable here. It is
-                # recorded and acked; it can never un-durable a fact the worker journaled,
-                # which is why `save()` did not block on it (law 9: at-least-once).
-                receipt = message.checkpoint_receipt
-                self.engine.absorb_receipt(receipt)
-                self.send(
-                    pb.WorkerMessage(
-                        checkpoint_ack=pb.JobCheckpointAck(
-                            session_id=receipt.session_id,
-                            executor_incarnation=receipt.executor_incarnation,
-                            request_id=receipt.request_id,
-                            attempt=receipt.attempt,
-                            operation_key=receipt.operation_key,
-                            receipt_id=receipt.receipt_id,
-                            content_digest=receipt.content_digest,
-                        )
-                    )
-                )
-        self.connected.clear()
+    # ------------------------------------------------------------------ dispatch
 
     def on_start(self, start: pb.StartAttempt) -> None:
-        """READER: fence, record, enqueue. Nothing here waits, fetches or leases.
-
-        Everything slow about an attempt — retrieving the payload, hydrating its inputs,
-        pricing a plan, waiting out a rebuild — happens on the DEVICE LANE below. This thread
-        is the only one that can hear a cancel, a terminal ack, a directive or a shutdown, so
-        work done here is time nobody else's message can be heard in. It used to do all four
-        (codex audit, adopted 2026-08-25), and the 120 s rebuild wait made the worst case a
-        two-minute deaf reader.
-        """
-        if start.session_id != self.fences.session_id:
-            self.note("fence", f"dropped: wrong session {start.session_id!r}")
-            return
-        if start.executor_incarnation < self.supervision.incarnation:
-            self.note("fence", f"dropped: stale incarnation {start.executor_incarnation}")
-            return
+        """STREAM THREAD: fence, record, enqueue. Nothing here waits, fetches or leases."""
+        if self.fences.mode == "serving":
+            wanted = self.deployment.deployment_id if self.deployment is not None else ""
+            if start.deployment_id != wanted:
+                self.note(
+                    "fence",
+                    f"unknown deployment {start.deployment_id!r} (this worker hosts {wanted!r})",
+                )
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_UNKNOWN_DEPLOYMENT,
+                        subject=start.deployment_id,
+                        reason="unknown_deployment",
+                        detail=f"the dispatch names deployment {start.deployment_id!r} and "
+                        f"this worker hosts {wanted!r}",
+                    )
+                )
+                self.refuse(
+                    start,
+                    "unknown_deployment",
+                    f"no deployment {start.deployment_id!r} is hosted here",
+                    CAUSE.CAUSE_CODE_PROTOCOL,
+                )
+                return
         if self.fences.posture == pb.Posture.POSTURE_DRAINING:
             self.note("intake", f"draining: refusing {start.request_id}")
             self.refuse(
@@ -937,7 +1102,7 @@ class Supervisor:
                 f"duplicate StartAttempt for {start.request_id}#{start.attempt}: replaying "
                 f"the journaled terminal, executing NOTHING (executions={attempt.executions})",
             )
-            self.send(pb.WorkerMessage(attempt_terminal=self.engine.wrap(attempt)))
+            self.send(pb.WorkerFrame(attempt_terminal=self.engine.wrap(attempt)))
             return
         if attempt.state == "queued":
             self.note(
@@ -952,40 +1117,15 @@ class Supervisor:
                 "duplicate StartAttempt for a held attempt: re-accepting "
                 "the SAME acceptance; nothing starts a second time",
             )
-            self.send(pb.WorkerMessage(attempt_accepted=self.engine.accepted_message(attempt)))
+            self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
             return
         self.engine.hold(attempt)
         self.work.put(attempt)
 
     def await_settled(self, attempt: AttemptRecord) -> None:
         """QUEUE behind a rebuild instead of refusing through one — for exactly as long as
-        the rebuild is MAKING PROGRESS.
-
-        The alternative is a dispatch/refuse/requeue loop: every attempt landing in a
-        rebuild window is refused `executor_not_ready`, which a coordinator can only read as
-        "this worker is broken". Waiting turns a refusal into a queue, which is what a
-        coordinator's budget is for (cl-003).
-
-        The wait is on the DEVICE LANE, which is the thread that would have been idle anyway.
-        It used to be on the control reader, where the waiting was time in which no cancel,
-        ack, directive or shutdown could be heard.
-
-        WHAT ENDS THE WAIT is never a wall-clock guess. It used to be `REBUILD_WAIT_SECONDS
-        = 120.0`, derived from nothing but the observation that a cold refill takes ~48 s —
-        which makes it a CEILING on how slow a legitimate refill may be, and the first
-        cold-cache load slower than it turns a working worker into a refusing one. The two
-        things that may end it are the two that mean something:
-
-        * THE CALLER'S OWN BOUND. `admit` cancels an attempt that reached the lane past its
-          deadline, so waiting past that deadline is waiting to throw the answer away. No
-          deadline is no bound, exactly as the output grant reads it (cr-009).
-        * A STALL, observed. Progress is the boot ring's own monotone position or the
-          executor burning CPU — the same two integers `SilenceMonitor` compares, and the
-          same rule: an UNREADABLE meter decides nothing, so it neither rescues the subject
-          nor condemns it. `observe.GIVE_UP_AFTER` consecutive samples that found both
-          still is a rebuild that has stopped, and the attempt takes the ordinary typed
-          not-ready refusal with that observation on the durable Report.
-        """
+        the rebuild is MAKING PROGRESS (#434: caller deadline or observed stall, never a
+        wall-clock guess)."""
         if self.settled.is_set():
             return
         started = time.perf_counter()
@@ -1001,8 +1141,6 @@ class Supervisor:
         why = ""
         while not (settled := self.settled.wait(REBUILD_SAMPLE_SECONDS)):
             if deadline_ms and time.time() * 1000 > deadline_ms:
-                # `admit` is about to cancel it for exactly this. Waiting on a rebuild for
-                # an answer whose caller has stopped waiting spends the card on nobody.
                 why = "the attempt's own deadline expired while it queued"
                 break
             still += 1
@@ -1031,26 +1169,15 @@ class Supervisor:
         cause: pb.CauseCode,
         origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
     ) -> None:
-        """A typed refusal is a TERMINAL: journaled before send, like any other.
-
-        `origin` is carried rather than assumed: the ORIGIN OF THE ADDRESS that missed is
-        what separates a caller's typed error from a platform-fatal one, and collapsing both
-        onto SUPERVISOR sends the wrong person to look (v1 REF_ORIGIN).
-        """
-        # The HELD record, but only while it is still open. A refusal about a message —
-        # `attempt_digest_conflict` names a NEW StartAttempt carrying a different spec for an
-        # ordinal that already finished — must not re-terminal the attempt that finished, or
-        # it re-closes an envelope that is already closed and the ledger reports the second
-        # close as a leak. Found by `worker-live.py arms`.
+        """A typed refusal is a TERMINAL: journaled before send, like any other."""
         held = self.engine.history.get((start.request_id, start.attempt))
         if held is not None and held.state in ("terminal", "closed"):
             held = None
         attempt = held or AttemptRecord(
             request_id=start.request_id,
             attempt=start.attempt,
-            digest=start.exec_spec_digest,
+            digest=start.invocation_digest,
             spec={},
-            grant=start.grant,
         )
         try:
             terminal = self.engine.terminal(
@@ -1064,33 +1191,20 @@ class Supervisor:
             self.note("journal", f"cannot journal a refusal ({exc.code}); sending nothing")
             return
         self.engine.history[attempt.key()] = attempt
-        self.send(pb.WorkerMessage(attempt_terminal=terminal))
+        self.send(pb.WorkerFrame(attempt_terminal=terminal))
 
     # ------------------------------------------------------------------ the device lane
 
     def device_lane(self) -> None:
-        """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild.
-
-        Two phases per attempt and they are strictly ordered against each other, which is the
-        point rather than an implementation convenience. ADMISSION prices a plan against the
-        live ledger; EXECUTION runs it and reconciles the ledger at the terminal. Admitting
-        attempt N+1 before N reconciled would price it against a residency N is about to move
-        — several attempts accepted against one snapshot, which is what the audit found. So
-        the lane admits nothing until the previous attempt's terminal has closed its books.
-
-        Overlapping admission with the previous attempt's GPU work is cr-019's door: it is
-        the pipelining this shape makes reachable, and it is not claimed here.
-        """
+        """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild."""
         while not self.stop.is_set():
             attempt = self.work.get()
             if attempt is None:
                 return
             if self.admit(attempt):
                 self.execute(attempt)
-            # Rebuild on REFUSALS too: a poisoned generation refuses every attempt, so a
-            # rebuild gated on admission could never run again — the refusal that names
-            # the poison is exactly the moment the replacement is owed (lifecycle-live §4
-            # caught the wedge: cooperative cancel -> poison -> refuse forever).
+            # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
+            # so a rebuild gated on admission could never run again.
             self.rebuild_if_needed()
 
     def admit(self, attempt: AttemptRecord) -> bool:
@@ -1098,16 +1212,11 @@ class Supervisor:
         key = f"{attempt.request_id}#{attempt.attempt}"
         self.await_settled(attempt)
         if attempt.canceling:
-            # Cancelled while it sat in the queue. Nothing was fetched, planned or reserved,
-            # so there is nothing to unwind — but the attempt is HELD and every held attempt
-            # ends in a terminal.
             self.note("cancel", f"{key} was cancelled before admission")
             self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
             return False
         deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
         if deadline_ms and time.time() * 1000 > deadline_ms:
-            # The queue can hold work now, so a deadline can expire before the lane reaches
-            # it. Running it anyway would spend the card on an answer nobody is waiting for.
             self.note("cancel", f"{key} reached the lane past its deadline")
             self.terminate(attempt, self.engine.finish_cancel, "deadline")
             return False
@@ -1144,7 +1253,7 @@ class Supervisor:
             )
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)  # fault first, then the edge
             return False
-        self.send(pb.WorkerMessage(attempt_accepted=accepted))
+        self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
     def execute(self, attempt: AttemptRecord) -> None:
@@ -1152,20 +1261,11 @@ class Supervisor:
         try:
             terminal = self.engine.execute(attempt)
         except JournalError as exc:
-            # NEVER SILENCE. The journal cannot commit, so nothing here will replay — and a
-            # coordinator holding an accepted attempt with no terminal waits forever, which
-            # is what job-001 measured. It gets the smallest terminal this worker can make,
-            # with the reason in it, and the worker goes ERROR.
             self.note("journal", f"{exc.code}: only a last-resort terminal can be claimed")
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             self.terminate(attempt, self.engine.last_resort, f"{exc.code}: {exc.detail}")
             return
         except Exception as exc:
-            # A BUG in the execution path is still an attempt that must terminate. Found
-            # live on the job lane: one unhandled ValueError killed this thread, and the
-            # coordinator then waited out its whole readiness deadline on an attempt it
-            # had already been told was accepted. A worker that cannot run an attempt
-            # says so with a terminal; it never converts a defect into a hang.
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
                 terminal = self.engine.abandon(
@@ -1176,23 +1276,21 @@ class Supervisor:
                 self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
                 self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return
-        self.send(pb.WorkerMessage(attempt_terminal=terminal))
+        self.send(pb.WorkerFrame(attempt_terminal=terminal))
 
     def terminate(
         self, attempt: AttemptRecord, build: Callable[..., pb.AttemptTerminal], *args: Any
     ) -> None:
-        """Journal ONE terminal for a held attempt and send it. A build that fails falls
-        back to the smallest terminal there is; only that failing is silence, and it is
-        journaled as a fault rather than swallowed."""
+        """Journal ONE terminal for a held attempt and send it."""
         why = ""
         try:
-            self.send(pb.WorkerMessage(attempt_terminal=build(attempt, *args)))
+            self.send(pb.WorkerFrame(attempt_terminal=build(attempt, *args)))
             return
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
             self.note("attempt", f"the terminal could not be built ({why}); last resort")
         try:
-            self.send(pb.WorkerMessage(attempt_terminal=self.engine.last_resort(attempt, why)))
+            self.send(pb.WorkerFrame(attempt_terminal=self.engine.last_resort(attempt, why)))
         except Exception as inner:
             self.note("attempt", f"even the last-resort terminal failed: {inner}")
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
@@ -1208,8 +1306,7 @@ class Supervisor:
             self.rebuild(f"poisoned: {current.poisoned}")
 
     def rebuild(self, why: str) -> None:
-        """Replace the executor and RELOAD before reporting ready. Never on the
-        cancellation critical path — the caller's cancel completed when CANCELED journaled."""
+        """Replace the executor and RELOAD before reporting ready."""
         self.intake(pb.IntakeState.INTAKE_STATE_LOADING)
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
@@ -1225,19 +1322,18 @@ class Supervisor:
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             return
         self.prepare_executor()
-        # Cleared LAST, not first: an invalidation raised by another thread WHILE the
-        # rebuild ran is about the executor this rebuild just replaced, and clearing at the
-        # start would leave the flag set and buy a second, pointless 4-second refill.
+        # Cleared LAST: an invalidation raised by another thread WHILE the rebuild ran is
+        # about the executor this rebuild just replaced.
         self.supervision.needs_rebuild = False
         self.note(
             "recovery",
             f"ready again in {(time.perf_counter() - started) * 1000:.0f} ms at "
-            f"incarnation {self.supervision.incarnation} / readiness epoch "
+            f"generation {self.supervision.incarnation} / readiness epoch "
             f"{self.supervision.readiness_epoch}",
         )
 
     def watchdog(self) -> None:
-        """The deadline and the grace clock — both the SUPERVISOR's, never author code's."""
+        """The deadline and the grace clock — both the WORKER's, never author code's."""
         while not self.stop.wait(0.05):
             for attempt in list(self.engine.live.values()):
                 if attempt.state != "running":
@@ -1264,45 +1360,24 @@ class Supervisor:
                         attempt.cancel_started = time.perf_counter() + 1e9
 
     def reporter(self) -> None:
-        """The Report tick, and the liveness SAMPLE that rides it.
-
-        The cadence is a scheduling choice; the VERDICT is not. `sample` compares two
-        positions and counts consecutive stills — no elapsed time enters the decision, so a
-        transfer that advances one MiB per tick is never called wedged however slow it is,
-        and one that stops is called wedged however fast it was.
-        """
+        """The Report tick, and the liveness SAMPLE that rides it."""
         seen: dict[str, str] = {}
         while not self.stop.wait(REPORT_SECONDS):
             for subject in list(self.monitor.cursors):
                 verdict = self.monitor.sample(subject)
-                # ON THE EDGE, not on every tick. A 20-minute leg was printing the same
-                # sentence every two seconds, which is a flood that says nothing new.
                 if verdict == "wedged" and seen.get(subject) != verdict:
                     self.note("liveness", f"{subject} is WEDGED by silence (no clock involved)")
                 seen[subject] = verdict
             if self.connected.is_set():
-                self.send(pb.WorkerMessage(report=self.report()))
+                self.send(pb.WorkerFrame(report=self.report()))
 
     def report(self) -> pb.Report:
-        """The Report tick. `capacity` is a ONEOF and it is scoped to the applied MODE.
-
-        Setting both members is not "reporting both": in protobuf a oneof holds exactly
-        one member, and the second assignment CLEARS the first. cr-009 added
-        `job_capacity=` beside `serving_capacity=` in this constructor and every serving
-        worker silently began advertising zero ready plans, so no coordinator could
-        dispatch to it — output-verified by cl-006's A/B against 54effcc. There is no
-        "both" to express and there never was: a Directive is a discriminated complete
-        replacement, so a worker is in ONE mode and reports ONE capacity. Before any
-        directive it reports NEITHER, which readers already see as empty — an honest
-        "no claim yet" rather than a fabricated zero.
-        """
+        """The Report tick. Serving truth is PER-DEPLOYMENT (#446); job mode reports its
+        capacity credit. Before any directive it reports NEITHER — an honest 'no claim
+        yet' rather than a fabricated zero."""
         report = pb.Report(
-            session_id=self.fences.session_id,
-            executor_incarnation=self.supervision.incarnation,
             applied_revision=self.fences.revision,
             intake_state=self.fences.intake,
-            credential_epoch=self.fences.credential_epoch,
-            readiness_epoch=self.supervision.readiness_epoch,
             active_attempts=self.engine.active(),
             faults=self.engine.faults[-8:],
             activity=self.fences.activity[-8:],
@@ -1311,32 +1386,55 @@ class Supervisor:
         if self.fences.mode == "job":
             report.job_capacity.CopyFrom(self.job_capacity())
         elif self.fences.mode == "serving":
-            report.serving_capacity.CopyFrom(self.serving_capacity())
+            report.applied_set_digest = self.fences.applied_set_digest
+            if self.deployment is not None:
+                report.deployments.append(self.deployment_status())
         return report
 
-    def serving_capacity(self) -> pb.ServingCapacity:
-        """Which entrypoint binding plans this worker can serve RIGHT NOW.
+    def deployment_status(self) -> pb.DeploymentStatus:
+        """Per-deployment truth (#446): readiness epoch, executor generation, credits.
 
-        The ready set is the executor's, not the directive's: a plan the hub named but the
-        executor has not prepared is not ready, which is what makes READY mean
-        first-request-servable rather than connected.
+        The accelerator qualification is deliberately ABSENT: this torch-free process
+        cannot measure capability facts, and absent IS the present-but-unqualified state
+        (#454 — registration honesty is schema). The executor-measured qualification lands
+        with cr-020/cr-021's lanes.
         """
-        return pb.ServingCapacity(
-            ready_entrypoint_binding_plan_ids=sorted(
-                self.supervision.current.ready_plans if self.supervision.current else ()
-            ),
-            free_vram_bytes=0,
+        assert self.deployment is not None
+        executor = self.supervision.current
+        ready = sorted(executor.ready_plans) if executor is not None else []
+        loadable = sorted(set(self.deployment.plan_ids) - set(ready))
+        return pb.DeploymentStatus(
+            deployment_id=self.deployment.deployment_id,
+            intake_state=self.fences.intake,
+            readiness_epoch=self.supervision.readiness_epoch,
+            executor_generation=self.supervision.incarnation,
+            attempt_credits=self.attempt_credits(),
+            ready_entrypoint_binding_plan_ids=ready,
+            loadable_entrypoint_binding_plan_ids=loadable,
+            faults=[
+                f
+                for f in self.engine.faults[-8:]
+                if f.kind
+                in (
+                    pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
+                    pb.FaultKind.FAULT_KIND_EXECUTOR_POISONED,
+                )
+            ],
         )
 
-    def job_capacity(self) -> pb.JobCapacity:
-        """How many JOB attempts this worker can take right now (cr-009).
+    def attempt_credits(self) -> int:
+        """Bounded admission credits at this readiness epoch (#441): the window less what
+        this worker already holds. Zero while not READY — credits are a capacity claim."""
+        if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
+            return 0
+        held = sum(
+            1 for a in self.engine.live.values() if a.state in ("queued", "accepted", "running")
+        )
+        return max(0, CREDIT_WINDOW - held)
 
-        Law 8 in the job lane: one active attempt per device group, so a worker with a live
-        job attempt advertises zero available. It is only ever called in JOB mode: a
-        serving worker does not report a zero here, it reports no job capacity at all,
-        because the oneof cannot carry both and a zero would be a claim rather than a
-        silence.
-        """
+    def job_capacity(self) -> pb.JobCapacity:
+        """How many JOB attempts this worker can take right now (cr-009)."""
         in_flight = sum(1 for a in self.engine.live.values() if a.job is not None)
         ready = bool(self.jobs) and self.fences.intake == pb.IntakeState.INTAKE_STATE_READY
         return pb.JobCapacity(
@@ -1344,67 +1442,28 @@ class Supervisor:
             jobs_available=max(0, (1 if ready else 0) - in_flight),
         )
 
-    # ------------------------------------------------------------------ transport
-
-    def outbound_iterator(self) -> Any:
-        while not self.stop.is_set():
-            message = self.outbound.get()
-            if message is None:
-                return
-            yield message
-
-    def pump_progress(self, link: Link) -> None:
-        """The lossy lane, on its OWN lane and its OWN thread. Its failure is invisible to
-        Control by construction — there is no shared buffer for backpressure to cross."""
-        link.progress(self.progress_iterator())
-
-    def progress_iterator(self) -> Any:
-        while not self.stop.is_set():
-            if self.progress:
-                self.progress_sent += 1
-                yield self.progress.popleft()
-            else:
-                time.sleep(0.01)
-
-    def register(self) -> pb.Register:
-        recovered = self.engine.recover()
-        if recovered:
-            self.note(
-                "recovery",
-                f"the recovered journal is REPORTED FIRST: {len(recovered)} attempt(s) "
-                "ride Register, and the hub closes them before minting any next ordinal",
-            )
-        return pb.Register(
-            session_id=self.fences.session_id,
-            executor_incarnation=self.supervision.incarnation,
-            wire_minor=WIRE_MINOR,
-            worker_id=self.options.worker_id,
-            instance_id=self.options.instance_id,
-            release_id=self.options.release_id,
-            image_digest="sha256:" + "00" * 32,
-            git_commit=self.options.git_commit,
-            resources=self.resources(),
-            recovered_attempts=recovered,
-        )
+    # ------------------------------------------------------------------ identity
 
     def resources(self) -> pb.WorkerResources:
-        """Host facts measured ONCE, by a bounded canary at registration.
-
-        The measurement itself belongs to `internal/hostfacts.py`, which the `doctor` verb
-        reads too: a wedged driver has to read the same to a registering worker and to a
-        user asking what is wrong, and two probes could disagree.
-        """
+        """Torch-free statics measured ONCE at claim time (#446): the worker NEVER
+        fabricates capability facts — a discovered accelerator is present-but-unqualified
+        until a deployment executor qualifies it."""
         facts = hostfacts.measure()
+        memory_model = ""
+        if facts.backend == "cuda":
+            memory_model = "discrete"
+        elif facts.backend == "mps":
+            memory_model = "unified"
         return pb.WorkerResources(
-            gpu_count=facts.gpu_count,
-            gpu_name=facts.gpu_name,
-            gpu_sm=facts.gpu_sm,
-            vram_total_bytes=facts.vram_total_bytes,
-            driver_version=facts.driver_version,
             platform=facts.platform,
+            backend=facts.backend,
+            memory_model=memory_model,
+            device_count=facts.gpu_count,
+            device_name=facts.gpu_name,
+            device_memory_total_bytes=facts.vram_total_bytes,
+            driver_version=facts.driver_version,
             host_ram_total_bytes=facts.host_ram_total_bytes,
             vcpu_count=facts.vcpu_count,
-            pinned_capacity_bytes=self.ledger.pinned_budget,
             unreadable=list(facts.unreadable),
         )
 
@@ -1423,13 +1482,9 @@ class Supervisor:
         }
 
     def boot_failure(self, reason: pb.BootFailureReason, detail: str) -> pb.BootFailure:
-        """One boot verdict, classified ONCE, with its invoice attached.
-
-        A boot that cannot write its journal is a claim about the POD SHAPE, not a transient
-        to retry: requeueing onto an identically-sized disk reproduces it exactly and burns
-        the rental twice (th#2246). So the verdict travels with the numbers that justify it
-        and the worker exits rather than looping.
-        """
+        """One boot verdict, classified ONCE, with its invoice attached. Delivered on the
+        first claimed stream INSTEAD of ClaimAck (01) — the owner dials, so the verdict
+        waits for it."""
         invoice = self.disk_invoice()
         self.boot.step("load", "boot_failure", 0.0, reason=pb.BootFailureReason.Name(reason))
         return pb.BootFailure(
@@ -1442,89 +1497,48 @@ class Supervisor:
         )
 
     def run(self) -> int:
-        """Link, register, serve, relink. The session outlives the connection.
-
-        The loop is the same whichever coordinator drives it — that is the point of the
-        transport seam. What differs is `reconnects`: a network peer that drops the stream
-        may come back and the worker redials the SAME session; an in-memory coordinator that
-        ends the stream has ended the run, and redialling it would be a hang.
-        """
+        """Serve until stopped. The worker outlives any one stream: an owner that drops
+        the connection re-dials and re-claims the SAME boot; the in-memory host ending its
+        one stream is the run ending."""
         try:
             self.journal.append(
                 "session",
-                {"session_id": self.fences.session_id, "instance_id": self.options.instance_id},
+                {"worker_boot_id": self.fences.boot_id, "instance_id": self.options.instance_id},
             )
         except JournalError as exc:
-            # The worker cannot durably commit anything, so it claims nothing and executes
-            # nothing. It still SAYS SO, once, with the disk numbers behind the claim.
-            failure = self.boot_failure(
+            self.boot_fatal = self.boot_failure(
                 pb.BootFailureReason.BOOT_FAILURE_REASON_DISK_SHAPE, exc.detail
             )
-            self.note("boot", f"BOOT FAILURE (disk shape): {failure.detail}")
-            link = self.link = self.coordinator.link()
-            with contextlib.suppress(LinkError):
-                link.control(self.outbound_iterator())
-                self.send(pb.WorkerMessage(boot_failure=failure))
-                time.sleep(0.1)
-            self.stop.set()
-            self.outbound.put(None)
-            link.cancel()
-            self.journal.close()
-            return int(Exit.internal)
-        # A path the kernel cannot bind is a POD SHAPE claim, like the disk one above, and
-        # it is knowable before anything is spawned. Saying so here is the difference
-        # between a named cause at `serve` and a worker that exits before advertising a
-        # plan (cl-013).
-        unbindable = socket_path_refusal(self.supervision.socket_path)
-        if unbindable:
-            failure = self.boot_failure(
-                pb.BootFailureReason.BOOT_FAILURE_REASON_CONFIG_INVALID, unbindable
-            )
-            self.note("boot", f"BOOT FAILURE (config): {unbindable}")
-            link = self.link = self.coordinator.link()
-            with contextlib.suppress(LinkError):
-                link.control(self.outbound_iterator())
-                self.send(pb.WorkerMessage(boot_failure=failure))
-                time.sleep(0.1)
-            self.stop.set()
-            self.outbound.put(None)
-            link.cancel()
-            self.journal.close()
-            return int(Exit.structural)
-        killed = self.supervision.sweep_orphans()
-        if killed:
-            self.note(
-                "recovery",
-                f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
-            )
-        threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
-        threading.Thread(target=self.reporter, daemon=True, name="report").start()
-        threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
-
-        backoff = 0.2
-        while not self.stop.is_set():
-            link = self.link = self.coordinator.link()
-            try:
-                threading.Thread(
-                    target=self.pump_progress, args=(link,), daemon=True, name="progress"
-                ).start()
-                responses = link.control(self.outbound_iterator())
-                self.send(pb.WorkerMessage(register=self.register()))
-                for attempt in self.engine.pending_terminals():
-                    self.note(
-                        "terminal",
-                        f"replaying the journaled terminal for {attempt.request_id}#"
-                        f"{attempt.attempt} in a fresh envelope ({attempt.terminal_id})",
-                    )
-                    self.send(pb.WorkerMessage(attempt_terminal=self.engine.wrap(attempt)))
-                self.reader(responses)
-            except LinkError as exc:
-                self.note("session", f"stream error: {exc}")
-            if self.stop.is_set() or not self.coordinator.reconnects:
-                break
-            self.note("session", f"reconnecting in {backoff:.1f} s (same session)")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 5.0)
+            self.exit_code = int(Exit.internal)
+            self.note("boot", f"BOOT FAILURE (disk shape): {self.boot_fatal.detail}")
+        if self.boot_fatal is None:
+            unbindable = socket_path_refusal(self.supervision.socket_path)
+            if unbindable:
+                self.boot_fatal = self.boot_failure(
+                    pb.BootFailureReason.BOOT_FAILURE_REASON_CONFIG_INVALID, unbindable
+                )
+                self.exit_code = int(Exit.structural)
+                self.note("boot", f"BOOT FAILURE (config): {unbindable}")
+        if self.boot_fatal is None:
+            killed = self.supervision.sweep_orphans()
+            if killed:
+                self.note(
+                    "recovery",
+                    f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
+                )
+            # Recovery replays the journal ONCE at boot; the snapshot on every later claim
+            # reads the engine's own held state.
+            recovered = self.engine.recover()
+            if recovered:
+                self.note(
+                    "recovery",
+                    f"the recovered journal holds {len(recovered)} attempt(s); they ride "
+                    "the snapshot and the owner closes them before minting any next ordinal",
+                )
+            threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
+            threading.Thread(target=self.reporter, daemon=True, name="report").start()
+            threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
+        self.host.serve(self)
         self.shutdown()
         return self.exit_code
 
@@ -1537,22 +1551,23 @@ class Supervisor:
         self.stop.set()
         self.work.put(None)
         self.outbound.put(None)
-        if self.link is not None:
-            self.link.cancel()
+        self.watches.end_all()
+        self.host.stop()
         self.supervision.close()
         self.journal.close()
         print(
-            "[supervisor] summary "
+            "[worker] summary "
             + json.dumps(
                 {
-                    "session_id": self.fences.session_id,
-                    "incarnations": self.supervision.spawns,
+                    "worker_boot_id": self.fences.boot_id,
+                    "control_generation": self.fences.generation,
+                    "executor_generations": self.supervision.spawns,
                     "readiness_epoch": self.supervision.readiness_epoch,
                     "executed": self.engine.executed,
                     "journal_appends": self.journal.appends,
                     "journal_fsync_ms": round(self.journal.fsync_ns / 1e6, 2),
-                    "progress_sent": self.progress_sent,
-                    "progress_shed": self.progress_shed,
+                    "progress_sent": self.watches.sent,
+                    "progress_shed": self.watches.shed,
                     "hub_calls_allowed": self.authorizer.allowed,
                     "hub_calls_refused": len(self.authorizer.refusals),
                     "seam": seam,
@@ -1565,16 +1580,17 @@ class Supervisor:
         )
 
 
-def supervise(config: RuntimeConfig, argv: list[str] | None = None) -> int:
-    """Parse the launch flags and run ONE supervisor against a real coordinator.
+def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
+    """Parse the launch flags and run ONE worker hosting the protocol.
 
-    Not an entrypoint: the config arrives from whoever already read it. `cozy-runtime serve`
-    reads the environment for its own verb dispatch and then calls this, and a second read
-    inside here refused `config_authority` — one config per process — so every worker the
-    CLI launched exited 1 before it could register (cl-004).
+    Not an entrypoint: the config arrives from whoever already read it (one config per
+    process, cl-004). `--listen` is the local binding this worker SERVES on — the owner
+    dials it; the worker never dials anyone (#436).
     """
-    parser = argparse.ArgumentParser(description="cozy-runtime worker supervisor (no CUDA)")
-    parser.add_argument("--hub", required=True, help="gRPC target, e.g. unix:/path/hub.sock")
+    parser = argparse.ArgumentParser(description="cozy-runtime worker (no CUDA)")
+    parser.add_argument(
+        "--listen", required=True, help="local binding, e.g. unix:/path/control.sock or 127.0.0.1:0"
+    )
     parser.add_argument("--root", required=True)
     parser.add_argument("--worker-id", default="wrk-local")
     parser.add_argument("--instance-id", default="")
@@ -1588,6 +1604,8 @@ def supervise(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--host-budget", type=int, default=8 << 30)
     parser.add_argument("--pinned-budget", type=int, default=512 << 20)
     parser.add_argument("--no-warm", action="store_true")
+    parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
+    parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
 
     options = WorkerOptions(
@@ -1605,28 +1623,55 @@ def supervise(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         pinned_budget=args.pinned_budget,
         no_warm=args.no_warm,
     )
-    supervisor = Supervisor(config, options, GrpcCoordinator(args.hub))
+    listen = args.listen
+    if listen.startswith("unix:"):
+        refusal = socket_path_refusal(listen[len("unix:") :])
+        if refusal:
+            print(f"[worker] {refusal}", file=sys.stderr, flush=True)
+            return int(Exit.structural)
+    tls_cert = Path(args.tls_cert) if args.tls_cert else None
+    tls_key = Path(args.tls_key) if args.tls_key else None
+    if (tls_cert is None) != (tls_key is None):
+        print("[worker] --tls-cert and --tls-key come together or not at all", file=sys.stderr)
+        return int(Exit.structural)
+    host_part = listen.rsplit(":", 1)[0]
+    if (
+        not listen.startswith("unix:")
+        and host_part not in ("127.0.0.1", "localhost", "::1")
+        and tls_cert is None
+    ):
+        # A worker never listens plaintext off-loopback: the remote leg is TLS + the
+        # bearer owner token, or it does not exist (#445; cr-020 item 4 keeps loopback).
+        print(
+            f"[worker] refusing to bind {listen} without TLS: a non-loopback listener "
+            "requires --tls-cert/--tls-key",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
+    host = GrpcControlHost(
+        listen, Path(args.root) / "control.addr", tls_cert=tls_cert, tls_key=tls_key
+    )
+    worker = Worker(config, options, host)
 
     def terminate(signum: int, frame: object) -> None:
-        supervisor.stop.set()
-        supervisor.outbound.put(None)
-        if supervisor.link is not None:
-            # Half-closing the request stream is not enough: the peer's response generator
-            # may be parked waiting to send. Cancelling ends the call from this side.
-            supervisor.link.cancel()
+        worker.stop.set()
+        worker.outbound.put(None)
+        worker.work.put(None)
+        host.stop()
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     try:
-        return supervisor.run()
+        return worker.run()
     except JournalError as exc:
-        print(f"[supervisor] {exc}", file=sys.stderr, flush=True)
+        print(f"[worker] {exc}", file=sys.stderr, flush=True)
         return int(Exit.internal)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The PROCESS entrypoint: read the ONE config here, then supervise."""
-    return supervise(read_config(), argv)
+    """The PROCESS entrypoint: read the ONE config here, then serve."""
+    return serve_worker(read_config(), argv)
 
 
 if __name__ == "__main__":

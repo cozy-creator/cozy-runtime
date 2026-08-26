@@ -1,10 +1,13 @@
 """DeliveryGrant reads and writes, and the CLOSED hub-call authorization table.
 
-The grant is refreshable AUTHORITY, never meaning: it is outside `exec_spec_digest`, and a
-refresh may re-derive exactly `{credential, expires_at_unix, urls}` and nothing else
-(worker-protocol/01 §5). This module is where that authority is SPENT — the only place the
-supervisor reads an input or writes an output — and every spend goes through
-`authorize()` first.
+The grant is refreshable ACCESS, never meaning (worker-protocol/01, #439): input
+identities, lengths, media kinds and output contracts live INSIDE the InvocationSpec's
+digested document, and the grant carries exactly `{invocation_digest, credential, urls,
+expiry}`. `bind()` is the JOIN — one BoundGrant per attempt, spec identity zipped to grant
+access, refused typed when the two disagree — and a refresh may re-derive access and
+nothing else: there is no field left for it to substitute meaning through. This module is
+where that authority is SPENT — the only place the worker reads an input or writes an
+output — and every spend goes through `authorize()` first.
 
 **The table is closed** (§3.1). Method + full-path regex + enumerated params, and a refusal
 is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and reported as a
@@ -24,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -120,6 +124,99 @@ class Authorizer:
         )
 
 
+# --------------------------------------------------------------------------- the join
+
+
+@dataclass(frozen=True, slots=True)
+class BoundInput:
+    """One input: identity from the SPEC (inside the digest), access from the GRANT."""
+
+    input_id: str
+    url: str
+    digest: bytes  # raw 32-byte sha256, or b"" when the spec declares none (a tree)
+    length: int
+    kind_mime: str
+    order: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoundOutput:
+    """One output destination: contract from the SPEC, presigned/granted URL from the GRANT."""
+
+    output_id: str
+    url: str
+    max_bytes: int
+    mime_type: str
+
+
+@dataclass(slots=True)
+class BoundGrant:
+    """The attempt's one working view of spec identity + grant access."""
+
+    file_base_url: str = ""
+    expires_at_unix: int = 0
+    credential_epoch: int = 0
+    inputs: dict[str, BoundInput] = field(default_factory=dict)
+    outputs: dict[str, BoundOutput] = field(default_factory=dict)
+
+
+def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: bytes) -> BoundGrant:
+    """JOIN the InvocationSpec document's identities to the grant's access, typed refusals.
+
+    The grant serves exactly one invocation: its `invocation_digest` must name this
+    attempt's. The id SETS must agree exactly — an input the spec declares with no access
+    is unfetchable, and access to an id the spec never declared is authority nobody's
+    digest covers.
+    """
+    if grant.invocation_digest and bytes(grant.invocation_digest) != invocation_digest:
+        raise GrantRefusal(
+            "grant_subject_mismatch",
+            "the delivery grant names a different invocation_digest than this attempt; a "
+            "grant serves exactly one invocation and a refresh can change access only",
+        )
+    spec_inputs = {str(row["input_id"]): row for row in spec.get("inputs", ())}
+    grant_inputs = {entry.input_id: entry.url for entry in grant.inputs}
+    if set(spec_inputs) != set(grant_inputs):
+        raise GrantRefusal(
+            "grant_binding_mismatch",
+            f"the spec declares inputs {sorted(spec_inputs) or 'none'} and the grant "
+            f"carries access for {sorted(grant_inputs) or 'none'}; the sets must agree "
+            "exactly",
+        )
+    spec_outputs = {str(row["output_id"]): row for row in spec.get("outputs", ())}
+    grant_outputs = {entry.output_id: entry.url for entry in grant.outputs}
+    if set(spec_outputs) != set(grant_outputs):
+        raise GrantRefusal(
+            "grant_binding_mismatch",
+            f"the spec declares outputs {sorted(spec_outputs) or 'none'} and the grant "
+            f"carries access for {sorted(grant_outputs) or 'none'}; the sets must agree "
+            "exactly",
+        )
+    bound = BoundGrant(
+        file_base_url=grant.file_base_url,
+        expires_at_unix=int(grant.expires_at_unix),
+        credential_epoch=int(grant.credential.epoch),
+    )
+    for order, (input_id, row) in enumerate(sorted(spec_inputs.items())):
+        spelled = str(row.get("digest", ""))
+        bound.inputs[input_id] = BoundInput(
+            input_id=input_id,
+            url=grant_inputs[input_id],
+            digest=bytes.fromhex(spelled[7:]) if spelled.startswith("sha256:") else b"",
+            length=int(row.get("length", 0)),
+            kind_mime=str(row.get("kind_mime", "")),
+            order=int(row.get("order", order)),
+        )
+    for output_id, row in spec_outputs.items():
+        bound.outputs[output_id] = BoundOutput(
+            output_id=output_id,
+            url=grant_outputs[output_id],
+            max_bytes=int(row.get("max_bytes", 0)),
+            mime_type=str(row.get("mime_type", "")),
+        )
+    return bound
+
+
 # --------------------------------------------------------------------------- grant I/O
 
 
@@ -167,15 +264,14 @@ def _read_granted(url: str, base: str, *, declared: int, policy: Any, what: str)
     return egress.fetch(absolute, policy, declared=declared, what=what)
 
 
-def expired(grant: pb.DeliveryGrant, now: float | None = None) -> bool:
+def expired(grant: BoundGrant, now: float | None = None) -> bool:
     at = time.time() if now is None else now
     return bool(grant.expires_at_unix) and grant.expires_at_unix < at
 
 
-def read_input(
-    grant: pb.DeliveryGrant, input_id: str, auth: Authorizer, policy: Any = None
-) -> bytes:
-    """One granted input, verified against the grant's own digest and length."""
+def read_input(grant: BoundGrant, input_id: str, auth: Authorizer, policy: Any = None) -> bytes:
+    """One bound input, verified against the SPEC's digest and length (the grant carries
+    access only, #439)."""
     from cozy_runtime.internal import egress
 
     if expired(grant):
@@ -185,43 +281,42 @@ def read_input(
             "a NEW attempt, never a patch to this one",
         )
     policy = policy or egress.EgressPolicy()
-    for entry in grant.inputs:
-        if entry.input_id != input_id:
-            continue
-        url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
-        auth.authorize(
-            "grant_input_read" if url.startswith("file://") else "grant_input_fetch",
-            "GET",
-            url,
-            {"input_id": input_id},
+    entry = grant.inputs.get(input_id)
+    if entry is None:
+        raise GrantRefusal(
+            "input_absent",
+            f"no bound input {input_id!r} (this attempt has "
+            f"{', '.join(sorted(grant.inputs)) or 'none'})",
         )
-        try:
-            data = _read_granted(
-                entry.url,
-                grant.file_base_url,
-                declared=int(entry.length),
-                policy=policy,
-                what=f"input {input_id!r}",
-            )
-        except egress.EgressRefusal as exc:
-            raise GrantRefusal(exc.code, exc.detail) from exc
-        if entry.length and len(data) != entry.length:
-            raise GrantRefusal(
-                "input_length_mismatch",
-                f"{input_id}: grant declares {entry.length} B, read {len(data)} B",
-            )
-        if entry.digest and hashlib.sha256(data).digest() != entry.digest:
-            raise GrantRefusal(
-                "input_digest_mismatch",
-                f"{input_id}: content digest disagrees with the grant — a signed grant never "
-                "bypasses the local bytes check",
-            )
-        return data
-    raise GrantRefusal(
-        "input_absent",
-        f"the grant carries no input {input_id!r} (it has "
-        f"{', '.join(e.input_id for e in grant.inputs) or 'none'})",
+    url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
+    auth.authorize(
+        "grant_input_read" if url.startswith("file://") else "grant_input_fetch",
+        "GET",
+        url,
+        {"input_id": input_id},
     )
+    try:
+        data = _read_granted(
+            entry.url,
+            grant.file_base_url,
+            declared=int(entry.length),
+            policy=policy,
+            what=f"input {input_id!r}",
+        )
+    except egress.EgressRefusal as exc:
+        raise GrantRefusal(exc.code, exc.detail) from exc
+    if entry.length and len(data) != entry.length:
+        raise GrantRefusal(
+            "input_length_mismatch",
+            f"{input_id}: the spec declares {entry.length} B, read {len(data)} B",
+        )
+    if entry.digest and hashlib.sha256(data).digest() != entry.digest:
+        raise GrantRefusal(
+            "input_digest_mismatch",
+            f"{input_id}: content digest disagrees with the invocation spec — a grant never "
+            "bypasses the local bytes check",
+        )
+    return data
 
 
 #: How a granted input TREE is spelled on a DeliveryGrant. The `input_id` carries the ref
@@ -242,7 +337,7 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def hydrate_inputs(
-    grant: pb.DeliveryGrant,
+    grant: BoundGrant,
     auth: Authorizer,
     *,
     spool: Path,
@@ -268,7 +363,7 @@ def hydrate_inputs(
         raise GrantRefusal("grant_expired", "the delivery grant expired before hydration")
     entries = [
         e
-        for e in grant.inputs
+        for e in sorted(grant.inputs.values(), key=lambda e: (e.order, e.input_id))
         if e.input_id != PAYLOAD_INPUT and not e.input_id.startswith(TREE_PREFIX)
     ]
     declared_total = sum(int(e.length) for e in entries)
@@ -331,7 +426,7 @@ def release_inputs(spool: Path) -> int:
     return removed
 
 
-def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Path, str]]:
+def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str]]:
     """Every granted input tree, as `ref -> (root, declared digest)` (cr-009).
 
     The BYTES of a tree are not re-hashed here and that is a layering statement, not a gap:
@@ -344,7 +439,7 @@ def read_trees(grant: pb.DeliveryGrant, auth: Authorizer) -> dict[str, tuple[Pat
     if expired(grant):
         raise GrantRefusal("grant_expired", "the delivery grant expired before the tree read")
     out: dict[str, tuple[Path, str]] = {}
-    for entry in grant.inputs:
+    for entry in sorted(grant.inputs.values(), key=lambda e: e.input_id):
         if not entry.input_id.startswith(TREE_PREFIX):
             continue
         ref = entry.input_id[len(TREE_PREFIX) :]
@@ -419,7 +514,7 @@ class PublicationReceipt:
 
 
 def write_output(
-    grant: pb.DeliveryGrant,
+    grant: BoundGrant,
     output_id: str,
     data: bytes,
     auth: Authorizer,
@@ -434,41 +529,35 @@ def write_output(
     """
     if expired(grant):
         raise GrantRefusal("grant_expired", "the output grant expired before the write")
-    for destination in grant.outputs:
-        if destination.output_id != output_id:
-            continue
-        url = (
-            destination.url
-            if "://" in destination.url
-            else grant.file_base_url.rstrip("/") + "/" + destination.url
+    destination = grant.outputs.get(output_id)
+    if destination is None:
+        raise GrantRefusal(
+            "destination_absent",
+            f"no granted destination {output_id!r} (this attempt names "
+            f"{', '.join(sorted(grant.outputs)) or 'none'}) — an output the owner did not "
+            "grant is unwritable, however the attempt produced it",
         )
-        auth.authorize(
-            "grant_output_write", "PUT", url, {"output_id": output_id, "length": len(data)}
+    url = (
+        destination.url
+        if "://" in destination.url
+        else grant.file_base_url.rstrip("/") + "/" + destination.url
+    )
+    auth.authorize("grant_output_write", "PUT", url, {"output_id": output_id, "length": len(data)})
+    if destination.max_bytes and len(data) > destination.max_bytes:
+        raise GrantRefusal(
+            "output_too_large",
+            f"{output_id}: {len(data)} B over the granted {destination.max_bytes} B",
         )
-        if destination.max_bytes and len(data) > destination.max_bytes:
-            raise GrantRefusal(
-                "output_too_large",
-                f"{output_id}: {len(data)} B over the granted {destination.max_bytes} B",
-            )
-        path = _local(destination.url, grant.file_base_url)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        return pb.OutputEntry(
-            output_id=output_id,
-            digest=hashlib.sha256(data).digest(),
-            length=len(data),
-            # The media type the AUTHOR declared when the asset was saved. It used to be
-            # hard-coded `application/octet-stream`, which made every client that trusts
-            # this field write an extensionless file — and a client that sniffs instead is
-            # a client deciding what the endpoint produced, which is the wrong owner.
-            # `application/octet-stream` remains the honest answer when nothing declared one.
-            mime_type=media_type or "application/octet-stream",
-        )
-    raise GrantRefusal(
-        "destination_absent",
-        f"no granted destination {output_id!r} (the grant names "
-        f"{', '.join(d.output_id for d in grant.outputs) or 'none'}) — an output the "
-        "coordinator did not grant is unwritable, however the attempt produced it",
+    path = _local(destination.url, grant.file_base_url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return pb.OutputEntry(
+        output_id=output_id,
+        digest=hashlib.sha256(data).digest(),
+        length=len(data),
+        # The media type the AUTHOR declared when the asset was saved.
+        # `application/octet-stream` remains the honest answer when nothing declared one.
+        mime_type=media_type or "application/octet-stream",
     )
 
 

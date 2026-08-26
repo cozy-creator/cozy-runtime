@@ -4,7 +4,6 @@ import grpc
 import warnings
 
 from cozy_runtime.protocol import worker_pb2 as cozy_dot_worker_dot_v1_dot_worker__pb2
-from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
@@ -26,10 +25,8 @@ if _version_not_supported:
     )
 
 
-class WorkerStub(object):
-    """The worker (the cozy-runtime supervisor) is the gRPC CLIENT; the hub (tensorhub, or
-    cozy-creator local-first) is the gRPC SERVER. All RPCs multiplex on one HTTP/2 connection;
-    their durability attributes differ.
+class WorkerControlStub(object):
+    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
     """
 
     def __init__(self, channel):
@@ -39,84 +36,64 @@ class WorkerStub(object):
             channel: A grpc.Channel.
         """
         self.Control = channel.stream_stream(
-                '/cozy.worker.v1.Worker/Control',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerMessage.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CoordinatorMessage.FromString,
+                '/cozy.worker.v1.WorkerControl/Control',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.FromString,
                 _registered_method=True)
-        self.StreamProgress = channel.stream_unary(
-                '/cozy.worker.v1.Worker/StreamProgress',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.SerializeToString,
-                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
-                _registered_method=True)
-        self.Purge = channel.stream_stream(
-                '/cozy.worker.v1.Worker/Purge',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.FromString,
+        self.WatchProgress = channel.unary_stream(
+                '/cozy.worker.v1.WorkerControl/WatchProgress',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProgressOpen.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.FromString,
                 _registered_method=True)
 
 
-class WorkerServicer(object):
-    """The worker (the cozy-runtime supervisor) is the gRPC CLIENT; the hub (tensorhub, or
-    cozy-creator local-first) is the gRPC SERVER. All RPCs multiplex on one HTTP/2 connection;
-    their durability attributes differ.
+class WorkerControlServicer(object):
+    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
     """
 
     def Control(self, request_iterator, context):
-        """RPC 1 - durable bidi control: one bidirectional stream, one causal order, one fence.
-        Durable messages are NEVER shed to backpressure. Terminal authority lives only here.
+        """Durable control: the owner's request stream carries OwnerFrames, the worker's response
+        stream carries WorkerFrames. Durable messages are never shed to backpressure. Terminal
+        authority lives only here. gRPC orders each DIRECTION independently — there is no cross-
+        direction causal order; causality is expressed by revisions, snapshot ids, and acks.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def StreamProgress(self, request_iterator, context):
-        """RPC 2 - bounded LOSSY progress (worker->hub). Sequence-numbered, gaps visible, oldest
-        shed first on overflow, no terminal authority. Saturating it can never block Control.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Purge(self, request_iterator, context):
-        """RPC 3 - RESERVED, post-M9 (cr-013/tfs-014). Independent durable purge exchange, NOT
-        nested in Directive, so a full-replace deployment change can never forget a
-        confidentiality obligation. Schema and numbers are frozen now; the launch conformance
-        surface contains no Purge case.
+    def WatchProgress(self, request, context):
+        """Bounded LOSSY progress, worker->owner server-streaming. Sequence-numbered, gaps visible,
+        oldest shed first on overflow, no terminal authority. Where the contract promises that
+        progress saturation cannot block control, the owner opens WatchProgress on a PHYSICALLY
+        SEPARATE HTTP/2 connection — separate streams on one TCP connection do not prove it.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_WorkerServicer_to_server(servicer, server):
+def add_WorkerControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Control': grpc.stream_stream_rpc_method_handler(
                     servicer.Control,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerMessage.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CoordinatorMessage.SerializeToString,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.SerializeToString,
             ),
-            'StreamProgress': grpc.stream_unary_rpc_method_handler(
-                    servicer.StreamProgress,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.FromString,
-                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
-            ),
-            'Purge': grpc.stream_stream_rpc_method_handler(
-                    servicer.Purge,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.SerializeToString,
+            'WatchProgress': grpc.unary_stream_rpc_method_handler(
+                    servicer.WatchProgress,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProgressOpen.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'cozy.worker.v1.Worker', rpc_method_handlers)
+            'cozy.worker.v1.WorkerControl', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('cozy.worker.v1.Worker', rpc_method_handlers)
+    server.add_registered_method_handlers('cozy.worker.v1.WorkerControl', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class Worker(object):
-    """The worker (the cozy-runtime supervisor) is the gRPC CLIENT; the hub (tensorhub, or
-    cozy-creator local-first) is the gRPC SERVER. All RPCs multiplex on one HTTP/2 connection;
-    their durability attributes differ.
+class WorkerControl(object):
+    """The worker supervisor is the gRPC SERVER; the record-plane owner is the CLIENT.
     """
 
     @staticmethod
@@ -133,9 +110,9 @@ class Worker(object):
         return grpc.experimental.stream_stream(
             request_iterator,
             target,
-            '/cozy.worker.v1.Worker/Control',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerMessage.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.CoordinatorMessage.FromString,
+            '/cozy.worker.v1.WorkerControl/Control',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.OwnerFrame.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkerFrame.FromString,
             options,
             channel_credentials,
             insecure,
@@ -147,7 +124,7 @@ class Worker(object):
             _registered_method=True)
 
     @staticmethod
-    def StreamProgress(request_iterator,
+    def WatchProgress(request,
             target,
             options=(),
             channel_credentials=None,
@@ -157,39 +134,12 @@ class Worker(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
+        return grpc.experimental.unary_stream(
+            request,
             target,
-            '/cozy.worker.v1.Worker/StreamProgress',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.SerializeToString,
-            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def Purge(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/cozy.worker.v1.Worker/Purge',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PurgeMessage.FromString,
+            '/cozy.worker.v1.WorkerControl/WatchProgress',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ProgressOpen.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.AttemptProgress.FromString,
             options,
             channel_credentials,
             insecure,

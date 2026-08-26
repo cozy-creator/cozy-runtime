@@ -1,23 +1,26 @@
 """The local slice: one request, through the REAL protocol path, with no network.
 
 This is §8's one-kernel rule made executable. A one-shot local run does not get its own
-execution implementation — it gets an EPHEMERAL LOCAL SUPERVISOR whose coordinator is a pair
-of in-process queues instead of a gRPC channel. Everything below that substitution is the
-production path, unchanged and un-branched:
+execution implementation — it gets an EPHEMERAL LOCAL WORKER whose owner is a pair of
+in-process queues instead of a dialing gRPC client (#436: the owner dials; here the "dial"
+is frame delivery). Everything below that substitution is the production path, unchanged
+and un-branched:
 
-    the same `ExecutionSpec` canonical bytes and the same digest recomputation
+    the same Claim -> ClaimAck -> snapshot -> SnapshotAck handshake and envelope fence
+    the same `InvocationSpec` canonical bytes and the same digest recomputation
     the same atomic acceptance boundary (payload fetch -> features -> plan -> prepare ->
       reserve -> JOURNAL -> AttemptAccepted)
-    the same supervisor/executor process boundary, exec-first trampoline and env seal
+    the same worker/executor process boundary, exec-first trampoline and env seal
     the same durable journal, the same terminal-before-send rule, the same TerminalAck
     the same output grant, freeze point, tail and manifest
     the same ledger, reconciled at attempt close
 
 The only two things that are LOCAL are stated out loud here rather than hidden:
 
-1. **The coordinator is this module.** It mints the revision, resolves the binding plan id,
-   builds the spec document, grants the payload input and one destination per output field
-   path, and acks the terminal. That is exactly cl-001's job on the network path.
+1. **The owner is this module.** It claims the worker, mints the revision and the
+   deployment set, resolves the binding plan id, builds the spec document, grants the
+   payload input and one destination per output field path, and acks the terminal. That is
+   exactly the local client's job on the network path.
 2. **The journal is DELETABLE** after a fully acknowledged terminal (§8). It is deleted at
    the END, never before: a run that is killed mid-attempt leaves its journal behind, which
    is what makes the next run's recovery honest instead of amnesiac.
@@ -40,16 +43,22 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
-from cozy_runtime.internal.worker.control import InMemoryLink, Link
-from cozy_runtime.internal.worker.session import Supervisor, WorkerOptions
+from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+#: The one local deployment's owner-minted routing key (#446). Routing, never identity:
+#: the InvocationSpec digest deliberately excludes it.
+LOCAL_DEPLOYMENT = "dpl-local"
+
+_M = TypeVar("_M")
 
 #: What an OUTPUT TRANSACTION is allowed AFTER the handler returns: read the attempt spool,
 #: write every granted destination, mint the receipt. The grant outlives the attempt by this
@@ -151,14 +160,13 @@ class SliceOutcome:
 
 
 class LocalCoordinator:
-    """The in-memory control adapter — the coordinator half of th-024, in this process.
+    """The in-memory OWNER — the record-plane half of th-024, in this process.
 
-    It is a real coordinator in every way that the worker can observe: it speaks only
-    `cozy.worker.v1` messages, it never reaches inside the supervisor, and it learns
-    readiness the way a hub does — from a durable Report, not from a Python attribute.
+    It is a real owner in every way that the worker can observe: it claims first, speaks
+    only `cozy.worker.v1` frames under the three-field envelope, reconciles the snapshot
+    before dispatching, and learns readiness the way a hub does — from a durable Report's
+    per-deployment status, not from a Python attribute.
     """
-
-    reconnects = False
 
     def __init__(
         self,
@@ -173,7 +181,7 @@ class LocalCoordinator:
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_plan_id
-        #: JOB mode: the durable checkpoint requests this coordinator answered, in order.
+        #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
         self.release_id = release_id
@@ -181,10 +189,15 @@ class LocalCoordinator:
         self.ready_timeout = ready_timeout
         self.ended = "unstarted"
         self.error = ""
-        self._link = InMemoryLink()
-        self._link.on_message = self._on_message
-        self._link.on_progress = on_progress
-        self.session_id = ""
+        self.host = InMemoryControlHost()
+        self.host.on_frame = self._on_frame
+        self._on_progress = on_progress
+        self.progress_frames: list[pb.AttemptProgress] = []
+        #: the accepted envelope this owner speaks under, learned from ClaimAck
+        self.owner_epoch = 1
+        self.generation = 0
+        self.boot_id = ""
+        self.snapshot_entries: list[pb.ActiveAttempt] = []
         self.dispatched = False
         self.accepted: pb.AttemptAccepted | None = None
         self.terminal: pb.AttemptTerminal | None = None
@@ -194,30 +207,28 @@ class LocalCoordinator:
         self.marks: dict[str, float] = {"start": time.perf_counter()}
         self.grant_dir = workspace / "grants"
         self.output_dir = workspace / "outputs"
-
-    @property
-    def progress_frames(self) -> list[pb.AttemptProgress]:
-        """What arrived on the LOSSY lane. Bounded, and never load-bearing for the result."""
-        return self._link.progress_frames
+        # THE CLAIM IS QUEUED BEFORE THE WORKER SERVES: the worker's stream conversation
+        # begins by reading it, exactly as a dialing owner's first frame arrives first.
+        claim = pb.Claim(
+            owner_epoch=self.owner_epoch,
+            controller_id="local-run",
+            wire_minor=WIRE_MINOR,
+        )
+        self.host.deliver(pb.OwnerFrame(claim=claim))
+        threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()
 
     def destination(self, output_id: str) -> Path:
         """The exact granted destination for one output field path."""
         return self.output_dir / self._filename(output_id)
 
-    # ------------------------------------------------------------------ Coordinator
-
-    def target(self) -> str:
-        return "local:in-memory"
-
-    def link(self) -> Link:
-        # A one-shot run gets a readiness DEADLINE. With the worker reporting an intake
-        # error on a failed preparation this rarely fires, but "rarely" is not "never", and
-        # a local run that hangs forever waiting for a worker that will not arrive is worse
-        # than one that says so: a person is sitting in front of it.
-        threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()
-        return self._link
+    def tap_progress(self, frame: pb.AttemptProgress) -> None:
+        """The lossy lane's in-process observer (the local door's one watcher)."""
+        self.progress_frames.append(frame)
+        if self._on_progress is not None:
+            self._on_progress(frame)
 
     def _deadline(self) -> None:
+        # A one-shot run gets a readiness DEADLINE: a person is sitting in front of it.
         if self.done.wait(self.ready_timeout):
             return
         if not self.dispatched:
@@ -228,63 +239,83 @@ class LocalCoordinator:
                 flush=True,
             )
             self.done.set()
-            self._link.close()
+            self.host.close()
+
+    def _env(self, message: _M) -> _M:
+        """The owner's half of the three-field envelope (02 §0)."""
+        inner: Any = message
+        inner.owner_epoch = self.owner_epoch
+        inner.control_generation = self.generation
+        inner.worker_boot_id = self.boot_id
+        return message
 
     # ------------------------------------------------------------------ the exchange
 
-    def _on_message(self, message: pb.WorkerMessage) -> None:
-        """One coordinator-side message. A FAILURE HERE ENDS THE RUN, never hangs it.
-
-        Found live: a `KeyError` in the report handler killed the message-pump thread, and
-        the worker then talked to nobody for the full 1,800-second readiness deadline. A
-        one-shot run has a person in front of it — a coordinator that cannot do its job says
-        so and stops, exactly as it does when the worker reports an intake error.
-        """
+    def _on_frame(self, frame: pb.WorkerFrame) -> None:
+        """One owner-side frame. A FAILURE HERE ENDS THE RUN, never hangs it."""
         try:
-            self._dispatch_message(message)
+            self._dispatch_frame(frame)
         except LocalBindingError as exc:
-            # A CONDITION, not a coordinator fault: the run ends the same way, but it says
-            # which entrypoint had no plan instead of naming a KeyError.
             self.ended = "unbound_entrypoint"
             self.error = str(exc)[:400]
             print(f"[run] {self.error}", flush=True)
             self.done.set()
-            self._link.close()
+            self.host.close()
         except Exception as exc:
             self.ended = "coordinator_error"
             self.error = f"{type(exc).__name__}: {exc}"[:400]
-            print(f"[run] the coordinator failed: {self.error}", flush=True)
+            print(f"[run] the owner failed: {self.error}", flush=True)
             self.done.set()
-            self._link.close()
+            self.host.close()
 
-    def _dispatch_message(self, message: pb.WorkerMessage) -> None:
-        kind = message.WhichOneof("msg")
-        if kind == "register":
-            self._on_register(message.register)
+    def _dispatch_frame(self, frame: pb.WorkerFrame) -> None:
+        kind = frame.WhichOneof("msg")
+        if kind == "claim_ack":
+            self._on_claim_ack(frame.claim_ack)
+        elif kind == "snapshot_begin":
+            self.snapshot_entries = []
+        elif kind == "snapshot_entry":
+            self.snapshot_entries.append(frame.snapshot_entry.attempt)
+        elif kind == "snapshot_end":
+            self._on_snapshot_end(frame.snapshot_end)
+        elif kind == "boot_failure":
+            self.ended = "worker_error"
+            self.error = f"boot failure: {frame.boot_failure.detail}"[:400]
+            self.done.set()
+            self.host.close()
         elif kind == "report":
-            self._on_report(message.report)
+            self._on_report(frame.report)
         elif kind == "attempt_accepted":
-            self.accepted = message.attempt_accepted
+            self.accepted = frame.attempt_accepted
             self.marks["accepted"] = time.perf_counter()
         elif kind == "attempt_terminal":
-            self._on_terminal(message.attempt_terminal)
+            self._on_terminal(frame.attempt_terminal)
         elif kind == "checkpoint_request":
-            self._on_checkpoint(message.checkpoint_request)
+            self._on_checkpoint(frame.checkpoint_request)
 
-    def _on_register(self, register: pb.Register) -> None:
-        self.session_id = register.session_id
+    def _on_claim_ack(self, ack: pb.ClaimAck) -> None:
+        if not ack.accepted:
+            self.ended = "worker_error"
+            self.error = f"claim refused: {pb.ClaimRejection.Name(ack.rejection)}"
+            self.done.set()
+            self.host.close()
+            return
+        self.generation = ack.control_generation
+        self.boot_id = ack.worker_boot_id
         self.marks["registered"] = time.perf_counter()
-        self._send(
-            pb.CoordinatorMessage(
-                register_ack=pb.RegisterAck(
-                    session_id=register.session_id,
-                    executor_incarnation=register.executor_incarnation,
-                    wire_minor=WIRE_MINOR,
-                    accepted=True,
-                )
+
+    def _on_snapshot_end(self, end: pb.SnapshotEnd) -> None:
+        """Reconcile, ack the EXACT snapshot, and only then send the directive (02 §6).
+        A one-shot run on a fresh root expects an empty snapshot; entries are recorded so
+        a driver can assert on them."""
+        if len(self.snapshot_entries) != end.entry_count:
+            raise RuntimeError(
+                f"snapshot gap: {len(self.snapshot_entries)} entries, end says {end.entry_count}"
             )
+        self._send(
+            pb.OwnerFrame(snapshot_ack=self._env(pb.SnapshotAck(snapshot_id=end.snapshot_id)))
         )
-        self._send(pb.CoordinatorMessage(directive=self._directive()))
+        self._send(pb.OwnerFrame(directive=self._directive()))
 
     def _plan_id(self) -> str:
         """The binding plan this request runs against, or the typed refusal that it has none.
@@ -305,32 +336,9 @@ class LocalCoordinator:
         return plan_id
 
     def _on_report(self, report: pb.Report) -> None:
-        """READY is learned from the worker's own durable Report, like a hub learns it."""
+        """READY is learned from the worker's own durable Report — per-deployment status in
+        serving mode (#446), job capacity in job mode."""
         self.reports.append(report)
-        if self.request.kind == "job":
-            # The JOB lane reads JOB capacity. A worker with no job plan applied reports
-            # zero available, which is an ANSWER — not an unknown to keep polling through.
-            ready = (
-                report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-                and report.job_capacity.jobs_available > 0
-            )
-            if report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR:
-                self.marks.setdefault("ready", time.perf_counter())
-                if self.terminal is None:
-                    self.ended = "worker_error"
-                self.done.set()
-                self._link.close()
-                return
-            if ready and not self.dispatched:
-                self.marks["ready"] = time.perf_counter()
-                self.dispatched = True
-                self._dispatch(report.executor_incarnation)
-            return
-        plan_id = self._plan_id()
-        ready = (
-            report.intake_state == pb.IntakeState.INTAKE_STATE_READY
-            and plan_id in report.serving_capacity.ready_entrypoint_binding_plan_ids
-        )
         if report.intake_state == pb.IntakeState.INTAKE_STATE_ERROR:
             # The worker said it cannot become ready. That is an answer, and a one-shot run
             # ends on it instead of waiting for a readiness that will never come.
@@ -338,12 +346,28 @@ class LocalCoordinator:
             if self.terminal is None:
                 self.ended = "worker_error"
             self.done.set()
-            self._link.close()
+            self.host.close()
             return
+        if self.request.kind == "job":
+            ready = (
+                report.intake_state == pb.IntakeState.INTAKE_STATE_READY
+                and report.job_capacity.jobs_available > 0
+            )
+        else:
+            plan_id = self._plan_id()
+            status = next(
+                (d for d in report.deployments if d.deployment_id == LOCAL_DEPLOYMENT), None
+            )
+            ready = (
+                status is not None
+                and status.intake_state == pb.IntakeState.INTAKE_STATE_READY
+                and status.attempt_credits > 0
+                and plan_id in status.ready_entrypoint_binding_plan_ids
+            )
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
             self.dispatched = True
-            self._dispatch(report.executor_incarnation)
+            self._dispatch()
 
     def _on_terminal(self, terminal: pb.AttemptTerminal) -> None:
         self.terminal = terminal
@@ -352,20 +376,20 @@ class LocalCoordinator:
         if not self.auto_ack:
             return
         self._send(
-            pb.CoordinatorMessage(
-                terminal_ack=pb.TerminalAck(
-                    session_id=terminal.session_id,
-                    executor_incarnation=terminal.executor_incarnation,
-                    request_id=terminal.request_id,
-                    attempt=terminal.attempt,
-                    exec_spec_digest=terminal.exec_spec_digest,
-                    terminal_id=terminal.terminal_id,
-                    terminal_digest=terminal.terminal_digest,
+            pb.OwnerFrame(
+                terminal_ack=self._env(
+                    pb.TerminalAck(
+                        request_id=terminal.request_id,
+                        attempt=terminal.attempt,
+                        invocation_digest=terminal.invocation_digest,
+                        terminal_id=terminal.terminal_id,
+                        terminal_digest=terminal.terminal_digest,
+                    )
                 )
             )
         )
         self.done.set()
-        self._link.close()
+        self.host.close()
 
     # ------------------------------------------------------------------ documents
 
@@ -383,19 +407,11 @@ class LocalCoordinator:
         return int(time.time()) + self.request.timeout_ms // 1000 + GRANT_TAIL_SECONDS
 
     def _directive(self) -> pb.Directive:
-        directive = pb.Directive(
-            session_id=self.session_id,
-            revision=1,
-            posture=pb.Posture.POSTURE_ACCEPTING,
-            wire_minor=WIRE_MINOR,
-        )
-        directive.credential.CopyFrom(
-            pb.Credential(
-                issuer="cozy-runtime-local",
-                key_id="local",
-                epoch=1,
-                expires_at_unix=self.expiry(),
-                token=b"local",
+        directive = self._env(
+            pb.Directive(
+                revision=1,
+                posture=pb.Posture.POSTURE_ACCEPTING,
+                wire_minor=WIRE_MINOR,
             )
         )
         if self.request.kind == "job":
@@ -406,14 +422,28 @@ class LocalCoordinator:
                     build_id=self.release_id,
                     job_descriptor_id=self.request.job_descriptor_id,
                     resource_caps=pb.ResourceCaps(
-                        gpu_required=False, max_rss_bytes=0, max_disk_bytes=0
+                        device_required=False, max_rss_bytes=0, max_disk_bytes=0
                     ),
                     publication_contract=self._publication(),
                     reclaim_on_terminal=True,
                 )
             )
             return directive
-        directive.serving.entrypoint_binding_plan_ids.extend(sorted(set(self.bindings.values())))
+        # THE ONE-DIGESTER RULE (#454): the owner authors BOTH the structured set and its
+        # canonical document digest; the worker echoes the digest as the set's NAME.
+        deployment_set = pb.DeploymentSet(
+            deployments=[
+                pb.Deployment(
+                    deployment_id=LOCAL_DEPLOYMENT,
+                    endpoint_release_id=self.release_id,
+                    entrypoint_binding_plan_ids=sorted(set(self.bindings.values())),
+                )
+            ]
+        )
+        _, set_digest = documents.identity(deployment_set)
+        directive.deployment_set.CopyFrom(
+            pb.DeploymentSetDirective(set_digest=set_digest, set=deployment_set)
+        )
         return directive
 
     def scratch_repo(self) -> str:
@@ -432,15 +462,64 @@ class LocalCoordinator:
         return pb.PublicationContract(
             grant_id=self.scratch_repo(),
             outputs=[
-                pb.OutputSpec(output_id=output_id, max_bytes=64 << 20)
+                pb.OutputBinding(output_id=output_id, max_bytes=64 << 20)
                 for output_id in self.request.outputs
             ],
         )
 
-    def _dispatch(self, incarnation: int) -> None:
+    def _input_bindings(self, body: bytes) -> list[pb.InputBinding]:
+        """The ORDERED input identities — INSIDE the digest (#439). The payload, the job's
+        materialized trees, and cr-012's input assets, each with the digest/length this
+        owner holds (a tree's verification is the store's own, so it carries none)."""
+        rows = [
+            pb.InputBinding(
+                input_id="payload",
+                digest="sha256:" + hashlib.sha256(body).hexdigest(),
+                length=len(body),
+                kind_mime="application/json",
+                order=0,
+            )
+        ]
+        order = 1
+        for ref in sorted(self.request.trees):
+            rows.append(
+                pb.InputBinding(
+                    input_id=f"{grants_module.TREE_PREFIX}{ref}",
+                    kind_mime="inode/directory",
+                    order=order,
+                )
+            )
+            order += 1
+        for input_id, source in sorted(self.request.inputs.items()):
+            data = Path(source).read_bytes()
+            rows.append(
+                pb.InputBinding(
+                    input_id=input_id,
+                    digest="sha256:" + hashlib.sha256(data).hexdigest(),
+                    length=len(data),
+                    kind_mime=_declared_media_type(Path(source)),
+                    order=order,
+                )
+            )
+            order += 1
+        return rows
+
+    def _output_bindings(self) -> list[pb.OutputBinding]:
+        return [
+            pb.OutputBinding(output_id=output_id, max_bytes=64 << 20)
+            for output_id in sorted(self.request.outputs)
+        ]
+
+    def _dispatch(self) -> None:
         plan_id = "" if self.request.kind == "job" else self._plan_id()
-        spec = pb.ExecutionSpec(
+        self.grant_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(self.request.payload).encode()
+        spec = pb.InvocationSpec(
             endpoint_release_id=self.release_id,
+            payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
+            inputs=self._input_bindings(body),
+            outputs=self._output_bindings(),
             # THE DEADLINE IS MINTED AT DISPATCH, from the caller's duration. It is what the
             # grant's own lifetime is derived from too, so the two cannot disagree.
             deadline_unix_ms=(
@@ -452,7 +531,7 @@ class LocalCoordinator:
         # for one would be the fabrication class this runtime exists to prevent.
         if self.request.kind == "job":
             spec.job.CopyFrom(
-                pb.JobExecutionSpec(
+                pb.JobInvocationSpec(
                     build_id=self.release_id,
                     job_descriptor_id=self.request.job_descriptor_id,
                     publication_contract=self._publication(),
@@ -465,31 +544,45 @@ class LocalCoordinator:
         self.spec_digest = digest
         self.marks["dispatched"] = time.perf_counter()
         self._send(
-            pb.CoordinatorMessage(
-                start_attempt=pb.StartAttempt(
-                    session_id=self.session_id,
-                    executor_incarnation=incarnation,
-                    request_id=self.request.request_id,
-                    attempt=self.request.attempt,
-                    exec_spec_digest=digest,
-                    exec_spec_canonical=canonical_bytes,
-                    grant=self._grant(),
+            pb.OwnerFrame(
+                start_attempt=self._env(
+                    pb.StartAttempt(
+                        request_id=self.request.request_id,
+                        attempt=self.request.attempt,
+                        invocation_digest=digest,
+                        invocation_canonical=canonical_bytes,
+                        grant=self._grant(body, digest),
+                        deployment_id="" if self.request.kind == "job" else LOCAL_DEPLOYMENT,
+                    )
                 )
             )
         )
 
-    def _grant(self) -> pb.DeliveryGrant:
-        self.grant_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        body = json.dumps(self.request.payload).encode()
+    def _grant(self, body: bytes, invocation_digest: bytes) -> pb.DeliveryGrant:
+        """Refreshable ACCESS only (#439): urls, credential, expiry — and the invocation it
+        serves. Identity lives in the spec's bindings, which is what makes a refresh
+        structurally unable to substitute meaning."""
         if self.request.payload_url:
-            url = self.request.payload_url
+            payload_url = self.request.payload_url
         else:
             path = self.grant_dir / f"{self.request.request_id}.json"
             path.write_bytes(body)
-            url = f"file://{path}"
+            payload_url = f"file://{path}"
         expires = self.expiry()
+        inputs = [pb.InputAccess(input_id="payload", url=payload_url)]
+        inputs += [
+            pb.InputAccess(
+                input_id=f"{grants_module.TREE_PREFIX}{ref}",
+                url=f"file://{Path(root).resolve()}",
+            )
+            for ref, root in sorted(self.request.trees.items())
+        ]
+        inputs += [
+            pb.InputAccess(input_id=input_id, url=f"file://{Path(source).resolve()}")
+            for input_id, source in sorted(self.request.inputs.items())
+        ]
         return pb.DeliveryGrant(
+            invocation_digest=invocation_digest,
             credential=pb.Credential(
                 issuer="cozy-runtime-local",
                 key_id="local",
@@ -499,48 +592,13 @@ class LocalCoordinator:
             ),
             file_base_url=f"file://{self.grant_dir}",
             expires_at_unix=expires,
-            inputs=[
-                pb.InputLocation(
-                    digest=hashlib.sha256(body).digest(),
-                    url=url,
-                    length=len(body),
-                    input_id="payload",
-                    kind_mime="application/json",
-                ),
-                # The job's typed model/dataset/checkpoint inputs, as MATERIALIZED TREES.
-                # The grant is the read capability: a `Tree` field whose ref is absent here
-                # never hydrates, and the job refuses typed rather than touching a path.
-                *[
-                    pb.InputLocation(
-                        url=f"file://{Path(root).resolve()}",
-                        input_id=f"{grants_module.TREE_PREFIX}{ref}",
-                        kind_mime="inode/directory",
-                    )
-                    for ref, root in sorted(self.request.trees.items())
-                ],
-                # cr-012's input ASSETS, in the declared order of their field paths. The
-                # digest and length come off the bytes here because a local coordinator IS
-                # the one that has them; a hub mints the same fields from its own record,
-                # and the worker's checks are identical either way.
-                *[
-                    pb.InputLocation(
-                        digest=hashlib.sha256(Path(source).read_bytes()).digest(),
-                        url=f"file://{Path(source).resolve()}",
-                        length=Path(source).stat().st_size,
-                        input_id=input_id,
-                        order=order,
-                        kind_mime=_declared_media_type(Path(source)),
-                    )
-                    for order, (input_id, source) in enumerate(sorted(self.request.inputs.items()))
-                ],
-            ],
+            inputs=inputs,
             outputs=[
-                pb.OutputDestination(
+                pb.OutputAccess(
                     output_id=output_id,
                     url=f"file://{self.output_dir / self._filename(output_id)}",
-                    max_bytes=64 << 20,
                 )
-                for output_id in self.request.outputs
+                for output_id in sorted(self.request.outputs)
             ],
         )
 
@@ -580,17 +638,17 @@ class LocalCoordinator:
             else pb.CheckpointOutcome.CHECKPOINT_OUTCOME_RECORDED
         )
         self._send(
-            pb.CoordinatorMessage(
-                checkpoint_receipt=pb.JobCheckpointReceipt(
-                    session_id=request.session_id,
-                    executor_incarnation=request.executor_incarnation,
-                    request_id=request.request_id,
-                    attempt=request.attempt,
-                    operation_key=request.operation_key,
-                    logical_key=request.logical_key,
-                    content_digest=request.content_digest,
-                    receipt_id=f"crc-{request.operation_key}-{request.seq}",
-                    outcome=outcome,
+            pb.OwnerFrame(
+                checkpoint_receipt=self._env(
+                    pb.JobCheckpointReceipt(
+                        request_id=request.request_id,
+                        attempt=request.attempt,
+                        operation_key=request.operation_key,
+                        logical_key=request.logical_key,
+                        content_digest=request.content_digest,
+                        receipt_id=f"crc-{request.operation_key}-{request.seq}",
+                        outcome=outcome,
+                    )
                 )
             )
         )
@@ -598,27 +656,25 @@ class LocalCoordinator:
     # ------------------------------------------------------------------ driving
 
     def cancel(self, reason: pb.CancelReason = pb.CancelReason.CANCEL_REASON_CLIENT) -> None:
-        """Cancel the live attempt — the same message a hub sends, on the same lane."""
+        """Cancel the live attempt — the same frame a hub sends, digest-fenced."""
         self._send(
-            pb.CoordinatorMessage(
-                cancel_attempt=pb.CancelAttempt(
-                    session_id=self.session_id,
-                    executor_incarnation=(
-                        self.accepted.executor_incarnation if self.accepted else 1
-                    ),
-                    request_id=self.request.request_id,
-                    attempt=self.request.attempt,
-                    exec_spec_digest=self.spec_digest,
-                    reason=reason,
+            pb.OwnerFrame(
+                cancel_attempt=self._env(
+                    pb.CancelAttempt(
+                        request_id=self.request.request_id,
+                        attempt=self.request.attempt,
+                        invocation_digest=self.spec_digest,
+                        reason=reason,
+                    )
                 )
             )
         )
 
     def close(self) -> None:
-        self._link.close()
+        self.host.close()
 
-    def _send(self, message: pb.CoordinatorMessage) -> None:
-        self._link.deliver(message)
+    def _send(self, frame: pb.OwnerFrame) -> None:
+        self.host.deliver(frame)
 
 
 # --------------------------------------------------------------------------- the runner
@@ -703,25 +759,26 @@ def run_slice(
     options = options or WorkerOptions(root=workspace / "worker")
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
-    supervisor = Supervisor(config, options, coordinator)
+    worker = Worker(config, options, coordinator.host)
+    worker.watches.tap = coordinator.tap_progress
     if coordinator_hook is not None:
-        coordinator_hook(coordinator, supervisor)
+        coordinator_hook(coordinator, worker)
     started = time.perf_counter()
-    exit_code = supervisor.run()
-    return _collect(coordinator, supervisor, started, exit_code, delete_journal)
+    exit_code = worker.run()
+    return _collect(coordinator, worker, started, exit_code, delete_journal)
 
 
 def _collect(
     coordinator: LocalCoordinator,
-    supervisor: Supervisor,
+    worker: Worker,
     started: float,
     exit_code: int,
     delete_journal: bool,
 ) -> SliceOutcome:
     outcome = SliceOutcome(exit_code=exit_code, ended=coordinator.ended, error=coordinator.error)
-    outcome.journal = _journal_rows(supervisor.root / "journal.log")
+    outcome.journal = _journal_rows(worker.root / "journal.log")
     outcome.reconciliation = (
-        supervisor.ledger.reconciliations[-1] if supervisor.ledger.reconciliations else {}
+        worker.ledger.reconciliations[-1] if worker.ledger.reconciliations else {}
     )
     # The ledger as it stood AT ATTEMPT CLOSE, not after shutdown. Reading it here would
     # report the executor's RSS as unreadable and its device classes as stale, because by
@@ -730,14 +787,14 @@ def _collect(
     outcome.ledger = (
         {"format": "cozy.runtime.Ledger/0", "classes": outcome.reconciliation["classes"]}
         if outcome.reconciliation
-        else supervisor.ledger.document()
+        else worker.ledger.document()
     )
-    outcome.warm = list(supervisor.warm)
+    outcome.warm = list(worker.warm)
     outcome.faults = [
-        {"reason": fault.reason, "detail": fault.detail} for fault in supervisor.engine.faults
+        {"reason": fault.reason, "detail": fault.detail} for fault in worker.engine.faults
     ]
     outcome.progress = len(coordinator.progress_frames)
-    outcome.executions = supervisor.engine.executed
+    outcome.executions = worker.engine.executed
     outcome.checkpoints = list(coordinator.checkpoints)
     outcome.publication_scope = (
         coordinator.scratch_repo() if coordinator.request.kind == "job" else ""
@@ -755,8 +812,8 @@ def _collect(
             "materialization": accepted.plan.materialization,
             "placement": accepted.plan.placement,
             "compute_dtype": accepted.plan.compute_dtype,
-            "reserved_vram_bytes": accepted.plan.reserved_vram_bytes,
-            "quantified_choice": accepted.plan.quantified_choice,
+            "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
+            "decision_explanation": accepted.plan.decision_explanation,
         }
     if coordinator.terminal is not None:
         body = documents.read(coordinator.terminal.terminal_canonical, pb.TerminalBody)
@@ -768,9 +825,9 @@ def _collect(
         if outcome.triage_subject:
             with contextlib.suppress(triage.TriageError, canonical.CanonicalError):
                 outcome.triage = triage.BundleStore.read(
-                    supervisor.root / "triage",
+                    worker.root / "triage",
                     outcome.triage_subject,
-                    supervisor.root / "journal.log",
+                    worker.root / "journal.log",
                 )
                 outcome.triage_explained = triage.explain(outcome.triage)
         outcome.status = pb.TerminalStatus.Name(
@@ -813,7 +870,7 @@ def _collect(
     # A run that died mid-attempt leaves it behind on purpose, so the next run recovers.
     closed = any(row.get("kind") == "closed" for row in outcome.journal)
     if delete_journal and closed:
-        shutil.rmtree(supervisor.root, ignore_errors=True)
+        shutil.rmtree(worker.root, ignore_errors=True)
         outcome.journal_deleted = True
     return outcome
 

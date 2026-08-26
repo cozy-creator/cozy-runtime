@@ -153,6 +153,11 @@ _SERVE_FLAGS: dict[str, str] = {
     "--grace": "--grace",
     "--host-budget": "--host-budget",
     "--pinned-budget": "--pinned-budget",
+    # The REMOTE leg (cl-014 item 1): a non-loopback listener requires both, and the
+    # worker refuses plaintext off-loopback. The bearer owner token arrives via
+    # COZY_BOOTSTRAP_CREDENTIAL and is checked at Claim (#445).
+    "--tls-cert": "--tls-cert",
+    "--tls-key": "--tls-key",
 }
 
 #: Flags that carry no value.
@@ -160,14 +165,18 @@ _SERVE_SWITCHES = ("--no-warm",)
 
 
 def serve(config: RuntimeConfig, args: list[str]) -> int:
-    """The process entry into cr-007's supervisor — a TRANSLATION, never a second loop.
+    """The process entry into cr-007's worker — a TRANSLATION, never a second loop.
 
-    `--socket`/`--cas`/`--out` are the coordinator-issued path grants; `_SERVE_FLAGS` are
-    the launch facts a coordinator must state because nothing can discover them for it —
+    `--socket`/`--cas`/`--out` are the launcher-issued path grants; `_SERVE_FLAGS` are
+    the launch facts a launcher must state because nothing can discover them for it —
     identity, release, device envelope, budgets and the grace clock. Everything else —
     directives, grants, config — arrives over the protocol, and always will.
+
+    `--socket` is the local binding this worker SERVES on (#436: the owner dials the
+    worker): a Unix socket path, or `host:port` loopback on win32 (`host:0` binds an
+    ephemeral port and publishes the real address to `<root>/control.addr`).
     """
-    from cozy_runtime.internal.worker.session import supervise
+    from cozy_runtime.internal.worker.session import serve_worker
 
     values: dict[str, str] = {}
     switches: list[str] = []
@@ -197,18 +206,18 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         raise CliError(
             "usage",
             "serve requires --socket",
-            "cozy-runtime serve --socket <path> — the coordinator's Unix socket",
+            "cozy-runtime serve --socket <path> — the local binding this worker serves on",
             Exit.usage,
         )
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
-    argv = ["--hub", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
-    for flag, supervisor_flag in _SERVE_FLAGS.items():
+    argv = ["--listen", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
+    for flag, worker_flag in _SERVE_FLAGS.items():
         if flag in values:
-            argv += [supervisor_flag, values[flag]]
+            argv += [worker_flag, values[flag]]
     argv += switches
     # THE CONFIG THIS VERB ALREADY READ. `session.main` reads it itself because it is a
     # process entrypoint too; calling that from here was a second read and refused.
-    return supervise(config, argv)
+    return serve_worker(config, argv)
 
 
 def bindings(config: RuntimeConfig, opts: Options) -> Result:

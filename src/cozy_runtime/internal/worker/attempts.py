@@ -90,9 +90,10 @@ def _coded(outcome: Mapping[str, Any]) -> str:
 #: and then hung on a supervisor-side SeamError with no terminal ever produced.
 PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 
-#: Fields the supervisor structurally CANNOT verify. Named on every terminal that carries
-#: them, sorted, because a claim printed as a measurement is worse than no number.
-UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_vram_bytes")
+#: Fields the worker structurally CANNOT verify, by their WIRE names. Named on every
+#: terminal that carries them, sorted, because a claim printed as a measurement is worse
+#: than no number.
+UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_device_memory_bytes")
 
 #: The fault tail this worker keeps. Every reader takes the last 8.
 FAULTS_HELD = 64
@@ -165,7 +166,7 @@ class AttemptRecord:
     attempt: int
     digest: bytes
     spec: dict[str, Any]
-    grant: pb.DeliveryGrant
+    grant: grants.BoundGrant = dataclasses_field(default_factory=grants.BoundGrant)
     plan: AttemptPlan | None = None
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
@@ -249,7 +250,7 @@ class AttemptRecord:
         self.spec = {}
         self.payload = {}
         self.opened = {}
-        self.grant = pb.DeliveryGrant()
+        self.grant = grants.BoundGrant()
         self.plan = None
         self.prepared = None
         self.declared = None
@@ -300,7 +301,7 @@ class AttemptEngine:
         spool_root: Path,
         scratch_root: Path,
         instance_id: str,
-        send: Callable[[pb.WorkerMessage], None],
+        send: Callable[[pb.WorkerFrame], None],
         progress: Callable[[str, int, dict[str, Any]], None],
         bundles: triage.BundleStore,
         monitor: observe.SilenceMonitor,
@@ -327,7 +328,10 @@ class AttemptEngine:
         self.progress = progress
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], AttemptRecord] = {}
-        self.session_id = ""
+        self.boot_id = ""
+        #: which deployment this worker hosts, read live from the worker ("" in job mode).
+        #: Routing only (#446): it rides acceptance and the snapshot, never the digest.
+        self.deployment_id: Callable[[], str] = lambda: ""
         self.recovered: list[pb.ActiveAttempt] = []
         self.executed = 0
         #: the worker's fault tail. BOUNDED: the Report and the triage bundle each read the
@@ -374,27 +378,27 @@ class AttemptEngine:
                 "acknowledges nothing and executes nothing",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        recomputed = documents.digest_of(start.exec_spec_canonical)
-        if recomputed != start.exec_spec_digest:
+        recomputed = documents.digest_of(start.invocation_canonical)
+        if recomputed != start.invocation_digest:
             raise AttemptRefusal(
-                "exec_spec_digest_mismatch",
-                f"carried {start.exec_spec_digest.hex()[:16]}… but the resident bytes hash "
+                "invocation_digest_mismatch",
+                f"carried {start.invocation_digest.hex()[:16]}… but the resident bytes hash "
                 f"to {recomputed.hex()[:16]}… — a digest never bypasses the lower check",
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
         try:
-            spec = documents.read(start.exec_spec_canonical, pb.ExecutionSpec)
+            spec = documents.read(start.invocation_canonical, pb.InvocationSpec)
         except documents.DocumentError as exc:
             raise AttemptRefusal(
-                f"exec_spec_{exc.code}",
-                f"the ExecutionSpec document refuses: {exc.detail}",
+                f"invocation_{exc.code}",
+                f"the InvocationSpec document refuses: {exc.detail}",
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             ) from exc
 
         # The (attempt, digest) fence binds the ORDINAL, not the current state: an attempt
         # is one execution of one spec whether it is running, journaled or already closed.
         known = self.history.get((start.request_id, start.attempt))
-        if known is not None and known.digest != start.exec_spec_digest:
+        if known is not None and known.digest != start.invocation_digest:
             raise AttemptRefusal(
                 "attempt_digest_conflict",
                 f"attempt {start.attempt} of {start.request_id} is bound to "
@@ -406,7 +410,9 @@ class AttemptEngine:
         held = self.live.get(start.request_id)
         if held is not None:
             if held.attempt == start.attempt:
-                held.grant = start.grant  # a refresh swaps authority; identity never moves
+                # a refresh swaps ACCESS; identity never moves (#439's structural half:
+                # the bind refuses a grant whose subject or id sets disagree)
+                held.grant = self._bind(spec, start)
                 return held  # idempotent: re-send AttemptAccepted, run once
             if held.state in ("queued", "accepted", "running"):
                 raise AttemptRefusal(
@@ -425,10 +431,16 @@ class AttemptEngine:
         return AttemptRecord(
             request_id=start.request_id,
             attempt=start.attempt,
-            digest=start.exec_spec_digest,
+            digest=start.invocation_digest,
             spec=spec,
-            grant=start.grant,
+            grant=self._bind(spec, start),
         )
+
+    def _bind(self, spec: Mapping[str, Any], start: pb.StartAttempt) -> grants.BoundGrant:
+        try:
+            return grants.bind(spec, start.grant, start.invocation_digest)
+        except grants.GrantRefusal as exc:
+            raise AttemptRefusal(exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_PROTOCOL) from exc
 
     def hold(self, attempt: AttemptRecord) -> None:
         """RECORD the attempt on the READER, before the device lane can reach it.
@@ -723,14 +735,15 @@ class AttemptEngine:
                 {
                     "request_id": attempt.request_id,
                     "attempt": attempt.attempt,
-                    "session_id": self.session_id,
+                    "worker_boot_id": self.boot_id,
                     "instance_id": self.instance_id,
                     "attempt_kind": "job",
-                    "exec_spec_digest": documents.spell(attempt.digest),
+                    "invocation_digest": documents.spell(attempt.digest),
                     "plan_digest": plan_digest,
                     "job_descriptor_id": descriptor_id,
                     "build_id": binding.build_id,
-                    "grant_epoch": int(attempt.grant.credential.epoch),
+                    "grant_epoch": attempt.grant.credential_epoch,
+                    "executor_generation": self.supervision.incarnation,
                     "input_trees": ",".join(sorted(attempt.trees)),
                 },
             )
@@ -847,15 +860,17 @@ class AttemptEngine:
                 {
                     "request_id": attempt.request_id,
                     "attempt": attempt.attempt,
-                    "session_id": self.session_id,
+                    "worker_boot_id": self.boot_id,
                     "instance_id": self.instance_id,
-                    "exec_spec_digest": documents.spell(attempt.digest),
+                    "invocation_digest": documents.spell(attempt.digest),
                     "plan_digest": plan_digest,
                     "model_construction_digest": plan.model_construction_digest,
                     "constructed_generation_digest": plan.constructed_generation_digest,
                     "request_features_digest": plan.request_features_digest,
                     "preflight_facts_digest": plan.preflight_facts_digest,
-                    "grant_epoch": int(attempt.grant.credential.epoch),
+                    "grant_epoch": attempt.grant.credential_epoch,
+                    "deployment_id": self.deployment_id(),
+                    "executor_generation": self.supervision.incarnation,
                     "entrypoint_binding_plan_id": plan_id,
                 },
             )
@@ -986,7 +1001,7 @@ class AttemptEngine:
         record = {
             "request_id": attempt.request_id,
             "attempt": attempt.attempt,
-            "session_id": self.session_id,
+            "worker_boot_id": self.boot_id,
             "operation_key": operation_key,
             "logical_key": logical_key,
             "content_digest": content_digest,
@@ -1006,11 +1021,11 @@ class AttemptEngine:
         # The coordinator's copy rides the DURABLE control lane, after the worker's own
         # journal — worker-local durability is what `save()` returned on, and the hub's copy
         # is at-least-once like every other durable message (law 9).
+        # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
+        # stamp — no constructor can forget one).
         self.send(
-            pb.WorkerMessage(
+            pb.WorkerFrame(
                 checkpoint_request=pb.JobCheckpointRequest(
-                    session_id=self.session_id,
-                    executor_incarnation=self.supervision.incarnation,
                     request_id=attempt.request_id,
                     attempt=attempt.attempt,
                     operation_key=operation_key,
@@ -1504,7 +1519,7 @@ class AttemptEngine:
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
         produced = {str(row["output_id"]): row for row in rows}
-        granted = {destination.output_id for destination in attempt.grant.outputs}
+        granted = set(attempt.grant.outputs)
         if set(produced) != granted:
             grants.abort_outputs(spool)
             return None, (
@@ -1624,7 +1639,7 @@ class AttemptEngine:
         body = pb.TerminalBody(
             request_id=attempt.request_id,
             attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
+            invocation_digest=documents.spell(attempt.digest),
             status=status,
             safe_message=safe(detail, 4096),
             cause=pb.TerminalCause(code=cause, origin=origin, detail=safe(detail)),
@@ -1664,9 +1679,9 @@ class AttemptEngine:
             {
                 "request_id": attempt.request_id,
                 "attempt": attempt.attempt,
-                "session_id": self.session_id,
+                "worker_boot_id": self.boot_id,
                 "instance_id": self.instance_id,
-                "exec_spec_digest": documents.spell(attempt.digest),
+                "invocation_digest": documents.spell(attempt.digest),
                 "terminal_id": attempt.terminal_id,
                 "terminal_digest": documents.spell(digest),
                 "terminal_canonical_b64": base64.b64encode(canonical_bytes).decode(),
@@ -1699,11 +1714,11 @@ class AttemptEngine:
             attempt={
                 "request_id": attempt.request_id,
                 "attempt": attempt.attempt,
-                "session_id": self.session_id,
+                "worker_boot_id": self.boot_id,
                 "instance_id": self.instance_id,
-                "executor_incarnation": self.supervision.incarnation,
+                "executor_generation": self.supervision.incarnation,
                 "readiness_epoch": self.supervision.readiness_epoch,
-                "exec_spec_digest": documents.spell(attempt.digest),
+                "invocation_digest": documents.spell(attempt.digest),
                 "entrypoint": attempt.declared.entrypoint if attempt.declared else "",
                 "executions": attempt.executions,
                 "replays": attempt.replays,
@@ -1788,11 +1803,9 @@ class AttemptEngine:
         assert attempt.plan is not None
         plan = attempt.plan
         return pb.AttemptAccepted(
-            session_id=self.session_id,
-            executor_incarnation=self.supervision.incarnation,
             request_id=attempt.request_id,
             attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
+            invocation_digest=attempt.digest,
             plan_digest=documents.raw(plan.digest()),
             # A JOB has no model construction, and an empty digest is the honest answer:
             # spelling one for a construction that never happened would invent an identity.
@@ -1806,10 +1819,14 @@ class AttemptEngine:
                 materialization=plan.materialization,
                 compute_dtype=plan.compute_dtype,
                 placement=plan.placement,
-                reserved_vram_bytes=plan.reserved_vram_bytes,
+                reserved_device_memory_bytes=plan.reserved_vram_bytes,
                 reserved_host_bytes=plan.reserved_host_bytes,
-                quantified_choice=plan.decision_explanation,
+                decision_explanation=plan.decision_explanation,
             ),
+            # ROUTING plus the generation fence the attempt runs under, fixed at
+            # acceptance (#446/#454): the attempt never survives its executor generation.
+            deployment_id=self.deployment_id(),
+            executor_generation=self.supervision.incarnation,
         )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptTerminal:
@@ -1822,14 +1839,13 @@ class AttemptEngine:
         if not attempt.terminal_bytes and attempt.terminal_id:
             attempt.terminal_bytes = self.journal.terminal_bytes(attempt.key())
         return pb.AttemptTerminal(
-            session_id=self.session_id,
-            executor_incarnation=self.supervision.incarnation,
             request_id=attempt.request_id,
             attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
+            invocation_digest=attempt.digest,
             terminal_id=attempt.terminal_id,
             terminal_digest=attempt.terminal_digest,
             terminal_canonical=attempt.terminal_bytes,
+            deployment_id=self.deployment_id(),
         )
 
     def _inline_result(
@@ -1919,11 +1935,11 @@ class AttemptEngine:
         return pb.AttemptMetrics(
             runtime_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
             queue_ms=int(max(queue_ms, 0.0)),
-            peak_vram_bytes=int(claim.get("peak_vram_bytes", 0)),
+            peak_device_memory_bytes=int(claim.get("peak_vram_bytes", 0)),
             rss_at_end_bytes=int(claim.get("rss_at_end_bytes", 0)),
             output_count=len(manifest.outputs) if manifest is not None else 0,
             device_lease_ms=int(min(float(claim.get("device_lease_ms", 0.0)), window_ms)),
-            gpu_count=int(claim.get("gpu_count", 0)),
+            device_count=int(claim.get("gpu_count", 0)),
             handler_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
             finalization_ms=int(max((time.perf_counter() - attempt.resulted_at) * 1000, 0)),
             unverified_fields=list(UNVERIFIABLE),
@@ -1936,7 +1952,7 @@ class AttemptEngine:
         held = self.live.get(message.request_id)
         if held is None or held.attempt != message.attempt:
             return "dropped: no such held attempt"
-        if held.digest != message.exec_spec_digest:
+        if held.digest != message.invocation_digest:
             return "dropped: cancel digest does not match the journaled acceptance"
         if held.state == "terminal":
             return "ignored: the attempt already reached a natural terminal"
@@ -2020,7 +2036,7 @@ class AttemptEngine:
         body = pb.TerminalBody(
             request_id=attempt.request_id,
             attempt=attempt.attempt,
-            exec_spec_digest=attempt.digest,
+            invocation_digest=documents.spell(attempt.digest),
             status=STATUS.TERMINAL_STATUS_ABANDONED,
             safe_message=safe(f"terminal_construction_failed: {why}", 4096),
             cause=pb.TerminalCause(
@@ -2039,9 +2055,9 @@ class AttemptEngine:
                 {
                     "request_id": attempt.request_id,
                     "attempt": attempt.attempt,
-                    "session_id": self.session_id,
+                    "worker_boot_id": self.boot_id,
                     "instance_id": self.instance_id,
-                    "exec_spec_digest": documents.spell(attempt.digest),
+                    "invocation_digest": documents.spell(attempt.digest),
                     "terminal_id": attempt.terminal_id,
                     "terminal_digest": documents.spell(digest),
                     "terminal_canonical_b64": base64.b64encode(canonical_bytes).decode(),
@@ -2133,9 +2149,9 @@ class AttemptEngine:
         for (request_id, number), row in self.journal.attempts().items():
             if row["state"] == "closed":
                 continue
-            digest = documents.raw(row["exec_spec_digest"])
+            digest = documents.raw(row["invocation_digest"])
             authorized = row.get("instance_id") == self.instance_id and row.get(
-                "exec_spec_digest"
+                "invocation_digest"
             ) == documents.spell(digest)
             if not authorized:
                 continue  # the three-authorization rule: unauthorized never replays
@@ -2144,7 +2160,6 @@ class AttemptEngine:
                 attempt=number,
                 digest=digest,
                 spec={},
-                grant=pb.DeliveryGrant(),
                 state="terminal",
                 kind=str(row.get("attempt_kind", "serving")),
             )
@@ -2165,38 +2180,45 @@ class AttemptEngine:
             else:
                 continue
             self.history[attempt.key()] = attempt
-            recovered.append(
-                pb.ActiveAttempt(
-                    request_id=request_id,
-                    attempt=number,
-                    kind=_KIND[attempt.kind],
-                    state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK,
-                    exec_spec_digest=digest,
-                )
-            )
+            recovered.append(self._active_row(attempt, row))
         self.recovered = recovered
         return recovered
 
+    def _active_row(
+        self, attempt: AttemptRecord, journal_row: Mapping[str, Any] | None = None
+    ) -> pb.ActiveAttempt:
+        """One deployment-aware ActiveAttempt (#446): a recovered attempt names the
+        deployment and executor generation its acceptance journaled; a live one names the
+        current."""
+        row = journal_row or {}
+        return pb.ActiveAttempt(
+            request_id=attempt.request_id,
+            attempt=attempt.attempt,
+            kind=_KIND[attempt.kind],
+            state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK
+            if attempt.state in ("terminal", "closed")
+            else pb.AttemptState.ATTEMPT_STATE_RUNNING,
+            invocation_digest=attempt.digest,
+            deployment_id=str(row.get("deployment_id", "")) or self.deployment_id(),
+            executor_generation=int(row.get("executor_generation", 0))
+            or self.supervision.incarnation,
+        )
+
     def pending_terminals(self) -> list[AttemptRecord]:
         return [a for a in self.history.values() if a.state == "terminal"]
+
+    def snapshot_entries(self) -> list[pb.ActiveAttempt]:
+        """The recovery snapshot (02 §6): every attempt this worker still HOLDS — accepted,
+        running, or terminal-pending-ack. A queued one is deliberately absent (the wire has
+        no state for held-not-admitted; the owner's DISPATCHING-absent rule resends it)."""
+        return [
+            self._active_row(a)
+            for a in self.history.values()
+            if a.state in ("accepted", "running", "terminal")
+        ]
 
     def active(self) -> list[pb.ActiveAttempt]:
         """The attempts this worker CLAIMS. A queued one is not among them: acceptance is
         what makes an attempt a claim, and the wire has no state for "held, not yet
         admitted"."""
-        out = []
-        for attempt in self.live.values():
-            if attempt.state == "queued":
-                continue
-            out.append(
-                pb.ActiveAttempt(
-                    request_id=attempt.request_id,
-                    attempt=attempt.attempt,
-                    kind=_KIND[attempt.kind],
-                    state=pb.AttemptState.ATTEMPT_STATE_TERMINAL_PENDING_ACK
-                    if attempt.state == "terminal"
-                    else pb.AttemptState.ATTEMPT_STATE_RUNNING,
-                    exec_spec_digest=attempt.digest,
-                )
-            )
-        return out
+        return [self._active_row(a) for a in self.live.values() if a.state != "queued"]

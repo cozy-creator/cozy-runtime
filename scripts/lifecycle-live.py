@@ -126,32 +126,20 @@ def start_weightless(tmp: Path, *, instance_id: str, fresh: bool) -> Any:
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     ids = stage_weightless(home, project, ("tick", "hold"))
-    socket_path = str(tmp / "hub.sock")
-    server, hub = wl.serve_hub(socket_path)
-    hub.directive = pb.Directive(
-        revision=1,
-        posture=pb.Posture.POSTURE_ACCEPTING,
-        wire_minor=wl.WIRE_MINOR,
-        credential=pb.Credential(
-            issuer="cozy-live",
-            key_id="k1",
-            epoch=1,
-            expires_at_unix=int(time.time()) + 3600,
-            token=b"never-crosses-the-seam",
-        ),
-        serving=pb.ServingDirective(
-            endpoint_release_id=RELEASE,
-            entrypoint_binding_plan_ids=sorted(ids.values()),
-        ),
+    socket_path = str(tmp / f"control-{len(os.listdir(tmp))}.sock")
+    hub = wl.Hub()
+    hub.directive = wl.serving_directive(
+        RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
     )
     hub.revision = 1
-    log = tmp / f"supervisor-{len(os.listdir(tmp))}.log"
+    log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "COZY_HOME": str(home),
         "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
     }
+    (root / "control.addr").unlink(missing_ok=True)
     argv = [
         "nice",
         "-n",
@@ -160,7 +148,7 @@ def start_weightless(tmp: Path, *, instance_id: str, fresh: bool) -> Any:
         "-c",
         "import sys; from cozy_runtime.internal.worker.session import main; "
         "raise SystemExit(main(sys.argv[1:]))",
-        "--hub",
+        "--listen",
         f"unix:{socket_path}",
         "--root",
         str(root),
@@ -180,7 +168,8 @@ def start_weightless(tmp: Path, *, instance_id: str, fresh: bool) -> Any:
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
-    worker = wl.Worker(home, root, process, hub, server, log)
+    hub.connect(wl.read_addr(root, process))
+    worker = wl.Worker(home, root, process, hub, log)
     return worker, ids
 
 
@@ -249,7 +238,7 @@ def main() -> int:
         boot_ms = (time.perf_counter() - t0) * 1000
         wl.check(
             "worker READY with both weightless plans",
-            set(report.serving_capacity.ready_entrypoint_binding_plan_ids) >= set(ids.values()),
+            set(hub.deployment(report).ready_entrypoint_binding_plan_ids) >= set(ids.values()),
             f"{boot_ms:.0f} ms to READY; executor pid {worker.executor_pid()}",
         )
 
@@ -306,13 +295,13 @@ def main() -> int:
         )
         t2 = time.perf_counter()
         hub.send(
-            pb.CoordinatorMessage(
-                cancel_attempt=pb.CancelAttempt(
-                    session_id=hub.session(),
-                    executor_incarnation=hub.incarnation(),
-                    request_id="req-cancel",
-                    attempt=1,
-                    exec_spec_digest=digest,
+            pb.OwnerFrame(
+                cancel_attempt=hub._env(
+                    pb.CancelAttempt(
+                        request_id="req-cancel",
+                        attempt=1,
+                        invocation_digest=digest,
+                    )
                 )
             )
         )
@@ -433,8 +422,7 @@ def main() -> int:
             f"worker control process {supervisor} SIGKILLed; executor {executor} gone "
             "(pdeathsig on linux; the seam-EOF exit is the portable backstop)",
         )
-        hub.send(None)
-        worker.server.stop(0)
+        hub.close()
 
         wl.head("6. recovery: restart on the same root, journal converges")
         t3 = time.perf_counter()
@@ -462,8 +450,7 @@ def main() -> int:
             wl.check("worker READY again after recovery", True, "second boot serves")
         finally:
             worker2.stop()
-            hub2.send(None)
-            worker2.server.stop(0)
+            hub2.close()
     finally:
         if worker.process.poll() is None:
             worker.stop()
