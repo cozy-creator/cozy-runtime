@@ -463,15 +463,29 @@ class Checkpoint:
         digest = str(entry["encoding"])
         return Encoded(digest, self._aliases.get(digest, "unregistered"), tuple(parts))
 
-    def read_plan(self, traversal: Sequence[tuple[str, str]], window_bytes: int) -> Any:
+    def read_plan(
+        self,
+        traversal: Sequence[tuple[str, str]],
+        window_bytes: int,
+        components: Sequence[str],
+    ) -> Any:
         """The store's own read plan over the traversal THIS PLANE asks for.
 
         cr-005's rule survives the swap and is now the store's to keep: read order is the
         STORE's, write order is the CONTRACT's. The runtime hands over the code-topology
         traversal and TensorFS decides how to touch the disk for it.
+
+        `components` DECLARES what this plan is for (#570b), and the fill plane always knows
+        it: this loop is already grouped BY COMPONENT, so the scope is the group's own name.
+        Completeness is then checked against those components' tensors rather than the whole
+        header — which is what makes an N-ary artifact servable at all. Under the old
+        whole-snapshot rule H3's Fl2VA class named 917 of 3445 tensors and was refused for
+        the 2528 belonging to a sibling transformer its contract forbids it to touch.
         """
         with store_refusals("planning the read"):
-            return self.tensorfs.plan(self.header_bytes, list(traversal), window=window_bytes)
+            return self.tensorfs.plan(
+                self.header_bytes, list(traversal), list(components), window=window_bytes
+            )
 
     def acquire(self) -> Any:
         """A verified read lease over the whole snapshot. The GC-safe hold registers FIRST."""
@@ -1820,7 +1834,7 @@ class StreamingFillBackend:
         stats: dict[str, Any] = {}
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
-            plan = self.checkpoints[component].read_plan(traversal, self.window_bytes)
+            plan = self.checkpoints[component].read_plan(traversal, self.window_bytes, (component,))
             expect = sum(row.stored_nbytes for row in group)
             if int(plan.bytes) != expect:
                 raise _refuse(
