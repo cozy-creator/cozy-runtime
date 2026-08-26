@@ -138,7 +138,11 @@ def section_surface(args: argparse.Namespace) -> None:
         ("uninstalled ref", ("run", "generate", f"{PROMPT}"), 4),
         ("--offline miss", ("run", "generate", "--offline"), 8),
         ("rm without --yes", ("rm", REF), 7),
-        ("pull, whose owner is TensorFS", ("pull", REF), 9),
+        # `pull` is BUILT (cr-016/#512); what it refuses without a hub is USAGE. The old
+        # arm asserted exit 9 "whose owner is TensorFS" — that owner delivered.
+        ("pull with no --hub", ("pull", REF), 2),
+        ("pull, hub unreachable", ("pull", REF, "--hub", "http://127.0.0.1:1"), 9),
+        ("ingest, whose owner is TensorFS", ("ingest", REF), 9),
         ("describe an unknown function", ("describe", "nosuchfn"), 4),
         ("list, empty", ("list",), 0),
         ("doctor", ("doctor",), 0),
