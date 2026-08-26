@@ -507,6 +507,14 @@ SATURATION_MARGIN = 1.0 + 2.0**-10
 #: on the same quantity) and a reader must be able to find it.
 ROW_SCALE_FLOOR = 1e-12
 
+#: The ceiling on the f32 transient a rounding-correct rowwise decode is allowed to hold at
+#: once. It is NOT a tuning knob and NOT arbitrary: it is the fill plane's own staging slot
+#: size (`StreamingFillBackend.slot_bytes`, floored at 16 MiB), so this route's largest
+#: unledgered allocation is the same order as the one the fill plane already reserves per
+#: slot. A decode that held a full-width f32 copy of a 4 GiB weight would be a second
+#: residency the ledger never granted.
+_CHUNK_BYTES = 16 << 20
+
 
 @dataclass(frozen=True, slots=True)
 class MicroScaledDequant:
@@ -641,6 +649,26 @@ class RowwiseDequant:
     fp8-rowwise bytes on a device where nothing measured the encoded-GEMM leaf. It exists so
     that "the chooser picks the leaf where it was measured and the floor where it was not"
     is a statement about two real providers rather than about a provider and an absence.
+
+    **THE ROUNDING RULE IS THE PRODUCER'S, AND IT IS NOT THIS ALIAS'S NEIGHBOUR'S** (found by
+    #549.4's vector leg, revision 2). The product is formed in f32 and rounded ONCE into the
+    destination; the scale is NOT narrowed first. That is the opposite of
+    `fp8-scaled-scalar/1`, whose registry entry pins narrow-then-multiply explicitly, and the
+    difference is a full ULP: measured against `fp8-rowwise/1`'s own producer-mined vectors,
+    narrowing first differs from the reference on 86 of 1,024 bf16 bytes and rounding once
+    matches it exactly, on both the rank-1 and the rank-2 digest.
+
+    Nothing could see that before. `probe.py::_numerics_rowwise` sweeps this route against
+    scales that are exact POWERS OF TWO — its own docstring says so — and under a power of
+    two the two rules agree bit for bit, so a domain sweep of 65,536 pairs proved the scale's
+    ROUTING and could not reach its ROUNDING. The producer's mined vectors carry continuous
+    f32 scales, which is exactly the case the synthetic oracle excluded, and #511c's rule
+    decides it: the reference wins over prose, and here the reference is the only thing that
+    had an opinion at all.
+
+    `code_revision` is `2` because of this. The records that measured revision 1 measured
+    different arithmetic, and #549.9's revision field is what makes them stop admitting it
+    rather than silently carrying a verdict about a decoder that no longer exists.
     """
 
     encoding: str
@@ -664,7 +692,8 @@ class RowwiseDequant:
 
     @property
     def code_revision(self) -> str:
-        return "1"
+        # 2: the rounding rule corrected to the producer's (see the class docstring).
+        return "2"
 
     @property
     def suite(self) -> str:
@@ -686,5 +715,23 @@ class RowwiseDequant:
         data = parts["data"]
         scale = parts["scale"]
         rows = int(destination.shape[0])
-        destination.copy_(data.view(destination.shape).to(destination.dtype))
-        destination.mul_(scale.to(destination.dtype).reshape(rows, 1))
+        payload = data.view(destination.shape)
+        rowscale = scale.to(torch.float32).reshape(rows, 1)
+        if destination.dtype == torch.float32:
+            # Already the working dtype: one rounding by construction, no temporary.
+            destination.copy_(payload.to(torch.float32))
+            destination.mul_(rowscale)
+            return
+        # ONE ROUNDING, IN ROW CHUNKS. The product has to be formed in f32 (see the class
+        # docstring), and forming it whole would allocate a full-width f32 copy of every
+        # weight — the second full copy `MicroScaledDequant` refuses to make, and one the
+        # ledger never granted because it is an allocator transient rather than decode
+        # scratch. Chunking by ROWS bounds that transient without changing a single
+        # arithmetic step: each row's scale applies to its own row and nothing else, so a
+        # row-block boundary is not a boundary the arithmetic can see.
+        stride = max(1, _CHUNK_BYTES // max(int(destination.shape[1]) * 4, 1))
+        for start in range(0, rows, stride):
+            stop = min(start + stride, rows)
+            block = payload[start:stop].to(torch.float32)
+            block.mul_(rowscale[start:stop])
+            destination[start:stop].copy_(block)

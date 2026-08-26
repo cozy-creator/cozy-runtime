@@ -638,11 +638,65 @@ def specs() -> None:
             exc.code == "spec_unreviewed",
             str(exc)[:220],
         )
+    _vector_rounding()
     check(
         "the alias is still DISPLAYED — it names what the refusal is talking about",
         "mxfp8/1"
         in str(next(iter([e for e in [_refusal_of(selector, planted)] if e is not None]))),
         "display, and only display",
+    )
+
+
+def _vector_rounding() -> None:
+    """The DEFECT the vector leg found on its first run, kept as an arm (#549.4).
+
+    `fp8-rowwise/1`'s decode narrowed the scale to the destination dtype and multiplied
+    there — the rule `fp8-scaled-scalar/1`'s registry entry pins explicitly, applied to its
+    alias-neighbour, which turns out to round the other way. Nothing could see it: the
+    synthetic oracle sweeps this route with scales that are exact POWERS OF TWO, and under a
+    power of two the two rules agree bit for bit. The producer's mined vectors carry
+    continuous f32 scales, which is the case the sweep excluded.
+
+    CPU-only: 16x32 elements, no device, no store.
+    """
+    import torch
+
+    from cozy_runtime.internal.encoding import RowwiseDequant
+    from cozy_runtime.internal.probe import spec_vector_document, vector_tensor
+
+    document = spec_vector_document(SPEC_ROWWISE)
+    assert document is not None
+    case = next(c for c in document["cases"] if c["logical"]["dtype"] == "bf16")
+    cpu = torch.device("cpu")
+    data = vector_tensor(torch, case["roles"]["data"], cpu)
+    scale = vector_tensor(torch, case["roles"]["scale"], cpu)
+    want = vector_tensor(torch, {**case["logical"], "bits": case["expect_logical_bits"]}, cpu)
+    rows = int(data.shape[0])
+
+    def differing(got: Any) -> int:
+        return int((got.reshape(-1).view(torch.uint8) != want.reshape(-1).view(torch.uint8)).sum())
+
+    narrowed = data.to(torch.bfloat16) * scale.to(torch.bfloat16).reshape(rows, 1)
+    red(
+        "the pre-#549.4 rowwise decode",
+        f"narrowed the scale THEN multiplied, and differs from `fp8-rowwise/1`'s own "
+        f"producer-mined reference on {differing(narrowed)} of {want.numel() * 2} bf16 "
+        "bytes — a full ULP, invisible to a sweep whose scales are all powers of two",
+    )
+    shipped = torch.empty_like(want)
+    RowwiseDequant(SPEC_ROWWISE).decode(torch, {"data": data, "scale": scale}, shipped)
+    check(
+        "ARM: the SHIPPED rowwise decode reproduces the producer's bytes EXACTLY",
+        differing(shipped) == 0 and differing(narrowed) > 0,
+        f"0 differing bytes against {differing(narrowed)} for the rule this alias's "
+        "NEIGHBOUR pins — two encodings, two rounding rules, and #511c decides it: the "
+        "reference wins over prose, and here it is the only thing that had an opinion",
+    )
+    check(
+        "the correction bumped the provider's CODE REVISION, so old records stop admitting it",
+        RowwiseDequant(SPEC_ROWWISE).code_revision == "2",
+        "#549.9's revision field doing exactly the job it was added for: the records that "
+        "measured revision 1 measured different arithmetic",
     )
 
 

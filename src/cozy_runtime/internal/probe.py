@@ -593,8 +593,9 @@ class _RolePartLike:
 VECTOR_ROOT = Path(__file__).resolve().parent / "encoding" / "vectors"
 
 
-def _from_bits(torch: Any, blob: Mapping[str, Any], device: Any) -> Any:
-    """One vector role/logical field -> the tensor it encodes.
+def vector_tensor(torch: Any, blob: Mapping[str, Any], device: Any) -> Any:
+    """One vector role/logical field -> the tensor it encodes. PUBLIC: the conformance
+    runner builds the same tensors to compare a rounding rule against the reference.
 
     `bits` is base64 of the LITTLE-ENDIAN raw bytes, exactly as the carrier stores them, so
     this is a `frombuffer` and a `view` and never a parse. A dtype the runtime has no torch
@@ -684,7 +685,7 @@ def _spec_vectors(
         logical = case.get("logical") or {}
         if TORCH_DTYPES.get(str(logical.get("dtype"))) != dtype_name:
             continue
-        roles = {role: _from_bits(torch, blob, device) for role, blob in case["roles"].items()}
+        roles = {role: vector_tensor(torch, blob, device) for role, blob in case["roles"].items()}
         missing = sorted(provider.required - set(roles))
         surplus = sorted(set(roles) - provider.required - provider.optional)
         if missing or surplus:
@@ -705,7 +706,7 @@ def _spec_vectors(
             continue
         destination = torch.empty(*shape, dtype=dtype, device=device)
         provider.decode(torch, roles, destination)
-        want = _from_bits(torch, {**logical, "bits": case["expect_logical_bits"]}, device)
+        want = vector_tensor(torch, {**logical, "bits": case["expect_logical_bits"]}, device)
         got_bits = destination.reshape(-1).view(torch.uint8).cpu()
         want_bits = want.reshape(-1).view(torch.uint8).cpu()
         differing = int((got_bits != want_bits).sum())
