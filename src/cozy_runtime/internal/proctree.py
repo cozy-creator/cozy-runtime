@@ -104,31 +104,6 @@ def tree_kill(pid: int, sig: int) -> None:
     os.killpg(os.getpgid(pid), sig)
 
 
-def birth_identity(pid: int) -> str:
-    """A pid plus its kernel start time: the identity that survives pid reuse.
-
-    Two processes can share a pid across time; none share (pid, starttime). Empty string
-    means the process is gone — never a guess.
-    """
-    _linux_only("birth_identity")
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
-        return f"{pid}:{fields[19]}"  # starttime is field 22; 19 after the (comm) split
-    except (OSError, IndexError):
-        return ""
-
-
-def cpu_seconds(pid: int) -> float:
-    """utime+stime for one pid, in seconds — the progress-observation clock (#434), or
-    -1.0 when the process is gone (UNREADABLE, never 0)."""
-    _linux_only("cpu_seconds")
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
-        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-    except (OSError, IndexError, ValueError):
-        return -1.0
-
-
 def progress_burn(pid: int) -> int:
     """The two-handed progress meter: CPU nanoseconds PLUS bytes read from disk — a child
     can be making progress by computing or by waiting on a cold page cache, and a meter

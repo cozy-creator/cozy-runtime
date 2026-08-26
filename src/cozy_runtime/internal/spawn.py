@@ -22,9 +22,7 @@ and does the privilege/parent-death work before exec'ing the executor.
 
 from __future__ import annotations
 
-import hashlib
 import os
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -101,13 +99,3 @@ def spawn_executor(
     )
     del cwd  # the executor's cwd is the supervisor's; the spool is passed as a path
     return Spawned(pid, env, seal_digest(env), tuple(argv))
-
-
-def interpreter() -> str:
-    """The interpreter the executor runs under. One venv, two processes (§3.1)."""
-    return sys.executable
-
-
-def env_fingerprint(names: Mapping[str, str]) -> str:
-    """A cheap stable fingerprint for logging a seal without printing its values."""
-    return hashlib.blake2b(canonical.write(dict(sorted(names.items()))), digest_size=8).hexdigest()

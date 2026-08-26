@@ -1200,15 +1200,6 @@ class StreamingFillBackend:
         self.ledger.release({"vram": self.vram_charge.pop(component, 0)})
         return before - accel.allocated(self.torch, self.kind, self.device)
 
-    def require_ready(self, what: str) -> None:
-        if self.state != "ready":
-            raise _refuse(
-                "not_ready",
-                f"{what} before the fill fence: the generation is {self.state!r}. Content "
-                "validity is the committed tuple (construction generation, backing epoch, "
-                "exact content binding, COMPLETED fill)",
-            )
-
     # -- the stream ---------------------------------------------------------------
 
     def _stream(self, ring: StagingRing) -> int:
@@ -1427,14 +1418,6 @@ def dtype_name(dtype: object) -> str:
 def _tensors(module: Any) -> Iterator[tuple[str, Any]]:
     yield from module.named_parameters(remove_duplicate=False)
     yield from module.named_buffers(remove_duplicate=False)
-
-
-def _non_persistent(root: Any) -> set[str]:
-    names: set[str] = set()
-    for prefix, sub in root.named_modules():
-        for local in getattr(sub, "_non_persistent_buffers_set", ()):
-            names.add(f"{prefix}.{local}" if prefix else local)
-    return names
 
 
 def _derived_values(root: Any) -> dict[tuple[Any, str], Any]:

@@ -40,13 +40,11 @@ float route it was not qualified for.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, canonical
 
 #: This module's own refusal codes, added to cr-005's matrix. Closed, like that one.
 REFUSALS = frozenset(
@@ -561,15 +559,9 @@ class Selector:
 # ------------------------------------------------------------------------------ digests
 
 
-def canonical_digest(payload: Mapping[str, Any]) -> str:
-    """`sha256:` over sorted-key compact JSON — the one spelling this module uses."""
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return "sha256:" + hashlib.sha256(data).hexdigest()
-
-
 def implementation_digest(provider: Any) -> str:
     """The provider's identity: its name, route, device floor and exact role set."""
-    return canonical_digest(
+    return canonical.digest(
         {
             "name": provider.name,
             "route": provider.route,

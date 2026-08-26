@@ -22,7 +22,3 @@ from __future__ import annotations
 #: The minor this copy speaks, from worker-protocol's `WIRE_MINOR` file. `effective =
 #: min(worker, hub)`; never a negotiation, never an admission gate (03 §1.3).
 WIRE_MINOR = 0
-
-#: The major is the package path: an unsupported major surfaces as gRPC UNIMPLEMENTED
-#: before a body byte is parsed.
-WIRE_PACKAGE = "cozy.worker.v1"

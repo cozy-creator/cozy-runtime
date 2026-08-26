@@ -555,10 +555,6 @@ def _digest(value: str, what: str) -> str:
     )
 
 
-def _split(packed: str) -> tuple[str, ...]:
-    return tuple(part.strip() for part in packed.split(",") if part.strip())
-
-
 def _normalize(variant: Variant) -> Variant:
     """One offered candidate, with its digests in the runtime's spelling."""
     return dataclasses.replace(
@@ -569,15 +565,6 @@ def _normalize(variant: Variant) -> Variant:
             for name, value in sorted(variant.snapshot_map().items())
         },
     )
-
-
-def _pairs(packed: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in _split(packed):
-        name, _, value = pair.partition("=")
-        if name and value:
-            out[name] = value
-    return out
 
 
 #: The CLOSED, ORDERED placement ladder (§3.2). Delivery is `native` at launch — `aot_decode`

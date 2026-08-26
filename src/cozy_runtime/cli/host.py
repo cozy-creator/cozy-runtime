@@ -257,7 +257,3 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
         else ("note: this project declares no model binding — nothing to resolve",),
         next=("cozy-runtime serve --socket <path> — serve these bindings over the protocol",),
     )
-
-
-def store_root(config: RuntimeConfig) -> Path:
-    return config.cozy_home

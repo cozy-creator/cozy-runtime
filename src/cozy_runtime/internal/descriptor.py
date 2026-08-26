@@ -32,7 +32,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from cozy_runtime import PYTHON_CONTRACT_VERSION, WIRE_MINOR, WIRE_PROTOCOL_PACKAGE
+from cozy_runtime import PYTHON_CONTRACT_VERSION, WIRE_PROTOCOL_PACKAGE
 from cozy_runtime.author import ConformanceError, Context, ModelBinding, Surface
 from cozy_runtime.author._demand import feature_specs
 from cozy_runtime.author._errors import NEUTRAL_ERROR_SET
@@ -40,6 +40,7 @@ from cozy_runtime.author._services import SERVICES
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
+from cozy_runtime.protocol import WIRE_MINOR
 
 SCHEMA = "cozy.endpoint.descriptor/1"
 FILE = "endpoint.descriptor.json"

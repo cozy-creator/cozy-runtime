@@ -36,12 +36,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
     Capabilities,
     CapabilityRecord,
     DeviceFacts,
-    canonical_digest,
     implementation_digest,
 )
 
@@ -154,7 +153,7 @@ def qualify(
     fabricated one — a record with no evidence is the thing this design forbids, and a
     record whose evidence says "verbatim" is honest.
     """
-    key = canonical_digest(
+    key = canonical.digest(
         {
             "tuple": device.tuple_key(),
             "release": release,
@@ -229,7 +228,7 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
                 device_predicate=observation["device_predicate"],
                 output_dtype=observation["output_dtype"],
                 delivery_route=observation["delivery_route"],
-                evidence_digest=canonical_digest(observation["evidence"]),
+                evidence_digest=canonical.digest(observation["evidence"]),
             )
         )
     return caps

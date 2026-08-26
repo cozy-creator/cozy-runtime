@@ -41,7 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal.encoding import DeviceFacts, canonical_digest, device_line
+from cozy_runtime.internal import canonical
+from cozy_runtime.internal.encoding import DeviceFacts, device_line
 
 
 #: The CLOSED, ORDERED delivery ladder. `delivery` and `materialization` are the wire's
@@ -286,7 +287,7 @@ class DeliveryTable:
 
     @classmethod
     def path_for(cls, root: Path | str, device: DeviceFacts) -> Path:
-        key = canonical_digest({"tuple": device.tuple_key()}).removeprefix("sha256:")[:32]
+        key = canonical.digest({"tuple": device.tuple_key()}).removeprefix("sha256:")[:32]
         return Path(root) / f"delivery-{key}.json"
 
     @classmethod
