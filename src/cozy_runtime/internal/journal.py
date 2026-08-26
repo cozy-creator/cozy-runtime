@@ -34,6 +34,7 @@ from cozy_runtime.internal import canonical
 #: Record kinds. Closed on purpose: a new kind is a schema change, not a new string.
 KINDS = (
     "session",  # a new session minted (control-parent boot)
+    "ownership",  # an ACCEPTED (owner_epoch, controller_id), journaled before ClaimAck (#494e)
     "accepted",  # PREPARED acceptance: spec + plan + model-construction digests
     "terminal",  # the exact canonical TerminalBody bytes, journaled before send
     "closed",  # TerminalAck bound by terminal_id + terminal_digest

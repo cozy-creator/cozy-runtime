@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import errno
 import os
+import queue
 import signal
 import socket
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -242,8 +244,46 @@ class ExecutorSupervision:
         executor cannot serve. The session installs the half it owns — dropping the
         advertised intake state — because readiness is a SESSION fact and the process
         supervisor has no business publishing one. See `invalidate`."""
+        self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]]] = queue.Queue()
+        self._launcher: threading.Thread | None = None
+        self._launcher_lock = threading.Lock()
 
     # ------------------------------------------------------------------ spawn
+
+    def _launch(self, **request: Any) -> spawn.Spawned:
+        """`posix_spawn` from ONE thread that outlives every control stream.
+
+        THE TRAMPOLINE'S CONTAINMENT SEAL IS THREAD-SCOPED. Linux delivers
+        `PR_SET_PDEATHSIG` when the child's parent THREAD exits, not when the parent process
+        does — and executor preparation runs on the accepted stream's own thread, because
+        that is where the Directive arrives. So an owner reconnect, which ends the previous
+        stream and its thread, delivered SIGKILL to a perfectly healthy executor: the
+        running attempt died as ABANDONED / EXECUTOR_INVALIDATED and the worker rebuilt,
+        for no reason but who happened to call `posix_spawn`. The seal is worth keeping —
+        it is the containment guarantee — so the CALLER moves instead: every spawn is
+        performed by this one thread, created once and alive for the life of the process.
+        """
+        with self._launcher_lock:
+            if self._launcher is None:
+
+                def serve_launches() -> None:
+                    while True:
+                        call, answer = self._launches.get()
+                        try:
+                            answer.put(("ok", spawn.spawn_executor(**call)))
+                        except BaseException as exc:  # returned to the asking thread
+                            answer.put(("raise", exc))
+
+                self._launcher = threading.Thread(
+                    target=serve_launches, daemon=True, name="executor-launcher"
+                )
+                self._launcher.start()
+        answer: queue.Queue[Any] = queue.Queue()
+        self._launches.put((request, answer))
+        kind, value = answer.get()
+        if kind == "raise":
+            raise value
+        return value  # type: ignore[no-any-return]
 
     def spawn(self, *, imposed: dict[str, str]) -> Executor:
         """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
@@ -279,7 +319,7 @@ class ExecutorSupervision:
             "COZY_HOME": str(self.cozy_home),
         }
         started = time.perf_counter()
-        spawned = spawn.spawn_executor(
+        spawned = self._launch(
             python=self.python,
             module_argv=[
                 "-c",

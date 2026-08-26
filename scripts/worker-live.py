@@ -187,7 +187,14 @@ class Hub:
         """
         self.streams += 1
         self.connected.clear()
-        self.outbound = queue.Queue()
+        # A FRESH queue per stream, and the request iterator closes over ITS OWN. Reading
+        # `self.outbound` from inside the iterator made every previous stream's iterator a
+        # consumer of the CURRENT stream's queue: a superseded iterator still parked in
+        # `get()` would take the new stream's Claim and write it to a channel that was
+        # closing, and the reconnect then waited forever for an ack to a claim the worker
+        # never received. Same defect as the worker's own outbound lane, same shape of fix.
+        outbound: queue.Queue[pb.OwnerFrame | None] = queue.Queue()
+        self.outbound = outbound
         if self.channel is not None:
             self.channel.close()
         if self.watch_channel is not None:
@@ -195,7 +202,7 @@ class Hub:
         self.root_cert, self.token = root_cert, token
         self.channel = self._dial(addr)
         stub = pb_grpc.WorkerControlStub(self.channel)
-        self.call = stub.Control(self._outbound_iter())
+        self.call = stub.Control(self._outbound_iter(outbound))
         threading.Thread(target=self._read, args=(self.call,), daemon=True).start()
         claim = pb.Claim(
             owner_epoch=self.epoch,
@@ -203,7 +210,7 @@ class Hub:
             wire_minor=WIRE_MINOR,
             proof=token.encode(),
         )
-        self.outbound.put(pb.OwnerFrame(claim=claim))
+        outbound.put(pb.OwnerFrame(claim=claim))
         if claim_only:
             return
         # The claim handshake completes on the reader thread (ClaimAck -> snapshot ->
@@ -235,9 +242,9 @@ class Hub:
             return grpc.secure_channel(addr, grpc.ssl_channel_credentials(self.root_cert))
         return grpc.insecure_channel(addr)
 
-    def _outbound_iter(self) -> Any:
+    def _outbound_iter(self, outbound: queue.Queue[pb.OwnerFrame | None]) -> Any:
         while True:
-            frame = self.outbound.get()
+            frame = outbound.get()
             if frame is None:
                 return
             yield frame

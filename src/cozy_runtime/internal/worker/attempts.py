@@ -131,6 +131,25 @@ class InlineResult:
     adjustments: tuple[Mapping[str, Any], ...]
 
 
+class UndurableOutcome(Exception):
+    """This attempt's outcome could not be journaled, so it will not be sent (#494b).
+
+    Ack-after-journal has no exception for the last resort. An outcome the worker cannot
+    replay after a restart, and cannot match against a TerminalAck, is not a terminal — it is
+    a claim about bytes nobody wrote down. The attempt stays HELD in `local_fault`, the
+    worker takes a LOCAL_SAFETY_REFUSAL fault naming it and goes INTAKE_STATE_ERROR, and the
+    owner reads a worker that stopped rather than an outcome it can never close.
+    """
+
+    def __init__(self, attempt: AttemptRecord, why: str) -> None:
+        super().__init__(
+            f"{attempt.request_id}#{attempt.attempt}: the outcome could not be journaled "
+            f"({why}); it is held in local_fault and NOTHING was sent"
+        )
+        self.key = attempt.key()
+        self.why = why
+
+
 class AttemptRefusal(Exception):
     """A typed refusal that becomes a REFUSED terminal (or a dropped message, when the
     fence says the message was never ours to read)."""
@@ -2029,9 +2048,12 @@ class AttemptEngine:
         nothing (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
         that has nothing left to fail on.
 
-        It is still journaled before it is sent. A journal that cannot commit it is named IN
-        the message, so a reader knows this terminal will not replay — which is strictly
-        better than a coordinator waiting on an answer that is never coming.
+        It is still journaled before it is sent, and NOT SENT AT ALL when that fails
+        (#494b). It used to name the journal failure in the message and ship anyway, which
+        gave the owner an outcome with no durable identity behind it: a restart replays
+        nothing for it, and an ack naming its terminal_id matches nothing. The attempt is
+        held in `local_fault` instead and the worker refuses onward — a worker that stopped
+        is readable; an unreplayable terminal is not.
         """
         body = pb.TerminalBody(
             request_id=attempt.request_id,
@@ -2065,14 +2087,23 @@ class AttemptEngine:
             )
             attempt.state = "terminal"
         except Exception as exc:
+            attempt.state = "local_fault"
+            attempt.terminal_id = ""
+            attempt.terminal_digest = b""
+            attempt.terminal_bytes = b""
             self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                     subject=f"{attempt.request_id}#{attempt.attempt}",
-                    reason="terminal_not_durable",
-                    detail=safe(f"the last-resort terminal could not be journaled: {exc}"),
+                    reason="outcome_not_durable",
+                    detail=safe(
+                        f"the last-resort terminal could not be journaled ({exc}); this "
+                        "attempt is HELD and no outcome was sent — ack-after-journal admits "
+                        "no last resort"
+                    ),
                 )
             )
+            raise UndurableOutcome(attempt, str(exc)) from exc
         return self.wrap(attempt)
 
     def abandon(self, attempt: AttemptRecord, why: str) -> pb.AttemptTerminal:
@@ -2144,17 +2175,22 @@ class AttemptEngine:
         The identity a recovered ABANDONED terminal needs — request id, ordinal, execution
         digest, instance — is journaled at ACCEPTANCE, before the attempt can start, which
         is what makes this reconstruction possible without guessing.
+
+        A row belonging to ANOTHER instance is not replayable — its terminal was authorized
+        under an identity this process is not — but it is not nothing either. It becomes a
+        freshly minted, freshly journaled TYPED LOSS (#494d): ABANDONED / EXECUTOR_INVALIDATED
+        naming the foreign instance, so the owner learns those attempts existed and died. The
+        old behaviour was `continue`, and a coordinator holding a dispatched attempt learned
+        nothing at all about it — the worker simply never mentioned it again.
         """
         recovered: list[pb.ActiveAttempt] = []
         for (request_id, number), row in self.journal.attempts().items():
             if row["state"] == "closed":
                 continue
             digest = documents.raw(row["invocation_digest"])
-            authorized = row.get("instance_id") == self.instance_id and row.get(
-                "invocation_digest"
-            ) == documents.spell(digest)
-            if not authorized:
-                continue  # the three-authorization rule: unauthorized never replays
+            if row.get("invocation_digest") != documents.spell(digest):
+                continue  # the row cannot even name its own subject
+            foreign = str(row.get("instance_id", ""))
             attempt = AttemptRecord(
                 request_id=request_id,
                 attempt=number,
@@ -2163,6 +2199,21 @@ class AttemptEngine:
                 state="terminal",
                 kind=str(row.get("attempt_kind", "serving")),
             )
+            if foreign != self.instance_id:
+                self.terminal(
+                    attempt,
+                    STATUS.TERMINAL_STATUS_ABANDONED,
+                    CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
+                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    f"foreign_instance_identity: this journal row was authorized under "
+                    f"instance {safe(foreign, 64) or '(unnamed)'} and this worker is "
+                    f"{safe(self.instance_id, 64) or '(unnamed)'}, so its journaled outcome "
+                    "is not replayable here; the attempt existed, it is over, and this is "
+                    "the loss said out loud rather than a row dropped in silence",
+                )
+                self.history[attempt.key()] = attempt
+                recovered.append(self._active_row(attempt, row))
+                continue
             if row["state"] == "terminal":
                 attempt.terminal_id = row["terminal_id"]
                 attempt.terminal_digest = documents.raw(row["terminal_digest"])
@@ -2207,15 +2258,19 @@ class AttemptEngine:
     def pending_terminals(self) -> list[AttemptRecord]:
         return [a for a in self.history.values() if a.state == "terminal"]
 
+    #: Every state in which this worker still HOLDS an attempt and owes the owner something.
+    #: `local_fault` is here on purpose (#494b): its outcome was never durable and never
+    #: sent, so the attempt is still the worker's — the wire has no state for "held, outcome
+    #: undurable", and RUNNING plus the LOCAL_SAFETY_REFUSAL fault naming it is the honest
+    #: pair. Dropping it would make the snapshot silent about work the worker is holding.
+    HELD = ("accepted", "running", "terminal", "local_fault")
+
     def snapshot_entries(self) -> list[pb.ActiveAttempt]:
         """The recovery snapshot (02 §6): every attempt this worker still HOLDS — accepted,
-        running, or terminal-pending-ack. A queued one is deliberately absent (the wire has
-        no state for held-not-admitted; the owner's DISPATCHING-absent rule resends it)."""
-        return [
-            self._active_row(a)
-            for a in self.history.values()
-            if a.state in ("accepted", "running", "terminal")
-        ]
+        running, terminal-pending-ack or locally faulted. A queued one is deliberately absent
+        (the wire has no state for held-not-admitted; the owner's DISPATCHING-absent rule
+        resends it, and the admission window is one, so there is never a QUEUE of them)."""
+        return [self._active_row(a) for a in self.history.values() if a.state in self.HELD]
 
     def active(self) -> list[pb.ActiveAttempt]:
         """The attempts this worker CLAIMS. A queued one is not among them: acceptance is

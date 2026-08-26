@@ -37,6 +37,7 @@ import itertools
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -60,6 +61,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptEngine,
     AttemptRecord,
     AttemptRefusal,
+    UndurableOutcome,
 )
 from cozy_runtime.internal.worker.child import (
     GRACE_SECONDS,
@@ -98,12 +100,18 @@ RECYCLE_EXIT = 75
 #: already the rate at which this worker's non-attempt facts move.
 REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 
-#: The worker's accepted-attempt WINDOW behind `attempt_credits` (#441, th-024's stated
-#: launch window): one GPU-active attempt plus at most one admitted tail, so the next
-#: attempt's CPU phase can overlap the current one's device phase and the deep queue stays
-#: at the owner. cr-019's credit accounting refines this; the number is the protocol's own
-#: window, not a tuning choice.
-CREDIT_WINDOW = 2
+#: The worker's accepted-attempt WINDOW behind `attempt_credits` (#441, #494f). ONE.
+#:
+#: It was 2, on the claim that attempt N+1's CPU phase overlaps attempt N's device phase.
+#: That overlap does not exist: `device_lane()` is a single thread that admits, executes and
+#: reconciles one attempt at a time, so a second admitted attempt could only WAIT — and it
+#: waited in a state (`queued`) the wire cannot spell, invisible to the snapshot and to
+#: `Report.active_attempts`. A worker holding work the owner cannot see breaks the
+#: snapshot-is-complete law, so the false state is DELETED rather than surfaced: a dispatch
+#: arriving while this worker already holds one is a typed REFUSED terminal the owner reads,
+#: never a silent hold. cr-019 may re-open overlap as a resource-fit admission decision; it
+#: does not re-open a hidden queue.
+CREDIT_WINDOW = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +127,13 @@ class WorkerOptions:
     root: Path
     worker_id: str = "wrk-local"
     instance_id: str = ""
-    release_id: str = "cozy/sdxl-unet@cr-005"
+    #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
+    #: The defaults used to name a real SDXL release and a `sha256:00…00` image, which rode
+    #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
+    #: owner reading an empty `release_id` learns the truth, and an owner reading a plausible
+    #: lie learns nothing it can act on.
+    release_id: str = ""
+    image_digest: str = ""
     git_commit: str = ""
     python: str = ""
     devices: str = "0"
@@ -154,6 +168,11 @@ class Fences:
     boot_id: str = ""
     owner_epoch: int = 0
     controller_id: str = ""
+    #: TRUE once an (owner_epoch, controller_id) pair has been DURABLY recorded — this boot,
+    #: or by a previous boot whose record recovery replayed (#494e). The claim fence reads
+    #: this and not `generation`: authority survives a restart, so a pre-restart owner at a
+    #: lower epoch must still be refused by a worker that has claimed nobody yet.
+    owner_recorded: bool = False
     generation: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
     dispatch_open: bool = False
@@ -175,6 +194,29 @@ def _stamped(message: Any, fences: Fences) -> Any:
     message.control_generation = fences.generation
     message.worker_boot_id = fences.boot_id
     return message
+
+
+def desired_state(directive: pb.Directive) -> bytes:
+    """The canonical bytes of a Directive's DESIRED STATE — the envelope excluded (#494a).
+
+    A Directive carries two unrelated things: what the owner wants this worker to be
+    (revision, posture, wire minor, drain grace, the mode's set or job), and the per-stream
+    envelope that routes it (owner_epoch, control_generation, worker_boot_id). Only the first
+    is the body §3's same-revision rule is about.
+
+    Hashing the whole message made `control_generation` — which the WORKER mints afresh for
+    every accepted stream, by design — part of the body, so the identical desired revision
+    re-sent after an ordinary reconnect classified as `same_revision_changed_body` and took a
+    permanent CONFIG_REFUSED fault. Same revision + same desired state is now the idempotent
+    re-apply it always was; same revision + genuinely different desired state stays the
+    protocol refusal, because that is the case the rule exists for.
+    """
+    body = pb.Directive()
+    body.CopyFrom(directive)
+    body.owner_epoch = 0
+    body.control_generation = 0
+    body.worker_boot_id = ""
+    return documents.canonical_bytes(body)
 
 
 class Worker:
@@ -234,6 +276,15 @@ class Worker:
         self.engine.deployment_id = lambda: (
             self.deployment.deployment_id if self.deployment is not None else ""
         )
+        #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
+        #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
+        #: keeps draining its own (now unread) queue and can never consume a frame authored
+        #: for the live stream. A single process-wide queue made that theft routine: the dead
+        #: generation's pump sits in `get(timeout=REPORT_SECONDS)`, and for up to that long
+        #: after a reconnect it woke on the NEXT frame — a live AttemptTerminal — saw the
+        #: generation had moved, and dropped it. The terminal was journaled, so it replayed on
+        #: the following claim and the replay law held; live delivery on the stream that
+        #: dispatched it did not.
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
         self.watches = WatchFanout(PROGRESS_QUEUE)
         self.work: queue.Queue[AttemptRecord | None] = queue.Queue()
@@ -281,10 +332,17 @@ class Worker:
     def send(self, frame: pb.WorkerFrame) -> None:
         """Durable. Queued, never shed; the inner message is stamped with the CURRENT fence
         so a frame authored before a re-claim still leaves under the live envelope, and an
-        unacknowledged terminal is replayed after a reconnect."""
+        unacknowledged terminal is replayed after a reconnect.
+
+        STAMP AND ENQUEUE ARE ONE STEP, under the same lock claim acceptance takes: the
+        envelope a frame carries and the stream it is queued on are then the same generation
+        by construction, with no window where a frame is stamped for one stream and handed to
+        another's sender.
+        """
         inner = getattr(frame, frame.WhichOneof("msg"))
-        self.stamp(inner)
-        self.outbound.put(frame)
+        with self.claim_lock:
+            self.stamp(inner)
+            self.outbound.put(frame)
 
     def intake(self, state: pb.IntakeState) -> None:
         """Move the intake state and REPORT IT IMMEDIATELY — readiness is an EDGE."""
@@ -395,20 +453,24 @@ class Worker:
         if claim is None:
             self.note("claim", "dropped a stream whose first frame is not a Claim")
             return
-        generation = self.accept_claim(claim, send)
+        generation, outbound = self.accept_claim(claim, send)
         if generation == 0:
             return  # refused; the rejection already went out and the stream ends
         if self.boot_fatal is not None:
-            # The boot-fatal verdict INSTEAD of ClaimAck (01): authenticated, delivered
-            # once, and the worker's run ends with its mapped exit code.
+            # The boot-fatal verdict INSTEAD of ClaimAck (01, #494c): the claim was
+            # AUTHENTICATED and FENCED above — that is what makes the verdict deliverable to
+            # this dialer — and then the worker says the one true thing it has to say. It
+            # used to ack the claim, send a snapshot, and only then confess it never booted,
+            # which is an owner told it holds a working worker and corrected afterwards.
             send(self.stamp(pb.WorkerFrame(boot_failure=self.boot_fatal)))
-            self.note("boot", "boot failure delivered to the claiming owner; stopping")
+            self.note("boot", "boot failure delivered INSTEAD of ClaimAck; stopping")
             self.shutdown_from_stream()
             return
+        self._send_claim_ack(claim, generation, send)
 
         sender = threading.Thread(
             target=self._pump_outbound,
-            args=(generation, send),
+            args=(generation, send, outbound),
             daemon=True,
             name=f"control-send-{generation}",
         )
@@ -426,17 +488,25 @@ class Worker:
                 self.connected.clear()
                 self.fences.dispatch_open = False
 
-    def accept_claim(self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]) -> int:
-        """The ownership fence (02 §4). Returns the minted generation, or 0 on refusal."""
+    def accept_claim(
+        self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]
+    ) -> tuple[int, queue.Queue[pb.WorkerFrame | None]]:
+        """The ownership fence (02 §4). AUTHENTICATE, fence, RECORD the authority durably,
+        mint the generation. Returns `(generation, this stream's outbound queue)`, or
+        `(0, …)` on refusal — the ClaimAck carrying the rejection has already gone out.
 
-        def reject(reason: pb.ClaimRejection, why: str) -> int:
+        Nothing is acknowledged here. The caller decides what the accepted claim is owed: a
+        BootFailure when this worker never booted, a ClaimAck plus a snapshot otherwise.
+        """
+
+        def reject(reason: pb.ClaimRejection, why: str) -> tuple[int, queue.Queue[Any]]:
             self.note("claim", f"REFUSED ({pb.ClaimRejection.Name(reason)}): {why}")
             ack = pb.ClaimAck(accepted=False, rejection=reason, wire_minor=WIRE_MINOR)
             ack.owner_epoch = claim.owner_epoch
             ack.control_generation = self.fences.generation
             ack.worker_boot_id = self.fences.boot_id
             send(pb.WorkerFrame(claim_ack=ack))
-            return 0
+            return 0, queue.Queue()
 
         if self.bootstrap and not hmac.compare_digest(
             claim.proof.decode(errors="replace"), self.bootstrap
@@ -451,14 +521,18 @@ class Worker:
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
-            if self.fences.generation and claim.owner_epoch < self.fences.owner_epoch:
+            # `owner_recorded`, not `generation`: the high-water authority this worker
+            # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
+            # before the restart instead of welcoming it back as the first claim of a fresh
+            # process.
+            if self.fences.owner_recorded and claim.owner_epoch < self.fences.owner_epoch:
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_STALE_OWNER_EPOCH,
                     f"epoch {claim.owner_epoch} is older than the accepted "
                     f"{self.fences.owner_epoch}",
                 )
             if (
-                self.fences.generation
+                self.fences.owner_recorded
                 and claim.owner_epoch == self.fences.owner_epoch
                 and claim.controller_id != self.fences.controller_id
             ):
@@ -466,13 +540,27 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
                     "equal epoch, different controller: the epoch is held",
                 )
+            # RECORD BEFORE ACKNOWLEDGING. The ack is the moment this worker starts obeying
+            # an owner, so the authority behind it has to outlive the process that obeys it —
+            # exactly the order acceptance and terminals already follow. A journal that
+            # cannot commit it makes this a boot-fatal verdict rather than an ack: accepting
+            # an authority the worker will forget is how a superseded owner reclaims.
+            if not self.record_ownership(claim):
+                return 0, queue.Queue()
             superseded = self.fences.generation
             self.fences.owner_epoch = claim.owner_epoch
             self.fences.controller_id = claim.controller_id
+            self.fences.owner_recorded = True
             self.fences.generation += 1
             self.fences.dispatch_open = False
             self.fences.wire_minor = min(WIRE_MINOR, claim.wire_minor)
             generation = self.fences.generation
+            # A FRESH queue for this stream. The superseded sender keeps its own and drains
+            # into a dead call; nothing it still holds was ever this stream's to deliver, and
+            # everything the law owes regenerates — terminals replay from the journal after
+            # SnapshotAck, reports re-tick.
+            outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
+            self.outbound = outbound
         if superseded:
             self.watches.end_generation(superseded)
             self.note(
@@ -480,17 +568,67 @@ class Worker:
                 f"stream generation {superseded} fenced; generation {generation} claims "
                 f"under epoch {claim.owner_epoch}",
             )
-        # Everything queued for the dead stream regenerates or replays under the law:
-        # terminals replay from the journal after SnapshotAck; reports re-tick.
-        self._drain_outbound()
+        return generation, outbound
 
+    def record_ownership(self, claim: pb.Claim) -> bool:
+        """Journal the authority this claim carries, BEFORE any ClaimAck (#494e).
+
+        Called with `claim_lock` held. False means the record could not be committed, and the
+        worker turns boot-fatal rather than obeying an owner it cannot remember obeying.
+        """
+        try:
+            self.journal.append(
+                "ownership",
+                {
+                    "worker_boot_id": self.fences.boot_id,
+                    "instance_id": self.options.instance_id,
+                    "owner_epoch": int(claim.owner_epoch),
+                    "controller_id": claim.controller_id,
+                },
+            )
+        except JournalError as exc:
+            self.boot_fatal = self.boot_failure(
+                pb.BootFailureReason.BOOT_FAILURE_REASON_DISK_SHAPE,
+                f"the accepted ownership record could not be journaled ({exc.code}): a worker "
+                "that cannot remember whose authority it accepted must not accept it",
+            )
+            self.exit_code = int(Exit.internal)
+            self.note("claim", f"REFUSED: ownership is not durable ({exc.code})")
+            return False
+        return True
+
+    def restore_ownership(self) -> None:
+        """Replay the journalled ownership high-water mark at boot (#494e).
+
+        The fence the owner relies on is "no epoch below the highest this worker ever
+        accepted". Held only in memory it lasted exactly as long as the process, so a
+        restart re-opened the worker to any epoch at all, including the stale owner a higher
+        epoch had already superseded.
+        """
+        rows = self.journal.of_kind("ownership")
+        if not rows:
+            return
+        best = max(rows, key=lambda record: int(record.body.get("owner_epoch", 0)))
+        self.fences.owner_epoch = int(best.body.get("owner_epoch", 0))
+        self.fences.controller_id = str(best.body.get("controller_id", ""))
+        self.fences.owner_recorded = True
+        self.note(
+            "recovery",
+            f"the durable ownership high-water mark is epoch {self.fences.owner_epoch} held "
+            f"by {self.fences.controller_id or '(unnamed)'}; a lower epoch is refused",
+        )
+
+    def _send_claim_ack(
+        self, claim: pb.Claim, generation: int, send: Callable[[pb.WorkerFrame], None]
+    ) -> None:
+        """ClaimAck + the recovery snapshot, for a claim this worker can actually serve."""
         ack = pb.ClaimAck(
             accepted=True,
             wire_minor=WIRE_MINOR,
             worker_id=self.options.worker_id,
             instance_id=self.options.instance_id,
             release_id=self.options.release_id,
-            image_digest="sha256:" + "00" * 32,
+            image_digest=self.options.image_digest,
             git_commit=self.options.git_commit,
             resources=self.resources(),
         )
@@ -502,7 +640,6 @@ class Worker:
             f"{claim.owner_epoch}, generation {generation} "
             f"(wire_minor effective {self.fences.wire_minor})",
         )
-        return generation
 
     def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
         """Begin -> one Entry per held/journaled attempt -> End. Dispatch stays closed
@@ -525,29 +662,28 @@ class Worker:
                 "the owner reconciles them before any dispatch",
             )
 
-    def _pump_outbound(self, generation: int, send: Callable[[pb.WorkerFrame], None]) -> None:
+    def _pump_outbound(
+        self,
+        generation: int,
+        send: Callable[[pb.WorkerFrame], None],
+        outbound: queue.Queue[pb.WorkerFrame | None],
+    ) -> None:
+        """ONE stream's durable sender, draining ONE stream's queue.
+
+        The queue is passed in rather than read off `self`: a superseded pump that keeps
+        looping for a moment must drain the queue it was born with, never the live stream's.
+        """
         while not self.stop.is_set() and self.fences.generation == generation:
             try:
-                frame = self.outbound.get(timeout=REPORT_SECONDS)
+                frame = outbound.get(timeout=REPORT_SECONDS)
             except queue.Empty:
                 continue  # the generation check above is this thread's fence
             if frame is None:
-                return
-            if self.fences.generation != generation:
-                # Superseded while holding a frame: put it back for the live stream's
-                # pump — the frame is stamped at send() time... it was stamped with the
-                # OLD fence. Regenerate-or-replay covers it; drop with a note.
-                self.note("fence", "an outbound frame outlived its stream; dropped (replay law)")
                 return
             try:
                 send(frame)
             except Exception:
                 return
-
-    def _drain_outbound(self) -> None:
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self.outbound.get_nowait()
 
     def fenced(self, message: Any) -> bool:
         """The three-field envelope, in its fixed order, BEFORE any body field (02 §0)."""
@@ -676,7 +812,7 @@ class Worker:
                     )
                 )
                 return
-        body = documents.canonical_bytes(directive)
+        body = desired_state(directive)
         if directive.revision < self.fences.revision:
             self.note("directive", f"revision {directive.revision} ignored (older)")
             return
@@ -685,7 +821,7 @@ class Worker:
                 self.note(
                     "directive",
                     f"PROTOCOL ERROR: revision {directive.revision} arrived with a different "
-                    "body; a changed body must carry a new revision",
+                    "desired state; a changed body must carry a new revision",
                 )
                 self.engine.fault(
                     pb.Fault(
@@ -1107,8 +1243,8 @@ class Worker:
         if attempt.state == "queued":
             self.note(
                 "attempt",
-                "duplicate StartAttempt for a QUEUED attempt: it is already held in arrival "
-                "order and its acceptance will be published when the lane admits it",
+                "duplicate StartAttempt for the attempt currently crossing to the device "
+                "lane: it is held, and its acceptance publishes when the lane admits it",
             )
             return
         if attempt.state in ("accepted", "running"):
@@ -1118,6 +1254,28 @@ class Worker:
                 "the SAME acceptance; nothing starts a second time",
             )
             self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
+            return
+        # THE WINDOW IS ONE, AND OVER IT THE ANSWER IS A TERMINAL (#494f). The device lane is
+        # a single serialized state machine, so a second held attempt could only wait — and
+        # it would wait in a state the wire cannot spell, absent from the snapshot and from
+        # `Report.active_attempts`. A refusal the owner can read and re-dispatch is strictly
+        # more informative than a hold it cannot see.
+        busy = [
+            held
+            for held in self.engine.live.values()
+            if held is not attempt and held.state in ("queued", "accepted", "running")
+        ]
+        if busy:
+            other = busy[0]
+            self.note("attempt", f"{start.request_id}#{start.attempt} over the admission window")
+            self.refuse(
+                start,
+                "no_admission_credit",
+                f"this worker admits one attempt at a time and holds "
+                f"{other.request_id}#{other.attempt} ({other.state}); the window is "
+                f"{CREDIT_WINDOW} and `attempt_credits` reports it every tick",
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
             return
         self.engine.hold(attempt)
         self.work.put(attempt)
@@ -1281,16 +1439,30 @@ class Worker:
     def terminate(
         self, attempt: AttemptRecord, build: Callable[..., pb.AttemptTerminal], *args: Any
     ) -> None:
-        """Journal ONE terminal for a held attempt and send it."""
+        """Journal ONE terminal for a held attempt and send it.
+
+        ACK-AFTER-JOURNAL IS THE LAW, INCLUDING HERE (#494b). An outcome that could not be
+        journaled is never sent: the attempt stays HELD in a typed local-fault state and the
+        worker goes INTAKE_STATE_ERROR with a fault naming it. Sending it anyway would hand
+        the owner truth the worker cannot replay after a restart and cannot ack correctly if
+        the owner tries — a durable claim about bytes nobody wrote down.
+        """
         why = ""
         try:
             self.send(pb.WorkerFrame(attempt_terminal=build(attempt, *args)))
+            return
+        except UndurableOutcome as exc:
+            self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
             return
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
             self.note("attempt", f"the terminal could not be built ({why}); last resort")
         try:
             self.send(pb.WorkerFrame(attempt_terminal=self.engine.last_resort(attempt, why)))
+        except UndurableOutcome as exc:
+            self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
+            self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
         except Exception as inner:
             self.note("attempt", f"even the last-resort terminal failed: {inner}")
             self.intake(pb.IntakeState.INTAKE_STATE_ERROR)
@@ -1429,7 +1601,9 @@ class Worker:
         if self.fences.intake != pb.IntakeState.INTAKE_STATE_READY:
             return 0
         held = sum(
-            1 for a in self.engine.live.values() if a.state in ("queued", "accepted", "running")
+            1
+            for a in self.engine.live.values()
+            if a.state in ("queued", "accepted", "running", "local_fault")
         )
         return max(0, CREDIT_WINDOW - held)
 
@@ -1494,6 +1668,7 @@ class Worker:
             detail=f"{detail} | disk invoice: {json.dumps(invoice, sort_keys=True)}"[:1024],
             resources=self.resources(),
             release_id=self.options.release_id,
+            image_digest=self.options.image_digest,
         )
 
     def run(self) -> int:
@@ -1526,6 +1701,9 @@ class Worker:
                     "recovery",
                     f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
                 )
+            # The accepted-authority high-water mark comes back BEFORE the first claim can
+            # be fenced against it (#494e).
+            self.restore_ownership()
             # Recovery replays the journal ONCE at boot; the snapshot on every later claim
             # reads the engine's own held state.
             recovered = self.engine.recover()
@@ -1580,6 +1758,35 @@ class Worker:
         )
 
 
+#: A provenance digest is `sha256:` plus 64 lowercase hex, or it is not one.
+_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+#: The loopback names a worker may serve plaintext, and without a bootstrap credential.
+LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def instance_identity(root: Path) -> str:
+    """THE instance identity for this journal root, minted once and reused (#494d).
+
+    `instance_id` is the terminal-replay authorization key: recovery only replays journal
+    rows whose instance matches. Minting a fresh `ins-<random>` on every boot therefore made
+    a bare restart declare its own journal foreign — the rows were dropped, and until #494d
+    they were dropped SILENTLY. The identity belongs to the durable root, so it lives beside
+    the journal: the first boot writes it, every later boot reads it, and a launcher that
+    genuinely rotates instances passes `--instance-id` and says so.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / "instance-id"
+    existing = ""
+    with contextlib.suppress(OSError):
+        existing = marker.read_text().strip()
+    if existing:
+        return existing
+    minted = f"ins-{uuid.uuid4().hex[:16]}"
+    marker.write_text(minted + "\n")
+    return minted
+
+
 def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     """Parse the launch flags and run ONE worker hosting the protocol.
 
@@ -1594,7 +1801,12 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--worker-id", default="wrk-local")
     parser.add_argument("--instance-id", default="")
-    parser.add_argument("--release-id", default="cozy/sdxl-unet@cr-005")
+    parser.add_argument("--release-id", default="")
+    parser.add_argument(
+        "--image-digest",
+        default="",
+        help="the worker image's provenance digest, `sha256:<64 hex>`; absent stays absent",
+    )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
     parser.add_argument("--devices", default="0")
@@ -1608,11 +1820,20 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
 
+    if args.image_digest and not _IMAGE_DIGEST.fullmatch(args.image_digest):
+        print(
+            f"[worker] --image-digest {args.image_digest!r} is not `sha256:<64 hex>`: a "
+            "provenance digest is measured or it is absent, never approximated",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
     options = WorkerOptions(
         root=Path(args.root),
         worker_id=args.worker_id,
-        instance_id=args.instance_id or f"ins-{uuid.uuid4().hex[:16]}",
+        instance_id=args.instance_id or instance_identity(Path(args.root)),
         release_id=args.release_id,
+        image_digest=args.image_digest,
         git_commit=args.git_commit,
         python=args.python,
         devices=args.devices,
@@ -1635,16 +1856,30 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         print("[worker] --tls-cert and --tls-key come together or not at all", file=sys.stderr)
         return int(Exit.structural)
     host_part = listen.rsplit(":", 1)[0]
-    if (
-        not listen.startswith("unix:")
-        and host_part not in ("127.0.0.1", "localhost", "::1")
-        and tls_cert is None
-    ):
+    remote = not listen.startswith("unix:") and host_part not in LOOPBACK
+    if remote and tls_cert is None:
         # A worker never listens plaintext off-loopback: the remote leg is TLS + the
         # bearer owner token, or it does not exist (#445; cr-020 item 4 keeps loopback).
         print(
             f"[worker] refusing to bind {listen} without TLS: a non-loopback listener "
             "requires --tls-cert/--tls-key",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
+    if remote and not config.bootstrap_credential:
+        # THE OTHER HALF OF THE SAME REFUSAL (#493 item 10). One-way TLS authenticates the
+        # WORKER to the dialer and says nothing about the dialer, and the Claim check is
+        # conditional on a credential being configured — so a TLS listener with no credential
+        # accepted whoever connected, and the first Claim owned the machine. Loopback and
+        # unix sockets stay legal without one: there the fence is the socket's own filesystem
+        # authority and the kernel's peer credentials, which is a real fence. Off-loopback
+        # there is no such thing, and a worker with no way to tell its owner from a stranger
+        # must not open the door at all.
+        print(
+            f"[worker] refusing to bind {listen} without a bootstrap credential: a "
+            "non-loopback listener authenticates its owner (COZY_BOOTSTRAP_CREDENTIAL) or it "
+            "does not serve — one-way TLS proves nothing about the dialer",
             file=sys.stderr,
             flush=True,
         )

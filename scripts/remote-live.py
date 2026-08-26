@@ -78,23 +78,25 @@ def mint_cert(tmp: Path) -> tuple[Path, Path]:
     return cert, key
 
 
-def start_remote(tmp: Path, cert: Path, key: Path, *, listen: str, token: str) -> tuple:
-    """The weightless worker on a TLS listener, its token provisioned via the environment
-    (the one channel a launcher hands it through, #449/#463)."""
-    home, root, project = tmp / "home", tmp / "worker", tmp / "project"
-    home.mkdir(parents=True, exist_ok=True)
-    root.mkdir(parents=True, exist_ok=True)
-    ids = ll.stage_weightless(home, project, ("tick",))
-    log = tmp / f"worker-{len(os.listdir(tmp))}.log"
+def serve_env(home: Path, *, token: str) -> dict[str, str]:
+    """The launch environment. An EMPTY token means the launcher provisioned none, which
+    is the whole subject of section 4 — the variable is absent, not empty-but-present."""
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "COZY_HOME": str(home),
         "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
-        "COZY_BOOTSTRAP_CREDENTIAL": token,
     }
-    (root / "control.addr").unlink(missing_ok=True)
-    argv = [
+    if token:
+        env["COZY_BOOTSTRAP_CREDENTIAL"] = token
+    return env
+
+
+def serve_argv(
+    *, listen: str, root: Path, cert: Path | None = None, key: Path | None = None
+) -> list[str]:
+    """ONE argv builder, so every arm below differs only in what it is testing."""
+    return [
         "nice",
         "-n",
         "19",
@@ -113,13 +115,27 @@ def start_remote(tmp: Path, cert: Path, key: Path, *, listen: str, token: str) -
         "--grace",
         "3.0",
         "--no-warm",
-        "--tls-cert",
-        str(cert),
-        "--tls-key",
-        str(key),
+        *(("--tls-cert", str(cert), "--tls-key", str(key)) if cert and key else ()),
     ]
+
+
+def start_remote(
+    tmp: Path, cert: Path, key: Path, *, listen: str, token: str
+) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str]]:
+    """The weightless worker on a TLS listener, its token provisioned via the environment
+    (the one channel a launcher hands it through, #449/#463)."""
+    home, root, project = tmp / "home", tmp / "worker", tmp / "project"
+    home.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    ids = ll.stage_weightless(home, project, ("tick",))
+    log = tmp / f"worker-{len(os.listdir(tmp))}.log"
+    (root / "control.addr").unlink(missing_ok=True)
     process = subprocess.Popen(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, bufsize=0
+        serve_argv(listen=listen, root=root, cert=cert, key=key),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=serve_env(home, token=token),
+        bufsize=0,
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
     return process, root, log, ids
@@ -204,32 +220,9 @@ def main() -> int:
             process.wait(timeout=15)
 
     wl.head("3. red arm: a non-loopback PLAINTEXT listener refuses to bind")
-    p2, root2, _log2, _ = start_remote(tmp, cert, key, listen="0.0.0.0:0", token=TOKEN)
-    # start_remote always passes TLS; strip it by launching once more WITHOUT the flags:
-    p2.terminate()
-    p2.wait(timeout=10)
-    env = {
-        "PATH": os.environ["PATH"],
-        "HOME": os.environ["HOME"],
-        "COZY_HOME": str(tmp / "home"),
-        "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
-    }
     plain = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; from cozy_runtime.internal.worker.session import main; "
-            "raise SystemExit(main(sys.argv[1:]))",
-            "--listen",
-            "0.0.0.0:0",
-            "--root",
-            str(root2),
-            "--instance-id",
-            "ins-plain",
-            "--release-id",
-            ll.RELEASE,
-        ],
-        env=env,
+        serve_argv(listen="0.0.0.0:0", root=tmp / "plain"),
+        env=serve_env(tmp / "home", token=TOKEN),
         capture_output=True,
         text=True,
         timeout=30,
@@ -241,6 +234,45 @@ def main() -> int:
         if (plain.stderr + plain.stdout).strip()
         else f"exit {plain.returncode}",
     )
+
+    wl.head("4. red arm: a non-loopback TLS listener with NO bootstrap credential refuses")
+    # THE OTHER HALF OF SECTION 3 (#493 item 10). TLS proves the WORKER's identity to the
+    # dialer and says nothing about the dialer; with no credential configured the Claim
+    # check is skipped entirely, so the first stranger to connect owned the machine. The
+    # refusal is at BIND, before a port exists — the same shape as the plaintext refusal.
+    anonymous = subprocess.run(
+        serve_argv(listen="0.0.0.0:0", root=tmp / "anon", cert=cert, key=key),
+        env=serve_env(tmp / "home", token=""),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = (anonymous.stderr + anonymous.stdout).strip()
+    wl.check(
+        "TLS off-loopback without a credential is a typed refusal to bind",
+        anonymous.returncode != 0 and "without a bootstrap credential" in output,
+        output.splitlines()[-1][:140] if output else f"exit {anonymous.returncode}",
+    )
+    # GREEN: the same argv with the credential provisioned binds and publishes its address.
+    (tmp / "authed").mkdir(parents=True, exist_ok=True)
+    authed = subprocess.Popen(
+        serve_argv(listen="0.0.0.0:0", root=tmp / "authed", cert=cert, key=key),
+        env=serve_env(tmp / "home", token=TOKEN),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    threading.Thread(target=wl._pump, args=(authed, tmp / "authed.log"), daemon=True).start()
+    try:
+        bound = wl.read_addr(tmp / "authed", authed)
+        wl.check(
+            "and the SAME listener with a credential provisioned binds and serves",
+            bool(bound),
+            f"bound {bound} with COZY_BOOTSTRAP_CREDENTIAL provisioned",
+        )
+    finally:
+        authed.terminate()
+        authed.wait(timeout=15)
 
     print(f"\nremote leg: {wl.PASS} ok, {wl.FAIL} failed")
     return 1 if wl.FAIL else 0
