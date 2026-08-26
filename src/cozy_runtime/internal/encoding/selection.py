@@ -155,7 +155,11 @@ def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
         kind=kind,
         name=str(identity["name"]),
         sm=int(identity["sm"]),
-        driver=str(identity["driver"]),
+        # THE REAL DRIVER, from NVML, on the SELECTED device — never `torch.version.cuda`,
+        # which is the wheel's build-time CUDA runtime and rides beside it as such (#549.9).
+        # The CUDA driver API version torch reports is folded in so an unreadable NVML still
+        # leaves a driver fact in the key rather than a bare "unreadable".
+        driver=f"{_nvml('driver_version', index)}/api{identity['driver_api']}",
         configuration=f"{_nvml('power.limit', index)}W/{_nvml('mig.mode.current', index)}",
         index=int(index),
         cuda_runtime=str(identity["cuda_runtime"]),

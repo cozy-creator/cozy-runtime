@@ -246,17 +246,44 @@ def rank() -> None:
         "first-match would have flipped both answers; a ranked table is a function of the "
         "measurements",
     )
-    try:
-        caps.admit(
-            "sha256:fixture", sm89, "bfloat16", "fp8-rowwise/1", objective="latency", among=among
-        )
-        check("ARM: an unmeasurable objective refuses", False, "it did not refuse")
-    except EncodingRefusal as exc:
-        check(
-            "ARM: `latency` has no axis measured across both routes, so it REFUSES",
-            exc.code == "objective_unranked",
-            f"[{exc.code}] {str(exc)[:230]}",
-        )
+    # #549.3 RETIRED THE REFUSAL THIS ARM USED TO ASSERT. `latency` still names no
+    # per-record axis — nothing on a capability record measures a quantity comparable
+    # between a decode paid once at fill and a GEMM paid every step — but `objective_unranked`
+    # was the DEFAULT objective refusing one layer above the store that holds whole-plan
+    # latency measurements, so the default path died as soon as a second implementation
+    # existed. Admission now DEFERS: it returns a deterministic order and says nothing, and
+    # `resolution.resolve` ranks whole plans where the measurement lives.
+    latency = caps.admit(
+        "sha256:fixture", sm89, "bfloat16", "fp8-rowwise/1", objective="latency", among=among
+    )
+    ranked = caps.rank(caps.records, among, "latency")
+    check(
+        "ARM: `latency` DEFERS instead of refusing, and its order is a function of nothing",
+        among[latency.implementation_digest].name
+        == min(among[r.implementation_digest].name for r in caps.records)
+        and [among[r.implementation_digest].name for r in ranked]
+        == [
+            among[r.implementation_digest].name
+            for r in caps.rank(list(reversed(caps.records)), among, "latency")
+        ],
+        f"{among[latency.implementation_digest].name} — ordered by implementation NAME, which "
+        "decides nothing and is stable; the plan level is where latency is actually scored "
+        "(#549.3), and refusing here is what made the DEFAULT axis a dead end",
+    )
+    check(
+        "an UNMEASURED axis still sorts LAST, so `nobody measured it` never wins",
+        caps.rank(
+            [
+                _record(decode, "cuda.sm89", -1.0, -1.0),
+                _record(native, "cuda.sm89", 8.286, 0.01459),
+            ],
+            among,
+            "footprint",
+        )[0].resident_bits_per_element
+        > 0.0,
+        "-1.0 is numerically smaller than every real measurement, so an unranked candidate "
+        "would have won a lower-is-better comparison it was never entitled to enter",
+    )
     # THE UNMEASURED DEVICE. Only the decode floor has a record that sm86 satisfies, so
     # `footprint` — the objective that WANTS the leaf — takes the floor and does not sulk.
     floor = Capabilities([_record(decode, "cuda.sm86", 16.0, 0.00911), *caps.records])

@@ -1236,6 +1236,16 @@ class _WrongScale:
     device_predicate = "any"
     required = frozenset({"data", "weight_scale"})
     optional = frozenset({"input_scale"})
+    # #549.4/#549.9's two additions to the provider surface. A plant has to carry them or it
+    # is not the shape a real provider is, and the arm would be exercising the wrong thing.
+    code_revision = "0"
+
+    @property
+    def reviewed_specs(self) -> frozenset[str]:
+        return frozenset({self.encoding})
+
+    def supports(self, shape: object) -> str:
+        return ""
 
     def decode(self, torch: Any, parts: dict[str, Any], destination: Any) -> None:
         destination.copy_(parts["data"].view(destination.shape).to(destination.dtype))

@@ -891,16 +891,18 @@ def arms() -> None:
     # table so the staged cross lands on a rung with a DIFFERENT kernel, which is exactly
     # the §3.2 violation the fence exists for. Planted, observed, removed.
     #
-    # THE LEDGER POSE IS THE ARM'S SECOND RED, AND IT IS NOT FIXED HERE. The pose below
-    # never reaches `component_staged` — the ladder answers `all_resident` — so the cross
-    # never runs and the guard branch prints FAIL. That is a fact about `worker/plan.py`'s
-    # placement ladder, which this lane did not touch and cannot verify from a header: the
-    # numbers that would reach the staged rung have to come from a real prepare's ledger,
-    # not from a hand-posed one. LEFT RED AND NAMED (#549 report), not papered over.
+    # THE LEDGER POSE, CORRECTED. This arm was the second of delivery-live's two
+    # pre-existing reds and it was a STALE ASSERTION, not a machinery failure: the pose
+    # reasoned from `activations_peak = 2 GiB` against `device_free = 1 GiB` and expected
+    # `all_resident` to come up short — but the activation coefficient BOUNDS the charge at
+    # 1 GiB, so all_resident needed exactly 1 GiB against exactly 1 GiB allocatable and fit.
+    # The ladder was right and the arm's arithmetic was not. 512 MiB free is short of the
+    # bound charge, so `all_resident` misses, `component_staged` may free the 4 GiB resident
+    # UNet and fits, and the cross the fence exists for actually runs.
     ledger = Ledger(host_budget=8 * GIB, pinned_budget=256 * MIB)
     ledger.resident = {"unet": 4 * GIB}
     ledger.activations_peak = 2 * GIB
-    ledger.device_free = 1 * GIB
+    ledger.device_free = 512 * MIB
     ledger.device_reserved = 0
     ledger.device_allocated = 0
     declared = DeclaredBinding.read(binding_record(variants()))
@@ -923,9 +925,7 @@ def arms() -> None:
             check(
                 "ARM: the plant needs the staged cross to fire",
                 False,
-                f"the ladder chose {planted.placement}, so the cross never ran — a "
-                "PRE-EXISTING red this lane did not subsume; the pose needs a real prepare's "
-                "ledger, not a hand-written one",
+                f"the ladder chose {planted.placement}, so the cross never ran",
             )
         else:
             check("ARM: a delivery side effect refuses", False, "it did not refuse")

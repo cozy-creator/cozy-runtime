@@ -153,15 +153,32 @@ def present(torch: Any, kind: str) -> bool:
 
 
 def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
-    """One device's STABLE identity — model, compute level, driver. Everything here holds
-    for the life of the machine, which is what lets a probe result be keyed by it."""
+    """One device's STABLE identity, from TORCH. Everything here holds for the life of the
+    machine, which is what lets a probe result be keyed by it.
+
+    **`driver` used to be `torch.version.cuda` and that was wrong** (#549.9). That value is
+    the CUDA RUNTIME torch was compiled against — a property of the wheel, not of the
+    machine — so two pods with one torch build and different NVIDIA drivers produced
+    identical capability keys, and a record minted under a driver with a miscompiled kernel
+    was reused under one without it. It is now spelled `cuda_runtime`, which is what it is.
+
+    Two DRIVER facts replace it, and neither is invented here: `driver_api` is the CUDA
+    driver API version torch itself reports (`_cuda_getDriverVersion`, e.g. 13000), and the
+    display driver version proper is an NVML query that `encoding.measure_device` makes with
+    the SELECTED device index. Both ride the key.
+    """
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "device_identity")
     major, minor = torch.cuda.get_device_capability(index)
+    api = getattr(getattr(torch, "_C", None), "_cuda_getDriverVersion", None)
     return {
         "name": str(torch.cuda.get_device_properties(index).name),
         "sm": major * 10 + minor,
-        "driver": str(torch.version.cuda or "unknown"),
+        # The CUDA runtime the WHEEL was built against. A build fact, named as one.
+        "cuda_runtime": str(torch.version.cuda or "unknown"),
+        # The CUDA DRIVER API version, from the driver. Unreadable is SPELLED, never
+        # defaulted to a number that would collide with a real one.
+        "driver_api": str(api() if callable(api) else "unreadable"),
     }
 
 
