@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import proctree, spawn
+from cozy_runtime.internal import accel, proctree, spawn
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 
@@ -271,6 +271,10 @@ class ExecutorSupervision:
         self.spawns += 1
         imposed = {
             **imposed,
+            # Backend-mandated laws come from the accelerator boundary (#450): on MPS this
+            # forces PYTORCH_ENABLE_MPS_FALLBACK=0; on CUDA it is empty. The FAMILY is a
+            # cheap platform fact (present-but-unqualified, #446).
+            **accel.child_env_law(accel.host_backend_family()),
             "COZY_EXECUTOR_SOCKET": self.socket_path,
             "COZY_HOME": str(self.cozy_home),
         }

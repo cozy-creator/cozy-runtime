@@ -67,6 +67,18 @@ def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
     }
 
 
+def host_backend_family() -> str:
+    """The accelerator FAMILY this host could serve — `mps` on Apple silicon, else `cuda`.
+    A platform fact, not a capability claim (present-but-unqualified, #446); cheap enough
+    for the spawn path, unlike hostfacts' nvidia-smi measurement."""
+    import platform as _platform
+    import sys as _sys
+
+    if _sys.platform == "darwin" and _platform.machine() == "arm64":
+        return "mps"
+    return "cuda"
+
+
 def child_env_law(kind: str) -> dict[str, str]:
     """Backend-mandated child-env impositions, merged into the reviewed seal (§3.5)."""
     if kind == "mps":
