@@ -371,6 +371,41 @@ LIVE_ARMS = (
         "    'doomed', read_host_available() + (4 << 30), 0, 'a move nobody can satisfy')\n",
         "host_move_doomed",
     ),
+    # ------------------------------------------------------------------ #574b
+    # The fill plane's device accounting, armed where it is arithmetic. Both bodies carry
+    # the REAL H3 numbers — a 92.42 GiB stored / 128.31 GiB logical N-ary artifact whose
+    # transformer is fp8-stored — so the fence is provable without a card.
+    (
+        "decode-scratch-rides-the-device-budget",
+        "from cozy_runtime.internal.fill import ResourceLedger\n"
+        "l = ResourceLedger(budgets={'vram': 97_544_751_472, 'pinned': 1 << 30})\n"
+        "l.grant({'vram': 97_544_751_472}, 'the four served components')\n"
+        # The decode scratch is DEVICE memory. Before the fix it had no budget at all and
+        # was charged to a counter the refusal never printed, so a fill could hold its whole
+        # vram budget AND its scratch and still report itself inside its envelope.
+        "l.grant({'decode': 691_011_584}, 'decode scratch for the fp8 transformer')\n",
+        "decode needs 691011584 B, 0 B free",
+    ),
+    (
+        "stored-bytes-are-not-resident-bytes",
+        "from cozy_runtime.internal.fill import price_envelope\n"
+        # transformer: fp8-stored, bf16-resident. text_encoder/video_vae/audio_vae: plain.
+        "rows = [\n"
+        "  ('transformer', 40_225_668_192, 20_958_085_592, 'decoded_float'),\n"
+        "  ('text_encoder', 51_506_191_840, 51_506_191_840, 'verbatim'),\n"
+        "  ('video_vae', 5_207_742_160, 5_207_742_160, 'verbatim'),\n"
+        "  ('audio_vae', 605_149_280, 605_149_280, 'verbatim'),\n"
+        "]\n"
+        "env = price_envelope(rows, 512 << 20)\n"
+        "stored = sum(r[2] for r in rows)\n"
+        "assert env['destination_bytes'] == 97_544_751_472, env['destination_bytes']\n"
+        "assert env['destination_bytes'] > stored, 'the fp8 rows did not expand'\n"
+        "raise SystemExit(\n"
+        "  'destinations %d B against %d B stored: the envelope EXPANDS the fp8 rows by "
+        "%d B, which is what the record priced at zero'\n"
+        "  % (env['destination_bytes'], stored, env['destination_bytes'] - stored))\n",
+        "the envelope EXPANDS the fp8 rows",
+    ),
     (
         "witness-boot-record-on-ram",
         "import pathlib\nfrom cozy_runtime.internal.witness import require_durable\n"

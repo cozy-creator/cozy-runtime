@@ -55,6 +55,10 @@ ERASED_PREFIXES: tuple[str, ...] = (
     "MKL_",
 )
 
+#: The fill plane's capture directory, named here because the allowlist row and the config
+#: authority's reader must spell it identically and this is the table both read.
+FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
+
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here.
 CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
@@ -88,6 +92,14 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "COZY_EXECUTOR_SOCKET",
         "worker.executor_channel",
         "the worker/executor control channel path handed to the child at spawn",
+    ),
+    ProjectedVar(
+        FILL_FORENSICS_DIR,
+        "config.forensics_dir",
+        "where the fill plane writes its per-boundary memory captures. The FILL runs in "
+        "the executor, so a capture directory that stopped at the worker would instrument "
+        "the one process that never allocates a destination. A path, not a switch: unset "
+        "means nowhere to write, and the served code path is identical either way",
     ),
 )
 

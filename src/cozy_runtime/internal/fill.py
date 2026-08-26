@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ from cozy_runtime.internal.encoding import (
     launch_providers,
     measure_device,
 )
+from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 
 # ------------------------------------------------------------------------- refusals
 
@@ -174,6 +176,13 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
 #: moments and a plan that prices them as one number prices neither.
 CLASSES = ("vram", "pinned", "staging", "decode")
 
+#: The classes that are DEVICE bytes. They share one budget because they share one card: a
+#: `decode` grant that rode free of the `vram` budget is how a fill priced at 85.4 GiB came
+#: to hold 139.0 (blocker 10) — the plane charged every byte it moved, in four counters, and
+#: then checked one of them. A budget over a subset of the classes on a resource is not a
+#: budget for that resource.
+DEVICE_CLASSES = ("vram", "decode")
+
 
 @dataclass(slots=True)
 class ResourceLedger:
@@ -187,28 +196,43 @@ class ResourceLedger:
     budgets: dict[str, int] = field(default_factory=dict)
     charged: dict[str, int] = field(default_factory=lambda: dict.fromkeys(CLASSES, 0))
     peak: dict[str, int] = field(default_factory=lambda: dict.fromkeys(CLASSES, 0))
+    #: the high-water of every DEVICE class SUMMED. Per-class peaks happen at different
+    #: moments, so their sum is not a number the card ever saw and the maximum of one of
+    #: them is not the number it did.
+    peak_device: int = 0
     grants: int = 0
+
+    @property
+    def device_charged(self) -> int:
+        """Every DEVICE class at once — the number the card actually experiences."""
+        return sum(self.charged[cls] for cls in DEVICE_CLASSES)
 
     def grant(self, request: Mapping[str, int], why: str) -> None:
         """Charge every class or none. A class over budget refuses naming need and have."""
+        device_want = sum(n for cls, n in request.items() if cls in DEVICE_CLASSES)
         for cls, nbytes in request.items():
             if cls not in CLASSES:
                 raise AssertionError(f"{cls} is not a ledger class")
-            budget = self.budgets.get(cls)
+            # A DEVICE class is priced against the DEVICE's budget and the device's total
+            # charge, never against its own counter alone.
+            budget = self.budgets.get("vram" if cls in DEVICE_CLASSES else cls)
             if budget is None:
                 continue
-            free = budget - self.charged[cls]
-            if nbytes > free:
+            have = self.device_charged if cls in DEVICE_CLASSES else self.charged[cls]
+            need = device_want if cls in DEVICE_CLASSES else nbytes
+            free = budget - have
+            if need > free:
                 raise _refuse(
                     "budget_overrun",
-                    f"{why}: {cls} needs {nbytes} B, {free} B free of a {budget} B budget "
-                    f"(short by {nbytes - free} B) — a fill is granted its whole envelope "
+                    f"{why}: {cls} needs {need} B, {free} B free of a {budget} B budget "
+                    f"(short by {need - free} B) — a fill is granted its whole envelope "
                     "before it moves a byte, never incrementally under pressure",
                     [cls],
                 )
         for cls, nbytes in request.items():
             self.charged[cls] += nbytes
             self.peak[cls] = max(self.peak[cls], self.charged[cls])
+        self.peak_device = max(self.peak_device, self.device_charged)
         self.grants += 1
 
     def release(self, request: Mapping[str, int]) -> None:
@@ -216,7 +240,7 @@ class ResourceLedger:
             self.charged[cls] = max(0, self.charged[cls] - nbytes)
 
     def rows(self) -> dict[str, dict[str, int]]:
-        return {
+        out = {
             cls: {
                 "charged": self.charged[cls],
                 "peak": self.peak[cls],
@@ -224,6 +248,73 @@ class ResourceLedger:
             }
             for cls in CLASSES
         }
+        out["device"] = {
+            "charged": self.device_charged,
+            "peak": self.peak_device,
+            "budget": self.budgets.get("vram", -1),
+        }
+        return out
+
+
+def price_envelope(
+    rows: Sequence[tuple[str, int, int, str]], decode_scratch_bytes: int
+) -> dict[str, Any]:
+    """The device envelope of one fill: (component, logical, stored, route) rows in, bytes out.
+
+    Pure arithmetic over header numbers, deliberately: it is the half of the fix that can be
+    RED-ARMED without a card, against the real stored-vs-logical sizes of a real artifact.
+
+    THE STORED SIZE IS NOT THE RESIDENT SIZE. A bf16 destination of an fp8-stored row occupies
+    its LOGICAL bytes, by exactly the ratio the header already states, so an envelope priced
+    at an artifact's stored bytes under-prices the fill by that ratio — and the budget check
+    it feeds can then refuse nothing real. Measured on H3: 92.42 GiB stored against 128.31 GiB
+    logical, and the number the record declared was the first one.
+
+    The composition, per class and per component, because a single total is exactly what made
+    a 53.6 GiB gap unattributable:
+
+      destinations  logical bytes of every row, which is what `to_empty` reserves;
+      native        the STORED payload of every `encoded_gemm` row, which becomes the resident
+                    weight and is live BESIDE its float destination until the leaf is
+                    installed — the rung's real peak, not its settled size;
+      decode        the rolling scratch envelope, `min(total, budget + largest)`, live for ONE
+                    component at a time and released at that component's stream end, so the
+                    fill's peak carries the LARGEST of them and never their sum.
+
+    A census may exceed `destinations`: a module tree holds derived buffers no row supplies.
+    This is therefore a FLOOR under the true envelope, and it says so.
+    """
+    per: dict[str, dict[str, int]] = {}
+    for component, logical, stored, route in rows:
+        cell = per.setdefault(
+            component,
+            {"destinations": 0, "native": 0, "decode_total": 0, "decode_largest": 0, "rows": 0},
+        )
+        cell["rows"] += 1
+        cell["destinations"] += logical
+        if route == "encoded_gemm":
+            cell["native"] += stored
+        elif route == "decoded_float":
+            cell["decode_total"] += stored
+            cell["decode_largest"] = max(cell["decode_largest"], stored)
+    for cell in per.values():
+        cell["decode_envelope"] = (
+            min(cell["decode_total"], decode_scratch_bytes + cell["decode_largest"])
+            if cell["decode_total"]
+            else 0
+        )
+    destinations = sum(cell["destinations"] for cell in per.values())
+    native = sum(cell["native"] for cell in per.values())
+    decode = max((cell["decode_envelope"] for cell in per.values()), default=0)
+    return {
+        "components": per,
+        "destination_bytes": destinations,
+        "native_bytes": native,
+        "decode_peak_bytes": decode,
+        "required_bytes": destinations + native + decode,
+        "basis": "header logical bytes + selected routes; a FLOOR — a module tree's derived "
+        "buffers are not rows and are not counted here",
+    }
 
 
 # ------------------------------------------------------------------- the TensorFS reader
@@ -843,6 +934,16 @@ class StreamingFillBackend:
         #: is where measured free VRAM decides things (cr-008b).
         self.resident_budget = 0
         self.stats: dict[str, Any] = {"windows": 0, "waits": 0}
+        #: What the LAST rollback proved it returned, read off the allocator rather than
+        #: claimed from arithmetic. Empty until one runs; a rollback that could not prove
+        #: its return leaves `complete: False` here and the refusal reply carries it.
+        self.rollback_report: dict[str, Any] = {}
+        #: THE MEMORY FORENSICS (§3.2's meters, at the boundaries). None unless a capture
+        #: directory was configured; every call below is a no-op then, and the serving path
+        #: is byte-for-byte the same. See `internal/forensics.py` for why it is permanent.
+        self.forensics = FillForensics.open(
+            self.torch, self.kind, self.device, f"fill-{os.getpid()}-{int(time.time())}"
+        )
         # cr-006. The device is measured once and the qualification suite runs once per
         # tuple (persisted, first-writer-wins), both at PREPARE time — §3.2's cost
         # placement: the request path runs neither. Selection itself is an O(1) dict
@@ -1001,6 +1102,9 @@ class StreamingFillBackend:
             )
         roots = dict(_members(obj))
         started = time.perf_counter_ns()
+        self._mark(
+            "materialize_begin", walked_components=list(walked.components), roots=sorted(roots)
+        )
         held = 0
         with placing():
             for name in walked.components:
@@ -1056,6 +1160,12 @@ class StreamingFillBackend:
                     raise
                 _restore_derived(member, derived)
                 self.components[name] = member
+                self._mark(
+                    "component_reserved",
+                    component=name,
+                    priced=want,
+                    derived_restored=len(derived),
+                )
             # Inside the placement window too: censusing a REAL module detaches every
             # tensor, and a detach on cuda is exactly the "real allocation during
             # construction" the derive guard exists to catch in author code.
@@ -1076,7 +1186,87 @@ class StreamingFillBackend:
             self.census_keys[component] = frozenset(
                 d.key for d in fresh.destinations if d.component == component
             )
+        self._mark("materialize_end", destinations=len(fresh.destinations))
         return fresh.live
+
+    # -- the forensics view ------------------------------------------------------
+
+    def _forensic_state(self) -> dict[str, Any]:
+        """What the PLANE believes, in the same row as what the allocator holds.
+
+        The two halves of a byte gap have to be read at one instant or the difference is an
+        argument rather than a measurement. `charged` is this plane's arithmetic per class;
+        `held` is the module trees' own distinct-storage bytes; `charge` is what each
+        component was priced at. Subtracting `held` from `charge` names the census's error
+        and subtracting their sum from the allocator's live bytes names everything else.
+        """
+        held: dict[str, int] = {}
+        for name, member in list(self.components.items()):
+            try:
+                held[name] = distinct_storage_bytes(t for _, t in _tensors(member))
+            except Exception:
+                continue
+        scratch = 0
+        for parts in self.scratch.values():
+            scratch += distinct_storage_bytes(parts.values())
+        return {
+            "ledger": self.ledger.rows(),
+            "charge": dict(self.vram_charge),
+            "component_bytes": dict(self.component_bytes),
+            "held": held,
+            "held_total": sum(held.values()),
+            "scratch_live_bytes": scratch,
+            "enqueued": len(self.enqueued),
+            "components": sorted(self.components),
+            "parked": sorted(self.parked),
+            "replaced": len(self.replaced),
+        }
+
+    def _mark(self, boundary: str, **fields: Any) -> None:
+        if self.forensics is None:
+            return
+        self.forensics.mark(boundary, **{**self._forensic_state(), **fields})
+
+    # -- the arithmetic, before a byte moves -------------------------------------
+
+    def device_envelope(self) -> dict[str, Any]:
+        """What this fill WILL hold on the card, priced from the header and the routes.
+
+        THE STORED SIZE IS NOT THE RESIDENT SIZE. An fp8-stored tensor served through the
+        decode floor occupies its LOGICAL bytes on the device — bf16 destinations of fp8
+        rows EXPAND, by exactly the ratio the header already states — so an envelope priced
+        at the artifact's stored bytes under-prices the fill by that ratio and the budget
+        check it feeds cannot refuse anything real. Measured on H3: 92.42 GiB stored against
+        128.31 GiB logical, and the number the coordinator declared was the first one.
+
+        The composition, per class and per component, because a single total is exactly what
+        made the 53.6 GiB gap unattributable:
+
+          destinations  logical bytes of every row, which is what `to_empty` reserves;
+          native        the STORED payload of every `encoded_gemm` row, which becomes the
+                        resident weight and is live BESIDE its float destination until the
+                        leaf is installed — the rung's real peak, not its settled size;
+          decode        the rolling scratch envelope, `min(total, budget + largest)`, live
+                        for ONE component at a time and released at its stream's end, so
+                        the fill's peak carries the LARGEST of them and not their sum.
+
+        The census may exceed `destinations`: a module tree holds derived buffers no row
+        supplies. This is therefore a FLOOR under the true envelope, and it says so.
+        """
+        return price_envelope(
+            [
+                (
+                    row.component,
+                    int(row.nbytes),
+                    int(row.stored_nbytes),
+                    self.selector.select(
+                        row.key, row.encoded, dtype_name(row.dtype), row.shape
+                    ).provider.route,
+                )
+                for row in self.plan.values()
+            ],
+            self.decode_scratch_bytes,
+        )
 
     # -- the Backend protocol ----------------------------------------------------
 
@@ -1326,6 +1516,9 @@ class StreamingFillBackend:
         self.stats["decode"] = dict(self.decoded)
         self._reconcile_leaves()
         self.enqueued.clear()
+        self._mark("fill_end", decoded=dict(self.decoded))
+        if self.forensics is not None:
+            self.forensics.dump("fill_end")
 
     def _reconcile_leaves(self) -> None:
         """The census law for a generation whose topology MOVED, and the ledger's settle.
@@ -1530,6 +1723,20 @@ class StreamingFillBackend:
         including the fill loop's live destination map. Measured here (an interrupted 4.78
         GiB fill "released" 0 bytes until the storages were freed explicitly), and it is
         the same hazard the moment a worker journals a fill failure.
+
+        AND IT PROVES ITS OWN RETURN. A rollback that reports success while the allocator
+        still holds the destinations is worse than one that fails loudly: the next attempt
+        in the same executor is priced against a card that number says is empty and is not,
+        so it refuses before it begins — measured on the H3 N-ary fill, where a rollback
+        returned 48 GiB, kept 90.8, and said nothing. The allocator is READ BACK here, the
+        claim is compared against it, and a return that cannot be proven is recorded as
+        `rollback_incomplete` with both numbers. The ledger is only told a class was
+        released for bytes the device agrees came back; charging on for memory this process
+        really is still holding is the whole point of keeping a ledger.
+
+        A MODULE TREE IS A REFERENCE, not just an allocation. `to_empty(meta)` alone frees
+        nothing while `parked`, `derived`, `scratch`, `replaced` or the leaf maps still hold
+        the tensors, so every one of them is dropped here.
         """
         from cozy_runtime.internal.derive import placing
 
@@ -1538,16 +1745,47 @@ class StreamingFillBackend:
         # store's reaper's problem, and leaving one is how a GC-safe hold becomes a leak.
         self.hold_lease = False
         self.release_lease()
+        entered = accel.allocated(self.torch, self.kind, self.device)
+        claimed = 0
+        self._mark("rollback_begin", keys=len(keys), entered_allocated=entered)
         with placing():
-            self._drop_scratch()
-            self._free_storages(self.enqueued.values())
+            claimed += self._drop_scratch()
+            claimed += self._free_storages(self.enqueued.values())
             self.enqueued.clear()
-            for name, member in list(self.components.items()):
-                self._free_storages(t for _, t in _tensors(member))
-                member.to_empty(device=self.torch.device("meta"), recurse=True)
-                self.ledger.release({"vram": self.vram_charge.pop(name, 0)})
-        self.components.clear()
+            for table in (self.components, self.parked):
+                for name, member in list(table.items()):
+                    claimed += self._free_storages(t for _, t in _tensors(member))
+                    member.to_empty(device=self.torch.device("meta"), recurse=True)
+                    self.vram_charge.pop(name, 0)
+                table.clear()
+            # The references, not only the bytes. `derived` holds cloned buffer VALUES and
+            # the leaf maps hold module identities; a rollback that leaves them behind hands
+            # the next generation a tree it was told no longer exists.
+            self.derived.clear()
+            self.scratch.clear()
+            self.replaced.clear()
+            self.leaf_sites.clear()
+            self.leaf_grant.clear()
+            self.census_keys.clear()
+        accel.synchronize(self.torch, self.kind)
         accel.release_cached(self.torch, self.kind)
+        returned = entered - accel.allocated(self.torch, self.kind, self.device)
+        # THE LEDGER IS TOLD WHAT THE DEVICE AGREED TO. Releasing the full charge against a
+        # partial return is exactly how the ledger came to describe a card that did not
+        # exist; the unreturned remainder stays CHARGED and named.
+        charged = self.ledger.charged["vram"]
+        self.ledger.release({"vram": min(charged, max(returned, 0))})
+        self.rollback_report = {
+            "entered_allocated_bytes": entered,
+            "claimed_bytes": claimed,
+            "returned_bytes": returned,
+            "retained_bytes": max(entered - returned, 0),
+            "ledger_vram_still_charged": self.ledger.charged["vram"],
+            "complete": returned >= claimed and self.ledger.charged["vram"] == 0,
+        }
+        self._mark("rollback_end", **self.rollback_report)
+        if self.forensics is not None:
+            self.forensics.dump("rollback_end")
         self.state = "rolled_back"
 
     def _free_storages(self, tensors: Any) -> int:
@@ -1753,6 +1991,9 @@ class StreamingFillBackend:
         remaining: dict[str, int] = {}
         pending: list[PlanRow] = []
         held = [0]
+        #: which component's plan the callbacks are servicing right now — a forensics row
+        #: with no component names a boundary nobody can place in the fill.
+        current = [""]
 
         def slot_for(what: str) -> Any:
             """The uint8 view one role's bytes land in, allocated on first touch.
@@ -1829,6 +2070,12 @@ class StreamingFillBackend:
                 # tensor: 743 fences would cost more than the scratch it saves.
                 ring.drain(0)
                 held[0] -= self._decode(pending)
+                self._mark(
+                    "decode_flush",
+                    component=current[0],
+                    scratch_held=held[0],
+                    batches=batches[0],
+                )
 
         started = time.perf_counter_ns()
         stats: dict[str, Any] = {}
@@ -1896,6 +2143,20 @@ class StreamingFillBackend:
             # and `dest_off` is an offset inside that plan's own logical stream.
             moved[0] += cursor[0]
             cursor[0] = 0
+            current[0] = component
+            self._mark(
+                "component_stream_begin",
+                component=component,
+                rows=len(group),
+                stored_bytes=expect,
+                logical_bytes=sum(row.nbytes for row in group),
+                decode_envelope=envelope,
+                native_bytes=native_bytes,
+                routes={
+                    route: sum(1 for r in routes.values() if r == route)
+                    for route in set(routes.values())
+                },
+            )
             try:
                 with store_refusals(f"streaming {component}"):
                     one = self._acquire(component).stream(
@@ -1914,8 +2175,14 @@ class StreamingFillBackend:
                 ring.drain(0)
                 held[0] -= self._decode(pending)
             finally:
-                self._drop_scratch()
+                dropped = self._drop_scratch()
                 self.ledger.release({"decode": envelope})
+                self._mark(
+                    "component_stream_end",
+                    component=component,
+                    scratch_dropped=dropped,
+                    scratch_held=held[0],
+                )
             for key, value in dict(one).items():
                 stats[key] = stats.get(key, 0) + value if isinstance(value, int) else value
         self.stats["read_ns"] = time.perf_counter_ns() - started

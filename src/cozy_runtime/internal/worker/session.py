@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import egress, hostfacts
+from cozy_runtime.internal import child_env, config, egress, hostfacts
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -1840,7 +1840,23 @@ class Worker:
                     f"{reply.get('peak_ledger_vram_bytes', 0)} B was LIVE when it failed; "
                     f"after rollback the allocator holds "
                     f"{reply.get('allocator_bytes', -1)} B and the device has "
-                    f"{reply.get('device_free_bytes', -1)} B free]",
+                    f"{reply.get('device_free_bytes', -1)} B free"
+                    # A ROLLBACK THAT CANNOT PROVE ITS RETURN SAYS SO, HERE. The retained
+                    # bytes are why the next attempt in this worker refuses before it
+                    # begins, so they belong beside the refusal that produced them.
+                    + (
+                        ""
+                        if (reply.get("rollback") or {}).get("complete", True)
+                        else (
+                            f"; ROLLBACK INCOMPLETE: claimed "
+                            f"{(reply.get('rollback') or {}).get('claimed_bytes')} B, the "
+                            f"allocator returned "
+                            f"{(reply.get('rollback') or {}).get('returned_bytes')} B, "
+                            f"{(reply.get('rollback') or {}).get('retained_bytes')} B are "
+                            "still held and stay CHARGED on the ledger"
+                        )
+                    )
+                    + "]",
                 )
                 # The executor generation is poisoned by the failed construction, so it is
                 # replaced — and the loop CONTINUES onto the next binding group, which gets
@@ -1997,11 +2013,18 @@ class Worker:
 
     def imposed(self) -> dict[str, str]:
         """The IMPOSE half of the seal. Every name here is in the reviewed allowlist."""
-        return {
+        imposed = {
             "CUDA_VISIBLE_DEVICES": self.options.devices,
             "PYTORCH_CUDA_ALLOC_CONF": self.options.alloc_conf,
             "OMP_NUM_THREADS": str(self.options.threads),
         }
+        # The FILL runs in the executor, so its capture directory has to cross the seal or
+        # it instruments the one process that never reserves a destination. Projected only
+        # when one is configured: an empty value is an imposition of nothing.
+        where = config.forensics_dir()
+        if where:
+            imposed[child_env.FILL_FORENSICS_DIR] = where
+        return imposed
 
     # ------------------------------------------------------------------ dispatch
 

@@ -109,6 +109,17 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
 
 
+def forensics_dir(environ: Mapping[str, str] | None = None) -> str:
+    """Where the fill plane writes its memory captures, or "" for nowhere.
+
+    A PATH, deliberately, and read HERE because this module is the environment authority.
+    It is configuration and not a logic gate: the plane branches on having somewhere to
+    write, and a run with no directory configured executes the identical code path.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(child_env.FILL_FORENSICS_DIR, "").strip()
+
+
 _read: bool = False
 
 

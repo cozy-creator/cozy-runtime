@@ -374,6 +374,45 @@ class Executor:
         # possible at all: 0 means every component stays resident.
         backend.resident_budget = int(budgets.get("resident", 0))
         backend.hold_lease = backend.resident_budget > 0
+        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The record's declared weight is the
+        # COORDINATOR's number and it is priced in the artifact's STORED bytes; the card
+        # experiences the LOGICAL destinations plus the scratch envelopes. Where the two
+        # disagree the header wins, because it is the only one of them that read the rows —
+        # and the fit is decided against MEASURED allocatable bytes here, where a refusal
+        # costs nothing, rather than by discovering an OOM 90 GiB into the fill.
+        envelope = backend.device_envelope()
+        declared = int(budgets["vram"])
+        ledger.budgets["vram"] = max(declared, int(envelope["required_bytes"]))
+        memory = accel.allocation(torch, self.device_kind)
+        allocatable = memory["driver_free_bytes"] + max(
+            memory["reserved_bytes"] - memory["allocated_bytes"], 0
+        )
+        if int(envelope["required_bytes"]) > allocatable:
+            self.poisoned = "fill refused: device_shortfall"
+            return {
+                "ok": False,
+                "code": "device_shortfall",
+                "detail": (
+                    f"this fill will hold {envelope['required_bytes']} B on the device "
+                    f"({envelope['destination_bytes']} B of logical destinations, "
+                    f"{envelope['native_bytes']} B of native encoded leaves, "
+                    f"{envelope['decode_peak_bytes']} B of decode scratch at its widest "
+                    f"component) against {allocatable} B allocatable — refused on the "
+                    f"arithmetic, before a byte moved. The record declared {declared} B, "
+                    "which is the artifact's STORED size; bf16 destinations of fp8-stored "
+                    "rows expand and the header prices them"
+                ),
+                "envelope": envelope,
+                "declared_weight_bytes": declared,
+                "shortfall": {
+                    "resource": "vram",
+                    "scope": "component_generation",
+                    "needed_bytes": int(envelope["required_bytes"]),
+                    "available_bytes": int(allocatable),
+                    "evidence_class": "measured",
+                },
+                "ledger": ledger.rows(),
+            }
         artifact = Artifact(
             next(v for v in offered if v.name == plan.variant).snapshot,
             topology_of(rows),
@@ -444,11 +483,19 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:400],
                 "state": backend.state,
                 "peak_allocator_bytes": accel.peak_allocated(torch, self.device_kind),
-                "peak_ledger_vram_bytes": ledger.peak["vram"],
+                # BOTH DEVICE CLASSES. `peak["vram"]` alone reported 85.4 GiB for a fill
+                # that also held decode scratch, and the difference read as unexplained.
+                "peak_ledger_vram_bytes": ledger.peak_device,
+                "peak_ledger_destinations_bytes": ledger.peak["vram"],
                 "allocator_bytes": memory["allocated_bytes"],
                 "device_free_bytes": free,
                 "device_total_bytes": total,
                 "ledger": ledger.rows(),
+                "envelope": envelope,
+                # WHAT THE ROLLBACK PROVED, read off the allocator. A rollback that could
+                # not prove its return is the reason the NEXT attempt refuses, so the
+                # refusal that caused it carries the evidence.
+                "rollback": backend.rollback_report,
             }
             if oom:
                 reply["shortfall"] = {
