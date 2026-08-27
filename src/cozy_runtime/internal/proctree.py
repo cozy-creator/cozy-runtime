@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import errno
 import hashlib
 import os
 import secrets
@@ -416,135 +415,6 @@ def process_state(process: ProcessIdentity) -> str | None:
         return None
 
 
-def process_group_members(pgid: int) -> list[tuple[ProcessIdentity, str]]:
-    """Every observable birth in process group ``pgid``, including zombies."""
-    _linux_only("process_group_members")
-    found: list[tuple[ProcessIdentity, str]] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        try:
-            fields = _linux_stat(pid)
-            if int(fields[2]) != pgid:
-                continue
-            found.append((ProcessIdentity(pid=pid, started_ticks=int(fields[19])), fields[0]))
-        except (ProcessLookupError, IndexError, ValueError):
-            continue
-    return found
-
-
-def _open_pidfd(process: ProcessIdentity) -> int:
-    """Open a stable kernel handle for exactly ``process``.
-
-    This Python build does not expose :func:`os.pidfd_open`, but glibc does.  Opening the
-    handle before re-reading the birth marker closes the usual check-then-``kill`` PID
-    reuse race: the handle keeps naming the birth it was opened against.
-    """
-    _linux_only("pidfd_open")
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        pidfd_open = libc.pidfd_open
-    except AttributeError as exc:
-        raise OSError(errno.ENOSYS, "libc has no pidfd_open") from exc
-    pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
-    pidfd_open.restype = ctypes.c_int
-    fd = int(pidfd_open(process.pid, 0))
-    if fd < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), process.pid)
-    if not same_process(process):
-        os.close(fd)
-        raise ProcessLookupError(process.pid)
-    return fd
-
-
-def signal_process(process: ProcessIdentity, sig: int) -> None:
-    """Signal one exact process birth through a pidfd, never a reusable numeric PID."""
-    fd = _open_pidfd(process)
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        try:
-            pidfd_send_signal = libc.pidfd_send_signal
-        except AttributeError as exc:
-            raise OSError(errno.ENOSYS, "libc has no pidfd_send_signal") from exc
-        pidfd_send_signal.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-        ]
-        pidfd_send_signal.restype = ctypes.c_int
-        if int(pidfd_send_signal(fd, int(sig), None, 0)) < 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), process.pid)
-    finally:
-        os.close(fd)
-
-
-def freeze_process_group(leader: ProcessIdentity, *, seconds: float = 10.0) -> set[ProcessIdentity]:
-    """Stop and return every exact birth in an executor's process group.
-
-    There is deliberately no ``killpg`` here.  The leader is stopped first, then every
-    observed member is stopped through a pidfd.  Two equal all-stopped censuses prove that
-    no member can still fork while the caller proceeds to exact per-birth signals.
-
-    The exact leader must still exist.  Its stopped birth pins the numeric group ID while
-    members are enumerated.  An absent or reused leader leaves only a reusable number, so
-    nothing is touched; restart recovery may observe that number but must not signal it.
-    """
-    _linux_only("freeze_process_group")
-    try:
-        current = process_identity(leader.pid)
-    except ProcessLookupError:
-        current = None
-    if current != leader:
-        return set()
-
-    deadline = time.monotonic() + seconds
-    known: set[ProcessIdentity] = set()
-    stable: frozenset[ProcessIdentity] | None = None
-    while True:
-        observed = process_group_members(leader.pid)
-        if same_process(leader) and all(process != leader for process, _ in observed):
-            # A provisional child may not have installed its own group yet.  It is still
-            # safe to stop by exact birth; its inherited worker group is never signalled.
-            state = process_state(leader)
-            if state is not None:
-                observed.append((leader, state))
-        for process, state in observed:
-            known.add(process)
-            if state not in {"T", "t", "Z"}:
-                with contextlib.suppress(ProcessLookupError):
-                    signal_process(process, signal.SIGSTOP)
-
-        census = process_group_members(leader.pid)
-        if same_process(leader) and all(process != leader for process, _ in census):
-            state = process_state(leader)
-            if state is not None:
-                census.append((leader, state))
-        known.update(process for process, _ in census)
-        stopped = all(state in {"T", "t", "Z"} for _, state in census)
-        identities = frozenset(process for process, _ in census)
-        if stopped and identities == stable:
-            return known
-        stable = identities if stopped else None
-        if time.monotonic() >= deadline:
-            states = {process.pid: state for process, state in census}
-            raise TimeoutError(f"could not freeze process group {leader.pid}: states={states}")
-        time.sleep(0.01)
-
-
-def kill_process_group(leader: ProcessIdentity, *, seconds: float = 10.0) -> set[ProcessIdentity]:
-    """Freeze one owned group, then SIGKILL each captured birth through a pidfd."""
-    known = freeze_process_group(leader, seconds=seconds)
-    for process in known:
-        if process_state(process) != "Z":
-            with contextlib.suppress(ProcessLookupError):
-                signal_process(process, signal.SIGKILL)
-    return known
-
-
 def reap_child(process: ProcessIdentity) -> int | None:
     """Reap one exact child zombie if it belongs to this worker."""
     if process_state(process) != "Z":
@@ -578,25 +448,6 @@ def progress_burn(pid: int) -> int:
         return burned + int(io["read_bytes"])
     except (OSError, KeyError, ValueError):
         return burned  # no `io` for this process; the CPU hand still decides
-
-
-def processes_with_cmdline_markers(
-    markers: tuple[bytes, ...], *, exclude: int = 0
-) -> list[ProcessIdentity]:
-    """Every live process birth whose argv contains all `markers`."""
-    _linux_only("processes_with_cmdline_markers")
-    found: list[ProcessIdentity] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit() or int(entry.name) == exclude:
-            continue
-        try:
-            text = b" ".join((entry / "cmdline").read_bytes().split(b"\0"))
-        except OSError:
-            continue
-        if all(marker in text for marker in markers):
-            with contextlib.suppress(ProcessLookupError):
-                found.append(process_identity(int(entry.name)))
-    return found
 
 
 def rss_bytes(pid: int) -> int:

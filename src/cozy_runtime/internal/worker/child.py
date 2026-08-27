@@ -123,7 +123,7 @@ class Executor:
     construction_key: str = ""
     prepared_binding_set: frozenset[str] = frozenset()
     prepared_model: PreparedModel | None = None
-    purpose: str = "fresh"
+    reserved_for_job: bool = False
     poisoned: str = ""
     spawned_at: float = 0.0
     ready_at: float = 0.0
@@ -198,20 +198,6 @@ class Executor:
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
-
-    # ------------------------------------------------------------------ signals
-
-    def kill_group(self, sig: int = signal.SIGKILL) -> int:
-        """Fault-injection hook: signal this exact executor group without retiring it."""
-        try:
-            known = proctree.freeze_process_group(self.process)
-            for process in known:
-                if proctree.process_state(process) != "Z":
-                    with contextlib.suppress(ProcessLookupError):
-                        proctree.signal_process(process, sig)
-            return len(known)
-        except (ProcessLookupError, PermissionError):
-            return 0
 
     def close(self) -> None:
         self.channel.close()
