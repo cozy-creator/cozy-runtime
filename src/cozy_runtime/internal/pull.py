@@ -7,13 +7,13 @@ TensorFS never sees a presigned URL or worker credential."* So this module owns 
 things — the hub's read routes, the SSRF guard, the credential, the deadline — and owns
 nothing about what the bytes ARE.
 
-**Every byte crosses one door and it is not in this file.** `tensorfs.fetch_admit` hashes
-what arrives, checks it against the plan's digest AND length, and commits at the digest it
-computed or commits nothing. This module never writes into the CAS, never decides an object
-is already present, and never computes a digest: `tensorfs.fetch_plan` answers residency and
-`tensorfs.fetch_complete` answers "did it land". A transport that answered any of those
-itself would be a second opinion about identity, and the two would disagree exactly once,
-silently, on the artifact that mattered.
+**Every byte crosses a TensorFS-owned door.** Network bodies use `tensorfs.fetch_admit`;
+cache-to-local and verified local-to-cache copies use `tensorfs.transfer_object`, whose
+destination is the same digest/length/no-clobber Store admission. This module never resolves
+Store layout, writes into a CAS, or computes a digest: `tensorfs.fetch_plan` answers local
+residency and `tensorfs.fetch_complete` answers "did it land". A transport that answered any
+of those itself would be a second opinion about identity, and the two would disagree exactly
+once, silently, on the artifact that mattered.
 
 **What resume means here.** The pull is resumable PER OBJECT, which is what the plan makes
 free: a dropped connection loses the partial temp file of one object and nothing else, and
@@ -92,7 +92,7 @@ class PullRefusal(Exception):
 
 
 def open_store(tensorfs: Any, root: Path) -> Any:
-    """Open or initialize the one local TensorFS store used by a transport adapter."""
+    """Open or initialize one TensorFS-owned store root without resolving its layout."""
 
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -105,7 +105,7 @@ def open_store(tensorfs: Any, root: Path) -> Any:
         raise PullRefusal(
             "border_refused",
             f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
-            "repair the substrate cache mount or launch against an empty store directory",
+            "repair the backing filesystem or launch against an empty store directory",
         ) from exc
 
 
@@ -447,6 +447,8 @@ class PullResult:
     bytes_total: int = 0
     presence: dict[str, str] = field(default_factory=dict)
     objects: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
+    cache_degradations: set[str] = field(default_factory=set)
 
     def document(self) -> dict[str, object]:
         return {
@@ -537,6 +539,7 @@ def pull(
         bytes_held=int(plan["held_bytes"]),
         bytes_total=int(plan["held_bytes"]) + int(plan["wanted_bytes"]),
         presence=dict(plan["presence"]),
+        sources={str(object_id): "local" for object_id, _ in plan["held"]},
     )
     _execute_plan(
         tensorfs,
@@ -564,6 +567,7 @@ def pull_granted_snapshot(
     session: str = "",
     streams: int = STREAMS,
     on_object: Callable[[str, int, bool], None] | None = None,
+    cache_store: Any | None = None,
 ) -> PullResult:
     """Admit one exact SnapshotManifest closure from closed direct HTTPS grants.
 
@@ -650,6 +654,7 @@ def pull_granted_snapshot(
         bytes_held=int(plan["held_bytes"]),
         bytes_total=int(plan["held_bytes"]) + int(plan["wanted_bytes"]),
         presence=dict(plan["presence"]),
+        sources={str(object_id): "local" for object_id, _ in plan["held"]},
     )
     _execute_plan(
         tensorfs,
@@ -663,6 +668,7 @@ def pull_granted_snapshot(
         streams=streams,
         on_object=on_object,
         no_proxy=True,
+        cache_store=cache_store,
     )
     return result
 
@@ -680,16 +686,27 @@ def _execute_plan(
     streams: int,
     on_object: Callable[[str, int, bool], None] | None,
     no_proxy: bool = False,
+    cache_store: Any | None = None,
 ) -> None:
     """Run one TensorFS-authored plan and require its own completion proof."""
 
     ledger = threading.Lock()
 
+    def degraded(code: str) -> None:
+        with ledger:
+            result.cache_degradations.add(code)
+
     def one(item: tuple[str, int]) -> None:
         object_id, length = item
         raw = in_hand.get(object_id)
-        if raw is not None:
+        if cache_store is not None and _admit_cached(
+            tensorfs, cache_store, store, object_id, length, degraded
+        ):
+            source = "network_cache"
+        elif raw is not None:
             _admit(tensorfs, store, plan["document"], object_id, _Bytes(raw))
+            _backfill(tensorfs, store, cache_store, object_id, length, degraded)
+            source = "cloud"
         else:
             url = urls.get(object_id)
             if url is None:
@@ -708,10 +725,13 @@ def _execute_plan(
                 allow_local,
                 no_proxy=no_proxy,
             )
+            _backfill(tensorfs, store, cache_store, object_id, length, degraded)
+            source = "cloud"
         with ledger:
             result.fetched += 1
             result.bytes_moved += length
             result.objects.append(object_id)
+            result.sources[object_id] = source
             if on_object is not None:
                 on_object(object_id, length, True)
 
@@ -747,6 +767,43 @@ class _Bytes:
         return chunk
 
 
+def _admit_cached(
+    tensorfs: Any,
+    cache_store: Any,
+    local_store: Any,
+    object_id: str,
+    length: int,
+    degraded: Callable[[str], None],
+) -> bool:
+    transfer = tensorfs.transfer_object
+    try:
+        transfer(cache_store, local_store, object_id, length)
+    except Exception as exc:
+        code = str(getattr(exc, "code", ""))
+        if code == "OBJECT_ABSENT":
+            return False
+        degraded("corrupt" if code in {"LENGTH_MISMATCH", "OBJECT_CORRUPT"} else "read_unavailable")
+        return False
+    return True
+
+
+def _backfill(
+    tensorfs: Any,
+    local_store: Any,
+    cache_store: Any | None,
+    object_id: str,
+    length: int,
+    degraded: Callable[[str], None],
+) -> None:
+    if cache_store is None:
+        return
+    transfer = tensorfs.transfer_object
+    try:
+        transfer(local_store, cache_store, object_id, length)
+    except Exception:
+        degraded("backfill_unavailable")
+
+
 def _fetch(
     tensorfs: Any,
     store: Any,
@@ -756,7 +813,7 @@ def _fetch(
     deadline: Deadline,
     allow_local: bool,
     *,
-    no_proxy: bool = False,
+    no_proxy: bool,
 ) -> None:
     try:
         resp = open_guarded(url, deadline, allow_local=allow_local, no_proxy=no_proxy)
@@ -810,6 +867,7 @@ def _border(exc: BaseException, code: str, subject: str = "") -> PullRefusal:
     layer could restate.
     """
     detail = f"{type(exc).__name__}: {exc}"
+    cause = str(getattr(exc, "code", ""))
     if code == "artifact_incomplete":
         return PullRefusal(
             "artifact_incomplete",
@@ -822,6 +880,7 @@ def _border(exc: BaseException, code: str, subject: str = "") -> PullRefusal:
         f"{subject or 'the artifact'} was refused at the TensorFS border — {detail}",
         "the bytes that arrived are not the bytes the catalog names; nothing was installed. "
         "Re-run to re-fetch, and if it repeats the hub's custody of that object is suspect",
+        cause=cause,
     )
 
 
