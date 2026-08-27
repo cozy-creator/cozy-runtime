@@ -322,10 +322,9 @@ def _prove_readonly_container_cgroup_v1() -> None:
     if not memberships:
         raise ContainmentUnavailable("no cgroup-v1 controller membership exists")
     mounts = _cgroup_v1_mounts()
-    readonly = getattr(os, "ST_RDONLY", 1)
     for controllers, relative in memberships:
         candidates = [
-            path
+            (mount, path)
             for mount in mounts
             if controllers.issubset(mount.controllers)
             if (path := _inside_mount(mount, relative)) is not None and path.is_dir()
@@ -335,15 +334,11 @@ def _prove_readonly_container_cgroup_v1() -> None:
                 f"cgroup-v1 controllers {sorted(controllers)} resolve to "
                 f"{len(candidates)} containing mount paths"
             )
-        try:
-            if not os.statvfs(candidates[0]).f_flag & readonly:
-                raise ContainmentUnavailable(
-                    f"cgroup-v1 controller path {candidates[0]} is not read-only"
-                )
-        except OSError as exc:
+        mount, path = candidates[0]
+        if "ro" not in mount.options:
             raise ContainmentUnavailable(
-                f"cannot inspect cgroup-v1 controller path {candidates[0]}"
-            ) from exc
+                f"cgroup-v1 controller mount {mount.target} for {path} is not read-only"
+            )
     if not _full_proc_visibility():
         raise ContainmentUnavailable("full same-UID /proc visibility is unavailable")
     try:
