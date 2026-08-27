@@ -5,6 +5,7 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 fixture="$repo/proofs/fixtures/model-contract-endpoint"
 fake_torch="$repo/proofs/fixtures/fake-torch"
 support="$repo/proofs/support/model_contract.py"
+shared_support="$repo/proofs/support/proof_data.py"
 uv_bin=$(command -v uv)
 proof_root=$(mktemp -d /tmp/cozy-model-contract-proof.XXXXXX)
 fixture_source="$proof_root/endpoint-source"
@@ -16,7 +17,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 if grep -R -n -E 'from cozy_runtime\.internal|import cozy_runtime\.internal' \
-    "$repo/proofs/model-contract" "$support"; then
+    "$repo/proofs/model-contract" "$support" "$shared_support"; then
     echo "public model-contract proof imports private Runtime modules" >&2
     exit 1
 fi

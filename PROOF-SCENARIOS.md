@@ -16,8 +16,8 @@ script remains the only local executor and must not be deleted yet.
 | `scripts/delivery-live.py` | variants, selection, refusals, calibration, serving | internal proof plus GPU qualification | pending; not rerun here |
 | `scripts/derive-corpus.py` | adversarial derivation corpus | internal derivation proof | pending; not rerun here |
 | `scripts/derive-verify.py` | H3/SDXL derivation and refusals | internal derivation proof | pending; not rerun here |
-| `scripts/environment-materializer-live.py` | private materializer cold/warm/refusals | internal environment proof | pending; no public-CLI claim |
-| `scripts/environment-proof-live.py` | public environment cold/rebuild/refusals | `proofs/environment/` | pending; dynamically imports materializer script |
+| `scripts/environment-materializer-live.py` | private materializer cold/warm/refusals | `proofs/internal/environment_materializer.py` | migrated 2026-08-27; only publish-race/receipt-keyed reuse and post-publication tamper checks remain private; public CLI subsumes its other facts |
+| `scripts/environment-proof-live.py` | public environment cold/rebuild/refusals | `proofs/environment/run.sh` | migrated 2026-08-27; installed wheel from `/`, exact receipt bytes/digest/length, isolated imports, CUDA ABI, atomic race, closed-request and wheel refusals, no partial outputs |
 | `scripts/fence.py` | architecture dependency scans | `checks/` | pending; current hosted-check owner |
 | `scripts/job-live.py` | job e2e, kill, refusals, identity, timing | internal job proof plus qualification/benchmark | pending; not rerun here |
 | `scripts/leaf-live.py` | provider selection, carriers, refusals | internal encoding proof plus qualification | pending; not rerun here |
@@ -44,7 +44,7 @@ script remains the only local executor and must not be deleted yet.
 | `scripts/wire-fence.py` | generated wire-schema identity | `checks/` | pending; current hosted-check owner |
 | `scripts/worker-live.py` | worker attempts, death/recovery, journals, readiness, timing | internal worker proof plus qualification/benchmark | pending; not rerun here |
 
-Eight old entrypoints dynamically load other entrypoints (`assets-live`, `cli-live`,
-`delivery-live`, `environment-proof-live`, `leaf-pod`, `lifecycle-live`,
-`model-contract-proof-live`, and `remote-live`). Replacements must use ordinary support modules
-or process contracts; moving that coupling under a new directory does not count as migration.
+Six old entrypoints dynamically load other entrypoints (`assets-live`, `cli-live`,
+`delivery-live`, `leaf-pod`, `lifecycle-live`, and `remote-live`). Replacements must use ordinary
+support modules or process contracts; moving that coupling under a new directory does not count
+as migration.

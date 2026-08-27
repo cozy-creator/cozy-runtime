@@ -6,6 +6,13 @@ from typing import Any, ClassVar, Self
 __version__ = "0.0.0-proof"
 
 
+class _Version:
+    cuda = "12.9"
+
+
+version = _Version()
+
+
 class _Context:
     def __enter__(self) -> Self:
         return self
