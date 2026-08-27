@@ -167,6 +167,8 @@ def _start_worker(
         grant_roots,
         "--environment-root",
         str(ENVIRONMENT_ROOT),
+        "--artifact-store",
+        str(prepared.artifact_store),
         "--tls-cert",
         str(config.tls_cert_path),
         "--tls-key",

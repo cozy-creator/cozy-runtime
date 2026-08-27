@@ -169,7 +169,6 @@ import dataclasses
 
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
-    ArtifactFacts,
     DeclaredBinding,
     PlanChooser,
     PreparedModel,
@@ -187,27 +186,18 @@ ledger.device_reserved = 5_400_000_000
 chooser = PlanChooser(ledger)
 
 
-FACTS = ArtifactFacts(
-    store="s", config="c", components=("unet",),
-    snapshots={"unet": "sha256:" + "0" * 64},
+BASE = DeclaredBinding(
+    entrypoint_binding_plan_id="sha256:" + "0" * 64,
+    entrypoint="generate", model_class="M", model_binding_path="b",
+    model_parameter_name="m", release="r", store="s", config="c",
+    components=("unet",), snapshots={"unet": "sha256:" + "0" * 64},
     reference_snapshot="sha256:" + "0" * 64, variant="sm89",
-    weight_bytes=6 << 30,
+    model_weight_bytes=6 << 30, host_bytes=1 << 30, pinned_bytes=256 << 20,
 )
 
 
 def binding(**over):
-    # The record names the REF; the artifact facts are the RESOLVER's (#567e), so a floor
-    # override rides the facts and never the document.
-    facts = dataclasses.replace(FACTS, vram_floor_bytes=over.pop("vram_floor_bytes", 0))
-    row = dict(
-        entrypoint_binding_plan_id="sha256:" + "0" * 64, project="x", model_class="M",
-        model_binding_path="b", model_parameter_name="m",
-        artifact_ref="acme/m@v1", components=["unet"],
-        release="r", host_bytes=1 << 30,
-        pinned_bytes=256 << 20, entrypoint="generate",
-    )
-    row.update(over)
-    return DeclaredBinding.read(row).resolve(facts)
+    return dataclasses.replace(BASE, **over)
 
 
 def choose(**over):
@@ -268,31 +258,6 @@ LIVE_ARMS = (
         "from cozy_runtime.internal.worker.plan import Coefficient\n"
         "Coefficient('activations', 1 << 30, 'measured')\n",
         "coefficient_unsourced",
-    ),
-    (
-        # #567e: a record that names a STORE is naming a disk it may not be on. The eight
-        # artifact facts left the closed key set, so a writer that still resolves the ref
-        # for somebody else is refused by name rather than believed.
-        "record-may-not-carry-the-writers-artifact-facts",
-        LADDER + "binding(store='/owner/cozy/store')\n",
-        "binding_plan_unknown_field",
-    ),
-    (
-        # The MORNING-LOOP refusal, at its true clock. A ref this machine does not hold is
-        # a typed refusal on the machine that would serve, naming what its own index holds
-        # — not exit 4 on the owner's box before a request ever leaves it.
-        "artifact-absent-refuses-naming-this-machines-index",
-        LADDER + "from cozy_runtime.internal.worker.plan import PlanRefusal\n"
-        "row = dict(entrypoint_binding_plan_id='sha256:' + '0' * 64, project='x',\n"
-        "           model_class='M', model_binding_path='b', model_parameter_name='m',\n"
-        "           artifact_ref='cozy/minimax-h3@se-001', release='r',\n"
-        "           entrypoint='generate')\n"
-        "try:\n"
-        "    DeclaredBinding.read(row).resolve(None, held=('acme/other@v1',))\n"
-        "except PlanRefusal as exc:\n"
-        "    assert exc.code == 'artifact_absent', exc.code\n"
-        "    raise SystemExit(exc.detail[-200:])\n",
-        "index holds: acme/other@v1",
     ),
     (
         # A slot that declares a component the artifact does not carry keeps the NAME so

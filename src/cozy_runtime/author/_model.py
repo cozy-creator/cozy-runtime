@@ -921,7 +921,10 @@ _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", topology={}, config=Config
 def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
     """Several `construct` calls in one `load()` are one construction contract."""
     return ConstructionRecord(
-        factory_identity=" + ".join(r.factory_identity for r in records),
+        # The derivation contract uses this exact separator.  Serve and derive joining the
+        # same construction records with different punctuation made the published factory
+        # identity impossible to verify at launch.
+        factory_identity="|".join(r.factory_identity for r in records),
         config_digest=records[0].config_digest,
         destinations=tuple(d for r in records for d in r.destinations),
         components=tuple(c for r in records for c in r.components),

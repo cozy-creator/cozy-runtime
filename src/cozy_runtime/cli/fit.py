@@ -1,19 +1,12 @@
-"""`cozy-runtime fit` — this host's verdicts, from the SAME arithmetic `run` uses.
+"""`cozy-runtime fit` — local host facts and weightless structural verdicts.
 
-One row per function and lane: `fits(<delivery>, <placement>)` · `fits-degraded(<plan>)` ·
-`structurally-incompatible` · `capacity(<shortfall>)`. WITH a payload the verdict is EXACT —
-the real `PlanChooser.choose` walk for that request's shape against a ledger holding this
-host's MEASURED device facts. Without one it prints structural/range information, labeled.
-
-The point of this verb is that it re-derives nothing: `choose` is the one function that
-prices a rung, so `fit` and `run` cannot disagree. What `fit` does differently is refuse to
-execute — it takes no I/O, loads no weights, and never touches the device.
+Model-bound capacity requires the exact selected Plan/RMB/MCC closure. This local verb does
+not mint or approximate that closure, so those rows remain explicitly unbound.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -21,20 +14,11 @@ from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import artifacts, hostfacts
 from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.worker import plan as worker_plan
-from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import (
-    DeclaredBinding,
-    PlanChooser,
-    PlanRefusal,
-    PreparedModel,
-    PreparedRequest,
-)
 
 MIB = 1 << 20
 
@@ -80,14 +64,11 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     for surface in surfaces:
         doc = run_verb._doc_for(body, surface.name, "entrypoint")
         exact = bool(terms[1:]) or bool(flags.get("--in"))
-        document = (
+        if exact:
             payload_grammar.parse(
                 terms[1:], doc["request"], infile=(flags.get("--in") or [""])[0], project=project
             )
-            if exact
-            else {}
-        )
-        verdict = _verdict(config, found, surface, document, facts, exact=exact)
+        verdict = _verdict(surface, exact=exact)
         verdicts.append(verdict)
         rows.append((surface.name, verdict["rendered"]))
     return Result(
@@ -124,11 +105,7 @@ def _free_bytes(facts: hostfacts.HostFacts) -> int:
 
 
 def _verdict(
-    config: RuntimeConfig,
-    found: Any,
     surface: Any,
-    document: dict[str, Any],
-    facts: hostfacts.HostFacts,
     *,
     exact: bool,
 ) -> dict[str, Any]:
@@ -140,73 +117,9 @@ def _verdict(
             "rendered": "fits(native, all_resident) — weightless, no model binding",
             "verdict": "fits",
         }
-    try:
-        record, _ = run_verb._binding_record(
-            config, found, surface, surface.name, {}, offline=False
-        )
-    except CliError as exc:
-        return {
-            "function": surface.name,
-            "exact": False,
-            "rendered": f"unbound — {exc.message}",
-            "verdict": "unbound",
-        }
-    installed = artifacts.find(config.cozy_home, str(record["release"]))
-    assert installed is not None
-    free = _free_bytes(facts)
-    ledger = Ledger(host_budget=record["host_bytes"] * 4, pinned_budget=record["pinned_bytes"])
-    ledger.device_free = free
-    ledger.device_total = facts.vram_total_bytes
-    share = installed.bytes // max(len(installed.components), 1)
-    ledger.resident = dict.fromkeys(installed.components, share)
-    # `fit` prices a real plan, so it needs the artifact FACTS the record no longer carries
-    # (#567e) — and it resolves them the same way the worker will, against this machine's
-    # own index. A local `fit` and a local `run` therefore price the identical binding.
-    declared = DeclaredBinding.read(dict(record)).resolve(
-        worker_plan.artifact_facts(config.cozy_home, str(record["artifact_ref"])),
-        held=worker_plan.held_refs(config.cozy_home),
-    )
-    chooser = PlanChooser(ledger)
-    # `fit` prices a HYPOTHETICAL: there is no endpoint process to prepare the request, so
-    # the shape axes are normalized from the document by the one normalizer and the record
-    # says out loud that nothing resolved it (its digests are empty).
-    request = PreparedRequest.unresolved(surface.name, _axes(surface, document))
-    try:
-        # NOTHING PREPARED THIS: `fit` estimates before any executor exists, so the
-        # resolved half is empty and the estimate says so through the plan document.
-        chosen = chooser.choose(declared, PreparedModel(), request)
-    except PlanRefusal as exc:
-        return {
-            "function": surface.name,
-            "exact": exact,
-            "verdict": "capacity",
-            "rendered": f"capacity({exc.detail})",
-            "shortfall": exc.shortfall,
-        }
-    why = chosen.decision_explanation
-    degraded = "DEGRADED" in why or "short by" in why
-    label = "fits-degraded" if degraded else "fits"
     return {
         "function": surface.name,
-        "exact": exact,
-        "verdict": label,
-        "rendered": f"{label}({chosen.delivery}, {chosen.placement}) · {chosen.compute_dtype} · "
-        f"{chosen.decision_explanation[:160]}",
-        "plan": chosen.document(),
+        "exact": False,
+        "rendered": "unbound — capacity requires a canonical selected Plan/RMB/MCC closure",
+        "verdict": "unbound",
     }
-
-
-def _axes(surface: Any, document: Mapping[str, Any]) -> Mapping[str, int]:
-    """The normalized shape axes of a document, through `author._demand` and nothing else.
-
-    A document `fit` was handed may be partial — it is an estimate over a request nobody has
-    sent — so a decode that does not converge yields NO axes rather than invented ones.
-    """
-    import msgspec
-
-    from cozy_runtime.author._demand import normalize
-
-    try:
-        return normalize(msgspec.convert(dict(document), type=surface.payload_type)).values
-    except (msgspec.ValidationError, TypeError):
-        return {}

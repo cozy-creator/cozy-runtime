@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, environment
+from cozy_runtime.internal import canonical, environment, fill, pull
 from cozy_runtime.internal.config import AdapterConfig
 
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
@@ -34,10 +34,12 @@ RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 PROVISION_SPEC_FORMAT = "tensorhub.rental_provision_spec/1"
 PROVISION_BUNDLE_FORMAT = "tensorhub.rental_provision_bundle/1"
+ARTIFACT_OBJECT_SET_KIND = "tensorhub.resolved_object_set/1"
 CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
 PROVISION_ROOT = Path("/var/lib/cozy/provision")
 ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
 PLANS_ROOT = Path("/run/cozy/binding-plans")
+BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
 REQUIRED_DOCUMENT_ROLES = (
     "artifact_object_set",
     "endpoint_build_record",
@@ -69,6 +71,7 @@ class PreparedLaunch:
     artifacts: Mapping[str, Path]
     installed: environment.InstalledEnvironment
     placement_set_digest: str
+    artifact_store: Path
 
 
 def prepare_launch(
@@ -105,12 +108,27 @@ def prepare_launch(
         document_paths[row["role"]] = fetch_exact(
             row, document_root, deadline=config.readiness_deadline_unix
         )
+    document_bytes = {role: path.read_bytes() for role, path in document_paths.items()}
+    object_roots, object_digests = _object_set(document_bytes["artifact_object_set"])
     artifact_paths = {
         row["digest"]: fetch_exact(row, artifact_root, deadline=config.readiness_deadline_unix)
         for row in bundle["artifact_grants"]
+        if row["digest"] not in object_digests
     }
-    document_bytes = {role: path.read_bytes() for role, path in document_paths.items()}
     release = _join_release(spec, bundle, document_bytes, artifact_paths)
+    granted = {str(row["digest"]) for row in bundle["artifact_grants"]}
+    required = set(release["required_artifacts"]) | object_digests
+    if granted != required:
+        raise LaunchRefusal(
+            "artifact_grants_mismatch",
+            f"missing={sorted(required - granted)} extra={sorted(granted - required)}",
+        )
+    artifact_store = _materialize_objects(
+        spec,
+        bundle,
+        object_roots,
+        deadline=config.readiness_deadline_unix,
+    )
     source = environment_input(
         environment_spec_bytes=document_bytes["endpoint_environment_spec"],
         endpoint_bundle_bytes=document_bytes["endpoint_bundle"],
@@ -125,6 +143,14 @@ def prepare_launch(
         expected_receipt_bytes=document_bytes["expected_installed_environment_receipt"],
     )
     _stage_plans(release["plan_subjects"], artifact_paths, plans_root)
+    _stage_documents(release["binding_documents"], artifact_paths, BINDING_DOCUMENTS_ROOT)
+    _validate_staged_bindings(
+        release["plan_subjects"],
+        artifact_paths,
+        endpoint_release=release["endpoint_release"],
+        store_root=artifact_store,
+        documents_root=BINDING_DOCUMENTS_ROOT,
+    )
     return PreparedLaunch(
         spec=spec,
         bundle=bundle,
@@ -132,6 +158,7 @@ def prepare_launch(
         artifacts=artifact_paths,
         installed=installed,
         placement_set_digest=_digest(document_bytes["initial_placement_set"]),
+        artifact_store=artifact_store,
     )
 
 
@@ -402,6 +429,9 @@ def _provision_pair(
         value = capacity[name]
         if not isinstance(value, str) or not value or value.strip() != value or len(value) > 256:
             raise LaunchRefusal("provision_capacity_invalid", name)
+    cache_mount = Path(capacity["cache_mount_path"])
+    if not cache_mount.is_absolute() or cache_mount == Path("/"):
+        raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path")
     image = spec["execution_substrate"]["oci_image"]
     if not isinstance(image, str) or image.count("@") != 1 or not image.split("@", 1)[0]:
         raise LaunchRefusal("provision_substrate_invalid", "OCI image is not digest pinned")
@@ -589,7 +619,33 @@ def _join_release(
             raise LaunchRefusal("binding_plan_grant_missing", ref["digest"])
         prior = subject_id
         plan_subjects[subject_id] = (ref["digest"], ref["length"])
-    return {"wheel_paths": wheel_paths, "plan_subjects": plan_subjects}
+    descriptor_ref = _ref(endpoint["descriptor"], "descriptor")
+    object_roots, _ = _object_set(docs["artifact_object_set"])
+    root_objects = {
+        root["digest"]: (
+            root["length"],
+            {ref["digest"]: ref["length"] for ref in objects},
+        )
+        for root, objects in object_roots
+    }
+    binding_documents = _binding_closure(
+        plan_subjects,
+        artifacts,
+        descriptor_ref,
+        root_objects,
+    )
+    required_artifacts = set(wheel_paths) | set(binding_documents)
+    required_artifacts.update(digest for digest, _ in plan_subjects.values())
+    required_artifacts.update(
+        _ref(endpoint[role], role)["digest"] for role in ("descriptor", "evaluated_config")
+    )
+    return {
+        "wheel_paths": wheel_paths,
+        "plan_subjects": plan_subjects,
+        "binding_documents": binding_documents,
+        "endpoint_release": endpoint["endpoint_release_id"],
+        "required_artifacts": required_artifacts,
+    }
 
 
 def _stage_plans(
@@ -615,6 +671,259 @@ def _stage_plans(
             _fsync(root)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _stage_documents(refs: Mapping[str, int], artifacts: Mapping[str, Path], root: Path) -> None:
+    _directory(root)
+    for digest, length in refs.items():
+        _stage_exact(artifacts[digest], digest, length, root / f"{digest[7:]}.json", root)
+
+
+def _validate_staged_bindings(
+    subjects: Mapping[str, tuple[str, int]],
+    artifacts: Mapping[str, Path],
+    *,
+    endpoint_release: str,
+    store_root: Path,
+    documents_root: Path,
+) -> None:
+    from cozy_runtime.internal.worker.plan import PlanRefusal, read_provisioned_binding
+
+    for subject_id, (digest, length) in subjects.items():
+        try:
+            read_provisioned_binding(
+                subject_id,
+                _local_exact(artifacts[digest], digest, length),
+                documents_root=documents_root,
+                endpoint_release=endpoint_release,
+                store_root=store_root,
+            )
+        except PlanRefusal as exc:
+            raise LaunchRefusal(
+                "binding_materialization_refused", f"{exc.code}: {exc.detail}"
+            ) from exc
+
+
+def _stage_exact(source: Path, digest: str, length: int, target: Path, root: Path) -> None:
+    _verify_local(source, digest, length)
+    if target.exists():
+        _verify_local(target, digest, length)
+        return
+    temporary = root / f".document-{uuid.uuid4().hex}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb") as handle:
+            while chunk := source_handle.read(CHUNK_BYTES):
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _verify_local(temporary, digest, length)
+        os.replace(temporary, target)
+        os.chmod(target, 0o400)
+        _fsync(root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _binding_closure(
+    subjects: Mapping[str, tuple[str, int]],
+    artifacts: Mapping[str, Path],
+    descriptor_ref: Mapping[str, Any],
+    root_objects: Mapping[str, tuple[int, Mapping[str, int]]],
+) -> dict[str, int]:
+    """Join selected plans to exact RMB/config/MCC documents and TensorFS roots."""
+
+    closure = {str(descriptor_ref["digest"]): int(descriptor_ref["length"])}
+    used_roots: set[str] = set()
+    for digest, length in subjects.values():
+        plan = _document(_local_exact(artifacts[digest], digest, length), "binding_plan")
+        _closed(plan, {"bindings", "descriptor", "entrypoint", "format"}, "binding_plan")
+        if plan["format"] != "cozy.endpoint.EntrypointBindingPlan/1" or _ref(
+            plan["descriptor"], "binding_plan.descriptor"
+        ) != dict(descriptor_ref):
+            raise LaunchRefusal("binding_plan_mismatch", digest)
+        bindings = plan["bindings"]
+        if not isinstance(bindings, list) or len(bindings) != 1:
+            raise LaunchRefusal(
+                "binding_plan_unsupported", "current Runtime requires exactly one selected slot"
+            )
+        row = bindings[0]
+        _closed(row, {"binding", "slot"}, "binding_plan.binding")
+        binding_ref = _ref(row["binding"], "binding_plan.binding")
+        binding_path = artifacts.get(binding_ref["digest"])
+        if binding_path is None:
+            raise LaunchRefusal("resolved_model_binding_grant_missing", binding_ref["digest"])
+        closure[binding_ref["digest"]] = binding_ref["length"]
+        binding = _document(
+            _local_exact(binding_path, binding_ref["digest"], binding_ref["length"]),
+            "resolved_model_binding",
+        )
+        _closed(
+            binding,
+            {
+                "checkpoint",
+                "config",
+                "execution_layout",
+                "fit",
+                "format",
+                "model_construction_contract",
+                "stamps",
+            },
+            "resolved_model_binding",
+        )
+        if binding["format"] != "cozy.endpoint.ResolvedModelBinding/1":
+            raise LaunchRefusal("resolved_model_binding_format", str(binding["format"]))
+        config = binding["config"]
+        _closed(config, {"assets", "document"}, "resolved_model_binding.config")
+        refs = [_ref(config["document"], "binding.config.document")]
+        assets = config["assets"]
+        if not isinstance(assets, list):
+            raise LaunchRefusal("resolved_model_binding_invalid", "config.assets")
+        for asset in assets:
+            _closed(asset, {"name", "ref"}, "binding.config.asset")
+            refs.append(_ref(asset["ref"], "binding.config.asset.ref"))
+        refs.append(
+            _ref(binding["model_construction_contract"], "binding.model_construction_contract")
+        )
+        for ref in refs:
+            path = artifacts.get(ref["digest"])
+            if path is None:
+                raise LaunchRefusal("binding_document_grant_missing", ref["digest"])
+            _verify_local(path, ref["digest"], ref["length"])
+            closure[ref["digest"]] = ref["length"]
+        checkpoint = binding["checkpoint"]
+        _closed(checkpoint, {"snapshot_root", "tensor_layout"}, "binding.checkpoint")
+        used_roots.add(_root_membership(checkpoint, root_objects, "binding.checkpoint"))
+        layout = binding["execution_layout"]
+        if not isinstance(layout, list) or not layout:
+            raise LaunchRefusal("resolved_model_binding_invalid", "execution_layout")
+        for index, component in enumerate(layout):
+            _closed(
+                component,
+                {"component", "snapshot_root", "tensor_layout"},
+                f"binding.execution_layout[{index}]",
+            )
+            used_roots.add(
+                _root_membership(component, root_objects, f"binding.execution_layout[{index}]")
+            )
+    if used_roots != set(root_objects):
+        raise LaunchRefusal(
+            "artifact_object_set_mismatch",
+            f"used roots {sorted(used_roots)} differ from delivered roots {sorted(root_objects)}",
+        )
+    return closure
+
+
+def _root_membership(
+    value: Mapping[str, Any],
+    root_objects: Mapping[str, tuple[int, Mapping[str, int]]],
+    name: str,
+) -> str:
+    root = _ref(value["snapshot_root"], f"{name}.snapshot_root")
+    layout = _ref(value["tensor_layout"], f"{name}.tensor_layout")
+    root_row = root_objects.get(root["digest"])
+    if (
+        root_row is None
+        or root_row[0] != root["length"]
+        or root_row[1].get(layout["digest"]) != layout["length"]
+    ):
+        raise LaunchRefusal("artifact_object_set_mismatch", name)
+    return str(root["digest"])
+
+
+def _object_set(
+    raw: bytes,
+) -> tuple[tuple[tuple[dict[str, Any], tuple[dict[str, Any], ...]], ...], set[str]]:
+    """Read the canonical grouped-root ArtifactObjectSet without erasing membership."""
+
+    document = _document(raw, "artifact_object_set")
+    _closed(document, {"kind", "roots"}, "artifact_object_set")
+    if document["kind"] != ARTIFACT_OBJECT_SET_KIND:
+        raise LaunchRefusal("artifact_object_set_format", str(document["kind"]))
+    rows = document["roots"]
+    if not isinstance(rows, list) or not rows:
+        raise LaunchRefusal("artifact_object_set_invalid", "roots are absent")
+    roots: list[tuple[dict[str, Any], tuple[dict[str, Any], ...]]] = []
+    all_digests: set[str] = set()
+    prior_root = ""
+    for root_index, row in enumerate(rows):
+        _closed(row, {"objects", "root"}, f"artifact_object_set.roots[{root_index}]")
+        root = _ref(row["root"], f"artifact_object_set.roots[{root_index}].root")
+        if root["digest"] <= prior_root:
+            raise LaunchRefusal("artifact_object_set_invalid", "roots are not sorted unique")
+        objects = row["objects"]
+        if not isinstance(objects, list) or not objects:
+            raise LaunchRefusal("artifact_object_set_invalid", "root objects are absent")
+        normalized: list[dict[str, Any]] = []
+        prior_object = ""
+        for object_index, value in enumerate(objects):
+            ref = _ref(
+                value,
+                f"artifact_object_set.roots[{root_index}].objects[{object_index}]",
+            )
+            if ref["digest"] <= prior_object or ref["digest"] == root["digest"]:
+                raise LaunchRefusal(
+                    "artifact_object_set_invalid", "objects are not sorted unique or include root"
+                )
+            prior_object = ref["digest"]
+            normalized.append(ref)
+        prior_root = root["digest"]
+        all_digests.add(root["digest"])
+        all_digests.update(ref["digest"] for ref in normalized)
+        roots.append((root, tuple(normalized)))
+    return tuple(roots), all_digests
+
+
+def _materialize_objects(
+    spec: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    roots: tuple[tuple[dict[str, Any], tuple[dict[str, Any], ...]], ...],
+    *,
+    deadline: int,
+) -> Path:
+    """Admit every exact root closure into the substrate's attached TensorFS store."""
+
+    grants = {str(row["digest"]): row for row in bundle["artifact_grants"]}
+    required = {ref["digest"] for root, objects in roots for ref in (root, *objects)}
+    missing = sorted(required - set(grants))
+    if missing:
+        raise LaunchRefusal("object_grant_missing", missing[0])
+    cache_mount = Path(str(spec["capacity"]["cache_mount_path"]))
+    if not cache_mount.is_absolute() or cache_mount == Path("/"):
+        raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path is not specific")
+    store_root = cache_mount / "tensorfs"
+    try:
+        tensorfs = fill.tensorfs_module()
+        store = pull.open_store(tensorfs, store_root)
+        for root, objects in roots:
+            closure = [root, *objects]
+            rows = sorted(
+                (
+                    pull.Read(
+                        object_id=ref["digest"],
+                        length=ref["length"],
+                        url=str(grants[ref["digest"]]["url"]),
+                    )
+                    for ref in closure
+                ),
+                key=lambda row: row.object_id,
+            )
+            pull.pull_granted_snapshot(
+                tensorfs,
+                store,
+                root["digest"],
+                root["length"],
+                rows,
+                timeout=max(float(deadline) - time.time(), 0.001),
+                session="provision-" + root["digest"].removeprefix("sha256:")[:12],
+            )
+    except pull.PullRefusal as exc:
+        raise LaunchRefusal("object_materialization_refused", f"{exc.code}: {exc.message}") from exc
+    except Exception as exc:
+        raise LaunchRefusal(
+            "object_materialization_refused", f"TensorFS unavailable: {type(exc).__name__}"
+        ) from exc
+    return store_root
 
 
 def _ref(value: object, name: str, *, allow_extra: bool = False) -> dict[str, Any]:

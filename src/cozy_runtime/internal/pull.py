@@ -46,6 +46,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 #: How many objects are in flight by default. It is a MEASURED number, not a taste: #566b
@@ -88,6 +89,24 @@ class PullRefusal(Exception):
         self.message = message
         self.remedy = remedy
         self.cause = cause
+
+
+def open_store(tensorfs: Any, root: Path) -> Any:
+    """Open or initialize the one local TensorFS store used by a transport adapter."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        return (
+            tensorfs.Store.open(str(root))
+            if (root / "store.json").is_file()
+            else tensorfs.Store.init(str(root))
+        )
+    except Exception as exc:
+        raise PullRefusal(
+            "border_refused",
+            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
+            "repair the substrate cache mount or launch against an empty store directory",
+        ) from exc
 
 
 # ---------------------------------------------------------------- deadline

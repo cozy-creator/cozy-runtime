@@ -9,13 +9,16 @@ import tempfile
 import time
 from pathlib import Path
 
-from cozy_runtime.internal import canonical, pull, readiness
+from cozy_runtime.internal import canonical, contract, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
     LaunchRefusal,
+    _binding_closure,
+    _object_set,
     _provision_pair,
 )
+from cozy_runtime.internal.worker import plan as worker_plan
 from cozy_runtime.protocol import SCHEMA_DIGEST
 
 
@@ -166,6 +169,207 @@ def main() -> int:
             assert exc.code == "artifact_incomplete"
         else:
             raise AssertionError("plaintext direct object grant was accepted")
+
+        construction = contract.ModelConstructionContract(
+            candidate=contract.Candidate(
+                release="endpoint@release",
+                application="endpoint:app",
+                model_class="endpoint.models:Model",
+                factory="sha256:" + "c" * 64,
+                snapshot="sha256:" + snapshot,
+                config_digest="sha256:" + "d" * 64,
+                hardware_variant="cuda-h200",
+            ),
+            logical_tensors=(
+                contract.LogicalTensor(
+                    key="transformer.weight",
+                    component="transformer",
+                    shape=(2, 3),
+                    kind="parameter",
+                    module_class="Linear",
+                    alias_group=0,
+                    dtype=None,
+                ),
+            ),
+            destination_sets=(
+                contract.DestinationSet(
+                    component="transformer",
+                    module_class="Transformer",
+                    training=False,
+                    compiled=False,
+                    keys=("transformer.weight",),
+                ),
+            ),
+            derived=(),
+            caches=(),
+        )
+        contract_bytes = canonical.write(construction.render())
+        parsed_contract = contract.read_contract(contract_bytes)
+        assert parsed_contract == construction
+        assert contract.logical_model_digest(parsed_contract).startswith("sha256:")
+        malformed_contract = dict(construction.render())
+        malformed_contract["asserted_digest"] = "sha256:" + "e" * 64
+        try:
+            contract.read_contract(canonical.write(malformed_contract))
+        except contract.ContractError as exc:
+            assert exc.code == "contract_document_invalid"
+        else:
+            raise AssertionError("open ModelConstructionContract field set was accepted")
+
+        binding_documents = root / "binding-documents"
+        binding_documents.mkdir()
+        config_bytes = b"{}"
+        config_ref = ref(config_bytes)
+        bound_contract = contract.ModelConstructionContract(
+            candidate=contract.Candidate(
+                release="endpoint@release",
+                application="endpoint:app",
+                model_class="endpoint.models:Model",
+                factory="factory-identity",
+                snapshot="sha256:" + snapshot,
+                config_digest=str(config_ref["digest"]),
+                hardware_variant="cuda-h200",
+            ),
+            logical_tensors=construction.logical_tensors,
+            destination_sets=construction.destination_sets,
+            derived=(),
+            caches=(),
+        )
+        contract_bytes = canonical.write(bound_contract.render())
+        contract_ref = ref(contract_bytes)
+        descriptor_bytes = canonical.write(
+            {
+                "application": "endpoint:app",
+                "entrypoints": [
+                    {
+                        "hidden": False,
+                        "kind": "entrypoint",
+                        "models": [
+                            {
+                                "class": "Model",
+                                "component_use": {"run": ["transformer"]},
+                                "param": "model",
+                                "path": "generate.models.model",
+                                "stamps": {},
+                            }
+                        ],
+                        "name": "generate",
+                    }
+                ],
+            }
+        )
+        descriptor_ref = ref(descriptor_bytes)
+        layout_ref = {"digest": "sha256:" + "e" * 64, "length": 23}
+        binding_bytes = canonical.write(
+            {
+                "checkpoint": {
+                    "snapshot_root": {"digest": "sha256:" + snapshot, "length": 17},
+                    "tensor_layout": layout_ref,
+                },
+                "config": {"assets": [], "document": config_ref},
+                "execution_layout": [
+                    {
+                        "component": "transformer",
+                        "snapshot_root": {
+                            "digest": "sha256:" + snapshot,
+                            "length": 17,
+                        },
+                        "tensor_layout": layout_ref,
+                    }
+                ],
+                "fit": {"model_weight_bytes": 4096, "vram_floor_bytes": 1024},
+                "format": "cozy.endpoint.ResolvedModelBinding/1",
+                "model_construction_contract": contract_ref,
+                "stamps": [],
+            }
+        )
+        binding_ref = ref(binding_bytes)
+        plan_bytes = canonical.write(
+            {
+                "bindings": [{"binding": binding_ref, "slot": "model"}],
+                "descriptor": descriptor_ref,
+                "entrypoint": "generate",
+                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+            }
+        )
+        for artifact_ref, raw in (
+            (config_ref, config_bytes),
+            (contract_ref, contract_bytes),
+            (descriptor_ref, descriptor_bytes),
+            (binding_ref, binding_bytes),
+        ):
+            (binding_documents / f"{str(artifact_ref['digest'])[7:]}.json").write_bytes(raw)
+        resolved_binding = worker_plan.read_provisioned_binding(
+            "project-wheel",
+            plan_bytes,
+            documents_root=binding_documents,
+            endpoint_release="endpoint@release",
+            store_root=root / "store",
+        )
+        assert resolved_binding.application == "endpoint:app"
+        assert resolved_binding.components == ("transformer",)
+        assert resolved_binding.expected_logical_model_digest == contract.logical_model_digest(
+            bound_contract
+        )
+        try:
+            worker_plan.read_provisioned_binding(
+                "project-wheel",
+                canonical.write(
+                    {
+                        "entrypoint_binding_plan_id": "project-wheel",
+                        "entrypoint": "generate",
+                        "project": "/source",
+                        "release": "endpoint@release",
+                    }
+                ),
+                documents_root=binding_documents,
+                endpoint_release="endpoint@release",
+                store_root=root / "store",
+            )
+        except worker_plan.PlanRefusal as exc:
+            assert exc.code == "plan_invalid"
+        else:
+            raise AssertionError("removed flat DeclaredBinding document was accepted")
+        object_set_bytes = canonical.write(
+            {
+                "kind": "tensorhub.resolved_object_set/1",
+                "roots": [
+                    {
+                        "objects": [layout_ref],
+                        "root": {"digest": "sha256:" + snapshot, "length": 17},
+                    }
+                ],
+            }
+        )
+        object_roots, object_digests = _object_set(object_set_bytes)
+        assert object_digests == {"sha256:" + snapshot, str(layout_ref["digest"])}
+        plan_ref = ref(plan_bytes)
+        assert isinstance(plan_ref["length"], int)
+        plan_path = root / "plan.json"
+        plan_path.write_bytes(plan_bytes)
+        artifacts = {
+            str(config_ref["digest"]): binding_documents / f"{str(config_ref['digest'])[7:]}.json",
+            str(contract_ref["digest"]): binding_documents
+            / f"{str(contract_ref['digest'])[7:]}.json",
+            str(descriptor_ref["digest"]): binding_documents
+            / f"{str(descriptor_ref['digest'])[7:]}.json",
+            str(binding_ref["digest"]): binding_documents
+            / f"{str(binding_ref['digest'])[7:]}.json",
+            str(plan_ref["digest"]): plan_path,
+        }
+        closure = _binding_closure(
+            {"project-wheel": (str(plan_ref["digest"]), plan_ref["length"])},
+            artifacts,
+            descriptor_ref,
+            {
+                root_ref["digest"]: (
+                    root_ref["length"],
+                    {item["digest"]: item["length"] for item in objects},
+                )
+                for root_ref, objects in object_roots
+            },
+        )
+        assert set(closure) == set(artifacts) - {str(plan_ref["digest"])}
 
         boot_raw = bytes(range(32))
         boot_id = base64.urlsafe_b64encode(boot_raw).rstrip(b"=").decode()

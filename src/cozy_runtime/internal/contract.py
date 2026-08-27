@@ -24,9 +24,10 @@ declared set can never re-key a construction contract.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import Literal
+from typing import Any, Literal, cast
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.canonical import Json
@@ -232,6 +233,214 @@ def closed_resources(contract: ModelConstructionContract) -> dict[str, Json]:
         "tensors": len(contract.logical_tensors),
         "elements": sum(int(v["elements"]) for v in per.values()),
     }
+
+
+def read_contract(raw: bytes) -> ModelConstructionContract:
+    """Read one exact canonical ModelConstructionContract, closed at every row.
+
+    Publication owns the bytes; Runtime independently reconstructs the typed value and
+    requires its own renderer to reproduce them byte-for-byte.  This is deliberately not a
+    permissive projection: an added field changes construction meaning and must first gain
+    one reader.
+    """
+
+    try:
+        document = canonical.parse_canonical(raw)
+        root = _object(
+            document,
+            {
+                "caches",
+                "candidate",
+                "derived",
+                "destination_sets",
+                "logical_tensors",
+                "resources",
+                "schema",
+            },
+            "contract",
+        )
+        candidate_row = _object(
+            root["candidate"],
+            {
+                "application",
+                "config_digest",
+                "factory",
+                "hardware_variant",
+                "model_class",
+                "release",
+                "snapshot",
+            },
+            "candidate",
+        )
+        candidate = Candidate(
+            release=_string(candidate_row["release"], "candidate.release"),
+            application=_string(candidate_row["application"], "candidate.application"),
+            model_class=_string(candidate_row["model_class"], "candidate.model_class"),
+            factory=_string(candidate_row["factory"], "candidate.factory"),
+            snapshot=_digest(candidate_row["snapshot"], "candidate.snapshot"),
+            config_digest=_digest(candidate_row["config_digest"], "candidate.config_digest"),
+            hardware_variant=_string(
+                candidate_row["hardware_variant"], "candidate.hardware_variant"
+            ),
+        )
+        logical = tuple(
+            _logical(row, index)
+            for index, row in enumerate(_array(root["logical_tensors"], "logical_tensors"))
+        )
+        destinations = tuple(
+            _destination_set(row, index)
+            for index, row in enumerate(_array(root["destination_sets"], "destination_sets"))
+        )
+        derived = tuple(
+            _derived(row, index) for index, row in enumerate(_array(root["derived"], "derived"))
+        )
+        caches = tuple(
+            _cache(row, index) for index, row in enumerate(_array(root["caches"], "caches"))
+        )
+        contract = ModelConstructionContract(candidate, logical, destinations, derived, caches)
+        if root["schema"] != CONTRACT_SCHEMA or contract.render() != root:
+            raise ValueError("document does not equal the closed Runtime rendering")
+        return contract
+    except (canonical.CanonicalError, KeyError, TypeError, ValueError) as exc:
+        raise ContractError(
+            f"ModelConstructionContract bytes refused: {type(exc).__name__}: {exc}",
+            code="contract_document_invalid",
+        ) from exc
+
+
+def logical_model_digest(contract: ModelConstructionContract) -> str:
+    """The serve/derive fence projected only from an exact published contract.
+
+    The executor independently derives each field after construction.  Sorting topology and
+    component rows makes traversal order non-authoritative and lets the same formula run on
+    publication bytes and the serving record without carrying a second asserted digest.
+    """
+
+    topology_rows = sorted(
+        f"{tensor.key}:{list(tensor.shape)}:{tensor.dtype or DEFAULT_DTYPE}"
+        for tensor in contract.logical_tensors
+    )
+    topology = (
+        "blake2b:" + hashlib.blake2b("\n".join(topology_rows).encode(), digest_size=16).hexdigest()
+    )
+    candidate = contract.candidate
+    return canonical.digest(
+        {
+            "format": "cozy.runtime.ModelConstructionContract/1",
+            "release": candidate.release,
+            "model_class": candidate.model_class,
+            "artifact": candidate.snapshot,
+            "config_digest": candidate.config_digest,
+            "factory_identity": candidate.factory,
+            "topology_digest": topology,
+            "components": sorted(row.component for row in contract.destination_sets),
+            "variant": candidate.hardware_variant,
+        }
+    )
+
+
+def _object(value: object, keys: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"{name} has a non-closed field set")
+    return value
+
+
+def _array(value: object, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{name} is not an array")
+    return value
+
+
+def _string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is not a non-empty string")
+    return value
+
+
+def _digest(value: object, name: str) -> str:
+    text = _string(value, name)
+    if canonical.DIGEST_RE.fullmatch(text) is None:
+        raise ValueError(f"{name} is not a sha256 digest")
+    return text
+
+
+def _shape(value: object, name: str) -> tuple[int, ...]:
+    rows = _array(value, name)
+    if any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in rows):
+        raise ValueError(f"{name} is not a non-negative integer shape")
+    return tuple(rows)
+
+
+def _logical(value: object, index: int) -> LogicalTensor:
+    name = f"logical_tensors[{index}]"
+    row = _object(
+        value,
+        {"alias_group", "component", "dtype", "key", "kind", "module_class", "shape"}
+        if isinstance(value, dict) and "dtype" in value and "alias_group" in value
+        else {"component", "key", "kind", "module_class", "shape"}
+        | ({"dtype"} if isinstance(value, dict) and "dtype" in value else set())
+        | ({"alias_group"} if isinstance(value, dict) and "alias_group" in value else set()),
+        name,
+    )
+    kind = row["kind"]
+    if kind not in ("parameter", "buffer"):
+        raise ValueError(f"{name}.kind is invalid")
+    alias = row.get("alias_group")
+    if alias is not None and (not isinstance(alias, int) or isinstance(alias, bool) or alias < 0):
+        raise ValueError(f"{name}.alias_group is invalid")
+    dtype = row.get("dtype")
+    if dtype is not None and (not isinstance(dtype, str) or not dtype):
+        raise ValueError(f"{name}.dtype is invalid")
+    return LogicalTensor(
+        key=_string(row["key"], f"{name}.key"),
+        component=_string(row["component"], f"{name}.component"),
+        shape=_shape(row["shape"], f"{name}.shape"),
+        kind=cast(TensorKind, kind),
+        module_class=_string(row["module_class"], f"{name}.module_class"),
+        alias_group=alias,
+        dtype=dtype,
+    )
+
+
+def _destination_set(value: object, index: int) -> DestinationSet:
+    name = f"destination_sets[{index}]"
+    row = _object(value, {"compiled", "component", "keys", "module_class", "training"}, name)
+    keys = tuple(_string(item, f"{name}.keys") for item in _array(row["keys"], f"{name}.keys"))
+    if not isinstance(row["training"], bool) or not isinstance(row["compiled"], bool):
+        raise ValueError(f"{name} flags are not boolean")
+    return DestinationSet(
+        component=_string(row["component"], f"{name}.component"),
+        module_class=_string(row["module_class"], f"{name}.module_class"),
+        training=row["training"],
+        compiled=row["compiled"],
+        keys=keys,
+    )
+
+
+def _derived(value: object, index: int) -> DerivedTensor:
+    name = f"derived[{index}]"
+    keys = {"component", "key", "shape"}
+    if isinstance(value, dict) and "dtype" in value:
+        keys.add("dtype")
+    row = _object(value, keys, name)
+    dtype = row.get("dtype")
+    if dtype is not None and (not isinstance(dtype, str) or not dtype):
+        raise ValueError(f"{name}.dtype is invalid")
+    return DerivedTensor(
+        key=_string(row["key"], f"{name}.key"),
+        component=_string(row["component"], f"{name}.component"),
+        shape=_shape(row["shape"], f"{name}.shape"),
+        dtype=dtype,
+    )
+
+
+def _cache(value: object, index: int) -> DeclaredCache:
+    name = f"caches[{index}]"
+    row = _object(value, {"max_bytes", "max_entries", "name"}, name)
+    for field in ("max_entries", "max_bytes"):
+        if not isinstance(row[field], int) or isinstance(row[field], bool) or row[field] <= 0:
+            raise ValueError(f"{name}.{field} is not positive")
+    return DeclaredCache(_string(row["name"], f"{name}.name"), row["max_entries"], row["max_bytes"])
 
 
 # ------------------------------------------------------------------------- agreement

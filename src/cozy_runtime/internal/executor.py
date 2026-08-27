@@ -37,6 +37,7 @@ import os
 import resource
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -51,9 +52,9 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import accel, canonical, descriptor
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 
@@ -231,8 +232,7 @@ class Executor:
             }
 
         if self.discovered is None:
-            self.discovered = discover(Path(binding["project"]))
-            self.surface_names = {s.name: s for s in self.discovered.surfaces}
+            self._discover_provisioned(binding)
 
         # The store IS the artifact identity: one snapshot digest, and TensorFS answers with
         # the header, the plan and the verified lease. The interim path needed a store root
@@ -560,7 +560,9 @@ class Executor:
                 "config_digest": record.config_digest,
                 "factory_identity": record.factory_identity,
                 "topology_digest": record.topology_digest,
-                "components": list(record.components),
+                # ModelConstructionContract destination sets are canonicalized by component.
+                # Construction traversal order is not identity and cannot change this fence.
+                "components": sorted(record.components),
                 "variant": binding["variant"],
             }
         )
@@ -677,6 +679,25 @@ class Executor:
             "facts": self.facts,
         }
 
+    def _discover_provisioned(self, binding: Mapping[str, Any]) -> None:
+        """Import only the installed application and bind it to the exact descriptor."""
+
+        application = str(binding.get("application") or "")
+        descriptor_path = str(binding.get("descriptor") or "")
+        if not application or not descriptor_path:
+            raise RuntimeError("executor requires the canonical installed release identity")
+        discovered = discover_installed(application)
+        published = canonical.parse(Path(descriptor_path).read_bytes())
+        if not isinstance(published, dict):
+            raise RuntimeError("staged EndpointDescriptor is not an object")
+        descriptor.compare(
+            published,
+            descriptor.document(descriptor.build(discovered)),
+            ("provisioned EndpointDescriptor", "installed endpoint"),
+        )
+        self.discovered = discovered
+        self.surface_names = {surface.name: surface for surface in discovered.surfaces}
+
     def _prepare_weightless(self, binding: dict[str, Any], started: float) -> dict[str, Any]:
         """A binding that declares NO MODEL: discover the release, be ready, import nothing.
 
@@ -687,8 +708,7 @@ class Executor:
         digests are empty and say so rather than naming a build that never happened.
         """
         if self.discovered is None:
-            self.discovered = discover(Path(binding["project"]))
-            self.surface_names = {s.name: s for s in self.discovered.surfaces}
+            self._discover_provisioned(binding)
         self.ready = True
         self.facts = {
             "cuda_init_ms": 0.0,

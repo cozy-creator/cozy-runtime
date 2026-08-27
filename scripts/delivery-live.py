@@ -918,7 +918,25 @@ def arms() -> None:
     ledger.device_free = 512 * MIB
     ledger.device_reserved = 0
     ledger.device_allocated = 0
-    declared = DeclaredBinding.read(binding_record(variants()))
+    offered = tuple(Variant.read(row) for row in variants())
+    reference = next(row for row in offered if row.reference)
+    declared = DeclaredBinding(
+        entrypoint_binding_plan_id=Q.plan_id_for("generate"),
+        entrypoint="generate",
+        model_class="SdxlPipelineModel",
+        model_binding_path="generate.models.model",
+        model_parameter_name="model",
+        release=RELEASE,
+        store=str(PLAIN_STORE),
+        variant="fp16",
+        reference_snapshot=reference.snapshot,
+        components=COMPONENTS,
+        snapshots=reference.snapshot_map(),
+        offered=offered,
+        model_weight_bytes=4 * GIB,
+        host_bytes=2 * GIB,
+        pinned_bytes=256 * MIB,
+    )
     generation = PreparedModel(delivery_rung="aot_decode", delivery_variant="fp8")
     chooser = PlanChooser(ledger)
     good = chooser.choose(declared, generation, PreparedRequest.unresolved("generate", {}))

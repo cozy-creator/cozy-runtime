@@ -90,8 +90,7 @@ from cozy_runtime.internal.worker.plan import (
     PlanChooser,
     PlanRefusal,
     PreparedModel,
-    artifact_facts,
-    held_refs,
+    read_provisioned_binding,
 )
 from cozy_runtime.protocol import (
     SCHEMA_DIGEST,
@@ -172,20 +171,8 @@ class WorkerOptions:
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
     """
-    project: Path | None = None
-    """THIS MACHINE's copy of the endpoint release being served (#563f).
-
-    A binding-plan record partitions into IDENTITY and RESOLUTION (#506a), and `project` is
-    the RESOLUTION half: the path the machine that WROTE the record put the release's tree
-    at. On that machine it is also this machine's path and the distinction never shows. On a
-    RENTED POD it is a path that does not exist, and discovering an endpoint from it fails
-    as `no_endpoint_toml` naming a directory on somebody else's disk — observed live.
-
-    So a worker resolves against its own root and never the writer's. `--project` states it;
-    absent, it is the process's working directory, which is what every launcher already sets
-    (cozy-creator runs the worker in the generation's source, and a pod's provisioner runs it
-    in the installed generation's source). The record's own `project` stays as recorded
-    evidence of where the WRITER resolved it, and decides nothing here."""
+    artifact_store: Path | None = None
+    """The verified TensorFS store populated from the canonical grouped-root closure."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -1731,20 +1718,18 @@ class Worker:
                     )
                 )
                 continue
-            # THE REF RESOLVES HERE, AGAINST THIS MACHINE'S OWN INDEX (#567e) — the same
-            # rule `project` already follows (#563f), applied to `store`, which is its
-            # twin. The record names `cozy/minimax-h3@se-001`; what that ref means on disk
-            # is a question only the machine about to serve it can answer, and it is
-            # answered before the placement can call itself STAGED. An absent artifact is a
-            # typed BINDING_UNAVAILABLE naming what this index does hold, not a fill-time
-            # surprise after a card is already rented and warm.
             try:
-                declared = DeclaredBinding.read(json.loads(record_bytes))
-                self.bindings[plan_id] = declared.resolve(
-                    artifact_facts(self.config.cozy_home, declared.artifact_ref)
-                    if declared.artifact_ref
-                    else None,
-                    held=held_refs(self.config.cozy_home),
+                if self.options.artifact_store is None:
+                    raise PlanRefusal(
+                        "artifact_store_required",
+                        "canonical provisioned bindings require the verified TensorFS store",
+                    )
+                self.bindings[plan_id] = read_provisioned_binding(
+                    plan_id,
+                    record_bytes,
+                    documents_root=self.config.cozy_home / "binding-documents",
+                    endpoint_release=placement.endpoint_release_id,
+                    store_root=self.options.artifact_store,
                 )
             except PlanRefusal as refusal:
                 missing.append(plan_id)
@@ -1985,10 +1970,8 @@ class Worker:
                     {
                         "cmd": "prepare",
                         "binding": {
-                            # THIS machine's root, not the record writer's (#563f). See
-                            # WorkerOptions.project: the record's `project` is the resolution of
-                            # whoever wrote it, and on a rented pod that path is not here.
-                            "project": str(self.options.project or Path.cwd()),
+                            "application": first.application,
+                            "descriptor": first.descriptor_path,
                             "model_class": first.model_class,
                             "model_binding_path": first.model_binding_path,
                             "model_parameter_name": first.model_parameter_name,
@@ -3124,11 +3107,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="cr-027 materializer root containing receipt-keyed immutable generations",
     )
     parser.add_argument(
-        "--project",
-        default="",
-        help="THIS machine's copy of the endpoint release tree; defaults to the working "
-        "directory. A binding-plan record's own `project` is the WRITER's resolution and is "
-        "not a path on a rented pod (#563f)",
+        "--artifact-store",
+        required=True,
+        help="verified TensorFS store populated from the provisioned grouped-root object set",
     )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
@@ -3159,7 +3140,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
-        project=Path(args.project).resolve() if args.project else Path.cwd(),
+        artifact_store=Path(args.artifact_store).resolve(),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,
