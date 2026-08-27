@@ -98,11 +98,9 @@ def prepare_launch(
 
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
-    spec_bytes = _local_exact(
-        config.provision_spec_path, config.provision_spec_digest, canonical.DOC_MAX_BYTES
-    )
-    bundle_bytes = _local_exact(
-        config.provision_bundle_path, config.provision_bundle_digest, canonical.DOC_MAX_BYTES
+    spec_bytes = _local_bounded_document(config.provision_spec_path, config.provision_spec_digest)
+    bundle_bytes = _local_bounded_document(
+        config.provision_bundle_path, config.provision_bundle_digest
     )
     spec, bundle = _provision_pair(spec_bytes, bundle_bytes, config)
     control_ref = _ref(spec["execution_substrate"]["control_runtime"], "control_runtime")
@@ -885,6 +883,21 @@ def _ref(value: object, name: str, *, allow_extra: bool = False) -> dict[str, An
 def _local_exact(path: Path, digest: str, length: int) -> bytes:
     _verify_local(path, digest, length)
     return path.read_bytes()
+
+
+def _local_bounded_document(path: Path, digest: str) -> bytes:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise LaunchRefusal("local_artifact_unreadable", f"{path}: {exc}") from exc
+    if (
+        not path.is_absolute()
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_size <= 0
+        or info.st_size > canonical.DOC_MAX_BYTES
+    ):
+        raise LaunchRefusal("local_artifact_invalid", str(path))
+    return _local_exact(path, digest, info.st_size)
 
 
 def _verify_local(path: Path, digest: str, length: int) -> None:
