@@ -93,6 +93,7 @@ REFUSALS = frozenset(
         "length_mismatch",  # segment/destination/object lengths disagree
         "dtype_mismatch",  # stored dtype is not the destination's (decode is cr-006)
         "budget_overrun",  # the ledger cannot grant this class
+        "ledger_underflow",  # a release exceeding the charge poisons; no counter clamps
         "destination_absent",  # a fill for a key the contract does not name
         "incomplete_fill",  # commit with a DestinationSet key never enqueued
         "lease_live",  # a staging slot reused before its completion event
@@ -236,8 +237,25 @@ class ResourceLedger:
         self.grants += 1
 
     def release(self, request: Mapping[str, int]) -> None:
+        """Return bytes to the ledger. Underflow POISONS, never clamps (cr-025).
+
+        A release exceeding what is charged means this plane's arithmetic no longer
+        matches what it moved; a `max(0, ...)` clamp would silently repair the counter
+        and keep serving on accounting known to be wrong.
+        """
         for cls, nbytes in request.items():
-            self.charged[cls] = max(0, self.charged[cls] - nbytes)
+            if cls not in CLASSES:
+                raise AssertionError(f"{cls} is not a ledger class")
+            remaining = self.charged[cls] - nbytes
+            if remaining < 0:
+                raise _refuse(
+                    "ledger_underflow",
+                    f"release of {nbytes} B from {cls} exceeds the {self.charged[cls]} B "
+                    "charged — the ledger no longer matches what this plane moved, and the "
+                    "generation is poisoned rather than clamped",
+                    [cls],
+                )
+            self.charged[cls] = remaining
 
     def rows(self) -> dict[str, dict[str, int]]:
         out = {
