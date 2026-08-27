@@ -102,7 +102,7 @@ class DecodedVideo:
     frame_pts: tuple[int, ...]
     frame_durations: tuple[int, ...]
     time_base: Fraction
-    average_rate: Fraction | None
+    average_rate: Fraction
     pixel_aspect_ratio: Fraction
     soundtrack: DecodedAudio | None
 
@@ -114,6 +114,7 @@ class DecodedVideo:
 @dataclass(slots=True)
 class _Budget:
     limit: int
+    parent: _Budget | None = None
     used: int = 0
 
     def claim(self, size: int, what: str) -> None:
@@ -122,6 +123,8 @@ class _Budget:
                 f"decoded {what} would cross the {self.limit}-byte expansion limit",
                 code="decoded_bytes_limit",
             )
+        if self.parent is not None:
+            self.parent.claim(size, "attempt media")
         self.used += size
 
 
@@ -276,11 +279,7 @@ class _VideoAccumulator:
         self.width = 0
         self.height = 0
         self.time_base: Fraction | None = None
-        self.average_rate = (
-            _positive_fraction(stream.average_rate, "video average rate")
-            if stream.average_rate is not None
-            else None
-        )
+        self.average_rate = _positive_fraction(stream.average_rate, "video average rate")
         ratio = stream.sample_aspect_ratio
         self.pixel_aspect_ratio = (
             _positive_fraction(ratio, "video pixel aspect ratio")
@@ -381,7 +380,7 @@ AssetT = TypeVar("AssetT", ImageAsset, AudioAsset, VideoAsset)
 class MediaDecoder:
     """Attempt-bound decoder injected into handlers that explicitly declare it."""
 
-    __slots__ = ("_active", "_attempt", "_limits")
+    __slots__ = ("_active", "_attempt", "_budget", "_limits")
 
     def __init__(
         self,
@@ -393,6 +392,7 @@ class MediaDecoder:
         self._attempt = attempt
         self._active = active
         self._limits = limits
+        self._budget = _Budget(limits.max_decoded_bytes)
 
     def decode_image(self, asset: ImageAsset) -> DecodedImage:
         av, budget, data = self._start(asset, ImageAsset, "decode_image")
@@ -430,6 +430,7 @@ class MediaDecoder:
             raise MediaDecodeError(
                 f"image container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",
+                fields=[asset._input_id] if asset._input_id else (),
             ) from exc
 
     def decode_audio(self, asset: AudioAsset) -> DecodedAudio:
@@ -450,6 +451,7 @@ class MediaDecoder:
             raise MediaDecodeError(
                 f"audio container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",
+                fields=[asset._input_id] if asset._input_id else (),
             ) from exc
 
     def decode_video(self, asset: VideoAsset) -> DecodedVideo:
@@ -486,6 +488,7 @@ class MediaDecoder:
             raise MediaDecodeError(
                 f"video container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",
+                fields=[asset._input_id] if asset._input_id else (),
             ) from exc
 
     def _start(
@@ -523,7 +526,10 @@ class MediaDecoder:
                 fields=[asset._input_id] if asset._input_id else (),
             )
         av = _av()
-        budget = _Budget(min(asset._max_decoded_bytes, self._limits.max_decoded_bytes))
+        budget = _Budget(
+            min(asset._max_decoded_bytes, self._limits.max_decoded_bytes),
+            parent=self._budget,
+        )
         return av, budget, asset.read_bytes()
 
 
@@ -626,12 +632,18 @@ def _jpeg_rotation(data: bytes) -> int:
     """
     offset = 2
     found: list[int] = []
-    while offset + 4 <= len(data):
+    while offset < len(data):
         if data[offset] != 0xFF:
             break
-        marker = data[offset + 1]
-        offset += 2
-        if marker in {0xD8, 0xD9}:
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            raise MediaDecodeError("JPEG marker is truncated", code="media_malformed")
+        marker = data[offset]
+        offset += 1
+        if marker == 0xD9:
+            break
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
             continue
         if marker == 0xDA:
             break

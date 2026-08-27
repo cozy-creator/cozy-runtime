@@ -54,11 +54,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f" — {detail}" if detail else ""))
 
 
-def expects(name: str, code: str, fn: Any) -> None:
+def expects(name: str, code: str, fn: Any, *, field: str | None = None) -> None:
     try:
         fn()
     except (CapabilityError, MediaDecodeError, DecoderUnavailable) as exc:
-        check(name, exc.code == code, f"code={exc.code}")
+        check(
+            name,
+            exc.code == code and (field is None or exc.fields == (field,)),
+            f"code={exc.code} fields={exc.fields}",
+        )
         return
     check(name, False, "no refusal")
 
@@ -337,7 +341,12 @@ def main() -> int:
         max_decoded_bytes=17,
         input_id="tiny",
     )
-    expects("decoded expansion cap", "decoded_bytes_limit", lambda: decoder.decode_image(tiny))
+    expects(
+        "decoded expansion cap",
+        "decoded_bytes_limit",
+        lambda: decoder.decode_image(tiny),
+        field="tiny",
+    )
     expects(
         "active component scope",
         "decode_in_component_scope",
@@ -382,6 +391,29 @@ def main() -> int:
         "pixels_per_frame_limit",
         lambda: MediaDecoder(record, active=lambda: False, limits=limits).decode_image(image),
     )
+    aggregate = MediaDecoder(
+        record,
+        active=lambda: False,
+        limits=DecodeLimits(30, 1000, 10, 2, 48_000),
+    )
+    aggregate.decode_image(image)
+    second = ImageAsset("second")
+    bind(
+        second,
+        local=image._local,
+        attempt="decode-live",
+        media_type=image.media_type,
+        digest=image.digest,
+        length=image.size_bytes,
+        max_decoded_bytes=1 << 20,
+        input_id="second",
+    )
+    expects(
+        "attempt aggregate expansion cap",
+        "decoded_bytes_limit",
+        lambda: aggregate.decode_image(second),
+        field="second",
+    )
 
     print("section: malformed bytes + absent media extra")
     corrupt_path = root / "corrupt.png"
@@ -397,7 +429,12 @@ def main() -> int:
         max_decoded_bytes=1 << 20,
         input_id="corrupt",
     )
-    expects("truncated container", "media_malformed", lambda: decoder.decode_image(corrupt))
+    expects(
+        "truncated container",
+        "media_malformed",
+        lambda: decoder.decode_image(corrupt),
+        field="corrupt",
+    )
     held = sys.modules.get("av")
     sys.modules["av"] = cast("Any", None)
     try:
