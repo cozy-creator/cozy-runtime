@@ -82,7 +82,9 @@ def fixture(out: Outputs) -> VideoAsset:
     return asset
 
 
-def composed(decoder: MediaDecoder, asset: VideoAsset, shots: int) -> Iterator[DecodedMediaEvent]:
+def composed(
+    decoder: MediaDecoder, asset: VideoAsset, shots: int, debug_rss: bool = False
+) -> Iterator[DecodedMediaEvent]:
     output_index = 0
     for shot in range(shots):
         with decoder.stream_video(asset) as stream:
@@ -125,21 +127,21 @@ def composed(decoder: MediaDecoder, asset: VideoAsset, shots: int) -> Iterator[D
                 )
                 output_index += 1
                 source_index += 1
-        if os.environ.get("COZY_MEDIA_STREAM_DEBUG"):
+        if debug_rss:
             print(
                 f"shot {shot + 1}: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} KiB",
                 file=sys.stderr,
             )
 
 
-def child(shots: int, snapshot: bool) -> int:
+def child(shots: int, snapshot: bool, debug_rss: bool = False) -> int:
     with tempfile.TemporaryDirectory(prefix="cozy-media-stream-") as directory:
         root = Path(directory)
         attempt = Attempt("media-stream", root, max_output_bytes=256 << 20)
         out = Outputs(attempt)
         decoder = MediaDecoder(attempt, active=lambda: False)
         source = fixture(out)
-        events: Any = composed(decoder, source, shots)
+        events: Any = composed(decoder, source, shots, debug_rss)
         if snapshot:
             events = list(events)
         saved = out.save_video_stream(iter(events))
@@ -250,10 +252,12 @@ def killed_midmux() -> None:
         )
 
 
-def run_child(shots: int, snapshot: bool = False) -> dict[str, Any]:
+def run_child(shots: int, snapshot: bool = False, debug_rss: bool = False) -> dict[str, Any]:
     command = [sys.executable, __file__, "--child", str(shots)]
     if snapshot:
         command.append("--snapshot")
+    if debug_rss:
+        command.append("--debug-rss")
     done = subprocess.run(
         command,
         check=True,
@@ -264,12 +268,12 @@ def run_child(shots: int, snapshot: bool = False) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(done.stdout.splitlines()[-1]))
 
 
-def parent(*, containment: bool) -> int:
+def parent(*, containment: bool, debug_rss: bool = False) -> int:
     if containment:
         killed_midmux()
-    two = run_child(2)
-    eight = run_child(8)
-    poison = run_child(8, snapshot=True)
+    two = run_child(2, debug_rss=debug_rss)
+    eight = run_child(8, debug_rss=debug_rss)
+    poison = run_child(8, snapshot=True, debug_rss=debug_rss)
     streaming_growth = int(eight["maxrss_kib"]) - int(two["maxrss_kib"])
     poison_growth = int(poison["maxrss_kib"]) - int(eight["maxrss_kib"])
     print(json.dumps({"two": two, "eight": eight, "poison": poison}, indent=2, sort_keys=True))
@@ -291,10 +295,13 @@ def main() -> int:
     parser.add_argument("--containment", action="store_true")
     parser.add_argument("--kill-child", type=Path)
     parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--debug-rss", action="store_true", help="print per-shot peak RSS")
     args = parser.parse_args()
     if args.kill_child is not None:
         return kill_child(args.kill_child)
-    return child(args.child, args.snapshot) if args.child else parent(containment=args.containment)
+    if args.child:
+        return child(args.child, args.snapshot, args.debug_rss)
+    return parent(containment=args.containment, debug_rss=args.debug_rss)
 
 
 if __name__ == "__main__":

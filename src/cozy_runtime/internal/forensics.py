@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.config import forensics_dir
 
 #: How many allocator history entries to retain when stacks are recorded. Bounded because
 #: the history is held in device-process memory and an unbounded one competes with the very
@@ -92,9 +91,12 @@ class FillForensics:
             self.stacks = False
 
     @classmethod
-    def open(cls, torch: Any, kind: str, device: Any, tag: str) -> FillForensics | None:
-        """A capture when a directory was configured and the backend can be metered."""
-        where = forensics_dir()
+    def open(cls, torch: Any, kind: str, device: Any, tag: str, where: str) -> FillForensics | None:
+        """A capture when a directory was configured and the backend can be metered.
+
+        `where` is passed down from the executor's sealed environment snapshot (cr-038):
+        this module never reads the process environment itself.
+        """
         if not where or kind != "cuda":
             return None
         try:

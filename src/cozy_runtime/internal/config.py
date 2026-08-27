@@ -95,6 +95,12 @@ class RuntimeConfig:
     base and hands the result to `posix_spawn`, so the child inherits nothing implicitly and
     no other module ever needs to look at `os.environ` to build it.
     """
+    fill_forensics_dir: str = ""
+    """Where the fill plane writes its memory captures, or "" for nowhere (cr-038).
+
+    A PATH, not a logic gate: the plane branches on having somewhere to write, and a run
+    with no directory configured executes the identical code path. Read ONCE here with the
+    rest of the config and projected across the executor seal by the worker."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,17 +161,6 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     env = os.environ if environ is None else environ
     return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
-
-
-def forensics_dir(environ: Mapping[str, str] | None = None) -> str:
-    """Where the fill plane writes its memory captures, or "" for nowhere.
-
-    A PATH, deliberately, and read HERE because this module is the environment authority.
-    It is configuration and not a logic gate: the plane branches on having somewhere to
-    write, and a run with no directory configured executes the identical code path.
-    """
-    env = os.environ if environ is None else environ
-    return env.get(child_env.FILL_FORENSICS_DIR, "").strip()
 
 
 _read: bool = False
@@ -232,6 +227,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
                 if not child_env.erased(k) and k != "COZY_BOOTSTRAP_CREDENTIAL"
             )
         ),
+        fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
     )
 
 

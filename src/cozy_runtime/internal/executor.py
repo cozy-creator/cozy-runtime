@@ -52,7 +52,7 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import accel, canonical, descriptor
+from cozy_runtime.internal import accel, canonical, child_env, descriptor
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
@@ -138,9 +138,12 @@ def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
 class Executor:
     """One incarnation's mutable state. Everything here dies with the process."""
 
-    def __init__(self, channel: Channel, root: Path) -> None:
+    def __init__(self, channel: Channel, root: Path, fill_forensics_dir: str = "") -> None:
         self.channel = channel
         self.root = root
+        #: cr-038: the fill plane's capture directory, taken from the sealed environment
+        #: snapshot at process entry and passed down — never read ambiently.
+        self.fill_forensics_dir = fill_forensics_dir
         self.torch: Any = None
         #: The BACKEND this incarnation serves. Every device operation below goes through
         #: `accel` with it, so the whole process holds exactly one backend conditional and
@@ -411,6 +414,7 @@ class Executor:
             # here would re-measure a device fact that has not changed.
             qualified=qualified,
             objective=objective,
+            forensics_dir=self.fill_forensics_dir,
         )
         # A STAGING generation re-reads the store after construction, so its GC-safe hold
         # must outlive the first commit. `resident_budget` is what makes a parked component
@@ -1469,7 +1473,11 @@ def main(argv: list[str] | None = None) -> int:
 
     _capture_seal()
     channel = connect(args.socket)
-    executor = Executor(channel, Path(args.root))
+    executor = Executor(
+        channel,
+        Path(args.root),
+        fill_forensics_dir=_SEALED.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+    )
 
     while True:
         try:

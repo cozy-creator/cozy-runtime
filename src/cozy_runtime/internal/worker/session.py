@@ -60,7 +60,6 @@ from typing import Any
 from cozy_runtime.internal import (
     accel,
     child_env,
-    config,
     egress,
     environment,
     fill,
@@ -2321,7 +2320,7 @@ class Worker:
         # The FILL runs in the executor, so its capture directory has to cross the seal or
         # it instruments the one process that never reserves a destination. Projected only
         # when one is configured: an empty value is an imposition of nothing.
-        where = config.forensics_dir()
+        where = self.config.fill_forensics_dir
         if where:
             imposed[child_env.FILL_FORENSICS_DIR] = where
         return imposed

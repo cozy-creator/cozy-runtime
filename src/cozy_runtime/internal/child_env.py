@@ -102,7 +102,7 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     ),
     ProjectedVar(
         FILL_FORENSICS_DIR,
-        "config.forensics_dir",
+        "config.fill_forensics_dir",
         "where the fill plane writes its per-boundary memory captures. The FILL runs in "
         "the executor, so a capture directory that stopped at the worker would instrument "
         "the one process that never allocates a destination. A path, not a switch: unset "

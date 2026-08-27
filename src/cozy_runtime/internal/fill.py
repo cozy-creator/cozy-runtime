@@ -889,6 +889,7 @@ class StreamingFillBackend:
         release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
         objective: str = "kernel_numeric_error",
+        forensics_dir: str = "",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -967,7 +968,11 @@ class StreamingFillBackend:
         #: directory was configured; every call below is a no-op then, and the serving path
         #: is byte-for-byte the same. See `internal/forensics.py` for why it is permanent.
         self.forensics = FillForensics.open(
-            self.torch, self.kind, self.device, f"fill-{os.getpid()}-{int(time.time())}"
+            self.torch,
+            self.kind,
+            self.device,
+            f"fill-{os.getpid()}-{int(time.time())}",
+            forensics_dir,
         )
         # cr-006. The device is measured once and the qualification suite runs once per
         # tuple (persisted, first-writer-wins), both at PREPARE time — §3.2's cost
