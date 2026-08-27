@@ -706,7 +706,7 @@ def descriptor_sections() -> None:
         ("duplicate key", b'{"format":"cozy.endpoint.descriptor/1","format":"x"}', "duplicate_key"),
         (
             "non-finite number",
-            base_raw.replace(b'"jobs": []', b'"jobs": [], "bad": NaN'),
+            base_raw.replace(b"{", b'{"bad":NaN,', 1),
             "number_range",
         ),
     ):
