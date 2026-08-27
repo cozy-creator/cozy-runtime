@@ -67,6 +67,8 @@ DEFAULT_DECODE_LIMITS = DecodeLimits(
     max_audio_samples=48_000 * 60 * 10,
 )
 
+MAX_ACTIVE_MEDIA_STREAMS = 2
+
 
 class DecoderUnavailable(CapabilityError):
     default_code = "decoder_unavailable"
@@ -897,7 +899,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
 class MediaDecoder:
     """Attempt-bound decoder injected into handlers that explicitly declare it."""
 
-    __slots__ = ("_active", "_attempt", "_budget", "_limits", "_stream_open")
+    __slots__ = ("_active", "_attempt", "_budget", "_limits", "_open_streams")
 
     def __init__(
         self,
@@ -910,7 +912,7 @@ class MediaDecoder:
         self._active = active
         self._limits = limits
         self._budget = _Budget(limits.max_decoded_bytes)
-        self._stream_open = False
+        self._open_streams = 0
 
     def decode_image(self, asset: ImageAsset) -> DecodedImage:
         av, budget, path = self._start(asset, ImageAsset, "decode_image")
@@ -1060,15 +1062,15 @@ class MediaDecoder:
                 "media streaming is forbidden inside an active component-use scope",
                 code="decode_in_component_scope",
             )
-        if self._stream_open:
+        if self._open_streams >= MAX_ACTIVE_MEDIA_STREAMS:
             raise CapabilityError(
-                "one MediaDecoder admits one active stream at a time",
+                f"one MediaDecoder admits at most {MAX_ACTIVE_MEDIA_STREAMS} active streams",
                 code="media_stream_active",
             )
-        self._stream_open = True
+        self._open_streams += 1
 
     def _release_stream(self) -> None:
-        self._stream_open = False
+        self._open_streams -= 1
 
     def _start(
         self,

@@ -757,6 +757,7 @@
     },
     "media_decode": {
       "limits": {
+        "max_active_streams": 2,
         "max_attempt_decoded_bytes": 2147483648
       },
       "members": [
@@ -808,5 +809,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:143372e2e4b6f8bc10711e3aad5b76309816737e16005f57278999dfe954fd38"
+  "surface_digest": "sha256:ad32b0f3c5eb9b354dfa254ea7d9c9aebb701a83a1748ec5f0e87050e0e25f23"
 }

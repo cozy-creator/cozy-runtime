@@ -253,10 +253,11 @@ def _services() -> dict[str, Json]:
         )
         document: dict[str, Json] = {"service": service.__name__, "members": members}
         if capability == "media_decode":
-            from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
+            from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MAX_ACTIVE_MEDIA_STREAMS
 
             document["limits"] = {
                 "max_attempt_decoded_bytes": DEFAULT_DECODE_LIMITS.max_decoded_bytes,
+                "max_active_streams": MAX_ACTIVE_MEDIA_STREAMS,
             }
         out[capability] = document
     return out

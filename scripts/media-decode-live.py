@@ -583,7 +583,8 @@ def main() -> int:
         "descriptor publishes the attempt aggregate decoded-value ceiling",
         isinstance(aggregate_limits, dict)
         and aggregate_limits.get("max_attempt_decoded_bytes")
-        == DEFAULT_DECODE_LIMITS.max_decoded_bytes,
+        == DEFAULT_DECODE_LIMITS.max_decoded_bytes
+        and aggregate_limits.get("max_active_streams") == 2,
     )
     hydrate(image, input_id="image", cap=1 << 20)
     decoded_image = decoder.decode_image(image)
@@ -682,16 +683,18 @@ def main() -> int:
         field="video",
     )
 
-    second_refused = False
-    with decoder.stream_video(video) as first:
+    third_refused = False
+    with decoder.stream_video(video) as first, decoder.stream_audio(audio) as second_stream:
         try:
             with decoder.stream_video(video):
                 pass
         except AuthorError as exc:
-            second_refused = exc.code == "media_stream_active"
+            third_refused = exc.code == "media_stream_active"
         for _event in first:
             pass
-    check("one decoder admits only one active stream", second_refused)
+        for _event in second_stream:
+            pass
+    check("one decoder admits exactly two active streams", third_refused)
 
     with decoder.stream_video(video) as source:
         saved = out.save_video_stream(source)
