@@ -16,7 +16,9 @@ a credential value or a path. Behaviour switches are flags, parsed by the CLI, n
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +97,55 @@ class RuntimeConfig:
     """
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterConfig:
+    """The fixed execution-substrate handoff to ``cozy-materialize-launch``."""
+
+    provision_spec_path: Path
+    provision_spec_digest: str
+    provision_bundle_path: Path
+    provision_bundle_digest: str
+    pod_boot_id_path: Path
+    tls_cert_path: Path
+    tls_key_path: Path
+    receipt_payload_path: Path
+    worker_internal_port: int
+    media_internal_port: int
+    provider_pod_id: str
+    renter_token_sha256: tuple[str, ...]
+    readiness_deadline_unix: int
+    child_base_env: tuple[tuple[str, str], ...]
+
+
+ADAPTER_ENV = {
+    "COZY_ADAPTER_PROVISION_SPEC_PATH",
+    "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
+    "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
+    "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+    "COZY_ADAPTER_POD_BOOT_ID_PATH",
+    "COZY_ADAPTER_TLS_CERT_PATH",
+    "COZY_ADAPTER_TLS_KEY_PATH",
+    "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH",
+    "COZY_ADAPTER_WORKER_INTERNAL_PORT",
+    "COZY_ADAPTER_MEDIA_INTERNAL_PORT",
+    "COZY_ADAPTER_PROVIDER_POD_ID",
+    "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON",
+    "COZY_ADAPTER_READINESS_DEADLINE_UNIX",
+}
+
+# The adapter starts one current control worker. Provider/image inheritance is not a config
+# channel: only these non-secret platform values survive, then the adapter imposes the two
+# worker-owned COZY paths explicitly. In particular RUNPOD/AWS/HF variables never cross.
+ADAPTER_CHILD_PLATFORM_ENV = {
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TZ",
+}
+
+
 def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The device-child SEAL names as this process actually received them (cr-007).
 
@@ -121,6 +172,10 @@ def forensics_dir(environ: Mapping[str, str] | None = None) -> str:
 
 
 _read: bool = False
+_adapter_read: bool = False
+
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -181,3 +236,125 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             )
         ),
     )
+
+
+def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConfig:
+    """Read the substrate adapter seam once, with no loose ``COZY_ADAPTER_*`` extension."""
+
+    global _adapter_read
+    if _adapter_read:
+        raise ConfigError(
+            "config_authority",
+            "read_adapter_config() called twice — a process has exactly one adapter handoff",
+            "read the adapter handoff once at its fixed executable entrypoint",
+            Exit.internal,
+        )
+    env = os.environ if environ is None else environ
+    if any(env.get(name) for name in ("PYTHONHOME", "PYTHONPATH")):
+        raise ConfigError(
+            "adapter_config",
+            "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed adapter",
+            "install and execute the substrate-owned control Runtime wheel without source paths",
+        )
+    if unknown := sorted(
+        name for name in env if name.startswith("COZY_ADAPTER_") and name not in ADAPTER_ENV
+    ):
+        raise ConfigError(
+            "adapter_config",
+            f"unknown adapter environment variable {unknown[0]}",
+            "use the closed execution-substrate adapter handoff",
+        )
+
+    def required(name: str) -> str:
+        value = env.get(name, "")
+        if not value:
+            raise ConfigError(
+                "adapter_config",
+                f"required adapter environment variable {name} is absent",
+                "launch only through the generic execution-substrate bootstrap",
+            )
+        return value
+
+    def path(name: str) -> Path:
+        raw = required(name)
+        value = Path(raw)
+        if not value.is_absolute() or str(value) != raw:
+            raise ConfigError(
+                "adapter_config", f"{name} is not one absolute normalized path", "fix bootstrap"
+            )
+        return value
+
+    def digest(name: str) -> str:
+        value = required(name)
+        if _DIGEST.fullmatch(value) is None:
+            raise ConfigError(
+                "adapter_config", f"{name} is not sha256:<64 lowercase hex>", "fix bootstrap"
+            )
+        return value
+
+    def decimal(name: str, maximum: int) -> int:
+        raw = required(name)
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ConfigError(
+                "adapter_config", f"{name} is not canonical decimal", "fix bootstrap"
+            ) from exc
+        if value <= 0 or value > maximum or str(value) != raw:
+            raise ConfigError(
+                "adapter_config", f"{name} is not canonical decimal in range", "fix bootstrap"
+            )
+        return value
+
+    try:
+        token_hashes = json.loads(required("COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            "adapter_config", "renter token hashes are not JSON", "fix bootstrap"
+        ) from exc
+    if (
+        not isinstance(token_hashes, list)
+        or not 1 <= len(token_hashes) <= 16
+        or not all(isinstance(item, str) and _TOKEN_HASH.fullmatch(item) for item in token_hashes)
+        or token_hashes != sorted(set(token_hashes))
+    ):
+        raise ConfigError(
+            "adapter_config",
+            "renter token hashes are not a non-empty bounded sorted unique set",
+            "fix bootstrap",
+        )
+    worker_port = decimal("COZY_ADAPTER_WORKER_INTERNAL_PORT", 65535)
+    media_port = decimal("COZY_ADAPTER_MEDIA_INTERNAL_PORT", 65535)
+    if worker_port == media_port:
+        raise ConfigError(
+            "adapter_config", "worker and media ports are equal", "fix bootstrap"
+        )
+    provider_pod_id = required("COZY_ADAPTER_PROVIDER_POD_ID")
+    if provider_pod_id.strip() != provider_pod_id or len(provider_pod_id) > 256:
+        raise ConfigError(
+            "adapter_config", "provider pod id is not one bounded id", "fix bootstrap"
+        )
+    parsed = AdapterConfig(
+        provision_spec_path=path("COZY_ADAPTER_PROVISION_SPEC_PATH"),
+        provision_spec_digest=digest("COZY_ADAPTER_PROVISION_SPEC_DIGEST"),
+        provision_bundle_path=path("COZY_ADAPTER_PROVISION_BUNDLE_PATH"),
+        provision_bundle_digest=digest("COZY_ADAPTER_PROVISION_BUNDLE_DIGEST"),
+        pod_boot_id_path=path("COZY_ADAPTER_POD_BOOT_ID_PATH"),
+        tls_cert_path=path("COZY_ADAPTER_TLS_CERT_PATH"),
+        tls_key_path=path("COZY_ADAPTER_TLS_KEY_PATH"),
+        receipt_payload_path=path("COZY_ADAPTER_RECEIPT_PAYLOAD_PATH"),
+        worker_internal_port=worker_port,
+        media_internal_port=media_port,
+        provider_pod_id=provider_pod_id,
+        renter_token_sha256=tuple(str(item) for item in token_hashes),
+        readiness_deadline_unix=decimal("COZY_ADAPTER_READINESS_DEADLINE_UNIX", (1 << 53) - 1),
+        child_base_env=tuple(
+            sorted(
+                (name, value)
+                for name, value in env.items()
+                if name in ADAPTER_CHILD_PLATFORM_ENV
+            )
+        ),
+    )
+    _adapter_read = True
+    return parsed

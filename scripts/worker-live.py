@@ -531,7 +531,7 @@ def read_addr(root: Path, process: Any, budget: float = 60.0) -> str:
 
 
 def serving_directive(
-    release: str, plan_ids: list[str], posture: Any, revision: int = 1
+    release: str, plan_ids: list[str], posture: Any, plan_root: Path, revision: int = 1
 ) -> pb.DesiredWorkerState:
     """The full-replace DesiredWorkerState carrying a CONTENT-ADDRESSED DesiredPlacementSet.
 
@@ -540,16 +540,27 @@ def serving_directive(
     frozen wire carried is deleted, so there is no second place for the set to disagree
     with itself.
     """
+    subjects = []
+    for plan_id in sorted(plan_ids):
+        source = plan_root / f"{plan_id.split(':')[-1]}.json"
+        raw = source.read_bytes()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        (plan_root / f"{digest.removeprefix('sha256:')}.json").write_bytes(raw)
+        subjects.append(
+            pb.ArtifactSubject(
+                subject_id=plan_id,
+                kind="plan",
+                digest=documents.raw(digest),
+                length=len(raw),
+            )
+        )
     placement_set = pb.PlacementSet(
         placements=[
             pb.Placement(
                 placement_id=PLACEMENT,
                 spec=pb.PlacementSpec(
                     endpoint_release_id=release,
-                    binding_plans=[
-                        pb.ArtifactSubject(subject_id=plan_id, kind="plan")
-                        for plan_id in sorted(plan_ids)
-                    ],
+                    binding_plans=subjects,
                 ),
             )
         ]
@@ -794,7 +805,9 @@ def start_worker(
     ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
     project = Path(str((overrides or {}).get("project") or ROOT / "corpus" / "endpoint"))
     hub = hub or Hub()
-    hub.directive = serving_directive(release, sorted(ids.values()), posture)
+    hub.directive = serving_directive(
+        release, sorted(ids.values()), posture, home / "binding-plans"
+    )
     hub.revision = 1
     # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
     # neighbour holds 5 GiB fails with a device shortfall that is true and uninformative.

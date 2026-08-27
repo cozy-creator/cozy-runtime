@@ -153,7 +153,10 @@ def start_weightless(
     socket_path = str(tmp / f"control-{len(os.listdir(tmp))}.sock")
     hub = hub or wl.Hub()
     hub.directive = wl.serving_directive(
-        RELEASE, sorted(ids.values()), posture or pb.Posture.POSTURE_ACCEPTING
+        RELEASE,
+        sorted(ids.values()),
+        posture or pb.Posture.POSTURE_ACCEPTING,
+        home / "binding-plans",
     )
     hub.revision = 1
     log = tmp / f"worker-{len(os.listdir(tmp))}.log"
@@ -319,7 +322,12 @@ def section_reconnect(args: argparse.Namespace, base: str) -> None:
         )
         # RED: same revision, genuinely different desired state (a posture flip).
         since = hub.mark()
-        changed = wl.serving_directive(RELEASE, sorted(ids.values()), pb.Posture.POSTURE_DRAINING)
+        changed = wl.serving_directive(
+            RELEASE,
+            sorted(ids.values()),
+            pb.Posture.POSTURE_DRAINING,
+            worker.home / "binding-plans",
+        )
         hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
         hub.wait(
             lambda m: (
@@ -605,7 +613,10 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
         keeper.epoch, keeper.record_owner_id = 5, "hub-authority"
         keeper.process, keeper.log = worker2.process, worker2.log
         keeper.directive = wl.serving_directive(
-            RELEASE, sorted(ids2.values()), pb.Posture.POSTURE_ACCEPTING
+            RELEASE,
+            sorted(ids2.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            worker2.home / "binding-plans",
         )
         keeper.connect(addr)
         ack = keeper.wait(
@@ -802,7 +813,11 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
     successor = wl.Hub()
     successor.process, successor.log = worker.process, worker.log
     successor.directive = wl.serving_directive(
-        RELEASE, [ids["tick"]], pb.Posture.POSTURE_ACCEPTING, revision=2
+        RELEASE,
+        [ids["tick"]],
+        pb.Posture.POSTURE_ACCEPTING,
+        worker.home / "binding-plans",
+        revision=2,
     )
     entered = tmp / "replacement-entered"
     release = tmp / "replacement-release"
@@ -905,7 +920,11 @@ def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
 
         since = hub.mark()
         exact = wl.serving_directive(
-            RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING, revision=2
+            RELEASE,
+            sorted(ids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            worker.home / "binding-plans",
+            revision=2,
         )
         hub.send(pb.RecordOwnerFrame(desired_state=hub._env(exact)))
         exact_report = hub.ready(ids["tick"], args.observe * 2, since=since)
@@ -919,7 +938,11 @@ def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
 
         since = hub.mark()
         changed = wl.serving_directive(
-            RELEASE, [ids["tick"]], pb.Posture.POSTURE_ACCEPTING, revision=3
+            RELEASE,
+            [ids["tick"]],
+            pb.Posture.POSTURE_ACCEPTING,
+            worker.home / "binding-plans",
+            revision=3,
         )
         hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
         changed_report = hub.ready(ids["tick"], args.observe * 2, since=since)

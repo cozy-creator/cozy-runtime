@@ -211,6 +211,8 @@ class Placement:
     installed_environment_receipt_digest: bytes
     descriptor_digest: bytes
     plan_ids: tuple[str, ...]
+    plan_refs: dict[str, tuple[str, int]]
+    """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
     #: offline" — the exact state an outgoing spec holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
@@ -359,6 +361,7 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
                 raise documents.DocumentError(
                     "unknown_field", f"PlacementSpec: unknown key {key!r} (a new key is /2)"
                 )
+        prior_subject = ""
         for subject in spec.get("binding_plans", []):
             if not isinstance(subject, dict):
                 raise documents.DocumentError("wrong_type", "an ArtifactSubject is an object")
@@ -367,6 +370,30 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
                     raise documents.DocumentError(
                         "unknown_field", f"ArtifactSubject: unknown key {key!r}"
                     )
+            if set(subject) != {"digest", "kind", "length", "subject_id"}:
+                raise documents.DocumentError(
+                    "artifact_subject_incomplete",
+                    "a binding-plan subject requires subject_id, kind, digest, and length",
+                )
+            subject_id = subject["subject_id"]
+            digest = subject["digest"]
+            length = subject["length"]
+            if (
+                not isinstance(subject_id, str)
+                or not subject_id
+                or subject_id <= prior_subject
+                or subject["kind"] != "plan"
+                or not isinstance(digest, str)
+                or HASH_ENTRY.fullmatch(digest) is None
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or length <= 0
+            ):
+                raise documents.DocumentError(
+                    "artifact_subject_invalid",
+                    "binding-plan subjects are sorted unique exact plan artifacts",
+                )
+            prior_subject = subject_id
     return [entry for entry in placements if isinstance(entry, dict)]
 
 
@@ -1561,6 +1588,9 @@ class Worker:
         plan_ids = tuple(
             str(row.get("subject_id", "")) for row in subjects if row.get("subject_id")
         )
+        plan_refs = {
+            str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
+        }
         self.placement = Placement(
             placement_id=placement_id,
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
@@ -1573,6 +1603,7 @@ class Worker:
             ),
             descriptor_digest=_digest_field(spec.get("descriptor_digest")),
             plan_ids=plan_ids,
+            plan_refs=plan_refs,
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
             # placement_id, new spec digest) retains the outgoing spec as the pin; a fresh
             # placement has none, and an empty pin means replacement is PAUSED — which is
@@ -1657,7 +1688,12 @@ class Worker:
             )
         missing: list[str] = []
         for plan_id in placement.plan_ids:
-            record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
+            plan_digest, plan_length = placement.plan_refs[plan_id]
+            record = (
+                self.config.cozy_home
+                / "binding-plans"
+                / f"{plan_digest.removeprefix('sha256:')}.json"
+            )
             if not record.is_file():
                 missing.append(plan_id)
                 self.engine.fault(
@@ -1669,6 +1705,32 @@ class Worker:
                     )
                 )
                 continue
+            try:
+                record_bytes = record.read_bytes()
+            except OSError as exc:
+                missing.append(plan_id)
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=plan_id,
+                        reason="binding_plan_unreadable",
+                        detail=safe(str(exc)),
+                    )
+                )
+                continue
+            measured_digest = "sha256:" + hashlib.sha256(record_bytes).hexdigest()
+            if len(record_bytes) != plan_length or measured_digest != plan_digest:
+                missing.append(plan_id)
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                        subject=plan_id,
+                        reason="binding_plan_identity_mismatch",
+                        detail=f"measured {measured_digest}/{len(record_bytes)}, expected "
+                        f"{plan_digest}/{plan_length}",
+                    )
+                )
+                continue
             # THE REF RESOLVES HERE, AGAINST THIS MACHINE'S OWN INDEX (#567e) — the same
             # rule `project` already follows (#563f), applied to `store`, which is its
             # twin. The record names `cozy/minimax-h3@se-001`; what that ref means on disk
@@ -1677,7 +1739,7 @@ class Worker:
             # typed BINDING_UNAVAILABLE naming what this index does hold, not a fill-time
             # surprise after a card is already rented and warm.
             try:
-                declared = DeclaredBinding.read(json.loads(record.read_text()))
+                declared = DeclaredBinding.read(json.loads(record_bytes))
                 self.bindings[plan_id] = declared.resolve(
                     artifact_facts(self.config.cozy_home, declared.artifact_ref)
                     if declared.artifact_ref

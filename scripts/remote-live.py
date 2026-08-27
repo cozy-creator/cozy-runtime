@@ -226,7 +226,10 @@ def main() -> int:
         hub = wl.Hub()
         hub.process, hub.log = process, log
         hub.directive = wl.serving_directive(
-            ll.RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
+            ll.RELEASE,
+            sorted(ids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            root.parent / "home" / "binding-plans",
         )
         t0 = time.perf_counter()
         hub.connect(addr, root_cert=root_cert, token=TOKEN)
@@ -340,7 +343,10 @@ def main() -> int:
         fhub = wl.Hub()
         fhub.process, fhub.log = fenced, flog
         fhub.directive = wl.serving_directive(
-            ll.RELEASE, sorted(fids.values()), pb.Posture.POSTURE_ACCEPTING
+            ll.RELEASE,
+            sorted(fids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            froot.parent / "home" / "binding-plans",
         )
         fhub.connect(faddr, root_cert=root_cert, token=TOKEN)
         fhub.ready(fids["tick"], 60)
@@ -492,7 +498,10 @@ def project_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:
         bhub = wl.Hub()
         bhub.process, bhub.log = broken, blog
         bhub.directive = wl.serving_directive(
-            ll.RELEASE, sorted(bids.values()), pb.Posture.POSTURE_ACCEPTING
+            ll.RELEASE,
+            sorted(bids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            broot.parent / "home" / "binding-plans",
         )
         bhub.connect(baddr, root_cert=root_cert, token=TOKEN)
         try:
@@ -533,7 +542,10 @@ def project_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:
         hub = wl.Hub()
         hub.process, hub.log = process, log
         hub.directive = wl.serving_directive(
-            ll.RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
+            ll.RELEASE,
+            sorted(ids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            root.parent / "home" / "binding-plans",
         )
         hub.connect(addr, root_cert=root_cert, token=TOKEN)
         hub.ready(ids["tick"], 60)
@@ -607,7 +619,10 @@ def hash_set_leg(tmp: Path, cert: Path, key: Path, root_cert: bytes) -> int:
         hub = wl.Hub()
         hub.process, hub.log = process, log
         hub.directive = wl.serving_directive(
-            ll.RELEASE, sorted(ids.values()), pb.Posture.POSTURE_ACCEPTING
+            ll.RELEASE,
+            sorted(ids.values()),
+            pb.Posture.POSTURE_ACCEPTING,
+            root.parent / "home" / "binding-plans",
         )
         t0 = time.perf_counter()
         hub.connect(addr, root_cert=root_cert, token=minted)

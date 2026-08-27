@@ -18,6 +18,7 @@ dev = ["mypy>=1.13", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
+cozy-materialize-launch = "cozy_runtime.cli.materialize_launch:main"
 
 [build-system]
 requires = ["hatchling"]

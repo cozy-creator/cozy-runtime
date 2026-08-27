@@ -153,6 +153,7 @@ _SERVE_FLAGS: dict[str, str] = {
     # which is exactly what puts it in this closed set.
     "--grant-root": "--grant-root",
     "--environment-root": "--environment-root",
+    "--artifact-digest": "--artifact-digest",
     "--project": "--project",
     "--threads": "--threads",
     "--grace": "--grace",
