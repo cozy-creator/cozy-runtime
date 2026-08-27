@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Fourteen fences, each provable red by planting the violation (`scripts/redarm.py`):
-  forbidden-dependency · canonical-numbers · torch-free-import · package-imports
+Fifteen fences, each provable red by planting the violation (`scripts/redarm.py`):
+  forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
+  package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
   endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
@@ -395,6 +396,72 @@ def fence_canonical_numbers() -> list[str]:
     return bad[:10]
 
 
+def fence_artifact_object_sets() -> list[str]:
+    """Reproduce the model-only ArtifactObjectSet bytes and digests from frozen vectors."""
+
+    import hashlib
+    import json
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import canonical, local, provisioned
+    from cozy_runtime.internal.worker.plan import PlanRefusal
+
+    bad: list[str] = []
+    path = ROOT / "vectors" / "artifact-object-sets.jsonl"
+    rows = [line for line in path.read_text().splitlines() if line.strip()]
+    names: set[str] = set()
+    rendered: dict[str, bytes] = {}
+    for line_number, line in enumerate(rows, 1):
+        vector = json.loads(line)
+        if not isinstance(vector, dict):
+            bad.append(f"{path}:{line_number}: vector is not an object")
+            continue
+        name = vector.get("name")
+        if not isinstance(name, str) or name in names:
+            bad.append(f"{path}:{line_number}: vector name is absent or duplicated")
+            continue
+        names.add(name)
+        document = vector.get("document")
+        expected = vector.get("canonical")
+        expected_digest = vector.get("digest")
+        if (
+            not isinstance(document, dict)
+            or not isinstance(expected, str)
+            or not isinstance(expected_digest, str)
+        ):
+            bad.append(f"{path}:{line_number}: vector fields are incomplete")
+            continue
+        raw = canonical.write(document)
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if raw.decode() != expected or digest != expected_digest:
+            bad.append(
+                f"{path}:{line_number}: wrote {raw.decode()!r} / {digest}, "
+                f"expected {expected!r} / {expected_digest}"
+            )
+            continue
+        try:
+            provisioned.read_artifact_object_set(raw)
+        except PlanRefusal as exc:
+            bad.append(f"{path}:{line_number}: strict reader refused {exc.code}: {exc.detail}")
+        rendered[name] = raw
+    if not rows:
+        bad.append(f"{path} is empty — a vector file that vanishes must not read green")
+    elif names != {"empty", "one-model-root"}:
+        bad.append(f"{path}: vector names are {sorted(names)}, want empty and one-model-root")
+    if "empty" in rendered:
+        local_bytes = local.weightless_release_documents(
+            {
+                "application": "vector:weightless",
+                "entrypoints": [
+                    {"hidden": False, "kind": "entrypoint", "models": [], "name": "health"}
+                ],
+            }
+        ).artifact_object_set
+        if local_bytes != rendered["empty"]:
+            bad.append(f"{path}: the local weightless writer diverges from the empty vector")
+    return bad[:10]
+
+
 def fence_torch_free_import() -> list[str]:
     """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
 
@@ -603,6 +670,7 @@ FENCES = {
     "reviewed-specs-exist": fence_reviewed_specs_exist,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
+    "artifact-object-sets": fence_artifact_object_sets,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "env-authority": fence_env_authority,

@@ -37,6 +37,14 @@ STATIC_ARMS = (
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
+    Arm(
+        "artifact-object-sets",
+        ROOT / "vectors" / "artifact-object-sets.jsonl",
+        '{"name":"planted-digest-drift","document":{"kind":'
+        '"tensorhub.resolved_object_set/1","roots":[]},"canonical":'
+        '"{\\"kind\\":\\"tensorhub.resolved_object_set/1\\",\\"roots\\":[]}",'
+        '"digest":"sha256:' + "0" * 64 + '"}\n',
+    ),
     # The exact drift that cost a rented H200: a reviewed spec digest this build declares
     # and the installed registry does not carry. Planted as a well-formed digest of the
     # right shape, because a malformed one would be caught by looking rather than by asking.

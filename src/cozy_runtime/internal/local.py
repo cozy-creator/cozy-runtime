@@ -884,7 +884,7 @@ def stage_weightless_release(
 ) -> StagedWeightlessRelease:
     """Stage the ONE canonical local closure for a wholly weightless release.
 
-    Tensorhub authors these exact Plan and grouped-root documents for a provisioned model
+    Tensorhub authors these exact Plan and model-root documents for a provisioned endpoint
     release. A local weightless run has no model root and nothing to fetch, but it still
     owes the worker the same stored-byte identities and complete visible-entrypoint set.
     This constructor is shared by the one-shot runner and process-launch acceptance paths;
@@ -958,7 +958,6 @@ def weightless_release_documents(
     descriptor_bytes = canonical.write(dict(endpoint_descriptor))
     descriptor_ref = _exact_ref(descriptor_bytes)
     plans: dict[str, bytes] = {}
-    object_refs: list[dict[str, Any]] = []
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
         entrypoint = str(entry.get("name", ""))
         plan_bytes = canonical.write(
@@ -969,20 +968,12 @@ def weightless_release_documents(
                 "format": "cozy.endpoint.EntrypointBindingPlan/1",
             }
         )
-        plan_ref = _exact_ref(plan_bytes)
         plans[entrypoint] = plan_bytes
-        object_refs.append(plan_ref)
 
     object_set_bytes = canonical.write(
         {
             "kind": provisioned.ARTIFACT_OBJECT_SET_KIND,
-            "roots": [
-                {
-                    "objects": sorted(object_refs, key=lambda row: str(row["digest"])),
-                    "role": "endpoint",
-                    "root": descriptor_ref,
-                }
-            ],
+            "roots": [],
         }
     )
     return WeightlessReleaseDocuments(descriptor_bytes, plans, object_set_bytes)

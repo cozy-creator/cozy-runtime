@@ -704,6 +704,9 @@ def _materialize_objects(
     if not cache_mount.is_absolute() or cache_mount == Path("/"):
         raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path is not specific")
     store_root = cache_mount / "tensorfs"
+    if not object_set.roots:
+        _directory(store_root)
+        return store_root
     try:
         tensorfs = fill.tensorfs_module()
         store = pull.open_store(tensorfs, store_root)
