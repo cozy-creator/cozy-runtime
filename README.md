@@ -128,10 +128,11 @@ no release digest, build timestamp, machine path or mutable binding reached it.
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.
 
-`endpoint.descriptor.json` is generated, committed and reviewed. It has one deterministic
-pretty byte representation; `descriptor_digest` is SHA-256 over those exact bytes and is its
-only identity. `describe --check` re-derives the exact bytes, so even a whitespace edit
-refuses. `describe` itself is read-only; `--write-descriptor` is the only writer, and
+`endpoint.descriptor.json` is generated, committed and reviewed. The committed file is a
+deterministic pretty projection; `descriptor_digest` is SHA-256 over canonical JSON content,
+so whitespace and key order never affect identity. `describe --check` compares meaning and
+refuses a stale surface while admitting a harmless reformat. `describe` itself is read-only;
+`--write-descriptor` is the normal projection writer, and
 `cozy-runtime new` runs it so a fresh endpoint is `--check`-clean out of the box.
 
 ## Commands
@@ -214,7 +215,8 @@ stores those bytes and refs; it never authors or reserializes an MCC.
 
 The request is a closed local process input. Every descriptor model path appears exactly
 once; a function with no model is still recorded in the output index with `bindings: []`.
-Config and descriptor refs bind their exact canonical stored bytes:
+Config and descriptor input refs bind exact local bytes for proof ingestion. Their generic
+`digest` is byte integrity and is never compared with semantic `descriptor_digest`:
 
 ```json
 {

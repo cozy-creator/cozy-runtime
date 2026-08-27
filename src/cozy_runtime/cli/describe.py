@@ -43,8 +43,7 @@ def run(function: str | None, opts: Options, *, write: bool, check: bool) -> Res
             "an endpoint's surface must be valid before it can be described (§1.0)",
             Exit.validation,
         ) from exc
-    raw = desc.render(body)
-    digest = desc.descriptor_digest(raw)
+    digest = desc.descriptor_digest(body)
 
     if check:
         return _check(project, body)
@@ -81,7 +80,7 @@ def _check(project: Path, derived: Mapping[str, Json]) -> Result:
     return Result(
         rows=(
             ("descriptor", "current"),
-            (desc.DIGEST_KEY, desc.descriptor_digest(desc.render(derived))),
+            (desc.DIGEST_KEY, desc.descriptor_digest(derived)),
         )
     )
 
@@ -109,7 +108,7 @@ def _list(body: Mapping[str, Json]) -> Result:
     counts = desc.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
-    rows.append((desc.DIGEST_KEY, desc.descriptor_digest(desc.render(body))))
+    rows.append((desc.DIGEST_KEY, desc.descriptor_digest(body)))
     return Result(
         rows=tuple(rows),
         document=body,

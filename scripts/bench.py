@@ -176,7 +176,8 @@ raw = descriptor.render(body)
 
 bench('descriptor.build (frozen app -> document)', lambda: descriptor.build(found), 200)
 bench('descriptor.render (the committed bytes)', lambda: descriptor.render(body), 500)
-bench('descriptor_digest (hash exact bytes)', lambda: descriptor.descriptor_digest(raw), 500)
+bench('descriptor_digest (canonical semantic hash)',
+      lambda: descriptor.descriptor_digest(body), 500)
 bench('canonical.parse (read the committed file)', lambda: canonical.parse(raw), 500)
 bench('compare (the --check comparison)',
       lambda: descriptor.compare(body, body, ('a', 'b')), 500)

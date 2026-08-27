@@ -951,7 +951,7 @@ def weightless_release_documents(
             "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
         )
 
-    descriptor_bytes = descriptor.render(endpoint_descriptor)
+    descriptor_bytes = descriptor.canonical_bytes(endpoint_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
     plans: dict[str, bytes] = {}
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):

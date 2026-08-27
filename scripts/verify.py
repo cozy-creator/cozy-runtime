@@ -625,7 +625,7 @@ def descriptor_sections() -> None:
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
             f"{counts['model_bindings']} slots · {size:>6,} B pretty · {elapsed_ms:6.1f} ms · "
-            f"{descriptor.descriptor_digest(raw)[:26]}…"
+            f"{descriptor.descriptor_digest(body)[:26]}…"
         )
 
     head("weights are never loaded — proven by a backend that refuses to be called")
@@ -669,9 +669,9 @@ def descriptor_sections() -> None:
     print(f"  async def:  {hashlib.sha256(pair[1]).hexdigest()[:32]}…")
     print(f"  identical:  {pair[0] == pair[1]} ({len(pair[0])} bytes each)")
 
-    head("digest sensitivity — a surface change flips it, an unrelated edit does not")
+    head("semantic digest — formatting is irrelevant and meaning is not")
     base_raw = descriptor.render(bodies["tiny_h3"])
-    base = descriptor.descriptor_digest(base_raw)
+    base = descriptor.descriptor_digest(bodies["tiny_h3"])
     mutations: dict[str, Callable[[Any], object]] = {
         "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
             {"name": "extra", "type": "int", "wire": "required"}
@@ -687,13 +687,37 @@ def descriptor_sections() -> None:
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
         mutate(mutated)
-        moved = descriptor.descriptor_digest(descriptor.render(mutated)) != base
+        moved = descriptor.descriptor_digest(mutated) != base
+        if not moved:
+            raise AssertionError(f"descriptor meaning change did not move identity: {what}")
         print(f"  {what:34} digest moved: {moved}")
     whitespace_edit = base_raw.replace(b"{\n", b"{\n ", 1)
-    print(
-        f"  {'reformatted JSON (whitespace only)':34} digest moved: "
-        f"{descriptor.descriptor_digest(whitespace_edit) != base}"
-    )
+    reordered = json.dumps(
+        dict(reversed(list(bodies["tiny_h3"].items()))), separators=(", ", ": ")
+    ).encode()
+    formatting_digests = {
+        descriptor.descriptor_digest(descriptor.read_bytes(raw, name))
+        for name, raw in (("whitespace twin", whitespace_edit), ("key-order twin", reordered))
+    }
+    if formatting_digests != {base}:
+        raise AssertionError("descriptor formatting changed semantic identity")
+    print(f"  {'whitespace/key-order twins':34} one digest: True")
+    for name, raw, code in (
+        ("duplicate key", b'{"format":"cozy.endpoint.descriptor/1","format":"x"}', "duplicate_key"),
+        (
+            "non-finite number",
+            base_raw.replace(b'"jobs": []', b'"jobs": [], "bad": NaN'),
+            "number_range",
+        ),
+    ):
+        try:
+            descriptor.read_bytes(raw, name)
+        except descriptor.StaleDescriptor as exc:
+            if code not in str(exc):
+                raise AssertionError(f"{name} refused for the wrong reason: {exc}") from exc
+        else:
+            raise AssertionError(f"{name} was admitted")
+        print(f"  {name:34} refused: {code}")
 
     head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
     committed = descriptor.render(bodies["tiny_h3"])

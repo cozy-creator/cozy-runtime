@@ -1508,8 +1508,7 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
 
 
 def run_stale_descriptor() -> list[str]:
-    """The committed descriptor is a CHECKED CACHE: hand-edit it, and both --check and any
-    build step that runs --check refuse."""
+    """Meaning changes and invalid JSON refuse; harmless formatting does not."""
     results = []
     with tempfile.TemporaryDirectory(prefix="cozy-arm-stale-") as tmp:
         project = _project(pathlib.Path(tmp), '[application]\nobject = "ep:app"\n', _VALID_MODULE)
@@ -1530,11 +1529,11 @@ def run_stale_descriptor() -> list[str]:
 
         target.write_text(good.replace("{\n", "{\n ", 1))
         code, output = _describe(project, "--check")
-        detail = _first(output, "deterministic descriptor encoding")
         results.append(
-            f"red — descriptor_exact_bytes (exit {code}): {detail}"
-            if code == 13
-            else f"NOT PROVEN — a whitespace-edited descriptor passed --check (exit {code})"
+            "green — descriptor formatting is not semantic identity"
+            if code == 0
+            else f"NOT PROVEN — whitespace-only descriptor edit refused "
+            f"(exit {code}): {output[:120]}"
         )
 
         target.write_text(good.replace('"format":', '"smuggled": 1,\n  "format":'))
