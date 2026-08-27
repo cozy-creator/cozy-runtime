@@ -38,12 +38,20 @@ def record_hash(data: bytes) -> str:
     return "sha256=" + encoded
 
 
-def build_wheel(root: Path, distribution: str, version: str, package: str) -> Path:
+def build_wheel(
+    root: Path,
+    distribution: str,
+    version: str,
+    package: str,
+    package_source: bytes | None = None,
+) -> Path:
     stem = distribution.replace("-", "_")
     filename = f"{stem}-{version}-py3-none-any.whl"
     dist_info = f"{stem}-{version}.dist-info"
     files = {
-        f"{package}/__init__.py": f"VALUE = {version!r}\n".encode(),
+        f"{package}/__init__.py": (
+            package_source if package_source is not None else f"VALUE = {version!r}\n".encode()
+        ),
         f"{dist_info}/METADATA": (
             f"Metadata-Version: 2.3\nName: {distribution}\nVersion: {version}\n\n"
         ).encode(),
@@ -129,9 +137,18 @@ def main() -> None:
         dependency_path = build_wheel(blobs, "exact-dependency", "1.2.3", "exact_dependency")
         project_path = build_wheel(blobs, "exact-project", "4.5.6", "exact_project")
         extra_path = build_wheel(blobs, "extra-wheel", "7.8.9", "extra_wheel")
+        torch_path = build_wheel(
+            blobs,
+            "torch",
+            "2.9.1",
+            "torch",
+            b"class version:\n    cuda = '12.9'\n"
+            b"class cuda:\n    @staticmethod\n    def is_available(): return False\n",
+        )
         dependency = inventory(dependency_path, "exact-dependency", "1.2.3", "wheelhouse")
         project = inventory(project_path, "exact-project", "4.5.6", "project")
         extra = inventory(extra_path, "extra-wheel", "7.8.9", "bundle")
+        torch = inventory(torch_path, "torch", "2.9.1", "wheelhouse")
 
         wheelhouse = canonical.write(
             {
@@ -171,17 +188,19 @@ def main() -> None:
         materialized_root = root / "installed"
         cold = materialize(source, materialized_root, uv=uv)
         rebuilt = materialize(source, root / "rebuilt", uv=uv)
+        raced = materialize(source, materialized_root, uv=uv)
         warm = materialize(
             source,
             materialized_root,
             uv=uv,
             expected_receipt_digest=cold.receipt_digest,
         )
-        assert cold.receipt_bytes == rebuilt.receipt_bytes == warm.receipt_bytes, (
+        assert cold.receipt_bytes == rebuilt.receipt_bytes == raced.receipt_bytes, (
             cold.receipt_bytes.decode(),
             rebuilt.receipt_bytes.decode(),
         )
-        assert not rebuilt.reused and warm.reused
+        assert raced.receipt_bytes == warm.receipt_bytes
+        assert not rebuilt.reused and raced.reused and warm.reused
         result = __import__("subprocess").run(
             [
                 str(warm.python),
@@ -195,6 +214,42 @@ def main() -> None:
             check=True,
         )
         assert result.stdout.strip() == "1.2.3 4.5.6"
+
+        cuda_target = pb.PlatformTarget(
+            os_arch=target.os_arch,
+            libc=target.libc,
+            python_abi=target.python_abi,
+            accelerator_backend="cuda",
+            accelerator_abi="cu129",
+        )
+        cuda_spec_bytes = documents.canonical_bytes(
+            pb.EndpointEnvironmentSpec(
+                platform_target=cuda_target,
+                endpoint_bundle_digest=documents.digest_of(bundle),
+                project_wheel_digest=documents.raw(project.digest),
+                wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
+            )
+        )
+        cuda_source = replace(
+            source,
+            environment_spec_bytes=cuda_spec_bytes,
+            environment_spec_digest=digest(cuda_spec_bytes),
+            wheels=(dependency, project, torch),
+            grants=(*source.grants, grant(torch_path, torch)),
+        )
+        cuda_environment = materialize(cuda_source, root / "cuda-installed", uv=uv)
+        unavailable = __import__("subprocess").run(
+            [
+                str(cuda_environment.python),
+                "-I",
+                "-c",
+                "import torch; print(torch.version.cuda, torch.cuda.is_available())",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert unavailable.stdout.strip() == "12.9 False"
 
         refusal(
             "wheel_blob_missing",
@@ -304,7 +359,8 @@ def main() -> None:
             ),
         )
         print(
-            "cr-027 live: two cold installs + warm receipt reuse + isolated imports; "
+            "cr-027 live: two cold installs + publish-race/warm reuse + isolated imports; "
+            "CUDA cu129 accepted without a physical device; "
             "missing/extra/corrupt/renamed/duplicate/expanded/unrecorded/tampered "
             "bytes refused; "
             f"receipt={cold.receipt_digest}"

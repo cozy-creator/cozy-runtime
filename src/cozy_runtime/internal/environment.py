@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import errno
 import hashlib
 import json
 import os
@@ -235,17 +236,21 @@ def materialize(
         _write_durable(receipt_path, receipt_bytes)
         _make_immutable(staging)
         _fsync_dir(staging)
+        reused = False
         try:
             os.rename(staging, final)
             final.chmod(final.stat().st_mode & ~0o222)
-        except FileExistsError:
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
             _remove_tree(staging)
+            reused = True
         _fsync_dir(generations)
         return verify_generation(
             final,
             receipt_digest=receipt_digest,
             environment_spec_digest=source.environment_spec_digest,
-            reused=False,
+            reused=reused,
         )
     except Exception:
         if staging.exists():
@@ -689,22 +694,31 @@ def _verify_host_target(target: PlatformTarget, python: Path, env: Mapping[str, 
 def _verify_installed_target(python: Path, target: PlatformTarget, env: Mapping[str, str]) -> None:
     if target.accelerator_backend == "none":
         return
-    probe = (
-        "import json,torch; "
-        "print(json.dumps({'cuda':getattr(torch.version,'cuda',None),"
-        "'cuda_available':torch.cuda.is_available(),"
-        "'mps_available':bool(getattr(getattr(torch.backends,'mps',None),'is_available',lambda:False)())}))"
-    )
-    result = _run([str(python), "-I", "-c", probe], env, "accelerator_probe_failed")
-    measured = json.loads(result.stdout)
     if target.accelerator_backend == "cuda":
-        cuda = measured.get("cuda")
+        result = _run(
+            [
+                str(python),
+                "-I",
+                "-B",
+                "-c",
+                "import json,torch; print(json.dumps(getattr(torch.version,'cuda',None)))",
+            ],
+            env,
+            "accelerator_probe_failed",
+        )
+        cuda = json.loads(result.stdout)
         abi = "cu" + str(cuda).replace(".", "") if cuda else ""
-        if abi != target.accelerator_abi or not measured.get("cuda_available"):
+        if abi != target.accelerator_abi:
             raise EnvironmentRefusal(
                 "platform_accelerator_mismatch", f"installed torch reports cuda={cuda!r}"
             )
-    elif not measured.get("mps_available") or target.accelerator_abi != "none":
+        return
+    probe = (
+        "import torch; print(int(bool("
+        "getattr(getattr(torch.backends,'mps',None),'is_available',lambda:False)())))"
+    )
+    result = _run([str(python), "-I", "-B", "-c", probe], env, "accelerator_probe_failed")
+    if result.stdout.strip() != "1" or target.accelerator_abi != "none":
         raise EnvironmentRefusal("platform_accelerator_mismatch", "installed torch has no MPS")
 
 
