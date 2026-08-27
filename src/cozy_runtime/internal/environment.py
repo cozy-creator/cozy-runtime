@@ -557,8 +557,19 @@ def _relocate_console_scripts(venv: Path) -> frozenset[Path]:
             continue
         raw = path.read_bytes()
         first, separator, body = raw.partition(b"\n")
-        if not separator or not first.startswith(b"#!") or staging not in first:
+        if not separator:
             continue
+        if not (first.startswith(b"#!") and staging in first):
+            lines = raw.splitlines(keepends=True)
+            if not (
+                len(lines) >= 3
+                and lines[0].rstrip(b"\r\n") == b"#!/bin/sh"
+                and lines[1].startswith(b"'''exec' ")
+                and staging in lines[1]
+                and lines[2].rstrip(b"\r\n") == b"' '''"
+            ):
+                continue
+            body = b"".join(lines[3:])
         mode = path.stat().st_mode
         path.write_bytes(trampoline + body)
         path.chmod(mode)
