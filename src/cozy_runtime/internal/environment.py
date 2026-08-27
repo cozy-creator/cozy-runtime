@@ -450,6 +450,8 @@ def _inspect_wheel(entry: WheelInventoryEntry, grant: BlobGrant) -> _InspectedWh
                     "wheel_expansion_cap",
                     f"{entry.filename}: {expanded} expanded bytes from {entry.length}",
                 )
+            metadata_names: list[str] = []
+            wheel_names: list[str] = []
             for member in members:
                 pure = PurePosixPath(member.filename)
                 if pure.is_absolute() or ".." in pure.parts or "\\" in member.filename:
@@ -457,16 +459,11 @@ def _inspect_wheel(entry: WheelInventoryEntry, grant: BlobGrant) -> _InspectedWh
                 mode = member.external_attr >> 16
                 if stat.S_ISLNK(mode):
                     raise EnvironmentRefusal("wheel_member_symlink", member.filename)
-            metadata_names = [
-                member.filename
-                for member in members
-                if member.filename.endswith(".dist-info/METADATA")
-            ]
-            wheel_names = [
-                member.filename
-                for member in members
-                if member.filename.endswith(".dist-info/WHEEL")
-            ]
+                if len(pure.parts) == 2 and pure.parts[0].endswith(".dist-info"):
+                    if pure.parts[1] == "METADATA":
+                        metadata_names.append(member.filename)
+                    elif pure.parts[1] == "WHEEL":
+                        wheel_names.append(member.filename)
             if len(metadata_names) != 1 or len(wheel_names) != 1:
                 raise EnvironmentRefusal("wheel_metadata_ambiguous", entry.filename)
             metadata = _zip_read(archive, metadata_names[0])
