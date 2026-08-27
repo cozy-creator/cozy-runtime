@@ -58,6 +58,7 @@ ERASED_PREFIXES: tuple[str, ...] = (
 #: The fill plane's capture directory, named here because the allowlist row and the config
 #: authority's reader must spell it identically and this is the table both read.
 FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
+EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here.
@@ -92,6 +93,12 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "COZY_EXECUTOR_SOCKET",
         "worker.executor_channel",
         "the worker/executor control channel path handed to the child at spawn",
+    ),
+    ProjectedVar(
+        EXECUTOR_SCOPE_ENV,
+        "worker.process_tree_scope",
+        "non-secret exact process identity inherited by first-party descendants when a "
+        "credential-unwritable cgroup-v1 container cannot supply a kernel subtree",
     ),
     ProjectedVar(
         FILL_FORENSICS_DIR,

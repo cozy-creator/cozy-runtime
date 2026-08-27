@@ -15,8 +15,8 @@ Order matters and is the point:
 2. **pdeathsig** — SIGKILL on parent death, then the parent check RUNS AGAIN: between (1)
    and (2) the parent could have died, and pdeathsig only fires on future deaths. The
    re-check is what closes that race.
-3. **cgroup** — join the worker-created executor scope. Every later process-group/session
-   change remains inside this kernel-owned subtree.
+3. **containment** — join the worker-created cgroup-v2 scope, or prove the exact inherited
+   process-tree token in a credential-unwritable cgroup-v1 container.
 4. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
 5. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable
@@ -48,12 +48,13 @@ def _fail(message: str, code: Exit) -> None:
 
 
 def main(argv: list[str]) -> None:
-    """Seal one child and join its pre-created cgroup before executor import."""
+    """Seal one child and enter its selected containment scope before executor import."""
     expect_parent = 0
     oom_adj = 0
     uid = gid = -1
     cgroup_path = ""
     cgroup_inode = 0
+    scope_backend = ""
     rest: list[str] = []
     index = 0
     while index < len(argv):
@@ -74,13 +75,21 @@ def main(argv: list[str]) -> None:
             cgroup_path = value
         elif flag == "--cgroup-inode":
             cgroup_inode = int(value)
+        elif flag == "--scope-backend":
+            scope_backend = value
         else:
             _fail(f"unknown flag {flag!r}", Exit.usage)
         index += 2
     if not rest:
         _fail("no program to exec", Exit.usage)
-    if not cgroup_path or cgroup_inode <= 0:
-        _fail("an exact executor cgroup scope is required", Exit.structural)
+    if scope_backend == "cgroup_v2":
+        if not cgroup_path or cgroup_inode <= 0:
+            _fail("an exact cgroup-v2 executor scope is required", Exit.structural)
+    elif scope_backend == "process_tree":
+        if cgroup_path or cgroup_inode:
+            _fail("a process-tree scope cannot also name a cgroup", Exit.structural)
+    else:
+        _fail(f"unknown containment backend {scope_backend!r}", Exit.structural)
 
     if expect_parent and os.getppid() != expect_parent:
         _fail(
@@ -97,10 +106,11 @@ def main(argv: list[str]) -> None:
     if expect_parent and os.getppid() != expect_parent:
         # The parent died in the window above; pdeathsig only covers FUTURE deaths.
         _fail("parent died before pdeathsig was armed", Exit.structural)
-    try:
-        proctree.join_executor_cgroup(proctree.CgroupScope(cgroup_path, cgroup_inode))
-    except (proctree.CgroupUnavailable, proctree.ProcessTreeUnsupported) as exc:
-        _fail(str(exc), Exit.structural)
+    if scope_backend == "cgroup_v2":
+        try:
+            proctree.join_executor_cgroup(proctree.CgroupScope(cgroup_path, cgroup_inode))
+        except (proctree.ContainmentUnavailable, proctree.ProcessTreeUnsupported) as exc:
+            _fail(str(exc), Exit.structural)
     try:
         proctree.seal_no_new_privs()
     except OSError as exc:
@@ -123,9 +133,12 @@ def main(argv: list[str]) -> None:
                 Exit.structural,
             )
 
-    # Keep executor-directed signals out of the worker's group. Subtree containment is the
-    # cgroup joined above; process groups alone cannot contain setsid().
+    # Keep executor-directed signals out of the worker's group. Under process-tree
+    # containment, stop before endpoint import so the parent can fsync this exact birth and
+    # PGID before allowing any first-party descendant to exist.
     proctree.own_process_group()
+    if scope_backend == "process_tree":
+        os.kill(os.getpid(), signal.SIGSTOP)
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGXFSZ, signal.SIGPIPE):
         signal.signal(number, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_SETMASK, set())

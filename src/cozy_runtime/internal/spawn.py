@@ -68,12 +68,24 @@ def spawn_executor(
     base_env: tuple[tuple[str, str], ...],
     imposed: Mapping[str, str],
     cwd: str,
-    cgroup: proctree.CgroupScope,
+    scope: proctree.ExecutorScope,
     uid: int = -1,
     gid: int = -1,
 ) -> Spawned:
     """EXEC-FIRST launch of one device executor. Returns before the child has run anything."""
     env = seal(base_env, imposed)
+    containment = (
+        [
+            "--scope-backend",
+            "cgroup_v2",
+            "--cgroup",
+            scope.relative_path,
+            "--cgroup-inode",
+            str(scope.inode),
+        ]
+        if isinstance(scope, proctree.CgroupScope)
+        else ["--scope-backend", "process_tree"]
+    )
     argv = [
         python,
         "-c",
@@ -86,10 +98,7 @@ def spawn_executor(
         str(uid),
         "--gid",
         str(gid),
-        "--cgroup",
-        cgroup.relative_path,
-        "--cgroup-inode",
-        str(cgroup.inode),
+        *containment,
         "--",
         python,
         *module_argv,
