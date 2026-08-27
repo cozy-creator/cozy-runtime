@@ -145,6 +145,7 @@ fresh endpoint is `--check`-clean out of the box.
     uv run python scripts/bench.py       # time + memory benchmarks
     uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof
     uv run python scripts/environment-proof-live.py # th-046 proof-seat cold/rebuild/red journey
+    uv run python scripts/model-contract-proof-live.py # installed MCC cold/rebuild/red proof
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
 
@@ -171,6 +172,43 @@ set is closed; every path value is a normalized absolute local path:
   "uv": "/opt/cozy/bin/uv",
   "python": "/opt/python/3.12/bin/python3.12",
   "environment_root": "/proof/fresh-environment"
+}
+```
+
+The receipt-keyed generation then exposes
+`cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
+it re-verifies its own installed environment, compares the exact descriptor with the
+installed project wheel, and double-derives every descriptor model binding under the
+offline construction sandbox. The fresh output directory appears atomically and contains
+`model-construction-proof.json` plus exact digest-named files under `contracts/`. Tensorhub
+stores those bytes and refs; it never authors or reserializes an MCC.
+
+The request is a closed local process input. Every descriptor model path appears exactly
+once; a function with no model is still recorded in the output index with `bindings: []`.
+Config and descriptor refs bind their exact canonical stored bytes:
+
+```json
+{
+  "format": "cozy.runtime.ModelConstructionProofRequest/1",
+  "environment_spec_digest": "sha256:<64 lowercase hex>",
+  "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
+  "project_wheel_digest": "sha256:<64 lowercase hex>",
+  "endpoint_release_id": "endpoint-release-id",
+  "endpoint_descriptor": {
+    "path": "/proof/endpoint.descriptor.json",
+    "digest": "sha256:<64 lowercase hex>",
+    "length": 5678
+  },
+  "bindings": [{
+    "path": "generate.models.model",
+    "snapshot": "sha256:<64 lowercase hex>",
+    "config": {
+      "path": "/proof/model-config.json",
+      "digest": "sha256:<64 lowercase hex>",
+      "length": 9012
+    },
+    "hardware_variants": ["sm89", "sm90"]
+  }]
 }
 ```
 

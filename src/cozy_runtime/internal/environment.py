@@ -218,7 +218,8 @@ def materialize(
             env,
             "wheel_install_failed",
         )
-        _strip_installer_paths(venv)
+        relocated_scripts = _relocate_console_scripts(venv)
+        _strip_installer_paths(venv, relocated_scripts)
         records = _verify_installed(
             venv, {wheel.distribution: (wheel.version, "") for wheel in install_wheels}
         )
@@ -545,21 +546,43 @@ def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> di
     return records
 
 
-def _strip_installer_paths(venv: Path) -> None:
-    """Delete uv's local staging metadata; a host path is not environment data."""
+def _relocate_console_scripts(venv: Path) -> frozenset[Path]:
+    """Replace uv's staging-path shebangs with one deterministic same-venv trampoline."""
+
+    scripts = venv / "bin"
+    if not scripts.is_dir():  # Windows launchers are already path-independent executables.
+        return frozenset()
+    staging = str(venv).encode()
+    trampoline = b"#!/bin/sh\n'''exec' \"${0%/*}/python\" \"$0\" \"$@\"\n' '''\n"
+    changed: set[Path] = set()
+    for path in scripts.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        raw = path.read_bytes()
+        first, separator, body = raw.partition(b"\n")
+        if not separator or not first.startswith(b"#!") or staging not in first:
+            continue
+        mode = path.stat().st_mode
+        path.write_bytes(trampoline + body)
+        path.chmod(mode)
+        changed.add(path.resolve())
+    return frozenset(changed)
+
+
+def _strip_installer_paths(venv: Path, relocated_scripts: frozenset[Path]) -> None:
+    """Delete uv staging metadata and restamp only relocated console-script RECORD rows."""
 
     sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
     if len(sites) != 1:
         raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
     site = sites[0]
+    unclaimed = set(relocated_scripts)
     for dist_info in site.glob("*.dist-info"):
         generated = [
             path
             for name in ("direct_url.json", "uv_cache.json")
             if (path := dist_info / name).exists()
         ]
-        if not generated:
-            continue
         record = dist_info / "RECORD"
         try:
             with record.open(newline="") as stream:
@@ -568,6 +591,19 @@ def _strip_installer_paths(venv: Path) -> None:
             filtered = [row for row in rows if row and row[0] not in relative]
             if len(filtered) != len(rows) - len(generated):
                 raise EnvironmentRefusal("installed_path_metadata_unrecorded", str(dist_info))
+            owned: set[Path] = set()
+            for row in filtered:
+                installed = (site / row[0]).resolve()
+                if installed not in relocated_scripts:
+                    continue
+                raw = installed.read_bytes()
+                encoded = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=")
+                row[1] = "sha256=" + encoded.decode()
+                row[2] = str(len(raw))
+                owned.add(installed)
+            if not generated and not owned:
+                continue
+            unclaimed.difference_update(owned)
             filtered.sort(key=lambda row: row[0])
             for path in generated:
                 path.unlink()
@@ -579,6 +615,8 @@ def _strip_installer_paths(venv: Path) -> None:
             os.replace(temporary, record)
         except OSError as exc:
             raise EnvironmentRefusal("installed_path_metadata_cleanup_failed", str(exc)) from exc
+    if unclaimed:
+        raise EnvironmentRefusal("installed_console_script_unowned", str(min(unclaimed, key=str)))
 
 
 def _strip_uv_venv_files(venv: Path) -> None:

@@ -453,6 +453,39 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
     return []
 
 
+def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
+    """Read one exact descriptor artifact without assuming it has a project-tree path."""
+    try:
+        parsed = canonical.parse(raw)
+    except canonical.CanonicalError as exc:
+        raise StaleDescriptor(f"{source}: {exc}", code="malformed_descriptor") from exc
+    if not isinstance(parsed, dict):
+        raise StaleDescriptor(f"{source} is not a JSON object", code="malformed_descriptor")
+    # EXACT field set, never a superset (v1's graph-document lesson: an unknown key read as
+    # a legal older document is how a reader goes quiet instead of refusing).
+    unknown = sorted(set(parsed) - TOP_LEVEL_KEYS)
+    if unknown:
+        raise StaleDescriptor(
+            f"{source} carries unknown top-level field(s) {', '.join(unknown)}: the descriptor "
+            f"schema is exactly {', '.join(sorted(TOP_LEVEL_KEYS))}",
+            code="unknown_field",
+        )
+    declared = parsed.get(DIGEST_KEY)
+    if not isinstance(declared, str) or not canonical.DIGEST_RE.match(declared):
+        raise StaleDescriptor(
+            f"{source}: {DIGEST_KEY} {declared!r} is not `sha256:<64 lowercase hex>` — one digest "
+            "spelling, shared with tensorfs (tfs-013)",
+            code="malformed_digest",
+        )
+    derived = surface_digest({key: value for key, value in parsed.items() if key != DIGEST_KEY})
+    if declared != derived:
+        raise StaleDescriptor(
+            f"{source}: {DIGEST_KEY} {declared} does not match its body {derived}",
+            code="digest_mismatch",
+        )
+    return parsed
+
+
 def read(project: Path) -> dict[str, Json]:
     """The committed descriptor, parsed. A missing one is a refusal, not an empty default."""
     target = path_of(project)
@@ -462,29 +495,7 @@ def read(project: Path) -> dict[str, Json]:
             "descriptor is derived and committed (§1.0)",
             code="missing_descriptor",
         )
-    try:
-        parsed = canonical.parse(target.read_bytes())
-    except canonical.CanonicalError as exc:
-        raise StaleDescriptor(f"{FILE}: {exc}", code="malformed_descriptor") from exc
-    if not isinstance(parsed, dict):
-        raise StaleDescriptor(f"{FILE} is not a JSON object", code="malformed_descriptor")
-    # EXACT field set, never a superset (v1's graph-document lesson: an unknown key read as
-    # a legal older document is how a reader goes quiet instead of refusing).
-    unknown = sorted(set(parsed) - TOP_LEVEL_KEYS)
-    if unknown:
-        raise StaleDescriptor(
-            f"{FILE} carries unknown top-level field(s) {', '.join(unknown)}: the descriptor "
-            f"schema is exactly {', '.join(sorted(TOP_LEVEL_KEYS))}",
-            code="unknown_field",
-        )
-    declared = parsed.get(DIGEST_KEY)
-    if not isinstance(declared, str) or not canonical.DIGEST_RE.match(declared):
-        raise StaleDescriptor(
-            f"{FILE}: {DIGEST_KEY} {declared!r} is not `sha256:<64 lowercase hex>` — one digest "
-            "spelling, shared with tensorfs (tfs-013)",
-            code="malformed_digest",
-        )
-    return parsed
+    return read_bytes(target.read_bytes(), str(target))
 
 
 def counts(body: Mapping[str, Json]) -> dict[str, int]:

@@ -20,6 +20,7 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -136,12 +137,27 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_data", "_where")
+    __slots__ = ("_data", "_document_digest", "_where")
 
     _data: Mapping[str, object]
+    _document_digest: str
     _where: str
 
-    def __init__(self, data: Mapping[str, object], where: str = "config") -> None:
+    def __init__(
+        self,
+        data: Mapping[str, object],
+        where: str = "config",
+        *,
+        document_digest: str | None = None,
+    ) -> None:
+        """Freeze one canonical config document and its one SHA-256 identity.
+
+        The proof seat supplies ``document_digest`` only after verifying the exact stored
+        canonical bytes. In-memory fixtures omit it and thereby author their own exact
+        canonical document from ``data``. Both paths use the same digest spelling; the old
+        short BLAKE2 projection was not a document identity and produced MCC bytes the
+        Runtime reader itself refused.
+        """
         for key, value in data.items():
             carrier = _carrier(key, value)
             if carrier is not None:
@@ -154,7 +170,23 @@ class Config:
                 )
             if isinstance(value, Mapping):
                 Config(value, f"{where}.{key}")
-        object.__setattr__(self, "_data", dict(data))
+        frozen = dict(data)
+        rendered = msgspec.json.encode(_canonical(frozen))
+        measured = "sha256:" + hashlib.sha256(rendered).hexdigest()
+        if document_digest is not None:
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", document_digest) is None:
+                raise ConformanceError(
+                    f"{where} document digest {document_digest!r} is not sha256:<64 lowercase hex>",
+                    code="config_digest",
+                )
+            if document_digest != measured:
+                raise ConformanceError(
+                    f"{where} document digest {document_digest} does not match its exact "
+                    f"canonical bytes {measured}",
+                    code="config_digest",
+                )
+        object.__setattr__(self, "_data", frozen)
+        object.__setattr__(self, "_document_digest", measured)
         object.__setattr__(self, "_where", where)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -218,13 +250,8 @@ class Config:
             ) from exc
 
     def digest(self) -> str:
-        """The immutable-configuration term of construction identity (§1.1)."""
-        return (
-            "blake2b:"
-            + hashlib.blake2b(
-                msgspec.json.encode(_canonical(self._data)), digest_size=16
-            ).hexdigest()
-        )
+        """The exact canonical config-document identity used by MCC and binding readers."""
+        return self._document_digest
 
     def _value(self, name: str) -> object:
         try:
