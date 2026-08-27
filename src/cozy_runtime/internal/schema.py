@@ -27,7 +27,9 @@ from cozy_runtime.author._assets import (
     ImageAsset,
     Tree,
     VideoAsset,
+    asset_kinds,
 )
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AssetBound, Shape, _ModelDefaultMarker
 from cozy_runtime.author._walker import MISSING, is_struct, strip, unwrap_optional
@@ -168,6 +170,14 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
                 bound["max_bytes"] = marker.max_bytes
             if marker.max_decoded_bytes is not None:
                 bound["max_decoded_bytes"] = marker.max_decoded_bytes
+                kinds = asset_kinds(base)
+                if kinds & {"image", "video"}:
+                    bound["max_pixels_per_frame"] = DEFAULT_DECODE_LIMITS.max_pixels_per_frame
+                if "video" in kinds:
+                    bound["max_video_frames"] = DEFAULT_DECODE_LIMITS.max_video_frames
+                if kinds & {"audio", "video"}:
+                    bound["max_audio_channels"] = DEFAULT_DECODE_LIMITS.max_audio_channels
+                    bound["max_audio_samples"] = DEFAULT_DECODE_LIMITS.max_audio_samples
             if marker.media_types:
                 bound["media_types"] = list(marker.media_types)
             doc["asset_bound"] = bound

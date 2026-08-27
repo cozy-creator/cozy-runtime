@@ -25,9 +25,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, get_args, get_type_hints
 
 import msgspec
 
@@ -394,8 +394,8 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
 
 
-def asset_inputs(payload: object) -> list[tuple[str, int, Asset]]:
-    """Every input asset with its STABLE IDENTITY: `(input_id, order, asset)`.
+def asset_inputs(payload: object) -> list[tuple[str, int, Asset, AssetBound | None]]:
+    """Every input asset with its identity, order, and concrete typed-field bound.
 
     `input_id` is the payload FIELD PATH with the list index included, which is
     worker-protocol/01's rule stated in code: inputs are identified, ORDERED subjects and
@@ -407,45 +407,47 @@ def asset_inputs(payload: object) -> list[tuple[str, int, Asset]]:
     which is a question about identity and must collect a repeat, while this one answers
     "which grant entry fills this field", which is a question about position.
     """
-    found: list[tuple[str, int, Asset]] = []
+    found: list[tuple[str, int, Asset, AssetBound | None]] = []
 
-    def walk_value(value: object, path: str, order: int, seen: set[int]) -> None:
+    def walk_value(
+        value: object,
+        path: str,
+        order: int,
+        seen: set[int],
+        bound: AssetBound | None,
+    ) -> None:
         if isinstance(value, Asset):
-            found.append((path, order, value))
+            found.append((path, order, value, bound))
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
         seen.add(id(value))
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                walk_value(item, f"{path}.{index}" if path else str(index), index, seen)
+                walk_value(item, f"{path}.{index}" if path else str(index), index, seen, bound)
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk_value(item, f"{path}.{key}" if path else str(key), 0, seen)
+                walk_value(item, f"{path}.{key}" if path else str(key), 0, seen, bound)
             return
+        annotations: dict[str, object] = {}
+        if isinstance(value, msgspec.Struct):
+            annotations = {field.name: field.type for field in msgspec.structs.fields(type(value))}
+        elif is_dataclass(value) and not isinstance(value, type):
+            annotations = get_type_hints(type(value), include_extras=True)
         for name, member in field_values(value).items():
-            walk_value(member, f"{path}.{name}" if path else name, 0, seen)
+            _base, markers = strip(annotations.get(name, object))
+            declared = next((m for m in markers if isinstance(m, AssetBound)), None)
+            walk_value(
+                member,
+                f"{path}.{name}" if path else name,
+                0,
+                seen,
+                declared if declared is not None else bound,
+            )
 
-    walk_value(payload, "", 0, set())
+    walk_value(payload, "", 0, set(), None)
     return found
-
-
-def asset_bounds(payload_type: object) -> dict[str, AssetBound]:
-    """field path (no index) -> the `AssetBound` annotating it. Describe-time knowledge."""
-    out: dict[str, AssetBound] = {}
-    for node in walk(payload_type):
-        if not _reaches(node.annotation, Asset):
-            continue
-        bound = node.marker(AssetBound)
-        if isinstance(bound, AssetBound):
-            out[node.path] = bound
-    return out
-
-
-def _unindexed(input_id: str) -> str:
-    """`refs.2.clip` -> `refs.clip`: a bound annotates the FIELD, not an element."""
-    return ".".join(part for part in input_id.split(".") if not part.isdigit())
 
 
 def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, cap: int) -> None:
@@ -464,12 +466,14 @@ def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, 
             "from the BYTES, not from the declaration: a mislabelled upload refuses at the "
             "field rather than inside a decoder this endpoint never agreed to run",
             code="asset_media_type",
+            fields=[granted.input_id],
         )
     if bound is not None and bound.media_types and granted.media_type not in bound.media_types:
         raise InvalidRequest(
             f"input {granted.input_id!r} is {granted.media_type!r} and this field declares "
             f"{list(bound.media_types)}",
             code="asset_media_type",
+            fields=[granted.input_id],
         )
     limit = min(bound.max_bytes, cap) if bound is not None and bound.max_bytes else cap
     if limit and granted.length > limit:
@@ -478,6 +482,7 @@ def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, 
             f"{limit} B. A size bound is a TYPED property of the field, so it refuses "
             "before the handler is entered and not inside it",
             code="asset_too_large",
+            fields=[granted.input_id],
         )
 
 
@@ -495,8 +500,7 @@ def _hydrate(payload: object, inv: Invocation) -> None:
     _materialize_trees(payload, inv)
     if not declares_assets(type(payload)):
         return
-    bounds = asset_bounds(type(payload))
-    for input_id, _order, asset in asset_inputs(payload):
+    for input_id, _order, asset, bound in asset_inputs(payload):
         granted = inv.assets.get(input_id)
         if granted is None:
             raise InvalidRequest(
@@ -505,8 +509,8 @@ def _hydrate(payload: object, inv: Invocation) -> None:
                 "asset is a digest-verified READ CAPABILITY minted by the coordinator, "
                 "never a location a request may name",
                 code="asset_ungranted",
+                fields=[input_id],
             )
-        bound = bounds.get(_unindexed(input_id))
         _check_input(asset, granted, bound, inv.max_input_bytes)
         bind(
             asset,

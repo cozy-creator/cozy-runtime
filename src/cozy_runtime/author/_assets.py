@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, get_args
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
 
@@ -106,6 +106,25 @@ class VideoAsset(Asset):
 
 class FileAsset(Asset):
     kind: ClassVar[str] = "file"
+
+
+def asset_kinds(annotation: object) -> frozenset[str]:
+    """Asset kinds reached through containers/unions, stopping at nested records.
+
+    A bound on ``list[ImageAsset]`` belongs to that field. A bound on
+    ``list[SomeReference]`` does not: the concrete reference record owns the bound on its
+    own asset field. Stopping at records keeps tagged-union reference schemas from growing
+    a second, lossy path-based authority over their leaf fields.
+    """
+    from cozy_runtime.author._walker import strip, unwrap_optional
+
+    base, _ = strip(annotation)
+    base, _ = unwrap_optional(base)
+    if isinstance(base, type):
+        if issubclass(base, Asset):
+            return frozenset({base.kind})
+        return frozenset()
+    return frozenset(kind for argument in get_args(base) for kind in asset_kinds(argument))
 
 
 class Tree:

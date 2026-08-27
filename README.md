@@ -146,6 +146,10 @@ fresh endpoint is `--check`-clean out of the box.
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
 
+An endpoint whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
+`describe` refuses the release if PyAV is absent. The descriptor publishes the hard per-field
+codec ceilings and the attempt-wide retained decoded-value ceiling.
+
 Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
 real CAS, so they are BUILDER-RUN and never CI steps):
 

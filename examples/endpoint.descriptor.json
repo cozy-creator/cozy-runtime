@@ -756,6 +756,9 @@
       "service": "Egress"
     },
     "media_decode": {
+      "limits": {
+        "max_attempt_decoded_bytes": 2147483648
+      },
       "members": [
         "decode_audio",
         "decode_image",
@@ -802,5 +805,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:40572caa9a1d88c229b4137a913317ab2b94dd392f3fa83914826d7022a5d28f"
+  "surface_digest": "sha256:ef2515e83c400c99a92ab2c539c036bf8b062bf07051333341c84751428238a8"
 }

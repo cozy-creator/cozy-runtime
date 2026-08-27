@@ -134,7 +134,9 @@ class AssetBound:
       conformance error, because widening a kind would promise a decoder nothing has.
     * `max_decoded_bytes` — the largest immutable RGB8 + float32 PCM value this field may
       expand to. It is bound into the hydrated asset by the runtime and can only narrow the
-      runtime's hard frame/pixel/channel/sample ceilings. Request data cannot set it.
+      runtime's hard frame/pixel/channel/sample ceilings. It accounts for the value retained
+      and returned to the handler, not codec working memory or peak process RSS. Request data
+      cannot set it.
 
     COUNT bounds are not here on purpose: `Annotated[list[ImageAsset], Meta(max_length=9)]`
     is msgspec's own, it is already in the descriptor's constraint vocabulary, and a second

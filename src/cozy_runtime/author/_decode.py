@@ -16,7 +16,7 @@ from fractions import Fraction
 from typing import Any, Literal, Protocol, TypeVar
 
 from cozy_runtime.author._assets import AudioAsset, ImageAsset, VideoAsset
-from cozy_runtime.author._errors import CapabilityError, InvalidRequest
+from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidRequest, RuntimeFailure
 
 
 class _Attempt(Protocol):
@@ -27,7 +27,12 @@ class _Attempt(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DecodeLimits:
-    """Runtime codec-safety ceilings. A field's decoded-byte bound can only lower these."""
+    """Runtime codec ceilings. A field's retained-value bound can only lower these.
+
+    ``max_decoded_bytes`` accounts for the immutable RGB8/float32 values returned to the
+    handler. It is not a claim about peak process RSS: encoded input, codec working memory,
+    and transient conversion buffers remain implementation memory.
+    """
 
     max_decoded_bytes: int
     max_pixels_per_frame: int
@@ -68,6 +73,10 @@ class MediaDecodeError(InvalidRequest):
     default_code = "media_decode"
 
 
+class MediaMaterializationError(RuntimeFailure):
+    default_code = "media_materialization"
+
+
 @dataclass(frozen=True, slots=True)
 class DecodedImage:
     width: int
@@ -77,7 +86,12 @@ class DecodedImage:
 
 @dataclass(frozen=True, slots=True)
 class DecodedAudio:
-    """One little-endian float32 byte string per channel, on the native sample clock."""
+    """Planar native-clock PCM on the container's presentation timeline.
+
+    ``start_time`` and a containing :class:`DecodedVideo`'s ``start_time`` share that
+    timeline, so an endpoint can preserve their exact A/V offset instead of assuming both
+    streams begin at zero.
+    """
 
     channels: int
     sample_count: int
@@ -85,6 +99,7 @@ class DecodedAudio:
     channel_layout: str
     channel_names: tuple[str, ...]
     pcm_f32le: tuple[bytes, ...]
+    start_time: Fraction
 
     @property
     def duration(self) -> Fraction:
@@ -102,9 +117,12 @@ class DecodedVideo:
     frame_pts: tuple[int, ...]
     frame_durations: tuple[int, ...]
     time_base: Fraction
-    average_rate: Fraction
     pixel_aspect_ratio: Fraction
     soundtrack: DecodedAudio | None
+
+    @property
+    def start_time(self) -> Fraction:
+        return self.frame_pts[0] * self.time_base
 
     @property
     def duration(self) -> Fraction:
@@ -120,7 +138,7 @@ class _Budget:
     def claim(self, size: int, what: str) -> None:
         if size < 0 or self.used + size > self.limit:
             raise MediaDecodeError(
-                f"decoded {what} would cross the {self.limit}-byte expansion limit",
+                f"retained decoded {what} would cross the {self.limit}-byte value limit",
                 code="decoded_bytes_limit",
             )
         if self.parent is not None:
@@ -137,7 +155,9 @@ class _AudioAccumulator:
         self._budget = budget
         self._resampler: Any | None = None
         self._channels: list[io.BytesIO] = []
-        self._last_time: Fraction | None = None
+        self._last_presentation_time: Fraction | None = None
+        self._time_base: Fraction | None = None
+        self.start_time: Fraction | None = None
         self.channels = 0
         self.sample_rate = 0
         self.channel_layout = ""
@@ -199,16 +219,34 @@ class _AudioAccumulator:
                 "audio format changes between decoded frames", code="audio_format_change"
             )
 
+        valid_samples = _valid_audio_samples(frame, samples, self.sample_rate)
         if frame.pts is None or frame.time_base is None:
             raise MediaDecodeError("audio frame has no exact presentation time", code="media_clock")
-        presentation_time = _fraction(frame.pts, "audio frame PTS") * _positive_fraction(
-            frame.time_base, "audio frame time base"
-        )
-        if self._last_time is not None and presentation_time <= self._last_time:
+        time_base = _positive_fraction(frame.time_base, "audio frame time base")
+        presentation_time = _fraction(frame.pts, "audio frame PTS") * time_base
+        if self._time_base is None:
+            self._time_base = time_base
+        elif time_base != self._time_base:
+            raise MediaDecodeError("audio time base changes between frames", code="media_clock")
+        if (
+            self._last_presentation_time is not None
+            and presentation_time <= self._last_presentation_time
+        ):
             raise MediaDecodeError("audio PTS is not strictly monotone", code="media_clock")
-        self._last_time = presentation_time
-
-        valid_samples = _valid_audio_samples(frame, samples, self.sample_rate)
+        if self.start_time is None:
+            self.start_time = presentation_time
+        else:
+            expected = self.start_time + Fraction(self.sample_count, self.sample_rate)
+            # Coarse clocks such as WebM milliseconds round sample-exact Opus starts. Half
+            # one declared tick is the entire rounding allowance; a real gap or overlap is
+            # never compacted into the returned PCM.
+            if abs(presentation_time - expected) > time_base / 2:
+                raise MediaDecodeError(
+                    f"audio presentation is discontinuous: expected {expected}, got "
+                    f"{presentation_time}",
+                    code="audio_discontinuity",
+                )
+        self._last_presentation_time = presentation_time
         if self.sample_count + valid_samples > self._limits.max_audio_samples:
             raise MediaDecodeError(
                 f"audio crosses the {self._limits.max_audio_samples}-sample limit",
@@ -250,7 +288,7 @@ class _AudioAccumulator:
         self.sample_count += valid_samples
 
     def finish(self) -> DecodedAudio:
-        if self.sample_count == 0 or self._resampler is None:
+        if self.sample_count == 0 or self._resampler is None or self.start_time is None:
             raise MediaDecodeError("audio stream decoded no samples", code="media_empty")
         if self._resampler.resample(None):
             raise MediaDecodeError(
@@ -263,6 +301,7 @@ class _AudioAccumulator:
             channel_layout=self.channel_layout,
             channel_names=self.channel_names,
             pcm_f32le=tuple(channel.getvalue() for channel in self._channels),
+            start_time=self.start_time,
         )
 
 
@@ -279,7 +318,6 @@ class _VideoAccumulator:
         self.width = 0
         self.height = 0
         self.time_base: Fraction | None = None
-        self.average_rate = _positive_fraction(stream.average_rate, "video average rate")
         ratio = stream.sample_aspect_ratio
         self.pixel_aspect_ratio = (
             _positive_fraction(ratio, "video pixel aspect ratio")
@@ -302,7 +340,7 @@ class _VideoAccumulator:
             )
         if declared and width and height and declared * width * height * 3 > budget.limit:
             raise MediaDecodeError(
-                "video metadata exceeds the decoded-byte expansion limit",
+                "video metadata exceeds the retained decoded-value limit",
                 code="decoded_bytes_limit",
             )
 
@@ -368,7 +406,6 @@ class _VideoAccumulator:
             frame_pts=tuple(self.frame_pts),
             frame_durations=tuple(self.frame_durations),
             time_base=self.time_base,
-            average_rate=self.average_rate,
             pixel_aspect_ratio=self.pixel_aspect_ratio,
             soundtrack=soundtrack,
         )
@@ -530,7 +567,17 @@ class MediaDecoder:
             min(asset._max_decoded_bytes, self._limits.max_decoded_bytes),
             parent=self._budget,
         )
-        return av, budget, asset.read_bytes()
+        try:
+            data = asset.read_bytes()
+        except AuthorError as exc:
+            _attribute(exc, asset)
+            raise
+        except OSError as exc:
+            raise MediaMaterializationError(
+                f"verified input bytes could not be read: {_safe_error(exc)}",
+                fields=[asset._input_id] if asset._input_id else (),
+            ) from exc
+        return av, budget, data
 
 
 def _av() -> Any:
@@ -539,6 +586,11 @@ def _av() -> Any:
     except ImportError as exc:
         raise DecoderUnavailable("media decode requires cozy-runtime[media] (PyAV)") from exc
     return av
+
+
+def require_decoder_dependency() -> None:
+    """Build-time closure check for a surface that declares ``MediaDecoder``."""
+    _av()
 
 
 def _decode_image_frame(
@@ -790,6 +842,6 @@ def _safe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
-def _attribute(exc: MediaDecodeError, asset: ImageAsset | AudioAsset | VideoAsset) -> None:
+def _attribute(exc: AuthorError, asset: ImageAsset | AudioAsset | VideoAsset) -> None:
     if not exc.fields and asset._input_id:
         exc.fields = (asset._input_id,)

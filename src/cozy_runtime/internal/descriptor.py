@@ -251,7 +251,14 @@ def _services() -> dict[str, Json]:
             for name, value in vars(service).items()
             if not name.startswith("_") and callable(value)
         )
-        out[capability] = {"service": service.__name__, "members": members}
+        document: dict[str, Json] = {"service": service.__name__, "members": members}
+        if capability == "media_decode":
+            from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
+
+            document["limits"] = {
+                "max_attempt_decoded_bytes": DEFAULT_DECODE_LIMITS.max_decoded_bytes,
+            }
+        out[capability] = document
     return out
 
 
