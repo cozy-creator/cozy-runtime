@@ -96,27 +96,16 @@ def hold(payload: HoldInput, ctx: Context) -> HoldOutput:
 ENDPOINT_TOML = '[application]\nobject = "lifecycle_endpoint:app"\n'
 
 
-def stage_weightless(home: Path, project: Path, entrypoints: tuple[str, ...]) -> dict[str, str]:
-    """A weightless binding-plan record carries the four REQUIRED keys and NO model keys
-    (plan.MODEL_KEYS — all or none, cl-013)."""
+def stage_weightless(home: Path, project: Path) -> Any:
+    """Stage this fixture through the production local weightless constructor."""
+    from cozy_runtime.internal import descriptor, local
+    from cozy_runtime.internal.discovery import discover
+
     project.mkdir(parents=True, exist_ok=True)
     (project / "lifecycle_endpoint.py").write_text(ENDPOINT_SOURCE)
     (project / "endpoint.toml").write_text(ENDPOINT_TOML)
-    (home / "binding-plans").mkdir(parents=True, exist_ok=True)
-    ids: dict[str, str] = {}
-    for entrypoint in entrypoints:
-        plan_id = wl.plan_id_for(entrypoint, RELEASE)
-        record = {
-            "entrypoint_binding_plan_id": plan_id,
-            "project": str(project),
-            "release": RELEASE,
-            "entrypoint": entrypoint,
-        }
-        (home / "binding-plans" / f"{plan_id.split(':')[1]}.json").write_text(
-            json.dumps(record, indent=2)
-        )
-        ids[entrypoint] = plan_id
-    return ids
+    found = discover(project)
+    return local.stage_weightless_release(home, descriptor.document(descriptor.build(found)))
 
 
 def start_weightless(
@@ -149,7 +138,8 @@ def start_weightless(
         shutil.rmtree(tmp, ignore_errors=True)
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    ids = stage_weightless(home, project, ("tick", "hold"))
+    staged = stage_weightless(home, project)
+    ids = dict(staged.plans)
     socket_path = str(tmp / f"control-{len(os.listdir(tmp))}.sock")
     hub = hub or wl.Hub()
     hub.directive = wl.serving_directive(
@@ -179,11 +169,13 @@ def start_weightless(
         f"unix:{socket_path}",
         "--root",
         str(root),
-        "--project",
-        str(project),
         *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
         RELEASE,
+        "--artifact-store",
+        str(staged.artifact_store),
+        "--artifact-object-set",
+        str(staged.artifact_object_set),
         "--grace",
         "3.0",
         "--no-warm",
@@ -198,6 +190,7 @@ def start_weightless(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
+        cwd=project,
         bufsize=0,
         preexec_fn=plant_disk_full if rlimit_fsize else None,
     )
@@ -813,8 +806,8 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
     successor = wl.Hub()
     successor.process, successor.log = worker.process, worker.log
     successor.directive = wl.serving_directive(
-        RELEASE,
-        [ids["tick"]],
+        RELEASE + "-replacement",
+        sorted(ids.values()),
         pb.Posture.POSTURE_ACCEPTING,
         worker.home / "binding-plans",
         revision=2,
@@ -836,7 +829,8 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
         old.ready(ids["tick"], args.observe * 4)
         old_generation = old.generation
 
-        # The changed binding set forces a fresh executor. Its real endpoint import records
+        # The changed release identity forces a fresh executor while retaining the complete
+        # visible-entrypoint plan set the canonical reader requires. Its real import records
         # that it entered, then waits for the harness to release it; the worker is therefore
         # blocked inside the actual prepare RPC, halfway through revision-2 convergence.
         gate = (
@@ -908,8 +902,8 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
 
 
 def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
-    """cr-024: exact set reuse, changed set replacement, then empty-set retirement."""
-    wl.head("16. executor generations: reuse exact, replace changed, retire empty")
+    """cr-024: exact release reuse, changed release replacement, then retirement."""
+    wl.head("16. executor generations: reuse exact, replace changed release, retire empty")
     tmp = Path(base + "-generation")
     worker, ids = start_weightless(tmp, instance_id="ins-generation", fresh=True)
     hub = worker.hub
@@ -938,8 +932,8 @@ def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
 
         since = hub.mark()
         changed = wl.serving_directive(
-            RELEASE,
-            [ids["tick"]],
+            RELEASE + "-replacement",
+            sorted(ids.values()),
             pb.Posture.POSTURE_ACCEPTING,
             worker.home / "binding-plans",
             revision=3,
@@ -949,7 +943,7 @@ def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
         changed_pid = executor_pid_of(worker, args.observe)
         changed_generation = hub.deployment(changed_report).executor_generation
         wl.check(
-            "a changed binding set publishes one successor only after the old PID is gone",
+            "a changed release publishes one successor only after the old PID is gone",
             changed_pid != first_pid
             and changed_generation == first_generation + 1
             and pid_gone(first_pid, args.observe, "replaced executor"),
@@ -1007,7 +1001,7 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True)
     root.mkdir(parents=True)
-    stage_weightless(home, project, ("tick",))
+    stage_weightless(home, project)
     detached_file = tmp / "detached.pid"
     endpoint = project / "lifecycle_endpoint.py"
     endpoint.write_text(

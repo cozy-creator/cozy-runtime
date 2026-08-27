@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, provisioned
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
@@ -73,6 +73,16 @@ GRANT_TAIL_SECONDS = 300
 
 class LocalBindingError(Exception):
     """The request names an entrypoint this run staged no binding plan for."""
+
+
+@dataclass(frozen=True, slots=True)
+class StagedWeightlessRelease:
+    """The complete local form of one canonical, model-free serving closure."""
+
+    plans: Mapping[str, str]
+    plan_refs: Mapping[str, tuple[str, int]]
+    artifact_store: Path
+    artifact_object_set: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -776,6 +786,112 @@ class LocalRecordOwner:
 # --------------------------------------------------------------------------- the runner
 
 
+def stage_weightless_release(
+    cozy_home: Path, endpoint_descriptor: Mapping[str, Any]
+) -> StagedWeightlessRelease:
+    """Stage the ONE canonical local closure for a wholly weightless release.
+
+    Tensorhub authors these exact Plan and grouped-root documents for a provisioned model
+    release. A local weightless run has no model root and nothing to fetch, but it still
+    owes the worker the same stored-byte identities and complete visible-entrypoint set.
+    This constructor is shared by the one-shot runner and process-launch acceptance paths;
+    neither may revive the retired flat binding record.
+    """
+
+    entries = endpoint_descriptor.get("entrypoints")
+    if not isinstance(entries, list):
+        raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
+    visible: list[Mapping[str, Any]] = [
+        entry
+        for entry in entries
+        if isinstance(entry, Mapping)
+        and entry.get("kind") == "entrypoint"
+        and entry.get("hidden") is False
+    ]
+    if not visible:
+        raise RuntimeError("a local serving closure requires at least one visible entrypoint")
+    modeled = sorted(str(entry.get("name", "")) for entry in visible if entry.get("models"))
+    if modeled:
+        raise RuntimeError(
+            "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
+        )
+
+    home = cozy_home.resolve()
+    documents_root = home / "binding-documents"
+    plans_root = home / "binding-plans"
+    object_sets_root = home / "artifact-object-sets"
+    artifact_store = home / "store"
+    artifact_store.mkdir(parents=True, exist_ok=True)
+
+    descriptor_bytes = canonical.write(dict(endpoint_descriptor))
+    descriptor_ref, _ = _stage_exact(documents_root, descriptor_bytes)
+    plans: dict[str, str] = {}
+    plan_refs: dict[str, tuple[str, int]] = {}
+    plan_documents: dict[str, provisioned.ExactDocument] = {}
+    object_refs: list[dict[str, Any]] = []
+    for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
+        entrypoint = str(entry.get("name", ""))
+        plan_bytes = canonical.write(
+            {
+                "bindings": [],
+                "descriptor": descriptor_ref,
+                "entrypoint": entrypoint,
+                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+            }
+        )
+        plan_ref, plan_path = _stage_exact(plans_root, plan_bytes)
+        plan_id = str(plan_ref["digest"])
+        length = int(plan_ref["length"])
+        plans[entrypoint] = plan_id
+        plan_refs[plan_id] = (plan_id, length)
+        object_refs.append(plan_ref)
+        plan_documents[plan_id] = provisioned.ExactDocument(
+            provisioned.ArtifactRef(plan_id, length), plan_path, plan_bytes
+        )
+
+    object_set_bytes = canonical.write(
+        {
+            "kind": provisioned.ARTIFACT_OBJECT_SET_KIND,
+            "roots": [
+                {
+                    "objects": sorted(object_refs, key=lambda row: str(row["digest"])),
+                    "role": "endpoint",
+                    "root": descriptor_ref,
+                }
+            ],
+        }
+    )
+    _, artifact_object_set = _stage_exact(object_sets_root, object_set_bytes)
+
+    # Exercise the same closed reader the worker will use after its process boundary. This
+    # proves the local writer produced no private dialect before a caller tries to launch it.
+    selected = provisioned.read_provisioned_release(
+        plan_documents,
+        read_document=provisioned.staged_document_reader(documents_root),
+        endpoint_release="local-weightless",
+        store_root=artifact_store,
+        object_set=provisioned.read_artifact_object_set(object_set_bytes),
+        dtype_widths={},
+    )
+    if set(selected.bindings) != set(plan_refs):
+        raise RuntimeError("the staged local binding set did not survive canonical validation")
+    return StagedWeightlessRelease(plans, plan_refs, artifact_store, artifact_object_set)
+
+
+def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    ref: dict[str, Any] = {"digest": digest, "length": len(raw)}
+    root.mkdir(parents=True, exist_ok=True)
+    path = (root / f"{digest.removeprefix('sha256:')}.json").resolve()
+    try:
+        with path.open("xb") as handle:
+            handle.write(raw)
+    except FileExistsError:
+        if path.read_bytes() != raw:
+            raise RuntimeError(f"content-addressed local document changed at {path}") from None
+    return ref, path
+
+
 def _declared_media_type(path: Path) -> str:
     """What the RecordOwner declares one input to be (cr-012).
 
@@ -812,10 +928,11 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
 def run_slice(
     config: RuntimeConfig,
     request: LocalRequest,
-    binding_records: list[dict[str, Any]],
+    binding_records: list[dict[str, Any]] | None = None,
     *,
     workspace: Path,
     release_id: str,
+    endpoint_descriptor: Mapping[str, Any] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
@@ -835,11 +952,28 @@ def run_slice(
         )
     plans: dict[str, str] = {}
     plan_refs: dict[str, tuple[str, int]] = {}
+    staged: StagedWeightlessRelease | None = None
+    if endpoint_descriptor is not None:
+        if request.kind != "entrypoint":
+            raise RuntimeError("only a serving run accepts an endpoint binding closure")
+        staged = stage_weightless_release(config.cozy_home, endpoint_descriptor)
+        plans.update(staged.plans)
+        plan_refs.update(staged.plan_refs)
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
         request, plans, plan_refs, workspace, release_id=release_id, auto_ack=auto_ack
     )
     options = options or WorkerOptions(root=workspace / "worker")
+    if staged is not None:
+        if options.artifact_store not in (None, staged.artifact_store):
+            raise RuntimeError("local closure and worker name different artifact stores")
+        if options.artifact_object_set not in (None, staged.artifact_object_set):
+            raise RuntimeError("local closure and worker name different artifact object sets")
+        options = dataclasses.replace(
+            options,
+            artifact_store=staged.artifact_store,
+            artifact_object_set=staged.artifact_object_set,
+        )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
     worker = Worker(config, options, record_owner.host)

@@ -255,10 +255,10 @@ def run(
         outcome = run_slice(
             config,
             request,
-            [],
             job_records=job_records,
             workspace=workspace,
             release_id=release_id,
+            endpoint_descriptor=desc.document(body) if kind == "entrypoint" else None,
             options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
