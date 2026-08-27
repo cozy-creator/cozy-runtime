@@ -14,8 +14,8 @@ nobody could reconcile against the other one.
 Cancellation is cooperative then forceful and the WORKER owns both clocks: the grace
 budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
 `CancelAttempt.grace_ms`, and never an author knob. Writable cgroup v2 remains the kernel
-boundary; a strictly proven read-only-cgroup container uses the narrower first-party
-process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
+boundary; a strictly proven credential-unwritable cgroup-v1 container uses the narrower
+first-party process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
 """
 
 from __future__ import annotations

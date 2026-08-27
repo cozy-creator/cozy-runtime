@@ -16,7 +16,7 @@ Order matters and is the point:
    and (2) the parent could have died, and pdeathsig only fires on future deaths. The
    re-check is what closes that race.
 3. **containment** — join the worker-created cgroup-v2 scope, or prove the exact inherited
-   process-tree token in a strict read-only-cgroup container.
+   process-tree token in a credential-unwritable cgroup-v1 container.
 4. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
 5. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable

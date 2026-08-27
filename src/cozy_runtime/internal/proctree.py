@@ -79,13 +79,11 @@ class ProcessTreeScope:
     """One first-party executor family in a positively proven container.
 
     ``token`` is non-secret process identity.  It is one complete inherited environment
-    entry, never a substring marker.  This scope is weaker than a cgroup: deliberately
-    scrubbing the token and escaping both ancestry and process group can evade it, while a
-    same-UID process can deliberately replay it and be treated as owned.  It is lifecycle
-    containment for our own executor, not a hostile-code sandbox. A process that
-    deliberately scrubs the token and escapes both ancestry and process group before a
-    census can evade recovery. Unlike cgroup v2, this scope provides no resource control
-    and its repeated SIGSTOP census is convergent rather than kernel-atomic.
+    entry, never a substring marker. This is lifecycle containment for our own executor,
+    not a hostile-code sandbox: code can evade it by scrubbing the token and escaping both
+    ancestry and process group, or cause collateral by replaying the token. Unlike cgroup
+    v2, it provides no resource control and its repeated SIGSTOP census is convergent rather
+    than kernel-atomic.
     """
 
     token: str
