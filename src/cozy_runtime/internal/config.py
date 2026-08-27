@@ -111,7 +111,6 @@ class AdapterConfig:
     receipt_payload_path: Path
     worker_internal_port: int
     media_internal_port: int
-    provider_pod_id: str
     renter_token_sha256: tuple[str, ...]
     readiness_deadline_unix: int
     child_base_env: tuple[tuple[str, str], ...]
@@ -128,7 +127,6 @@ ADAPTER_ENV = {
     "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH",
     "COZY_ADAPTER_WORKER_INTERNAL_PORT",
     "COZY_ADAPTER_MEDIA_INTERNAL_PORT",
-    "COZY_ADAPTER_PROVIDER_POD_ID",
     "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON",
     "COZY_ADAPTER_READINESS_DEADLINE_UNIX",
 }
@@ -327,11 +325,6 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
     media_port = decimal("COZY_ADAPTER_MEDIA_INTERNAL_PORT", 65535)
     if worker_port == media_port:
         raise ConfigError("adapter_config", "worker and media ports are equal", "fix bootstrap")
-    provider_pod_id = required("COZY_ADAPTER_PROVIDER_POD_ID")
-    if provider_pod_id.strip() != provider_pod_id or len(provider_pod_id) > 256:
-        raise ConfigError(
-            "adapter_config", "provider pod id is not one bounded id", "fix bootstrap"
-        )
     parsed = AdapterConfig(
         provision_spec_path=path("COZY_ADAPTER_PROVISION_SPEC_PATH"),
         provision_spec_digest=digest("COZY_ADAPTER_PROVISION_SPEC_DIGEST"),
@@ -343,7 +336,6 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         receipt_payload_path=path("COZY_ADAPTER_RECEIPT_PAYLOAD_PATH"),
         worker_internal_port=worker_port,
         media_internal_port=media_port,
-        provider_pod_id=provider_pod_id,
         renter_token_sha256=tuple(str(item) for item in token_hashes),
         readiness_deadline_unix=decimal("COZY_ADAPTER_READINESS_DEADLINE_UNIX", (1 << 53) - 1),
         child_base_env=tuple(

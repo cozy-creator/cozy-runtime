@@ -41,6 +41,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal.readiness import WORKER_TLS_SERVER_NAME
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
@@ -67,7 +69,7 @@ TOKEN = "tok-" + os.urandom(16).hex()
 
 
 def mint_cert(tmp: Path) -> tuple[Path, Path]:
-    """A self-signed cert for 127.0.0.1 — exactly what a pod mints at provision."""
+    """The provider-neutral worker certificate: one fixed DNS SAN, pinned by the owner."""
     cert, key = tmp / "worker.crt", tmp / "worker.key"
     subprocess.run(
         [
@@ -86,7 +88,7 @@ def mint_cert(tmp: Path) -> tuple[Path, Path]:
             "-subj",
             "/CN=cozy-worker",
             "-addext",
-            "subjectAltName=IP:127.0.0.1,DNS:localhost",
+            f"subjectAltName=DNS:{WORKER_TLS_SERVER_NAME}",
         ],
         check=True,
         capture_output=True,

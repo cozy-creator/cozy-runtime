@@ -37,7 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchRefusal("adapter_arguments_forbidden", "fixed adapter takes no arguments")
         config = read_adapter_config()
         boot_id = readiness.pod_boot_id(config.pod_boot_id_path)
-        certificate_der, certificate_ip = readiness.certificate(config.tls_cert_path)
+        certificate_der = readiness.certificate(config.tls_cert_path)
         gpus = readiness.runtime_gpus(
             config.child_base_env, deadline=config.readiness_deadline_unix
         )
@@ -57,20 +57,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         readiness.prove_worker_foreign_refusal(
             config.worker_internal_port,
             certificate_pem,
-            certificate_ip,
             deadline=config.readiness_deadline_unix,
         )
         readiness.prove_media_foreign_refusal(
             config.media_internal_port,
             certificate_der,
-            certificate_ip,
             deadline=config.readiness_deadline_unix,
         )
         payload = readiness.receipt_payload(
             spec=prepared.spec,
             provision_spec_digest=config.provision_spec_digest,
             provision_bundle_digest=config.provision_bundle_digest,
-            provider_pod_id=config.provider_pod_id,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
             installed_receipt_digest=prepared.installed.receipt_digest,
@@ -153,7 +150,7 @@ def _start_worker(
         "--out",
         str(WORKER_ROOT),
         "--worker-id",
-        config.provider_pod_id,
+        str(prepared.spec["acquisition_attempt_id"]),
         "--instance-id",
         boot_id,
         "--release-id",

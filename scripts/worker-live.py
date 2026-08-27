@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
+from cozy_runtime.internal.readiness import WORKER_TLS_SERVER_NAME  # noqa: E402
 from cozy_runtime.protocol import (  # noqa: E402
     SCHEMA_DIGEST,
     SCHEMA_DIGEST_RAW,
@@ -255,7 +256,14 @@ class Hub:
 
     def _dial(self, addr: str) -> Any:
         if self.root_cert is not None:
-            return grpc.secure_channel(addr, grpc.ssl_channel_credentials(self.root_cert))
+            return grpc.secure_channel(
+                addr,
+                grpc.ssl_channel_credentials(self.root_cert),
+                options=(
+                    ("grpc.ssl_target_name_override", WORKER_TLS_SERVER_NAME),
+                    ("grpc.default_authority", WORKER_TLS_SERVER_NAME),
+                ),
+            )
         return grpc.insecure_channel(addr)
 
     def _outbound_iter(self, outbound: queue.Queue[pb.RecordOwnerFrame | None]) -> Any:
