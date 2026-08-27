@@ -40,7 +40,7 @@ class ExactDocument:
 
 
 @dataclass(frozen=True, slots=True)
-class ObjectRoot:
+class ModelRoot:
     root: ArtifactRef
     objects: tuple[ArtifactRef, ...]
 
@@ -49,7 +49,7 @@ class ObjectRoot:
 class ArtifactObjectSet:
     """The complete delivered model-root closure; empty for a weightless endpoint."""
 
-    roots: tuple[ObjectRoot, ...]
+    roots: tuple[ModelRoot, ...]
 
     @property
     def refs(self) -> Mapping[str, int]:
@@ -95,7 +95,7 @@ def read_artifact_object_set(raw: bytes) -> ArtifactObjectSet:
     rows = document["roots"]
     if not isinstance(rows, list):
         raise PlanRefusal("artifact_object_set_invalid", "roots is not an array")
-    roots: list[ObjectRoot] = []
+    roots: list[ModelRoot] = []
     prior_root = ""
     for index, row in enumerate(rows):
         _closed_keys(row, {"objects", "root"}, f"artifact_object_set.roots[{index}]")
@@ -119,7 +119,7 @@ def read_artifact_object_set(raw: bytes) -> ArtifactObjectSet:
                 )
             prior_object = ref.digest
             objects.append(ref)
-        roots.append(ObjectRoot(root, tuple(objects)))
+        roots.append(ModelRoot(root, tuple(objects)))
         prior_root = root.digest
     result = ArtifactObjectSet(tuple(roots))
     _ = result.refs  # prove cross-root length consistency once
