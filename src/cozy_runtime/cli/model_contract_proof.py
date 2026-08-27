@@ -444,10 +444,7 @@ def _child_entry(args: Sequence[str]) -> int:
         request_path = _existing_file(args[0], "request")
         request = _read_request(request_path)
         _verify_installed_generation(request)
-        descriptor_bytes = _read_exact(request.endpoint_descriptor, "endpoint_descriptor")
-        descriptor_doc = endpoint_descriptor.read_bytes(
-            descriptor_bytes, str(request.endpoint_descriptor.path)
-        )
+        descriptor_doc = _read_descriptor(request.endpoint_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:
             raise ProofRefusal("model_contract_descriptor_invalid", "application is absent")
@@ -655,6 +652,19 @@ def _read_exact(ref: LocalDocumentRef, name: str) -> bytes:
             f"{name} at {ref.path} does not match {ref.digest}/{ref.length}",
         )
     return raw
+
+
+def _read_descriptor(ref: LocalDocumentRef) -> dict[str, Any]:
+    """Read a review projection, then verify its semantic canonical ref."""
+    raw = _document_bytes(ref.path, "endpoint_descriptor")
+    document = endpoint_descriptor.read_bytes(raw, str(ref.path))
+    semantic = endpoint_descriptor.canonical_bytes(document)
+    if len(semantic) != ref.length or _sha(semantic) != ref.digest:
+        raise ProofRefusal(
+            "model_contract_input_identity_mismatch",
+            f"endpoint_descriptor at {ref.path} does not mean {ref.digest}/{ref.length}",
+        )
+    return document
 
 
 def _emit_child(value: Mapping[str, Any]) -> None:
