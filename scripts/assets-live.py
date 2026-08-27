@@ -225,7 +225,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         release_id=S.RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=S.RELEASE, no_warm=True),
         delete_journal=False,
-        coordinator_hook=hook,
+        record_owner_hook=hook,
     )
     out_path.write_text(json.dumps(dataclasses.asdict(outcome), default=str))
 

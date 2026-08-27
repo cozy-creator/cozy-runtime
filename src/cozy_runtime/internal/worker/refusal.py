@@ -126,7 +126,7 @@ class Refusal:
             return CAUSE.CAUSE_CODE_INVALID_REQUEST, ORIGIN.CAUSE_ORIGIN_CLIENT
         if self.side == READER:
             return CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE, ORIGIN.CAUSE_ORIGIN_RUNTIME
-        return CAUSE.CAUSE_CODE_LOCAL_SAFETY, ORIGIN.CAUSE_ORIGIN_SUPERVISOR
+        return CAUSE.CAUSE_CODE_LOCAL_SAFETY, ORIGIN.CAUSE_ORIGIN_WORKER
 
     def severity(self) -> str:
         """`caller_error` or `platform_fatal` - the v1 REF_ORIGIN split, kept explicit."""

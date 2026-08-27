@@ -2502,7 +2502,7 @@ class Worker:
         code: str,
         detail: str,
         cause: pb.CauseCode,
-        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> None:
         """A typed refusal is an OUTCOME: journaled before send, like any other (§7).
 

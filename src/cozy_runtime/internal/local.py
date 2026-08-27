@@ -64,7 +64,7 @@ _M = TypeVar("_M")
 #: write every granted destination, mint the receipt. The grant outlives the attempt by this
 #: and by nothing more — it is a tail, never a lifetime.
 #:
-#: The lifetime itself is DERIVED FROM THE ATTEMPT (`LocalCoordinator.expiry`). It used to be
+#: The lifetime itself is DERIVED FROM THE ATTEMPT (`LocalRecordOwner.expiry`). It used to be
 #: a 900 s constant derived from nothing, which is not a bound but a ceiling on what a job
 #: may be: job-001's dual production ran 20:15.89, landed its 99 GB artifact intact, and died
 #: `grant_expired: the output grant expired before the write`.
@@ -153,7 +153,7 @@ class SliceOutcome:
     publication_scope: str = ""
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
     #: `worker_error` (the worker reported it could not become ready), `ready_timeout`, or
-    #: `coordinator_error` (this side failed). A one-shot run that cannot say this would
+    #: `record_owner_error` (this side failed). A one-shot run that cannot say this would
     #: have to pretend a hang was a result.
     ended: str = "unstarted"
     error: str = ""
@@ -196,12 +196,12 @@ def redispatchable(body: Mapping[str, Any]) -> bool:
     cause = body.get("cause") or {}
     return (
         cause.get("code") in PRE_EXECUTION_REFUSALS
-        and cause.get("origin") == pb.CauseOrigin.CAUSE_ORIGIN_SUPERVISOR
+        and cause.get("origin") == pb.CauseOrigin.CAUSE_ORIGIN_WORKER
         and not body.get("execution_started", False)
     )
 
 
-class LocalCoordinator:
+class LocalRecordOwner:
     """The in-memory RECORDOWNER — the record-plane half of th-024, in this process.
 
     It is a real RecordOwner in every way the worker can observe: it claims first (carrying
@@ -314,7 +314,7 @@ class LocalCoordinator:
             self.done.set()
             self.host.close()
         except Exception as exc:
-            self.ended = "coordinator_error"
+            self.ended = "record_owner_error"
             self.error = f"{type(exc).__name__}: {exc}"[:400]
             print(f"[run] the owner failed: {self.error}", flush=True)
             self.done.set()
@@ -820,11 +820,11 @@ def run_slice(
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
     auto_ack: bool = True,
-    coordinator_hook: Any = None,
+    record_owner_hook: Any = None,
 ) -> SliceOutcome:
     """One request in, one typed result out, through the whole real path.
 
-    `coordinator_hook` is handed the live `LocalCoordinator` before the worker starts — that
+    `record_owner_hook` is handed the live `LocalRecordOwner` before the worker starts — that
     is how a driver injects a cancel at a chosen moment WITHOUT a plant switch inside the
     runtime (decisions #249: fault injection belongs to the harness).
     """
@@ -836,7 +836,7 @@ def run_slice(
     plans: dict[str, str] = {}
     plan_refs: dict[str, tuple[str, int]] = {}
     stage_job_plans(config.cozy_home, job_records or [])
-    coordinator = LocalCoordinator(
+    coordinator = LocalRecordOwner(
         request, plans, plan_refs, workspace, release_id=release_id, auto_ack=auto_ack
     )
     options = options or WorkerOptions(root=workspace / "worker")
@@ -844,15 +844,15 @@ def run_slice(
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
     worker = Worker(config, options, coordinator.host)
     worker.watches.tap = coordinator.tap_progress
-    if coordinator_hook is not None:
-        coordinator_hook(coordinator, worker)
+    if record_owner_hook is not None:
+        record_owner_hook(coordinator, worker)
     started = time.perf_counter()
     exit_code = worker.run()
     return _collect(coordinator, worker, started, exit_code, delete_journal)
 
 
 def _collect(
-    coordinator: LocalCoordinator,
+    coordinator: LocalRecordOwner,
     worker: Worker,
     started: float,
     exit_code: int,

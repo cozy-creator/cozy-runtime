@@ -95,10 +95,10 @@ class CauseOrigin(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CAUSE_ORIGIN_AUTHOR: _ClassVar[CauseOrigin]
     CAUSE_ORIGIN_RUNTIME: _ClassVar[CauseOrigin]
     CAUSE_ORIGIN_EXECUTOR: _ClassVar[CauseOrigin]
-    CAUSE_ORIGIN_SUPERVISOR: _ClassVar[CauseOrigin]
+    CAUSE_ORIGIN_WORKER: _ClassVar[CauseOrigin]
     CAUSE_ORIGIN_INFRA: _ClassVar[CauseOrigin]
     CAUSE_ORIGIN_CLIENT: _ClassVar[CauseOrigin]
-    CAUSE_ORIGIN_COORDINATOR: _ClassVar[CauseOrigin]
+    CAUSE_ORIGIN_RECORD_OWNER: _ClassVar[CauseOrigin]
 
 class CancelReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -225,10 +225,10 @@ CAUSE_ORIGIN_UNSPECIFIED: CauseOrigin
 CAUSE_ORIGIN_AUTHOR: CauseOrigin
 CAUSE_ORIGIN_RUNTIME: CauseOrigin
 CAUSE_ORIGIN_EXECUTOR: CauseOrigin
-CAUSE_ORIGIN_SUPERVISOR: CauseOrigin
+CAUSE_ORIGIN_WORKER: CauseOrigin
 CAUSE_ORIGIN_INFRA: CauseOrigin
 CAUSE_ORIGIN_CLIENT: CauseOrigin
-CAUSE_ORIGIN_COORDINATOR: CauseOrigin
+CAUSE_ORIGIN_RECORD_OWNER: CauseOrigin
 CANCEL_REASON_UNSPECIFIED: CancelReason
 CANCEL_REASON_CLIENT: CancelReason
 CANCEL_REASON_DRAIN: CancelReason

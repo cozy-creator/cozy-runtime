@@ -280,7 +280,7 @@ def run_job(
         options=WorkerOptions(
             root=workspace / "worker", release_id=record["build_id"], no_warm=True
         ),
-        coordinator_hook=hook,
+        record_owner_hook=hook,
     )
 
 

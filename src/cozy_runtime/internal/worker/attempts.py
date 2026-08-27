@@ -162,7 +162,7 @@ class AttemptRefusal(Exception):
         *,
         cause: pb.CauseCode,
         drop: bool = False,
-        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
@@ -520,7 +520,7 @@ class AttemptEngine:
         code: str,
         detail: str,
         cause: pb.CauseCode,
-        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> pb.AttemptOutcome:
         """A REFUSED terminal for an attempt this worker is already holding."""
         return self.outcome(
@@ -592,7 +592,7 @@ class AttemptEngine:
         "a caller trying to move tensors or media through here fails immediately". It did not
         fail immediately. Measured by ev-003 (decisions #302): a 73,721 B request is accepted,
         the dispatch frame then raises a worker-side `SeamError` AFTER acceptance, and the
-        run HANGS — `LocalCoordinator` only deadlines a run that never dispatched. A 42,719 B
+        run HANGS — `LocalRecordOwner` only deadlines a run that never dispatched. A 42,719 B
         request on the same path succeeds.
 
         That violates the acceptance-boundary law directly: everything before the journal
@@ -715,7 +715,7 @@ class AttemptEngine:
                 else CAUSE.CAUSE_CODE_GRANT_EXPIRED
                 if exc.code == "grant_expired"
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-                origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_WORKER,
             ) from exc
 
     def _accept_job(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
@@ -1437,7 +1437,7 @@ class AttemptEngine:
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
                 "the executor could not prove quiescence after the handler returned; a "
                 "terminal journaled under unproven quiescence would be a claim about state "
                 "that may still be moving",
@@ -1449,7 +1449,7 @@ class AttemptEngine:
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
                 "env_seal_broken: the executor's environment changed after CUDA init — the "
                 "allocator read it once, so the imposition was a silent no-op",
             )
@@ -1530,7 +1530,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_FAILED,
                     CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     tail_error,
                 )
         else:
@@ -2230,7 +2230,7 @@ class AttemptEngine:
             attempt,
             STATUS.OUTCOME_STATUS_CANCELED,
             cause,
-            ORIGIN.CAUSE_ORIGIN_COORDINATOR
+            ORIGIN.CAUSE_ORIGIN_RECORD_OWNER
             if reason in ("drain", "policy", "superseded")
             else ORIGIN.CAUSE_ORIGIN_CLIENT,
             f"canceled ({reason}); "
@@ -2267,7 +2267,7 @@ class AttemptEngine:
             safe_message=safe(f"outcome_construction_failed: {why}", 4096),
             cause=pb.OutcomeCause(
                 code=CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                origin=ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                origin=ORIGIN.CAUSE_ORIGIN_WORKER,
                 detail=safe(f"outcome_construction_failed: {why}"),
             ),
             execution_started=attempt.executions > 0,
@@ -2414,7 +2414,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_ABANDONED,
                     CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     f"foreign_instance_identity: this journal row was authorized under "
                     f"instance {safe(foreign, 64) or '(unnamed)'} and this worker is "
                     f"{safe(self.instance_id, 64) or '(unnamed)'}, so its journaled outcome "
@@ -2433,7 +2433,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_ABANDONED,
                     CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     "accepted-but-incomplete across a control-parent restart: the execution "
                     "context is gone, so this attempt reports ABANDONED and is never "
                     "re-executed",

@@ -691,7 +691,7 @@ def section_window(args: argparse.Namespace, base: str) -> None:
             "an offer over the window is a JOURNALED REFUSED outcome, not an invisible hold",
             body["status"] == 2
             and body["cause"]["code"] == 17  # CAUSE_CODE_NO_CAPACITY
-            and body["cause"]["origin"] == 4  # CAUSE_ORIGIN_SUPERVISOR
+            and body["cause"]["origin"] == 4  # CAUSE_ORIGIN_WORKER
             and not body.get("execution_started", False),
             f"status={body['status']} cause={body['cause']['code']}/"
             f"origin={body['cause']['origin']} execution_started="

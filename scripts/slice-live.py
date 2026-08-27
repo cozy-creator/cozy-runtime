@@ -192,7 +192,7 @@ def corrupt_store(at: Path, source: str) -> str:
 def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     """ONE slice, in THIS process. The whole of `exec` mode."""
     from cozy_runtime.internal.config import read_config
-    from cozy_runtime.internal.local import LocalCoordinator, LocalRequest, run_slice
+    from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest, run_slice
     from cozy_runtime.internal.worker.session import WorkerOptions
     from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -224,7 +224,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         no_warm=bool(spec.get("no_warm", True)),
     )
 
-    def arm(coordinator: LocalCoordinator, worker: Any) -> None:
+    def arm(coordinator: LocalRecordOwner, worker: Any) -> None:
         # SIGINT on a local run CANCELS the attempt — the same CancelAttempt a hub sends,
         # on the same lane. This is the local spelling of Ctrl-C, and it is why the
         # cancellation arms need no hook inside the runtime. SIGTERM is deliberately NOT
@@ -257,7 +257,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         release_id=RELEASE,
         options=options,
         delete_journal=bool(spec.get("delete_journal", True)),
-        coordinator_hook=arm,
+        record_owner_hook=arm,
     )
     return dataclasses.asdict(outcome)
 
