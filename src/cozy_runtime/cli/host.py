@@ -152,6 +152,7 @@ _SERVE_FLAGS: dict[str, str] = {
     # on this machine. A launcher knows its own root and nothing can discover it for one,
     # which is exactly what puts it in this closed set.
     "--grant-root": "--grant-root",
+    "--environment-root": "--environment-root",
     "--project": "--project",
     "--threads": "--threads",
     "--grace": "--grace",

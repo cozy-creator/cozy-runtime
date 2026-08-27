@@ -143,6 +143,7 @@ fresh endpoint is `--check`-clean out of the box.
     uv run python scripts/conformance.py # every descriptor-declared fact has a live writer
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
+    uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
 
