@@ -71,7 +71,7 @@ class PreparedLaunch:
     placement_set_digest: str
 
 
-def prepare(
+def prepare_launch(
     config: AdapterConfig,
     *,
     uv: Path,

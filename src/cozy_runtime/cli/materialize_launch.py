@@ -15,7 +15,7 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
     LaunchRefusal,
-    prepare,
+    prepare_launch,
 )
 
 WORKER_ROOT = Path("/run/cozy/worker")
@@ -40,7 +40,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpus = readiness.runtime_gpus(
             config.child_base_env, deadline=config.readiness_deadline_unix
         )
-        prepared = prepare(config, uv=UV_PATH)
+        prepared = prepare_launch(config, uv=UV_PATH)
         capacity = prepared.spec["capacity"]
         if len(gpus) != capacity["accelerator_count"] or any(
             row["device_name"] != capacity["accelerator_model"] for row in gpus
