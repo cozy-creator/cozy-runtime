@@ -31,15 +31,15 @@ sys.path.insert(0, str(ROOT / "src"))
 from cozy.worker.v1 import wire_identity  # noqa: E402
 from cozy_runtime.protocol import documents  # noqa: E402
 
-#: THE PIN. worker-protocol `b0243af`, `WIRE_SCHEMA_REV` 3, and the digest its `SCHEMA_REVS`
+#: THE PIN. worker-protocol `c954853`, `WIRE_SCHEMA_REV` 4, and the digest its `SCHEMA_REVS`
 #: ledger registers for that rev. Written here as a LITERAL on purpose: comparing the derived
 #: digest only against `wire_identity.SCHEMA_DIGEST` proves the copy is self-consistent, and
 #: a wholesale re-vendor of some other schema would be self-consistent too. The literal is
 #: what says WHICH schema this repo is a consumer of, and moving it is the deliberate act of
 #: adopting a new protocol rev.
-PROTOCOL_SHA = "b0243af1ceadf5c0e32f4ce66bfd55fef98ff1ca"
-WIRE_SCHEMA_REV = 3
-SCHEMA_DIGEST = "sha256:b1848f108a96fc6620f81702019a0ff009997eb86b55f01e549d8a5f3bbd41a8"
+PROTOCOL_SHA = "c954853a8509e54caea5927bd068e07431447a2a"
+WIRE_SCHEMA_REV = 4
+SCHEMA_DIGEST = "sha256:f22c1ca89c51c5c16e9d7541a3b91e9b38dd8bf423e2b619db7e6eb6cef10469"
 
 
 def main() -> int:
