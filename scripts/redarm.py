@@ -38,6 +38,11 @@ STATIC_ARMS = (
     ),
     Arm("package-imports", SRC / "author" / "_app.py", "import cozy_runtime.internal.config\n"),
     Arm("package-imports", SRC / "internal" / "config.py", "from cozy_runtime.cli import io\n"),
+    Arm(
+        "package-imports",
+        SRC / "internal" / "readiness.py",
+        "from cozy.worker.v1 import worker_pb2\n",
+    ),
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
     Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
