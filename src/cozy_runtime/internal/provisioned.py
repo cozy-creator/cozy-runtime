@@ -80,6 +80,7 @@ class ProvisionedRelease:
 
 
 DocumentReader = Callable[[ArtifactRef, str], ExactDocument]
+DTypeWidths = Mapping[str, int] | Callable[[], Mapping[str, int]]
 
 
 def tensorfs_destination_widths(tensorfs: Any) -> Mapping[str, int]:
@@ -149,7 +150,7 @@ def read_provisioned_release(
     endpoint_release: str,
     store_root: Path,
     object_set: ArtifactObjectSet,
-    dtype_widths: Mapping[str, int],
+    dtype_widths: DTypeWidths,
 ) -> ProvisionedRelease:
     """Resolve the complete selected plan set through one closed typed reader."""
 
@@ -272,7 +273,7 @@ def _read_binding(
     endpoint_release: str,
     store_root: Path,
     object_set: ArtifactObjectSet,
-    dtype_widths: Mapping[str, int],
+    dtype_widths: DTypeWidths,
     documents: dict[str, int],
     config_assets: dict[str, int],
     used_model_roots: set[str],
@@ -428,7 +429,8 @@ def _read_binding(
             raise PlanRefusal("resolved_model_binding_mismatch", f"missing stamp {key}={value}")
 
     try:
-        model_weight_bytes = contract.destination_resident_bytes(construction, dtype_widths)
+        widths = dtype_widths() if callable(dtype_widths) else dtype_widths
+        model_weight_bytes = contract.destination_resident_bytes(construction, widths)
     except contract.ContractError as exc:
         raise PlanRefusal(exc.code, str(exc)) from exc
     return DeclaredBinding(

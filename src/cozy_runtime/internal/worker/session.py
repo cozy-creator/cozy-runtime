@@ -1752,7 +1752,11 @@ class Worker:
                     endpoint_release=placement.endpoint_release_id,
                     store_root=self.options.artifact_store,
                     object_set=object_set,
-                    dtype_widths=provisioned.tensorfs_destination_widths(fill.tensorfs_module()),
+                    # A weightless release never opens TensorFS. Defer the facade lookup
+                    # until the shared reader actually reaches a model-bearing binding.
+                    dtype_widths=lambda: provisioned.tensorfs_destination_widths(
+                        fill.tensorfs_module()
+                    ),
                 )
                 self.bindings = dict(selected.bindings)
             except (OSError, PlanRefusal, fill.FillRefusal) as refusal:
