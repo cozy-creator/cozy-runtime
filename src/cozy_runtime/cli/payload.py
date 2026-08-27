@@ -1,8 +1,9 @@
 """The `run`/`job` payload grammar and the descriptor-derived output field paths.
 
 Grammar (cozy-runtime-cli.md): a positional primary field, `key=value` scalars,
-`key=@file` file/asset inputs, `key:=<json>` raw JSON for nested values, and `--in <file>`
-supplying the whole payload as JSON with `key=value` merged on top.
+`key:=<json>` raw JSON for nested values, and `--in <file>` supplying the whole payload as
+JSON with `key=value` merged on top. After that merge, `@/absolute/file` is local staging
+syntax only at descriptor-typed Asset leaves; ordinary strings are never paths.
 
 Typing is the DESCRIPTOR's, not this module's: a scalar's spelling is decided by the field's
 rendered schema, so `steps=20` becomes an int because the schema says int — never because
@@ -17,9 +18,15 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import msgspec
+
+from cozy_runtime.author._assets import asset_dec_hook
+from cozy_runtime.author._errors import InvalidRequest
+from cozy_runtime.author._invoke import asset_inputs
 from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.local import LocalInput
 
 
 def fields(struct: Json) -> dict[str, Json]:
@@ -74,7 +81,6 @@ def parse(
     request: Json,
     *,
     infile: str = "",
-    project: Path | None = None,
 ) -> dict[str, Any]:
     """argv payload terms -> the request document, typed against the rendered schema."""
     declared = fields(request)
@@ -115,10 +121,7 @@ def parse(
             document[key] = _json(key, raw)
         elif "=" in term:
             key, _, raw = term.partition("=")
-            if raw.startswith("@"):
-                document[key] = _file(key, raw[1:], project)
-            else:
-                document[key] = _scalar(key, raw, declared, request)
+            document[key] = _scalar(key, raw, declared, request)
         else:
             positional.append(term)
 
@@ -153,6 +156,86 @@ def parse(
     return document
 
 
+def extract_local_assets(document: dict[str, Any], payload_type: object) -> dict[str, LocalInput]:
+    """Replace typed `@/absolute/file` leaves with path-free refs and return their grants.
+
+    The fully merged request is decoded through the endpoint's actual request type first.
+    That makes an Asset declaration, including a selected tagged-union arm, the sole path
+    authority. A prompt or any other string beginning `@/` remains text.
+    """
+    try:
+        payload = msgspec.convert(dict(document), type=payload_type, dec_hook=asset_dec_hook)
+    except (msgspec.ValidationError, TypeError, NotImplementedError) as exc:
+        raise CliError(
+            "validation",
+            f"the request does not validate: {exc}",
+            "the payload must match the function's declared request schema",
+            Exit.validation,
+        ) from exc
+
+    try:
+        assets = asset_inputs(payload)
+    except InvalidRequest as exc:
+        raise CliError(
+            "validation",
+            str(exc),
+            "every declared Asset field must have one unambiguous wire path",
+            Exit.validation,
+        ) from exc
+
+    pending: list[tuple[Any, str | int, str, int, Path]] = []
+    for item in assets:
+        if not item.asset.ref.startswith("@/"):
+            continue
+        spelled = Path(item.asset.ref[1:])
+        try:
+            source = spelled.resolve(strict=True)
+        except OSError as exc:
+            raise CliError(
+                "not_found",
+                f"{item.input_id}={item.asset.ref}: no such file",
+                "a local Asset is spelled @/absolute/file and must name a regular file",
+                Exit.not_found,
+            ) from exc
+        if not source.is_file():
+            raise CliError(
+                "not_found",
+                f"{item.input_id}={item.asset.ref}: not a regular file",
+                "a local Asset is spelled @/absolute/file and must name a regular file",
+                Exit.not_found,
+            )
+        container, key = _replacement(document, item.segments, item.input_id)
+        pending.append((container, key, item.input_id, item.order, source))
+
+    # Resolve every destination before mutating any. A dotted wire alias can otherwise
+    # make a prior asset path-free and leave a later absolute path in a failed document.
+    sources: dict[str, LocalInput] = {}
+    for container, key, field_path, order, source in pending:
+        container[key] = f"input:{field_path}"
+        sources[field_path] = LocalInput(str(source), order)
+    return sources
+
+
+def _replacement(
+    document: dict[str, Any], segments: tuple[str | int, ...], input_id: str
+) -> tuple[Any, str | int]:
+    """Resolve one lossless typed-field address without mutating the request."""
+    node: Any = document
+    try:
+        for part in segments[:-1]:
+            node = node[part]
+        key = segments[-1]
+        node[key]
+        return node, key
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise CliError(
+            "validation",
+            f"local Asset {input_id!r} is not explicit in the request document",
+            "local files must be named on an explicit descriptor-declared Asset field",
+            Exit.validation,
+        ) from exc
+
+
 def _json(key: str, raw: str) -> Json:
     try:
         return json.loads(raw)
@@ -163,20 +246,6 @@ def _json(key: str, raw: str) -> Json:
             f"`{key}:=<json>` takes a raw JSON value; use `{key}=<text>` for a plain string",
             Exit.usage,
         ) from exc
-
-
-def _file(key: str, spelled: str, project: Path | None) -> str:
-    path = Path(spelled).expanduser()
-    if not path.is_absolute() and project is not None:
-        path = (project / path).resolve() if not path.exists() else path.resolve()
-    if not path.is_file():
-        raise CliError(
-            "not_found",
-            f"{key}=@{spelled}: no such file",
-            "`key=@file` reads that file as the field's value",
-            Exit.not_found,
-        )
-    return str(path)
 
 
 def _scalar(key: str, raw: str, declared: Mapping[str, Json], request: Json) -> Any:

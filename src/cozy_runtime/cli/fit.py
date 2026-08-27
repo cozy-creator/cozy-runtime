@@ -65,9 +65,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         doc = run_verb._doc_for(body, surface.name, "entrypoint")
         exact = bool(terms[1:]) or bool(flags.get("--in"))
         if exact:
-            payload_grammar.parse(
-                terms[1:], doc["request"], infile=(flags.get("--in") or [""])[0], project=project
-            )
+            payload_grammar.parse(terms[1:], doc["request"], infile=(flags.get("--in") or [""])[0])
         verdict = _verdict(surface, exact=exact)
         verdicts.append(verdict)
         rows.append((surface.name, verdict["rendered"]))

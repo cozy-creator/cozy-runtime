@@ -1786,7 +1786,6 @@ class Worker:
         )
         self.engine.egress = egress.EgressPolicy(
             allowed_hosts=tuple(hosts),
-            max_bytes=max((b.max_input_bytes for b in self.bindings.values()), default=64 << 20),
             allow_private=any(b.tenancy == "local" for b in self.bindings.values()),
         )
         self.note(

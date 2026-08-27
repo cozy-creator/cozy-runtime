@@ -185,18 +185,7 @@ def run(
             next=("cozy-runtime describe — the full list",),
         )
 
-    doc = _doc_for(body, function, kind)
-    request_schema = doc["request"]
-    document = payload_grammar.parse(
-        terms, request_schema, infile=(flags.get("--in") or [""])[0], project=project
-    )
-    seed = (flags.get("--seed") or [""])[0]
-    if seed and "seed" in payload_grammar.fields(request_schema):
-        document["seed"] = int(seed)
-    outputs = payload_grammar.asset_paths(doc["result"])
-
     slots = surface.model_bindings
-    warnings: list[str] = []
     if slots and kind == "job":
         raise CliError(
             "structural",
@@ -215,6 +204,16 @@ def run(
             "run through Tensorhub's selected canonical Plan/RMB/MCC provision closure",
             Exit.structural,
         )
+
+    doc = _doc_for(body, function, kind)
+    request_schema = doc["request"]
+    document = payload_grammar.parse(terms, request_schema, infile=(flags.get("--in") or [""])[0])
+    seed = (flags.get("--seed") or [""])[0]
+    if seed and "seed" in payload_grammar.fields(request_schema):
+        document["seed"] = int(seed)
+    inputs = payload_grammar.extract_local_assets(document, surface.payload_type)
+    outputs = payload_grammar.asset_paths(doc["result"])
+    warnings: list[str] = []
 
     job_records: list[dict[str, Any]] = []
     trees: dict[str, str] = {}
@@ -249,6 +248,7 @@ def run(
         kind=kind if kind == "job" else "entrypoint",
         job_descriptor_id=descriptor_id,
         trees=trees,
+        inputs=inputs,
         org=(flags.get("--org") or ["local"])[0],
     )
     release_id = str(body["application"])
@@ -487,6 +487,7 @@ def _render(
         "status": status,
         "result": outcome.result,
         "outputs": saved,
+        "invocation": outcome.invocation,
         "plan": accepted,
         "ledger": outcome.ledger,
         "timings": outcome.timings,
