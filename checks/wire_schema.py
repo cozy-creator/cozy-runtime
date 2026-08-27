@@ -17,7 +17,7 @@ same. That is `worker-protocol/scripts/vendored-diff.sh`, which needs the protoc
 runs in CI's `drift` job the moment a read credential for it exists. This step is what fires
 in the meantime, and it fires on every push rather than waiting behind anything.
 
-    uv run python scripts/wire-fence.py
+    uv run python checks/wire_schema.py
 """
 
 from __future__ import annotations

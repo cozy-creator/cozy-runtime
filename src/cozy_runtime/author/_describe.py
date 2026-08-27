@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from cozy_runtime.author._app import App
 
 #: Names deleted from the author surface, with WHY. One list, one owner: an endpoint that
-#: declares any of them refuses, and `scripts/fence.py` proves the SDK never grows one back.
+#: declares any of them refuses, and `checks/architecture.py` proves the SDK never grows one back.
 DELETED_SURFACES: Mapping[str, str] = {
     "generator": "the seeded generator is view.generator — there is no ctx.generator (§1.3)",
     "recommended": "'runs better on newer silicon' is a measured ranking fact (§1.2)",

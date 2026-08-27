@@ -21,7 +21,7 @@ jobs:
       - run: uv run mypy
       # Self-contained architecture fences + frozen ES6 vectors + torch-free import. The
       # one cross-repo TensorFS registry comparison has its own pinned job below.
-      - run: uv run python scripts/fence.py --exclude reviewed-specs-exist
+      - run: uv run python checks/architecture.py --exclude reviewed-specs-exist
       # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
       # refuses a stale one (§1.0). A staleness check, not a test suite.
       - run: uv run cozy-runtime describe --check --dir examples
@@ -29,10 +29,10 @@ jobs:
       # digest is DERIVED, so a copy that is not the schema it claims refuses here. It
       # fires on every push and needs nothing outside this repo. What it does NOT cover —
       # the generated FILES, byte for byte — is the `drift` job below.
-      - run: uv run python scripts/wire-fence.py
+      - run: uv run python checks/wire_schema.py
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
-      - run: uv run python scripts/conformance.py
+      - run: uv run python checks/declared_facts.py
       - run: uv run cozy-runtime version
 
   # The provider's reviewed spec digests must exist in TensorFS's exact pinned registry.
@@ -72,7 +72,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.1
       - run: uv sync
       - run: uv pip install .tensorfs
-      - run: uv run python scripts/fence.py --only reviewed-specs-exist
+      - run: uv run python checks/architecture.py --only reviewed-specs-exist
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
   # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another
@@ -102,7 +102,7 @@ jobs:
       # hand-flipped variable, the job detects the credential and runs the moment it
       # exists — and says loudly, in the run's annotations, when it does not.
       #
-      # Nothing is silently unguarded in the meantime: `scripts/wire-fence.py` in `checks`
+      # Nothing is silently unguarded in the meantime: `checks/wire_schema.py`
       # refuses a vendored binding that is not the pinned schema, on every push. This job
       # adds what that one structurally cannot see — the generated files themselves,
       # compared against a regeneration by the pinned toolchain.
@@ -112,7 +112,7 @@ jobs:
             echo "present=yes" >> "$GITHUB_OUTPUT"
           else
             echo "present=no" >> "$GITHUB_OUTPUT"
-            echo "::warning title=vendored-drift check not run::WORKER_PROTOCOL_TOKEN is not set, so cozy-creator/worker-protocol-v2 cannot be checked out and the byte-for-byte vendored-drift check did not run. scripts/wire-fence.py still fenced the schema itself."
+            echo "::warning title=vendored-drift check not run::WORKER_PROTOCOL_TOKEN is not set, so cozy-creator/worker-protocol-v2 cannot be checked out and the byte-for-byte vendored-drift check did not run. checks/wire_schema.py still fenced the schema itself."
           fi
       - if: steps.credential.outputs.present == 'yes'
         uses: actions/checkout@v4

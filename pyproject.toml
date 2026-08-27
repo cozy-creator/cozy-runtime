@@ -39,6 +39,7 @@ members = ["packages/*"]
 python_version = "3.11"
 files = [
     "src",
+    "checks",
     "scripts",
     "proofs/internal",
     "proofs/support",
@@ -54,7 +55,7 @@ files = [
 # byte-identical. mypy needs the source roots stated for that, or it maps
 # `src/cozy/worker/v1/wire_identity.py` to bare `wire_identity`.
 explicit_package_bases = true
-mypy_path = "src:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/environment-wheelhouse/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-endpoint/src:examples"
+mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/environment-wheelhouse/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-endpoint/src:examples"
 # The two derive-* runners live with the corpus they drive: they are torch-shaped code for
 # the corpus venv, and checking them against a torch that is not installed produces
 # confident nonsense. They are exercised by RUNNING them.
@@ -70,7 +71,7 @@ implicit_reexport = false
 # torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
 # does not have it and mypy cannot see its types. The consequence is recorded rather than
 # papered over: the two modules that touch torch are checked without unused-ignore warnings
-# and with torch itself untyped. `scripts/fence.py::torch-free-import` is what actually
+# and with torch itself untyped. `checks/architecture.py::torch-free-import` is what actually
 # holds the packaging rule; mypy never could.
 [[tool.mypy.overrides]]
 module = ["torch.*", "triton.*", "numpy.*"]
@@ -140,7 +141,7 @@ follow_imports = "skip"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "scripts", "proofs", "examples"]
+src = ["src", "checks", "scripts", "proofs", "examples"]
 # Generated bindings: protoc's line lengths and import style are not ours to lint.
 extend-exclude = ["src/cozy/worker/v1/worker_pb2.py",
                   "src/cozy/worker/v1/worker_pb2_grpc.py",

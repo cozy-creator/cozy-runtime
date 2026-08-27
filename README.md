@@ -141,9 +141,10 @@ refuses. `describe` itself is read-only; `--write-descriptor` is the only writer
     uv run cozy-runtime new <name>       # scaffold a minimal valid endpoint
     uv run cozy-runtime describe         # the surface, without loading weights
     uv run cozy-runtime describe --check # refuse a stale endpoint.descriptor.json (CI)
-    uv run python scripts/fence.py       # architecture fences
+    uv run python checks/architecture.py # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
-    uv run python scripts/conformance.py # every public Context/service fact has a live writer
+    uv run python checks/declared_facts.py # every public Context/service fact has a live writer
+    uv run python checks/wire_schema.py  # vendored worker-schema identity
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
