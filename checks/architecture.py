@@ -850,6 +850,79 @@ def fence_descriptor_minimality() -> list[str]:
     return bad
 
 
+#: proto-007 (#616.a): the registry of document kinds this repo AUTHORS, each with its one
+#: declaring module. A format name exists only for a document that crosses a repo/process
+#: boundary AND is stored or digested; a provider `name()` is in the preimage of every
+#: implementation_digest and therefore every plan digest, so it is registered too. A literal
+#: outside this table is a new kind without its decision row.
+DOCUMENT_KINDS = {
+    "cozy.endpoint.descriptor/1": "internal/descriptor.py",
+    "cozy.endpoint.EntrypointBindingPlan/1": "internal/provisioned.py",
+    "cozy.endpoint.ResolvedModelBinding/1": "internal/provisioned.py",
+    "cozy.fp8-rowwise.dequant/1": "internal/encoding/formats.py",
+    "cozy.fp8-scaled-scalar.dequant/1": "internal/encoding/formats.py",
+    "cozy.mxfp8.dequant/1": "internal/encoding/formats.py",
+    "cozy.plain.verbatim/1": "internal/encoding/formats.py",
+    "cozy.fp8-rowwise.native-leaf/1": "internal/encoding/leaves.py",
+    "cozy.mxfp8.native-leaf/1": "internal/encoding/leaves.py",
+    "cozy.pod-readiness/1": "internal/readiness.py",
+    "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
+    "cozy.runtime.ConstructedGeneration/2": "internal/executor.py",
+    "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
+    "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
+    "cozy.runtime.Ledger/0": "internal/worker/ledger.py",
+    "cozy.runtime.LocalArtifact/1": "internal/artifacts.py",
+    "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
+    "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
+    "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
+    "cozy.runtime.plan-fact/1": "internal/planfacts.py",
+    "cozy.runtime.probe/1": "internal/probe.py",
+    "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
+    "cozy.runtime.ResolvedExecutionPlan/1": "internal/resolution.py",
+    "cozy.runtime.TriageWriteReceipt/1": "internal/worker/triage.py",
+    "cozy.runtime.WitnessBoot/1": "internal/witness.py",
+    "cozy.runtime.WitnessDeath/1": "internal/witness.py",
+    "cozy.runtime.WorkerTriageBundle/1": "internal/worker/triage.py",
+}
+#: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
+#: Naming them is decoding, not authoring; the owner's fence polices the name.
+FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
+#: Modules that name a registered kind without declaring it (a second reader is fine; a
+#: second DECLARATION is the drift this fence exists for).
+KIND_READERS = {
+    "cozy.endpoint.EntrypointBindingPlan/1": {"internal/local.py"},
+    "cozy.runtime.Ledger/0": {"internal/local.py"},
+    "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
+}
+KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)"')
+
+
+def fence_document_kinds() -> list[str]:
+    """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
+    bad: list[str] = []
+    for path in py_files():
+        rel = path.relative_to(SRC).as_posix()
+        if rel.endswith("_pb2.py"):
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            for kind in KIND_LITERAL.findall(line):
+                if kind.startswith(FOREIGN_KIND_PREFIXES):
+                    continue
+                owner = DOCUMENT_KINDS.get(kind)
+                if owner is None:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, a document kind "
+                        "outside DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and "
+                        "a boundary + storage/digest party (proto-007)"
+                    )
+                elif rel != owner and rel not in KIND_READERS.get(kind, set()):
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
+                        f"{owner} — a second declaration of one kind"
+                    )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -869,6 +942,7 @@ FENCES = {
     "timing-decides-nothing": fence_timing_decides_nothing,
     "endpoint-owns-no-residency": fence_endpoint_owns_no_residency,
     "endpoint-owns-no-media-decode": fence_endpoint_owns_no_media_decode,
+    "document-kinds": fence_document_kinds,
 }
 
 
