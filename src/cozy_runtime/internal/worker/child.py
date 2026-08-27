@@ -13,9 +13,9 @@ nobody could reconcile against the other one.
 
 Cancellation is cooperative then forceful and the WORKER owns both clocks: the grace
 budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
-`CancelAttempt.grace_ms`, and never an author knob. The forceful path kills the executor's
-whole cgroup subtree, so even a detached grandchild cannot outlive the terminal that closed
-its attempt.
+`CancelAttempt.grace_ms`, and never an author knob. Writable cgroup v2 remains the kernel
+boundary; a strictly proven read-only-cgroup container uses the narrower first-party
+process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel, proctree, spawn
+from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 from cozy_runtime.internal.worker.plan import PreparedModel
@@ -115,7 +116,7 @@ class Executor:
 
     incarnation: int
     process: proctree.ProcessIdentity
-    cgroup: proctree.CgroupScope
+    scope: proctree.ExecutorScope
     channel: Channel
     seal_digest: str
     hello: dict[str, Any] = field(default_factory=dict)
@@ -213,13 +214,12 @@ class ReclaimEvidence:
 
 @dataclass(frozen=True, slots=True)
 class OwnerRecord:
-    """The exact kernel scope, provisionally or finally bound to its leader birth."""
+    """The exact local scope, provisionally or finally bound to its leader birth."""
 
-    cgroup: proctree.CgroupScope
+    scope: proctree.ExecutorScope
     process: proctree.ProcessIdentity | None = None
     members: tuple[proctree.ProcessIdentity, ...] = ()
     """Frozen pre-kill census, durable so reclaim proof survives worker death."""
-    reclaimed: bool = False
 
 
 class ExecutorSupervision:
@@ -239,7 +239,7 @@ class ExecutorSupervision:
         self.base_env = base_env
         self.cozy_home = cozy_home
         self.root.mkdir(parents=True, exist_ok=True)
-        self._cgroup_namespace = proctree.executor_cgroup_namespace(self.root)
+        self._scope_namespace = proctree.executor_scope_namespace(self.root)
         try:
             self._root_lease = proctree.acquire_worker_root_lease(self.root / "worker.lock")
         except BlockingIOError as exc:
@@ -287,12 +287,18 @@ class ExecutorSupervision:
 
     def _owner_payload(self, owner: OwnerRecord) -> str:
         process = owner.process
+        scope = owner.scope
         return json.dumps(
             {
-                "cgroup": {
-                    "relative_path": owner.cgroup.relative_path,
-                    "inode": owner.cgroup.inode,
-                },
+                "scope": (
+                    {
+                        "backend": "cgroup_v2",
+                        "relative_path": scope.relative_path,
+                        "inode": scope.inode,
+                    }
+                    if isinstance(scope, proctree.CgroupScope)
+                    else {"backend": "process_tree", "token": scope.token}
+                ),
                 "process": (
                     {"pid": process.pid, "started_ticks": process.started_ticks}
                     if process is not None
@@ -302,7 +308,6 @@ class ExecutorSupervision:
                     {"pid": member.pid, "started_ticks": member.started_ticks}
                     for member in owner.members
                 ],
-                "reclaimed": owner.reclaimed,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -336,8 +341,8 @@ class ExecutorSupervision:
         self, provisional: OwnerRecord, process: proctree.ProcessIdentity
     ) -> OwnerRecord:
         if provisional.process is not None or self._read_owner() != provisional:
-            raise ExecutorGone("executor cgroup ownership changed before leader binding")
-        owner = OwnerRecord(provisional.cgroup, process, provisional.members)
+            raise ExecutorGone("executor scope ownership changed before leader binding")
+        owner = OwnerRecord(provisional.scope, process, provisional.members)
         self._replace_owner(provisional, owner)
         return owner
 
@@ -359,10 +364,27 @@ class ExecutorSupervision:
     def _read_owner(self) -> OwnerRecord | None:
         try:
             document = json.loads(self._owner_path.read_text())
-            cgroup = proctree.CgroupScope(
-                relative_path=str(document["cgroup"]["relative_path"]),
-                inode=int(document["cgroup"]["inode"]),
-            )
+            if not isinstance(document, dict) or set(document) != {"scope", "process", "members"}:
+                raise TypeError("owner fields differ")
+            raw_scope = document["scope"]
+            if not isinstance(raw_scope, dict):
+                raise TypeError("scope is not an object")
+            if raw_scope.get("backend") == "cgroup_v2" and set(raw_scope) == {
+                "backend",
+                "relative_path",
+                "inode",
+            }:
+                scope: proctree.ExecutorScope = proctree.CgroupScope(
+                    relative_path=str(raw_scope["relative_path"]),
+                    inode=int(raw_scope["inode"]),
+                )
+            elif raw_scope.get("backend") == "process_tree" and set(raw_scope) == {
+                "backend",
+                "token",
+            }:
+                scope = proctree.ProcessTreeScope(str(raw_scope["token"]))
+            else:
+                raise TypeError("scope fields differ")
             raw_process = document["process"]
             process = (
                 proctree.ProcessIdentity(
@@ -384,9 +406,6 @@ class ExecutorSupervision:
                     key=lambda member: (member.pid, member.started_ticks),
                 )
             )
-            reclaimed = document["reclaimed"]
-            if not isinstance(reclaimed, bool):
-                raise TypeError("reclaimed must be a boolean")
         except FileNotFoundError:
             return None
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -394,15 +413,15 @@ class ExecutorSupervision:
                 f"executor ownership record {self._owner_path} is unreadable; refusing "
                 "to guess that the device is unowned"
             ) from exc
-        if cgroup.inode <= 0 or not cgroup.relative_path.startswith("/"):
-            raise ExecutorGone(
-                f"executor ownership record {self._owner_path} has invalid cgroup {cgroup}"
-            )
+        if isinstance(scope, proctree.CgroupScope) and (
+            scope.inode <= 0 or not scope.relative_path.startswith("/")
+        ):
+            raise ExecutorGone(f"executor ownership record {self._owner_path} has invalid {scope}")
         try:
-            proctree.validate_executor_cgroup(cgroup, self._cgroup_namespace)
-        except proctree.CgroupUnavailable as exc:
+            proctree.validate_executor_scope(scope, self._scope_namespace)
+        except proctree.ContainmentUnavailable as exc:
             raise ExecutorGone(
-                f"executor ownership record {self._owner_path} names an unsafe cgroup: {exc}"
+                f"executor ownership record {self._owner_path} names an unsafe scope: {exc}"
             ) from exc
         if process is not None and (process.pid <= 0 or process.started_ticks <= 0):
             raise ExecutorGone(
@@ -414,7 +433,7 @@ class ExecutorSupervision:
             raise ExecutorGone(
                 f"executor ownership record {self._owner_path} has invalid member census"
             )
-        return OwnerRecord(cgroup, process, members, reclaimed)
+        return OwnerRecord(scope, process, members)
 
     def _clear_owner(self, expected: OwnerRecord) -> None:
         """Clear only the exact durable owner whose OS and driver absence was proved."""
@@ -561,11 +580,13 @@ class ExecutorSupervision:
         conn: socket.socket | None = None
         try:
             try:
-                owner = OwnerRecord(proctree.create_executor_cgroup(self._cgroup_namespace))
-            except (proctree.CgroupUnavailable, proctree.ProcessTreeUnsupported) as exc:
+                owner = OwnerRecord(proctree.create_executor_scope(self._scope_namespace))
+            except (proctree.ContainmentUnavailable, proctree.ProcessTreeUnsupported) as exc:
                 raise ExecutorGone(
                     f"executor containment unavailable before allocation: {exc}"
                 ) from exc
+            if isinstance(owner.scope, proctree.ProcessTreeScope):
+                imposed[EXECUTOR_SCOPE_ENV] = owner.scope.token
             self._write_owner(owner)
             spawned = self._launch(
                 python=self.python,
@@ -581,15 +602,23 @@ class ExecutorSupervision:
                 base_env=self.base_env,
                 imposed=imposed,
                 cwd=str(self.root),
-                cgroup=owner.cgroup,
+                scope=owner.scope,
             )
             process = proctree.process_identity(spawned.pid)
+            if isinstance(owner.scope, proctree.ProcessTreeScope):
+                proctree.wait_process_stopped(process, seconds=RECLAIM_SECONDS)
+                if not proctree.process_scope_contains(owner.scope, process):
+                    raise ExecutorGone(
+                        f"process-tree trampoline {process.pid} stopped outside its exact scope"
+                    )
             owner = self._bind_owner(owner, process)
+            if isinstance(owner.scope, proctree.ProcessTreeScope):
+                proctree.signal_process(process, signal.SIGCONT)
             conn = self._dial_back(process)
             executor = Executor(
                 incarnation=self.incarnation,
                 process=process,
-                cgroup=owner.cgroup,
+                scope=owner.scope,
                 channel=Channel(conn),
                 seal_digest=spawned.seal_digest,
                 spawned_at=started,
@@ -601,11 +630,16 @@ class ExecutorSupervision:
                 {"cmd": "hello"}, timeout=HELLO_SECONDS, total_timeout=HELLO_SECONDS
             )
             sealed = executor.hello.get("sealed")
+            contained = (
+                proctree.cgroup_contains(owner.scope, process)
+                if isinstance(owner.scope, proctree.CgroupScope)
+                else proctree.process_scope_contains(owner.scope, process)
+            )
             if (
                 executor.hello.get("pid") != spawned.pid
                 or executor.hello.get("ppid") != os.getpid()
                 or executor.hello.get("pgid") != spawned.pid
-                or not proctree.cgroup_contains(owner.cgroup, process)
+                or not contained
                 or not isinstance(sealed, dict)
                 or spawn.seal_digest(sealed) != spawned.seal_digest
             ):
@@ -638,8 +672,8 @@ class ExecutorSupervision:
                     if self._read_owner() == owner:
                         self._reclaim_owner(owner, "spawn before launch")
                     else:
-                        proctree.remove_executor_cgroup(owner.cgroup)
-                except (ExecutorGone, proctree.CgroupUnavailable) as cleanup:
+                        proctree.remove_executor_scope(owner.scope)
+                except (ExecutorGone, proctree.ContainmentUnavailable) as cleanup:
                     raise ExecutorGone(f"{exc}; {cleanup}") from exc
             raise
 
@@ -732,23 +766,39 @@ class ExecutorSupervision:
     def _stop_and_observe_reclaim(
         self, owner: OwnerRecord, why: str
     ) -> tuple[OwnerRecord, set[proctree.ProcessIdentity], accel.ProcessMemory]:
-        """Kill the exact cgroup subtree, then retain births until driver absence."""
-        if owner.reclaimed:
-            raise ExecutorGone(f"cannot reclaim already-reclaimed owner {owner}")
+        """Stop one exact scope, persist its census, then prove OS and driver absence."""
         known = set(owner.members)
         if owner.process is not None:
             known.add(owner.process)
         try:
-            known.update(proctree.freeze_executor_cgroup(owner.cgroup, seconds=RECLAIM_SECONDS))
+            if isinstance(owner.scope, proctree.CgroupScope):
+                if proctree.executor_scope_exists(owner.scope):
+                    known.update(
+                        proctree.freeze_executor_cgroup(owner.scope, seconds=RECLAIM_SECONDS)
+                    )
+            else:
+                known.update(
+                    proctree.freeze_process_tree(
+                        owner.scope,
+                        owner.process,
+                        known,
+                        worker_pid=os.getpid(),
+                        seconds=RECLAIM_SECONDS,
+                    )
+                )
             members = tuple(sorted(known, key=lambda item: (item.pid, item.started_ticks)))
             if members != owner.members:
-                expanded = OwnerRecord(owner.cgroup, owner.process, members)
+                expanded = OwnerRecord(owner.scope, owner.process, members)
                 self._replace_owner(owner, expanded)
                 owner = expanded
-            proctree.kill_frozen_executor_cgroup(owner.cgroup, seconds=RECLAIM_SECONDS)
-        except (proctree.CgroupUnavailable, TimeoutError) as exc:
+            if isinstance(owner.scope, proctree.CgroupScope):
+                if proctree.executor_scope_exists(owner.scope):
+                    proctree.kill_frozen_executor_cgroup(owner.scope, seconds=RECLAIM_SECONDS)
+            else:
+                proctree.kill_process_tree(known)
+        except (proctree.ContainmentUnavailable, TimeoutError) as exc:
             raise ExecutorGone(
-                f"could not reclaim exact executor cgroup {owner.cgroup} ({why}): {exc}; "
+                f"could not reclaim exact executor scope {owner.scope} ({why}): {exc}; "
                 "ownership retained and successor spawn refused"
             ) from exc
 
@@ -757,8 +807,21 @@ class ExecutorSupervision:
         while True:
             states = {member.pid: proctree.process_state(member) for member in known}
             observations = self._observe_processes(known)
-            if all(state in {None, "Z"} for state in states.values()) and all(
-                item.state == "absent" for item in observations.values()
+            try:
+                token_leftovers = (
+                    proctree.process_scope_processes(owner.scope)
+                    if isinstance(owner.scope, proctree.ProcessTreeScope)
+                    else set()
+                )
+            except proctree.ContainmentUnavailable as exc:
+                raise ExecutorGone(
+                    f"could not prove process-tree scope empty ({why}): {exc}; "
+                    "ownership retained and successor spawn refused"
+                ) from exc
+            if (
+                all(state in {None, "Z"} for state in states.values())
+                and all(item.state == "absent" for item in observations.values())
+                and not token_leftovers
             ):
                 leader_device = (
                     observations[owner.process.pid]
@@ -768,9 +831,10 @@ class ExecutorSupervision:
                 return owner, known, leader_device
             if time.monotonic() >= deadline:
                 raise ExecutorGone(
-                    f"could not prove reclaim of {owner.cgroup} ({why}): "
+                    f"could not prove reclaim of {owner.scope} ({why}): "
                     f"process_states={states}, device_states="
                     f"{ {pid: item.state for pid, item in observations.items()} }; "
+                    f"token_leftovers={sorted(p.pid for p in token_leftovers)}; "
                     "ownership retained and successor spawn refused"
                 )
             time.sleep(RECLAIM_SAMPLE_SECONDS)
@@ -800,15 +864,19 @@ class ExecutorSupervision:
             time.sleep(0.01)
 
     def _remove_scope_and_owner(self, owner: OwnerRecord) -> None:
-        """Durably mark reclaim before removing its exact empty kernel scope."""
-        reclaimed = OwnerRecord(owner.cgroup, owner.process, owner.members, True)
-        self._replace_owner(owner, reclaimed)
+        """Remove an empty kernel scope when present, then atomically clear its owner."""
         try:
-            if proctree.executor_cgroup_exists(reclaimed.cgroup):
-                proctree.remove_executor_cgroup(reclaimed.cgroup)
-        except proctree.CgroupUnavailable as exc:
-            raise ExecutorGone(f"could not remove reclaimed executor cgroup: {exc}") from exc
-        self._clear_owner(reclaimed)
+            if isinstance(owner.scope, proctree.CgroupScope):
+                if proctree.executor_scope_exists(owner.scope):
+                    proctree.remove_executor_scope(owner.scope)
+            else:
+                # Re-census immediately at the clear boundary. A same-UID process can
+                # deliberately replay the non-secret token; that documented first-party
+                # residual must still fail closed when it is observable.
+                proctree.remove_executor_scope(owner.scope)
+        except proctree.ContainmentUnavailable as exc:
+            raise ExecutorGone(f"could not remove reclaimed executor scope: {exc}") from exc
+        self._clear_owner(owner)
 
     def _reclaim_owner(self, owner: OwnerRecord, why: str) -> ReclaimEvidence:
         owner, known, device = self._stop_and_observe_reclaim(owner, why)
@@ -831,12 +899,7 @@ class ExecutorSupervision:
             return None
         self._invalidate_locked(expected, why)
         owner = self._read_owner()
-        if (
-            owner is None
-            or owner.cgroup != expected.cgroup
-            or owner.process != expected.process
-            or owner.reclaimed
-        ):
+        if owner is None or owner.scope != expected.scope or owner.process != expected.process:
             raise ExecutorGone(
                 f"durable executor owner does not match incarnation {expected.incarnation} "
                 f"pid {expected.pid}: {owner}"
@@ -871,16 +934,6 @@ class ExecutorSupervision:
     def _sweep_orphans_locked(self, why: str) -> list[int]:
         owner = self._read_owner()
         if owner is None:
-            return []
-        if owner.reclaimed:
-            try:
-                if proctree.executor_cgroup_exists(owner.cgroup):
-                    proctree.remove_executor_cgroup(owner.cgroup)
-            except proctree.CgroupUnavailable as exc:
-                raise ExecutorGone(
-                    f"could not finish durable reclaimed-scope cleanup: {exc}"
-                ) from exc
-            self._clear_owner(owner)
             return []
         was_present = owner.process is not None and proctree.same_process(owner.process)
         self._reclaim_owner(owner, why)

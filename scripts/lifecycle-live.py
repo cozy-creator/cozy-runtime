@@ -1132,7 +1132,8 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         intruder.returncode == 73
         and supervision.current is first
         and first.alive()
-        and proctree.cgroup_contains(first.cgroup, first.process),
+        and isinstance(first.scope, proctree.CgroupScope)
+        and proctree.cgroup_contains(first.scope, first.process),
         f"first pid {first.pid} remains the exact live cgroup owner",
     )
     refused = False
@@ -1346,14 +1347,15 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         device_process=lambda _pid: accel.ProcessMemory("absent", 0),
     )
     owner = OwnerRecord(
-        proctree.create_executor_cgroup(proctree.executor_cgroup_namespace(orphan_root))
+        proctree.create_executor_cgroup(proctree.executor_scope_namespace(orphan_root))
     )
+    assert isinstance(owner.scope, proctree.CgroupScope)
     leaderless._write_owner(owner)
     helper_file = orphan_root / "helper.pid"
     release_file = orphan_root / "release-leader"
     leader_code = (
         "import os,time,pathlib\n"
-        f"scope=pathlib.Path('/sys/fs/cgroup') / {owner.cgroup.relative_path.lstrip('/')!r}\n"
+        f"scope=pathlib.Path('/sys/fs/cgroup') / {owner.scope.relative_path.lstrip('/')!r}\n"
         "(scope/'cgroup.procs').write_text('0\\n')\n"
         "child=os.fork()\n"
         "if child == 0:\n"

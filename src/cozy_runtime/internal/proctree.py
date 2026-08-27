@@ -18,14 +18,18 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import os
 import secrets
 import signal
+import stat
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 
 PLATFORM = sys.platform
 
@@ -47,8 +51,8 @@ class ProcessTreeUnsupported(Exception):
         self.lane = lane
 
 
-class CgroupUnavailable(Exception):
-    """Linux cannot provide the executor subtree boundary it promised."""
+class ContainmentUnavailable(Exception):
+    """Linux cannot provide or prove an executor containment boundary."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +67,30 @@ class CgroupScope:
 
     relative_path: str
     inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessTreeScope:
+    """One first-party executor family in a positively proven container.
+
+    ``token`` is non-secret process identity.  It is one complete inherited environment
+    entry, never a substring marker.  This scope is weaker than a cgroup: deliberately
+    scrubbing the token and escaping both ancestry and process group can evade it, while a
+    same-UID process can deliberately replay it and be treated as owned.  It is lifecycle
+    containment for our own executor, not a hostile-code sandbox. A process that
+    deliberately scrubs the token, calls ``setsid``/double-forks, and escapes ancestry
+    before a census can evade recovery; a same-UID process can replay the token and be
+    treated as owned. Unlike cgroup v2, this scope provides no memory/OOM/resource
+    attribution and its repeated SIGSTOP census is convergent rather than kernel-atomic.
+    """
+
+    token: str
+
+
+ExecutorScope = CgroupScope | ProcessTreeScope
+
+_PROCESS_SCOPE_TOKEN_BYTES = 32
+_CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,10 +171,157 @@ def arm_subreaper() -> None:
     _prctl(_PR_SET_CHILD_SUBREAPER, 1)
 
 
+@dataclass(frozen=True, slots=True)
+class _CgroupMount:
+    root: Path
+    target: Path
+    options: frozenset[str]
+    controllers: frozenset[str]
+
+
+def _mount_path(value: str) -> Path:
+    """Decode mountinfo's four octal escapes; cgroup paths otherwise stay opaque."""
+    for escaped, plain in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        value = value.replace(escaped, plain)
+    return Path(value)
+
+
+def _cgroup_v1_mounts() -> tuple[_CgroupMount, ...]:
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError as exc:
+        raise ContainmentUnavailable("cannot read cgroup mount facts") from exc
+    mounts: list[_CgroupMount] = []
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if separator + 3 >= len(fields) or fields[separator + 1] != "cgroup":
+            continue
+        mounts.append(
+            _CgroupMount(
+                root=_mount_path(fields[3]),
+                target=_mount_path(fields[4]),
+                options=frozenset(fields[5].split(",")),
+                controllers=frozenset(fields[separator + 3].split(",")),
+            )
+        )
+    return tuple(mounts)
+
+
+def _inside_mount(mount: _CgroupMount, relative: Path) -> Path | None:
+    try:
+        suffix = relative.relative_to(mount.root)
+    except ValueError:
+        return None
+    return mount.target / suffix
+
+
+def _root_owned_container_marker() -> bool:
+    for marker in _CONTAINER_MARKERS:
+        try:
+            found = marker.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(found.st_mode) and found.st_uid == 0 and found.st_mode & 0o022 == 0:
+            return True
+    return False
+
+
+def _full_proc_visibility() -> bool:
+    """Require every same-UID process to expose stat and its complete environment."""
+    try:
+        entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+        if not entries or not Path("/proc/1/stat").is_file():
+            return False
+    except OSError:
+        return False
+    euid = os.geteuid()
+    for entry in entries:
+        try:
+            fields = _linux_stat(int(entry.name))
+            status = (entry / "status").read_text().splitlines()
+            uid = next(line for line in status if line.startswith("Uid:"))
+            if int(uid.split()[1]) == euid and fields[0] != "Z":
+                (entry / "environ").read_bytes()
+        except FileNotFoundError:
+            continue  # one birth ended during the census
+        except (OSError, StopIteration, ValueError):
+            return False
+    return True
+
+
+def _readonly_container_cgroup_v1() -> bool:
+    """Whether kernel facts prove the narrow first-party process-tree backend.
+
+    A marker alone proves little and a read-only cgroup alone can be an ordinary host.
+    Selection requires their conjunction, non-root execution, a genuine v1 membership for
+    every controller, read-only backing mounts, full same-UID proc visibility, and working
+    pidfds.  Unified v2 is checked by the caller first and never reaches this path.
+    """
+
+    if os.geteuid() == 0 or not _root_owned_container_marker():
+        return False
+    try:
+        memberships: list[tuple[frozenset[str], Path]] = []
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            hierarchy, controller_text, relative_text = line.split(":", 2)
+            if hierarchy == "0" and not controller_text:
+                return False
+            names = frozenset(item for item in controller_text.split(",") if item)
+            if not hierarchy.isdigit() or not names or not relative_text.startswith("/"):
+                return False
+            memberships.append((names, Path(relative_text)))
+    except (OSError, ValueError):
+        return False
+    if not memberships:
+        return False
+    mounts = _cgroup_v1_mounts()
+    readonly = getattr(os, "ST_RDONLY", 1)
+    for controllers, relative in memberships:
+        candidates = [
+            path
+            for mount in mounts
+            if controllers.issubset(mount.controllers)
+            if (path := _inside_mount(mount, relative)) is not None and path.is_dir()
+        ]
+        if len(candidates) != 1:
+            return False
+        try:
+            if not os.statvfs(candidates[0]).f_flag & readonly:
+                return False
+        except OSError:
+            return False
+    if not _full_proc_visibility():
+        return False
+    try:
+        signal_process(process_identity(os.getpid()), 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def create_executor_scope(namespace: str) -> ExecutorScope:
+    """Select and create the strongest proven executor scope on this Linux host."""
+    _linux_only("create_executor_scope")
+    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+        # Unified v2 always keeps the kernel scope path.  A read-only or undelegated v2
+        # hierarchy refuses in create_executor_cgroup; it never silently falls back.
+        return create_executor_cgroup(namespace)
+    if _readonly_container_cgroup_v1():
+        return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES))
+    raise ContainmentUnavailable(
+        "no writable cgroup-v2 delegation and the strict read-only-container cgroup-v1 "
+        "process-tree proof did not hold"
+    )
+
+
 def _cgroup_root() -> Path:
     root = Path("/sys/fs/cgroup")
     if not (root / "cgroup.controllers").is_file():
-        raise CgroupUnavailable("a writable unified cgroup-v2 hierarchy is required")
+        raise ContainmentUnavailable("a writable unified cgroup-v2 hierarchy is required")
     return root
 
 
@@ -155,32 +330,32 @@ def _own_cgroup_relative() -> str:
         entries = Path("/proc/self/cgroup").read_text().splitlines()
         relative = next(line.split("::", 1)[1] for line in entries if line.startswith("0::"))
     except (OSError, StopIteration, IndexError) as exc:
-        raise CgroupUnavailable("cannot resolve this worker's cgroup-v2 delegation") from exc
+        raise ContainmentUnavailable("cannot resolve this worker's cgroup-v2 delegation") from exc
     return "/" + relative.strip("/") if relative.strip("/") else "/"
 
 
 def _scope_path(scope: CgroupScope) -> Path:
     if not scope.relative_path.startswith("/") or ".." in Path(scope.relative_path).parts:
-        raise CgroupUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
+        raise ContainmentUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
     path = _cgroup_root() / scope.relative_path.lstrip("/")
     try:
         inode = path.stat().st_ino
     except FileNotFoundError as exc:
-        raise CgroupUnavailable(f"executor cgroup {scope.relative_path} is absent") from exc
+        raise ContainmentUnavailable(f"executor cgroup {scope.relative_path} is absent") from exc
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot inspect executor cgroup {scope.relative_path}: {exc}"
         ) from exc
     if inode != scope.inode:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"executor cgroup {scope.relative_path} was replaced: "
             f"expected inode {scope.inode}, found {inode}"
         )
     return path
 
 
-def executor_cgroup_namespace(worker_root: Path) -> str:
-    """Stable, opaque cgroup namespace for one worker root."""
+def executor_scope_namespace(worker_root: Path) -> str:
+    """Stable, opaque kernel-scope namespace for one worker root."""
     return hashlib.sha256(os.fsencode(str(worker_root.resolve()))).hexdigest()[:16]
 
 
@@ -188,9 +363,21 @@ def validate_executor_cgroup(scope: CgroupScope, namespace: str) -> None:
     """Refuse a durable record that could name another worker root's scope."""
     name = Path(scope.relative_path).name
     if not namespace or not name.startswith(f"cozy-executor-{namespace}-"):
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"executor cgroup {scope.relative_path!r} is outside namespace {namespace!r}"
         )
+
+
+def validate_executor_scope(scope: ExecutorScope, namespace: str) -> None:
+    if isinstance(scope, CgroupScope):
+        validate_executor_cgroup(scope, namespace)
+        return
+    if (
+        len(scope.token) != _PROCESS_SCOPE_TOKEN_BYTES * 2
+        or scope.token != scope.token.lower()
+        or any(char not in "0123456789abcdef" for char in scope.token)
+    ):
+        raise ContainmentUnavailable("process-tree scope token is not 64 lowercase hex")
 
 
 def create_executor_cgroup(namespace: str) -> CgroupScope:
@@ -199,14 +386,16 @@ def create_executor_cgroup(namespace: str) -> CgroupScope:
     root = _cgroup_root()
     parent = root / _own_cgroup_relative().lstrip("/")
     if not namespace or any(char not in "0123456789abcdef" for char in namespace):
-        raise CgroupUnavailable(f"invalid executor cgroup namespace {namespace!r}")
+        raise ContainmentUnavailable(f"invalid executor cgroup namespace {namespace!r}")
     path = parent / f"cozy-executor-{namespace}-{secrets.token_hex(8)}"
     try:
         path.mkdir(mode=0o700)
         required = ("cgroup.procs", "cgroup.events", "cgroup.freeze", "cgroup.kill")
         missing = [name for name in required if not (path / name).exists()]
         if missing:
-            raise CgroupUnavailable(f"executor cgroup {path} lacks required kernel files {missing}")
+            raise ContainmentUnavailable(
+                f"executor cgroup {path} lacks required kernel files {missing}"
+            )
         # Opening the two control files catches a non-delegated hierarchy now, before the
         # trampoline or any executor import exists.
         for name in ("cgroup.procs", "cgroup.freeze", "cgroup.kill"):
@@ -217,9 +406,9 @@ def create_executor_cgroup(namespace: str) -> CgroupScope:
     except BaseException as exc:
         with contextlib.suppress(OSError):
             path.rmdir()
-        if isinstance(exc, (CgroupUnavailable, ProcessTreeUnsupported)):
+        if isinstance(exc, (ContainmentUnavailable, ProcessTreeUnsupported)):
             raise
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot create delegated executor cgroup below {parent}: {exc}"
         ) from exc
 
@@ -231,11 +420,11 @@ def join_executor_cgroup(scope: CgroupScope) -> None:
     try:
         (path / "cgroup.procs").write_text("0\n")
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot join executor cgroup {scope.relative_path}: {exc}"
         ) from exc
     if _own_cgroup_relative() != scope.relative_path or _scope_path(scope) != path:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"joining executor cgroup {scope.relative_path} did not take effect"
         )
 
@@ -245,7 +434,7 @@ def _cgroup_event(path: Path, name: str) -> int:
         events = dict(line.split() for line in (path / "cgroup.events").read_text().splitlines())
         return int(events[name])
     except (OSError, KeyError, ValueError) as exc:
-        raise CgroupUnavailable(f"cannot read {name!r} from {path / 'cgroup.events'}") from exc
+        raise ContainmentUnavailable(f"cannot read {name!r} from {path / 'cgroup.events'}") from exc
 
 
 def _cgroup_processes(path: Path) -> set[ProcessIdentity]:
@@ -257,7 +446,7 @@ def _cgroup_processes(path: Path) -> set[ProcessIdentity]:
                 with contextlib.suppress(ProcessLookupError, ValueError):
                     found.add(process_identity(int(text)))
     except OSError as exc:
-        raise CgroupUnavailable(f"cannot enumerate executor cgroup {path}: {exc}") from exc
+        raise ContainmentUnavailable(f"cannot enumerate executor cgroup {path}: {exc}") from exc
     return found
 
 
@@ -269,18 +458,18 @@ def cgroup_contains(scope: CgroupScope, process: ProcessIdentity) -> bool:
 def executor_cgroup_exists(scope: CgroupScope) -> bool:
     """Whether the exact scope still exists; path reuse remains a typed failure."""
     if not scope.relative_path.startswith("/") or ".." in Path(scope.relative_path).parts:
-        raise CgroupUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
+        raise ContainmentUnavailable(f"invalid executor cgroup path {scope.relative_path!r}")
     path = _cgroup_root() / scope.relative_path.lstrip("/")
     try:
         inode = path.stat().st_ino
     except FileNotFoundError:
         return False
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot inspect executor cgroup {scope.relative_path}: {exc}"
         ) from exc
     if inode != scope.inode:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"executor cgroup {scope.relative_path} was replaced: "
             f"expected inode {scope.inode}, found {inode}"
         )
@@ -299,7 +488,7 @@ def freeze_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) -> set[
             time.sleep(0.01)
         return _cgroup_processes(path)
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot freeze executor cgroup {scope.relative_path}: {exc}"
         ) from exc
 
@@ -315,7 +504,7 @@ def kill_frozen_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) ->
                 raise TimeoutError(f"executor cgroup {scope.relative_path} remained populated")
             time.sleep(0.01)
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot reclaim executor cgroup {scope.relative_path}: {exc}"
         ) from exc
 
@@ -324,7 +513,7 @@ def remove_executor_cgroup(scope: CgroupScope) -> None:
     """Remove the exact, proven-empty scope and any empty descendant cgroups."""
     path = _scope_path(scope)
     if _cgroup_event(path, "populated"):
-        raise CgroupUnavailable(f"executor cgroup {scope.relative_path} is still populated")
+        raise ContainmentUnavailable(f"executor cgroup {scope.relative_path} is still populated")
     try:
         descendants = sorted(
             (item for item in path.rglob("*") if item.is_dir()),
@@ -335,9 +524,247 @@ def remove_executor_cgroup(scope: CgroupScope) -> None:
             descendant.rmdir()
         path.rmdir()
     except OSError as exc:
-        raise CgroupUnavailable(
+        raise ContainmentUnavailable(
             f"cannot remove executor cgroup {scope.relative_path}: {exc}"
         ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessSnapshot:
+    identity: ProcessIdentity
+    state: str
+    parent_pid: int
+    process_group: int
+    scope_token: bool
+
+
+def _open_pidfd(process: ProcessIdentity) -> int:
+    """Open a kernel handle for one exact birth and recheck after the open."""
+    _linux_only("pidfd_open")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        pidfd_open = libc.pidfd_open
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc has no pidfd_open") from exc
+    pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+    pidfd_open.restype = ctypes.c_int
+    descriptor = int(pidfd_open(process.pid, 0))
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), process.pid)
+    if not same_process(process):
+        os.close(descriptor)
+        raise ProcessLookupError(process.pid)
+    return descriptor
+
+
+def signal_process(process: ProcessIdentity, sig: int) -> None:
+    """Signal one exact process birth through a pidfd, never a reusable PID."""
+    descriptor = _open_pidfd(process)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            pidfd_send_signal = libc.pidfd_send_signal
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "libc has no pidfd_send_signal") from exc
+        pidfd_send_signal.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        pidfd_send_signal.restype = ctypes.c_int
+        if int(pidfd_send_signal(descriptor, int(sig), None, 0)) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), process.pid)
+    finally:
+        os.close(descriptor)
+
+
+def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
+    """One full proc census, matching the scope as one complete environment entry."""
+    _linux_only("process_tree_census")
+    expected = f"{EXECUTOR_SCOPE_ENV}={scope.token}".encode()
+    euid = os.geteuid()
+    snapshots: dict[int, _ProcessSnapshot] = {}
+    try:
+        entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+    except OSError as exc:
+        raise ContainmentUnavailable("cannot enumerate /proc for executor reclaim") from exc
+    for entry in entries:
+        pid = int(entry.name)
+        try:
+            fields = _linux_stat(pid)
+            status = (entry / "status").read_text().splitlines()
+            uid = next(line for line in status if line.startswith("Uid:"))
+            if int(uid.split()[1]) != euid:
+                continue
+            state = fields[0]
+            # Linux exposes no useful environment for a zombie. It cannot fork or hold a
+            # device context; an adopted same-UID zombie is included below by parentage so
+            # the subreaper can still reap it.
+            if state in {"X", "x", "Z"}:
+                environment = []
+            else:
+                try:
+                    environment = (entry / "environ").read_bytes().split(b"\0")
+                except PermissionError:
+                    # A SIGKILLed task can shed its mm (and therefore environ) before its
+                    # proc state reaches Z/X. Empty cmdline proves that exit transition;
+                    # a live non-dumpable task remains unreadable and fails closed.
+                    if (entry / "cmdline").read_bytes():
+                        raise
+                    environment = []
+            snapshots[pid] = _ProcessSnapshot(
+                identity=ProcessIdentity(pid, int(fields[19])),
+                state=state,
+                parent_pid=int(fields[1]),
+                process_group=int(fields[2]),
+                scope_token=expected in environment,
+            )
+        except FileNotFoundError:
+            continue
+        except (OSError, StopIteration, IndexError, ValueError) as exc:
+            raise ContainmentUnavailable(
+                f"cannot read complete same-UID proc identity for pid {pid} "
+                f"state={fields[0]} ppid={fields[1]} pgrp={fields[2]}"
+            ) from exc
+    return snapshots
+
+
+def _process_tree_census(
+    scope: ProcessTreeScope,
+    leader: ProcessIdentity | None,
+    known: set[ProcessIdentity],
+    *,
+    worker_pid: int,
+) -> dict[ProcessIdentity, str]:
+    snapshots = _same_uid_processes(scope)
+    owned: set[ProcessIdentity] = {row.identity for row in snapshots.values() if row.scope_token}
+    for process in known:
+        row = snapshots.get(process.pid)
+        if row is not None and row.identity == process:
+            owned.add(process)
+    if leader is not None:
+        row = snapshots.get(leader.pid)
+        if row is not None and row.identity == leader:
+            owned.add(leader)
+
+    while True:
+        pids = {process.pid for process in owned}
+        expanded = {
+            row.identity
+            for row in snapshots.values()
+            if row.parent_pid in pids
+            or (row.parent_pid == worker_pid and (row.scope_token or row.state == "Z"))
+        }
+        group_id = leader.pid if leader is not None else 0
+        group_is_pinned = group_id > 0 and any(
+            snapshots.get(process.pid) is not None
+            and snapshots[process.pid].process_group == group_id
+            for process in owned
+        )
+        if group_is_pinned:
+            expanded.update(
+                row.identity for row in snapshots.values() if row.process_group == group_id
+            )
+        before = len(owned)
+        owned.update(expanded)
+        if len(owned) == before:
+            break
+    return {
+        process: snapshots[process.pid].state
+        for process in owned
+        if snapshots.get(process.pid) is not None and snapshots[process.pid].identity == process
+    }
+
+
+def process_scope_contains(scope: ProcessTreeScope, process: ProcessIdentity) -> bool:
+    row = _same_uid_processes(scope).get(process.pid)
+    return (
+        row is not None
+        and row.identity == process
+        and row.scope_token
+        and row.process_group == process.pid
+    )
+
+
+def wait_process_stopped(process: ProcessIdentity, *, seconds: float = 10.0) -> None:
+    """Wait for the trampoline's pre-import self-stop without reaping the child."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if not same_process(process):
+            raise ProcessLookupError(process.pid)
+        waited, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+        if waited:
+            if os.WIFSTOPPED(status):
+                return
+            raise ProcessLookupError(process.pid)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"process-tree trampoline {process.pid} did not stop before import")
+        time.sleep(0.01)
+
+
+def freeze_process_tree(
+    scope: ProcessTreeScope,
+    leader: ProcessIdentity | None,
+    known: set[ProcessIdentity],
+    *,
+    worker_pid: int,
+    seconds: float = 10.0,
+) -> set[ProcessIdentity]:
+    """Converge on two equal all-stopped first-party descendant censuses."""
+    deadline = time.monotonic() + seconds
+    stable: frozenset[ProcessIdentity] | None = None
+    captured = set(known)
+    while True:
+        observed = _process_tree_census(scope, leader, captured, worker_pid=worker_pid)
+        captured.update(observed)
+        for process, state in observed.items():
+            if state not in {"T", "t", "Z"}:
+                with contextlib.suppress(ProcessLookupError):
+                    signal_process(process, signal.SIGSTOP)
+        census = _process_tree_census(scope, leader, captured, worker_pid=worker_pid)
+        captured.update(census)
+        identities = frozenset(census)
+        stopped = all(state in {"T", "t", "Z"} for state in census.values())
+        if stopped and identities == stable:
+            return captured
+        stable = identities if stopped else None
+        if time.monotonic() >= deadline:
+            states = {process.pid: state for process, state in census.items()}
+            raise TimeoutError(f"could not freeze first-party process tree: states={states}")
+        time.sleep(0.01)
+
+
+def kill_process_tree(processes: set[ProcessIdentity]) -> None:
+    """Kill each frozen exact birth through its pidfd."""
+    for process in processes:
+        if process_state(process) != "Z":
+            with contextlib.suppress(ProcessLookupError):
+                signal_process(process, signal.SIGKILL)
+
+
+def process_scope_processes(scope: ProcessTreeScope) -> set[ProcessIdentity]:
+    return {row.identity for row in _same_uid_processes(scope).values() if row.scope_token}
+
+
+def executor_scope_exists(scope: ExecutorScope) -> bool:
+    if isinstance(scope, CgroupScope):
+        return executor_cgroup_exists(scope)
+    return bool(process_scope_processes(scope))
+
+
+def remove_executor_scope(scope: ExecutorScope) -> None:
+    if isinstance(scope, CgroupScope):
+        remove_executor_cgroup(scope)
+        return
+    leftovers = process_scope_processes(scope)
+    if leftovers:
+        births = sorted(leftovers, key=lambda process: process.pid)
+        raise ContainmentUnavailable(
+            f"cannot clear process-tree scope with live token births {births}"
+        )
 
 
 def acquire_worker_root_lease(path: Path) -> WorkerRootLease:
