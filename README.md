@@ -325,3 +325,6 @@ TensorFS commits the snapshot and retains its root, while Runtime journals the e
 receipt and recovers the commit-before-journal crash gap by transaction id. Rev 5 carries the
 Runtime receipt in `AttemptOutcomeBody/3` and one authenticated replayable finalize exchange
 adopts or abandons its retained root; `AttemptOutcomeAck` remains acknowledgement only.
+The adopted private root is `artifact-scratch-<sha256>` over a length-framed tuple of owner
+scope, request id, and output slot (`artifact_transactions.scratch_root_id`); it is deliberately
+not another canonical document kind under #616's identity-kind freeze.

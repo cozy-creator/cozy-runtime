@@ -47,9 +47,6 @@ from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.protocol import artifact_limits, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-DECLARATION_FORMAT = "cozy.runtime.ArtifactDeclaration/1"
-TRANSACTION_FORMAT = "cozy.runtime.ArtifactTransactionIdentity/1"
-SCRATCH_ROOT_FORMAT = "cozy.runtime.ArtifactScratchRootIdentity/1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _STAGED_NAME = re.compile(r"^artifact-[0-9a-f]{64}\.(declaration|receipt)$")
 
@@ -279,7 +276,6 @@ def prepare_declaration(
     targets = [_target(name, target, aliases) for name, target in sorted(request.targets.items())]
     configs = [_config(name, config, aliases) for name, config in sorted(request.configs.items())]
     document = {
-        "format": DECLARATION_FORMAT,
         "output_slot": request.output_slot,
         "sources": sources,
         "configs": configs,
@@ -308,16 +304,13 @@ def transaction_id(
         raise ArtifactTransactionError(
             "artifact_identity", "InvocationSpec identity is not one lowercase sha256 digest"
         )
-    data = canonical.write(
-        {
-            "format": TRANSACTION_FORMAT,
-            "owner_authority_scope": owner_authority_scope,
-            "request_id": request_id,
-            "invocation_spec_digest": invocation_spec_digest,
-            "output_slot": output_slot,
-        }
+    return _tuple_id(
+        b"cozy-runtime-artifact-transaction-v1",
+        owner_authority_scope,
+        request_id,
+        invocation_spec_digest,
+        output_slot,
     )
-    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def scratch_root_id(owner_authority_scope: str, request_id: str, output_slot: str) -> str:
@@ -326,15 +319,27 @@ def scratch_root_id(owner_authority_scope: str, request_id: str, output_slot: st
         raise ArtifactTransactionError(
             "artifact_scratch_identity", "owner scope, request id, and output slot are required"
         )
-    data = canonical.write(
-        {
-            "format": SCRATCH_ROOT_FORMAT,
-            "owner_authority_scope": owner_authority_scope,
-            "request_id": request_id,
-            "output_slot": output_slot,
-        }
+    return (
+        "artifact-scratch-"
+        + _tuple_id(
+            b"cozy-runtime-artifact-scratch-v1",
+            owner_authority_scope,
+            request_id,
+            output_slot,
+        )[7:]
     )
-    return "artifact-scratch-" + hashlib.sha256(data).hexdigest()
+
+
+def _tuple_id(domain: bytes, *fields: str) -> str:
+    """Length-framed protocol-derived id; not a new canonical document kind (#616)."""
+    digest = hashlib.sha256()
+    digest.update(len(domain).to_bytes(4, "big"))
+    digest.update(domain)
+    for field in fields:
+        encoded = field.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return "sha256:" + digest.hexdigest()
 
 
 def stage_exact(root: Path, suffix: str, data: bytes) -> tuple[str, str]:
@@ -776,12 +781,12 @@ def validate_declaration(data: bytes) -> dict[str, Any]:
         raise ArtifactTransactionError(exc.code, exc.detail) from exc
     document = _closed(
         value,
-        frozenset({"format", "output_slot", "sources", "configs", "targets"}),
+        frozenset({"output_slot", "sources", "configs", "targets"}),
         "ArtifactDeclaration",
     )
-    if document["format"] != DECLARATION_FORMAT or not isinstance(document["output_slot"], str):
+    if not isinstance(document["output_slot"], str):
         raise ArtifactTransactionError(
-            "artifact_declaration_schema", "ArtifactDeclaration has the wrong format or slot"
+            "artifact_declaration_schema", "ArtifactDeclaration has an invalid output slot"
         )
     sources = document["sources"]
     if not isinstance(sources, list) or not sources:
