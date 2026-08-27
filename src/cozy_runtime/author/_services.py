@@ -77,6 +77,9 @@ class Attempt:
     spool: Path
     max_output_bytes: int = MAX_OUTPUT_BYTES
     closed: bool = False
+    entered: bool = False
+    """Whether the endpoint handler itself was entered. Pre-entry refusals never poison a
+    healthy executor; one structural bit is safer than duplicating refusal-code lists."""
     pending: dict[str, Asset] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     ring: EventRing = field(default_factory=EventRing)

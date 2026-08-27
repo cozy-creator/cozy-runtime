@@ -25,13 +25,17 @@ spool.
 from __future__ import annotations
 
 import hashlib
+import io
+import os
 import re
+import stat
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -41,6 +45,15 @@ class GrantRefusal(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+#: How a granted input TREE is spelled on a DeliveryGrant. The `input_id` carries the ref
+#: the job's typed field names, so the mapping from field value to grant is the ref itself.
+TREE_PREFIX = "tree:"
+
+#: The one input_id that is not an asset: the request DOCUMENT itself rides the grant as an
+#: input, which is why the payload and the assets share one authorization table and reader.
+PAYLOAD_INPUT = "payload"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,12 +149,8 @@ class Authorizer:
         """A `file://` grant addresses a declared root or it addresses nothing here."""
         if not self.roots or not url.startswith("file://"):
             return
-        target = Path(urlparse(url).path)
-        for root in self.roots:
-            try:
-                target.relative_to(Path(root))
-            except ValueError:
-                continue
+        target = _local(url, "")
+        if _select_root(target, self.roots) is not None:
             return
         event = {"call": name, "method": method, "url": url[:200], "why": "outside every root"}
         self.refusals.append(event)
@@ -209,14 +218,20 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
     is unfetchable, and access to an id the spec never declared is authority nobody's
     digest covers.
     """
-    if grant.invocation_spec_digest and bytes(grant.invocation_spec_digest) != invocation_digest:
+    subject = bytes(grant.invocation_spec_digest)
+    if (
+        len(subject) != hashlib.sha256().digest_size
+        or len(invocation_digest) != hashlib.sha256().digest_size
+        or subject != invocation_digest
+    ):
         raise GrantRefusal(
             "grant_subject_mismatch",
-            "the delivery grant names a different invocation_spec_digest than this attempt; a "
-            "grant serves exactly one invocation and a refresh can change access only",
+            "the delivery grant must name this attempt's exact 32-byte "
+            "invocation_spec_digest; a grant serves exactly one invocation and a refresh "
+            "can change access only",
         )
-    spec_inputs = {str(row["input_id"]): row for row in spec.get("inputs", ())}
-    grant_inputs = {entry.input_id: entry.url for entry in grant.inputs}
+    spec_inputs = _index_spec_bindings(spec.get("inputs", ()), "input_id", "spec inputs")
+    grant_inputs = _index_access(grant.inputs, "input_id", "grant inputs")
     if set(spec_inputs) != set(grant_inputs):
         raise GrantRefusal(
             "grant_binding_mismatch",
@@ -224,8 +239,8 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             f"carries access for {sorted(grant_inputs) or 'none'}; the sets must agree "
             "exactly",
         )
-    spec_outputs = {str(row["output_id"]): row for row in spec.get("outputs", ())}
-    grant_outputs = {entry.output_id: entry.url for entry in grant.outputs}
+    spec_outputs = _index_spec_bindings(spec.get("outputs", ()), "output_id", "spec outputs")
+    grant_outputs = _index_access(grant.outputs, "output_id", "grant outputs")
     if set(spec_outputs) != set(grant_outputs):
         raise GrantRefusal(
             "grant_binding_mismatch",
@@ -238,15 +253,36 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
         expires_at_unix=int(grant.expires_at_unix),
         credential_epoch=int(grant.credential.epoch),
     )
-    for order, (input_id, row) in enumerate(sorted(spec_inputs.items())):
+    for input_id, row in spec_inputs.items():
         spelled = str(row.get("digest", ""))
+        carried_order = int(row.get("order", 0))
+        is_tree = input_id.startswith(TREE_PREFIX)
+        if not is_tree and (
+            not spelled.startswith("sha256:")
+            or len(spelled) != len("sha256:") + hashlib.sha256().digest_size * 2
+        ):
+            raise GrantRefusal(
+                "grant_input_identity",
+                f"input {input_id!r} does not carry one exact sha256 identity",
+            )
+        if not is_tree and int(row.get("length", 0)) < 0:
+            raise GrantRefusal(
+                "grant_input_identity",
+                f"input {input_id!r} does not carry one exact nonnegative length",
+            )
+        try:
+            digest = bytes.fromhex(spelled[7:]) if spelled.startswith("sha256:") else b""
+        except ValueError as exc:
+            raise GrantRefusal(
+                "grant_input_identity", f"input {input_id!r} has a malformed sha256 digest"
+            ) from exc
         bound.inputs[input_id] = BoundInput(
             input_id=input_id,
             url=grant_inputs[input_id],
-            digest=bytes.fromhex(spelled[7:]) if spelled.startswith("sha256:") else b"",
+            digest=digest,
             length=int(row.get("length", 0)),
             kind_mime=str(row.get("kind_mime", "")),
-            order=int(row.get("order", order)),
+            order=carried_order,
         )
     for output_id, row in spec_outputs.items():
         bound.outputs[output_id] = BoundOutput(
@@ -258,61 +294,129 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
     return bound
 
 
+def _index_spec_bindings(rows: Any, field_name: str, what: str) -> dict[str, Mapping[str, Any]]:
+    """Index one canonical binding set without allowing a last-wins interpretation."""
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for position, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise GrantRefusal(
+                "grant_binding_ambiguous", f"{what}[{position}] is not a binding object"
+            )
+        identity = str(row.get(field_name, ""))
+        if not identity or identity in indexed:
+            problem = "empty" if not identity else "repeated"
+            raise GrantRefusal(
+                "grant_binding_ambiguous",
+                f"{what} carry an {problem} {field_name} at position {position}; every "
+                "binding identity must be non-empty and unique",
+            )
+        indexed[identity] = row
+    return indexed
+
+
+def _index_access(rows: Any, field_name: str, what: str) -> dict[str, str]:
+    """Index one protobuf access set without silently collapsing duplicate authority."""
+    indexed: dict[str, str] = {}
+    for position, row in enumerate(rows):
+        identity = str(getattr(row, field_name, ""))
+        if not identity or identity in indexed:
+            problem = "empty" if not identity else "repeated"
+            raise GrantRefusal(
+                "grant_binding_ambiguous",
+                f"{what} carry an {problem} {field_name} at position {position}; every "
+                "access identity must be non-empty and unique",
+            )
+        indexed[identity] = str(row.url)
+    return indexed
+
+
 # --------------------------------------------------------------------------- grant I/O
 
 
+def _parse_grant_url(url: str) -> ParseResult:
+    """Parse untrusted grant text without leaking parser exceptions into admission."""
+    try:
+        return urlparse(url)
+    except ValueError as exc:
+        raise GrantRefusal("grant_transport", f"the grant URL is malformed ({exc})") from exc
+
+
 def _local(url: str, base: str) -> Path:
+    """Resolve the exact local target used by both authorization and I/O.
+
+    `Path.relative_to` on a lexical path admits `root/../secret`, and opening the raw path
+    after checking a resolved one would restore the same escape. Returning only the
+    canonical target makes traversal and existing symlink escapes visible to the root
+    fence and makes the later open spend that same address.
+    """
     absolute = url if "://" in url else base.rstrip("/") + "/" + url.lstrip("/")
-    parsed = urlparse(absolute)
+    parsed = _parse_grant_url(absolute)
     if parsed.scheme != "file":
         raise GrantRefusal(
             "grant_transport",
             f"{parsed.scheme or 'relative'}:// is not a local grant URL; an https grant is "
             "fetched through the egress boundary (`internal/egress.py`), never opened here",
         )
-    return Path(parsed.path)
+    return Path(parsed.path).resolve()
 
 
-def _read_granted(url: str, base: str, *, declared: int, policy: Any, what: str) -> bytes:
-    """The ONE way a granted object's bytes enter this process (cr-012).
+def _select_root(path: Path, roots: tuple[str, ...]) -> tuple[Path, Path] | None:
+    """Return one declared root and the path relative to it, if any."""
+    for declared in roots:
+        root = Path(declared).resolve()
+        try:
+            return root, path.relative_to(root)
+        except ValueError:
+            continue
+    return None
 
-    Two transports and one reader. `file://` is the local deployment's own CAS or spool;
-    `https://` goes through the egress boundary, which re-validates every redirect hop.
-    Both land in `read_bounded`, which holds the stream to the smaller of the grant's
-    declared length and the deployment cap — there is deliberately no second downloader,
-    because "two downloaders and only one had the check" is the failure this shape exists
-    against.
+
+def _open_local_grant(path: Path, auth: Authorizer, absolute: str, input_id: str) -> int:
+    """Authorize and open one local grant beneath a held declared-root descriptor.
+
+    The root fd is opened before authorization.  A parent renamed to a symlink after the
+    authorization check therefore cannot redirect the later read: every component is
+    walked relative to that held directory with no-follow semantics.
     """
-    from cozy_runtime.internal import egress
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not auth.roots:
+        auth.authorize("grant_input_read", "GET", absolute, {"input_id": input_id})
+        return os.open(path, os.O_RDONLY | nofollow)
 
-    absolute = url if "://" in url else base.rstrip("/") + "/" + url.lstrip("/")
-    if urlparse(absolute).scheme == "file":
-        path = _local(url, base)
-        with open(path, "rb") as handle:
-            return egress.read_bounded(
-                iter(lambda: handle.read(egress.CHUNK), b""),
-                declared=declared,
-                cap=policy.max_bytes,
-                what=what,
-            )
-    if policy is None or not policy.allowed_hosts:
+    selected = _select_root(path, auth.roots)
+    if selected is None:
+        # Preserve the closed-table refusal event and its stable typed code.
+        auth.authorize("grant_input_read", "GET", absolute, {"input_id": input_id})
         raise GrantRefusal(
-            "grant_transport",
-            f"{what}: the grant names {absolute[:80]} and this deployment declares no "
-            "allowed egress hosts. The allowlist is a deployment-wide declaration and "
-            "nothing widens it at request time, so a remote grant is unfetchable here",
+            "grant_path_outside_roots", f"input {input_id!r} is outside every declared root"
         )
-    return egress.fetch(absolute, policy, declared=declared, what=what)
+
+    root, relative = selected
+    held: list[int] = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)]
+    try:
+        auth.authorize("grant_input_read", "GET", absolute, {"input_id": input_id})
+        for position, component in enumerate(relative.parts):
+            flags = os.O_RDONLY | nofollow
+            if position < len(relative.parts) - 1:
+                flags |= os.O_DIRECTORY
+            held.append(os.open(component, flags, dir_fd=held[-1]))
+        return held.pop()
+    finally:
+        for descriptor in reversed(held):
+            os.close(descriptor)
 
 
-def expired(grant: BoundGrant, now: float | None = None) -> bool:
-    at = time.time() if now is None else now
-    return bool(grant.expires_at_unix) and grant.expires_at_unix < at
-
-
-def read_input(grant: BoundGrant, input_id: str, auth: Authorizer, policy: Any = None) -> bytes:
-    """One bound input, verified against the SPEC's digest and length (the grant carries
-    access only, #439)."""
+def _transfer_granted(
+    grant: BoundGrant,
+    entry: BoundInput,
+    auth: Authorizer,
+    sink: Any,
+    *,
+    policy: Any,
+    cap: int,
+    prefix_bytes: int,
+) -> Any:
+    """Authorize, stream, measure and verify one exact bound input."""
     from cozy_runtime.internal import egress
 
     if expired(grant):
@@ -321,7 +425,81 @@ def read_input(grant: BoundGrant, input_id: str, auth: Authorizer, policy: Any =
             f"the delivery grant expired at {grant.expires_at_unix}; a resolver fallback is "
             "a NEW attempt, never a patch to this one",
         )
-    policy = policy or egress.EgressPolicy()
+    absolute = (
+        entry.url
+        if "://" in entry.url
+        else grant.file_base_url.rstrip("/") + "/" + entry.url.lstrip("/")
+    )
+    local = _parse_grant_url(absolute).scheme == "file"
+    local_path = _local(entry.url, grant.file_base_url) if local else None
+    if local_path is not None:
+        absolute = f"file://{local_path}"
+    try:
+        if local:
+            assert local_path is not None
+            try:
+                descriptor = _open_local_grant(local_path, auth, absolute, entry.input_id)
+            except OSError as exc:
+                raise GrantRefusal(
+                    "input_not_a_file",
+                    f"{entry.input_id}: the grant does not name an openable regular file",
+                ) from exc
+            with os.fdopen(descriptor, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise GrantRefusal(
+                        "input_not_a_file",
+                        f"{entry.input_id}: the grant does not name a regular file",
+                    )
+                receipt = egress.copy_bounded(
+                    iter(lambda: handle.read(egress.CHUNK), b""),
+                    sink,
+                    expected_length=entry.length,
+                    cap=cap,
+                    prefix_bytes=prefix_bytes,
+                    what=f"input {entry.input_id!r}",
+                )
+        else:
+            auth.authorize("grant_input_fetch", "GET", absolute, {"input_id": entry.input_id})
+            if policy is None or not policy.allowed_hosts:
+                raise GrantRefusal(
+                    "grant_transport",
+                    f"input {entry.input_id!r}: this deployment declares no allowed egress hosts",
+                )
+            receipt = egress.fetch_into(
+                absolute,
+                policy,
+                sink,
+                expected_length=entry.length,
+                cap=cap,
+                prefix_bytes=prefix_bytes,
+                what=f"input {entry.input_id!r}",
+            )
+    except egress.EgressRefusal as exc:
+        raise GrantRefusal(exc.code, exc.detail) from exc
+    if receipt.sha256 != entry.digest:
+        raise GrantRefusal(
+            "input_digest_mismatch",
+            f"{entry.input_id}: content digest disagrees with the invocation spec — a "
+            "grant never bypasses the local bytes check",
+        )
+    return receipt
+
+
+def expired(grant: BoundGrant, now: float | None = None) -> bool:
+    at = time.time() if now is None else now
+    return bool(grant.expires_at_unix) and grant.expires_at_unix < at
+
+
+def read_input(
+    grant: BoundGrant,
+    input_id: str,
+    auth: Authorizer,
+    policy: Any = None,
+    *,
+    cap: int,
+) -> bytes:
+    """One bound input, verified against the SPEC's digest and length (the grant carries
+    access only, #439)."""
     entry = grant.inputs.get(input_id)
     if entry is None:
         raise GrantRefusal(
@@ -329,48 +507,10 @@ def read_input(grant: BoundGrant, input_id: str, auth: Authorizer, policy: Any =
             f"no bound input {input_id!r} (this attempt has "
             f"{', '.join(sorted(grant.inputs)) or 'none'})",
         )
-    url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
-    auth.authorize(
-        "grant_input_read" if url.startswith("file://") else "grant_input_fetch",
-        "GET",
-        url,
-        {"input_id": input_id},
-    )
-    try:
-        data = _read_granted(
-            entry.url,
-            grant.file_base_url,
-            declared=int(entry.length),
-            policy=policy,
-            what=f"input {input_id!r}",
-        )
-    except egress.EgressRefusal as exc:
-        raise GrantRefusal(exc.code, exc.detail) from exc
-    if entry.length and len(data) != entry.length:
-        raise GrantRefusal(
-            "input_length_mismatch",
-            f"{input_id}: the spec declares {entry.length} B, read {len(data)} B",
-        )
-    if entry.digest and hashlib.sha256(data).digest() != entry.digest:
-        raise GrantRefusal(
-            "input_digest_mismatch",
-            f"{input_id}: content digest disagrees with the invocation spec — a grant never "
-            "bypasses the local bytes check",
-        )
-    return data
+    sink = io.BytesIO()
+    _transfer_granted(grant, entry, auth, sink, policy=policy, cap=cap, prefix_bytes=0)
+    return sink.getvalue()
 
-
-#: How a granted input TREE is spelled on a DeliveryGrant. The `input_id` carries the ref
-#: the job's typed field names, so the mapping from field value to grant is the ref itself.
-TREE_PREFIX = "tree:"
-
-#: The one input_id that is not an asset: the request DOCUMENT itself rides the grant as an
-#: input, which is why the payload and the assets share one authorization table and one
-#: bounded reader. It is excluded from asset hydration by name because it is the only
-#: reserved id there is (§1.3's payload/asset split, cr-009's 64 KiB seam law: control goes
-#: through the frame, DATA goes through the spool, and the seam is what makes them different
-#: things rather than one field that got large).
-PAYLOAD_INPUT = "payload"
 
 #: A conservative name for a spooled input. The input_id is a FIELD PATH the caller can
 #: influence through list indices, so it never reaches the filesystem uninspected.
@@ -418,36 +558,74 @@ def hydrate_inputs(
         )
     out: dict[str, Any] = {}
     root = spool / "inputs"
-    for order, entry in enumerate(entries):
-        if entry.length and int(entry.length) > max_bytes:
-            raise GrantRefusal(
-                "input_over_cap",
-                f"input {entry.input_id!r} declares {entry.length} B and this deployment "
-                f"admits {max_bytes} B per input. The DECLARED length refuses before a byte "
-                "moves; the bytes are held to the same bound on the way in",
+    published: list[Path] = []
+    complete = False
+    try:
+        for position, entry in enumerate(entries):
+            if int(entry.length) > max_bytes:
+                raise GrantRefusal(
+                    "input_over_cap",
+                    f"input {entry.input_id!r} declares {entry.length} B and this deployment "
+                    f"admits {max_bytes} B per input. The DECLARED length refuses before a "
+                    "byte moves; the bytes are held to the same bound on the way in",
+                )
+            root.mkdir(parents=True, exist_ok=True)
+            local = root / f"{position:03d}-{_SAFE.sub('_', entry.input_id)[:96]}"
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w+b", dir=root, prefix=f".{position:03d}-", delete=False
+                ) as sink:
+                    temporary = Path(sink.name)
+                    receipt = _transfer_granted(
+                        grant,
+                        entry,
+                        auth,
+                        sink,
+                        policy=policy,
+                        cap=max_bytes,
+                        prefix_bytes=SNIFF_BYTES,
+                    )
+                declared = normalize(entry.kind_mime)
+                actual = sniff(receipt.prefix)
+                if declared and actual and declared != actual:
+                    raise GrantRefusal(
+                        "input_media_type",
+                        f"input {entry.input_id!r} is declared {declared!r} and its bytes are "
+                        f"{actual!r}. The declaration is a claim by whoever minted the grant; "
+                        "the signature is what the object is, and a mislabelled input refuses "
+                        "rather than reaching a decoder under a type nobody agreed to",
+                    )
+                if declared.startswith(("image/", "video/", "audio/")) and not actual:
+                    raise GrantRefusal(
+                        "input_media_type",
+                        f"input {entry.input_id!r} is declared {declared!r}, but its bytes "
+                        "have no recognised media signature. A typed media declaration is "
+                        "a claim, not a substitute for what the bytes are",
+                    )
+                temporary.chmod(0o444)
+                os.link(temporary, local)
+                published.append(local)
+                temporary.unlink()
+                temporary = None
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            out[entry.input_id] = GrantedInput(
+                input_id=entry.input_id,
+                local=local,
+                media_type=actual,
+                digest="sha256:" + receipt.sha256.hex(),
+                length=receipt.length,
+                order=int(entry.order),
             )
-        data = read_input(grant, entry.input_id, auth, policy)
-        declared = normalize(entry.kind_mime)
-        actual = sniff(data[:SNIFF_BYTES])
-        if declared and actual and declared != actual:
-            raise GrantRefusal(
-                "input_media_type",
-                f"input {entry.input_id!r} is declared {declared!r} and its bytes are "
-                f"{actual!r}. The declaration is a claim by whoever minted the grant; the "
-                "signature is what the object is, and a mislabelled input refuses rather "
-                "than reaching a decoder under a type nobody agreed to",
-            )
-        root.mkdir(parents=True, exist_ok=True)
-        local = root / f"{order:03d}-{_SAFE.sub('_', entry.input_id)[:96]}"
-        local.write_bytes(data)
-        out[entry.input_id] = GrantedInput(
-            input_id=entry.input_id,
-            local=local,
-            media_type=actual or declared,
-            digest="sha256:" + entry.digest.hex() if entry.digest else "",
-            length=len(data),
-            order=int(entry.order) or order,
-        )
+        complete = True
+    except OSError as exc:
+        raise GrantRefusal("input_spool_io", f"input spool publication failed: {exc}") from exc
+    finally:
+        if not complete:
+            for path in published:
+                path.unlink(missing_ok=True)
     return out
 
 

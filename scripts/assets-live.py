@@ -15,6 +15,7 @@ hydration, the real executor and the real endpoint, and prints numbers.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -154,7 +155,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     import dataclasses
 
     from cozy_runtime.internal.config import read_config
-    from cozy_runtime.internal.local import LocalRequest, run_slice
+    from cozy_runtime.internal.local import LocalInput, LocalRequest, run_slice
     from cozy_runtime.internal.worker.session import WorkerOptions
 
     spec = json.loads(spec_path.read_text())
@@ -218,7 +219,10 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
             payload=spec["payload"],
             outputs=tuple(spec.get("outputs", ("image",))),
             request_id=spec["request_id"],
-            inputs=spec.get("inputs", {}),
+            inputs={
+                input_id: LocalInput(str(row["source"]), int(row.get("order", 0)))
+                for input_id, row in spec.get("inputs", {}).items()
+            },
         ),
         [spec["binding"]],
         workspace=workspace,
@@ -254,9 +258,9 @@ def roundtrip() -> None:
             "binding": binding(),
             "payload": {"photo": "in:photo", "refs": ["in:ref0", "in:ref1"], "scale": 2},
             "inputs": {
-                "photo": str(files["photo"]),
-                "refs.0": str(files["ref0"]),
-                "refs.1": str(files["ref1"]),
+                "photo": {"source": str(files["photo"]), "order": 0},
+                "refs.0": {"source": str(files["ref0"]), "order": 0},
+                "refs.1": {"source": str(files["ref1"]), "order": 1},
             },
             "request_id": "cr012-roundtrip",
         },
@@ -329,7 +333,7 @@ def kill() -> None:
             # real handler work, so the kill lands INSIDE the attempt rather than racing a
             # handler that already finished. The input is hydrated before any of it runs.
             "payload": {"photo": "in:photo", "scale": 1},
-            "inputs": {"photo": str(files["huge"])},
+            "inputs": {"photo": {"source": str(files["huge"]), "order": 0}},
             "request_id": "cr012-kill",
             "kill_after": 0.25,
         },
@@ -385,7 +389,7 @@ def arms() -> None:
         {
             "binding": binding(max_input_bytes=64 << 10),
             "payload": {"photo": "in:photo", "scale": 2},
-            "inputs": {"photo": str(files["huge"])},
+            "inputs": {"photo": {"source": str(files["huge"]), "order": 0}},
             "request_id": "cr012-oversize",
         },
     )
@@ -410,7 +414,7 @@ def arms() -> None:
         {
             "binding": binding(),
             "payload": {"photo": "in:photo", "scale": 2},
-            "inputs": {"photo": str(mislabelled)},
+            "inputs": {"photo": {"source": str(mislabelled), "order": 0}},
             "request_id": "cr012-media",
         },
     )
@@ -426,7 +430,7 @@ def arms() -> None:
         {
             "binding": binding(),
             "payload": {"photo": "in:photo", "refs": ["in:nobody-granted-this"], "scale": 2},
-            "inputs": {"photo": str(files["photo"])},
+            "inputs": {"photo": {"source": str(files["photo"]), "order": 0}},
             "request_id": "cr012-ungranted",
         },
     )
@@ -446,7 +450,7 @@ def arms() -> None:
         {
             "binding": binding(),
             "payload": {"photo": "in:photo", "scale": 2},
-            "inputs": {"photo": str(tampered)},
+            "inputs": {"photo": {"source": str(tampered), "order": 0}},
             "request_id": "cr012-corrupt",
             "tamper": str(tampered),
         },
@@ -544,15 +548,22 @@ def arms() -> None:
             str(exc)[:200],
         )
 
-    # ARM 9 — the bounded reader, both directions.
-    from cozy_runtime.internal.egress import EgressRefusal, read_bounded
+    # ARM 9 — the bounded stream copier, both directions.
+    from cozy_runtime.internal.egress import EgressRefusal, copy_bounded
 
     for name, chunks, declared, cap, want in (
-        ("over", [b"x" * 100, b"x" * 100], 0, 150, "stream_over_declared_size"),
+        ("over", [b"x" * 100, b"x" * 100], None, 150, "stream_over_declared_size"),
         ("under", [b"x" * 10], 100, 1000, "stream_under_declared_size"),
     ):
         try:
-            read_bounded(iter(chunks), declared=declared, cap=cap, what="arm")
+            copy_bounded(
+                iter(chunks),
+                io.BytesIO(),
+                expected_length=declared,
+                cap=cap,
+                prefix_bytes=16,
+                what="arm",
+            )
             check(f"ARM: the bounded reader refuses ({name})", False, "it returned")
         except EgressRefusal as exc:
             check(
@@ -572,7 +583,22 @@ def egress() -> None:
     import http.server
     import threading
 
-    from cozy_runtime.internal.egress import EgressPolicy, EgressRefusal, fetch
+    from cozy_runtime.internal.egress import EgressPolicy, EgressRefusal, copy_bounded, fetch_into
+
+    def fetch(
+        url: str, policy: EgressPolicy, *, declared: int | None = None, cap: int = 1 << 20
+    ) -> bytes:
+        sink = io.BytesIO()
+        fetch_into(
+            url,
+            policy,
+            sink,
+            expected_length=declared,
+            cap=cap,
+            prefix_bytes=32,
+            what="egress arm",
+        )
+        return sink.getvalue()
 
     body = png(8, 8, 5)
 
@@ -598,6 +624,24 @@ def egress() -> None:
                 self.send_header("Location", "/loop")
                 self.end_headers()
                 return
+            if self.path == "/truncated":
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(b"20\r\nshort\r\n")
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            if self.path == "/malformed-location":
+                self.send_response(302)
+                self.send_header("Location", "https://[broken/object")
+                self.end_headers()
+                return
+            if self.path == "/invalid-request-location":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{port}/a b")
+                self.end_headers()
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -608,8 +652,8 @@ def egress() -> None:
         # A LOCAL deployment declares both halves: this host is allowlisted AND private
         # addresses are admitted. Two switches, because "I trust this host" and "I accept a
         # private address" are different statements.
-        local = EgressPolicy(allowed_hosts=("127.0.0.1",), max_bytes=1 << 20, allow_private=True)
-        got = fetch(f"http://127.0.0.1:{port}/ok", local, declared=len(body), what="green")
+        local = EgressPolicy(allowed_hosts=("127.0.0.1",), allow_private=True)
+        got = fetch(f"http://127.0.0.1:{port}/ok", local, declared=len(body))
         check(
             "GREEN FIRST: an allowlisted host over a declared length fetches",
             got == body,
@@ -621,7 +665,7 @@ def egress() -> None:
         # hop-0-only check waves through.
         strict = EgressPolicy(allowed_hosts=("127.0.0.1", "169.254.169.254"), allow_private=False)
         try:
-            fetch(f"http://127.0.0.1:{port}/metadata", strict, what="ssrf")
+            fetch(f"http://127.0.0.1:{port}/metadata", strict)
             check("ARM: a redirect to the metadata service refuses", False, "it fetched")
         except EgressRefusal as exc:
             check(
@@ -631,7 +675,7 @@ def egress() -> None:
             )
 
         try:
-            fetch(f"http://elsewhere.invalid:{port}/ok", local, what="host")
+            fetch(f"http://elsewhere.invalid:{port}/ok", local)
             check("ARM: an unallowlisted host refuses", False, "it fetched")
         except EgressRefusal as exc:
             check(
@@ -641,7 +685,7 @@ def egress() -> None:
             )
 
         try:
-            fetch(f"http://127.0.0.1:{port}/loop", local, what="loop")
+            fetch(f"http://127.0.0.1:{port}/loop", local)
             check("ARM: a redirect loop refuses", False, "it fetched")
         except EgressRefusal as exc:
             check(
@@ -650,9 +694,34 @@ def egress() -> None:
                 exc.detail[:180],
             )
 
-        tiny = EgressPolicy(allowed_hosts=("127.0.0.1",), max_bytes=16, allow_private=True)
         try:
-            fetch(f"http://127.0.0.1:{port}/ok", tiny, what="cap")
+            fetch(f"http://127.0.0.1:{port}/truncated", local)
+            check("ARM: a malformed chunked body refuses", False, "it returned")
+        except EgressRefusal as exc:
+            check(
+                "ARM: a truncated HTTP body becomes a typed refusal",
+                exc.code == "egress_body_error",
+                exc.detail[:180],
+            )
+
+        malformed_codes: list[str] = []
+        for url in (
+            "https://127.0.0.1:99999/object",
+            f"http://127.0.0.1:{port}/malformed-location",
+            f"http://127.0.0.1:{port}/invalid-request-location",
+        ):
+            try:
+                fetch(url, local)
+            except EgressRefusal as exc:
+                malformed_codes.append(exc.code)
+        check(
+            "ARM: malformed direct and redirected URLs both become typed refusals",
+            malformed_codes == ["egress_url", "egress_url", "egress_unreachable"],
+            str(malformed_codes),
+        )
+
+        try:
+            fetch(f"http://127.0.0.1:{port}/ok", local, cap=16)
             check("ARM: a body past the cap refuses", False, "it fetched")
         except EgressRefusal as exc:
             check(
@@ -661,9 +730,249 @@ def egress() -> None:
                 exc.detail[:180],
             )
 
+        import hashlib
+        import tempfile
+        import tracemalloc
+
+        exact_empty = copy_bounded(
+            iter(()),
+            io.BytesIO(),
+            expected_length=0,
+            cap=1,
+            prefix_bytes=16,
+            what="exact empty arm",
+        )
+        check(
+            "the exact-zero identity is distinct from an unknown length",
+            exact_empty.length == 0 and exact_empty.sha256.hex() == hashlib.sha256(b"").hexdigest(),
+        )
+
+        from cozy_runtime.internal.worker import grants
+        from cozy_runtime.protocol import worker_pb2 as pb
+
+        with tempfile.TemporaryDirectory(prefix="cozy-grant-arms-") as directory:
+            grant_root = Path(directory) / "grants"
+            grant_root.mkdir()
+            subject = hashlib.sha256(b"invocation").digest()
+            empty = grant_root / "empty.bin"
+            empty.write_bytes(b"")
+            empty_spec = {
+                "inputs": [
+                    {
+                        "input_id": "empty",
+                        "digest": "sha256:" + hashlib.sha256(b"").hexdigest(),
+                        # Proto3 canonical JSON omits uint64 zero. Omission means exact zero.
+                        "kind_mime": "application/octet-stream",
+                    }
+                ],
+                "outputs": [],
+            }
+            empty_grant = pb.DeliveryGrant(
+                invocation_spec_digest=subject,
+                file_base_url=f"file://{grant_root}",
+                inputs=[pb.InputAccess(input_id="empty", url=f"file://{empty}")],
+            )
+            bound = grants.bind(empty_spec, empty_grant, subject)
+            hydrated = grants.hydrate_inputs(
+                bound,
+                grants.Authorizer(roots=(str(grant_root),)),
+                spool=Path(directory) / "empty-spool",
+                max_bytes=1,
+                max_total_bytes=1,
+            )
+            zero = hydrated.get("empty")
+            check(
+                "an omitted proto3 zero length binds and hydrates as an exact empty FileAsset",
+                zero is not None
+                and zero.length == 0
+                and zero.media_type == ""
+                and zero.local.read_bytes() == b"",
+            )
+
+            unknown = grant_root / "unknown.bin"
+            unknown.write_bytes(b"not-an-image")
+            unknown_spec = {
+                "inputs": [
+                    {
+                        "input_id": "photo",
+                        "digest": "sha256:" + hashlib.sha256(unknown.read_bytes()).hexdigest(),
+                        "length": unknown.stat().st_size,
+                        "kind_mime": "image/png",
+                    }
+                ],
+                "outputs": [],
+            }
+            unknown_grant = pb.DeliveryGrant(
+                invocation_spec_digest=subject,
+                inputs=[pb.InputAccess(input_id="photo", url=f"file://{unknown}")],
+            )
+            try:
+                grants.hydrate_inputs(
+                    grants.bind(unknown_spec, unknown_grant, subject),
+                    grants.Authorizer(roots=(str(grant_root),)),
+                    spool=Path(directory) / "unknown-spool",
+                )
+                unknown_refused = False
+            except grants.GrantRefusal as exc:
+                unknown_refused = exc.code == "input_media_type"
+            check(
+                "unknown bytes cannot borrow an image MIME declaration",
+                unknown_refused and not list((Path(directory) / "unknown-spool").rglob("inputs/*")),
+            )
+
+            try:
+                grants.bind(
+                    empty_spec,
+                    pb.DeliveryGrant(inputs=empty_grant.inputs),
+                    subject,
+                )
+                subject_refused = False
+            except grants.GrantRefusal as exc:
+                subject_refused = exc.code == "grant_subject_mismatch"
+            check("an absent grant subject cannot bind to an invocation", subject_refused)
+
+            input_row = {
+                "input_id": "i",
+                "digest": "sha256:" + hashlib.sha256(b"").hexdigest(),
+                "kind_mime": "application/octet-stream",
+            }
+            output_row = {"output_id": "o", "max_bytes": 1}
+            ambiguity_cases: tuple[
+                tuple[
+                    dict[str, Any],
+                    list[pb.InputAccess],
+                    list[pb.OutputAccess],
+                    list[pb.OutputAccess],
+                ],
+                ...,
+            ] = (
+                ({"inputs": [{**input_row, "input_id": ""}]}, [], [], []),
+                ({"inputs": []}, [pb.InputAccess(input_id="", url="file:///x")], [], []),
+                ({"inputs": [input_row, input_row]}, [pb.InputAccess(input_id="i")], [], []),
+                ({"inputs": [input_row]}, [pb.InputAccess(input_id="i")] * 2, [], []),
+                ({"outputs": [{**output_row, "output_id": ""}]}, [], [], []),
+                ({"outputs": []}, [], [], [pb.OutputAccess(output_id="", url="file:///x")]),
+                ({"outputs": [output_row, output_row]}, [], [pb.OutputAccess(output_id="o")], []),
+                ({"outputs": [output_row]}, [], [], [pb.OutputAccess(output_id="o")] * 2),
+            )
+            ambiguous_refusals = 0
+            for partial, accesses, single_outputs, repeated_outputs in ambiguity_cases:
+                document = {"inputs": [], "outputs": [], **partial}
+                try:
+                    grants.bind(
+                        document,
+                        pb.DeliveryGrant(
+                            invocation_spec_digest=subject,
+                            inputs=accesses,
+                            outputs=[*single_outputs, *repeated_outputs],
+                        ),
+                        subject,
+                    )
+                except grants.GrantRefusal as exc:
+                    ambiguous_refusals += exc.code == "grant_binding_ambiguous"
+            check(
+                "empty and repeated spec/grant ids refuse on both input and output joins",
+                ambiguous_refusals == len(ambiguity_cases),
+                f"{ambiguous_refusals}/{len(ambiguity_cases)} refused",
+            )
+
+            malformed_grant_refusals = 0
+            for url in ("file://[broken/object", "https://[broken/object"):
+                malformed = grants.BoundGrant(
+                    inputs={
+                        "asset": grants.BoundInput(
+                            "asset",
+                            url,
+                            hashlib.sha256(b"").digest(),
+                            0,
+                            "application/octet-stream",
+                            0,
+                        )
+                    }
+                )
+                try:
+                    grants.read_input(
+                        malformed,
+                        "asset",
+                        grants.Authorizer(),
+                        policy=local,
+                        cap=1,
+                    )
+                except grants.GrantRefusal as exc:
+                    malformed_grant_refusals += exc.code == "grant_transport"
+            check(
+                "malformed local and remote grant URLs refuse at the grant front door",
+                malformed_grant_refusals == 2,
+                f"{malformed_grant_refusals}/2 typed refusals",
+            )
+
+            inside_parent = grant_root / "parent"
+            inside_parent.mkdir()
+            inside = inside_parent / "asset.bin"
+            inside.write_bytes(b"inside")
+            outside_parent = Path(directory) / "outside"
+            outside_parent.mkdir()
+            outside = outside_parent / "asset.bin"
+            outside.write_bytes(b"outside-secret")
+            moved = grant_root / "moved-parent"
+
+            class SwapAuthorizer(grants.Authorizer):
+                def authorize(
+                    self, name: str, method: str, url: str, params: dict[str, Any]
+                ) -> None:
+                    super().authorize(name, method, url, params)
+                    inside_parent.rename(moved)
+                    inside_parent.symlink_to(outside_parent, target_is_directory=True)
+
+            raced = grants.BoundGrant(
+                inputs={
+                    "asset": grants.BoundInput(
+                        "asset",
+                        f"file://{inside}",
+                        hashlib.sha256(outside.read_bytes()).digest(),
+                        outside.stat().st_size,
+                        "application/octet-stream",
+                        0,
+                    )
+                }
+            )
+            try:
+                grants.read_input(
+                    raced,
+                    "asset",
+                    SwapAuthorizer(roots=(str(grant_root),)),
+                    cap=1 << 20,
+                )
+                swap_refused = False
+            except grants.GrantRefusal as exc:
+                swap_refused = exc.code == "input_not_a_file"
+            check(
+                "a parent swapped to an outside symlink after authorization cannot redirect read",
+                swap_refused,
+            )
+
+        streamed = 64 * MIB
+        tracemalloc.start()
+        with tempfile.TemporaryFile() as sink:
+            receipt = copy_bounded(
+                (b"x" * MIB for _ in range(streamed // MIB)),
+                sink,
+                expected_length=streamed,
+                cap=streamed,
+                prefix_bytes=32,
+                what="bounded-memory arm",
+            )
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        check(
+            "a 64 MiB transfer keeps Python heap usage to a few chunks",
+            receipt.length == streamed and peak < 8 * MIB,
+            f"{receipt.length // MIB} MiB copied, {peak / MIB:.2f} MiB peak Python heap",
+        )
+
         off = EgressPolicy()
         try:
-            fetch(f"http://127.0.0.1:{port}/ok", off, what="off")
+            fetch(f"http://127.0.0.1:{port}/ok", off)
             check("ARM: a deployment with no allowlist refuses", False, "it fetched")
         except EgressRefusal as exc:
             check(

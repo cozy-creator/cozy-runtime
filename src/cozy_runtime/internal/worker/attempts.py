@@ -41,6 +41,7 @@ from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import canonical, egress, seam
 from cozy_runtime.internal.journal import Journal, JournalError
+from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
@@ -680,7 +681,9 @@ class AttemptEngine:
         written into it, and an attempt refused during hydration leaves a spool with
         nothing in it rather than an accepted attempt with nowhere to put its inputs.
         """
-        spool = self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
+        spool = self.spool_root / opaque_key(
+            "attempt-input-spool", attempt.request_id, attempt.attempt
+        )
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
         binding = attempt.declared
@@ -702,7 +705,6 @@ class AttemptEngine:
                 "input_over_cap",
                 "inputs_over_total_cap",
                 "input_media_type",
-                "input_length_mismatch",
                 "input_digest_mismatch",
                 "stream_over_declared_size",
                 "stream_under_declared_size",
@@ -768,6 +770,10 @@ class AttemptEngine:
                 if exc.code == "grant_expired"
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
+        # Assets follow the same eager grant path as serving: verified and spooled before
+        # acceptance, then projected into the executor command. A job is a lifecycle mode,
+        # not a second input plane.
+        self._hydrate_inputs(attempt)
 
         caps = attempt.spec.get("resource_caps") or {}
         plan = AttemptPlan.for_job(
@@ -783,7 +789,7 @@ class AttemptEngine:
         # retried attempt the SAME tree, which is the whole of resume. It is created here,
         # before acceptance, so a job never discovers at step 40,000 that it has nowhere
         # durable to write.
-        attempt.scratch = self.scratch_root / attempt.request_id
+        attempt.scratch = self.scratch_root / opaque_key("job-scratch", attempt.request_id)
         attempt.scratch.mkdir(parents=True, exist_ok=True)
 
         attempt.opened = self.ledger.snapshot()
@@ -1249,7 +1255,9 @@ class AttemptEngine:
             return self.abandon(attempt, "its accepted executor vanished before dispatch")
         # The spool already exists — cr-012's hydration made it before acceptance. This
         # stays for the recovered-attempt path, whose acceptance was another process's.
-        spool = attempt.spool or self.spool_root / f"{attempt.request_id}-{attempt.attempt}"
+        spool = attempt.spool or self.spool_root / opaque_key(
+            "attempt-input-spool", attempt.request_id, attempt.attempt
+        )
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
         attempt.state = "running"
@@ -1329,6 +1337,16 @@ class AttemptEngine:
         self, attempt: AttemptRecord, key: str, spool: Path, seconds: float | None
     ) -> dict[str, Any]:
         """The ONE thing the two lanes genuinely differ in: what they ask the executor."""
+        inputs = {
+            input_id: {
+                "local": str(granted.local),
+                "media_type": granted.media_type,
+                "digest": granted.digest,
+                "length": granted.length,
+                "order": granted.order,
+            }
+            for input_id, granted in attempt.inputs.items()
+        }
         if attempt.job is not None:
             return {
                 "cmd": "run_job",
@@ -1340,6 +1358,8 @@ class AttemptEngine:
                 "spool": str(spool),
                 "scratch": str(attempt.scratch) if attempt.scratch else "",
                 "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
+                "inputs": inputs,
+                "max_input_bytes": 64 << 20,
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
                     "gpu_count": attempt.job.gpu_count,
@@ -1359,16 +1379,7 @@ class AttemptEngine:
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor, which has no outbound network at all.
-            "inputs": {
-                input_id: {
-                    "local": str(granted.local),
-                    "media_type": granted.media_type,
-                    "digest": granted.digest,
-                    "length": granted.length,
-                    "order": granted.order,
-                }
-                for input_id, granted in attempt.inputs.items()
-            },
+            "inputs": inputs,
             "max_input_bytes": attempt.declared.max_input_bytes,
         }
 
@@ -1693,7 +1704,13 @@ class AttemptEngine:
 
     def _payload(self, attempt: AttemptRecord) -> dict[str, Any]:
         """The payload travels as a grant INPUT, fetched worker-side under the grant."""
-        data = grants.read_input(attempt.grant, "payload", self.authorizer)
+        data = grants.read_input(
+            attempt.grant,
+            "payload",
+            self.authorizer,
+            self.egress,
+            cap=PAYLOAD_MAX_BYTES,
+        )
         value = json.loads(data)
         if not isinstance(value, dict):
             raise ValueError(f"a payload document is an object, not {type(value).__name__}")

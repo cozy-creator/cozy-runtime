@@ -6,6 +6,7 @@ real four-component SDXL endpoint and prints what it observed.
 
     corpus/.venv/bin/python scripts/cli-live.py surface    verbs, exits, AXI conformance
     corpus/.venv/bin/python scripts/cli-live.py keys       the local-bind extra-key tier
+    uv run python scripts/cli-live.py inputs     typed local assets + invocation receipt
     corpus/.venv/bin/python scripts/cli-live.py identity   CLI run == direct run_slice
     corpus/.venv/bin/python scripts/cli-live.py all
 
@@ -18,18 +19,34 @@ out, not about the import graph.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
+
+import msgspec
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "examples"))
+
+from cozy_runtime.author import ImageAsset  # noqa: E402
+
+
+class _NestedAsset(msgspec.Struct):
+    b: ImageAsset
+
+
+class _AmbiguousAssets(msgspec.Struct):
+    aliased: ImageAsset = msgspec.field(name="a.b")
+    a: _NestedAsset
+
 
 PROJECT = ROOT / "corpus" / "pipeline"
 REF = "cozy/sdxl-pipeline@cr-008b"
@@ -316,6 +333,593 @@ def section_keys(args: argparse.Namespace) -> None:
     )
 
 
+# --------------------------------------------------------------------------- inputs
+
+
+_INPUT_APP = """import hashlib
+
+import msgspec
+
+from cozy_runtime.author import App, AudioAsset, ImageAsset, VideoAsset
+
+app = App()
+
+
+class ImageReference(msgspec.Struct, tag="image", tag_field="type"):
+    image: ImageAsset
+
+
+class VideoReference(msgspec.Struct, tag="video", tag_field="type"):
+    video: VideoAsset
+
+
+class AudioReference(msgspec.Struct, tag="audio", tag_field="type"):
+    audio: AudioAsset
+
+
+Reference = ImageReference | VideoReference | AudioReference
+
+
+class InspectRequest(msgspec.Struct, forbid_unknown_fields=True):
+    prompt: str
+    cover: ImageAsset = msgspec.field(name="hero")
+    references: list[Reference]
+
+
+class InspectResult(msgspec.Struct):
+    prompt: str
+    digests: list[str]
+
+
+@app.job
+def inspect(payload: InspectRequest) -> InspectResult:
+    assets = [payload.cover]
+    assets.extend(
+        reference.image
+        if isinstance(reference, ImageReference)
+        else reference.video
+        if isinstance(reference, VideoReference)
+        else reference.audio
+        for reference in payload.references
+    )
+    return InspectResult(
+        prompt=payload.prompt,
+        digests=[hashlib.sha256(asset.read_bytes()).hexdigest() for asset in assets],
+    )
+
+
+@app.entrypoint
+def inspect_endpoint(payload: InspectRequest) -> InspectResult:
+    return inspect(payload)
+"""
+
+
+def _input_project(root: Path) -> Path:
+    project = root / "project"
+    project.mkdir(parents=True)
+    (project / "endpoint.toml").write_text('[application]\nobject = "probe:app"\n')
+    (project / "probe.py").write_text(_INPUT_APP)
+    return project
+
+
+def _input_cli(
+    project: Path,
+    home: Path,
+    request: Path,
+    output: Path,
+    *terms: str,
+) -> tuple[int, str, str]:
+    return cli(
+        "--json",
+        "--dir",
+        str(project),
+        "job",
+        "inspect",
+        "--in",
+        str(request),
+        *terms,
+        "--out",
+        str(output),
+        home=home,
+        cwd=project,
+    )
+
+
+def _input_slice(
+    project: Path,
+    config: Any,
+    workspace: Path,
+    payload: dict[str, Any],
+    inputs: dict[str, Any],
+    *,
+    request_id: str,
+    tamper: Path | None = None,
+    accepted_placement: str = "",
+) -> Any:
+    """One fault-injectable weightless job through the real worker/executor lifecycle."""
+    from cozy_runtime.internal import descriptor
+    from cozy_runtime.internal.discovery import discover
+    from cozy_runtime.internal.local import LocalRequest, run_slice
+    from cozy_runtime.internal.worker.session import WorkerOptions
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    found = discover(project)
+    body = descriptor.build(found)
+    descriptor_id = descriptor.job_descriptor_id(body, "inspect")
+    release_id = str(body["application"])
+
+    def plant(owner: Any, worker: Any) -> None:
+        del worker
+        if tamper is not None:
+            mint = owner._grant
+
+            def mutate_after_mint(document: bytes, invocation_digest: bytes) -> Any:
+                grant = mint(document, invocation_digest)
+                changed = bytearray(tamper.read_bytes())
+                changed[-1] ^= 0x5A
+                tamper.write_bytes(changed)
+                return grant
+
+            owner._grant = mutate_after_mint
+        if accepted_placement:
+            retain = owner._on_accepted
+
+            def corrupt_acceptance(message: Any) -> None:
+                changed = pb.AttemptAccepted()
+                changed.CopyFrom(message)
+                changed.placement_id = accepted_placement
+                retain(changed)
+
+            owner._on_accepted = corrupt_acceptance
+
+    return run_slice(
+        config,
+        LocalRequest(
+            entrypoint="inspect",
+            payload=payload,
+            outputs=(),
+            request_id=request_id,
+            kind="job",
+            job_descriptor_id=descriptor_id,
+            inputs=inputs,
+        ),
+        [],
+        job_records=[
+            {
+                "job_descriptor_id": descriptor_id,
+                "build_id": release_id,
+                "project": str(project),
+                "job": "inspect",
+                "gpu_count": 0,
+                "publishes": False,
+                "emits_media": False,
+            }
+        ],
+        workspace=workspace,
+        release_id=release_id,
+        options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
+        record_owner_hook=plant,
+    )
+
+
+def _serving_slice(
+    project: Path,
+    config: Any,
+    workspace: Path,
+    payload: dict[str, Any],
+    inputs: dict[str, Any],
+    *,
+    request_id: str,
+    accepted_mutation: Any = None,
+) -> Any:
+    """One weightless serving attempt, optionally corrupting acceptance owner-side."""
+    from cozy_runtime.internal import descriptor
+    from cozy_runtime.internal.discovery import discover
+    from cozy_runtime.internal.local import LocalRequest, run_slice
+    from cozy_runtime.internal.worker.session import WorkerOptions
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    body = descriptor.build(discover(project))
+    release_id = str(body["application"])
+
+    def plant(owner: Any, worker: Any) -> None:
+        del worker
+        retain = owner._on_accepted
+
+        def corrupt_acceptance(message: Any) -> None:
+            changed = pb.AttemptAccepted()
+            changed.CopyFrom(message)
+            accepted_mutation(changed)
+            retain(changed)
+
+        owner._on_accepted = corrupt_acceptance
+
+    return run_slice(
+        config,
+        LocalRequest(
+            entrypoint="inspect_endpoint",
+            payload=payload,
+            outputs=(),
+            request_id=request_id,
+            inputs=inputs,
+        ),
+        workspace=workspace,
+        release_id=release_id,
+        endpoint_descriptor=descriptor.document(body),
+        options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
+        record_owner_hook=plant if accepted_mutation is not None else None,
+    )
+
+
+def section_inputs(args: argparse.Namespace) -> None:
+    """cr-012's real CLI asset bridge and canonical invocation receipt."""
+    del args
+    temporary = tempfile.TemporaryDirectory(prefix="cozy-cli-inputs-")
+    root = Path(temporary.name)
+    project = _input_project(root)
+    home = root / "home"
+    media = root / "media"
+    media.mkdir()
+
+    png = media / "same.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"same-subject-bytes")
+    video = media / "motion.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"video-reference")
+    audio = media / "voice.wav"
+    audio.write_bytes(b"RIFF\x10\x00\x00\x00WAVE" + b"audio-reference")
+    prompt = "@/this/is/a/long/prompt/not/a/path"
+
+    first_request = root / "first.json"
+    first_request.write_text(
+        json.dumps(
+            {
+                "prompt": prompt,
+                "hero": "overridden-by-the-explicit-cli-term",
+                "references": [
+                    {"type": "image", "image": f"@{png}"},
+                    {"type": "video", "video": f"@{video}"},
+                    {"type": "audio", "audio": f"@{audio}"},
+                    {"type": "image", "image": f"@{png}"},
+                ],
+            }
+        )
+    )
+
+    head("typed local assets become path-free input grants")
+    code, out, err = _input_cli(project, home, first_request, root / "first-out", f"hero=@{png}")
+    check("the real weightless CLI job succeeds", code == 0, _first(err or out))
+    if code != 0:
+        return
+    document = json.loads(out)
+    invocation = document.get("invocation") or {}
+    invocation_document = invocation.get("document") or {}
+    inputs = {
+        row["input_id"]: row
+        for row in invocation_document.get("inputs", ())
+        if row.get("input_id") != "payload"
+    }
+    check(
+        "only descriptor-typed Asset leaves become input ids, including the wire alias",
+        set(inputs)
+        == {
+            "hero",
+            "references.0.image",
+            "references.1.video",
+            "references.2.audio",
+            "references.3.image",
+        },
+        str(sorted(inputs)),
+    )
+    check(
+        "the nearest list index is the one carried order, including a real zero",
+        [inputs[name].get("order", 0) for name in sorted(inputs)] == [0, 0, 1, 2, 3],
+        str({name: row.get("order", 0) for name, row in inputs.items()}),
+    )
+    image_rows = [inputs["hero"], inputs["references.0.image"], inputs["references.3.image"]]
+    check(
+        "equal bytes remain three identified subjects rather than digest-deduplicating",
+        len({row["digest"] for row in image_rows}) == 1,
+        str([row["input_id"] for row in image_rows]),
+    )
+    result = document.get("result") or {}
+    check(
+        "a non-Asset string beginning @/ remains the exact prompt text",
+        result.get("prompt") == prompt,
+        str(result.get("prompt")),
+    )
+
+    from cozy_runtime.internal import canonical
+
+    canonical_bytes = canonical.write(invocation_document)
+    check(
+        "the rendered canonical document re-digests to the rendered invocation identity",
+        invocation.get("digest") == "sha256:" + hashlib.sha256(canonical_bytes).hexdigest(),
+        str(invocation.get("digest")),
+    )
+    accepted = document.get("plan") or {}
+    check(
+        "the accepted echo names that exact invocation plus its executor generation",
+        accepted.get("invocation_spec_digest") == invocation.get("digest")
+        and accepted.get("request_id") == "cli-inspect"
+        and accepted.get("attempt_ordinal") == 1
+        and int(accepted.get("executor_generation", 0)) > 0,
+        json.dumps(accepted, sort_keys=True),
+    )
+    receipt = json.dumps({"invocation": invocation, "accepted": accepted}, sort_keys=True)
+    check(
+        "neither source paths nor DeliveryGrant credentials enter either receipt",
+        all(str(path) not in receipt for path in (png, video, audio))
+        and "credential" not in receipt,
+        receipt[:180],
+    )
+
+    head("field-path and file-root red arms")
+    from cozy_runtime.cli import payload as payload_grammar
+    from cozy_runtime.cli.io import CliError
+    from cozy_runtime.internal.worker import grants
+
+    ambiguous = {"a.b": f"@{png}", "a": {"b": f"@{png}"}}
+    original = json.loads(json.dumps(ambiguous))
+    try:
+        payload_grammar.extract_local_assets(ambiguous, _AmbiguousAssets)
+        ambiguous_refused = False
+    except CliError as exc:
+        ambiguous_refused = "field path segments" in str(exc)
+    check(
+        "dotted Asset path segments refuse atomically before any path is replaced",
+        ambiguous_refused and ambiguous == original,
+        json.dumps(ambiguous, sort_keys=True),
+    )
+
+    grant_root = root / "grant-root"
+    grant_root.mkdir()
+    outside = root / "outside.bin"
+    outside.write_bytes(b"outside")
+    (grant_root / "escape").symlink_to(outside)
+    authorizer = grants.Authorizer(roots=(str(grant_root),))
+    refused = 0
+    for url in (
+        f"file://{grant_root}/../outside.bin",
+        f"file://{grant_root}/escape",
+    ):
+        try:
+            authorizer.authorize("grant_input_read", "GET", url, {"input_id": "hero"})
+        except grants.GrantRefusal as exc:
+            if exc.code == "grant_path_outside_roots":
+                refused += 1
+    check(
+        "traversal and symlink escapes both refuse at the declared file root",
+        refused == 2,
+        f"{refused}/2 refused",
+    )
+
+    inside = grant_root / "inside.bin"
+    inside.write_bytes(b"inside")
+    try:
+        authorizer.authorize("grant_input_read", "GET", f"file://{inside}", {"input_id": "hero"})
+        inside_allowed = True
+    except grants.GrantRefusal:
+        inside_allowed = False
+    check(
+        "the same canonical root fence admits an ordinary in-root file",
+        inside_allowed,
+    )
+
+    head("attempt lifecycle red arms")
+    import dataclasses
+
+    from cozy_runtime.internal.config import read_config
+    from cozy_runtime.internal.local import LocalInput
+
+    arm_config = read_config(
+        {
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ["HOME"],
+            "COZY_HOME": str(root / "arm-home"),
+            "PYTHONPATH": f"{project}:{ROOT}:{ROOT / 'src'}",
+        }
+    )
+
+    base_payload = {
+        "prompt": "fault arm",
+        "hero": "input:hero",
+        "references": [{"type": "image", "image": "input:references.0.image"}],
+    }
+    tampered = media / "tampered.png"
+    tampered.write_bytes(png.read_bytes())
+    outcome = _input_slice(
+        project,
+        arm_config,
+        root / "tamper-workspace",
+        dict(base_payload),
+        {
+            "hero": LocalInput(str(tampered), 0),
+            "references.0.image": LocalInput(str(png), 0),
+        },
+        request_id="cli-input-tamper",
+        tamper=tampered,
+    )
+    narrative = json.dumps(dataclasses.asdict(outcome), default=str)
+    check(
+        "post-mint source mutation refuses before the job body",
+        "input_digest_mismatch" in narrative or "stream_" in narrative,
+        narrative[:180],
+    )
+    leftovers = [
+        path
+        for path in (root / "tamper-workspace" / "worker" / "spool").rglob("inputs/*")
+        if path.is_file()
+    ]
+    check(
+        "a refused transfer publishes neither a final input nor a partial file",
+        not leftovers,
+        str(leftovers),
+    )
+
+    outcome = _input_slice(
+        project,
+        arm_config,
+        root / "order-workspace",
+        dict(base_payload),
+        {
+            "hero": LocalInput(str(png), 0),
+            "references.0.image": LocalInput(str(png), 7),
+        },
+        request_id="cli-input-order",
+    )
+    narrative = json.dumps(dataclasses.asdict(outcome), default=str)
+    check(
+        "a planted nonzero order at typed list position zero refuses in the real attempt",
+        "asset_order" in narrative,
+        narrative[:180],
+    )
+
+    hostile_request = "../../outside-authority"
+    hostile_workspace = root / "hostile-id-workspace"
+    outcome = _input_slice(
+        project,
+        arm_config,
+        hostile_workspace,
+        dict(base_payload),
+        {
+            "hero": LocalInput(str(png), 0),
+            "references.0.image": LocalInput(str(png), 0),
+        },
+        request_id=hostile_request,
+    )
+    escaped = list(root.rglob("outside-authority*"))
+    check(
+        "an opaque request id remains wire identity and never becomes filesystem authority",
+        outcome.ended == "terminal" and not escaped,
+        f"{outcome.ended}; escaped paths: {escaped}",
+    )
+
+    outcome = _input_slice(
+        project,
+        arm_config,
+        root / "echo-workspace",
+        dict(base_payload),
+        {
+            "hero": LocalInput(str(png), 0),
+            "references.0.image": LocalInput(str(png), 0),
+        },
+        request_id="cli-input-echo",
+        accepted_placement="plc-not-offered",
+    )
+    check(
+        "a changed accepted placement converges to a record-owner refusal",
+        outcome.ended == "record_owner_error" and "serving placement" in outcome.error,
+        f"{outcome.ended}: {outcome.error}",
+    )
+
+    head("weightless serving acceptance is an exact receipt")
+    serving = _serving_slice(
+        project,
+        arm_config,
+        root / "serving-workspace",
+        dict(base_payload),
+        {
+            "hero": LocalInput(str(png), 0),
+            "references.0.image": LocalInput(str(png), 0),
+        },
+        request_id="cli-serving",
+    )
+    check(
+        "an unmodified weightless serving receipt succeeds and includes its host reservation",
+        serving.ended == "terminal"
+        and serving.accepted.get("request_id") == "cli-serving"
+        and "reserved_host_bytes" in serving.accepted,
+        f"{serving.ended}: {json.dumps(serving.accepted, sort_keys=True)}",
+    )
+
+    receipt_arms = (
+        ("request", lambda message: setattr(message, "request_id", "wrong"), "accepted request"),
+        (
+            "ordinal",
+            lambda message: setattr(message, "attempt_ordinal", message.attempt_ordinal + 1),
+            "accepted ordinal",
+        ),
+        (
+            "invocation",
+            lambda message: setattr(message, "invocation_spec_digest", b"\0" * 32),
+            "accepted invocation digest",
+        ),
+        (
+            "construction",
+            lambda message: setattr(message, "model_construction_digest", b"\1" * 32),
+            "invents model construction",
+        ),
+        (
+            "plan",
+            lambda message: setattr(message.plan, "delivery", "float"),
+            "model-bearing plan",
+        ),
+    )
+    serving_refusals = 0
+    for name, mutation, expected in receipt_arms:
+        outcome = _serving_slice(
+            project,
+            arm_config,
+            root / f"serving-{name}-workspace",
+            dict(base_payload),
+            {
+                "hero": LocalInput(str(png), 0),
+                "references.0.image": LocalInput(str(png), 0),
+            },
+            request_id=f"cli-serving-{name}",
+            accepted_mutation=mutation,
+        )
+        serving_refusals += outcome.ended == "record_owner_error" and expected in outcome.error
+    check(
+        "request, ordinal, invocation, construction, and plan receipt drift all refuse",
+        serving_refusals == len(receipt_arms),
+        f"{serving_refusals}/{len(receipt_arms)} refused",
+    )
+
+    head("reference order is invocation meaning")
+    reordered = root / "reordered.json"
+    reordered.write_text(
+        json.dumps(
+            {
+                **json.loads(first_request.read_text()),
+                "references": [
+                    {"type": "audio", "audio": f"@{audio}"},
+                    {"type": "image", "image": f"@{png}"},
+                    {"type": "video", "video": f"@{video}"},
+                    {"type": "image", "image": f"@{png}"},
+                ],
+            }
+        )
+    )
+    code, out, err = _input_cli(project, home, reordered, root / "reordered-out", f"hero=@{png}")
+    reordered_document = json.loads(out) if code == 0 else {}
+    check("the reordered request also succeeds", code == 0, _first(err or out))
+    check(
+        "reordering the same subjects changes the invocation identity",
+        (reordered_document.get("invocation") or {}).get("digest") != invocation.get("digest"),
+        str((reordered_document.get("invocation") or {}).get("digest")),
+    )
+
+    head("local-source and media-type failures refuse before the job body")
+    missing = root / "absent.png"
+    code, out, err = _input_cli(
+        project, home, first_request, root / "missing-out", f"hero=@{missing}"
+    )
+    check(
+        "a missing typed local file refuses as not found",
+        code == 4 and "no such file" in err.lower(),
+        f"exit {code}: {_first(err or out)}",
+    )
+    wrong = media / "not-an-image.txt"
+    wrong.write_text("plain text")
+    code, out, err = _input_cli(project, home, first_request, root / "wrong-out", f"hero=@{wrong}")
+    check(
+        "bytes outside the declared Asset kind refuse pre-entrypoint",
+        code == 3 and "imageasset" in err.lower(),
+        f"exit {code}: {_first(err or out)}",
+    )
+
+
 # --------------------------------------------------------------------------- identity
 
 
@@ -516,7 +1120,9 @@ def section_hubless(args: argparse.Namespace) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="cr-016 live CLI verification")
-    parser.add_argument("section", choices=("surface", "keys", "identity", "hubless", "all"))
+    parser.add_argument(
+        "section", choices=("surface", "keys", "inputs", "identity", "hubless", "all")
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--size", type=int, default=1024)
     args = parser.parse_args()
@@ -524,6 +1130,7 @@ def main() -> int:
     sections = {
         "surface": section_surface,
         "keys": section_keys,
+        "inputs": section_inputs,
         "identity": section_identity,
         "hubless": section_hubless,
     }

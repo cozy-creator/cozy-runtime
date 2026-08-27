@@ -67,6 +67,7 @@ run/job flags:
   --out <dir>           output directory (default ./outputs)
   --seed <n>            deterministic RNG
   --in <file>           whole payload as JSON, key=value merged on top
+  key=@/absolute/file   stage a local file only at a declared Asset field
   --offline             CAS-only; a miss is exit 8, never a fetch
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --strict-keys         a local bind's unknown extra keys refuse instead of confessing

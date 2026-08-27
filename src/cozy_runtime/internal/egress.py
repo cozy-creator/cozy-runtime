@@ -4,8 +4,8 @@ Everything that pulls bytes into this runtime from an address someone else minte
 through here. That is the point: the failure mode this module exists against is not "the
 SSRF check was wrong", it is "there were two downloaders and only one had the check".
 
-**A stream may not exceed its declared size.** `read_bounded` stops at the declared length
-and refuses; it never buffers an unbounded body to find out how big it was. A body that
+**A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
+and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that
 UNDER-runs is equally a refusal — a truncated read that returns short bytes is how a digest
 check gets skipped by an empty file.
 
@@ -35,10 +35,12 @@ below nulls anything.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import BinaryIO
 from urllib.parse import urlparse
 
 #: How much of a body one read() pulls. Small enough that a cap refusal happens promptly.
@@ -57,32 +59,54 @@ class EgressRefusal(Exception):
         self.detail = detail
 
 
-def read_bounded(chunks: Iterable[bytes], *, declared: int, cap: int, what: str) -> bytes:
-    """THE bounded read. Every byte this runtime pulls from a stream passes through here.
+@dataclass(frozen=True, slots=True)
+class StreamReceipt:
+    """Facts measured while one stream was copied to its destination."""
 
-    `declared` is what the grant says the object weighs and `cap` is what this deployment
-    admits; the stream is held to the smaller of the two and refuses at the first byte past
-    it, rather than after the body is already in memory.
-    """
-    limit = min(declared, cap) if declared else cap
-    out = bytearray()
+    length: int
+    sha256: bytes
+    prefix: bytes
+
+
+def copy_bounded(
+    chunks: Iterable[bytes],
+    sink: BinaryIO,
+    *,
+    expected_length: int | None,
+    cap: int,
+    prefix_bytes: int,
+    what: str,
+) -> StreamReceipt:
+    """Copy once while enforcing size and measuring identity plus a sniff prefix."""
+    if expected_length is not None and expected_length < 0:
+        raise EgressRefusal("stream_invalid_length", f"{what}: negative expected length")
+    limit = min(expected_length, cap) if expected_length is not None else cap
+    seen = 0
+    digest = hashlib.sha256()
+    prefix = bytearray()
     for chunk in chunks:
-        out += chunk
-        if len(out) > limit:
+        next_seen = seen + len(chunk)
+        if next_seen > limit:
             raise EgressRefusal(
                 "stream_over_declared_size",
-                f"{what}: the stream passed {limit} B (declared {declared} B, deployment "
-                f"cap {cap} B) and was cut there. A stream may not exceed its declared "
+                f"{what}: the stream passed {limit} B (declared {expected_length} B, "
+                f"deployment cap {cap} B) and was cut there. A stream may not exceed its declared "
                 "size, and finding out afterwards is not a bound",
             )
-    if declared and len(out) != declared:
+        sink.write(chunk)
+        digest.update(chunk)
+        if len(prefix) < prefix_bytes:
+            prefix.extend(chunk[: prefix_bytes - len(prefix)])
+        seen = next_seen
+    if expected_length is not None and seen != expected_length:
         raise EgressRefusal(
             "stream_under_declared_size",
-            f"{what}: the stream ended at {len(out)} B and the grant declares {declared} B. "
+            f"{what}: the stream ended at {seen} B and the grant declares "
+            f"{expected_length} B. "
             "A short read is a refusal: a truncated body that is never compared against its "
             "declared length is how an empty file passes for content",
         )
-    return bytes(out)
+    return StreamReceipt(seen, digest.digest(), bytes(prefix))
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +114,6 @@ class EgressPolicy:
     """The deployment's declared egress bound. Empty allowlist means NO egress at all."""
 
     allowed_hosts: tuple[str, ...] = ()
-    max_bytes: int = 64 << 20
     max_redirects: int = MAX_REDIRECTS
     allow_private: bool = False
     """Loopback and private ranges, admitted ONLY for a local deployment that declares it.
@@ -147,21 +170,34 @@ class EgressPolicy:
 
 
 def _validate(url: str, policy: EgressPolicy) -> tuple[str, list[str]]:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise EgressRefusal("egress_url", f"the URL is malformed ({exc})") from exc
     if parsed.scheme != "https" and not (policy.allow_private and parsed.scheme == "http"):
         raise EgressRefusal(
             "egress_scheme",
             f"{parsed.scheme or 'relative'}:// is not fetchable: egress is https, and plain "
             "http only for a deployment that declared allow_private",
         )
-    host = parsed.hostname or ""
     policy.check_host(host)
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return host, policy.check_addresses(host, port)
 
 
-def fetch(url: str, policy: EgressPolicy, *, declared: int = 0, what: str = "input") -> bytes:
-    """Fetch ONE object, re-validating at every redirect hop, bounded on the way in."""
+def fetch_into(
+    url: str,
+    policy: EgressPolicy,
+    sink: BinaryIO,
+    *,
+    expected_length: int | None,
+    cap: int,
+    prefix_bytes: int,
+    what: str = "input",
+) -> StreamReceipt:
+    """Fetch one object into a sink, re-validating at every redirect hop."""
+    import http.client
     import urllib.error
     import urllib.parse
     import urllib.request
@@ -179,8 +215,10 @@ def fetch(url: str, policy: EgressPolicy, *, declared: int = 0, what: str = "inp
     for hop in range(policy.max_redirects + 1):
         host, addresses = _validate(current, policy)
         hops.append(f"{host} {addresses}")
-        request = urllib.request.Request(current, method="GET")
         try:
+            request = urllib.request.Request(
+                current, method="GET", headers={"Accept-Encoding": "identity"}
+            )
             response = opener.open(request, timeout=30)
         except urllib.error.HTTPError as error:
             location = error.headers.get("Location") if error.headers else None
@@ -191,16 +229,33 @@ def fetch(url: str, policy: EgressPolicy, *, declared: int = 0, what: str = "inp
                         f"{what}: more than {policy.max_redirects} redirects "
                         f"({' -> '.join(hops)}); a longer chain is a loop or an evasion",
                     ) from error
-                current = urllib.parse.urljoin(current, location)
+                try:
+                    current = urllib.parse.urljoin(current, location)
+                except ValueError as exc:
+                    raise EgressRefusal(
+                        "egress_url", f"{what}: a redirect names a malformed URL ({exc})"
+                    ) from exc
                 continue
             raise EgressRefusal("egress_http_error", f"{what}: {error.code} from {host}") from error
-        except OSError as exc:
+        except ValueError as exc:
+            raise EgressRefusal("egress_url", f"{what}: the URL is malformed ({exc})") from exc
+        except (http.client.HTTPException, OSError) as exc:
             raise EgressRefusal("egress_unreachable", f"{what}: {exc}") from exc
-        with response as body:
-            return read_bounded(
-                iter(lambda body=body: body.read(CHUNK), b""),  # type: ignore[misc]
-                declared=declared,
-                cap=policy.max_bytes,
-                what=what,
-            )
+        try:
+            with response as body:
+                return copy_bounded(
+                    iter(lambda body=body: body.read(CHUNK), b""),  # type: ignore[misc]
+                    sink,
+                    expected_length=expected_length,
+                    cap=cap,
+                    prefix_bytes=prefix_bytes,
+                    what=what,
+                )
+        except EgressRefusal:
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            raise EgressRefusal(
+                "egress_body_error",
+                f"{what}: the response body could not be read completely ({type(exc).__name__})",
+            ) from exc
     raise EgressRefusal("egress_redirect_budget", f"{what}: redirect budget exhausted")

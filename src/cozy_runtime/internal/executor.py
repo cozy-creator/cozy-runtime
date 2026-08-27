@@ -117,6 +117,21 @@ def _deadline(seconds: float | None) -> float:
     return math.inf if seconds is None else time.monotonic() + seconds
 
 
+def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
+    """Verified worker-spooled inputs, projected identically into either execution lane."""
+    return {
+        input_id: GrantedInput(
+            input_id=input_id,
+            local=Path(row["local"]),
+            media_type=str(row["media_type"]),
+            digest=str(row["digest"]),
+            length=int(row["length"]),
+            order=int(row.get("order", 0)),
+        )
+        for input_id, row in (command.get("inputs") or {}).items()
+    }
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -868,17 +883,7 @@ class Executor:
                 # cr-012: the inputs the WORKER already fetched, verified and spooled.
                 # Every value is a path inside this attempt's own spool; this process has
                 # no outbound network and never resolves an address of its own.
-                assets={
-                    input_id: GrantedInput(
-                        input_id=input_id,
-                        local=Path(row["local"]),
-                        media_type=str(row["media_type"]),
-                        digest=str(row["digest"]),
-                        length=int(row["length"]),
-                        order=int(row.get("order", 0)),
-                    )
-                    for input_id, row in (command.get("inputs") or {}).items()
-                },
+                assets=_granted_inputs(command),
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
             ),
         )
@@ -898,20 +903,9 @@ class Executor:
         quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        # Author code entered, so reuse is poisoned by any non-success — a refusal raised
-        # BEFORE entry (schema, bounds, preflight) leaves a Ready executor untouched (§3.1).
-        pre_entry = (
-            "invalid_request",
-            "unsupported_input",
-            "default_resolution",
-            # cr-012's typed input refusals. They fire BEFORE the entrypoint exists to the
-            # request, so they leave the generation exactly as they found it — listing them
-            # here is what keeps a bad input from poisoning a Ready executor.
-            "asset_ungranted",
-            "asset_media_type",
-            "asset_too_large",
-        )
-        if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
+        # A typed refusal before handler entry leaves a Ready executor untouched. This is
+        # an observed phase bit, not a refusal-code allowlist that drifts as validation grows.
+        if outcome.terminal != "succeeded" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
@@ -1063,6 +1057,8 @@ class Executor:
                     ref: (Path(root), digest)
                     for ref, (root, digest) in (command.get("trees") or {}).items()
                 },
+                assets=_granted_inputs(command),
+                max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
                 budget=BudgetFacts(
@@ -1081,8 +1077,7 @@ class Executor:
             peak_vram = accel.peak_allocated(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        pre_entry = ("invalid_request", "unsupported_input", "default_resolution", "tree_ungranted")
-        if outcome.terminal != "succeeded" and outcome.code not in pre_entry:
+        if outcome.terminal != "succeeded" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         return {
             "ok": True,

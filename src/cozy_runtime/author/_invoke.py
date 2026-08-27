@@ -221,6 +221,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     )
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
+    attempt.entered = True
     result = _call(surface, kwargs)
 
     _validate_result(surface, result, attempt)
@@ -394,7 +395,18 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
 
 
-def asset_inputs(payload: object) -> list[tuple[str, int, Asset, AssetBound | None]]:
+@dataclass(frozen=True, slots=True)
+class AssetInput:
+    """One typed Asset occurrence and its lossless request address."""
+
+    input_id: str
+    order: int
+    asset: Asset
+    bound: AssetBound | None
+    segments: tuple[str | int, ...]
+
+
+def asset_inputs(payload: object) -> list[AssetInput]:
     """Every input asset with its identity, order, and concrete typed-field bound.
 
     `input_id` is the payload FIELD PATH with the list index included, which is
@@ -407,56 +419,98 @@ def asset_inputs(payload: object) -> list[tuple[str, int, Asset, AssetBound | No
     which is a question about identity and must collect a repeat, while this one answers
     "which grant entry fills this field", which is a question about position.
     """
-    found: list[tuple[str, int, Asset, AssetBound | None]] = []
+    found: list[AssetInput] = []
 
     def walk_value(
         value: object,
-        path: str,
+        segments: tuple[str | int, ...],
         order: int,
         seen: set[int],
         bound: AssetBound | None,
     ) -> None:
         if isinstance(value, Asset):
-            found.append((path, order, value, bound))
+            bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
+            if bad:
+                raise InvalidRequest(
+                    "asset field path segments must be non-empty and contain no '.': "
+                    + ", ".join(repr(part) for part in bad),
+                    code="asset_input_path_unsupported",
+                )
+            input_id = ".".join(str(part) for part in segments)
+            found.append(AssetInput(input_id, order, value, bound, segments))
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
         seen.add(id(value))
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                walk_value(item, f"{path}.{index}" if path else str(index), index, seen, bound)
+                walk_value(item, (*segments, index), index, seen, bound)
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk_value(item, f"{path}.{key}" if path else str(key), 0, seen, bound)
+                walk_value(item, (*segments, str(key)), order, seen, bound)
             return
-        annotations: dict[str, object] = {}
         if isinstance(value, msgspec.Struct):
-            annotations = {field.name: field.type for field in msgspec.structs.fields(type(value))}
-        elif is_dataclass(value) and not isinstance(value, type):
+            for field_info in msgspec.structs.fields(type(value)):
+                _base, markers = strip(field_info.type)
+                declared = next((m for m in markers if isinstance(m, AssetBound)), None)
+                name = field_info.encode_name
+                walk_value(
+                    getattr(value, field_info.name),
+                    (*segments, name),
+                    order,
+                    seen,
+                    declared if declared is not None else bound,
+                )
+            return
+        if is_dataclass(value) and not isinstance(value, type):
             annotations = get_type_hints(type(value), include_extras=True)
-        for name, member in field_values(value).items():
-            _base, markers = strip(annotations.get(name, object))
-            declared = next((m for m in markers if isinstance(m, AssetBound)), None)
-            walk_value(
-                member,
-                f"{path}.{name}" if path else name,
-                0,
-                seen,
-                declared if declared is not None else bound,
-            )
+            for name, member in field_values(value).items():
+                _base, markers = strip(annotations.get(name, object))
+                declared = next((m for m in markers if isinstance(m, AssetBound)), None)
+                walk_value(
+                    member,
+                    (*segments, name),
+                    order,
+                    seen,
+                    declared if declared is not None else bound,
+                )
 
-    walk_value(payload, "", 0, set(), None)
+    walk_value(payload, (), 0, set(), None)
+    counts: dict[str, int] = {}
+    for item in found:
+        counts[item.input_id] = counts.get(item.input_id, 0) + 1
+    duplicates = sorted(input_id for input_id, count in counts.items() if count > 1)
+    if duplicates:
+        raise InvalidRequest(
+            "asset field paths are ambiguous after wire-name encoding: "
+            + ", ".join(repr(input_id) for input_id in duplicates),
+            code="asset_input_id_ambiguous",
+            fields=duplicates,
+        )
     return found
 
 
-def _check_input(asset: Asset, granted: GrantedInput, bound: AssetBound | None, cap: int) -> None:
+def _check_input(
+    asset: Asset,
+    granted: GrantedInput,
+    bound: AssetBound | None,
+    cap: int,
+    expected_order: int,
+) -> None:
     """The typed gate every input passes before the entrypoint exists to it.
 
     MEDIA-TYPE HONESTY is the first check and it is about the BYTES: `granted.media_type`
     is what the worker sniffed, not what the caller declared, so a `.png` that is a
     zip refuses here rather than inside a decoder the endpoint did not agree to run.
     """
+    if granted.order != expected_order:
+        raise InvalidRequest(
+            f"input {granted.input_id!r} carries order {granted.order}, but the decoded "
+            f"request places it at {expected_order}",
+            code="asset_order",
+            fields=[granted.input_id],
+        )
     kind = type(asset).kind
     if not admits(kind, granted.media_type):
         raise InvalidRequest(
@@ -500,27 +554,27 @@ def _hydrate(payload: object, inv: Invocation) -> None:
     _materialize_trees(payload, inv)
     if not declares_assets(type(payload)):
         return
-    for input_id, _order, asset, bound in asset_inputs(payload):
-        granted = inv.assets.get(input_id)
+    for item in asset_inputs(payload):
+        granted = inv.assets.get(item.input_id)
         if granted is None:
             raise InvalidRequest(
-                f"input asset {input_id!r} (ref {asset.ref!r}) is not granted to this "
+                f"input asset {item.input_id!r} (ref {item.asset.ref!r}) is not granted to this "
                 f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
                 "asset is a digest-verified READ CAPABILITY minted by the RecordOwner, "
                 "never a location a request may name",
                 code="asset_ungranted",
-                fields=[input_id],
+                fields=[item.input_id],
             )
-        _check_input(asset, granted, bound, inv.max_input_bytes)
+        _check_input(item.asset, granted, item.bound, inv.max_input_bytes, item.order)
         bind(
-            asset,
+            item.asset,
             local=granted.local,
             attempt=inv.request_id,
             media_type=granted.media_type,
             digest=granted.digest,
             length=granted.length,
-            max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
-            input_id=input_id,
+            max_decoded_bytes=(item.bound.max_decoded_bytes or 0) if item.bound is not None else 0,
+            input_id=item.input_id,
         )
 
 

@@ -47,6 +47,7 @@ from typing import Any, TypeVar
 
 from cozy_runtime.internal import canonical, provisioned
 from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -112,6 +113,14 @@ class WeightlessReleaseDocuments:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalInput:
+    """One owner-held file plus its typed position in the request."""
+
+    source: str
+    order: int
+
+
+@dataclass(frozen=True, slots=True)
 class LocalRequest:
     """One request, as a RecordOwner would put it on the wire."""
 
@@ -141,12 +150,12 @@ class LocalRequest:
     #: the materialized input trees this run grants (`ref -> local directory`).
     job_descriptor_id: str = ""
     trees: Mapping[str, str] = field(default_factory=dict)
-    #: cr-012: the INPUT ASSETS this run grants, as `input_id -> local file`. The key is
-    #: the payload FIELD PATH (`photo`, `refs.0`) and the value is a location the
-    #: RecordOwner can authorize; the worker still verifies every byte it reads against the
-    #: grant's own digest and length, and sniffs the type it was told. Ordered, identified
-    #: subjects — never a digest-sorted anonymous list (worker-protocol/01).
-    inputs: Mapping[str, str] = field(default_factory=dict)
+    #: cr-012: the INPUT ASSETS this run grants, as `input_id -> (source, typed order)`.
+    #: Order comes from the decoded request walk exactly once; it is never guessed back out
+    #: of a field-path string, where a numeric map key is indistinguishable from a list
+    #: position. The worker still verifies every byte and sniffs its type. Ordered,
+    #: identified subjects — never a digest-sorted anonymous list (worker-protocol/01).
+    inputs: Mapping[str, LocalInput] = field(default_factory=dict)
     org: str = "local"
     """The publishing org. A job's outputs are hub-rewritten into the SCRATCH repo
     `<org>/_job-<request-id>` — the underscore is deliberately outside the public repo
@@ -162,6 +171,7 @@ class SliceOutcome:
     terminal: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     result_schema_digest: str = ""
+    invocation: dict[str, Any] = field(default_factory=dict)
     accepted: dict[str, Any] = field(default_factory=dict)
     manifest: list[dict[str, Any]] = field(default_factory=list)
     #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
@@ -286,6 +296,7 @@ class LocalRecordOwner:
         self.terminal: pb.AttemptOutcome | None = None
         self.reports: list[pb.ObservedWorkerState] = []
         self.spec_digest = b""
+        self.spec_document: dict[str, Any] = {}
         self.done = threading.Event()
         self.marks: dict[str, float] = {"start": time.perf_counter()}
         self.grant_dir = workspace / "grants"
@@ -370,12 +381,58 @@ class LocalRecordOwner:
         elif kind == "observed_state":
             self._on_observed_state(frame.observed_state)
         elif kind == "attempt_accepted":
-            self.accepted = frame.attempt_accepted
-            self.marks["accepted"] = time.perf_counter()
+            self._on_accepted(frame.attempt_accepted)
         elif kind == "attempt_outcome":
             self._on_outcome(frame.attempt_outcome)
         elif kind == "checkpoint_request":
             self._on_checkpoint(frame.checkpoint_request)
+
+    def _on_accepted(self, accepted: pb.AttemptAccepted) -> None:
+        """Retain only a complete acceptance for the exact offered invocation and mode."""
+        if self.accepted is not None:
+            raise RuntimeError("the worker accepted the same local attempt more than once")
+        if accepted.request_id != self.request.request_id:
+            raise RuntimeError(
+                f"accepted request {accepted.request_id!r}, offered {self.request.request_id!r}"
+            )
+        if accepted.attempt_ordinal != self.request.attempt:
+            raise RuntimeError(
+                f"accepted ordinal {accepted.attempt_ordinal}, offered {self.request.attempt}"
+            )
+        if bytes(accepted.invocation_spec_digest) != self.spec_digest:
+            raise RuntimeError("accepted invocation digest differs from the offered spec")
+        if len(bytes(accepted.plan_digest)) != hashlib.sha256().digest_size:
+            raise RuntimeError("accepted plan digest is not one SHA-256 identity")
+        construction = bytes(accepted.model_construction_digest)
+        if accepted.executor_generation <= 0:
+            raise RuntimeError("accepted executor generation is not positive")
+        if self.request.kind == "job":
+            if accepted.placement_id:
+                raise RuntimeError("a job acceptance carries a serving placement")
+            if construction:
+                raise RuntimeError("a job acceptance carries a model-construction identity")
+            if (
+                accepted.plan.delivery != "job"
+                or accepted.plan.materialization != "run_to_completion"
+                or accepted.plan.placement != "job_attempt"
+            ):
+                raise RuntimeError("a job acceptance carries a serving attempt plan")
+        else:
+            if accepted.placement_id != LOCAL_PLACEMENT:
+                raise RuntimeError(
+                    f"accepted placement {accepted.placement_id!r}, offered {LOCAL_PLACEMENT!r}"
+                )
+            if construction:
+                raise RuntimeError("a local weightless acceptance invents model construction")
+            if (
+                accepted.plan.delivery != "native"
+                or accepted.plan.materialization
+                or accepted.plan.placement != "all_resident"
+                or accepted.plan.reserved_device_memory_bytes
+            ):
+                raise RuntimeError("a local weightless acceptance carries a model-bearing plan")
+        self.accepted = accepted
+        self.marks["accepted"] = time.perf_counter()
 
     def _on_claim_ack(self, ack: pb.ClaimAck) -> None:
         if not ack.accepted:
@@ -575,14 +632,15 @@ class LocalRecordOwner:
         return directive
 
     def scratch_repo(self) -> str:
-        """`<org>/_job-<request-id>` — the SCRATCH repo a job's publishes are rewritten into.
+        """The opaque SCRATCH repo a job's publishes are rewritten into.
 
         The underscore is deliberately outside the public repo grammar (`artifacts.REF`
         admits `[a-zA-Z0-9]` first), so no user ref can ever squat a job's scratch. Promotion
         OUT of scratch is an explicit later act under the caller's own credentials; a verdict
-        stamps metadata and never gates persistence — a failed run's writes still land.
+        stamps metadata and never gates persistence — a failed run's writes still land. The
+        wire request id is hashed because a repository name is authority, not identity.
         """
-        return f"{self.request.org}/_job-{self.request.request_id}"
+        return f"{self.request.org}/_job-{opaque_key('job-repository', self.request.request_id)}"
 
     def _publication(self) -> pb.PublicationContract:
         """What this run authorizes the job to write, by output id. Minted from the job's own
@@ -608,28 +666,25 @@ class LocalRecordOwner:
                 order=0,
             )
         ]
-        order = 1
         for ref in sorted(self.request.trees):
             rows.append(
                 pb.InputBinding(
                     input_id=f"{grants_module.TREE_PREFIX}{ref}",
                     kind_mime="inode/directory",
-                    order=order,
+                    order=0,
                 )
             )
-            order += 1
-        for input_id, source in sorted(self.request.inputs.items()):
-            data = Path(source).read_bytes()
+        for input_id, local_input in sorted(self.request.inputs.items()):
+            digest, length, media_type = _input_facts(Path(local_input.source))
             rows.append(
                 pb.InputBinding(
                     input_id=input_id,
-                    digest="sha256:" + hashlib.sha256(data).hexdigest(),
-                    length=len(data),
-                    kind_mime=_declared_media_type(Path(source)),
-                    order=order,
+                    digest=digest,
+                    length=length,
+                    kind_mime=media_type,
+                    order=local_input.order,
                 )
             )
-            order += 1
         return rows
 
     def _output_bindings(self) -> list[pb.OutputBinding]:
@@ -671,6 +726,7 @@ class LocalRecordOwner:
             spec.serving.attempt_binding_id = plan_id
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
+        self.spec_document = documents.read(canonical_bytes, pb.InvocationSpec)
         self.marks["dispatched"] = time.perf_counter()
         self._send(
             pb.RecordOwnerFrame(
@@ -697,7 +753,10 @@ class LocalRecordOwner:
         if self.request.payload_url:
             payload_url = self.request.payload_url
         else:
-            path = self.grant_dir / f"{self.request.request_id}.json"
+            path = self.grant_dir / (
+                opaque_key("local-payload-grant", self.request.request_id, self.request.attempt)
+                + ".json"
+            )
             path.write_bytes(body)
             payload_url = f"file://{path}"
         expires = self.expiry()
@@ -710,8 +769,8 @@ class LocalRecordOwner:
             for ref, root in sorted(self.request.trees.items())
         ]
         inputs += [
-            pb.InputAccess(input_id=input_id, url=f"file://{Path(source).resolve()}")
-            for input_id, source in sorted(self.request.inputs.items())
+            pb.InputAccess(input_id=input_id, url=f"file://{Path(item.source).resolve()}")
+            for input_id, item in sorted(self.request.inputs.items())
         ]
         return pb.DeliveryGrant(
             invocation_spec_digest=invocation_digest,
@@ -735,7 +794,15 @@ class LocalRecordOwner:
         )
 
     def _filename(self, output_id: str) -> str:
-        return f"{self.request.request_id}-{output_id.replace('.', '-')}.bin"
+        return (
+            opaque_key(
+                "local-output",
+                self.request.request_id,
+                self.request.attempt,
+                output_id,
+            )
+            + ".bin"
+        )
 
     def _on_checkpoint(self, request: pb.JobCheckpointRequest) -> None:
         """The RecordOwner half of the DURABLE checkpoint exchange (cr-009).
@@ -939,8 +1006,8 @@ def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
     return ref, path
 
 
-def _declared_media_type(path: Path) -> str:
-    """What the RecordOwner declares one input to be (cr-012).
+def _input_facts(path: Path) -> tuple[str, int, str]:
+    """Stream one local input once into its exact digest, length, and media claim.
 
     A local RecordOwner reads the bytes because it holds them; a hub reads its own record
     instead. Either way it is a CLAIM, and the worker sniffs what it actually received and
@@ -948,8 +1015,20 @@ def _declared_media_type(path: Path) -> str:
     """
     from cozy_runtime.author._media import SNIFF_BYTES, sniff
 
+    digest = hashlib.sha256()
+    length = 0
+    head = bytearray()
     with open(path, "rb") as handle:
-        return sniff(handle.read(SNIFF_BYTES)) or "application/octet-stream"
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+            length += len(chunk)
+            if len(head) < SNIFF_BYTES:
+                head.extend(chunk[: SNIFF_BYTES - len(head)])
+    return (
+        "sha256:" + digest.hexdigest(),
+        length,
+        sniff(bytes(head)) or "application/octet-stream",
+    )
 
 
 def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:
@@ -1063,10 +1142,18 @@ def _collect(
     outcome.publication_scope = (
         record_owner.scratch_repo() if record_owner.request.kind == "job" else ""
     )
+    if record_owner.spec_document:
+        outcome.invocation = {
+            "digest": _spell(record_owner.spec_digest),
+            "document": record_owner.spec_document,
+        }
 
     if record_owner.accepted is not None:
         accepted = record_owner.accepted
         outcome.accepted = {
+            "request_id": accepted.request_id,
+            "attempt_ordinal": accepted.attempt_ordinal,
+            "invocation_spec_digest": _spell(accepted.invocation_spec_digest),
             "plan_digest": _spell(accepted.plan_digest),
             # A JOB attempt has NO model construction: no warm pool, no serving pointer, no
             # retained generation. The empty digest is the honest answer and spelling it as
@@ -1077,7 +1164,10 @@ def _collect(
             "placement": accepted.plan.placement,
             "compute_dtype": accepted.plan.compute_dtype,
             "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
+            "reserved_host_bytes": accepted.plan.reserved_host_bytes,
             "decision_explanation": accepted.plan.decision_explanation,
+            "placement_id": accepted.placement_id,
+            "executor_generation": accepted.executor_generation,
         }
     if record_owner.terminal is not None:
         body = documents.read(record_owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
