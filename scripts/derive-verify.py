@@ -793,7 +793,7 @@ def section_gap_doctrine() -> None:
     check(
         "the author surface still refuses every construction keyword the runtime owns",
         {"device", "dtype", "offload", "compile"} <= set(EXCLUDED_KEYWORDS),
-        f"{len(EXCLUDED_KEYWORDS)} excluded keywords, held live by scripts/fence.py",
+        f"{len(EXCLUDED_KEYWORDS)} excluded keywords, held live by checks/architecture.py",
     )
     check(
         "the descriptor's fixed point still forbids candidate-derived facts",

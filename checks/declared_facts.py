@@ -13,7 +13,7 @@ found by a human running grep. This script is that grep, mechanized and tied to 
 SDK: COVERAGE IS ENFORCED — a public fact with no exercise here is a refusal, so Runtime's
 author contract and the exercise list cannot drift apart.
 
-    uv run python scripts/conformance.py
+    uv run python checks/declared_facts.py
 """
 
 from __future__ import annotations

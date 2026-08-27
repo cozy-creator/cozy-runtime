@@ -17,13 +17,13 @@ means the old script remains the only local executor and must not be deleted yet
 | deleted `scripts/cli-live.py inputs` | typed local media, canonical invocation receipt and ordering; private transfer/RecordOwner fault plants | `proofs/cli/run.sh`; `proofs/internal/local_input_acceptance.py` | migrated 2026-08-27; public and explicitly private legs both run from the freshly installed wheel |
 | deleted `scripts/cli-live.py identity` | real SDXL CLI-vs-attempt output, plan and ledger equivalence | current exit-6 local-binding refusal; `scripts/pipeline-live.py image` | retired 2026-08-27; model-bound `cozy-runtime run` was deleted with flat local binding records, so no public GPU result exists to compare and preserving the old path would revive removed authority |
 | deleted `scripts/cli-live.py hubless` | network-cut SDXL inference and planted physical-floor refusal | `proofs/cli/run.sh`; `scripts/pipeline-live.py image/arms` | split 2026-08-27; installed weightless `--offline` runs with AF_INET/6 cut, while real pipeline output and quantified floor remain GPU-owned; the deleted local model-binding CLI path is not an acceptance contract |
-| `scripts/conformance.py` | descriptor facts have live writers | `checks/` | pending; current hosted-check owner |
+| `checks/declared_facts.py` | descriptor facts have live writers | `checks/` | migrated 2026-08-27; hosted static check, path and CI owner now agree |
 | `scripts/delivery-live.py` | variants, selection, refusals, calibration, serving | internal proof plus GPU qualification | pending; not rerun here |
 | `scripts/derive-corpus.py` | adversarial derivation corpus | internal derivation proof | pending; not rerun here |
 | `scripts/derive-verify.py` | H3/SDXL derivation and refusals | internal derivation proof | pending; not rerun here |
 | `scripts/environment-materializer-live.py` | private materializer cold/warm/refusals | `proofs/internal/environment_materializer.py` | migrated 2026-08-27; only publish-race/receipt-keyed reuse and post-publication tamper checks remain private; public CLI subsumes its other facts |
 | `scripts/environment-proof-live.py` | public environment cold/rebuild/refusals | `proofs/environment/run.sh` | migrated 2026-08-27; installed wheel from `/`, exact receipt bytes/digest/length, isolated imports, CUDA ABI, atomic race, closed-request and wheel refusals, no partial outputs |
-| `scripts/fence.py` | architecture dependency scans | `checks/` | pending; current hosted-check owner |
+| `checks/architecture.py` | architecture dependency scans | `checks/` | migrated 2026-08-27; hosted static check, path and CI owner now agree |
 | `scripts/job-live.py` | job e2e, kill, refusals, identity, timing | internal job proof plus qualification/benchmark | pending; not rerun here |
 | `scripts/leaf-live.py` | provider selection, carriers, refusals | internal encoding proof plus qualification | pending; not rerun here |
 | `scripts/leaf-pod.py` | H3 fetch, ingest, probe, fill, forward, choose | `qualification/gpu/` | pending; dynamically imports pod script |
@@ -46,7 +46,7 @@ means the old script remains the only local executor and must not be deleted yet
 | `scripts/slice-live.py` | slice, ledger, refusals, triage, witness, clone, timing | internal execution proof plus qualification/benchmark | pending; not rerun here |
 | `scripts/tiered-cache-live.py` | TensorFS/local HTTP cache | internal cache proof | pending; not rerun here |
 | `scripts/verify.py` | author surface and examples end to end | internal author proof; installed CLI arm to `proofs/cli/` | pending; not rerun here |
-| `scripts/wire-fence.py` | generated wire-schema identity | `checks/` | pending; current hosted-check owner |
+| `checks/wire_schema.py` | generated wire-schema identity | `checks/` | migrated 2026-08-27; hosted static check, path and CI owner now agree |
 | `scripts/worker-live.py` | worker attempts, death/recovery, journals, readiness, timing | internal worker proof plus qualification/benchmark | pending; not rerun here |
 
 Five old entrypoints dynamically load other entrypoints (`assets-live`, `delivery-live`,

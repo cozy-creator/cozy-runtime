@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fence prover: PLANT each violation for real, observe the refusal, remove the plant.
 
-Not a test — it mutates the working tree and restores it. Static arms run `scripts/fence.py`
+Not a test — it mutates the working tree and restores it. Static arms run
+`checks/architecture.py`
 and expect it red; live arms execute the real runtime function and expect its typed refusal.
 Run it whenever a fence changes: `uv run python scripts/redarm.py`.
 """
@@ -1235,7 +1236,7 @@ def run_separation() -> str:
 
 def fence() -> tuple[int, str]:
     out = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "fence.py")],
+        [sys.executable, str(ROOT / "checks" / "architecture.py")],
         capture_output=True,
         text=True,
         cwd=ROOT,
