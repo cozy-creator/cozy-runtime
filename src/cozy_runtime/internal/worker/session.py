@@ -2033,7 +2033,9 @@ class Worker:
                             # field says what it carries so it cannot be read as a ceiling.
                             "declared_weight_bytes": first.model_weight_bytes,
                             "pinned": first.pinned_bytes,
+                            # cl-027: None means DERIVE at prepare; the floor rides with it.
                             "resident": first.resident_budget_bytes,
+                            "vram_floor": first.vram_floor_bytes,
                         },
                         "expect_construction_digest": first.expected_logical_model_digest,
                     },

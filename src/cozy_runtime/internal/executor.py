@@ -132,6 +132,26 @@ def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
     }
 
 
+def residence_ceiling(
+    declared: int | None, *, destinations: int, allocatable: int, floor: int
+) -> tuple[int, str]:
+    """The construction's residence ceiling and where it came from (cl-027 / cr-025).
+
+    A declared value is applied as declared: an explicit 0 is ALL-RESIDENT (no ceiling), a
+    positive value parks components past it. `None` — what a provisioned binding carries
+    now that the creator no longer authors this field — is DERIVED from the card: the
+    measured allocatable capacity minus the physical floor (activations, scratch, one
+    component chunk), capped at the artifact's own complete destination bytes so a card
+    with room reports the artifact's size rather than its own. The derived value is never
+    0 by accident: a floor that leaves no room at all is a typed shortfall at the caller.
+
+    Returns `(ceiling_bytes, basis)` with basis `declared` or `derived`.
+    """
+    if declared is not None:
+        return max(int(declared), 0), "declared"
+    return min(int(destinations), max(int(allocatable) - int(floor), 0)), "derived"
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -413,11 +433,6 @@ class Executor:
             qualified=qualified,
             forensics_dir=self.fill_forensics_dir,
         )
-        # A STAGING generation re-reads the store after construction, so its GC-safe hold
-        # must outlive the first commit. `resident_budget` is what makes a parked component
-        # possible at all: 0 means every component stays resident.
-        backend.resident_budget = int(budgets.get("resident", 0))
-        backend.hold_lease = backend.resident_budget > 0
         # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
         # destination residency from the MCC's complete logical+derived tensor census. The
         # header independently prices logical rows and the selected route's native/decode
@@ -426,11 +441,57 @@ class Executor:
         # This refusal runs before allocation instead of discovering an OOM mid-fill.
         declared = int(budgets["declared_weight_bytes"])
         envelope = complete_device_envelope(backend.device_envelope(), declared)
-        required = int(envelope["required_bytes"])
         memory = accel.allocation(torch, self.device_kind)
         allocatable = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
+        # THE RESIDENCE CEILING (cl-027 / cr-025). Declared by the binding, or DERIVED here
+        # from measured capacity, the artifact's complete destination bytes and the floor —
+        # and whichever it was, the APPLIED value is what the generation's digest carries.
+        # A staging generation re-reads the store after construction, so its GC-safe hold
+        # must outlive the first commit; that is what `hold_lease` is.
+        destinations = max(int(envelope["destination_bytes"]), declared)
+        resident_budget, resident_basis = residence_ceiling(
+            budgets.get("resident"),
+            destinations=destinations,
+            allocatable=int(allocatable),
+            floor=int(budgets.get("vram_floor") or 0),
+        )
+        if resident_basis == "derived" and resident_budget <= 0:
+            self.poisoned = "fill refused: device_shortfall"
+            return {
+                "ok": False,
+                "code": "device_shortfall",
+                "detail": (
+                    f"the declared floor of {int(budgets.get('vram_floor') or 0)} B leaves "
+                    f"no residence ceiling on {allocatable} B allocatable — nothing of this "
+                    "construction can stay resident, so there is no plan to derive"
+                ),
+                "shortfall": {
+                    "resource": "vram",
+                    "scope": "component_generation",
+                    "needed_bytes": int(budgets.get("vram_floor") or 0),
+                    "available_bytes": int(allocatable),
+                    "evidence_class": "measured",
+                },
+            }
+        backend.resident_budget = resident_budget
+        backend.hold_lease = 0 < resident_budget < destinations
+        # ADMISSION prices the RESIDENT set, not every destination: a construction whose
+        # total exceeds the card but whose ceiling fits prepares and stages (cr-025 done-when).
+        resident_destinations = (
+            min(destinations, resident_budget) if resident_budget else destinations
+        )
+        required = (
+            resident_destinations + int(envelope["native_bytes"]) + int(envelope["decode_peak_bytes"])
+        )
+        envelope = {
+            **envelope,
+            "resident_destination_bytes": resident_destinations,
+            "resident_budget_bytes": resident_budget,
+            "resident_budget_basis": resident_basis,
+            "required_bytes": required,
+        }
         if required > allocatable:
             self.poisoned = "fill refused: device_shortfall"
             return {
@@ -438,7 +499,9 @@ class Executor:
                 "code": "device_shortfall",
                 "detail": (
                     f"this fill will hold {required} B on the device "
-                    f"({envelope['destination_bytes']} B of logical destinations, "
+                    f"({resident_destinations} B of resident destinations under a "
+                    f"{resident_basis} ceiling of {resident_budget} B; "
+                    f"{envelope['destination_bytes']} B of logical destinations, "
                     f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
                     "destinations, "
                     f"{envelope['native_bytes']} B of native encoded leaves, "
@@ -595,7 +658,8 @@ class Executor:
                 "plan_digest": plan.digest(),
                 "topology_digest": record.topology_digest,
                 "config_digest": record.config_digest,
-                "resident_budget_bytes": int(budgets.get("resident", 0)),
+                # THE APPLIED CEILING — derived or declared — never the wire's absent 0 (cl-027).
+                "resident_budget_bytes": resident_budget,
             }
         )
         expected = command.get("expect_construction_digest") or ""
@@ -622,6 +686,8 @@ class Executor:
             "reserved_bytes": memory["reserved_bytes"],
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
+            "resident_budget_bytes": resident_budget,
+            "resident_budget_basis": resident_basis,
             "rss_bytes": _rss(),
             "pinned": dict(backend.pinned),
             "store": backend.stats.get("store", {}),

@@ -313,9 +313,13 @@ class DeclaredBinding:
     rung, and a local capacity refusal is the honest answer. RESOLUTION — the border
     measured it and the index row carries it, so it comes from the resolver's own index
     with the rest of the artifact's facts; 0 takes the conservative default."""
-    resident_budget_bytes: int = 0
-    """The DECLARED construction ceiling: components past it are parked and staged in on
-    first declared use. 0 means every component stays resident."""
+    resident_budget_bytes: int | None = None
+    """The construction's RESIDENCE CEILING: components past it are parked and staged in on
+    first declared use. None — the provisioned default since cl-027, when the creator stopped
+    authoring it — means the executor DERIVES it at prepare from measured device capacity,
+    the artifact's destination bytes and `vram_floor_bytes`; an explicit 0 means every
+    component stays resident. Whatever value is APPLIED is stamped into the
+    ConstructedGeneration digest (cr-025)."""
     tenancy: str = "local"
     """`local` (single-tenant: capacity never refuses above the floor, it deepens the ladder
     and confesses) or `shared` (a shortfall is a RESCHEDULE for the RecordOwner, never a
