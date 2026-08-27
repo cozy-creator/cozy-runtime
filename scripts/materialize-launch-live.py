@@ -8,21 +8,25 @@ import hashlib
 import tempfile
 import time
 from pathlib import Path
+from typing import TypedDict
 
-from cozy_runtime.internal import canonical, contract, pull, readiness
+from cozy_runtime.internal import canonical, contract, fill, provisioned, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
     LaunchRefusal,
-    _binding_closure,
-    _object_set,
     _provision_pair,
 )
-from cozy_runtime.internal.worker import plan as worker_plan
+from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.protocol import SCHEMA_DIGEST
 
 
-def ref(raw: bytes) -> dict[str, object]:
+class Ref(TypedDict):
+    digest: str
+    length: int
+
+
+def ref(raw: bytes) -> Ref:
     return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
 
 
@@ -169,6 +173,16 @@ def main() -> int:
             assert exc.code == "artifact_incomplete"
         else:
             raise AssertionError("plaintext direct object grant was accepted")
+        try:
+            pull.open_guarded(
+                "https://127.0.0.1/grant",
+                pull.Deadline.after(1),
+                no_proxy=True,
+            )
+        except pull.PullRefusal as exc:
+            assert exc.code == "source_not_allowed"
+        else:
+            raise AssertionError("private small-artifact grant bypassed the shared guard")
 
         construction = contract.ModelConstructionContract(
             candidate=contract.Candidate(
@@ -184,7 +198,7 @@ def main() -> int:
                 contract.LogicalTensor(
                     key="transformer.weight",
                     component="transformer",
-                    shape=(2, 3),
+                    shape=(16, 16),
                     kind="parameter",
                     module_class="Linear",
                     alias_group=0,
@@ -200,7 +214,14 @@ def main() -> int:
                     keys=("transformer.weight",),
                 ),
             ),
-            derived=(),
+            derived=(
+                contract.DerivedTensor(
+                    key="transformer.rotary",
+                    component="transformer",
+                    shape=(8,),
+                    dtype="float32",
+                ),
+            ),
             caches=(),
         )
         contract_bytes = canonical.write(construction.render())
@@ -220,6 +241,8 @@ def main() -> int:
         binding_documents.mkdir()
         config_bytes = b"{}"
         config_ref = ref(config_bytes)
+        config_asset_bytes = b"tokenizer-asset"
+        config_asset_ref = ref(config_asset_bytes)
         bound_contract = contract.ModelConstructionContract(
             candidate=contract.Candidate(
                 release="endpoint@release",
@@ -232,7 +255,7 @@ def main() -> int:
             ),
             logical_tensors=construction.logical_tensors,
             destination_sets=construction.destination_sets,
-            derived=(),
+            derived=construction.derived,
             caches=(),
         )
         contract_bytes = canonical.write(bound_contract.render())
@@ -254,30 +277,39 @@ def main() -> int:
                             }
                         ],
                         "name": "generate",
-                    }
+                    },
+                    {
+                        "hidden": False,
+                        "kind": "entrypoint",
+                        "models": [],
+                        "name": "health",
+                    },
                 ],
             }
         )
         descriptor_ref = ref(descriptor_bytes)
-        layout_ref = {"digest": "sha256:" + "e" * 64, "length": 23}
+        layout_ref: Ref = {"digest": "sha256:" + "e" * 64, "length": 23}
+        fp8_weights_ref: Ref = {"digest": "sha256:" + "f" * 64, "length": 256}
+        endpoint_layout_ref: Ref = {"digest": "sha256:" + "2" * 64, "length": 29}
+        endpoint_root_ref: Ref = {"digest": "sha256:" + "1" * 64, "length": 13}
+        model_root_ref: Ref = {"digest": "sha256:" + snapshot, "length": 17}
         binding_bytes = canonical.write(
             {
                 "checkpoint": {
-                    "snapshot_root": {"digest": "sha256:" + snapshot, "length": 17},
+                    "snapshot_root": model_root_ref,
                     "tensor_layout": layout_ref,
                 },
-                "config": {"assets": [], "document": config_ref},
+                "config": {
+                    "assets": [{"name": "tokenizer", "ref": config_asset_ref}],
+                    "document": config_ref,
+                },
                 "execution_layout": [
                     {
                         "component": "transformer",
-                        "snapshot_root": {
-                            "digest": "sha256:" + snapshot,
-                            "length": 17,
-                        },
+                        "snapshot_root": model_root_ref,
                         "tensor_layout": layout_ref,
                     }
                 ],
-                "fit": {"model_weight_bytes": 4096, "vram_floor_bytes": 1024},
                 "format": "cozy.endpoint.ResolvedModelBinding/1",
                 "model_construction_contract": contract_ref,
                 "stamps": [],
@@ -292,6 +324,14 @@ def main() -> int:
                 "format": "cozy.endpoint.EntrypointBindingPlan/1",
             }
         )
+        weightless_plan_bytes = canonical.write(
+            {
+                "bindings": [],
+                "descriptor": descriptor_ref,
+                "entrypoint": "health",
+                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+            }
+        )
         for artifact_ref, raw in (
             (config_ref, config_bytes),
             (contract_ref, contract_bytes),
@@ -299,77 +339,95 @@ def main() -> int:
             (binding_ref, binding_bytes),
         ):
             (binding_documents / f"{str(artifact_ref['digest'])[7:]}.json").write_bytes(raw)
-        resolved_binding = worker_plan.read_provisioned_binding(
-            "project-wheel",
-            plan_bytes,
-            documents_root=binding_documents,
-            endpoint_release="endpoint@release",
-            store_root=root / "store",
-        )
-        assert resolved_binding.application == "endpoint:app"
-        assert resolved_binding.components == ("transformer",)
-        assert resolved_binding.expected_logical_model_digest == contract.logical_model_digest(
-            bound_contract
-        )
-        try:
-            worker_plan.read_provisioned_binding(
-                "project-wheel",
-                canonical.write(
-                    {
-                        "entrypoint_binding_plan_id": "project-wheel",
-                        "entrypoint": "generate",
-                        "project": "/source",
-                        "release": "endpoint@release",
-                    }
-                ),
-                documents_root=binding_documents,
-                endpoint_release="endpoint@release",
-                store_root=root / "store",
-            )
-        except worker_plan.PlanRefusal as exc:
-            assert exc.code == "plan_invalid"
-        else:
-            raise AssertionError("removed flat DeclaredBinding document was accepted")
         object_set_bytes = canonical.write(
             {
                 "kind": "tensorhub.resolved_object_set/1",
                 "roots": [
                     {
-                        "objects": [layout_ref],
-                        "root": {"digest": "sha256:" + snapshot, "length": 17},
-                    }
+                        "objects": [endpoint_layout_ref],
+                        "role": "endpoint",
+                        "root": endpoint_root_ref,
+                    },
+                    {
+                        "objects": sorted(
+                            [config_asset_ref, fp8_weights_ref, layout_ref],
+                            key=lambda row: str(row["digest"]),
+                        ),
+                        "role": "model",
+                        "root": model_root_ref,
+                    },
                 ],
             }
         )
-        object_roots, object_digests = _object_set(object_set_bytes)
-        assert object_digests == {"sha256:" + snapshot, str(layout_ref["digest"])}
+        object_set = provisioned.read_artifact_object_set(object_set_bytes)
+        assert object_set.endpoint.root.digest == endpoint_root_ref["digest"]
+        assert object_set.model_roots == {model_root_ref["digest"]}
         plan_ref = ref(plan_bytes)
-        assert isinstance(plan_ref["length"], int)
+        weightless_plan_ref = ref(weightless_plan_bytes)
         plan_path = root / "plan.json"
+        weightless_plan_path = root / "weightless-plan.json"
         plan_path.write_bytes(plan_bytes)
-        artifacts = {
-            str(config_ref["digest"]): binding_documents / f"{str(config_ref['digest'])[7:]}.json",
-            str(contract_ref["digest"]): binding_documents
-            / f"{str(contract_ref['digest'])[7:]}.json",
-            str(descriptor_ref["digest"]): binding_documents
-            / f"{str(descriptor_ref['digest'])[7:]}.json",
-            str(binding_ref["digest"]): binding_documents
-            / f"{str(binding_ref['digest'])[7:]}.json",
-            str(plan_ref["digest"]): plan_path,
+        weightless_plan_path.write_bytes(weightless_plan_bytes)
+        plan_documents = {
+            str(plan_ref["digest"]): provisioned.ExactDocument(
+                provisioned.ArtifactRef(str(plan_ref["digest"]), int(plan_ref["length"])),
+                plan_path,
+                plan_bytes,
+            ),
+            str(weightless_plan_ref["digest"]): provisioned.ExactDocument(
+                provisioned.ArtifactRef(
+                    str(weightless_plan_ref["digest"]), int(weightless_plan_ref["length"])
+                ),
+                weightless_plan_path,
+                weightless_plan_bytes,
+            ),
         }
-        closure = _binding_closure(
-            {"project-wheel": (str(plan_ref["digest"]), plan_ref["length"])},
-            artifacts,
-            descriptor_ref,
-            {
-                root_ref["digest"]: (
-                    root_ref["length"],
-                    {item["digest"]: item["length"] for item in objects},
-                )
-                for root_ref, objects in object_roots
-            },
+        selected = provisioned.read_provisioned_release(
+            plan_documents,
+            read_document=provisioned.staged_document_reader(binding_documents),
+            endpoint_release="endpoint@release",
+            store_root=root / "store",
+            object_set=object_set,
+            dtype_widths={"bfloat16": 2, "float32": 4},
         )
-        assert set(closure) == set(artifacts) - {str(plan_ref["digest"])}
+        resolved_binding = selected.bindings[str(plan_ref["digest"])]
+        assert resolved_binding.application == "endpoint:app"
+        assert resolved_binding.components == ("transformer",)
+        # The TensorFS payload is FP8-sized, while the allocator destinations are BF16
+        # plus one derived f32 buffer. Stored/custody bytes never become the fill budget.
+        assert int(fp8_weights_ref["length"]) < 16 * 16 * 2
+        assert resolved_binding.model_weight_bytes == 16 * 16 * 2 + 8 * 4
+        header_envelope = fill.price_envelope(
+            [("transformer", 16 * 16 * 2, int(fp8_weights_ref["length"]), "decoded_float")],
+            decode_scratch_bytes=64,
+        )
+        complete_envelope = fill.complete_device_envelope(
+            header_envelope, resolved_binding.model_weight_bytes
+        )
+        assert complete_envelope["derived_destination_bytes"] == 8 * 4
+        assert complete_envelope["required_bytes"] == 16 * 16 * 2 + 8 * 4 + 256
+        assert resolved_binding.expected_logical_model_digest == contract.logical_model_digest(
+            bound_contract
+        )
+        weightless_binding = selected.bindings[str(weightless_plan_ref["digest"])]
+        assert weightless_binding.weightless and weightless_binding.model_weight_bytes == 0
+        assert selected.config_assets == {
+            str(config_asset_ref["digest"]): int(config_asset_ref["length"])
+        }
+        assert str(config_asset_ref["digest"]) not in selected.documents
+        try:
+            provisioned.read_provisioned_release(
+                {str(plan_ref["digest"]): plan_documents[str(plan_ref["digest"])]},
+                read_document=provisioned.staged_document_reader(binding_documents),
+                endpoint_release="endpoint@release",
+                store_root=root / "store",
+                object_set=object_set,
+                dtype_widths={"bfloat16": 2, "float32": 4},
+            )
+        except PlanRefusal as exc:
+            assert exc.code == "binding_plan_set_invalid"
+        else:
+            raise AssertionError("incomplete visible-entrypoint plan set was accepted")
 
         boot_raw = bytes(range(32))
         boot_id = base64.urlsafe_b64encode(boot_raw).rstrip(b"=").decode()
@@ -401,12 +459,14 @@ def main() -> int:
         assert receipt["media_foreign_credential_refused"] is True
         readiness.publish(config.receipt_payload_path, payload)
         assert config.receipt_payload_path.read_bytes() == payload
+        readiness.publish(config.receipt_payload_path, payload)
+        assert config.receipt_payload_path.read_bytes() == payload
         try:
-            readiness.publish(config.receipt_payload_path, payload)
+            readiness.publish(config.receipt_payload_path, payload + b"\n")
         except LaunchRefusal as exc:
             assert exc.code == "readiness_receipt_conflict"
         else:
-            raise AssertionError("readiness receipt was overwritten")
+            raise AssertionError("different readiness receipt overwrote the published bytes")
     print("materialize-launch contract: PASS")
     return 0
 

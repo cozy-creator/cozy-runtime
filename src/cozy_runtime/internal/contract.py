@@ -235,6 +235,36 @@ def closed_resources(contract: ModelConstructionContract) -> dict[str, Json]:
     }
 
 
+def destination_resident_bytes(
+    construction: ModelConstructionContract, dtype_widths: Mapping[str, int]
+) -> int:
+    """Price the exact destination census using the substrate's dtype-width authority.
+
+    This mirrors ``StreamingFillBackend.reserve_components``: every named logical or
+    derived tensor returned by the deep walk is a destination charged by the allocator.
+    Alias groups are deliberately not collapsed because that allocator walks with
+    ``remove_duplicate=False`` and charges the same named census before ``to_empty``.
+    """
+
+    def tensor_bytes(tensor: LogicalTensor | DerivedTensor) -> int:
+        dtype = tensor.dtype or DEFAULT_DTYPE
+        width = dtype_widths.get(dtype)
+        if not isinstance(width, int) or isinstance(width, bool) or width <= 0:
+            raise ContractError(
+                f"destination dtype {dtype!r} has no positive width in this TensorFS build",
+                code="contract_destination_dtype_invalid",
+                fields=[tensor.key],
+            )
+        elements = 1
+        for extent in tensor.shape:
+            elements *= extent
+        return elements * width
+
+    return sum(tensor_bytes(tensor) for tensor in construction.logical_tensors) + sum(
+        tensor_bytes(tensor) for tensor in construction.derived
+    )
+
+
 def read_contract(raw: bytes) -> ModelConstructionContract:
     """Read one exact canonical ModelConstructionContract, closed at every row.
 

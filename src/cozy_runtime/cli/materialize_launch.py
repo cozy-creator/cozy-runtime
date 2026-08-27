@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -20,7 +22,6 @@ from cozy_runtime.internal.materialize_launch import (
 
 WORKER_ROOT = Path("/run/cozy/worker")
 MEDIA_ROOT = Path("/run/cozy/media")
-TOKEN_HASHES_PATH = Path("/run/cozy/bootstrap/renter-token-hashes")
 UV_PATH = Path("/opt/cozy/bin/uv")
 
 
@@ -110,7 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=10)
 
 
 def _start_worker(
@@ -128,16 +130,11 @@ def _start_worker(
     WORKER_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     (WORKER_ROOT / "control.addr").unlink(missing_ok=True)
     control_ref = prepared.spec["execution_substrate"]["control_runtime"]
-    endpoint = prepared.documents["endpoint_bundle"]
-    from cozy_runtime.internal import canonical
-
-    endpoint_doc = canonical.parse_canonical(endpoint)
-    assert isinstance(endpoint_doc, dict)
     devices = ",".join(str(row["device_index"]) for row in gpus)
     child_env = dict(config.child_base_env)
     child_env.update(
         {
-            "COZY_ACCESS_TOKEN_SHA256": str(TOKEN_HASHES_PATH),
+            "COZY_ACCESS_TOKEN_SHA256": ",".join(config.renter_token_sha256),
             "COZY_HOME": "/run/cozy",
             "PYTHONNOUSERSITE": "1",
         }
@@ -158,7 +155,7 @@ def _start_worker(
         "--instance-id",
         boot_id,
         "--release-id",
-        str(endpoint_doc["endpoint_release_id"]),
+        prepared.endpoint_release,
         "--artifact-digest",
         str(control_ref["digest"]),
         "--devices",
@@ -169,6 +166,8 @@ def _start_worker(
         str(ENVIRONMENT_ROOT),
         "--artifact-store",
         str(prepared.artifact_store),
+        "--artifact-object-set",
+        str(prepared.artifact_object_set),
         "--tls-cert",
         str(config.tls_cert_path),
         "--tls-key",
@@ -188,17 +187,30 @@ def _supervise(process: subprocess.Popen[bytes]) -> int:
     """Keep the adapter coupled to its worker; XS owns media and whole-pod supervision."""
 
     stopped = False
+    terminate_at = 0.0
 
     def stop(signum: int, frame: object) -> None:
-        nonlocal stopped
+        nonlocal stopped, terminate_at
         stopped = True
         if process.poll() is None:
             process.terminate()
+            terminate_at = terminate_at or time.monotonic()
 
     prior_term = signal.signal(signal.SIGTERM, stop)
     prior_int = signal.signal(signal.SIGINT, stop)
     try:
-        code = process.wait()
+        while True:
+            try:
+                code = process.wait(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if terminate_at and time.monotonic() - terminate_at >= 10:
+                    process.kill()
+                    try:
+                        code = process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        return int(Exit.internal)
+                    break
     finally:
         signal.signal(signal.SIGTERM, prior_term)
         signal.signal(signal.SIGINT, prior_int)

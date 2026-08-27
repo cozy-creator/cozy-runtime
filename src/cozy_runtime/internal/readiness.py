@@ -255,7 +255,7 @@ def receipt_payload(
 
 
 def publish(path: Path, payload: bytes) -> None:
-    """Publish exactly once by atomic rename after every readiness fact was observed."""
+    """Publish atomically once; an exact replay converges and different bytes refuse."""
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.parent / f".receipt-{uuid.uuid4().hex}"
@@ -265,9 +265,18 @@ def publish(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        if path.exists():
-            raise LaunchRefusal("readiness_receipt_conflict", "receipt path already exists")
-        os.replace(temporary, path)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = path.read_bytes()
+            except OSError as exc:
+                raise LaunchRefusal(
+                    "readiness_receipt_conflict", "existing receipt is unreadable"
+                ) from exc
+            if existing != payload:
+                raise LaunchRefusal("readiness_receipt_conflict", "receipt bytes differ") from None
+            return
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory)

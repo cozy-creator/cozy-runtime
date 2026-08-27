@@ -206,6 +206,7 @@ class Executor:
             FillRefusal,
             ResourceLedger,
             StreamingFillBackend,
+            complete_device_envelope,
             dtype_name,
             topology_of,
         )
@@ -401,40 +402,43 @@ class Executor:
         # possible at all: 0 means every component stays resident.
         backend.resident_budget = int(budgets.get("resident", 0))
         backend.hold_lease = backend.resident_budget > 0
-        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The record's declared weight is the
-        # COORDINATOR's number and it is priced in the artifact's STORED bytes; the card
-        # experiences the LOGICAL destinations plus the scratch envelopes. Where the two
-        # disagree the header wins, because it is the only one of them that read the rows —
-        # and the fit is decided against MEASURED allocatable bytes here, where a refusal
-        # costs nothing, rather than by discovering an OOM 90 GiB into the fill.
-        envelope = backend.device_envelope()
+        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
+        # destination residency from the MCC's complete logical+derived tensor census. The
+        # header independently prices logical rows and the selected route's native/decode
+        # overhead. Derived buffers remain live beside that overhead, so the complete peak
+        # is additive and the larger destination census wins if the two have not yet met.
+        # This refusal runs before allocation instead of discovering an OOM mid-fill.
         declared = int(budgets["vram"])
-        ledger.budgets["vram"] = max(declared, int(envelope["required_bytes"]))
+        envelope = complete_device_envelope(backend.device_envelope(), declared)
+        required = int(envelope["required_bytes"])
+        ledger.budgets["vram"] = required
         memory = accel.allocation(torch, self.device_kind)
         allocatable = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
-        if int(envelope["required_bytes"]) > allocatable:
+        if required > allocatable:
             self.poisoned = "fill refused: device_shortfall"
             return {
                 "ok": False,
                 "code": "device_shortfall",
                 "detail": (
-                    f"this fill will hold {envelope['required_bytes']} B on the device "
+                    f"this fill will hold {required} B on the device "
                     f"({envelope['destination_bytes']} B of logical destinations, "
+                    f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
+                    "destinations, "
                     f"{envelope['native_bytes']} B of native encoded leaves, "
                     f"{envelope['decode_peak_bytes']} B of decode scratch at its widest "
                     f"component) against {allocatable} B allocatable - refused on the "
-                    f"arithmetic, before a byte moved. The record declared {declared} B, "
-                    "which is the artifact's STORED size; bf16 destinations of fp8-stored "
-                    "rows expand and the header prices them"
+                    f"arithmetic, before a byte moved. The binding's MCC priced {declared} B "
+                    "of logical plus derived destinations; the header independently prices "
+                    "stored encoding overhead"
                 ),
                 "envelope": envelope,
                 "declared_weight_bytes": declared,
                 "shortfall": {
                     "resource": "vram",
                     "scope": "component_generation",
-                    "needed_bytes": int(envelope["required_bytes"]),
+                    "needed_bytes": required,
                     "available_bytes": int(allocatable),
                     "evidence_class": "measured",
                 },

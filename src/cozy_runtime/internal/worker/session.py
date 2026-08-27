@@ -57,7 +57,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel, child_env, config, egress, environment, hostfacts, proctree
+from cozy_runtime.internal import (
+    accel,
+    child_env,
+    config,
+    egress,
+    environment,
+    fill,
+    hostfacts,
+    proctree,
+    provisioned,
+)
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -90,7 +100,6 @@ from cozy_runtime.internal.worker.plan import (
     PlanChooser,
     PlanRefusal,
     PreparedModel,
-    read_provisioned_binding,
 )
 from cozy_runtime.protocol import (
     SCHEMA_DIGEST,
@@ -173,6 +182,8 @@ class WorkerOptions:
     """
     artifact_store: Path | None = None
     """The verified TensorFS store populated from the canonical grouped-root closure."""
+    artifact_object_set: Path | None = None
+    """The exact root-role document used by the shared provisioned-release reader."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -1674,6 +1685,7 @@ class Worker:
                 f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
             )
         missing: list[str] = []
+        plan_documents: dict[str, provisioned.ExactDocument] = {}
         for plan_id in placement.plan_ids:
             plan_digest, plan_length = placement.plan_refs[plan_id]
             record = (
@@ -1718,30 +1730,47 @@ class Worker:
                     )
                 )
                 continue
+            plan_documents[plan_id] = provisioned.ExactDocument(
+                provisioned.ArtifactRef(plan_digest, plan_length), record, record_bytes
+            )
+        if not missing:
             try:
-                if self.options.artifact_store is None:
+                if self.options.artifact_store is None or self.options.artifact_object_set is None:
                     raise PlanRefusal(
                         "artifact_store_required",
-                        "canonical provisioned bindings require the verified TensorFS store",
+                        "canonical provisioned bindings require the verified TensorFS store "
+                        "and exact root-role document",
                     )
-                self.bindings[plan_id] = read_provisioned_binding(
-                    plan_id,
-                    record_bytes,
-                    documents_root=self.config.cozy_home / "binding-documents",
+                object_set = provisioned.read_artifact_object_set(
+                    self.options.artifact_object_set.read_bytes()
+                )
+                selected = provisioned.read_provisioned_release(
+                    plan_documents,
+                    read_document=provisioned.staged_document_reader(
+                        self.config.cozy_home / "binding-documents"
+                    ),
                     endpoint_release=placement.endpoint_release_id,
                     store_root=self.options.artifact_store,
+                    object_set=object_set,
+                    dtype_widths=provisioned.tensorfs_destination_widths(fill.tensorfs_module()),
                 )
-            except PlanRefusal as refusal:
-                missing.append(plan_id)
+                self.bindings = dict(selected.bindings)
+            except (OSError, PlanRefusal, fill.FillRefusal) as refusal:
+                code = (
+                    refusal.code
+                    if isinstance(refusal, (PlanRefusal, fill.FillRefusal))
+                    else "artifact_object_set_unreadable"
+                )
+                detail = refusal.detail if isinstance(refusal, PlanRefusal) else str(refusal)
+                missing.extend(placement.plan_ids)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=plan_id,
-                        reason=refusal.code,
-                        detail=safe(refusal.detail),
+                        subject=placement.placement_id,
+                        reason=code,
+                        detail=safe(detail),
                     )
                 )
-                continue
         placement.materialization = (
             pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
             if missing
@@ -3111,6 +3140,11 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         required=True,
         help="verified TensorFS store populated from the provisioned grouped-root object set",
     )
+    parser.add_argument(
+        "--artifact-object-set",
+        required=True,
+        help="exact canonical grouped root-role document for provisioned binding validation",
+    )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -3141,6 +3175,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
         artifact_store=Path(args.artifact_store).resolve(),
+        artifact_object_set=Path(args.artifact_object_set).resolve(),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

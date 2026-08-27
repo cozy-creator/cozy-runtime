@@ -224,6 +224,22 @@ def _open(req: urllib.request.Request, deadline: Deadline, *, no_proxy: bool = F
     return opener.open(req, timeout=deadline.remaining())
 
 
+def open_guarded(
+    url: str,
+    deadline: Deadline,
+    *,
+    headers: Mapping[str, str] | None = None,
+    allow_local: bool = False,
+    no_proxy: bool = False,
+) -> Any:
+    """Open one already-authorized URL through the shared guarded transport."""
+
+    guard(url, allow_local=allow_local)
+    return _open(
+        urllib.request.Request(url, headers=dict(headers or {})), deadline, no_proxy=no_proxy
+    )
+
+
 def _json(base: str, path: str, deadline: Deadline, *, token: str = "", body: Any = None) -> Any:
     url = base.rstrip("/") + path
     guard(url, allow_local=local_hub(base))
@@ -742,9 +758,8 @@ def _fetch(
     *,
     no_proxy: bool = False,
 ) -> None:
-    guard(url, allow_local=allow_local)
     try:
-        resp = _open(urllib.request.Request(url), deadline, no_proxy=no_proxy)
+        resp = open_guarded(url, deadline, allow_local=allow_local, no_proxy=no_proxy)
     except urllib.error.HTTPError as exc:
         raise PullRefusal(
             "transfer_failed",
