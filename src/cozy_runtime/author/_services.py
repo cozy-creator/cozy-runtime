@@ -13,12 +13,14 @@ what makes "escaped handle" a typed failure instead of a review rule.
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 import time
 import zlib
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Generic, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
@@ -32,8 +34,14 @@ from cozy_runtime.author._assets import (
     digest_bytes,
 )
 from cozy_runtime.author._context import Context
-from cozy_runtime.author._decode import MediaDecoder
-from cozy_runtime.author._errors import CapabilityError, OutputError
+from cozy_runtime.author._decode import (
+    DecodedAudioChunk,
+    DecodedMediaEvent,
+    DecodedMediaHeader,
+    DecodedVideoFrame,
+    MediaDecoder,
+)
+from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
 from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
@@ -168,6 +176,16 @@ class ImageFrame:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class SavedVideo:
+    """One atomically committed streaming MP4 plus the facts re-probed from its bytes."""
+
+    video: VideoAsset
+    frame_count: int
+    submitted_audio_samples: int
+    decoded_audio_samples: int
+
+
 @runtime_checkable
 class _PilLike(Protocol):
     """Structural view of a PIL image — duck-typed, never imported."""
@@ -289,6 +307,180 @@ class Outputs(_Bound):
         data = _codec.encode_mp4(video, float(fps), planar, sample_rate)
         return self._register(data, VideoAsset, "video/mp4")
 
+    def save_video_stream(self, events: Iterator[DecodedMediaEvent]) -> SavedVideo:
+        """Consume one canonical event stream into one bounded, probed, atomic MP4."""
+        self._attempt.check_open("Outputs.save_video_stream")
+        _codec.require_encoder()
+        source = iter(events)
+        try:
+            header = next(source)
+        except StopIteration:
+            raise OutputError("streaming video has no header", code="media_header") from None
+        if not isinstance(header, DecodedMediaHeader) or header.video is None:
+            raise OutputError(
+                "streaming video must begin with one video header", code="media_header"
+            )
+        video_format = header.video
+        if video_format.nominal_frame_rate is None:
+            raise OutputError("streaming video header has no nominal frame rate", code="frame_rate")
+        audio_format = header.audio
+        handle = self._attempt.next_handle(VideoAsset.kind)
+        tail = handle.rsplit("/", 1)[-1]
+        temporary = self._attempt.spool / f".video-{tail}.partial"
+        final = self._attempt.spool / f"video-{tail}"
+        encoder: _codec.StreamingMP4Encoder | None = None
+        finished = False
+        registered = False
+        frame_count = 0
+        audio_samples = 0
+        try:
+            encoder = _codec.StreamingMP4Encoder(
+                temporary,
+                width=video_format.width,
+                height=video_format.height,
+                frame_rate=video_format.nominal_frame_rate,
+                pixel_aspect_ratio=video_format.pixel_aspect_ratio,
+                color_primaries=video_format.color_primaries,
+                color_transfer=video_format.color_transfer,
+                color_matrix=video_format.color_matrix,
+                color_range=video_format.color_range,
+                max_bytes=self._attempt.max_output_bytes,
+                audio_channels=audio_format.channels if audio_format is not None else 0,
+                audio_sample_rate=audio_format.sample_rate if audio_format is not None else 0,
+            )
+            for event in source:
+                self._attempt.check_open("Outputs.save_video_stream")
+                if isinstance(event, DecodedMediaHeader):
+                    raise OutputError(
+                        "streaming video contains a second header", code="media_header"
+                    )
+                if isinstance(event, DecodedVideoFrame):
+                    if (
+                        event.width != video_format.width
+                        or event.height != video_format.height
+                        or event.time_base != video_format.time_base
+                        or event.pixel_aspect_ratio != video_format.pixel_aspect_ratio
+                        or event.color_primaries != video_format.color_primaries
+                        or event.color_transfer != video_format.color_transfer
+                        or event.color_matrix != video_format.color_matrix
+                        or event.color_range != video_format.color_range
+                    ):
+                        raise OutputError(
+                            "streaming video frame differs from its header", code="frame_shape"
+                        )
+                    expected = Fraction(frame_count, 1) / video_format.nominal_frame_rate
+                    if event.start_time != expected:
+                        raise OutputError(
+                            f"streaming video frame starts at {event.start_time}, expected "
+                            f"{expected}",
+                            code="video_discontinuity",
+                        )
+                    if event.duration * event.time_base != 1 / video_format.nominal_frame_rate:
+                        raise OutputError(
+                            "streaming video frame duration differs from its output rate",
+                            code="video_discontinuity",
+                        )
+                    encoder.write_video(event.rgb)
+                    frame_count += 1
+                    continue
+                if not isinstance(event, DecodedAudioChunk):
+                    raise OutputError(
+                        f"streaming video received {type(event).__name__}, not a media event",
+                        code="media_event",
+                    )
+                if audio_format is None:
+                    raise OutputError(
+                        "streaming video contains undeclared audio", code="audio_absent"
+                    )
+                if (
+                    event.channels != audio_format.channels
+                    or event.sample_rate != audio_format.sample_rate
+                    or event.channel_layout != audio_format.channel_layout
+                    or event.channel_names != audio_format.channel_names
+                    or event.time_base != audio_format.time_base
+                ):
+                    raise OutputError(
+                        "streaming audio chunk differs from its header", code="audio_format"
+                    )
+                expected_audio = Fraction(audio_samples, audio_format.sample_rate)
+                if event.start_time != expected_audio:
+                    raise OutputError(
+                        f"streaming audio starts at {event.start_time}, expected {expected_audio}",
+                        code="audio_discontinuity",
+                    )
+                planar, clipped = _codec.audio_chunk(event.pcm_f32le, event.sample_count)
+                self._clip_row(clipped)
+                encoder.write_audio(planar)
+                audio_samples += event.sample_count
+
+            if audio_format is not None and audio_samples == 0:
+                raise OutputError(
+                    "streaming video declared audio but yielded no samples", code="audio_shape"
+                )
+            facts = encoder.finish()
+            finished = True
+            if (
+                facts.width != video_format.width
+                or facts.height != video_format.height
+                or facts.frame_count != frame_count
+                or facts.frame_rate != video_format.nominal_frame_rate
+                or facts.color_primaries != video_format.color_primaries
+                or facts.color_transfer != video_format.color_transfer
+                or facts.color_matrix != video_format.color_matrix
+                or facts.color_range != video_format.color_range
+                or facts.video_codec != "h264"
+                or (audio_format is None and facts.audio_codec)
+                or (audio_format is not None and facts.audio_codec != "aac")
+                or facts.audio_decoded_samples - audio_samples not in (0, _codec.AAC_FRAME_SAMPLES)
+            ):
+                raise OutputError(
+                    "streaming MP4 probe disagrees with submitted media: "
+                    f"submitted frames={frame_count} rate={video_format.nominal_frame_rate} "
+                    f"audio={audio_samples}; probed {facts}",
+                    code="output_probe",
+                )
+
+            size, digest = self._measure_file(temporary)
+            if self._pending_bytes() + size > self._attempt.max_output_bytes:
+                raise OutputError(
+                    "streaming output would cross the attempt aggregate output limit",
+                    code="output_too_large",
+                )
+            os.link(temporary, final)
+            self._fsync_directory(final.parent)
+            temporary.unlink()
+            asset = VideoAsset(
+                handle,
+                media_type="video/mp4",
+                size_bytes=size,
+                digest=digest,
+                local=final,
+                attempt=self._attempt.request_id,
+            )
+            self._attempt.pending[handle] = asset
+            registered = True
+            return SavedVideo(
+                video=asset,
+                frame_count=facts.frame_count,
+                submitted_audio_samples=audio_samples,
+                decoded_audio_samples=facts.audio_decoded_samples,
+            )
+        except AuthorError:
+            raise
+        except Exception as exc:
+            raise OutputError(
+                f"streaming video encode failed: {type(exc).__name__}: {exc}",
+                code="output_encode",
+            ) from exc
+        finally:
+            if temporary.exists():
+                if encoder is not None and not finished:
+                    encoder.abort()
+                else:
+                    temporary.unlink(missing_ok=True)
+            if not registered:
+                final.unlink(missing_ok=True)
+
     @staticmethod
     def _check_rate(sample_rate: object) -> None:
         if not (isinstance(sample_rate, int) and 0 < sample_rate <= 384_000):
@@ -333,10 +525,10 @@ class Outputs(_Bound):
 
     def _register(self, data: bytes, kind: type[A], media_type: str) -> A:
         self._attempt.check_open("Outputs.save")
-        if len(data) > self._attempt.max_output_bytes:
+        if self._pending_bytes() + len(data) > self._attempt.max_output_bytes:
             raise OutputError(
-                f"output is {len(data)} bytes, over the attempt limit of "
-                f"{self._attempt.max_output_bytes}",
+                f"output would bring the attempt to {self._pending_bytes() + len(data)} bytes, "
+                f"over its {self._attempt.max_output_bytes}-byte aggregate limit",
                 code="output_too_large",
             )
         handle = self._attempt.next_handle(kind.kind)
@@ -352,6 +544,29 @@ class Outputs(_Bound):
         )
         self._attempt.pending[handle] = asset
         return asset
+
+    def _pending_bytes(self) -> int:
+        return sum(asset.size_bytes for asset in self._attempt.pending.values())
+
+    @staticmethod
+    def _measure_file(path: Path) -> tuple[int, str]:
+        digest = hashlib.blake2b(digest_size=16)
+        length = 0
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                length += len(chunk)
+                digest.update(chunk)
+        return length, "blake2b:" + digest.hexdigest()
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if os.name != "posix":
+            return
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 class Telemetry(_Bound):

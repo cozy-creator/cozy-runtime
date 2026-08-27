@@ -104,6 +104,11 @@ STATIC_ARMS = (
         "    return reference.from_file('request.mp4')\n",
     ),
     Arm(
+        "endpoint-owns-no-media-decode",
+        ROOT / "examples" / "tiny_h3.py",
+        "def _packet_decode(container: object) -> object:\n    return container.demux()\n",
+    ),
+    Arm(
         "timing-decides-nothing",
         SRC / "author" / "_observations.py",
         "from cozy_runtime.internal.fill import ResourceLedger\n",

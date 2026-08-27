@@ -34,7 +34,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 from urllib.parse import ParseResult, urlparse
 
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -468,7 +468,7 @@ def _transfer_granted(
             receipt = egress.fetch_into(
                 absolute,
                 policy,
-                sink,
+                cast(BinaryIO, sink),
                 expected_length=entry.length,
                 cap=cap,
                 prefix_bytes=prefix_bytes,
@@ -735,7 +735,7 @@ class PublicationReceipt:
 def write_output(
     grant: BoundGrant,
     output_id: str,
-    data: bytes,
+    source: Path,
     auth: Authorizer,
     media_type: str = "",
 ) -> pb.OutputEntry:
@@ -761,19 +761,72 @@ def write_output(
         if "://" in destination.url
         else grant.file_base_url.rstrip("/") + "/" + destination.url
     )
-    auth.authorize("grant_output_write", "PUT", url, {"output_id": output_id, "length": len(data)})
-    if destination.max_bytes and len(data) > destination.max_bytes:
+    try:
+        source_info = source.stat()
+    except OSError as exc:
+        raise GrantRefusal(
+            "output_spool_io", f"{output_id}: output spool bytes are unreadable ({exc})"
+        ) from exc
+    if not stat.S_ISREG(source_info.st_mode):
+        raise GrantRefusal("output_spool_io", f"{output_id}: output spool is not a regular file")
+    length = int(source_info.st_size)
+    auth.authorize("grant_output_write", "PUT", url, {"output_id": output_id, "length": length})
+    if destination.max_bytes and length > destination.max_bytes:
         raise GrantRefusal(
             "output_too_large",
-            f"{output_id}: {len(data)} B over the granted {destination.max_bytes} B",
+            f"{output_id}: {length} B over the granted {destination.max_bytes} B",
         )
     path = _local(destination.url, grant.file_base_url)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    temporary: Path | None = None
+    try:
+        from cozy_runtime.internal import egress
+
+        with (
+            source.open("rb") as opened,
+            tempfile.NamedTemporaryFile(
+                mode="w+b", dir=path.parent, prefix=".cozy-output-", delete=False
+            ) as sink,
+        ):
+            temporary = Path(sink.name)
+            receipt = egress.copy_bounded(
+                iter(lambda: opened.read(egress.CHUNK), b""),
+                cast(BinaryIO, sink),
+                expected_length=length,
+                cap=destination.max_bytes or length,
+                prefix_bytes=0,
+                what=f"output {output_id!r}",
+            )
+            sink.flush()
+            os.fsync(sink.fileno())
+        try:
+            os.link(temporary, path)
+            if os.name == "posix":
+                directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except FileExistsError as exc:
+            raise GrantRefusal(
+                "output_destination_exists",
+                f"{output_id}: the granted destination already exists; outputs never overwrite",
+            ) from exc
+    except egress.EgressRefusal as exc:
+        raise GrantRefusal(exc.code, exc.detail) from exc
+    except GrantRefusal:
+        raise
+    except OSError as exc:
+        raise GrantRefusal(
+            "output_spool_io", f"{output_id}: streaming publication failed ({exc})"
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return pb.OutputEntry(
         output_id=output_id,
-        digest=hashlib.sha256(data).digest(),
-        length=len(data),
+        digest=receipt.sha256,
+        length=receipt.length,
         # The media type the AUTHOR declared when the asset was saved.
         # `application/octet-stream` remains the honest answer when nothing declared one.
         mime_type=media_type or "application/octet-stream",

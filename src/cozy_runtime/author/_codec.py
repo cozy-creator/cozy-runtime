@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from array import array
+from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author import _color
 from cozy_runtime.author._errors import OutputError
 
 #: Raw-snapshot ceiling as a multiple of the attempt's output ceiling. H3's largest launch
@@ -44,7 +48,7 @@ _X264 = {"crf": "17", "preset": "veryfast"}
 _AAC_BIT_RATE = 192_000
 
 _FLAC_CHUNK = 4096
-_AAC_CHUNK = 1024
+AAC_FRAME_SAMPLES = 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +174,45 @@ def snapshot_audio(waveform: object, max_output_bytes: int) -> tuple[Planar, int
     return Planar(floats.tobytes(), (channels, samples)), clipped
 
 
-def _audio_frames(av: Any, planar: Planar, sample_rate: int, fmt: str, chunk: int) -> Any:
+def audio_chunk(pcm_f32le: tuple[bytes, ...], sample_count: int) -> tuple[Planar, int]:
+    """Validate and clamp one already-planar decoded chunk without joining a timeline."""
+    channels = len(pcm_f32le)
+    if channels not in (1, 2) or sample_count <= 0:
+        raise OutputError(
+            f"streaming audio shape ({channels}, {sample_count}) is not mono/stereo PCM",
+            code="audio_shape",
+        )
+    if any(len(channel) != sample_count * 4 for channel in pcm_f32le):
+        raise OutputError(
+            "streaming audio plane length disagrees with its sample count", code="audio_shape"
+        )
+    floats = array("f")
+    floats.frombytes(b"".join(pcm_f32le))
+    clipped = 0
+    for index, value in enumerate(floats):
+        if not math.isfinite(value):
+            raise OutputError(
+                f"audio sample {index} is not finite ({value!r})",
+                code="audio_nonfinite",
+            )
+        if value > 1.0:
+            floats[index] = 1.0
+            clipped += 1
+        elif value < -1.0:
+            floats[index] = -1.0
+            clipped += 1
+    return Planar(floats.tobytes(), (channels, sample_count)), clipped
+
+
+def _audio_frames(
+    av: Any,
+    planar: Planar,
+    sample_rate: int,
+    fmt: str,
+    chunk: int,
+    *,
+    start_pts: int = 0,
+) -> Any:
     """Yield AudioFrames of `chunk` samples in `fmt` (packed), pts in sample units."""
     channels, samples = planar.shape
     layout = "mono" if channels == 1 else "stereo"
@@ -196,7 +238,7 @@ def _audio_frames(av: Any, planar: Planar, sample_rate: int, fmt: str, chunk: in
             raw, unit = planar.data, 4 * channels
 
     def gen() -> Any:
-        pts = 0
+        pts = start_pts
         for off in range(0, samples, chunk):
             n = min(chunk, samples - off)
             frame = av.AudioFrame(format=fmt, layout=layout, samples=n)
@@ -269,7 +311,344 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
         container.mux(vstream.encode())
 
         if audio is not None and astream is not None and sample_rate is not None:
-            for aframe in _audio_frames(av, audio, sample_rate, "flt", _AAC_CHUNK):
+            for aframe in _audio_frames(av, audio, sample_rate, "flt", AAC_FRAME_SAMPLES):
                 container.mux(astream.encode(aframe))
             container.mux(astream.encode())
     return buf.getvalue()
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedVideoFacts:
+    width: int
+    height: int
+    frame_count: int
+    frame_rate: Fraction
+    video_codec: str
+    audio_codec: str
+    audio_channels: int
+    audio_sample_rate: int
+    audio_decoded_samples: int
+    color_primaries: int
+    color_transfer: int
+    color_matrix: int
+    color_range: int
+
+
+class _BoundedWriter:
+    """Seekable AVIO wrapper that refuses before a write crosses the output grant."""
+
+    def __init__(self, raw: Any, cap: int) -> None:
+        self.raw = raw
+        self.cap = cap
+
+    def write(self, data: bytes) -> int:
+        end = self.raw.tell() + len(data)
+        if end > self.cap:
+            raise OutputError(
+                f"streaming output would cross the {self.cap}-byte attempt limit",
+                code="output_too_large",
+            )
+        written = self.raw.write(data)
+        return int(written)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return int(self.raw.seek(offset, whence))
+
+    def tell(self) -> int:
+        return int(self.raw.tell())
+
+    def truncate(self, size: int | None = None) -> int:
+        target = self.raw.tell() if size is None else size
+        if target > self.cap:
+            raise OutputError(
+                f"streaming output would cross the {self.cap}-byte attempt limit",
+                code="output_too_large",
+            )
+        return int(self.raw.truncate(target))
+
+    def flush(self) -> None:
+        self.raw.flush()
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
+class StreamingMP4Encoder:
+    """The one bounded fragmented H.264/AAC writer used by the author stream sink."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        width: int,
+        height: int,
+        frame_rate: Fraction,
+        pixel_aspect_ratio: Fraction,
+        color_primaries: int,
+        color_transfer: int,
+        color_matrix: int,
+        color_range: int,
+        max_bytes: int,
+        audio_channels: int = 0,
+        audio_sample_rate: int = 0,
+    ) -> None:
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
+            raise OutputError(
+                f"streaming video geometry {width}x{height} is not positive and even",
+                code="frame_shape",
+            )
+        if frame_rate <= 0 or frame_rate >= 1000:
+            raise OutputError(f"frame rate {frame_rate} is not supported", code="frame_rate")
+        if pixel_aspect_ratio <= 0:
+            raise OutputError(
+                f"pixel aspect ratio {pixel_aspect_ratio} is not positive", code="frame_shape"
+            )
+        if audio_channels not in (0, 1, 2):
+            raise OutputError(
+                f"streaming audio has {audio_channels} channels; mono or stereo is required",
+                code="audio_shape",
+            )
+        if bool(audio_channels) != bool(audio_sample_rate):
+            raise OutputError(
+                "streaming audio channels and sample rate must be declared together",
+                code="audio_rate",
+            )
+
+        self.path = path
+        self.width = width
+        self.height = height
+        self.frame_rate = frame_rate
+        self.audio_channels = audio_channels
+        self.audio_sample_rate = audio_sample_rate
+        self.color_primaries = color_primaries
+        self.color_transfer = color_transfer
+        self.color_matrix = color_matrix
+        self.color_range = color_range
+        self.video_frames = 0
+        self.audio_samples = 0
+        self._av = _av()
+        try:
+            self._colorspace = _color.colorspace(self._av, color_matrix)
+            self._color_range = _color.range_value(self._av, color_range)
+        except ValueError as exc:
+            raise OutputError(str(exc), code="video_color") from exc
+        self._reformatter = self._av.video.reformatter.VideoReformatter()
+        self._raw = path.open("x+b")
+        self._bounded = _BoundedWriter(self._raw, max_bytes)
+        try:
+            self._container = self._av.open(
+                self._bounded,
+                "w",
+                format="mp4",
+                options={
+                    "fflags": "+bitexact",
+                    "frag_duration": "1000000",
+                    "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx",
+                    "use_editlist": "0",
+                },
+            )
+            self._video = self._container.add_stream("libx264", rate=frame_rate)
+            self._video.width = width
+            self._video.height = height
+            self._video.pix_fmt = "yuv420p"
+            self._video.sample_aspect_ratio = pixel_aspect_ratio
+            vcodec = self._video.codec_context
+            vcodec.thread_count = 1
+            vcodec.gop_size = max(1, round(float(frame_rate)))
+            vcodec.max_b_frames = 0
+            vcodec.color_primaries = color_primaries
+            vcodec.color_trc = color_transfer
+            vcodec.colorspace = color_matrix
+            vcodec.color_range = color_range
+            vcodec.options = dict(_X264)
+            self._audio = None
+            if audio_channels:
+                self._audio = self._container.add_stream("aac", rate=audio_sample_rate)
+                acodec = self._audio.codec_context
+                acodec.thread_count = 1
+                acodec.layout = "mono" if audio_channels == 1 else "stereo"
+                acodec.format = "fltp"
+                acodec.bit_rate = _AAC_BIT_RATE
+        except Exception:
+            self._raw.close()
+            path.unlink(missing_ok=True)
+            raise
+
+    def write_video(self, rgb: bytes) -> None:
+        expected = self.width * self.height * 3
+        if len(rgb) != expected:
+            raise OutputError(
+                f"streaming RGB frame is {len(rgb)} bytes, expected {expected}",
+                code="frame_shape",
+            )
+        frame = self._av.VideoFrame(self.width, self.height, "rgb24")
+        frame.color_primaries = self.color_primaries
+        frame.color_trc = self.color_transfer
+        frame.colorspace = self.color_matrix
+        frame.color_range = 2  # immutable RGB events are full-range.
+        plane = frame.planes[0]
+        if plane.line_size == self.width * 3:
+            plane.update(rgb)
+        else:
+            padded = bytearray()
+            pad = b"\x00" * (plane.line_size - self.width * 3)
+            stride = self.width * 3
+            for row in range(self.height):
+                padded += rgb[row * stride : (row + 1) * stride] + pad
+            plane.update(bytes(padded))
+        interpolation = (
+            self._av.video.reformatter.Interpolation.BILINEAR
+            | self._av.video.reformatter.Interpolation.ACCURATE_RND
+            | self._av.video.reformatter.Interpolation.BITEXACT
+        )
+        frame = self._reformatter.reformat(
+            frame,
+            format="yuv420p",
+            src_colorspace=self._colorspace,
+            dst_colorspace=self._colorspace,
+            src_color_range=self._av.video.reformatter.ColorRange.JPEG,
+            dst_color_range=self._color_range,
+            dst_color_trc=self.color_transfer,
+            dst_color_primaries=self.color_primaries,
+            interpolation=interpolation,
+            threads=1,
+        )
+        frame.pts = self.video_frames
+        frame.time_base = Fraction(self.frame_rate.denominator, self.frame_rate.numerator)
+        for packet in self._video.encode(frame):
+            packet.duration = 1
+            self._container.mux(packet)
+        self.video_frames += 1
+
+    def write_audio(self, planar: Planar) -> None:
+        if self._audio is None:
+            raise OutputError("streaming video was declared without audio", code="audio_absent")
+        if planar.shape[0] != self.audio_channels:
+            raise OutputError(
+                f"streaming audio has {planar.shape[0]} channels, expected {self.audio_channels}",
+                code="audio_shape",
+            )
+        for frame in _audio_frames(
+            self._av,
+            planar,
+            self.audio_sample_rate,
+            "flt",
+            AAC_FRAME_SAMPLES,
+            # AAC delays its first packet by one codec frame. Offset the submitted PTS so
+            # fragmented MP4 starts both tracks at zero instead of stretching video frame 0.
+            start_pts=self.audio_samples + AAC_FRAME_SAMPLES,
+        ):
+            for packet in self._audio.encode(frame):
+                self._container.mux(packet)
+        self.audio_samples += planar.shape[1]
+
+    def finish(self) -> EncodedVideoFacts:
+        if self.video_frames == 0:
+            raise OutputError("streaming video contains no frames", code="frame_shape")
+        for packet in self._video.encode():
+            packet.duration = 1
+            self._container.mux(packet)
+        if self._audio is not None:
+            for packet in self._audio.encode():
+                self._container.mux(packet)
+        self._container.close()
+        self._raw.flush()
+        os.fsync(self._raw.fileno())
+        self._raw.close()
+        return probe_mp4(self.path)
+
+    def abort(self) -> None:
+        with suppress(Exception):
+            self._container.close()
+        self._raw.close()
+        self.path.unlink(missing_ok=True)
+
+
+def probe_mp4(path: Path) -> EncodedVideoFacts:
+    """Stream-probe the final bytes; no decoded frame or PCM timeline is retained."""
+    from cozy_runtime.author._decode import _valid_audio_samples
+
+    av = _av()
+    with av.open(str(path), "r") as container:
+        videos = list(container.streams.video)
+        audios = list(container.streams.audio)
+        if len(videos) != 1 or len(audios) > 1:
+            raise OutputError(
+                "encoded MP4 does not contain exactly one video and at most one audio track",
+                code="output_probe",
+            )
+        video = videos[0]
+        width = int(video.codec_context.width or 0)
+        height = int(video.codec_context.height or 0)
+        frame_rate = Fraction(0)
+        video_frames = 0
+        prior_video_time: Fraction | None = None
+        video_step: Fraction | None = None
+        color_facts: tuple[int, int, int, int] | None = None
+        audio_samples = 0
+        selected = (video, *audios)
+        for packet in container.demux(*selected):
+            for frame in packet.decode():
+                if packet.stream.index == video.index:
+                    video_frames += 1
+                    if int(frame.width) != width or int(frame.height) != height:
+                        raise OutputError(
+                            "encoded video geometry changes during probe", code="output_probe"
+                        )
+                    frame_color = (
+                        int(frame.color_primaries),
+                        int(frame.color_trc),
+                        int(frame.colorspace),
+                        int(frame.color_range),
+                    )
+                    if color_facts is None:
+                        color_facts = frame_color
+                    elif frame_color != color_facts:
+                        raise OutputError(
+                            "encoded video color facts change during probe", code="output_probe"
+                        )
+                    if frame.pts is None or frame.time_base is None:
+                        raise OutputError(
+                            "encoded video frame has no exact clock", code="output_probe"
+                        )
+                    video_time = int(frame.pts) * Fraction(frame.time_base)
+                    if prior_video_time is not None:
+                        step = video_time - prior_video_time
+                        if step <= 0 or (video_step is not None and step != video_step):
+                            raise OutputError(
+                                f"encoded video frame clock is discontinuous: prior="
+                                f"{prior_video_time} current={video_time} step={step} "
+                                f"expected={video_step}",
+                                code="output_probe",
+                            )
+                        video_step = step
+                    prior_video_time = video_time
+                else:
+                    samples = int(frame.samples or 0)
+                    rate = int(frame.sample_rate or 0)
+                    audio_samples += _valid_audio_samples(frame, samples, rate)
+        if video_step is not None:
+            frame_rate = 1 / video_step
+        elif video.average_rate is not None:
+            frame_rate = Fraction(video.average_rate)
+        if video_frames == 0 or width <= 0 or height <= 0 or frame_rate <= 0 or color_facts is None:
+            raise OutputError("encoded MP4 has no valid video clock", code="output_probe")
+        audio = audios[0] if audios else None
+        return EncodedVideoFacts(
+            width=width,
+            height=height,
+            frame_count=video_frames,
+            frame_rate=frame_rate,
+            video_codec=str(video.codec_context.name),
+            audio_codec=str(audio.codec_context.name) if audio is not None else "",
+            audio_channels=int(audio.codec_context.channels or 0) if audio is not None else 0,
+            audio_sample_rate=int(audio.codec_context.sample_rate or 0) if audio is not None else 0,
+            audio_decoded_samples=audio_samples,
+            color_primaries=color_facts[0],
+            color_transfer=color_facts[1],
+            color_matrix=color_facts[2],
+            color_range=color_facts[3],
+        )

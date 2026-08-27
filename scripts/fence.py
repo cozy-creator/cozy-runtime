@@ -325,10 +325,16 @@ def fence_endpoint_owns_no_media_decode() -> list[str]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
                 continue
-            if node.attr == "_local":
+            if node.attr in {"_local", "_path"}:
                 bad.append(
-                    f"{rel}:{node.lineno}: endpoint code reaches Asset._local — verified "
+                    f"{rel}:{node.lineno}: endpoint code reaches private media path "
+                    f"{node.attr} — verified "
                     "input paths are Runtime-private"
+                )
+            elif node.attr == "demux":
+                bad.append(
+                    f"{rel}:{node.lineno}: endpoint code demuxes packets — only immutable "
+                    "Runtime media events cross the author boundary"
                 )
             elif node.attr == "from_file":
                 bad.append(
