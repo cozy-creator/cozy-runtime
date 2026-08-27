@@ -310,7 +310,11 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
         return
     seen.mutations.setdefault(id(target), []).append(name)
     seen.holds.append(target)
-    if name in _PURE_WRITE:
+    # A value transform on a local constructor temporary is ordinary
+    # initialization: the audio VAE's Kaiser-sinc filter normalizes before it
+    # becomes a persistent buffer. Once a tensor is registered, the same op is
+    # a load-time transform of a destination and remains storage territory.
+    if name in _PURE_WRITE or seen.registered.get(id(target)) is not target:
         return
     raise ConstructionFault(
         f"in-place weight transform `{name}`",
@@ -330,6 +334,7 @@ class Observations:
     real_allocations: list[tuple[str, str]] = field(default_factory=list)
     mutations: dict[int, list[str]] = field(default_factory=dict)
     holds: list[object] = field(default_factory=list)
+    registered: dict[int, object] = field(default_factory=dict)
 
 
 _PLACEMENT = threading.local()
@@ -409,6 +414,35 @@ def _guard_mode(seen: Observations) -> Any:
 
 
 @contextmanager
+def _track_registrations(seen: Observations) -> Iterator[None]:
+    """Record the clock edge where a local tensor becomes model state."""
+    torch = torch_module()
+    nn = torch.nn
+    parameter = nn.Module.register_parameter
+    buffer = nn.Module.register_buffer
+
+    def register_parameter(module: Any, name: str, value: Any) -> None:
+        parameter(module, name, value)
+        held = module._parameters.get(name)
+        if isinstance(held, torch.Tensor):
+            seen.registered[id(held)] = held
+
+    def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
+        buffer(module, name, value, persistent=persistent)
+        held = module._buffers.get(name)
+        if isinstance(held, torch.Tensor):
+            seen.registered[id(held)] = held
+
+    nn.Module.register_parameter = register_parameter
+    nn.Module.register_buffer = register_buffer
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = parameter
+        nn.Module.register_buffer = buffer
+
+
+@contextmanager
 def meta_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
     """The complete derive-mode substrate: meta parameters, no compile, declared card."""
     torch = torch_module()
@@ -420,6 +454,7 @@ def meta_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
         stack.enter_context(torch.device("meta"))
         stack.enter_context(_refuse_compile())
         stack.enter_context(_capability(cap))
+        stack.enter_context(_track_registrations(seen))
         stack.enter_context(_guard_mode(seen))
         yield cap
 
@@ -448,6 +483,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     nn = torch.nn
     cap = _Capability(variant)
     original = nn.Module.register_parameter
+    original_buffer = nn.Module.register_buffer
 
     def register(module: Any, name: str, param: Any) -> None:
         original(module, name, param)
@@ -458,6 +494,14 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         # the fence is on WHO moves bytes, not on what (see `placing`).
         with placing():
             module._parameters[name] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
+        held = module._parameters[name]
+        seen.registered[id(held)] = held
+
+    def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
+        original_buffer(module, name, value, persistent=persistent)
+        held = module._buffers.get(name)
+        if isinstance(held, torch.Tensor):
+            seen.registered[id(held)] = held
 
     swap = torch.__future__.get_swap_module_params_on_conversion()
     with ExitStack() as stack:
@@ -465,6 +509,8 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(torch.__future__.set_swap_module_params_on_conversion, swap)
         nn.Module.register_parameter = register
         stack.callback(setattr, nn.Module, "register_parameter", original)
+        nn.Module.register_buffer = register_buffer
+        stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
         stack.enter_context(_refuse_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
