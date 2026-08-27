@@ -253,8 +253,8 @@ def _full_proc_visibility() -> bool:
     return True
 
 
-def _readonly_container_cgroup_v1() -> bool:
-    """Whether kernel facts prove the narrow first-party process-tree backend.
+def _prove_readonly_container_cgroup_v1() -> None:
+    """Require every fact behind the narrow first-party process-tree backend.
 
     A marker alone proves little and a read-only cgroup alone can be an ordinary host.
     Selection requires their conjunction, non-root execution, a genuine v1 membership for
@@ -262,8 +262,12 @@ def _readonly_container_cgroup_v1() -> bool:
     pidfds.  Unified v2 is checked by the caller first and never reaches this path.
     """
 
-    if os.geteuid() == 0 or not _root_owned_container_marker():
-        return False
+    if os.geteuid() == 0:
+        raise ContainmentUnavailable("process-tree backend requires a non-root effective uid")
+    if not _root_owned_container_marker():
+        raise ContainmentUnavailable(
+            "process-tree backend found no regular uid-0 non-writable container marker"
+        )
     try:
         memberships: list[tuple[frozenset[str], Path]] = []
         for line in Path("/proc/self/cgroup").read_text().splitlines():
@@ -276,12 +280,16 @@ def _readonly_container_cgroup_v1() -> bool:
                 continue
             names = frozenset(item for item in controller_text.split(",") if item)
             if not hierarchy.isdigit() or not names or not relative_text.startswith("/"):
-                return False
+                raise ContainmentUnavailable(
+                    f"invalid cgroup-v1 membership line {line!r}"
+                )
             memberships.append((names, Path(relative_text)))
-    except (OSError, ValueError):
-        return False
+    except OSError as exc:
+        raise ContainmentUnavailable("cannot read cgroup-v1 memberships") from exc
+    except ValueError as exc:
+        raise ContainmentUnavailable("malformed cgroup-v1 membership") from exc
     if not memberships:
-        return False
+        raise ContainmentUnavailable("no cgroup-v1 controller membership exists")
     mounts = _cgroup_v1_mounts()
     readonly = getattr(os, "ST_RDONLY", 1)
     for controllers, relative in memberships:
@@ -292,19 +300,25 @@ def _readonly_container_cgroup_v1() -> bool:
             if (path := _inside_mount(mount, relative)) is not None and path.is_dir()
         ]
         if len(candidates) != 1:
-            return False
+            raise ContainmentUnavailable(
+                f"cgroup-v1 controllers {sorted(controllers)} resolve to "
+                f"{len(candidates)} containing mount paths"
+            )
         try:
             if not os.statvfs(candidates[0]).f_flag & readonly:
-                return False
-        except OSError:
-            return False
+                raise ContainmentUnavailable(
+                    f"cgroup-v1 controller path {candidates[0]} is not read-only"
+                )
+        except OSError as exc:
+            raise ContainmentUnavailable(
+                f"cannot inspect cgroup-v1 controller path {candidates[0]}"
+            ) from exc
     if not _full_proc_visibility():
-        return False
+        raise ContainmentUnavailable("full same-UID /proc visibility is unavailable")
     try:
         signal_process(process_identity(os.getpid()), 0)
-    except (OSError, ProcessLookupError):
-        return False
-    return True
+    except (OSError, ProcessLookupError) as exc:
+        raise ContainmentUnavailable("pidfd open/send proof failed") from exc
 
 
 def create_executor_scope(namespace: str) -> ExecutorScope:
@@ -314,12 +328,8 @@ def create_executor_scope(namespace: str) -> ExecutorScope:
         # Unified v2 always keeps the kernel scope path.  A read-only or undelegated v2
         # hierarchy refuses in create_executor_cgroup; it never silently falls back.
         return create_executor_cgroup(namespace)
-    if _readonly_container_cgroup_v1():
-        return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES))
-    raise ContainmentUnavailable(
-        "no writable cgroup-v2 delegation and the strict read-only-container cgroup-v1 "
-        "process-tree proof did not hold"
-    )
+    _prove_readonly_container_cgroup_v1()
+    return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES))
 
 
 def _cgroup_root() -> Path:
