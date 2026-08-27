@@ -861,7 +861,7 @@ class StreamingFillBackend:
         on_position: Callable[[int], None] | None = None,
         probe_cache: str | Path | None = None,
         decode_scratch_bytes: int = 512 << 20,
-        release: str = "cozy-runtime/0.0.1",
+        release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
         objective: str = "kernel_numeric_error",
     ) -> None:
