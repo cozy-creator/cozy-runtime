@@ -170,7 +170,7 @@ def main() -> int:
         else:
             raise AssertionError("retired provider identity entered the adapter handoff")
         config = read_adapter_config(env)
-        assert dict(config.child_base_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
+        assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
 
