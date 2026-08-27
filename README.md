@@ -4,8 +4,9 @@ The worker runtime: author surface (`cozy_runtime.author`), worker, disposable d
 executor, and the single-endpoint CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
 `cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.
 
-**No automated tests** (decisions.md #160): verification = running the real thing and
-recording what it did, plus time/memory benchmarks.
+**No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
+deterministic contract/arithmetic/staleness checks; everything else is verified by running
+the real thing and recording what it did, plus time/memory benchmarks.
 
 ## Layout
 

@@ -36,39 +36,43 @@ jobs:
       - run: uv run cozy-runtime version
 
   # The provider's reviewed spec digests must exist in TensorFS's exact pinned registry.
-  # TensorFS is a private sibling, so this job arms as soon as the repository read token is
-  # installed; local release validation still runs the same fence against the built wheel.
-  tensorfs-registry-drift:
+  # TensorFS is a private sibling, so this fence arms as soon as the repository read token
+  # is installed; local release validation still runs the same fence against the built
+  # wheel. Split into a gate + a gated job (cr-037) so a tokenless run renders the drift
+  # job SKIPPED — visibly distinct from green — instead of a warning that reads as pass.
+  # (`secrets` is not readable in a job-level `if`, hence the gate job.)
+  tensorfs-credential:
     runs-on: ubuntu-latest
-    env:
-      TENSORFS_SHA: c6c598baca3799508f64b4ef02af542c9181dc27
+    outputs:
+      present: ${{ steps.credential.outputs.present }}
     steps:
-      - uses: actions/checkout@v4
       - id: credential
         run: |
           if [ -n "${{ secrets.TENSORFS_TOKEN }}" ]; then
             echo "present=yes" >> "$GITHUB_OUTPUT"
           else
             echo "present=no" >> "$GITHUB_OUTPUT"
-            echo "::warning title=TensorFS registry fence not run::TENSORFS_TOKEN is not set, so the pinned private TensorFS wheel cannot be built. Release validation must retain a recorded 13/13 local fence run."
+            echo "::warning title=TensorFS registry fence not run::TENSORFS_TOKEN is not set, so the pinned private TensorFS wheel cannot be built and tensorfs-registry-drift is SKIPPED. Release validation must retain a recorded local fence run."
           fi
-      - if: steps.credential.outputs.present == 'yes'
-        uses: actions/checkout@v4
+  tensorfs-registry-drift:
+    needs: tensorfs-credential
+    if: needs.tensorfs-credential.outputs.present == 'yes'
+    runs-on: ubuntu-latest
+    env:
+      TENSORFS_SHA: c6c598baca3799508f64b4ef02af542c9181dc27
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: cozy-creator/tensorfs-v2
           ref: ${{ env.TENSORFS_SHA }}
           path: .tensorfs
           token: ${{ secrets.TENSORFS_TOKEN }}
-      - if: steps.credential.outputs.present == 'yes'
-        uses: astral-sh/setup-uv@v5
-      - if: steps.credential.outputs.present == 'yes'
-        uses: dtolnay/rust-toolchain@1.91.1
-      - if: steps.credential.outputs.present == 'yes'
-        run: uv sync
-      - if: steps.credential.outputs.present == 'yes'
-        run: uv pip install .tensorfs
-      - if: steps.credential.outputs.present == 'yes'
-        run: uv run python scripts/fence.py --only reviewed-specs-exist
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - run: uv sync
+      - run: uv pip install .tensorfs
+      - run: uv run python scripts/fence.py --only reviewed-specs-exist
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
   # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another
