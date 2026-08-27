@@ -13,8 +13,8 @@ recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 2) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
-| `cozy_runtime.cli` | local-coordinator adapter over the core | author, internal |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 3) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
@@ -30,16 +30,16 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 `internal/spawn.py` executes the seal (ERASE -> IMPOSE -> SEAL) around it.
 `internal/exits.py` is the one shared exit-code matrix.
 
-## The two processes, and the two coordinators
+## The two processes, and the two RecordOwners
 
-    a real coordinator ──gRPC───┐
+    a real RecordOwner ──gRPC───┐
                                 ├──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
-    an in-memory coordinator ───┘        cozy.worker.v1, either way
+    an in-memory RecordOwner ───┘        cozy.worker.v1, either way
 
 | module | role |
 |---|---|
 | `internal/worker/session.py` | the protocol client and the worker entrypoint |
-| `internal/worker/control.py` | the transport seam: `Link`/`Coordinator`, gRPC and in-memory |
+| `internal/worker/control.py` | the worker-owned control transport: gRPC and in-memory hosts |
 | `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
 | `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
@@ -62,7 +62,7 @@ The worker never imports torch, and that is proved against the RUNNING process
 list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
-ephemeral local worker whose coordinator is a pair of in-process queues, over the same
+ephemeral local worker whose RecordOwner is a pair of in-process queues, over the same
 process boundary, journal, acceptance boundary, freeze point and ledger. The rule is
 structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
 exactly one caller (the device executor) and the attempt engine exactly one constructor (the

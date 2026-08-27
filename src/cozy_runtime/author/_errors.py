@@ -105,7 +105,7 @@ class Outcome:
     """What ONE attempt reports at the invocation boundary — neutral FACTS only (§2).
 
     There is deliberately no `retryable`, `retry_after` or `fatal` member. RETRYABLE and
-    FATAL are coordinator PROJECTIONS over these facts, never observations the worker or
+    FATAL are RecordOwner PROJECTIONS over these facts, never observations the worker or
     the author writes: each wrongly-classified retry buys a pod.
     """
 
@@ -121,7 +121,7 @@ NEUTRAL_ERROR_SET: Mapping[str, object] = {
     "author_raises": ["InvalidRequest", "UnsupportedInput", "Cancelled", "exception"],
     "terminals": ["succeeded", "refused", "failed", "canceled"],
     "origins": ["author", "request", "runtime"],
-    "retryability": "a coordinator projection over these facts; never author-declared",
+    "retryability": "a RecordOwner projection over these facts; never author-declared",
 }
 
 SUCCEEDED = Outcome("succeeded", "runtime", "ok")

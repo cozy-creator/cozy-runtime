@@ -22,7 +22,7 @@ observations until it fits, recording that it did. Raw unbounded logs never ride
 control stream, and there is no field here for them.
 
 **Opaque by identity.** The handle is `subject_id`, minted per terminal attempt. Nothing in
-the bundle is addressable by path, and the coordinator's own opaque attempt key
+the bundle is addressable by path, and the RecordOwner's own opaque attempt key
 (`records.AttemptByKey`, cl-001) maps to it through the terminal — so a triage read is a key
 lookup on both sides, never a filesystem walk.
 

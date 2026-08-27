@@ -389,7 +389,7 @@ STORE_REFUSALS: dict[str, str] = {
     "UNKNOWN_FORMAT": "checkpoint_unreadable",
     "MISSING_FIELD": "checkpoint_unreadable",
     # The header re-check against its own encoding closure (`Checkpoint.__init__`), which is
-    # law 18 made mechanical: a coordinator's authority is not worker safety, so the worker
+    # law 18 made mechanical: a RecordOwner's authority is not worker safety, so the worker
     # asks TensorFS whether every tensor's stored roles ARE the roles its cited spec
     # declares. Both codes were escaping this plane UNTRANSLATED — a raw
     # `tensorfs.errors.Refusal` crossing a boundary whose whole contract is that the
@@ -480,7 +480,7 @@ class Checkpoint:
             # cites a spec digest per tensor and lists those spec objects; reading them
             # back out of the CAS and re-validating is how "the decode targets come from
             # the header's cited specs" stops being a claim. It is also law 18: a
-            # coordinator's authority is not worker safety, so the worker re-checks that
+            # RecordOwner's authority is not worker safety, so the worker re-checks that
             # each tensor's stored ROLES are the roles its cited spec declares — which is
             # TensorFS's fact, asked of TensorFS rather than reimplemented here.
             closure = tensorfs.Closure()
@@ -1262,7 +1262,7 @@ class StreamingFillBackend:
         rows EXPAND, by exactly the ratio the header already states — so an envelope priced
         at the artifact's stored bytes under-prices the fill by that ratio and the budget
         check it feeds cannot refuse anything real. Measured on H3: 92.42 GiB stored against
-        128.31 GiB logical, and the number the coordinator declared was the first one.
+        128.31 GiB logical, and the number the RecordOwner declared was the first one.
 
         The composition, per class and per component, because a single total is exactly what
         made the 53.6 GiB gap unattributable:

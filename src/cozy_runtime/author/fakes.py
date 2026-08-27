@@ -168,7 +168,7 @@ def invoke_with_fakes(
     assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> InvocationResult:
-    """Run a handler through the REAL kernel with no GPU, no hub and no coordinator."""
+    """Run a handler through the REAL kernel with no GPU, no hub and no RecordOwner."""
     spool = _spool(request_id)
     return invoke(
         prepare(registration, wire, recipes=recipes, clamps=clamps, settings=settings),

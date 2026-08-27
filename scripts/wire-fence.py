@@ -3,7 +3,7 @@
 
 WHAT THIS REFUSES. A vendored `cozy.worker.v1` binding that is not the schema it claims to
 be. That is the whole of #530-A1: `WIRE_MINOR` fenced nothing, because a version constant
-can agree while the bytes disagree — the protocol sat at rev-2 while two vendored copies sat
+can agree while the bytes disagree — the protocol sat at rev 2 while two vendored copies sat
 revisions behind and all three declared minor 0.
 
 WHY IT CAN RUN HERE AT ALL. The identity is DERIVED, not declared: `worker_pb2.py` embeds
@@ -31,15 +31,15 @@ sys.path.insert(0, str(ROOT / "src"))
 from cozy.worker.v1 import wire_identity  # noqa: E402
 from cozy_runtime.protocol import documents  # noqa: E402
 
-#: THE PIN. worker-protocol `df05c8d`, `WIRE_SCHEMA_REV` 2, and the digest its `SCHEMA_REVS`
+#: THE PIN. worker-protocol `b0243af`, `WIRE_SCHEMA_REV` 3, and the digest its `SCHEMA_REVS`
 #: ledger registers for that rev. Written here as a LITERAL on purpose: comparing the derived
 #: digest only against `wire_identity.SCHEMA_DIGEST` proves the copy is self-consistent, and
 #: a wholesale re-vendor of some other schema would be self-consistent too. The literal is
 #: what says WHICH schema this repo is a consumer of, and moving it is the deliberate act of
 #: adopting a new protocol rev.
-PROTOCOL_SHA = "df05c8d6f03603a9e6b5e735522507aa4e3b4638"
-WIRE_SCHEMA_REV = 2
-SCHEMA_DIGEST = "sha256:1946a5d9c1118632708074f500221eaabc31f1837d230635d44c2b71becf6ce6"
+PROTOCOL_SHA = "b0243af1ceadf5c0e32f4ce66bfd55fef98ff1ca"
+WIRE_SCHEMA_REV = 3
+SCHEMA_DIGEST = "sha256:b1848f108a96fc6620f81702019a0ff009997eb86b55f01e549d8a5f3bbd41a8"
 
 
 def main() -> int:

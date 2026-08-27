@@ -2,7 +2,7 @@
 """cr-008a's live verification: ONE request, through the whole real path, no network.
 
 Not a test suite (#160). Every section starts the actual system — an ephemeral local
-worker in a REAL process, with an in-memory coordinator instead of a gRPC one, and a
+worker in a REAL process, with an in-memory RecordOwner instead of a gRPC one, and a
 disposable CUDA executor child serving cr-005's real SDXL UNet — and prints what it observed.
 
     nice -n 19 corpus/.venv/bin/python scripts/slice-live.py slice
@@ -192,7 +192,7 @@ def corrupt_store(at: Path, source: str) -> str:
 def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     """ONE slice, in THIS process. The whole of `exec` mode."""
     from cozy_runtime.internal.config import read_config
-    from cozy_runtime.internal.local import LocalCoordinator, LocalRequest, run_slice
+    from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest, run_slice
     from cozy_runtime.internal.worker.session import WorkerOptions
     from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -224,7 +224,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         no_warm=bool(spec.get("no_warm", True)),
     )
 
-    def arm(coordinator: LocalCoordinator, worker: Any) -> None:
+    def arm(record_owner: LocalRecordOwner, worker: Any) -> None:
         # SIGINT on a local run CANCELS the attempt — the same CancelAttempt a hub sends,
         # on the same lane. This is the local spelling of Ctrl-C, and it is why the
         # cancellation arms need no hook inside the runtime. SIGTERM is deliberately NOT
@@ -232,14 +232,14 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         # polite request the run may outlive.
         def cancel(signum: int, frame: object) -> None:
             print(f"[run] signal {signum}: cancelling the live attempt", flush=True)
-            coordinator.cancel(pb.CancelReason.CANCEL_REASON_CLIENT)
+            record_owner.cancel(pb.CancelReason.CANCEL_REASON_CLIENT)
 
         signal.signal(signal.SIGINT, cancel)
         marker = Path(spec["workspace"]) / "accepted.marker"
 
         def watch() -> None:
-            while not coordinator.done.is_set():
-                if coordinator.accepted is not None and not marker.exists():
+            while not record_owner.done.is_set():
+                if record_owner.accepted is not None and not marker.exists():
                     marker.write_text("accepted\n")
                 if worker.supervision.current is not None:
                     executor = workspace / "executor.pid"
@@ -257,7 +257,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         release_id=RELEASE,
         options=options,
         delete_journal=bool(spec.get("delete_journal", True)),
-        coordinator_hook=arm,
+        record_owner_hook=arm,
     )
     return dataclasses.asdict(outcome)
 
@@ -1406,7 +1406,7 @@ def flood_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
     Two caps have to hold and they are different: the RING's memory cap (count + bytes,
     oldest shed first) and the BUNDLE's protocol cap. A flood that fits one and blows the
-    other would produce a terminal a coordinator cannot accept.
+    other would produce a terminal a RecordOwner cannot accept.
     """
     from cozy_runtime.author._observations import EventRing, ObservationRefusal
     from cozy_runtime.internal.journal import Journal

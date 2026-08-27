@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """cr-007's live verification: a REAL two-process worker, driven over REAL protocol bytes.
 
-Not a test suite (#160). Every section below starts the actual system — a coordinator
+Not a test suite (#160). Every section below starts the actual system — a RecordOwner
 process (this script), a no-CUDA worker process, and a disposable CUDA executor process
-— and prints what it observed. `cl-001` does not exist yet, so the coordinator side of
+— and prints what it observed. `cl-001` does not exist yet, so the RecordOwner side of
 th-024 is a scripted gRPC SERVER here: it speaks the committed `cozy.worker.v1` service
 over a unix socket with the copied bindings, and its canonical documents are checked against
 worker-protocol's own frozen fixtures (`fixtures` section) so "real bytes" is a fact.
@@ -711,7 +711,7 @@ class Worker:
     def result_schema_digest(self, entrypoint: str) -> str:
         """The DECLARED result-surface digest, computed independently of the worker.
 
-        In a SUBPROCESS on purpose: the coordinator has no business importing endpoint code
+        In a SUBPROCESS on purpose: the RecordOwner has no business importing endpoint code
         either, and the import tripwire must stay a fact about the worker's processes.
         """
         code = (
@@ -747,7 +747,7 @@ def stage(
 ) -> dict[str, str]:
     """Write one binding-plan record per entrypoint, and install the artifact row they name.
 
-    `overrides` is how a DIFFERENT fixture is driven through the same coordinator: the
+    `overrides` is how a DIFFERENT fixture is driven through the same RecordOwner: the
     four-component pipeline is the same worker, the same protocol and the same records with
     another project and component set. Its ARTIFACT half (store, config, snapshots) goes
     into the index row rather than the record — #567e moved those facts to the resolver.
@@ -1042,7 +1042,7 @@ def terminal_body(terminal: pb.AttemptOutcome) -> dict[str, Any]:
 
 
 def section_fixtures(args: argparse.Namespace) -> None:
-    """The copied bindings and this writer against worker-protocol's rev-2 corpus."""
+    """The copied bindings and this writer against worker-protocol's schema-rev-3 corpus."""
     head("the SCHEMA FENCE is DERIVED here, not declared (#530-A1/#536b)")
     derived = documents.wire_schema_document()
     derived_id = "sha256:" + documents.digest_of(derived).hex()
@@ -1060,7 +1060,7 @@ def section_fixtures(args: argparse.Namespace) -> None:
         f"the document-version map {documents.DOC_VERSION} inside it",
     )
 
-    head("the vendored rev-2 bindings decode the frozen fixture corpus")
+    head("the vendored schema-rev-3 bindings decode the frozen fixture corpus")
     manifest = json.loads((FIXTURES / "MANIFEST.json").read_text())
     bad = []
     for name, row in manifest["positive"].items():
@@ -2024,7 +2024,7 @@ def section_arms(args: argparse.Namespace) -> None:
             )
         )
         check(
-            "an output the coordinator did not grant is UNWRITABLE, however it was made",
+            "an output the RecordOwner did not grant is UNWRITABLE, however it was made",
             body["status"] == 3 and "destination_absent" in body["safe_message"],
             body["safe_message"][:130],
         )
@@ -2706,7 +2706,7 @@ def section_results(args: argparse.Namespace) -> None:
 
 # --------------------------------------------------------------- the four-component fixture
 
-#: cr-008b's real SDXL pipeline, driven through THIS coordinator so a resident worker can be
+#: cr-008b's real SDXL pipeline, driven through THIS RecordOwner so a resident worker can be
 #: given more than one request. `pipeline-live.py` runs one request per process by design —
 #: it measures cold-to-first-image — and the defect cl-003 found lives entirely in the SECOND
 #: request on a worker that is already warm.
@@ -3003,7 +3003,7 @@ def section_drift(args: argparse.Namespace) -> dict[str, Any]:
             if fault.reason == "ledger_unreconciled"
         ]
         check(
-            "an unreconciled ledger is LOUD at the COORDINATOR seat, not a silent drift",
+            "an unreconciled ledger is LOUD at the RecordOwner seat, not a silent drift",
             bool(reported) and bool(record.get("leaks")),
             (
                 f"{pb.FaultKind.Name(reported[-1].kind)} {reported[-1].reason}: "
@@ -3150,7 +3150,7 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
             f"{dropped.admission_generation})",
         )
         # DISPATCHED INTO THE WINDOW, on purpose and immediately: the executor is dead, the
-        # rebuild has not spawned its replacement yet, so the incarnation the coordinator
+        # rebuild has not spawned its replacement yet, so the incarnation the RecordOwner
         # holds is still the current one and this StartAttempt is a live message aimed at a
         # worker that cannot serve. That window is the whole defect — it is where every
         # attempt used to die `executor_not_ready`/EXECUTOR_FAULT until a requeue budget was
@@ -3289,7 +3289,7 @@ def main() -> int:
     args = parser.parse_args()
     # One workspace per invocation. A worker whose harness went away keeps reconnecting
     # to its hub socket, so a shared path would let a previous run's worker register into
-    # this run's coordinator — two workers, one hub, and unreadable evidence.
+    # this run's RecordOwner — two workers, one hub, and unreadable evidence.
     args.tmp = args.tmp or f"/tmp/cozy-cr007/{args.section}-{os.getpid()}"
     sections = {
         "fixtures": section_fixtures,
@@ -3313,7 +3313,7 @@ def main() -> int:
     if isinstance(row, dict):
         print("\n" + json.dumps(row, indent=2))
     print(f"\n{PASS} passed, {FAIL} failed", flush=True)
-    # Hard exit: the coordinator's gRPC server and the hub's reader threads are not this
+    # Hard exit: the RecordOwner's gRPC server and the hub's reader threads are not this
     # script's product, and a lingering harness holds a socket the next section wants.
     os._exit(1 if FAIL else 0)
 

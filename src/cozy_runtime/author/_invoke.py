@@ -244,7 +244,7 @@ def run_prepared(
     `invoke` raises typed refusals because author-facing code should; the boundary the
     worker speaks across cannot, because the terminal must still ship when the body
     fails (§2). What crosses is FACTS — terminal, origin, code — and never a retry command:
-    RETRYABLE and FATAL are coordinator projections over these, never observations here.
+    RETRYABLE and FATAL are RecordOwner projections over these, never observations here.
     """
     record = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
     try:
@@ -381,14 +381,14 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
             raise InvalidRequest(
                 f"input tree {tree.ref!r} is not granted to this attempt: this run "
                 f"materialized {sorted(inv.trees) or 'no trees'}. A tree is a digest-verified "
-                "READ CAPABILITY minted by the coordinator, never a path a job may name",
+                "READ CAPABILITY minted by the RecordOwner, never a path a job may name",
                 code="tree_ungranted",
             )
         root, digest = granted
         if not root.is_dir():
             raise InvalidRequest(
                 f"input tree {tree.ref!r} was granted at a location that is not a directory: "
-                "the coordinator minted this address, so this runtime substitutes none",
+                "the RecordOwner minted this address, so this runtime substitutes none",
                 code="tree_unmaterialized",
             )
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
@@ -506,7 +506,7 @@ def _hydrate(payload: object, inv: Invocation) -> None:
             raise InvalidRequest(
                 f"input asset {input_id!r} (ref {asset.ref!r}) is not granted to this "
                 f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
-                "asset is a digest-verified READ CAPABILITY minted by the coordinator, "
+                "asset is a digest-verified READ CAPABILITY minted by the RecordOwner, "
                 "never a location a request may name",
                 code="asset_ungranted",
                 fields=[input_id],

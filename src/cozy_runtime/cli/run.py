@@ -272,7 +272,7 @@ def release_id_of(body: Mapping[str, Json]) -> str:
 def _input_trees(values: Sequence[str]) -> dict[str, str]:
     """`--input <ref>=<dir>` — one MATERIALIZED input tree grant per typed Tree field.
 
-    Locally the coordinator grants a directory it can already read; on the network path
+    Locally the RecordOwner grants a directory it can already read; on the network path
     tfs-003 materializes the snapshot and th-004 mints the same grant. Either way, the job's
     typed field carries the ref and the GRANT carries the capability.
     """
@@ -571,7 +571,7 @@ def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
     """Move the granted outputs into `--out`, named by their descriptor FIELD PATH.
 
     The EXTENSION comes from the asset's own declared media type, not from the granted
-    destination's filename: a coordinator grants an opaque location and the worker writes
+    destination's filename: a RecordOwner grants an opaque location and the worker writes
     bytes to it, so the grant path knows nothing about what the encoder produced. The
     author's returned asset does.
     """

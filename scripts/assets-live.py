@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cr-012 live verification: typed INPUT ASSETS, end to end on the real attempt path.
 
-Not a test (tracker README #160): every leg runs the real coordinator, the real worker
+Not a test (tracker README #160): every leg runs the real RecordOwner, the real worker
 hydration, the real executor and the real endpoint, and prints numbers.
 
   roundtrip  a real PNG in -> `retouch` -> a real PNG out, digest-verified both ways
@@ -150,7 +150,7 @@ def spawn(label: str, spec: dict[str, Any], mode: str = "exec") -> dict[str, Any
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — coordinator, worker, executor."""
+    """ONE request through the WHOLE real path — RecordOwner, worker, executor."""
     import dataclasses
 
     from cozy_runtime.internal.config import read_config
@@ -171,12 +171,12 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         }
     )
 
-    def hook(coordinator: Any, worker: Any) -> None:
+    def hook(record_owner: Any, worker: Any) -> None:
         """Harness-side fault injection through the documented seam (decisions #249)."""
         if spec.get("kill_after"):
             import threading
 
-            dispatched = coordinator._dispatch
+            dispatched = record_owner._dispatch
 
             def killer() -> None:
                 deadline = time.monotonic() + float(spec["kill_after"])
@@ -193,13 +193,13 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
                 threading.Thread(target=killer, daemon=True).start()
                 return dispatched(incarnation)
 
-            coordinator._dispatch = arming
+            record_owner._dispatch = arming
         if spec.get("tamper"):
-            # THE PLANT: the coordinator mints the grant over the file as it stands, and
+            # THE PLANT: the RecordOwner mints the grant over the file as it stands, and
             # the bytes then change underneath it. That is what a corrupted input IS in
             # production — a stored object that moved after the record naming it was
             # written — and it needs no switch inside the runtime.
-            minted = coordinator._grant
+            minted = record_owner._grant
 
             def corrupting() -> Any:
                 grant = minted()
@@ -209,7 +209,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
                 path.write_bytes(bytes(body))
                 return grant
 
-            coordinator._grant = corrupting
+            record_owner._grant = corrupting
 
     outcome = run_slice(
         config,
@@ -225,7 +225,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         release_id=S.RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=S.RELEASE, no_warm=True),
         delete_journal=False,
-        coordinator_hook=hook,
+        record_owner_hook=hook,
     )
     out_path.write_text(json.dumps(dataclasses.asdict(outcome), default=str))
 

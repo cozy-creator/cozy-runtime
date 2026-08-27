@@ -215,7 +215,7 @@ def _resources(surface: Surface) -> dict[str, Json]:
 
 def _protocol() -> dict[str, Json]:
     """The declared RANGE this release speaks. Scripts gate on capability tokens, never on
-    version strings (cozy-runtime-cli.md) — this is what a coordinator checks admissibility
+    version strings (cozy-runtime-cli.md) — this is what a RecordOwner checks admissibility
     against, not what anyone parses for features."""
     return {
         "wire_package": WIRE_PROTOCOL_PACKAGE,

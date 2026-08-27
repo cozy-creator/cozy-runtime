@@ -11,8 +11,8 @@ worker-protocol/02 fixes:
     CLOSED      closure recorded
 
 Two things are deliberately NOT here, because they are not the worker's: retryability (a
-coordinator projection over status/cause/origin) and attempt-selection order beyond this
-worker (dispatch is the coordinator's; below that boundary service class does not exist and
+RecordOwner projection over status/cause/origin) and attempt-selection order beyond this
+worker (dispatch is the RecordOwner's; below that boundary service class does not exist and
 there is no field to carry it). Two attempts assigned to this worker SERIALIZE on the single
 device lease, in arrival order, and that is the whole of local arbitration.
 
@@ -72,7 +72,7 @@ def safe(text: str, cap: int = 1024) -> str:
 def _coded(outcome: Mapping[str, Any]) -> str:
     """`<code>: <message>` — the AUTHOR's typed code in front of its own sentence.
 
-    The wire carries a small neutral `CauseCode` on purpose (a coordinator classifies, it
+    The wire carries a small neutral `CauseCode` on purpose (a RecordOwner classifies, it
     does not read author vocabulary), so the typed code has to ride the message or it does
     not survive the boundary at all. Every other refusal on this path already renders this
     way; author outcomes were the exception.
@@ -162,7 +162,7 @@ class AttemptRefusal(Exception):
         *,
         cause: pb.CauseCode,
         drop: bool = False,
-        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
@@ -520,7 +520,7 @@ class AttemptEngine:
         code: str,
         detail: str,
         cause: pb.CauseCode,
-        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+        origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> pb.AttemptOutcome:
         """A REFUSED terminal for an attempt this worker is already holding."""
         return self.outcome(
@@ -537,7 +537,7 @@ class AttemptEngine:
         """Fetch, verify and decode the granted payload. Shared by BOTH modes.
 
         It happens at ACCEPTANCE and not at execution time on purpose: a missing, expired or
-        malformed payload must be a refusal the coordinator can read, not an accepted attempt
+        malformed payload must be a refusal the RecordOwner can read, not an accepted attempt
         that later dies on a thread with no terminal to show for it.
         """
         try:
@@ -551,14 +551,14 @@ class AttemptEngine:
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
         except OSError as exc:
-            # The ADDRESS was minted by the coordinator, so a miss here is PLATFORM-FATAL,
+            # The ADDRESS was minted by the RecordOwner, so a miss here is PLATFORM-FATAL,
             # not a bad request (v1 REF_ORIGIN). This used to fall into the branch below and
             # report a missing file as "not a JSON object" — the wrong system, the wrong
             # person, and a sentence with no remedy in it.
             classified = refusal.classify(
                 "payload_unreadable",
                 f"the granted payload location could not be read ({type(exc).__name__}); the "
-                "coordinator minted this address, so this worker cannot substitute another",
+                "RecordOwner minted this address, so this worker cannot substitute another",
                 origin=refusal.PLATFORM,
             )
             code, cause_origin = classified.cause()
@@ -592,7 +592,7 @@ class AttemptEngine:
         "a caller trying to move tensors or media through here fails immediately". It did not
         fail immediately. Measured by ev-003 (decisions #302): a 73,721 B request is accepted,
         the dispatch frame then raises a worker-side `SeamError` AFTER acceptance, and the
-        run HANGS — `LocalCoordinator` only deadlines a run that never dispatched. A 42,719 B
+        run HANGS — `LocalRecordOwner` only deadlines a run that never dispatched. A 42,719 B
         request on the same path succeeds.
 
         That violates the acceptance-boundary law directly: everything before the journal
@@ -696,7 +696,7 @@ class AttemptEngine:
         except grants.GrantRefusal as exc:
             # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
             # absent grant entry are facts about the REQUEST; an expired grant or an
-            # unreachable coordinator-minted address are facts about the platform, and
+            # unreachable RecordOwner-minted address are facts about the platform, and
             # rendering the two the same way sends the wrong person to the wrong question.
             caller = exc.code in (
                 "input_over_cap",
@@ -715,7 +715,7 @@ class AttemptEngine:
                 else CAUSE.CAUSE_CODE_GRANT_EXPIRED
                 if exc.code == "grant_expired"
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-                origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_WORKER,
             ) from exc
 
     def _accept_job(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
@@ -725,7 +725,7 @@ class AttemptEngine:
         serving worker, so an attempt is accepted only against a Ready executor. A job is the
         opposite shape — one immutable build, one bounded attempt, terminal, reclaim — and
         there is nothing to be warm FOR. Preparing before acceptance would only hold a rented
-        pod idle while the coordinator waits to hear whether its work was taken.
+        pod idle while the RecordOwner waits to hear whether its work was taken.
 
         What does NOT change: acceptance is journaled BEFORE anything runs, the payload is
         fetched and decoded here, the input trees are resolved under the grant here, and the
@@ -842,7 +842,7 @@ class AttemptEngine:
         Everything before the journal either completes or raises a typed PRE-ACCEPT refusal,
         and the reservation rolls back if the journal cannot commit. The payload is fetched
         HERE and not at execution time on purpose: a missing, expired or malformed payload
-        must be a refusal the coordinator can read, not an accepted attempt that later dies
+        must be a refusal the RecordOwner can read, not an accepted attempt that later dies
         on a thread with no terminal to show for it.
 
         Features are derived from the DECODED PAYLOAD. Deriving them from the plan id would
@@ -929,7 +929,7 @@ class AttemptEngine:
         # validate -> plan -> hydrate -> prepare -> accept -> invoke). After the plan,
         # because a request that has no plan should download nothing; before acceptance,
         # because an oversized, ungranted, mislabelled or unreachable input must be a
-        # refusal the coordinator can read rather than an accepted attempt that dies on a
+        # refusal the RecordOwner can read rather than an accepted attempt that dies on a
         # thread. And before the lease, which is the ordering that matters most: a slow URL
         # fetched under a lease would pin staged weights for its whole duration.
         self._hydrate_inputs(attempt)
@@ -1184,10 +1184,10 @@ class AttemptEngine:
                 "no checkpoint declaration it cannot make durable",
             }
         self.receipts[key] = record
-        # The coordinator's copy rides the DURABLE control lane, after the worker's own
+        # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
         # journal, at-least-once like every other durable message (law 9). `artifact` stays
         # UNSET, and that is the honest state of this frame: no ArtifactSink exists to fill
-        # it, so the coordinator is being told an attempt DECLARED a checkpoint and nothing
+        # it, so the RecordOwner is being told an attempt DECLARED a checkpoint and nothing
         # more (#552/#553a).
         # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
         # stamp — no constructor can forget one).
@@ -1213,10 +1213,10 @@ class AttemptEngine:
         return {"ok": True, "receipt_id": receipt_id, "replayed": False}
 
     def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
-        """Record the COORDINATOR's verdict on a checkpoint this worker already journaled.
+        """Record the RecordOwner's verdict on a checkpoint this worker already journaled.
 
         It is a second observer, not a second authority: the declaration is already in this
-        worker's journal. A coordinator CONFLICT is a real fact and is journaled as a fault,
+        worker's journal. A RecordOwner CONFLICT is a real fact and is journaled as a fault,
         because it means the run's identity is contested upstream — but it cannot
         retroactively un-write a declaration that is durable here.
         """
@@ -1227,7 +1227,7 @@ class AttemptEngine:
                     subject=f"{receipt.request_id}#{receipt.attempt_ordinal}",
                     reason="checkpoint_conflict_upstream",
                     detail=safe(
-                        f"the coordinator reports {receipt.logical_key!r} under operation key "
+                        f"the RecordOwner reports {receipt.logical_key!r} under operation key "
                         f"{receipt.operation_key!r} conflicts: {receipt.fault.detail}"
                     ),
                 )
@@ -1437,7 +1437,7 @@ class AttemptEngine:
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
                 "the executor could not prove quiescence after the handler returned; a "
                 "terminal journaled under unproven quiescence would be a claim about state "
                 "that may still be moving",
@@ -1449,7 +1449,7 @@ class AttemptEngine:
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
                 "env_seal_broken: the executor's environment changed after CUDA init — the "
                 "allocator read it once, so the imposition was a silent no-op",
             )
@@ -1530,7 +1530,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_FAILED,
                     CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     tail_error,
                 )
         else:
@@ -1713,7 +1713,7 @@ class AttemptEngine:
         path (`image`, `pair.thumb`, `frames.0`) — with EXACT SET EQUALITY against the
         grant. Never by list index: two outputs that arrive in a different order must still
         land in their own destinations, and a position cannot express that. A produced
-        output the coordinator did not grant, or a granted destination the attempt did not
+        output the RecordOwner did not grant, or a granted destination the attempt did not
         fill, refuses the tail WHOLE — an output transaction is not partially successful.
         """
         rows = list(reply.get("outputs", ()))
@@ -1729,7 +1729,7 @@ class AttemptEngine:
             return None, (
                 f"destination_absent: the attempt produced {sorted(produced) or 'nothing'} "
                 f"and the grant names {sorted(granted) or 'nothing'}; an output the "
-                "coordinator did not grant is unwritable however it was produced, and a "
+                "RecordOwner did not grant is unwritable however it was produced, and a "
                 "granted destination the attempt never filled is not a success"
             )
         entries = []
@@ -2124,7 +2124,7 @@ class AttemptEngine:
             ],
         )
         # The EXECUTOR's exact serialized bytes, not a re-serialization of a decoded copy:
-        # the envelope's whole claim is that the bytes a coordinator holds and the value the
+        # the envelope's whole claim is that the bytes a RecordOwner holds and the value the
         # handler returned are one thing.
         envelope.inline_result = result.canonical
         return envelope
@@ -2230,7 +2230,7 @@ class AttemptEngine:
             attempt,
             STATUS.OUTCOME_STATUS_CANCELED,
             cause,
-            ORIGIN.CAUSE_ORIGIN_COORDINATOR
+            ORIGIN.CAUSE_ORIGIN_RECORD_OWNER
             if reason in ("drain", "policy", "superseded")
             else ORIGIN.CAUSE_ORIGIN_CLIENT,
             f"canceled ({reason}); "
@@ -2247,7 +2247,7 @@ class AttemptEngine:
 
         `terminal()` builds a rich body — a reconciliation, a triage bundle, attested
         metrics, an inline result — and every one of those can fail on its own. When one
-        does, the attempt used to end in SILENCE: the lane returned, the coordinator held an
+        does, the attempt used to end in SILENCE: the lane returned, the RecordOwner held an
         accepted attempt with no terminal, and the liveness detector printed WEDGED and did
         nothing (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
         that has nothing left to fail on.
@@ -2267,7 +2267,7 @@ class AttemptEngine:
             safe_message=safe(f"outcome_construction_failed: {why}", 4096),
             cause=pb.OutcomeCause(
                 code=CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                origin=ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                origin=ORIGIN.CAUSE_ORIGIN_WORKER,
                 detail=safe(f"outcome_construction_failed: {why}"),
             ),
             execution_started=attempt.executions > 0,
@@ -2387,7 +2387,7 @@ class AttemptEngine:
         under an identity this process is not — but it is not nothing either. It becomes a
         freshly minted, freshly journaled TYPED LOSS (#494d): ABANDONED / EXECUTOR_INVALIDATED
         naming the foreign instance, so the owner learns those attempts existed and died. The
-        old behaviour was `continue`, and a coordinator holding a dispatched attempt learned
+        old behaviour was `continue`, and a RecordOwner holding a dispatched attempt learned
         nothing at all about it — the worker simply never mentioned it again.
         """
         recovered: list[pb.HeldAttempt] = []
@@ -2414,7 +2414,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_ABANDONED,
                     CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     f"foreign_instance_identity: this journal row was authorized under "
                     f"instance {safe(foreign, 64) or '(unnamed)'} and this worker is "
                     f"{safe(self.instance_id, 64) or '(unnamed)'}, so its journaled outcome "
@@ -2433,7 +2433,7 @@ class AttemptEngine:
                     attempt,
                     STATUS.OUTCOME_STATUS_ABANDONED,
                     CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_SUPERVISOR,
+                    ORIGIN.CAUSE_ORIGIN_WORKER,
                     "accepted-but-incomplete across a control-parent restart: the execution "
                     "context is gone, so this attempt reports ABANDONED and is never "
                     "re-executed",

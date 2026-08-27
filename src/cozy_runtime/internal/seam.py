@@ -15,7 +15,7 @@ Three properties are structural rather than reviewed:
   the executor's writable storage to exactly that spool (§3.1).
 * **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
   grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
-  a code-review rule. The executor holds no coordinator, storage or billing credential.
+  a code-review rule. The executor holds no RecordOwner, storage or billing credential.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.

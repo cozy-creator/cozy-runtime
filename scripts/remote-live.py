@@ -382,7 +382,7 @@ def main() -> int:
         )
 
         # The RED arm: the same request with the payload staged on the OWNER's disk — the
-        # address a coordinator mints when it forgets there is a boundary (#493.3). Nothing
+        # address a RecordOwner mints when it forgets there is a boundary (#493.3). Nothing
         # else moves: same worker, same plan, same declared inputs.
         elsewhere = tmp / "owner-only"
         elsewhere.mkdir(parents=True, exist_ok=True)
