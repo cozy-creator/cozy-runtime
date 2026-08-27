@@ -45,6 +45,8 @@ RECEIPT_FORMAT = "cozy.worker.v1.InstalledEnvironmentReceipt/1"
 RECEIPT_NAME = "installed-environment-receipt.json"
 MAX_WHEEL_BYTES = 8 << 30
 MAX_WHEEL_MEMBERS = 200_000
+MAX_WHEEL_EXPANDED_BYTES = 32 << 30
+MAX_WHEEL_EXPANSION = 64
 MAX_METADATA_BYTES = 4 << 20
 PINNED_UV_VERSION = "uv 0.9.18"
 PINNED_UV_LENGTH = 55_339_456
@@ -194,6 +196,7 @@ def materialize(
             env,
             "venv_create_failed",
         )
+        _strip_uv_venv_files(venv)
         venv_python = _venv_python(venv)
         _run(
             [
@@ -432,6 +435,15 @@ def _inspect_wheel(entry: WheelInventoryEntry, grant: BlobGrant) -> _InspectedWh
             members = archive.infolist()
             if len(members) > MAX_WHEEL_MEMBERS:
                 raise EnvironmentRefusal("wheel_member_cap", entry.filename)
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise EnvironmentRefusal("wheel_member_duplicate", entry.filename)
+            expanded = sum(member.file_size for member in members)
+            if expanded > min(MAX_WHEEL_EXPANDED_BYTES, entry.length * MAX_WHEEL_EXPANSION):
+                raise EnvironmentRefusal(
+                    "wheel_expansion_cap",
+                    f"{entry.filename}: {expanded} expanded bytes from {entry.length}",
+                )
             for member in members:
                 pure = PurePosixPath(member.filename)
                 if pure.is_absolute() or ".." in pure.parts or "\\" in member.filename:
@@ -485,6 +497,8 @@ def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> di
     if len(sites) != 1:
         raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
     site = sites[0]
+    if site.is_symlink():
+        raise EnvironmentRefusal("installed_unowned_symlink", str(site))
     measured: dict[str, tuple[str, Path]] = {}
     for dist_info in site.glob("*.dist-info"):
         metadata_path = dist_info / "METADATA"
@@ -502,6 +516,7 @@ def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> di
             f"extra={sorted(set(measured) - set(expected))}",
         )
     records: dict[str, str] = {}
+    owned: set[Path] = set()
     for name, (expected_version, expected_record_digest) in expected.items():
         version, dist_info = measured[name]
         if version != expected_version:
@@ -509,11 +524,19 @@ def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> di
                 "installed_version_mismatch", f"{name}: {version!r} != {expected_version!r}"
             )
         record = dist_info / "RECORD"
-        _verify_record(venv, site, record)
+        distribution_owned = _verify_record(venv, site, record)
+        if duplicate := owned & distribution_owned:
+            raise EnvironmentRefusal("installed_record_duplicate_ownership", str(min(duplicate)))
+        owned.update(distribution_owned)
         record_digest = _hash_file(record)
         if expected_record_digest and record_digest != expected_record_digest:
             raise EnvironmentRefusal("installed_record_digest_mismatch", name)
         records[name] = record_digest
+    for path in site.rglob("*"):
+        if path.is_symlink():
+            raise EnvironmentRefusal("installed_unowned_symlink", str(path))
+        if path.is_file() and path.resolve() not in owned:
+            raise EnvironmentRefusal("installed_unrecorded_file", str(path))
     return records
 
 
@@ -553,7 +576,19 @@ def _strip_installer_paths(venv: Path) -> None:
             raise EnvironmentRefusal("installed_path_metadata_cleanup_failed", str(exc)) from exc
 
 
-def _verify_record(venv: Path, site: Path, record: Path) -> None:
+def _strip_uv_venv_files(venv: Path) -> None:
+    """Remove uv's unowned bootstrap before wheels can claim either path."""
+
+    sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
+    if len(sites) != 1:
+        raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
+    for name in ("_virtualenv.pth", "_virtualenv.py"):
+        path = sites[0] / name
+        if path.exists():
+            path.unlink()
+
+
+def _verify_record(venv: Path, site: Path, record: Path) -> set[Path]:
     if not record.is_file():
         raise EnvironmentRefusal("installed_record_missing", str(record))
     root = venv.resolve()
@@ -562,7 +597,10 @@ def _verify_record(venv: Path, site: Path, record: Path) -> None:
         for row in csv.reader(stream):
             if len(row) != 3 or not row[0]:
                 raise EnvironmentRefusal("installed_record_invalid", f"{record}: {row!r}")
-            path = (site / row[0]).resolve()
+            unresolved = site / row[0]
+            if unresolved.is_symlink():
+                raise EnvironmentRefusal("installed_record_symlink", row[0])
+            path = unresolved.resolve()
             if path in seen or (path != root and root not in path.parents):
                 raise EnvironmentRefusal("installed_record_path", row[0])
             seen.add(path)
@@ -578,6 +616,7 @@ def _verify_record(venv: Path, site: Path, record: Path) -> None:
             actual = base64.urlsafe_b64encode(_hash_raw(path)).rstrip(b"=").decode()
             if actual != encoded or not row[2].isdigit() or path.stat().st_size != int(row[2]):
                 raise EnvironmentRefusal("installed_record_mismatch", row[0])
+    return seen
 
 
 def _receipt(

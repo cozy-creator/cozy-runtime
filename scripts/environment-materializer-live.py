@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import warnings
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -81,6 +82,26 @@ def inventory(path: Path, distribution: str, version: str, owner: str) -> WheelI
 
 def grant(path: Path, entry: WheelInventoryEntry) -> BlobGrant:
     return BlobGrant(entry.digest, entry.length, path)
+
+
+def duplicate_member_wheel(source: Path, root: Path) -> Path:
+    root.mkdir()
+    path = root / source.name
+    shutil.copyfile(source, path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_DEFLATED) as wheel:
+            wheel.writestr("exact_dependency/__init__.py", b"VALUE = 'duplicate'\n")
+    return path
+
+
+def expanding_wheel(source: Path, root: Path) -> Path:
+    root.mkdir()
+    path = root / source.name
+    shutil.copyfile(source, path)
+    with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_DEFLATED) as wheel:
+        wheel.writestr("expansion-payload", b"\0" * (2 << 20))
+    return path
 
 
 def refusal(code: str, call: object) -> None:
@@ -221,6 +242,52 @@ def main() -> None:
                 uv=uv,
             ),
         )
+        duplicate_path = duplicate_member_wheel(dependency_path, root / "duplicate-cas")
+        duplicate = inventory(duplicate_path, "exact-dependency", "1.2.3", "wheelhouse")
+        refusal(
+            "wheel_member_duplicate",
+            lambda: materialize(
+                replace(
+                    source,
+                    wheels=(duplicate, project),
+                    grants=(grant(duplicate_path, duplicate), source.grants[1]),
+                ),
+                root / "duplicate",
+                uv=uv,
+            ),
+        )
+        expanding_path = expanding_wheel(dependency_path, root / "expanding-cas")
+        expanding = inventory(expanding_path, "exact-dependency", "1.2.3", "wheelhouse")
+        refusal(
+            "wheel_expansion_cap",
+            lambda: materialize(
+                replace(
+                    source,
+                    wheels=(expanding, project),
+                    grants=(grant(expanding_path, expanding), source.grants[1]),
+                ),
+                root / "expanding",
+                uv=uv,
+            ),
+        )
+        site = next((warm.generation / "venv" / "lib").glob("python*/site-packages"))
+        site_mode = site.stat().st_mode
+        site.chmod(site_mode | stat.S_IWUSR)
+        unrecorded = site / "planted_unrecorded.py"
+        unrecorded.write_text("VALUE = 'unrecorded'\n")
+        unrecorded.chmod(unrecorded.stat().st_mode & ~0o222)
+        site.chmod(site_mode)
+        refusal(
+            "installed_unrecorded_file",
+            lambda: verify_generation(
+                warm.generation,
+                receipt_digest=warm.receipt_digest,
+                environment_spec_digest=source.environment_spec_digest,
+            ),
+        )
+        site.chmod(site_mode | stat.S_IWUSR)
+        unrecorded.unlink()
+        site.chmod(site_mode)
         installed_file = warm.generation / "venv" / "lib"
         installed_file = next(
             installed_file.glob("python*/site-packages/exact_project/__init__.py")
@@ -238,7 +305,8 @@ def main() -> None:
         )
         print(
             "cr-027 live: two cold installs + warm receipt reuse + isolated imports; "
-            "missing/extra/corrupt/renamed/tampered bytes refused; "
+            "missing/extra/corrupt/renamed/duplicate/expanded/unrecorded/tampered "
+            "bytes refused; "
             f"receipt={cold.receipt_digest}"
         )
     finally:
