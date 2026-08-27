@@ -40,6 +40,8 @@ class ProjectedVar:
 
 # ERASE pass: every child env name starting with one of these prefixes is removed before
 # imposition. Credential prefixes are here on purpose — the executor gets no tokens.
+# Class-B erase rule — tracker-v2/spawn-allowlists.md (#616.d) is the authority; keep
+# equal to that row.
 ERASED_PREFIXES: tuple[str, ...] = (
     "COZY_",
     "CUDA_",
@@ -61,7 +63,9 @@ FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
 EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
-# runtime refuses to project anything not listed here.
+# runtime refuses to project anything not listed here. Class-B impose vocabulary
+# (tracker-v2/spawn-allowlists.md #616.d; per-tool superset — COZY_BOOTSTRAP_CREDENTIAL
+# is the creator->worker leg's imposition, never the executor's).
 CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     ProjectedVar(
         "CUDA_VISIBLE_DEVICES",

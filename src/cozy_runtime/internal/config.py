@@ -88,7 +88,8 @@ class RuntimeConfig:
     Mutually exclusive with `bootstrap_credential`: two credential authorities over one
     door is an ambiguity, not a fallback, and it refuses here."""
     child_base_env: tuple[tuple[str, str], ...] = ()
-    """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal).
+    """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal;
+    class B of tracker-v2/spawn-allowlists.md #616.d).
 
     The erase happens here because this is the one module permitted to read the process
     environment: `internal/spawn.py` imposes the reviewed allowlist on top of this frozen
@@ -140,6 +141,8 @@ ADAPTER_ENV = {
 # The adapter starts one current control worker. Provider/image inheritance is not a config
 # channel: only these non-secret platform values survive, then the adapter imposes the two
 # worker-owned COZY paths explicitly. In particular RUNPOD/AWS/HF variables never cross.
+# Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d); keep equal to that
+# row. PATH is deliberately absent: every pod exec is by absolute path.
 ADAPTER_CHILD_PLATFORM_ENV = {
     "LANG",
     "LC_ALL",

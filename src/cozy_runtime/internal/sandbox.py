@@ -128,7 +128,12 @@ def bound(*, address_bytes: int, cpu_seconds: int) -> None:
 
 
 def child_environment(base: dict[str, str]) -> dict[str, str]:
-    """The environment a derivation child gets: no accelerator, no hub credentials."""
+    """The environment a derivation child gets: no accelerator, no hub credentials.
+
+    Class C of tracker-v2/spawn-allowlists.md (#616.d): the class-B result with
+    credential prefixes stripped, then the four offline impositions. Keep equal to
+    that row.
+    """
     env = {
         k: v
         for k, v in base.items()

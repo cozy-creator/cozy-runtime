@@ -155,6 +155,8 @@ def fence_package_imports() -> list[str]:
 
 
 def fence_env_authority() -> list[str]:
+    # The one env read the fence protects builds the class-B/C/D child envs of
+    # tracker-v2/spawn-allowlists.md (#616.d).
     bad: list[str] = []
     for path in py_files():
         if path == ENV_AUTHORITY:

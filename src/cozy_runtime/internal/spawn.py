@@ -1,5 +1,8 @@
 """Executor spawn: the env SEAL and the exec-first launch.
 
+Class B of tracker-v2/spawn-allowlists.md (#616.d); `internal/child_env.py` holds the
+erase/impose tables that must stay equal to that row.
+
 The seal is ERASE -> IMPOSE -> SEAL and it completes BEFORE the child's CUDA init, because
 the allocator reads its environment exactly once and a late imposition is a silent no-op
 (pgw#1640). Here the three steps are three different places, on purpose:
