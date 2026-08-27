@@ -12,16 +12,27 @@ import csv
 import hashlib
 import importlib.metadata
 import io
-import json
 import platform
 import stat
 import sys
 import zipfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+
+from proof_data import ProofFailure
+from proof_data import canonical as _canonical
+from proof_data import digest as _digest
+from proof_data import inventory as _inventory
+from proof_data import json_file as _json
+from proof_data import parse_canonical as _parse_canonical
+from proof_data import parse_json as _parse_json
+from proof_data import read_json as _read_json
+from proof_data import ref as _ref
+from proof_data import require as _require
+from proof_data import wheel as _wheel
+from proof_data import write as _write
 
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -29,21 +40,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 ENVIRONMENT_REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 MODEL_REQUEST_FORMAT = "cozy.runtime.ModelConstructionProofRequest/1"
 STATE_FORMAT = "cozy.runtime.proof.ModelContractState/1"
-
-
-class ProofFailure(RuntimeError):
-    """The observed public proof evidence did not match the contract."""
-
-
-@dataclass(frozen=True, slots=True)
-class WheelInventoryEntry:
-    distribution: str
-    version: str
-    filename: str
-    digest: str
-    length: int
-    tags: tuple[str, ...]
-    owner: str
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -104,12 +100,9 @@ def _prepare(args: argparse.Namespace) -> None:
         _pack_installed(wheels, name)
         for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
     ]
-    project = _inventory(endpoint_path, "project")
+    project = _inventory(endpoint_path)
     resolved_pairs = sorted(
-        [
-            (_inventory(path, "bundle"), path)
-            for path in (runtime_path, torch_path, *dependency_paths)
-        ],
+        [(_inventory(path), path) for path in (runtime_path, torch_path, *dependency_paths)],
         key=lambda pair: pair[0].distribution,
     )
     target = _target()
@@ -334,26 +327,6 @@ def _pack_installed(root: Path, distribution: str) -> Path:
     return path
 
 
-def _inventory(path: Path, owner: str) -> WheelInventoryEntry:
-    with zipfile.ZipFile(path) as archive:
-        metadata_name = next(
-            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
-        )
-        wheel_name = next(name for name in archive.namelist() if name.endswith(".dist-info/WHEEL"))
-        metadata = BytesParser().parsebytes(archive.read(metadata_name))
-        wheel = BytesParser().parsebytes(archive.read(wheel_name))
-    raw = path.read_bytes()
-    return WheelInventoryEntry(
-        distribution=str(metadata["Name"]),
-        version=str(metadata["Version"]),
-        filename=path.name,
-        digest=_digest(raw),
-        length=len(raw),
-        tags=tuple(sorted(wheel.get_all("Tag") or [])),
-        owner=owner,
-    )
-
-
 def _target() -> dict[str, str]:
     libc_name, libc_version = platform.libc_ver()
     return {
@@ -363,21 +336,6 @@ def _target() -> dict[str, str]:
         "os_arch": "linux/amd64",
         "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
     }
-
-
-def _wheel(entry: WheelInventoryEntry) -> dict[str, Any]:
-    return {
-        "digest": entry.digest,
-        "distribution": entry.distribution,
-        "filename": entry.filename,
-        "length": entry.length,
-        "tags": list(entry.tags),
-        "version": entry.version,
-    }
-
-
-def _ref(raw: bytes) -> dict[str, Any]:
-    return {"digest": _digest(raw), "length": len(raw)}
 
 
 def _record_hash(raw: bytes) -> str:
@@ -394,68 +352,12 @@ def _zip(path: Path, files: Mapping[str, bytes]) -> None:
             wheel.writestr(info, raw)
 
 
-def _json(path: Path, value: object) -> Path:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True))
-    return path.resolve()
-
-
-def _read_json(path: Path) -> object:
-    return json.loads(path.read_text())
-
-
-def _write(path: Path, raw: bytes) -> Path:
-    path.write_bytes(raw)
-    return path.resolve()
-
-
 def _tree(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
-
-
-def _digest(raw: bytes) -> str:
-    return "sha256:" + hashlib.sha256(raw).hexdigest()
-
-
-def _canonical(value: object) -> bytes:
-    """Encode the proof's integer/string-only documents without Runtime's writer."""
-
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-
-
-def _parse_json(raw: bytes) -> object:
-    def pairs(rows: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in rows:
-            if key in result:
-                raise ProofFailure(f"duplicate JSON key: {key}")
-            result[key] = value
-        return result
-
-    try:
-        return json.loads(raw, object_pairs_hook=pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProofFailure(f"invalid JSON: {exc}") from exc
-
-
-def _parse_canonical(raw: bytes) -> object:
-    value = _parse_json(raw)
-    _require(_canonical(value) == raw, "document is not its own canonical JSON encoding")
-    return value
-
-
-def _require(condition: bool, detail: str) -> None:
-    if not condition:
-        raise ProofFailure(detail)
 
 
 if __name__ == "__main__":

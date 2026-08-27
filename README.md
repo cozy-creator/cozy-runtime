@@ -146,8 +146,7 @@ refuses. `describe` itself is read-only; `--write-descriptor` is the only writer
     uv run python scripts/conformance.py # every public Context/service fact has a live writer
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
-    uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof
-    uv run python scripts/environment-proof-live.py # th-046 proof-seat cold/rebuild/red journey
+    proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
     proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
@@ -158,6 +157,14 @@ and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. 
 fake Torch packages live as ordinary, linted projects under `proofs/fixtures/`. They exercise the
 weightless control plane only; this proof makes no claim about real Torch, GPU execution, model
 loading, or output quality.
+
+The environment proof likewise builds and installs the exact Runtime wheel before invoking its
+public command from `/` with `PYTHONPATH` unset and offline process settings. Normal fixture
+packages replace generated source strings. The public path proves independent builds, exact
+receipt identity, isolated imports, atomic publication, and bounded refusals. The proof seat
+requires a fresh root by contract, so receipt-keyed reuse and installed-tree tamper refusals live
+in the explicitly private `proofs/internal/environment_materializer.py` check rather than
+masquerading as CLI behavior.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
