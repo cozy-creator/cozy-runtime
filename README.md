@@ -146,10 +146,16 @@ fresh endpoint is `--check`-clean out of the box.
     uv run python scripts/bench.py       # time + memory benchmarks
     uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof
     uv run python scripts/environment-proof-live.py # th-046 proof-seat cold/rebuild/red journey
-    uv run python scripts/model-contract-proof-live.py # installed MCC cold/rebuild/red proof
+    proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
     uv run --extra media python scripts/media-stream-live.py # cr-029 2/8-shot RSS + kill cleanup
+
+The model-contract proof builds a Runtime wheel, installs it into a fresh driver environment,
+and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its endpoint and
+fake Torch packages live as ordinary, linted projects under `proofs/fixtures/`. They exercise the
+weightless control plane only; this proof makes no claim about real Torch, GPU execution, model
+loading, or output quality.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
