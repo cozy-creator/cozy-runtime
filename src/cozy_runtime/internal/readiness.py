@@ -23,6 +23,7 @@ from cozy_runtime.internal.materialize_launch import LaunchRefusal
 from cozy_runtime.protocol import SCHEMA_DIGEST_RAW, WIRE_MINOR
 
 MAX_HTTP_PROOF_BYTES = 64 << 10
+WORKER_TLS_SERVER_NAME = "cozy-worker"
 
 
 class RuntimeGPU(TypedDict):
@@ -49,7 +50,7 @@ def pod_boot_id(path: Path) -> str:
     return value
 
 
-def certificate(path: Path) -> tuple[bytes, str]:
+def certificate(path: Path) -> bytes:
     try:
         pem = path.read_text(encoding="ascii")
         der = ssl.PEM_cert_to_DER_cert(pem)
@@ -57,12 +58,14 @@ def certificate(path: Path) -> tuple[bytes, str]:
         # growing an X.509 parser merely to supply gRPC's target-name override.
         decoded = ssl._ssl._test_decode_cert(str(path))  # type: ignore[attr-defined]
         sans = decoded.get("subjectAltName", ())
-        ips = [value for kind, value in sans if kind == "IP Address"]
     except (OSError, UnicodeError, ValueError, ssl.SSLError) as exc:
         raise LaunchRefusal("tls_certificate_invalid", "certificate handoff is unreadable") from exc
-    if not der or len(ips) != 1:
-        raise LaunchRefusal("tls_certificate_invalid", "certificate requires exactly one IP SAN")
-    return der, ips[0]
+    if not der or tuple(sans) != (("DNS", WORKER_TLS_SERVER_NAME),):
+        raise LaunchRefusal(
+            "tls_certificate_invalid",
+            f"certificate requires only DNS SAN {WORKER_TLS_SERVER_NAME}",
+        )
+    return der
 
 
 def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, deadline: int) -> list[RuntimeGPU]:
@@ -131,9 +134,7 @@ def wait_worker_listener(root: Path, process: subprocess.Popen[bytes], *, deadli
     raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
 
 
-def prove_worker_foreign_refusal(
-    port: int, certificate_pem: bytes, certificate_ip: str, *, deadline: int
-) -> None:
+def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline: int) -> None:
     """Observe a current-schema Claim rejected specifically for a foreign credential."""
 
     address = f"127.0.0.1:{port}"
@@ -142,8 +143,8 @@ def prove_worker_foreign_refusal(
         address,
         credentials,
         options=(
-            ("grpc.ssl_target_name_override", certificate_ip),
-            ("grpc.default_authority", certificate_ip),
+            ("grpc.ssl_target_name_override", WORKER_TLS_SERVER_NAME),
+            ("grpc.default_authority", WORKER_TLS_SERVER_NAME),
         ),
     )
     try:
@@ -171,9 +172,7 @@ def prove_worker_foreign_refusal(
         raise LaunchRefusal("worker_foreign_credential_unproven", "negative Claim was not refused")
 
 
-def prove_media_foreign_refusal(
-    port: int, expected_der: bytes, certificate_ip: str, *, deadline: int
-) -> None:
+def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int) -> None:
     """Observe the media listener's authenticated health route refuse a foreign bearer."""
 
     timeout = _remaining(deadline)
@@ -184,7 +183,7 @@ def prove_media_foreign_refusal(
     try:
         with (
             socket.create_connection(("127.0.0.1", port), timeout=timeout) as raw,
-            context.wrap_socket(raw, server_hostname=certificate_ip) as connection,
+            context.wrap_socket(raw, server_hostname=WORKER_TLS_SERVER_NAME) as connection,
         ):
             connection.settimeout(_remaining(deadline))
             if connection.getpeercert(binary_form=True) != expected_der:
@@ -218,7 +217,6 @@ def receipt_payload(
     spec: Mapping[str, Any],
     provision_spec_digest: str,
     provision_bundle_digest: str,
-    provider_pod_id: str,
     pod_boot_id_value: str,
     certificate_der: bytes,
     installed_receipt_digest: str,
@@ -269,7 +267,6 @@ def receipt_payload(
             "network_cache_degradations": degradations,
             "observed_renter_token_sha256": spec["renter_token_sha256"],
             "pod_boot_id": pod_boot_id_value,
-            "provider_pod_id": provider_pod_id,
             "provision_bundle_digest": provision_bundle_digest,
             "provision_spec_digest": provision_spec_digest,
             "rental_id": spec["rental_id"],

@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +40,33 @@ class ObjectSetVector(TypedDict):
 
 def ref(raw: bytes) -> Ref:
     return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
+
+
+def mint_certificate(root: Path, name: str, san: str) -> Path:
+    certificate, key = root / f"{name}.crt", root / f"{name}.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=cozy-worker",
+            "-addext",
+            f"subjectAltName={san}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return certificate
 
 
 def main() -> int:
@@ -126,7 +154,6 @@ def main() -> int:
             "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH": str(root / "receipt.json"),
             "COZY_ADAPTER_WORKER_INTERNAL_PORT": "43100",
             "COZY_ADAPTER_MEDIA_INTERNAL_PORT": "43101",
-            "COZY_ADAPTER_PROVIDER_POD_ID": "pod-live",
             "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON": f'["{token}"]',
             "COZY_ADAPTER_READINESS_DEADLINE_UNIX": str(int(time.time()) + 60),
         }
@@ -136,6 +163,12 @@ def main() -> int:
             assert exc.name == "adapter_config"
         else:
             raise AssertionError("PYTHONPATH source injection was accepted")
+        try:
+            read_adapter_config({**env, "COZY_ADAPTER_PROVIDER_POD_ID": "retired-provider-id"})
+        except ConfigError as exc:
+            assert exc.name == "adapter_config" and "unknown" in exc.message
+        else:
+            raise AssertionError("retired provider identity entered the adapter handoff")
         config = read_adapter_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
@@ -529,11 +562,19 @@ def main() -> int:
         boot_id = base64.urlsafe_b64encode(boot_raw).rstrip(b"=").decode()
         config.pod_boot_id_path.write_text(boot_id + "\n")
         assert readiness.pod_boot_id(config.pod_boot_id_path) == boot_id
+        fixed_certificate = mint_certificate(root, "fixed-worker", "DNS:cozy-worker")
+        assert readiness.certificate(fixed_certificate)
+        ip_certificate = mint_certificate(root, "provider-ip", "IP:127.0.0.1")
+        try:
+            readiness.certificate(ip_certificate)
+        except LaunchRefusal as exc:
+            assert exc.code == "tls_certificate_invalid"
+        else:
+            raise AssertionError("provider IP SAN was accepted as worker identity")
         payload = readiness.receipt_payload(
             spec=spec,
             provision_spec_digest=str(spec_ref["digest"]),
             provision_bundle_digest=str(bundle_ref["digest"]),
-            provider_pod_id="pod-live",
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
             installed_receipt_digest="sha256:" + "5" * 64,
@@ -560,6 +601,8 @@ def main() -> int:
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
         assert receipt["artifact_sources"]["local"] == {"bytes": 36, "objects": 2}
+        assert receipt["acquisition_attempt_id"] == "attempt-live"
+        assert "provider_pod_id" not in receipt
         readiness.publish(config.receipt_payload_path, payload)
         assert config.receipt_payload_path.read_bytes() == payload
         readiness.publish(config.receipt_payload_path, payload)
