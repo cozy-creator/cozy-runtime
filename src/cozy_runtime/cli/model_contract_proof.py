@@ -35,7 +35,6 @@ from cozy_runtime.internal.exits import Exit
 
 REQUEST_FORMAT = "cozy.runtime.ModelConstructionProofRequest/1"
 INDEX_FORMAT = "cozy.runtime.ModelConstructionProof/1"
-CHILD_FORMAT = "cozy.runtime.ModelConstructionDerivation/1"
 INDEX_NAME = "model-construction-proof.json"
 CONTRACTS_DIR = "contracts"
 RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
@@ -118,16 +117,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         request_path = _cli_input_path(args[0])
         output = _cli_output_path(args[1])
         request = _read_request(request_path)
-        installed = _verify_installed_generation(request)
-        if output.is_relative_to(installed.generation):
+        generation, python = _installed_paths()
+        if output.is_relative_to(generation):
             raise CliError(
                 "model_contract_output_invalid",
                 "the proof output must be outside the immutable environment generation",
                 "choose a separate fresh output directory owned by the build seat",
                 Exit.validation,
             )
-        response = _run_child(installed.python, request_path)
-        index, documents = _decode_child(response, request, installed)
+        response = _run_child(python, request_path)
+        index, documents = _decode_child(response, request)
         index_bytes = canonical.write(index)
         _publish(output, index_bytes, documents)
         print(
@@ -345,13 +344,7 @@ def _document_bytes(path: Path, name: str) -> bytes:
 
 
 def _verify_installed_generation(request: ProofRequest) -> environment.InstalledEnvironment:
-    prefix = Path(sys.prefix).absolute()
-    if prefix.name != "venv":
-        raise ProofRefusal(
-            "model_contract_environment_unbound",
-            f"sys.prefix {prefix} is not a materializer generation's venv",
-        )
-    generation = prefix.parent
+    generation, _ = _installed_paths()
     installed = environment.verify_generation(
         generation,
         receipt_digest=request.installed_environment_receipt.digest,
@@ -375,13 +368,20 @@ def _verify_installed_generation(request: ProofRequest) -> environment.Installed
     return installed
 
 
+def _installed_paths() -> tuple[Path, Path]:
+    prefix = Path(sys.prefix).resolve()
+    if prefix.name != "venv":
+        raise ProofRefusal(
+            "model_contract_environment_unbound",
+            f"sys.prefix {prefix} is not a materializer generation's venv",
+        )
+    generation = prefix.parent
+    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return generation, python
+
+
 def _run_child(python: Path, request: Path) -> dict[str, Any]:
-    base = {
-        key: os.environ[key]
-        for key in ("LANG", "LC_ALL", "LD_LIBRARY_PATH", "PATH", "TZ")
-        if key in os.environ
-    }
-    child_env = sandbox.child_environment(base)
+    child_env = sandbox.child_environment({})
     child_env.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -600,7 +600,6 @@ def _derive_all(
             }
             for digest, raw in sorted(documents.items())
         ],
-        "format": CHILD_FORMAT,
         "functions": functions,
     }
 
@@ -660,12 +659,11 @@ def _emit_child(value: Mapping[str, Any]) -> None:
 def _decode_child(
     response: Mapping[str, Any],
     request: ProofRequest,
-    installed: environment.InstalledEnvironment,
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
-    if set(response) != {"application", "contracts", "format", "functions"}:
+    if set(response) != {"application", "contracts", "functions"}:
         raise ProofRefusal("model_contract_child_invalid", "child result has an open field set")
-    if response["format"] != CHILD_FORMAT or not isinstance(response["application"], str):
-        raise ProofRefusal("model_contract_child_invalid", "child result format/application")
+    if not isinstance(response["application"], str):
+        raise ProofRefusal("model_contract_child_invalid", "child result application")
     rows = response["contracts"]
     if not isinstance(rows, list):
         raise ProofRefusal("model_contract_child_invalid", "contracts is not an array")
@@ -707,10 +705,7 @@ def _decode_child(
         "environment_spec_digest": request.environment_spec_digest,
         "format": INDEX_FORMAT,
         "functions": functions,
-        "installed_environment_receipt": {
-            "digest": installed.receipt_digest,
-            "length": len(installed.receipt_bytes),
-        },
+        "installed_environment_receipt": request.installed_environment_receipt.render(),
         "project_wheel_digest": request.project_wheel_digest,
     }
     return index, documents

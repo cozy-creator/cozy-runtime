@@ -462,7 +462,11 @@ class Executor:
         artifact = Artifact(
             next(v for v in offered if v.name == plan.variant).snapshot,
             topology_of(rows),
-            Config(config_document, "unet.config"),
+            Config(
+                config_document,
+                "unet.config",
+                document_digest=construction.config_digest,
+            ),
             # CUSTODY is a BINDING fact, not a runtime constant: a checkpoint that came
             # through the border is canonical and a serve-time extra key is drift, while a
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
