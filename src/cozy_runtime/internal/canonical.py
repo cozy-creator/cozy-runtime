@@ -8,8 +8,9 @@ duplicate-key refusal, lowercase `sha256:` digests, and STORED bytes are canonic
 
 Recorded divergence from tensorfs's PROFILE (not from RFC 8785): tensorfs restricts its own
 header codec to integers, printable ASCII and no `null`. A descriptor legitimately carries
-float bounds (`le=20.0`), `None` defaults and non-ASCII literals, so this writer implements
-the full JCS rules for those three instead of the restriction. The seam is exercised live:
+float bounds (`le=20.0`), `None` defaults and non-ASCII literals, so this writer admits
+those three while retaining the I-JSON safe-number magnitude for every numeric value. The
+seam is exercised live:
 `scripts/verify.py` runs this codec over tensorfs's own `vectors/cases/canonical` corpus and
 reports, per case, whether the refusal is shared or profile-only.
 
@@ -29,8 +30,8 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
-#: I-JSON interoperable integer range. An integer outside it refuses rather than becoming a
-#: float in some other language's reader.
+#: I-JSON interoperable numeric range. A value outside it refuses regardless of whether its
+#: source token used integer, decimal, or exponent notation.
 INT_MAX = (1 << 53) - 1
 INT_MIN = -INT_MAX
 
@@ -176,6 +177,11 @@ def _number(value: float) -> str:
     """
     if math.isnan(value) or math.isinf(value):
         raise CanonicalError("number_range", f"{value!r} has no JSON spelling")
+    if abs(value) > INT_MAX:
+        raise CanonicalError(
+            "number_range",
+            f"{value!r} is outside the interoperable numeric range +/-{INT_MAX}",
+        )
     if value == 0:
         return "0"
     sign, raw, exponent = Decimal(repr(value)).as_tuple()
@@ -207,6 +213,8 @@ def parse(data: bytes) -> Json:
             data.decode("utf-8"),
             object_pairs_hook=_pairs,
             parse_constant=_no_constants,
+            parse_int=_parse_int,
+            parse_float=_parse_float,
         )
     except UnicodeDecodeError as exc:
         raise CanonicalError("malformed_json", f"not UTF-8: {exc}") from exc
@@ -235,6 +243,20 @@ def _pairs(pairs: list[tuple[str, Json]]) -> dict[str, Json]:
 
 def _no_constants(name: str) -> Json:
     raise CanonicalError("number_range", f"{name} is not admitted")
+
+
+def _parse_int(token: str) -> int:
+    value = int(token)
+    if not INT_MIN <= value <= INT_MAX:
+        raise CanonicalError("number_range", f"{token} is outside the interoperable numeric range")
+    return value
+
+
+def _parse_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value) or abs(value) > INT_MAX:
+        raise CanonicalError("number_range", f"{token} is outside the interoperable numeric range")
+    return value
 
 
 # --------------------------------------------------------------------------- projection

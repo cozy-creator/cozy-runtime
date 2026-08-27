@@ -447,16 +447,73 @@ def fence_canonical_numbers() -> list[str]:
     from cozy_runtime.author import canonical_json
 
     bad: list[str] = []
+    safe = (1 << 53) - 1
+    admitted = refused = 0
     path = ROOT / "vectors" / "es6-numbers.txt"
     rows = path.read_text().strip().splitlines()
     for line in rows:
         raw, expected = line.split(" ", 1)
         value = struct.unpack("<d", bytes.fromhex(raw))[0]
-        got = canonical_json.encode(value).decode()
-        if got != expected:
+        try:
+            got = canonical_json.encode(value).decode()
+        except ValueError:
+            if abs(value) <= safe:
+                bad.append(f"{raw}: in-range {value!r} refused")
+            else:
+                refused += 1
+            continue
+        admitted += 1
+        if abs(value) > safe:
+            bad.append(f"{raw}: out-of-profile {value!r} was admitted as {got!r}")
+        elif got != expected:
             bad.append(f"{raw}: wrote {got!r}, ES6 says {expected!r}")
     if not rows:
         bad.append(f"{path} is empty — a vector file that vanishes must not read green")
+    if admitted == 0 or refused == 0:
+        bad.append(f"numeric profile did not exercise both outcomes: {admitted=} {refused=}")
+
+    in_range = (
+        b'{"v":9007199254740991}',
+        b'{"v":9007199254740991.0}',
+        b'{"v":9.007199254740991e15}',
+        b'{"v":-9007199254740991}',
+        b'{"v":-9007199254740991.0}',
+        b'{"v":-9.007199254740991e15}',
+    )
+    identities = set()
+    for source in in_range:
+        try:
+            canonical_json.decode(source)
+            normalized = canonical_json.normalize(source)
+            if canonical_json.normalize(normalized) != normalized:
+                bad.append(f"{source!r}: normalization is not idempotent")
+            identities.add(canonical_json.digest_bytes(source))
+        except ValueError as exc:
+            bad.append(f"{source!r}: safe boundary spelling refused: {exc}")
+    if len(identities) != 2:
+        bad.append(f"safe +/- boundary twins produced {len(identities)} identities, want 2")
+
+    out_of_range = (
+        b'{"v":9007199254740992}',
+        b'{"v":9007199254740992.0}',
+        b'{"v":9.007199254740992e15}',
+        b'{"v":-9007199254740992}',
+        b'{"v":-9007199254740992.0}',
+        b'{"v":-9.007199254740992e15}',
+        b'{"v":1000000000000000000000}',
+        b'{"v":1e21}',
+    )
+    for source in out_of_range:
+        for operation in (
+            canonical_json.decode,
+            canonical_json.normalize,
+            canonical_json.digest_bytes,
+        ):
+            try:
+                operation(source)
+            except ValueError:
+                continue
+            bad.append(f"{source!r}: {operation.__name__} admitted an out-of-profile value")
     return bad[:10]
 
 
