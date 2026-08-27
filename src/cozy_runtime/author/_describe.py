@@ -152,6 +152,7 @@ def check(surface: Surface) -> Surface:
     assert_declaration_shape(surface.result_type)
     specs = feature_specs(surface.payload_type)
     _separation(surface)
+    _media_decode_bounds(surface)
 
     # A JOB's `gpu_count` is the override door's CANONICAL case (§1.2/§2): a floor is the
     # number of devices a materialization structurally requires, and a job that shards across
@@ -199,6 +200,39 @@ def check(surface: Surface) -> Surface:
     for binding in surface.model_bindings:
         _check_model(binding)
     return surface
+
+
+def _media_decode_bounds(surface: Surface) -> None:
+    """A decoder capability is useful only over explicitly expansion-bounded media.
+
+    Compressed bytes are already deployment- and field-bounded. Decode has a different
+    amplification factor, so requesting the service without binding every decodable media
+    field would make the most dangerous input the one field an endpoint forgot to annotate.
+    Refuse that endpoint at describe instead of offering a request-time unbounded overload.
+    """
+    if "media_decode" not in surface.capabilities:
+        return
+    reached = 0
+    for node in walk(surface.payload_type):
+        kind = _asset_kind(node.annotation)
+        if kind not in {"image", "video", "audio"}:
+            continue
+        reached += 1
+        bound = node.marker(AssetBound)
+        if not isinstance(bound, AssetBound) or bound.max_decoded_bytes is None:
+            raise ConformanceError(
+                f"{surface.name}.{node.path} is decoded by MediaDecoder but declares no "
+                "AssetBound(max_decoded_bytes=...): compressed and decoded size are separate "
+                "limits, and the decoder has no unbounded overload",
+                code="asset_decode_unbounded",
+                fields=[node.path],
+            )
+    if not reached:
+        raise ConformanceError(
+            f"{surface.name} requests MediaDecoder but its payload contains no image, video "
+            "or audio asset field",
+            code="unused_capability",
+        )
 
 
 def _check_model(binding: ModelBinding) -> None:

@@ -27,6 +27,7 @@ class Asset:
 
     __slots__ = (
         "_attempt",
+        "_input_id",
         "_local",
         "_max_decoded_bytes",
         "digest",
@@ -53,6 +54,7 @@ class Asset:
         self.digest = digest
         self._local = local
         self._attempt = attempt
+        self._input_id = ""
         self._max_decoded_bytes = 0
 
     def __repr__(self) -> str:
@@ -215,6 +217,7 @@ def bind(
     digest: str,
     length: int,
     max_decoded_bytes: int = 0,
+    input_id: str = "",
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -230,6 +233,7 @@ def bind(
         )
     asset._local = local
     asset._attempt = attempt
+    asset._input_id = input_id
     asset.media_type = media_type
     asset.size_bytes = length
     asset.digest = digest

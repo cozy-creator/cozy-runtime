@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Thirteen fences, each provable red by planting the violation (`scripts/redarm.py`):
+Fourteen fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import · package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
-  endpoint-owns-no-residency · reviewed-specs-exist
+  endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
 """
 
 from __future__ import annotations
@@ -44,7 +44,9 @@ AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec",)
 # The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
 # the same shape as torch in the harness — importing the author surface never pulls it, and
 # an absent wheel is the typed `encoder_unavailable` refusal, not an ImportError at import.
-AUTHOR_ALLOWED_LAZY = ("av",)
+AUTHOR_ALLOWED_LAZY: dict[str, frozenset[str]] = {
+    "av": frozenset({"_codec.py", "_decode.py"}),
+}
 
 ENV_AUTHORITY = SRC / "internal" / "config.py"
 CONFIG_SYMBOLS = ("RuntimeConfig", "read_config")
@@ -131,7 +133,11 @@ def fence_package_imports() -> list[str]:
                 and root not in stdlib
                 and root != "cozy_runtime"
                 and root not in AUTHOR_ALLOWED_THIRD_PARTY
-                and not (root in AUTHOR_ALLOWED_LAZY and root not in module_scope)
+                and not (
+                    root in AUTHOR_ALLOWED_LAZY
+                    and path.name in AUTHOR_ALLOWED_LAZY[root]
+                    and root not in module_scope
+                )
             ):
                 bad.append(f"{rel}: author surface may not import third-party {name}")
     return bad
@@ -294,6 +300,39 @@ def fence_endpoint_owns_no_residency() -> list[str]:
                     f"{path.relative_to(ROOT)}:{line}: endpoint code names {reached!r} — "
                     "residency is the runtime's, declared with @uses_components and "
                     "nothing else; an endpoint that can move bytes is a second policy"
+                )
+    return bad
+
+
+def fence_endpoint_owns_no_media_decode() -> list[str]:
+    """cr-012's one-decoder law: endpoint code consumes `MediaDecoder` values.
+
+    Opening a container, reaching the runtime's private spool path, or calling a library
+    path helper would create another fetch/decode authority with different bounds and clock
+    semantics. Those spellings are absent from endpoint/model code, not merely discouraged.
+    """
+    bad: list[str] = []
+    for path in endpoint_and_model_code():
+        tree = ast.parse(path.read_text())
+        rel = path.relative_to(ROOT)
+        for name in imports(tree):
+            if name == "av" or name.startswith("av.") or name == "PIL" or name.startswith("PIL."):
+                bad.append(
+                    f"{rel}: endpoint code imports {name!r} — hydrated media decodes only "
+                    "through the Runtime-owned MediaDecoder"
+                )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if node.attr == "_local":
+                bad.append(
+                    f"{rel}:{node.lineno}: endpoint code reaches Asset._local — verified "
+                    "input paths are Runtime-private"
+                )
+            elif node.attr == "from_file":
+                bad.append(
+                    f"{rel}:{node.lineno}: endpoint code calls from_file — a library path/URL "
+                    "decoder is a second media authority"
                 )
     return bad
 
@@ -573,6 +612,7 @@ FENCES = {
     "no-identifiers-in-endpoint-code": fence_no_identifiers,
     "timing-decides-nothing": fence_timing_decides_nothing,
     "endpoint-owns-no-residency": fence_endpoint_owns_no_residency,
+    "endpoint-owns-no-media-decode": fence_endpoint_owns_no_media_decode,
 }
 
 

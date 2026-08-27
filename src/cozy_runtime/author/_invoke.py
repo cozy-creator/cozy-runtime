@@ -34,6 +34,7 @@ import msgspec
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
+from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
@@ -515,6 +516,7 @@ def _hydrate(payload: object, inv: Invocation) -> None:
             digest=granted.digest,
             length=granted.length,
             max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
+            input_id=input_id,
         )
 
 
@@ -578,6 +580,11 @@ def _service(param: Param, attempt: Attempt, ctx: Context, inv: Invocation) -> o
             return Checkpoints(attempt, inv.checkpoints)
         case "budget":
             return Budget(attempt, inv.budget)
+        case "media_decode":
+            return MediaDecoder(
+                attempt,
+                active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
+            )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
 

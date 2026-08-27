@@ -166,6 +166,12 @@ class AssetBound:
         """A declared type outside the KIND's own set is a conformance error at describe."""
         from cozy_runtime.author._media import KIND_MEDIA
 
+        if self.max_decoded_bytes is not None and kind not in {"image", "video", "audio"}:
+            raise ConformanceError(
+                f"AssetBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "
+                "ImageAsset, VideoAsset and AudioAsset have a MediaDecoder",
+                fields=["max_decoded_bytes"],
+            )
         allowed = KIND_MEDIA.get(kind, ())
         outside = [m for m in self.media_types if allowed and m not in allowed]
         if outside:

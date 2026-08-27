@@ -29,6 +29,7 @@ from typing import Any
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, GrantedInput
 from cozy_runtime.author._context import AdapterRef, Context, Device
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, DecodeLimits, MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
@@ -137,6 +138,16 @@ def fake_egress(respond: Callable[..., Any], attempt: Attempt | None = None) -> 
     """An `Egress` over a local responder. The real broker, allowlist and SSRF fail-closed
     path are cr-012's; this proves only injection and the capability."""
     return Egress(attempt or fake_attempt(), respond)
+
+
+def fake_media_decoder(
+    attempt: Attempt | None = None,
+    *,
+    active: bool = False,
+    limits: DecodeLimits = DEFAULT_DECODE_LIMITS,
+) -> MediaDecoder:
+    """The real decoder over a caller-controlled attempt, without a parallel fake codec."""
+    return MediaDecoder(attempt or fake_attempt(), active=lambda: active, limits=limits)
 
 
 def invoke_with_fakes(

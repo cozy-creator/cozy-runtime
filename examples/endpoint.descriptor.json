@@ -755,6 +755,14 @@
       ],
       "service": "Egress"
     },
+    "media_decode": {
+      "members": [
+        "decode_audio",
+        "decode_image",
+        "decode_video"
+      ],
+      "service": "MediaDecoder"
+    },
     "save": {
       "members": [
         "save_audio",
@@ -794,5 +802,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:572c7e6c9c7387d9e6c7b4d076248aad791d1bafb6a873447e04dd0b90853458"
+  "surface_digest": "sha256:40572caa9a1d88c229b4137a913317ab2b94dd392f3fa83914826d7022a5d28f"
 }
