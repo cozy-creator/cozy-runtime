@@ -505,7 +505,8 @@ def _hydrate(payload: object, inv: Invocation) -> None:
                 "never a location a request may name",
                 code="asset_ungranted",
             )
-        _check_input(asset, granted, bounds.get(_unindexed(input_id)), inv.max_input_bytes)
+        bound = bounds.get(_unindexed(input_id))
+        _check_input(asset, granted, bound, inv.max_input_bytes)
         bind(
             asset,
             local=granted.local,
@@ -513,6 +514,7 @@ def _hydrate(payload: object, inv: Invocation) -> None:
             media_type=granted.media_type,
             digest=granted.digest,
             length=granted.length,
+            max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
         )
 
 

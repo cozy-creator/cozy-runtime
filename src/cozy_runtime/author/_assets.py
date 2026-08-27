@@ -25,7 +25,15 @@ _UNBOUND: Final = ""
 class Asset:
     """A digest-identified immutable blob, referenced by an opaque handle."""
 
-    __slots__ = ("_attempt", "_local", "digest", "media_type", "ref", "size_bytes")
+    __slots__ = (
+        "_attempt",
+        "_local",
+        "_max_decoded_bytes",
+        "digest",
+        "media_type",
+        "ref",
+        "size_bytes",
+    )
 
     kind: ClassVar[str] = "file"
 
@@ -45,6 +53,7 @@ class Asset:
         self.digest = digest
         self._local = local
         self._attempt = attempt
+        self._max_decoded_bytes = 0
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.ref!r}, media_type={self.media_type!r})"
@@ -198,7 +207,14 @@ class GrantedInput:
 
 
 def bind(
-    asset: Asset, *, local: Path, attempt: str, media_type: str, digest: str, length: int
+    asset: Asset,
+    *,
+    local: Path,
+    attempt: str,
+    media_type: str,
+    digest: str,
+    length: int,
+    max_decoded_bytes: int = 0,
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -217,6 +233,7 @@ def bind(
     asset.media_type = media_type
     asset.size_bytes = length
     asset.digest = digest
+    asset._max_decoded_bytes = max_decoded_bytes
 
 
 def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:

@@ -166,6 +166,8 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
             bound: dict[str, Json] = {}
             if marker.max_bytes is not None:
                 bound["max_bytes"] = marker.max_bytes
+            if marker.max_decoded_bytes is not None:
+                bound["max_decoded_bytes"] = marker.max_decoded_bytes
             if marker.media_types:
                 bound["media_types"] = list(marker.media_types)
             doc["asset_bound"] = bound
