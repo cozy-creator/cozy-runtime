@@ -5,25 +5,36 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import tempfile
 import time
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
-from cozy_runtime.internal import canonical, contract, fill, provisioned, pull, readiness
+from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
     LaunchRefusal,
+    _materialize_objects,
     _provision_pair,
 )
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.protocol import SCHEMA_DIGEST
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 class Ref(TypedDict):
     digest: str
     length: int
+
+
+class ObjectSetVector(TypedDict):
+    name: str
+    document: dict[str, object]
+    canonical: str
+    digest: str
 
 
 def ref(raw: bytes) -> Ref:
@@ -115,6 +126,37 @@ def main() -> int:
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
+
+        vectors: dict[str, tuple[bytes, provisioned.ArtifactObjectSet]] = {}
+        for line in (ROOT / "vectors" / "artifact-object-sets.jsonl").read_text().splitlines():
+            vector = cast(ObjectSetVector, json.loads(line))
+            raw = canonical.write(vector["document"])
+            assert raw == vector["canonical"].encode()
+            assert "sha256:" + hashlib.sha256(raw).hexdigest() == vector["digest"]
+            vectors[vector["name"]] = (raw, provisioned.read_artifact_object_set(raw))
+        empty_bytes, empty_object_set = vectors["empty"]
+        assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
+        assert empty_object_set.roots == () and empty_object_set.refs == {}
+        local_weightless = local.weightless_release_documents(
+            {
+                "application": "weightless:app",
+                "entrypoints": [
+                    {"hidden": False, "kind": "entrypoint", "models": [], "name": "health"}
+                ],
+            }
+        )
+        assert local_weightless.artifact_object_set == empty_bytes
+        assert ref(local_weightless.artifact_object_set) == {
+            "digest": "sha256:d60755ff474871fce1e9705850245780895c1d2b798750f7692962c2d64d8856",
+            "length": 53,
+        }
+        empty_store = _materialize_objects(
+            {"capacity": {"cache_mount_path": str(root / "empty-cache")}},
+            {"artifact_grants": []},
+            empty_object_set,
+            deadline=int(time.time()) + 60,
+        )
+        assert empty_store == root / "empty-cache" / "tensorfs" and empty_store.is_dir()
 
         snapshot = "a" * 64
 
@@ -290,8 +332,6 @@ def main() -> int:
         descriptor_ref = ref(descriptor_bytes)
         layout_ref: Ref = {"digest": "sha256:" + "e" * 64, "length": 23}
         fp8_weights_ref: Ref = {"digest": "sha256:" + "f" * 64, "length": 256}
-        endpoint_layout_ref: Ref = {"digest": "sha256:" + "2" * 64, "length": 29}
-        endpoint_root_ref: Ref = {"digest": "sha256:" + "1" * 64, "length": 13}
         model_root_ref: Ref = {"digest": "sha256:" + snapshot, "length": 17}
         binding_bytes = canonical.write(
             {
@@ -344,24 +384,35 @@ def main() -> int:
                 "kind": "tensorhub.resolved_object_set/1",
                 "roots": [
                     {
-                        "objects": [endpoint_layout_ref],
-                        "role": "endpoint",
-                        "root": endpoint_root_ref,
-                    },
-                    {
                         "objects": sorted(
                             [config_asset_ref, fp8_weights_ref, layout_ref],
                             key=lambda row: str(row["digest"]),
                         ),
-                        "role": "model",
                         "root": model_root_ref,
                     },
                 ],
             }
         )
         object_set = provisioned.read_artifact_object_set(object_set_bytes)
-        assert object_set.endpoint.root.digest == endpoint_root_ref["digest"]
-        assert object_set.model_roots == {model_root_ref["digest"]}
+        assert [root.root.digest for root in object_set.roots] == [model_root_ref["digest"]]
+        legacy_role_bytes = canonical.write(
+            {
+                "kind": "tensorhub.resolved_object_set/1",
+                "roots": [
+                    {
+                        "objects": [layout_ref],
+                        "role": "endpoint",
+                        "root": model_root_ref,
+                    }
+                ],
+            }
+        )
+        try:
+            provisioned.read_artifact_object_set(legacy_role_bytes)
+        except PlanRefusal as exc:
+            assert exc.code == "artifact_object_set.roots[0]_invalid"
+        else:
+            raise AssertionError("deleted ArtifactObjectSet role field was accepted")
         plan_ref = ref(plan_bytes)
         weightless_plan_ref = ref(weightless_plan_bytes)
         plan_path = root / "plan.json"
@@ -415,6 +466,38 @@ def main() -> int:
             str(config_asset_ref["digest"]): int(config_asset_ref["length"])
         }
         assert str(config_asset_ref["digest"]) not in selected.documents
+        extra_root_ref: Ref = {"digest": "sha256:" + "c" * 64, "length": 31}
+        extra_layout_ref: Ref = {"digest": "sha256:" + "d" * 64, "length": 37}
+        extra_object_set = provisioned.read_artifact_object_set(
+            canonical.write(
+                {
+                    "kind": "tensorhub.resolved_object_set/1",
+                    "roots": [
+                        {
+                            "objects": sorted(
+                                [config_asset_ref, fp8_weights_ref, layout_ref],
+                                key=lambda row: str(row["digest"]),
+                            ),
+                            "root": model_root_ref,
+                        },
+                        {"objects": [extra_layout_ref], "root": extra_root_ref},
+                    ],
+                }
+            )
+        )
+        try:
+            provisioned.read_provisioned_release(
+                plan_documents,
+                read_document=provisioned.staged_document_reader(binding_documents),
+                endpoint_release="endpoint@release",
+                store_root=root / "store",
+                object_set=extra_object_set,
+                dtype_widths={"bfloat16": 2, "float32": 4},
+            )
+        except PlanRefusal as exc:
+            assert exc.code == "artifact_object_set_mismatch"
+        else:
+            raise AssertionError("an unconsumed model root was accepted")
         try:
             provisioned.read_provisioned_release(
                 {str(plan_ref["digest"]): plan_documents[str(plan_ref["digest"])]},

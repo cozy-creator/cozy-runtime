@@ -181,9 +181,9 @@ class WorkerOptions:
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
     """
     artifact_store: Path | None = None
-    """The verified TensorFS store populated from the canonical grouped-root closure."""
+    """The verified TensorFS store populated from the canonical model-root closure."""
     artifact_object_set: Path | None = None
-    """The exact root-role document used by the shared provisioned-release reader."""
+    """The exact model-root document used by the shared provisioned-release reader."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -1739,7 +1739,7 @@ class Worker:
                     raise PlanRefusal(
                         "artifact_store_required",
                         "canonical provisioned bindings require the verified TensorFS store "
-                        "and exact root-role document",
+                        "and exact model-root document",
                     )
                 object_set = provisioned.read_artifact_object_set(
                     self.options.artifact_object_set.read_bytes()
@@ -3141,12 +3141,12 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--artifact-store",
         required=True,
-        help="verified TensorFS store populated from the provisioned grouped-root object set",
+        help="verified TensorFS store populated from the provisioned model-root object set",
     )
     parser.add_argument(
         "--artifact-object-set",
         required=True,
-        help="exact canonical grouped root-role document for provisioned binding validation",
+        help="exact canonical model-root document for provisioned binding validation",
     )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)

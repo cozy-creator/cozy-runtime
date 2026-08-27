@@ -41,22 +41,15 @@ class ExactDocument:
 
 @dataclass(frozen=True, slots=True)
 class ObjectRoot:
-    role: str
     root: ArtifactRef
     objects: tuple[ArtifactRef, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ArtifactObjectSet:
+    """The complete delivered model-root closure; empty for a weightless endpoint."""
+
     roots: tuple[ObjectRoot, ...]
-
-    @property
-    def endpoint(self) -> ObjectRoot:
-        return next(root for root in self.roots if root.role == "endpoint")
-
-    @property
-    def model_roots(self) -> frozenset[str]:
-        return frozenset(root.root.digest for root in self.roots if root.role == "model")
 
     @property
     def refs(self) -> Mapping[str, int]:
@@ -100,19 +93,13 @@ def read_artifact_object_set(raw: bytes) -> ArtifactObjectSet:
     if document["kind"] != ARTIFACT_OBJECT_SET_KIND:
         raise PlanRefusal("artifact_object_set_format", str(document["kind"]))
     rows = document["roots"]
-    if not isinstance(rows, list) or not rows:
-        raise PlanRefusal("artifact_object_set_invalid", "roots are absent")
+    if not isinstance(rows, list):
+        raise PlanRefusal("artifact_object_set_invalid", "roots is not an array")
     roots: list[ObjectRoot] = []
     prior_root = ""
-    endpoint_count = 0
     for index, row in enumerate(rows):
-        _closed_keys(row, {"objects", "role", "root"}, f"artifact_object_set.roots[{index}]")
+        _closed_keys(row, {"objects", "root"}, f"artifact_object_set.roots[{index}]")
         root = _artifact_ref(row["root"], f"artifact_object_set.roots[{index}].root")
-        role = row["role"]
-        if role not in {"endpoint", "model"}:
-            raise PlanRefusal("artifact_object_set_invalid", f"root role {role!r}")
-        if role == "endpoint":
-            endpoint_count += 1
         if root.digest <= prior_root:
             raise PlanRefusal("artifact_object_set_invalid", "roots are not sorted unique")
         object_rows = row["objects"]
@@ -132,12 +119,8 @@ def read_artifact_object_set(raw: bytes) -> ArtifactObjectSet:
                 )
             prior_object = ref.digest
             objects.append(ref)
-        roots.append(ObjectRoot(str(role), root, tuple(objects)))
+        roots.append(ObjectRoot(root, tuple(objects)))
         prior_root = root.digest
-    if endpoint_count != 1:
-        raise PlanRefusal(
-            "artifact_object_set_invalid", f"requires one endpoint root, found {endpoint_count}"
-        )
     result = ArtifactObjectSet(tuple(roots))
     _ = result.refs  # prove cross-root length consistency once
     return result
@@ -214,11 +197,12 @@ def read_provisioned_release(
             f"missing={sorted(set(visible) - set(bindings))} "
             f"extra={sorted(set(bindings) - set(visible))}",
         )
-    if used_model_roots != set(object_set.model_roots):
+    delivered_model_roots = {root.root.digest for root in object_set.roots}
+    if used_model_roots != delivered_model_roots:
         raise PlanRefusal(
             "artifact_object_set_mismatch",
             f"used model roots {sorted(used_model_roots)} differ from delivered model roots "
-            f"{sorted(object_set.model_roots)}",
+            f"{sorted(delivered_model_roots)}",
         )
     return ProvisionedRelease(
         bindings={binding.entrypoint_binding_plan_id: binding for binding in bindings.values()},
@@ -465,7 +449,7 @@ def _model_root(
     root = _artifact_ref(value["snapshot_root"], f"{name}.snapshot_root")
     layout = _artifact_ref(value["tensor_layout"], f"{name}.tensor_layout")
     matches = [row for row in object_set.roots if row.root.digest == root.digest]
-    if len(matches) != 1 or matches[0].role != "model" or matches[0].root != root:
+    if len(matches) != 1 or matches[0].root != root:
         raise PlanRefusal("artifact_object_set_mismatch", f"{name} does not name a model root")
     objects = {row.digest: row.length for row in matches[0].objects}
     if objects.get(layout.digest) != layout.length:
