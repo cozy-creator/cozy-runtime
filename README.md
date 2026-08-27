@@ -146,6 +146,7 @@ refuses. `describe` itself is read-only; `--write-descriptor` is the only writer
     uv run python scripts/conformance.py # every public Context/service fact has a live writer
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
+    proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
     proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
     proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
@@ -165,6 +166,16 @@ receipt identity, isolated imports, atomic publication, and bounded refusals. Th
 requires a fresh root by contract, so receipt-keyed reuse and installed-tree tamper refusals live
 in the explicitly private `proofs/internal/environment_materializer.py` check rather than
 masquerading as CLI behavior.
+
+The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
+fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
+`cozy-runtime` command. It proves the current process exit matrix, read-only and exact-byte
+Descriptor/1 behavior, canonical/local/strict key classification through a real job, typed
+mixed-media grants and canonical invocation identity, and `--offline` execution while every
+AF_INET/6 connect is refused. Its private companion
+`proofs/internal/local_input_acceptance.py` owns transfer and RecordOwner fault plants; those
+private hooks are not presented as CLI evidence. The full scenario census and retired claims
+are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
@@ -244,12 +255,19 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/pipeline-live.py fixtures  # cr-008b: the config + bundled tokenizers
     corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
     corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
+    corpus/.venv/bin/python scripts/pipeline-live.py arms      # cr-008b: access + physical-floor refusals
     corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
     corpus/.venv/bin/python scripts/job-live.py all          # cr-009: the @job surface, services and runner
     corpus/.venv/bin/python scripts/quant-live.py arms       # cr-006: the encoding border and its refusals
     corpus/.venv/bin/python scripts/delivery-live.py all     # cr-008c: the delivery ladder, chosen over two real artifacts
     corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
     corpus/.venv/bin/python scripts/leaf-live.py all         # cr-006: the native-encoded rung — leaf replacement and the ranked chooser
+
+There is deliberately no model-bound `cozy-runtime run` GPU qualification. Flat local model
+bindings were removed; that command now exits 6 and requires Tensorhub's selected
+Plan/RMB/MCC provision closure. `scripts/pipeline-live.py image/arms` retain the real SDXL
+output and floor evidence, while `qualification/gpu/README.md` records why the obsolete
+CLI-versus-private comparison was retired instead of rebuilding deleted authority.
 
 `scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
 735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.

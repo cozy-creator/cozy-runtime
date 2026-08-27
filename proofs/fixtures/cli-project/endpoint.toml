@@ -1,0 +1,2 @@
+[application]
+object = "proof_cli_endpoint:app"

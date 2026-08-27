@@ -387,7 +387,8 @@ LIVE_ARMS = (
         # the refusal never printed (#574b); since #613 the only arithmetic is admission,
         # and the envelope must carry the scratch beside the destinations or a fill can
         # be admitted at its weights alone.
-        "env = price_envelope([('transformer', 40_225_668_192, 20_958_085_592, 'decoded_float')], 512 << 20)\n"
+        "env = price_envelope("
+        "[('transformer', 40_225_668_192, 20_958_085_592, 'decoded_float')], 512 << 20)\n"
         "assert env['decode_peak_bytes'] > 0\n"
         "assert env['required_bytes'] == env['destination_bytes'] + env['decode_peak_bytes']\n"
         "raise SystemExit('decode scratch of %d B rides the device envelope: %d B required' "

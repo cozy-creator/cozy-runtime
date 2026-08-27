@@ -327,9 +327,7 @@ def unet_config() -> dict[str, Any]:
     return {k: v for k, v in raw.items() if k not in carriers}
 
 
-def _fill(
-    store: str, snap: str, *, scratch: int = 512 * MIB
-) -> tuple[Any, Any, Any]:
+def _fill(store: str, snap: str, *, scratch: int = 512 * MIB) -> tuple[Any, Any, Any]:
     """Construct + fill the real SDXL UNet from one snapshot. Returns (backend, model, torch)."""
     import torch
     from corpus.sdxl_real import SdxlUnetModel

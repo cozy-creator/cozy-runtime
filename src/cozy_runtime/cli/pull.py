@@ -112,7 +112,16 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     timeout = _duration(flags["--timeout"]) if "--timeout" in flags else None
     streams = _streams(flags.get("--streams", ""))
 
-    tensorfs = fill.tensorfs_module()
+    try:
+        tensorfs = fill.tensorfs_module()
+    except fill.FillRefusal as refusal:
+        raise CliError(
+            "unavailable",
+            f"the TensorFS reader is unavailable: {refusal}",
+            "install the TensorFS Python facade in this Runtime environment, then run the "
+            "same pull again",
+            Exit.unavailable,
+        ) from refusal
     store = _store(tensorfs, store_root)
 
     try:

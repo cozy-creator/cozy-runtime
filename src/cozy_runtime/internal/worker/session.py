@@ -2121,8 +2121,7 @@ class Worker:
                     f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
                     f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
                     f"the device has {reply.get('device_free_bytes', -1)} B free. The executor "
-                    "is poisoned and replaced; the card returns with the process (#613)]"
-                    + "]",
+                    "is poisoned and replaced; the card returns with the process (#613)]" + "]",
                 )
                 # A failed construction owns no retry policy. Retire its possibly retained
                 # allocations and remain offline; convergence decides whether to try again.
