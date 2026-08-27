@@ -45,7 +45,7 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
-| `internal/staging.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
+| `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
 | `internal/worker/triage.py` | the `WorkerTriageBundle` schema, its assembler, and the journal-backed store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |

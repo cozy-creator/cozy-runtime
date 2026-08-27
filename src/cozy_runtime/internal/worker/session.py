@@ -2029,7 +2029,9 @@ class Worker:
                             "delivery_cache": str(self.config.cozy_home / "probe"),
                         },
                         "budgets": {
-                            "vram": first.model_weight_bytes,
+                            # cr-037/law 19: a prediction BASIS, not a budget — the wire
+                            # field says what it carries so it cannot be read as a ceiling.
+                            "declared_weight_bytes": first.model_weight_bytes,
                             "pinned": first.pinned_bytes,
                             "resident": first.resident_budget_bytes,
                         },

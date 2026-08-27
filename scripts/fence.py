@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Fifteen fences, each provable red by planting the violation (`scripts/redarm.py`):
+Seventeen fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
   endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
+  module-name-vocabulary · seam-budget-vocabulary
 """
 
 from __future__ import annotations
@@ -155,6 +156,51 @@ def fence_env_authority() -> list[str]:
             if re.search(r"\bos\.(environ|getenv)\b|\bgetenv\(|\benviron\[", line):
                 rel = path.relative_to(ROOT)
                 bad.append(f"{rel}:{i}: environment read outside the config authority")
+    return bad
+
+
+#: cr-037's vocabulary law for MODULE names. Bare "staging" is banned: the concept is
+#: residency (`internal/residency.py`); the pinned staging-buffer is a SYMBOL
+#: (`StagingRing` in fill.py), never a module name.
+BANNED_MODULE_WORDS = ("staging",)
+
+
+def fence_module_name_vocabulary() -> list[str]:
+    bad: list[str] = []
+    for path in py_files():
+        words = path.stem.split("_")
+        for banned in BANNED_MODULE_WORDS:
+            if banned in words:
+                bad.append(
+                    f"{path.relative_to(ROOT)}: module name carries the banned bare word "
+                    f"{banned!r} — the vocabulary law names this concept residency"
+                )
+    return bad
+
+
+def fence_seam_budget_vocabulary() -> list[str]:
+    """Law 19 on the prepare seam: stored/authorized/predicted bytes stay separately named.
+
+    The wire field is `declared_weight_bytes` — a prediction basis, never a budget wearing
+    `vram`'s name. The fill ledger's internal `"vram"` resource class is not this seam and
+    stays; the fence bans exactly the seam spelling `budgets["vram"]`.
+    """
+    bad: list[str] = []
+    for path in py_files():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "budgets"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "vram"
+            ):
+                bad.append(
+                    f'{path.relative_to(ROOT)}:{node.lineno}: budgets["vram"] — the seam '
+                    "field is declared_weight_bytes (law 19: a prediction basis is not a "
+                    "budget)"
+                )
     return bad
 
 
@@ -680,6 +726,8 @@ FENCES = {
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "env-authority": fence_env_authority,
+    "module-name-vocabulary": fence_module_name_vocabulary,
+    "seam-budget-vocabulary": fence_seam_budget_vocabulary,
     "single-config": fence_single_config,
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,

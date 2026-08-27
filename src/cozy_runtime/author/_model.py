@@ -205,7 +205,7 @@ class Residency(Protocol):
     Declared here because the contract has one home; implemented nowhere in this package,
     because admission, materialization, event fencing and eviction all need a device and
     this package is torch-free by construction. cozy-runtime supplies the body
-    (`internal/staging.py`); a promoted Varena adapter would supply a different one and the
+    (`internal/residency.py`); a promoted Varena adapter would supply a different one and the
     endpoint above would not be able to tell.
 
     `admit` runs BEFORE method entry and either makes the declared set materialized or

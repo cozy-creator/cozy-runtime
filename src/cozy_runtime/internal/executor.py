@@ -230,13 +230,13 @@ class Executor:
         )
         from cozy_runtime.internal.planfacts import PlanFacts, RunFact, run_id
         from cozy_runtime.internal.probe import qualify
+        from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
             PlanRefusal,
             Variant,
             resolve,
         )
-        from cozy_runtime.internal.staging import ComponentResidency
 
         accel.initialize(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
@@ -375,7 +375,9 @@ class Executor:
                 "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
         checkpoints, rows = surveyed[plan.variant]
-        ledger = ResourceLedger(budgets={"vram": budgets["vram"], "pinned": budgets["pinned"]})
+        ledger = ResourceLedger(
+            budgets={"vram": budgets["declared_weight_bytes"], "pinned": budgets["pinned"]}
+        )
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
         # worker can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
@@ -427,7 +429,7 @@ class Executor:
         # overhead. Derived buffers remain live beside that overhead, so the complete peak
         # is additive and the larger destination census wins if the two have not yet met.
         # This refusal runs before allocation instead of discovering an OOM mid-fill.
-        declared = int(budgets["vram"])
+        declared = int(budgets["declared_weight_bytes"])
         envelope = complete_device_envelope(backend.device_envelope(), declared)
         required = int(envelope["required_bytes"])
         ledger.budgets["vram"] = required
@@ -555,7 +557,7 @@ class Executor:
                 reply["shortfall"] = {
                     "resource": "vram",
                     "scope": "component_generation",
-                    "needed_bytes": int(budgets["vram"]),
+                    "needed_bytes": int(budgets["declared_weight_bytes"]),
                     "available_bytes": int(free),
                     "evidence_class": "measured",
                 }
