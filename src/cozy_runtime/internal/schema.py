@@ -81,7 +81,7 @@ def _render_bare(tp: object, seen: frozenset[type]) -> Json:
     if origin is Literal:
         return {"literal": sorted_union([_literal(a) for a in get_args(tp)])}
     if origin is typing.Union or origin is types.UnionType:
-        return {"union": sorted_union([_render(a, seen) for a in get_args(tp)])}
+        return _union(get_args(tp), seen)
     if origin in (list, Sequence):
         args = get_args(tp)
         return {"list": _render(args[0], seen) if args else "any"}
@@ -118,15 +118,67 @@ def _literal(value: object) -> Json:
     raise ConformanceError(f"literal {value!r} is not JSON-representable", code="unrenderable_type")
 
 
+def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
+    rendered = sorted_union([_render(member, seen) for member in members])
+    tags: list[tuple[str, Json]] = []
+    for member in members:
+        base, _ = strip(member)
+        if not is_struct(base):
+            continue
+        struct = typing.cast(type[msgspec.Struct], base)
+        config = struct.__struct_config__
+        if config.tag is not None:
+            if not isinstance(config.tag_field, str) or not config.tag_field:
+                raise ConformanceError(
+                    f"tagged union member {struct.__name__} declares no string tag field",
+                    code="tagged_union_incoherent",
+                )
+            tags.append((config.tag_field, _literal(config.tag)))
+    if not tags:
+        return {"union": rendered}
+    fields = {field for field, _ in tags}
+    if len(tags) != len(members) or len(fields) != 1:
+        raise ConformanceError(
+            "a tagged union must contain only tagged structs sharing one tag field",
+            code="tagged_union_incoherent",
+        )
+    if len({write(value) for _, value in tags}) != len(tags):
+        raise ConformanceError(
+            "a tagged union's member tags must be unique",
+            code="tagged_union_incoherent",
+        )
+    return {"union": rendered, "tag_field": next(iter(fields))}
+
+
 def _struct(tp: type[msgspec.Struct], seen: frozenset[type]) -> Json:
     if tp in seen:
         return {"struct_ref": tp.__name__}
     nested = seen | {tp}
     config = tp.__struct_config__
+    fields = [_field(f, nested) for f in msgspec.structs.fields(tp)]
+    if config.tag is not None:
+        if not isinstance(config.tag_field, str) or not config.tag_field:
+            raise ConformanceError(
+                f"tagged struct {tp.__name__} declares no string tag field",
+                code="tagged_union_incoherent",
+            )
+        tag = _literal(config.tag)
+        fields.insert(
+            0,
+            {
+                "name": config.tag_field,
+                "type": {"literal": [tag]},
+                "wire": "required",
+                "discriminator": True,
+            },
+        )
     doc: dict[str, Json] = {
         "struct": tp.__name__,
-        "fields": [_field(f, nested) for f in msgspec.structs.fields(tp)],
+        "fields": fields,
     }
+    if config.tag is not None:
+        doc["tag_field"] = typing.cast(str, config.tag_field)
+        doc["tag"] = _literal(config.tag)
     if config.forbid_unknown_fields:
         doc["forbid_unknown_fields"] = True
     if config.frozen:
