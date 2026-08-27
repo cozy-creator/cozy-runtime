@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Generic, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
+from cozy_runtime.author._artifact_sink import ArtifactSink
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -1080,13 +1081,14 @@ SERVICES: Mapping[str, type] = {
     "secrets": Secrets,
     "scratch": Scratch,
     "checkpoints": Checkpoints,
+    "artifact_sink": ArtifactSink,
     "budget": Budget,
     "media_decode": MediaDecoder,
 }
 
 #: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs
 #: to completion and owns durable working state; a request handler owns neither.
-JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget"})
+JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "artifact_sink", "budget"})
 
 #: The mirror: SERVING-ONLY surface. `adjust` writes the caller-visible adjustments envelope,
 #: which is a fact about serving one request; a run-to-completion job has no caller to

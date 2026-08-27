@@ -104,7 +104,8 @@ def _separation(surface: Surface) -> None:
                 "that service writes the caller-visible adjustments envelope, and a "
                 "run-to-completion job has no caller to confess to (§2)"
                 if job
-                else "Scratch, Checkpoints and Budget are JOB services: durable working "
+                else "Scratch, Checkpoints, ArtifactSink and Budget are JOB services: durable "
+                "working "
                 "state and a spend envelope belong to a bounded attempt, never to a "
                 "request handler on a warm serving loop (§2)"
             ),

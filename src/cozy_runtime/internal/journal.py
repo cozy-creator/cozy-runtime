@@ -47,6 +47,9 @@ KINDS = (
     "ledger",  # one attempt's byte-class reconciliation at close (cr-008a)
     "triage",  # one WorkerTriageBundle write receipt (cr-011): subject, digest, length
     "job_checkpoint",  # one DURABLE job checkpoint identity + receipt (cr-009)
+    "artifact_intent",  # exact grant-bound declaration + monotone writer session (cr-030)
+    "artifact_receipt",  # exact TensorFS commit receipt, durable before outcome linkage
+    "artifact_final",  # one owner-authenticated stored-root disposition (cr-030/th-049)
     "publication",  # ONE canonical bundle snapshot per publication (cr-009)
 )
 

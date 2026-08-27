@@ -14,6 +14,19 @@ fakes live in `cozy_runtime.author.fakes`.
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
+from cozy_runtime.author._artifact_sink import (
+    ArtifactCommit,
+    ArtifactConfig,
+    ArtifactPart,
+    ArtifactReader,
+    ArtifactSink,
+    ArtifactValue,
+    CopyComponent,
+    CopyConfig,
+    CreateComponent,
+    CreateConfig,
+    DeriveComponent,
+)
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -137,6 +150,12 @@ __all__ = [
     "Adjustments",
     "App",
     "Artifact",
+    "ArtifactCommit",
+    "ArtifactConfig",
+    "ArtifactPart",
+    "ArtifactReader",
+    "ArtifactSink",
+    "ArtifactValue",
     "Asset",
     "AssetBound",
     "AudioAsset",
@@ -159,6 +178,10 @@ __all__ = [
     "ConstructionIdentity",
     "ConstructionRecord",
     "Context",
+    "CopyComponent",
+    "CopyConfig",
+    "CreateComponent",
+    "CreateConfig",
     "DeadlineExceeded",
     "DecodeLimits",
     "DecodedAudio",
@@ -173,6 +196,7 @@ __all__ = [
     "DecodedVideoFrame",
     "DecoderUnavailable",
     "DefaultResolutionError",
+    "DeriveComponent",
     "DerivedCache",
     "Device",
     "Egress",

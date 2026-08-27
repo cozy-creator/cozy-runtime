@@ -32,6 +32,7 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifact_sink import ArtifactCommit, ArtifactSink, _ArtifactRequest
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import MediaDecoder
@@ -113,6 +114,8 @@ class Invocation:
     """The checkpoint DECLARATION exchange. Distinct from the lossy progress lane on
     purpose: the lossy lane has no authority over a journaled fact. It carries no bytes —
     see `Checkpoints` (#553a)."""
+    artifact_sink: Callable[[_ArtifactRequest], ArtifactCommit] | None = None
+    """The Runtime-owned, InvocationSpec-bound large-artifact transaction."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
@@ -636,6 +639,8 @@ def _service(param: Param, attempt: Attempt, ctx: Context, inv: Invocation) -> o
             return Scratch(attempt, inv.scratch)
         case "checkpoints":
             return Checkpoints(attempt, inv.checkpoints)
+        case "artifact_sink":
+            return ArtifactSink(attempt, inv.artifact_sink)
         case "budget":
             return Budget(attempt, inv.budget)
         case "media_decode":
