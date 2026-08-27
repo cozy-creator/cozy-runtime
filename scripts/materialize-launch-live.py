@@ -17,6 +17,7 @@ from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
     LaunchRefusal,
+    _local_bounded_document,
     _materialize_objects,
     _provision_pair,
 )
@@ -171,6 +172,18 @@ def main() -> int:
             raise AssertionError("retired provider identity entered the adapter handoff")
         config = read_adapter_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
+        assert 0 < len(spec_bytes) < canonical.DOC_MAX_BYTES
+        assert 0 < len(bundle_bytes) < canonical.DOC_MAX_BYTES
+        config.provision_spec_path.write_bytes(spec_bytes)
+        config.provision_bundle_path.write_bytes(bundle_bytes)
+        assert (
+            _local_bounded_document(config.provision_spec_path, config.provision_spec_digest)
+            == spec_bytes
+        )
+        assert (
+            _local_bounded_document(config.provision_bundle_path, config.provision_bundle_digest)
+            == bundle_bytes
+        )
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
 
