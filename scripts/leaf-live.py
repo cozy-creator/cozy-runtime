@@ -447,7 +447,7 @@ def mixed() -> None:
         launch_providers,
         measure_device,
     )
-    from cozy_runtime.internal.fill import PlanRow, servability, survey_routes
+    from cozy_runtime.internal.fill import PlanRow, servability_for_script
     from cozy_runtime.internal.probe import qualify as run_suite
 
     head("mixed — three encodings, three routes, ONE component (#543g)")
@@ -536,9 +536,16 @@ def mixed() -> None:
         "the SAME objective lands on different routes for different tensors — which is "
         "exactly what a per-artifact answer could not express",
     )
-    routes, refusal = survey_routes(rows, selector)
-    answer = servability(rows, selector)
-    print(f"  survey     {routes}  refusal={refusal or 'none'}")
+    answer = servability_for_script(
+        rows,
+        release=RELEASE,
+        objective="footprint",
+        providers=table,
+        capabilities=caps,
+        device=device,
+        facts_dir=str(WORK / "plan-facts"),
+    )
+    print(f"  survey     {answer.routes}  refusal={answer.refusal or 'none'}")
     print(f"  servable   {answer.line()}")
 
     # #549.1's ARM, replacing the old `eligible_rungs` one. That arm asked whether a mixed
@@ -708,9 +715,11 @@ def _backend(objective: str, **kwargs: Any) -> Any:
     snapshot = (WORK / "snapshot.txt").read_text().strip()
     books = {"block": Checkpoint(str(STORE), snapshot)}
     rows = books["block"].rows("block")
-    backend = StreamingFillBackend(
+    backend = StreamingFillBackend.for_script(
         books,
         rows,
+        store=str(STORE),
+        snapshot=snapshot,
         window_bytes=1 << 20,
         slots=4,
         readers=4,
@@ -842,7 +851,7 @@ def fill() -> None:
     # gets it before a destination is reserved.
     backend, rows = _backend("footprint")
     if not any(
-        backend.selector.select(r.key, r.encoded, dtype_name(r.dtype)).provider.route
+        backend.resolved[r.key].route
         == "encoded_gemm"
         for r in rows
     ):

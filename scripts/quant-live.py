@@ -343,9 +343,11 @@ def _fill(store: str, snap: str, *, scratch: int = 512 * MIB) -> tuple[Any, Any,
 
     checkpoints = {"unet": Checkpoint(store, snap)}
     rows = checkpoints["unet"].rows("unet")
-    backend = StreamingFillBackend(
+    backend = StreamingFillBackend.for_script(
         checkpoints,
         rows,
+        store=store,
+        snapshot=snap,
         window_bytes=4 * MIB,
         slots=16,
         readers=16,

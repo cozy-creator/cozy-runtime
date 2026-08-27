@@ -259,7 +259,7 @@ def carrier() -> None:
         launch_providers,
         measure_device,
     )
-    from cozy_runtime.internal.fill import Checkpoint, dtype_name, servability
+    from cozy_runtime.internal.fill import Checkpoint, dtype_name, servability_for_script
     from cozy_runtime.internal.probe import qualify
 
     head("carrier — the producing job's own equation, through the real border and back")
@@ -368,7 +368,16 @@ def carrier() -> None:
         release="cozy/mxfp8-live",
         cache=None,
     )
-    answer = servability(rows, Selector(providers, capabilities, device))
+    answer = servability_for_script(
+        rows,
+        release="cozy/mxfp8-live",
+        providers=providers,
+        capabilities=capabilities,
+        device=device,
+        facts_dir=str(WORK / "plan-facts"),
+        store=str(STORE),
+        snapshot=snapshot,
+    )
     check(
         "SERVABILITY, before a byte moves: this runtime's own answer", answer.serves, answer.line()
     )
@@ -449,7 +458,7 @@ def arms() -> None:
         launch_providers,
         measure_device,
     )
-    from cozy_runtime.internal.fill import FillRefusal, servability, store_refusals
+    from cozy_runtime.internal.fill import FillRefusal, servability_for_script, store_refusals
     from cozy_runtime.internal.probe import qualify
     from cozy_runtime.internal.worker.refusal import SIDE, classify
 
@@ -643,11 +652,25 @@ def arms() -> None:
     from cozy_runtime.internal.fill import PlanRow
 
     row = PlanRow("c.w", "w", "c", "bf16", (64, 96), 12288, Encoded(mx, "mxfp8/1", parts))
-    answer = servability([row], selector)
+    answer = servability_for_script(
+        [row],
+        release="cozy/mxfp8-live",
+        providers=providers,
+        capabilities=capabilities,
+        device=device,
+        facts_dir=str(WORK / "plan-facts"),
+    )
     check(
         "the servability answer is GREEN for bytes this build serves", answer.serves, answer.line()
     )
-    blind = servability([row], Selector(providers, Capabilities(), device))
+    blind = servability_for_script(
+        [row],
+        release="cozy/mxfp8-live",
+        providers=providers,
+        capabilities=Capabilities(),
+        device=device,
+        facts_dir=str(WORK / "plan-facts"),
+    )
     check(
         "a worker with NO capability record says so TYPED, before any fill",
         not blind.serves and blind.code == "encoding_unqualified" and "mxfp8/1" in blind.line(),

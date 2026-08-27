@@ -169,8 +169,8 @@ def survey() -> None:
     head("variants — what each artifact's HEADER demands, and what plan that resolves to")
 
     from cozy_runtime.internal.delivery import DELIVERY_RUNGS
-    from cozy_runtime.internal.encoding import Selector, device_line
-    from cozy_runtime.internal.fill import survey_routes
+    from cozy_runtime.internal.encoding import device_line
+    from cozy_runtime.internal.fill import servability_for_script
     from cozy_runtime.internal.resolution import route_label
 
     print("  the delivery routes, and WHEN each one is paid (data, not a chooser):")
@@ -184,10 +184,17 @@ def survey() -> None:
     context = resolved()
     device, probe = context["device"], context["probe"]
     print(f"  device: {device_line(device)}")
-    selector = Selector(context["providers"], context["capabilities"], device)
     labels: dict[str, str] = {}
     for name, rows in context["rows_for"].items():
-        routes, refusal = survey_routes(rows, selector)
+        answer = servability_for_script(
+            rows,
+            release=RELEASE,
+            providers=context["providers"],
+            capabilities=context["capabilities"],
+            device=device,
+            facts_dir=str(HOME / "probe"),
+        )
+        routes, refusal = answer.routes, answer.refusal
         labels[name] = route_label(routes)
         aliases = sorted({r.encoded.alias for r in rows})
         print(

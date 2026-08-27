@@ -396,6 +396,7 @@ class Executor:
         backend = StreamingFillBackend(
             checkpoints,
             rows,
+            plan=plan,
             on_position=position,
             window_bytes=binding.get("window_bytes", 4 << 20),
             slots=binding.get("slots", 16),
@@ -410,7 +411,6 @@ class Executor:
             # The suite already ran, above, to resolve the plan. Running it a second time
             # here would re-measure a device fact that has not changed.
             qualified=qualified,
-            objective=objective,
             forensics_dir=self.fill_forensics_dir,
         )
         # A STAGING generation re-reads the store after construction, so its GC-safe hold

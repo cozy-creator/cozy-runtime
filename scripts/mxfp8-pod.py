@@ -307,9 +307,11 @@ def fill_arm(arm: str) -> tuple[Any, Any, Any]:
     snapshot = (ROOT / f"snapshot-{arm}.txt").read_text().strip()
     books = {"block": Checkpoint(str(STORE), snapshot)}
     rows = books["block"].rows("block")
-    backend = StreamingFillBackend(
+    backend = StreamingFillBackend.for_script(
         books,
         rows,
+        store=str(STORE),
+        snapshot=snapshot,
         window_bytes=4 * MIB,
         slots=16,
         readers=16,

@@ -68,15 +68,15 @@ from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
     Encoded,
-    EncodingRefusal,
     RolePart,
     Selection,
-    Selector,
     device_line,
+    implementation_digest,
     launch_providers,
     measure_device,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
+from cozy_runtime.internal.resolution import PlanRefusal, ResolvedExecutionPlan, TensorResolution
 
 # ------------------------------------------------------------------------- refusals
 
@@ -152,6 +152,15 @@ REFUSALS = frozenset(
         # holding what the substitution declared (a runtime/artifact disagreement).
         "leaf_unconsented",
         "leaf_topology",
+        # cr-025's ONE-SELECTION-AUTHORITY law. `plan_divergence`: the resolved plan this
+        # generation was priced and identified under names a tensor, an implementation, a
+        # route, a geometry or a dtype that is not what this checkpoint holds or this build
+        # and device can execute. The plane never re-selects to paper over it — the
+        # planner-A/executor-B split is exactly what the digest in generation identity
+        # forbids. `plan_unresolved`: no executable plan resolves for these bytes here,
+        # spoken in this vocabulary by the honesty surface (`servability`).
+        "plan_divergence",
+        "plan_unresolved",
     }
 )
 
@@ -529,29 +538,6 @@ class Checkpoint:
             return self.store.acquire_snapshot(self.snapshot_id)
 
 
-def survey_routes(rows: Sequence[PlanRow], selector: Selector) -> tuple[dict[str, int], str]:
-    """What ROUTES an artifact's own header demands, and whether this device serves them.
-
-    cr-008c's delivery choice needs both facts about a CANDIDATE artifact before choosing
-    to read it, and both come from the header alone: cr-006 measured the whole per-tensor
-    encoding plan of the real fp8 UNet at 400,592 B read and 6.7 MiB peak RSS, zero tensor
-    bytes. So surveying every offered variant is header work, not a load.
-
-    Returns (route -> tensor count, refusal sentence or ""). The refusal is carried out
-    VERBATIM from cr-006's `Selector` rather than re-derived, so what a reader sees is what
-    the capability table actually said — including the device line and the named seam that
-    would serve these bytes elsewhere.
-    """
-    routes: dict[str, int] = {}
-    for row in rows:
-        try:
-            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype), row.shape)
-        except EncodingRefusal as exc:
-            return routes, str(exc)
-        routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
-    return routes, ""
-
-
 @dataclass(frozen=True, slots=True)
 class Servability:
     """This runtime's OWN answer to "can I serve these bytes", given before any of them move.
@@ -589,27 +575,76 @@ class Servability:
             raise _refuse(self.code, self.refusal)
 
 
-def servability(rows: Sequence[PlanRow], selector: Selector) -> Servability:
-    """Answer for a whole component set, from the header alone. No I/O, no tensor bytes.
+def servability(
+    rows: Sequence[PlanRow], answer: ResolvedExecutionPlan | PlanRefusal
+) -> Servability:
+    """The honesty answer, DERIVED from plan resolution — never from a second selector.
 
-    `survey_routes` already walks these rows for the delivery lane's variant arithmetic and
-    returns the same refusal verbatim; this adds the two things an HONESTY answer needs and
-    a route census does not — WHICH encodings were cited (so the answer names the artifact's
-    actual encoding rather than a route count) and the refusal's CODE (so it can be spoken
-    as a typed refusal rather than printed as a sentence).
+    `answer` is what `resolution.resolve()` (or `script_plan()`) produced for these rows: a
+    plan, in which case every route it names is executable here by construction, or the
+    `PlanRefusal` it raised. A refusal is spoken through the walk's first typed verdict
+    (`encoding_unqualified`, `role_mismatch`, ...) so the answer names the ENCODING and
+    the remedy rather than the resolver's summary; a plan that refused for a reason the
+    walk does not type is `plan_unresolved`.
     """
     by_alias: dict[str, int] = {}
-    routes: dict[str, int] = {}
     for row in rows:
-        alias = row.encoded.alias
-        by_alias[alias] = by_alias.get(alias, 0) + 1
-    for row in rows:
-        try:
-            selection = selector.select(row.key, row.encoded, dtype_name(row.dtype), row.shape)
-        except EncodingRefusal as exc:
-            return Servability(False, by_alias, routes, str(exc), exc.code)
-        routes[selection.provider.route] = routes.get(selection.provider.route, 0) + 1
-    return Servability(True, by_alias, routes, "", "")
+        by_alias[row.encoded.alias] = by_alias.get(row.encoded.alias, 0) + 1
+    if isinstance(answer, ResolvedExecutionPlan):
+        return Servability(True, by_alias, answer.route_census(), "", "")
+    summary = {"no_rows", "unconsented", "unscored", "eligible", "chosen", "chosen_uncalibrated"}
+    for step in answer.walk:
+        verdict = str(step.get("verdict", ""))
+        if verdict in summary:
+            continue
+        code = "encoding_unqualified" if verdict == "unqualified" else verdict
+        if code in REFUSALS:
+            return Servability(False, by_alias, {}, str(step.get("why", "")), code)
+    return Servability(False, by_alias, {}, answer.detail, "plan_unresolved")
+
+
+def servability_for_script(
+    rows: Sequence[PlanRow],
+    *,
+    release: str,
+    providers: Mapping[str, Any],
+    capabilities: Capabilities,
+    device: DeviceFacts,
+    facts_dir: str,
+    store: str = "synthetic",
+    snapshot: str = "synthetic",
+    objective: str = "latency",
+    encoded_leaves: str = "accept",
+) -> Servability:
+    """The honesty answer for a DRIVER SCRIPT: resolve a `script_plan`, then derive.
+
+    Header work only — no tensor bytes move — through the same `resolve()` the executor
+    uses, so what a script prints as servable is what a worker would execute.
+    """
+    from cozy_runtime.internal.derive import torch_module
+    from cozy_runtime.internal.encoding import measure_runtime
+    from cozy_runtime.internal.planfacts import PlanFacts
+    from cozy_runtime.internal.resolution import script_plan
+
+    try:
+        answer: ResolvedExecutionPlan | PlanRefusal = script_plan(
+            rows=rows,
+            components=sorted({row.component for row in rows}),
+            release=release,
+            store=store,
+            snapshot=snapshot,
+            providers=providers,
+            capabilities=capabilities,
+            device=device,
+            runtime=measure_runtime(torch_module(), release),
+            facts=PlanFacts(facts_dir),
+            objective=objective,
+            encoded_leaves=encoded_leaves,
+            dtype_name=dtype_name,
+        )
+    except PlanRefusal as exc:
+        answer = exc
+    return servability(rows, answer)
 
 
 def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
@@ -791,6 +826,7 @@ class StreamingFillBackend:
         checkpoint: Checkpoint | Mapping[str, Checkpoint],
         rows: Sequence[PlanRow],
         *,
+        plan: ResolvedExecutionPlan,
         device: str = "cuda",
         window_bytes: int = 16 << 20,
         slots: int = 16,
@@ -802,7 +838,6 @@ class StreamingFillBackend:
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
-        objective: str = "kernel_numeric_error",
         forensics_dir: str = "",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
@@ -915,23 +950,33 @@ class StreamingFillBackend:
                 release=release,
                 cache=Path(probe_cache) if probe_cache else None,
             )
-        #: The DEPLOYMENT's stated axis, the same field `DeliveryChooser` reads, carried
-        #: down so both choices are made under one objective. Defaulted to
-        #: `kernel_numeric_error` rather than to `latency`: an unstated objective must not be
-        #: the one that trades numerics for bytes, and #517d measured that trade at 4.1 dB.
-        #: RENAMED from `fidelity` (#549.11) — the axis is a kernel diagnostic, and quality
-        #: is a paired video+audio eval the eval plane owns.
-        self.objective = objective
-        self.selector = Selector(self.providers, self.capabilities, self.device_facts, objective)
-        #: THE SERVABILITY ANSWER, given here — before `expect` acquires a lease, before a
-        #: destination is reserved, before a byte moves. `fill()` re-selects per key and
-        #: would refuse too, but one tensor into a 532-tensor artifact is not when a worker
-        #: should discover it cannot serve the encoding it was handed, and a per-key refusal
-        #: names a key where the honest answer names the ENCODING (#501f's runtime twin).
-        self.servability = servability(rows, self.selector)
-        self.servability.require()
-        #: The provider chosen for each destination, resolved in `fill` before a byte moves.
-        self.selected: dict[str, Selection] = {}
+        #: THE RESOLVED PLAN IS THE EXECUTABLE AUTHORITY (cr-025). Every route, provider and
+        #: geometry this plane will execute is read from it by contract key; nothing below
+        #: this line runs a `Selector`. Its digest is what entered generation identity, so a
+        #: mismatch between it and what this checkpoint/build/device can do is
+        #: `plan_divergence`, refused before a byte moves — never re-chosen.
+        self.execution = plan
+        self.resolved: dict[str, TensorResolution] = plan.by_key()
+        planned, held = set(self.resolved), set(self.plan)
+        if planned != held:
+            raise _refuse(
+                "plan_divergence",
+                f"the resolved plan [{plan.digest()[:19]}…] names {len(planned)} destinations "
+                f"and this checkpoint set supplies {len(held)}: missing from the plan "
+                f"{sorted(held - planned)[:3]}, absent from the checkpoint "
+                f"{sorted(planned - held)[:3]} — the plan was resolved over different rows",
+                sorted(planned ^ held)[:6],
+            )
+        #: THE SERVABILITY ANSWER, derived from the plan (#501f's runtime twin): a resolved
+        #: plan exists only where every tensor has a qualified route on this device.
+        self.servability = servability(rows, plan)
+        #: EVERY destination's provider, matched by digest HERE — at construction, before a
+        #: lease is taken, a destination reserved or the consent gate consulted. The match is
+        #: pure (this build's providers, this device's records), so a divergence refuses with
+        #: nothing allocated; `fill` reads this map and never selects.
+        self.selected: dict[str, Selection] = {
+            key: self._select(key, row) for key, row in self.plan.items()
+        }
         #: Transient device buffers holding STORED role bytes. They exist between the
         #: stream and the decode and never outlive one component's fill.
         self.scratch: dict[str, dict[str, Any]] = {}
@@ -965,6 +1010,146 @@ class StreamingFillBackend:
         #: agreed with it. `materialize` writes it, `_reconcile_leaves` checks the
         #: substitution against it and writes the new one.
         self.census_keys: dict[str, frozenset[str]] = {}
+
+    # -- plan execution (cr-025) --------------------------------------------------
+
+    def _select(self, key: str, row: PlanRow) -> Selection:
+        """The plan's answer for one destination, MATCHED BY DIGEST against this build.
+
+        The plan names an implementation digest, a route, a validated geometry and an output
+        dtype. This finds the provider in this build whose `implementation_digest` is exactly
+        that, and the capability record on THIS device for it. Anything that does not match
+        is `plan_divergence`: the tensor is not the tensor the plan priced, this build does
+        not carry the implementation the plan chose, or this card was never measured under
+        it. The plane refuses; it never selects a substitute.
+
+        `Selection.record` is therefore the RE-MATCHED record, not the one resolution ranked
+        — the two coincide whenever the plan was resolved on this device with this build,
+        and a record that is absent now is a divergence rather than a permission.
+        """
+        resolved = self.resolved.get(key)
+        if resolved is None:
+            raise _refuse("plan_divergence", f"{key}: the resolved plan names no such destination", [key])
+        actual = (row.encoded.encoding, tuple(row.shape), dtype_name(row.dtype))
+        planned = (resolved.encoding, tuple(resolved.geometry), resolved.output_dtype)
+        if actual != planned:
+            raise _refuse(
+                "plan_divergence",
+                f"{key}: the plan priced encoding/geometry/dtype {planned} and the checkpoint "
+                f"holds {actual} — the plan was resolved over different bytes",
+                [key],
+            )
+        provider = next(
+            (
+                c
+                for c in self.providers.get(row.encoded.encoding, ())
+                if implementation_digest(c) == resolved.implementation_digest
+            ),
+            None,
+        )
+        if provider is None or str(provider.route) != resolved.route:
+            raise _refuse(
+                "plan_divergence",
+                f"{key}: the plan executes {resolved.implementation} "
+                f"[{resolved.implementation_digest[:19]}…, {resolved.route}] and this build "
+                + (
+                    "carries no implementation with that digest"
+                    if provider is None
+                    else f"has it on route {provider.route!r}"
+                )
+                + " — the runtime that resolved the plan is not the runtime executing it",
+                [key],
+            )
+        records = self.capabilities.qualified(
+            row.encoded.encoding,
+            self.device_facts,
+            resolved.output_dtype,
+            {resolved.implementation_digest: provider},
+        )
+        if not records:
+            raise _refuse(
+                "plan_divergence",
+                f"{key}: the plan executes {resolved.implementation} and "
+                f"{device_line(self.device_facts)} holds no capability record for it — the "
+                "plan was resolved on a device this one is not",
+                [key],
+            )
+        return Selection(provider, records[0], row.encoded, resolved.reason)
+
+    @classmethod
+    def for_script(
+        cls,
+        checkpoint: Checkpoint | Mapping[str, Checkpoint],
+        rows: Sequence[PlanRow],
+        *,
+        release: str,
+        store: str,
+        snapshot: str,
+        objective: str = "latency",
+        placement: str = "all_resident",
+        encoded_leaves: str = "accept",
+        probe_cache: str | Path | None = None,
+        device: str = "cuda",
+        **kwargs: Any,
+    ) -> StreamingFillBackend:
+        """A backend for a DRIVER SCRIPT with no model class: resolve, then construct.
+
+        The small script-facing plan builder cr-025 asked for. It measures the device, launches
+        the providers, runs the qualification suite once, resolves a `script_plan` over these
+        rows under the stated objective, and hands that plan to the constructor — so a script
+        fills through exactly the authority the executor does. A refusal is the resolver's
+        `PlanRefusal`, surfaced untranslated: the script asked a plan question.
+        """
+        from cozy_runtime.internal.derive import torch_module
+        from cozy_runtime.internal.encoding import measure_runtime
+        from cozy_runtime.internal.planfacts import PlanFacts
+        from cozy_runtime.internal.probe import qualify
+        from cozy_runtime.internal.resolution import script_plan
+
+        torch = torch_module()
+        index = torch.device(device).index or 0
+        facts = measure_device(torch, index)
+        providers = launch_providers()
+        qualified = qualify(
+            torch,
+            providers,
+            facts,
+            sorted({dtype_name(row.dtype) for row in rows}),
+            release=release,
+            cache=Path(probe_cache) if probe_cache else None,
+        )
+        components = sorted({row.component for row in rows})
+        plan = script_plan(
+            rows=rows,
+            components=components,
+            release=release,
+            store=store,
+            snapshot=snapshot,
+            snapshots=(
+                {name: book.snapshot_id for name, book in checkpoint.items()}
+                if isinstance(checkpoint, Mapping)
+                else {}
+            ),
+            providers=providers,
+            capabilities=qualified[0],
+            device=facts,
+            runtime=measure_runtime(torch, release),
+            facts=PlanFacts(str(probe_cache) if probe_cache else "."),
+            objective=objective,
+            placement=placement,
+            encoded_leaves=encoded_leaves,
+            dtype_name=dtype_name,
+        )
+        return cls(
+            checkpoint,
+            rows,
+            plan=plan,
+            device=device,
+            probe_cache=probe_cache,
+            release=release,
+            qualified=qualified,
+            **kwargs,
+        )
 
     # -- reservation -------------------------------------------------------------
 
@@ -1009,9 +1194,9 @@ class StreamingFillBackend:
         topology is not a placement, it is a different construction.
 
         THE CONSENT GATE IS FIRST, before a byte of device memory is reserved. Every row's
-        route is already known — `__init__` surveyed them for `servability` — so an
-        endpoint that did not declare `encoded_leaves="accept"` and was handed an artifact
-        whose only qualified route replaces modules refuses HERE, with nothing allocated
+        route is the resolved plan's — so an
+        endpoint that did not declare `encoded_leaves="accept"` and was handed a plan
+        that replaces modules refuses HERE, with nothing allocated
         and nothing to undo. Discovering it at the decode, with the component resident,
         would mean rolling back gigabytes to deliver an answer that was knowable from the
         header.
@@ -1020,14 +1205,7 @@ class StreamingFillBackend:
         from cozy_runtime.internal.derive import placing
 
         self.encoded_leaves = encoded_leaves
-        native = sorted(
-            row.key
-            for row in self.plan.values()
-            if self.selector.select(
-                row.key, row.encoded, dtype_name(row.dtype), row.shape
-            ).provider.route
-            == "encoded_gemm"
-        )
+        native = sorted(k for k, t in self.resolved.items() if t.route == "encoded_gemm")
         if native and encoded_leaves != "accept":
             raise _refuse(
                 "leaf_unconsented",
@@ -1160,7 +1338,7 @@ class StreamingFillBackend:
     # -- the arithmetic, before a byte moves -------------------------------------
 
     def device_envelope(self) -> dict[str, Any]:
-        """What this fill WILL hold on the card, priced from the header and the routes.
+        """What this fill WILL hold on the card, priced from the header and the PLAN's routes.
 
         THE STORED SIZE IS NOT THE RESIDENT SIZE. An fp8-stored tensor served through the
         decode floor occupies its LOGICAL bytes on the device — bf16 destinations of fp8
@@ -1189,9 +1367,7 @@ class StreamingFillBackend:
                     row.component,
                     int(row.nbytes),
                     int(row.stored_nbytes),
-                    self.selector.select(
-                        row.key, row.encoded, dtype_name(row.dtype), row.shape
-                    ).provider.route,
+                    self.resolved[row.key].route,
                 )
                 for row in self.plan.values()
             ],
@@ -1238,17 +1414,10 @@ class StreamingFillBackend:
                 "destination that wants another dtype is a different construction",
                 [key],
             )
-        # SELECTION, before a byte moves. The provider comes from this tensor's own
-        # encoding digest, this tensor's own GEOMETRY (#549.5) and the device's qualification
-        # record; an unregistered encoding, an unreviewed spec, a shape no implementation
-        # consumes, an unqualified device or a role set no decoder accounts for all refuse
-        # HERE, where the generation has nothing to undo.
-        try:
-            self.selected[key] = self.selector.select(
-                key, row.encoded, dtype_name(row.dtype), row.shape
-            )
-        except EncodingRefusal as exc:
-            raise _refuse(exc.code, str(exc), exc.fields) from exc
+        # PLAN EXECUTION (cr-025): the provider was matched by digest at construction and is
+        # read here, never selected. A key the plan does not name cannot reach this line —
+        # `row` came from the same table the construction-time match covered.
+        assert key in self.selected, key
         if str(getattr(tensor, "device", "")) != self.device_str:
             raise _refuse(
                 "destination_absent",

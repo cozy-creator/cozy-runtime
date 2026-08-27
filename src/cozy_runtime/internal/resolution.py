@@ -286,6 +286,10 @@ class ResolvedExecutionPlan:
 
     # ------------------------------------------------------------------ derived facts
 
+    def by_key(self) -> dict[str, TensorResolution]:
+        """contract key -> its resolution. The fill plane EXECUTES this map (cr-025)."""
+        return {row.key: row for row in self.tensors}
+
     def route_census(self) -> dict[str, int]:
         census: dict[str, int] = {}
         for row in self.tensors:
@@ -779,6 +783,64 @@ def resolve(
             for r in walk
         ),
         walk,
+    )
+
+
+def script_plan(
+    *,
+    rows: Sequence[Any],
+    components: Sequence[str],
+    release: str,
+    store: str,
+    snapshot: str,
+    providers: Mapping[str, Any],
+    capabilities: Any,
+    device: DeviceFacts,
+    runtime: RuntimeIdentity,
+    facts: PlanFacts,
+    dtype_name: Any,
+    snapshots: Mapping[str, str] | None = None,
+    objective: str = "latency",
+    placement: str = "all_resident",
+    encoded_leaves: str = "accept",
+) -> ResolvedExecutionPlan:
+    """MODEL-LESS resolution for a driver script: one reference variant, these header rows.
+
+    cr-025's one-selection-authority law says the fill plane executes a resolved plan and
+    never selects below it. The executor resolves through `resolve()` with the model
+    class's own construction facts; a GPU driver script fills a raw component with no
+    model class at all, so this builds the construction identity from the rows alone
+    (`script:<components>`, the empty config) and runs THE SAME `resolve()`. Nothing here
+    is a second chooser: every candidate, score and confession is `resolve()`'s.
+    """
+    construction = ConstructionFacts(
+        release=release,
+        model_class="script:" + "+".join(components),
+        config_digest=canonical.digest({}),
+        topology_digest=canonical.digest(
+            {
+                row.key: [list(row.shape), dtype_name(row.dtype), row.encoded.alias]
+                for row in sorted(rows, key=lambda r: str(r.key))
+            }
+        ),
+        components=tuple(components),
+    )
+    variant = Variant(
+        name="script", store=store, snapshot=snapshot, snapshots=dict(snapshots or {}), reference=True
+    )
+    return resolve(
+        variants=[variant],
+        rows_for={"script": list(rows)},
+        providers=providers,
+        capabilities=capabilities,
+        device=device,
+        runtime=runtime,
+        construction=construction,
+        facts=facts,
+        objective=objective,
+        placement=placement,
+        encoded_leaves=encoded_leaves,
+        dtype_name=dtype_name,
     )
 
 

@@ -560,9 +560,12 @@ def section_sources(args: argparse.Namespace) -> None:
     have = snapshots()
     checkpoints = {name: Checkpoint(str(STORE), have[name]) for name in COMPONENTS}
     rows = [row for name in COMPONENTS for row in checkpoints[name].rows(name)]
-    backend = StreamingFillBackend(
+    backend = StreamingFillBackend.for_script(
         checkpoints,
         rows,
+        release=RELEASE,
+        store=str(STORE),
+        snapshot=have["unet"],
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
@@ -643,8 +646,16 @@ def section_poison(args: argparse.Namespace) -> None:
     have = snapshots()
     checkpoints = {"vae": Checkpoint(str(STORE), have["vae"])}
     rows = checkpoints["vae"].rows("vae")
-    backend = StreamingFillBackend(
-        checkpoints, rows, window_bytes=4 * MIB, slots=16, readers=16, inflight=8
+    backend = StreamingFillBackend.for_script(
+        checkpoints,
+        rows,
+        release="cr-008b",
+        store=str(STORE),
+        snapshot=have["vae"],
+        window_bytes=4 * MIB,
+        slots=16,
+        readers=16,
+        inflight=8,
     )
     backend.hold_lease = True
     config = json.loads(CONFIG.read_text())
@@ -955,9 +966,12 @@ def fill_once(component: str) -> dict[str, Any]:
     spellings = {name: getattr(torch, torch_name) for name, torch_name in TORCH_DTYPES.items()}
     checkpoint = Checkpoint(str(STORE), snapshots()[component])
     rows = checkpoint.rows(component)
-    backend = Backend(
+    backend = Backend.for_script(
         {component: checkpoint},
         rows,
+        release=RELEASE,
+        store=str(STORE),
+        snapshot=snapshots()[component],
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
