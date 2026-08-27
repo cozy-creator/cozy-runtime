@@ -76,6 +76,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             installed_receipt_digest=prepared.installed.receipt_digest,
             placement_set_digest=prepared.placement_set_digest,
             gpus=gpus,
+            artifact_sources=prepared.artifact_sources,
+            network_cache_degradations=prepared.network_cache_degradations,
         )
         readiness.publish(config.receipt_payload_path, payload)
         return _supervise(process)
@@ -139,7 +141,7 @@ def _start_worker(
             "PYTHONNOUSERSITE": "1",
         }
     )
-    grant_roots = f"{MEDIA_ROOT},{prepared.spec['capacity']['cache_mount_path']}"
+    grant_roots = str(MEDIA_ROOT)
     command = [
         sys.executable,
         "-I",

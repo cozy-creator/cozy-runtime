@@ -10,7 +10,7 @@ import ssl
 import subprocess
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -224,18 +224,49 @@ def receipt_payload(
     installed_receipt_digest: str,
     placement_set_digest: str,
     gpus: list[RuntimeGPU],
+    artifact_sources: Mapping[str, Mapping[str, int]],
+    network_cache_degradations: Sequence[str],
 ) -> bytes:
+    expected_sources = {"cloud", "local", "network_cache"}
+    if set(artifact_sources) != expected_sources or any(
+        set(row) != {"bytes", "objects"}
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in row.values()
+        )
+        for row in artifact_sources.values()
+    ):
+        raise LaunchRefusal("artifact_source_evidence_invalid", "source rows are not closed counts")
+    degradations = list(network_cache_degradations)
+    if degradations != sorted(set(degradations)) or any(
+        value
+        not in {
+            "backfill_unavailable",
+            "corrupt",
+            "read_unavailable",
+            "unavailable",
+        }
+        for value in degradations
+    ):
+        raise LaunchRefusal(
+            "network_cache_evidence_invalid", "degradations are not a canonical closed set"
+        )
     network = spec["network"]
     return canonical.write(
         {
             "acquisition_attempt_id": spec["acquisition_attempt_id"],
             "acquisition_attempt_ordinal": spec["acquisition_attempt_ordinal"],
+            "artifact_sources": {
+                source: {"bytes": row["bytes"], "objects": row["objects"]}
+                for source, row in artifact_sources.items()
+            },
             "format": "cozy.pod-readiness/1",
             "media_foreign_credential_refused": True,
             "media_internal_port": network["media_port"],
             "media_listener_bound": True,
             "media_protocol": network["media_protocol"],
             "measured_installed_environment_receipt_digest": installed_receipt_digest,
+            "network_cache_degradations": degradations,
             "observed_renter_token_sha256": spec["renter_token_sha256"],
             "pod_boot_id": pod_boot_id_value,
             "provider_pod_id": provider_pod_id,

@@ -161,8 +161,15 @@ def main() -> int:
             {"artifact_grants": []},
             empty_object_set,
             deadline=int(time.time()) + 60,
+            store_root=root / "empty-local-store",
         )
-        assert empty_store == root / "empty-cache" / "tensorfs" and empty_store.is_dir()
+        assert empty_store.store == root / "empty-local-store" and empty_store.store.is_dir()
+        assert not (root / "empty-cache" / "tensorfs").exists()
+        assert empty_store.sources == {
+            "cloud": {"bytes": 0, "objects": 0},
+            "local": {"bytes": 0, "objects": 0},
+            "network_cache": {"bytes": 0, "objects": 0},
+        }
 
         snapshot = "a" * 64
 
@@ -541,11 +548,18 @@ def main() -> int:
                     "pci_bus_id": "00000000:01:00.0",
                 }
             ],
+            artifact_sources={
+                "cloud": {"bytes": 0, "objects": 0},
+                "local": {"bytes": 36, "objects": 2},
+                "network_cache": {"bytes": 0, "objects": 0},
+            },
+            network_cache_degradations=(),
         )
         receipt = canonical.parse_canonical(payload)
         assert isinstance(receipt, dict)
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
+        assert receipt["artifact_sources"]["local"] == {"bytes": 36, "objects": 2}
         readiness.publish(config.receipt_payload_path, payload)
         assert config.receipt_payload_path.read_bytes() == payload
         readiness.publish(config.receipt_payload_path, payload)

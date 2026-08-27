@@ -34,8 +34,12 @@ WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 PROVISION_SPEC_FORMAT = "tensorhub.rental_provision_spec/1"
 PROVISION_BUNDLE_FORMAT = "tensorhub.rental_provision_bundle/1"
 CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
-PROVISION_ROOT = Path("/var/lib/cozy/provision")
-ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
+# execution-substrates creates and grants the runtime exactly this container-local data root.
+# Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
+LOCAL_DATA_ROOT = Path("/var/lib/cozy")
+PROVISION_ROOT = LOCAL_DATA_ROOT / "provision"
+ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
+LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
 PLANS_ROOT = Path("/run/cozy/binding-plans")
 BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
 REQUIRED_DOCUMENT_ROLES = (
@@ -69,6 +73,15 @@ class PreparedLaunch:
     placement_set_digest: str
     artifact_store: Path
     artifact_object_set: Path
+    artifact_sources: dict[str, dict[str, int]]
+    network_cache_degradations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedObjects:
+    store: Path
+    sources: dict[str, dict[str, int]]
+    network_cache_degradations: tuple[str, ...]
 
 
 def prepare_launch(
@@ -77,6 +90,7 @@ def prepare_launch(
     uv: Path,
     provision_root: Path = PROVISION_ROOT,
     environment_root: Path = ENVIRONMENT_ROOT,
+    artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
     plans_root: Path = PLANS_ROOT,
     control_runtime_wheel: Path = CONTROL_RUNTIME_WHEEL,
 ) -> PreparedLaunch:
@@ -116,7 +130,14 @@ def prepare_launch(
         for row in bundle["artifact_grants"]
         if row["digest"] not in object_digests
     }
-    release = _join_release(spec, bundle, document_bytes, artifact_paths, object_set)
+    release = _join_release(
+        spec,
+        bundle,
+        document_bytes,
+        artifact_paths,
+        object_set,
+        store_root=artifact_store_root,
+    )
     granted = {str(row["digest"]) for row in bundle["artifact_grants"]}
     required = set(release["required_artifacts"]) | object_digests
     if granted != required:
@@ -124,11 +145,12 @@ def prepare_launch(
             "artifact_grants_mismatch",
             f"missing={sorted(required - granted)} extra={sorted(granted - required)}",
         )
-    artifact_store = _materialize_objects(
+    materialized_objects = _materialize_objects(
         spec,
         bundle,
         object_set,
         deadline=config.readiness_deadline_unix,
+        store_root=artifact_store_root,
     )
     source = environment_input(
         environment_spec_bytes=document_bytes["endpoint_environment_spec"],
@@ -150,8 +172,10 @@ def prepare_launch(
         endpoint_release=release["endpoint_release"],
         installed=installed,
         placement_set_digest=_digest(document_bytes["initial_placement_set"]),
-        artifact_store=artifact_store,
+        artifact_store=materialized_objects.store,
         artifact_object_set=document_paths["artifact_object_set"],
+        artifact_sources=materialized_objects.sources,
+        network_cache_degradations=materialized_objects.network_cache_degradations,
     )
 
 
@@ -472,6 +496,8 @@ def _join_release(
     docs: Mapping[str, bytes],
     artifacts: Mapping[str, Path],
     object_set: provisioned.ArtifactObjectSet,
+    *,
+    store_root: Path,
 ) -> dict[str, Any]:
     grants = {row["role"]: row for row in bundle["documents"]}
     if set(docs) != set(REQUIRED_DOCUMENT_ROLES):
@@ -626,7 +652,7 @@ def _join_release(
             plans,
             read_document=read_document,
             endpoint_release=str(endpoint["endpoint_release_id"]),
-            store_root=Path(str(spec["capacity"]["cache_mount_path"])) / "tensorfs",
+            store_root=store_root,
             object_set=object_set,
             dtype_widths=dtype_widths,
         )
@@ -692,24 +718,34 @@ def _materialize_objects(
     object_set: provisioned.ArtifactObjectSet,
     *,
     deadline: int,
-) -> Path:
-    """Admit every exact root closure into the substrate's attached TensorFS store."""
+    store_root: Path,
+) -> MaterializedObjects:
+    """Admit each exact model closure into the required worker-local TensorFS CAS."""
 
     grants = {str(row["digest"]): row for row in bundle["artifact_grants"]}
-    required = set(object_set.refs)
+    refs = object_set.refs
+    required = set(refs)
     missing = sorted(required - set(grants))
     if missing:
         raise LaunchRefusal("object_grant_missing", missing[0])
     cache_mount = Path(str(spec["capacity"]["cache_mount_path"]))
     if not cache_mount.is_absolute() or cache_mount == Path("/"):
         raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path is not specific")
-    store_root = cache_mount / "tensorfs"
-    if not object_set.roots:
-        _directory(store_root)
-        return store_root
+    cache_root = cache_mount / "tensorfs"
+    _require_separate_store_roots(store_root, cache_mount, cache_root)
+    degradations: set[str] = set()
+    source_by_object: dict[str, str] = {}
     try:
+        if not object_set.roots:
+            _directory(store_root)
+            return MaterializedObjects(
+                store=store_root,
+                sources=_source_usage(source_by_object, refs),
+                network_cache_degradations=(),
+            )
         tensorfs = fill.tensorfs_module()
         store = pull.open_store(tensorfs, store_root)
+        cache_store = _open_cache_store(tensorfs, cache_mount, cache_root, degradations)
         for group in object_set.roots:
             closure = (group.root, *group.objects)
             rows = sorted(
@@ -723,7 +759,7 @@ def _materialize_objects(
                 ),
                 key=lambda row: row.object_id,
             )
-            pull.pull_granted_snapshot(
+            outcome = pull.pull_granted_snapshot(
                 tensorfs,
                 store,
                 group.root.digest,
@@ -731,14 +767,99 @@ def _materialize_objects(
                 rows,
                 timeout=max(float(deadline) - time.time(), 0.001),
                 session="provision-" + group.root.digest.removeprefix("sha256:")[:12],
+                cache_store=cache_store,
             )
+            for object_id, source in outcome.sources.items():
+                source_by_object.setdefault(object_id, source)
+            degradations.update(outcome.cache_degradations)
+        if set(source_by_object) != required:
+            raise LaunchRefusal(
+                "object_materialization_refused", "source evidence does not cover the object set"
+            )
+    except LaunchRefusal:
+        raise
     except pull.PullRefusal as exc:
         raise LaunchRefusal("object_materialization_refused", f"{exc.code}: {exc.message}") from exc
     except Exception as exc:
         raise LaunchRefusal(
             "object_materialization_refused", f"TensorFS unavailable: {type(exc).__name__}"
         ) from exc
-    return store_root
+    return MaterializedObjects(
+        store=store_root,
+        sources=_source_usage(source_by_object, refs),
+        network_cache_degradations=tuple(sorted(degradations)),
+    )
+
+
+def _open_cache_store(
+    tensorfs: Any, cache_mount: Path, cache_root: Path, degradations: set[str]
+) -> Any | None:
+    try:
+        if not stat.S_ISDIR(cache_mount.stat().st_mode):
+            raise NotADirectoryError(cache_mount)
+        return pull.open_store(tensorfs, cache_root)
+    except (OSError, pull.PullRefusal):
+        degradations.add("unavailable")
+        return None
+
+
+def _source_usage(
+    source_by_object: Mapping[str, str], refs: Mapping[str, int]
+) -> dict[str, dict[str, int]]:
+    usage = {source: {"bytes": 0, "objects": 0} for source in ("cloud", "local", "network_cache")}
+    for object_id, source in source_by_object.items():
+        row = usage.get(source)
+        if row is None or object_id not in refs:
+            raise LaunchRefusal("object_materialization_refused", "invalid source evidence")
+        row["bytes"] += refs[object_id]
+        row["objects"] += 1
+    return usage
+
+
+def _require_separate_store_roots(local_store: Path, cache_mount: Path, cache_root: Path) -> None:
+    """Refuse lexical, symlink, and bind-mount aliases before either store can be touched."""
+
+    def overlaps(left: Path, right: Path) -> bool:
+        return left == right or left in right.parents or right in left.parents
+
+    lexical_local = Path(os.path.abspath(local_store))
+    lexical_mount = Path(os.path.abspath(cache_mount))
+    lexical_cache = Path(os.path.abspath(cache_root))
+    if overlaps(lexical_local, lexical_mount) or overlaps(lexical_local, lexical_cache):
+        raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths overlap")
+    try:
+        resolved_local = local_store.resolve(strict=False)
+        resolved_mount = cache_mount.resolve(strict=False)
+        resolved_cache = cache_root.resolve(strict=False)
+    except OSError:
+        resolved_local, resolved_mount, resolved_cache = (
+            lexical_local,
+            lexical_mount,
+            lexical_cache,
+        )
+    if overlaps(resolved_local, resolved_mount) or overlaps(resolved_local, resolved_cache):
+        raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
+
+    local_lineage = (local_store, *local_store.parents[:-1])
+    cache_lineage = (cache_mount, *cache_mount.parents[:-1])
+    try:
+        if any(
+            candidate.exists() and os.path.samefile(candidate, cache_mount)
+            for candidate in local_lineage
+        ) or any(
+            candidate.exists() and os.path.samefile(candidate, local_store)
+            for candidate in cache_lineage
+        ):
+            raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
+        if (
+            cache_root.exists()
+            and local_store.exists()
+            and os.path.samefile(local_store, cache_root)
+        ):
+            raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
+    except OSError:
+        # An unavailable cache is allowed; lexical and resolvable aliases have already refused.
+        return
 
 
 def _ref(value: object, name: str, *, allow_extra: bool = False) -> dict[str, Any]:
