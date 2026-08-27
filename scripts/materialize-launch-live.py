@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from cozy_runtime.internal import canonical, readiness
+from cozy_runtime.internal import canonical, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
@@ -108,6 +108,64 @@ def main() -> int:
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
+
+        snapshot = "a" * 64
+
+        class FakeStore:
+            def __init__(self, path: Path) -> None:
+                self.root = path
+
+        class FakeTensorFS:
+            def __init__(self) -> None:
+                self.completed = False
+
+            def fetch_plan(
+                self,
+                _store: FakeStore,
+                _session: str,
+                root_digest: str,
+                root_length: int,
+                declared: list[tuple[str, int]],
+            ) -> dict[str, object]:
+                assert root_digest == snapshot and root_length == 17
+                assert declared == [("sha256:" + "b" * 64, 19)]
+                return {
+                    "document": b"tensorfs-plan",
+                    "held": [("sha256:" + snapshot, 17), *declared],
+                    "held_bytes": 36,
+                    "presence": {},
+                    "wanted": [],
+                    "wanted_bytes": 0,
+                }
+
+            def fetch_complete(self, _store: FakeStore, document: bytes) -> None:
+                assert document == b"tensorfs-plan"
+                self.completed = True
+
+        tensorfs = FakeTensorFS()
+        outcome = pull.pull_granted_snapshot(
+            tensorfs,
+            FakeStore(root / "store"),
+            "sha256:" + snapshot,
+            17,
+            [
+                pull.Read("sha256:" + snapshot, 17, "https://delivery.invalid/root"),
+                pull.Read("sha256:" + "b" * 64, 19, "https://delivery.invalid/object"),
+            ],
+        )
+        assert tensorfs.completed and outcome.held == 2 and outcome.fetched == 0
+        try:
+            pull.pull_granted_snapshot(
+                tensorfs,
+                FakeStore(root / "store"),
+                snapshot,
+                17,
+                [pull.Read("sha256:" + snapshot, 17, "http://delivery.invalid/root")],
+            )
+        except pull.PullRefusal as exc:
+            assert exc.code == "artifact_incomplete"
+        else:
+            raise AssertionError("plaintext direct object grant was accepted")
 
         boot_raw = bytes(range(32))
         boot_id = base64.urlsafe_b64encode(boot_raw).rstrip(b"=").decode()
