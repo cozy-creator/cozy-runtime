@@ -179,7 +179,12 @@ class Config:
                     f"{where} document digest {document_digest!r} is not sha256:<64 lowercase hex>",
                     code="config_digest",
                 )
-            measured = document_digest
+            if document_digest != measured:
+                raise ConformanceError(
+                    f"{where} document digest {document_digest} does not match its exact "
+                    f"canonical bytes {measured}",
+                    code="config_digest",
+                )
         object.__setattr__(self, "_data", frozen)
         object.__setattr__(self, "_document_digest", measured)
         object.__setattr__(self, "_where", where)
