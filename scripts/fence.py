@@ -41,6 +41,7 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
+GENERATED_PROTOCOL_PREFIX = "cozy.worker.v1"
 # The author surface is import-fenced to stdlib + schema/typing libraries only.
 AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec",)
 # The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
@@ -127,6 +128,14 @@ def fence_package_imports() -> list[str]:
         }
         for name in imports(tree):
             rel = path.relative_to(ROOT)
+            if pkg != "protocol" and (
+                name == GENERATED_PROTOCOL_PREFIX
+                or name.startswith(GENERATED_PROTOCOL_PREFIX + ".")
+            ):
+                bad.append(
+                    f"{rel}: Runtime modules must import generated bindings through "
+                    "cozy_runtime.protocol"
+                )
             if any(name == f or name.startswith(f + ".") for f in forbidden):
                 bad.append(f"{rel}: {module_of(path)} may not import {name}")
             root = name.split(".")[0]

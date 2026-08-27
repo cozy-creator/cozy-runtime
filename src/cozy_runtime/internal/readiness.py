@@ -16,11 +16,11 @@ from typing import Any, TypedDict
 
 import grpc
 
-from cozy.worker.v1 import worker_pb2 as pb
-from cozy.worker.v1 import worker_pb2_grpc as pb_grpc
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.materialize_launch import LaunchRefusal
 from cozy_runtime.protocol import SCHEMA_DIGEST_RAW, WIRE_MINOR
+from cozy_runtime.protocol import worker_pb2 as pb
+from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 MAX_HTTP_PROOF_BYTES = 64 << 10
 WORKER_TLS_SERVER_NAME = "cozy-worker"
