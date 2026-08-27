@@ -70,6 +70,10 @@ class ToyModel(Model[Pipeline]):
         return None
 
 
+class HiddenToyModel(ToyModel):
+    pass
+
+
 app = App()
 
 
@@ -80,6 +84,12 @@ def metadata(payload: Request) -> Result:
 
 @app.entrypoint
 def render(payload: Request, model: ToyModel) -> Result:
+    model.touch()
+    return Result(payload.value)
+
+
+@app.entrypoint(hidden=True)
+def hidden_render(payload: Request, model: HiddenToyModel) -> Result:
     model.touch()
     return Result(payload.value)
 """
@@ -169,7 +179,17 @@ class Module:
     _non_persistent_buffers_set = set()
 
     def __init__(self):
-        self.weight = Parameter()
+        self._parameters = {}
+        self._buffers = {}
+        self.register_parameter("weight", Parameter())
+
+    def register_parameter(self, name, value):
+        self._parameters[name] = value
+        setattr(self, name, value)
+
+    def register_buffer(self, name, value, persistent=True):
+        self._buffers[name] = value
+        setattr(self, name, value)
 
     def state_dict(self):
         return {"weight": self.weight}
@@ -255,6 +275,13 @@ def main() -> None:
         config = canonical.write({"width": 4})
         descriptor_path = _descriptor(root)
         descriptor_bytes = descriptor_path.read_bytes()
+        descriptor_doc = json.loads(descriptor_bytes)
+        assert isinstance(descriptor_doc, dict)
+        assert [
+            row["name"]
+            for row in descriptor_doc["entrypoints"]
+            if isinstance(row, dict) and row.get("hidden") is True
+        ] == ["hidden_render"]
         bundle = canonical.write(
             {
                 "descriptor": _ref(descriptor_bytes),
@@ -369,7 +396,7 @@ def main() -> None:
 
         print(
             "model contract proof live: independent offline materializations produced "
-            "byte-identical receipt/index/MCC bytes; every descriptor function was indexed; "
+            "byte-identical receipt/index/MCC bytes; hidden function omitted; "
             "missing binding refused before output; "
             f"mcc={_digest(contracts[0])}"
         )

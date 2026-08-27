@@ -510,9 +510,10 @@ def _warm_torch() -> None:
 def _derive_all(
     request: ProofRequest, found: Any, descriptor_doc: Mapping[str, Any]
 ) -> dict[str, Any]:
+    surfaces = {surface.name: surface for surface in found.surfaces if not surface.hidden}
     requested = {row.path: row for row in request.bindings}
     actual = {
-        binding.path: binding for surface in found.surfaces for binding in surface.model_bindings
+        binding.path: binding for surface in surfaces.values() for binding in surface.model_bindings
     }
     if set(requested) != set(actual):
         raise ProofRefusal(
@@ -521,7 +522,6 @@ def _derive_all(
             f"extra={sorted(set(requested) - set(actual))}",
         )
 
-    surfaces = {surface.name: surface for surface in found.surfaces}
     documents: dict[str, bytes] = {}
     functions: list[dict[str, Any]] = []
     for collection in ("entrypoints", "jobs"):
@@ -534,7 +534,13 @@ def _derive_all(
                     "model_contract_descriptor_invalid", f"{collection} row is invalid"
                 )
             name = described["name"]
-            surface = surfaces[name]
+            surface = surfaces.get(name)
+            if surface is None:
+                if described.get("hidden") is True:
+                    continue
+                raise ProofRefusal(
+                    "model_contract_descriptor_invalid", f"{collection} surface {name!r} is absent"
+                )
             binding_rows: list[dict[str, Any]] = []
             for binding in surface.model_bindings:
                 source = requested[binding.path]
