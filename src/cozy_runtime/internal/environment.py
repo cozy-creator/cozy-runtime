@@ -160,9 +160,7 @@ def materialize(
     _verify_host_target(target, python, env)
     inspected = _verify_grants(source)
     if expected_receipt_digest and not _DIGEST.fullmatch(expected_receipt_digest):
-        raise EnvironmentRefusal(
-            "environment_receipt_digest_invalid", expected_receipt_digest
-        )
+        raise EnvironmentRefusal("environment_receipt_digest_invalid", expected_receipt_digest)
 
     generations = root / "generations"
     generations.mkdir(parents=True, exist_ok=True)
@@ -221,9 +219,7 @@ def materialize(
             venv, {wheel.distribution: (wheel.version, "") for wheel in install_wheels}
         )
         _verify_installed_target(venv_python, target, env)
-        receipt_bytes = canonical.write(
-            _receipt(source, spec, target, install_wheels, records)
-        )
+        receipt_bytes = canonical.write(_receipt(source, spec, target, install_wheels, records))
         receipt_digest = _sha(receipt_bytes)
         if expected_receipt_digest and receipt_digest != expected_receipt_digest:
             raise EnvironmentRefusal(
@@ -477,9 +473,7 @@ def _inspect_wheel(entry: WheelInventoryEntry, grant: BlobGrant) -> _InspectedWh
     return _InspectedWheel(entry, distribution, version, tags, path)
 
 
-def _verify_installed(
-    venv: Path, expected: Mapping[str, tuple[str, str]]
-) -> dict[str, str]:
+def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> dict[str, str]:
     cfg = venv / "pyvenv.cfg"
     try:
         cfg_text = cfg.read_text()
@@ -545,9 +539,7 @@ def _strip_installer_paths(venv: Path) -> None:
             relative = {path.relative_to(site).as_posix() for path in generated}
             filtered = [row for row in rows if row and row[0] not in relative]
             if len(filtered) != len(rows) - len(generated):
-                raise EnvironmentRefusal(
-                    "installed_path_metadata_unrecorded", str(dist_info)
-                )
+                raise EnvironmentRefusal("installed_path_metadata_unrecorded", str(dist_info))
             filtered.sort(key=lambda row: row[0])
             for path in generated:
                 path.unlink()
@@ -614,9 +606,7 @@ def _receipt(
     }
 
 
-def _verify_host_target(
-    target: PlatformTarget, python: Path, env: Mapping[str, str]
-) -> None:
+def _verify_host_target(target: PlatformTarget, python: Path, env: Mapping[str, str]) -> None:
     system = platform.system().lower()
     machine = platform.machine().lower()
     if machine in {"x86_64", "amd64"}:
@@ -741,9 +731,7 @@ def _stage_wheels(
         if target.stat().st_size != wheel.entry.length or _hash_file(target) != wheel.entry.digest:
             raise EnvironmentRefusal("wheel_stage_mismatch", wheel.entry.digest)
         staged.append(
-            _InspectedWheel(
-                wheel.entry, wheel.distribution, wheel.version, wheel.tags, target
-            )
+            _InspectedWheel(wheel.entry, wheel.distribution, wheel.version, wheel.tags, target)
         )
     return tuple(staged)
 

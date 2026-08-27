@@ -1619,25 +1619,19 @@ class Worker:
                 )
                 return
             generation = (
-                self.options.environment_root
-                / "generations"
-                / expected.removeprefix("sha256:")
+                self.options.environment_root / "generations" / expected.removeprefix("sha256:")
             )
             try:
                 installed = environment.verify_generation(
                     generation,
                     receipt_digest=expected,
-                    environment_spec_digest=documents.spell(
-                        placement.environment_spec_digest
-                    ),
+                    environment_spec_digest=documents.spell(placement.environment_spec_digest),
                 )
             except (environment.EnvironmentRefusal, OSError) as exc:
                 reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
                 unavailable = reason in {"environment_receipt_absent", "io_error"}
                 if not unavailable:
-                    placement.materialization = (
-                        pb.MaterializationState.MATERIALIZATION_STATE_FAILED
-                    )
+                    placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
                 self.latch(
                     pb.Fault(
                         kind=(
@@ -1659,8 +1653,7 @@ class Worker:
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             self.note(
                 "materialization",
-                f"verified receipt {expected[:23]}… at immutable generation "
-                f"{installed.generation}",
+                f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
             )
         missing: list[str] = []
         for plan_id in placement.plan_ids:

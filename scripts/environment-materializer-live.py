@@ -44,9 +44,7 @@ def build_wheel(root: Path, distribution: str, version: str, package: str) -> Pa
     files = {
         f"{package}/__init__.py": f"VALUE = {version!r}\n".encode(),
         f"{dist_info}/METADATA": (
-            "Metadata-Version: 2.3\n"
-            f"Name: {distribution}\n"
-            f"Version: {version}\n\n"
+            f"Metadata-Version: 2.3\nName: {distribution}\nVersion: {version}\n\n"
         ).encode(),
         f"{dist_info}/WHEEL": (
             b"Wheel-Version: 1.0\nGenerator: cr-027-live\n"
