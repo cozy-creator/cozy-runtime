@@ -37,6 +37,11 @@ _PR_SET_PDEATHSIG = 1
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_SET_NO_NEW_PRIVS = 38
 
+# Linux assigns these through asm-generic and x86_64 alike. The process backend is selected
+# only on Linux; Python builds that expose the typed wrappers use those instead.
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+
 
 class ProcessTreeUnsupported(Exception):
     """This platform's ProcessTree implementation does not exist yet — typed, with a lane."""
@@ -78,10 +83,9 @@ class ProcessTreeScope:
     scrubbing the token and escaping both ancestry and process group can evade it, while a
     same-UID process can deliberately replay it and be treated as owned.  It is lifecycle
     containment for our own executor, not a hostile-code sandbox. A process that
-    deliberately scrubs the token, calls ``setsid``/double-forks, and escapes ancestry
-    before a census can evade recovery; a same-UID process can replay the token and be
-    treated as owned. Unlike cgroup v2, this scope provides no memory/OOM/resource
-    attribution and its repeated SIGSTOP census is convergent rather than kernel-atomic.
+    deliberately scrubs the token and escapes both ancestry and process group before a
+    census can evade recovery. Unlike cgroup v2, this scope provides no resource control
+    and its repeated SIGSTOP census is convergent rather than kernel-atomic.
     """
 
     token: str
@@ -219,6 +223,35 @@ def _inside_mount(mount: _CgroupMount, relative: Path) -> Path | None:
     return mount.target / suffix
 
 
+def _cgroup_v1_controller_path(controller: str) -> Path:
+    try:
+        memberships = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError as exc:
+        raise ContainmentUnavailable("cannot read cgroup-v1 memberships") from exc
+    relative: Path | None = None
+    for line in memberships:
+        try:
+            _, names, raw_path = line.split(":", 2)
+        except ValueError as exc:
+            raise ContainmentUnavailable("malformed cgroup-v1 membership") from exc
+        if controller in names.split(","):
+            relative = Path(raw_path)
+            break
+    if relative is None or not str(relative).startswith("/"):
+        raise ContainmentUnavailable(f"no cgroup-v1 {controller} membership exists")
+    candidates = [
+        resolved
+        for mount in _cgroup_v1_mounts()
+        if controller in mount.controllers
+        if (resolved := _inside_mount(mount, relative)) is not None and resolved.is_dir()
+    ]
+    if len(candidates) != 1:
+        raise ContainmentUnavailable(
+            f"cgroup-v1 {controller} membership resolves to {len(candidates)} paths"
+        )
+    return candidates[0]
+
+
 def _root_owned_container_marker() -> bool:
     for marker in _CONTAINER_MARKERS:
         try:
@@ -280,9 +313,7 @@ def _prove_readonly_container_cgroup_v1() -> None:
                 continue
             names = frozenset(item for item in controller_text.split(",") if item)
             if not hierarchy.isdigit() or not names or not relative_text.startswith("/"):
-                raise ContainmentUnavailable(
-                    f"invalid cgroup-v1 membership line {line!r}"
-                )
+                raise ContainmentUnavailable(f"invalid cgroup-v1 membership line {line!r}")
             memberships.append((names, Path(relative_text)))
     except OSError as exc:
         raise ContainmentUnavailable("cannot read cgroup-v1 memberships") from exc
@@ -555,17 +586,15 @@ class _ProcessSnapshot:
 def _open_pidfd(process: ProcessIdentity) -> int:
     """Open a kernel handle for one exact birth and recheck after the open."""
     _linux_only("pidfd_open")
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        pidfd_open = libc.pidfd_open
-    except AttributeError as exc:
-        raise OSError(errno.ENOSYS, "libc has no pidfd_open") from exc
-    pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
-    pidfd_open.restype = ctypes.c_int
-    descriptor = int(pidfd_open(process.pid, 0))
-    if descriptor < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), process.pid)
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is not None:
+        descriptor = int(pidfd_open(process.pid))
+    else:
+        libc = ctypes.CDLL(None, use_errno=True)
+        descriptor = int(libc.syscall(_SYS_PIDFD_OPEN, process.pid, 0))
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise OSError(error or errno.ENOSYS, os.strerror(error or errno.ENOSYS))
     if not same_process(process):
         os.close(descriptor)
         raise ProcessLookupError(process.pid)
@@ -576,21 +605,15 @@ def signal_process(process: ProcessIdentity, sig: int) -> None:
     """Signal one exact process birth through a pidfd, never a reusable PID."""
     descriptor = _open_pidfd(process)
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        try:
-            pidfd_send_signal = libc.pidfd_send_signal
-        except AttributeError as exc:
-            raise OSError(errno.ENOSYS, "libc has no pidfd_send_signal") from exc
-        pidfd_send_signal.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-        ]
-        pidfd_send_signal.restype = ctypes.c_int
-        if int(pidfd_send_signal(descriptor, int(sig), None, 0)) < 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), process.pid)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if pidfd_send_signal is not None:
+            pidfd_send_signal(descriptor, sig)
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = int(libc.syscall(_SYS_PIDFD_SEND_SIGNAL, descriptor, sig, 0, 0))
+            if result < 0:
+                error = ctypes.get_errno()
+                raise OSError(error or errno.ENOSYS, os.strerror(error or errno.ENOSYS))
     finally:
         os.close(descriptor)
 
@@ -607,6 +630,7 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
         raise ContainmentUnavailable("cannot enumerate /proc for executor reclaim") from exc
     for entry in entries:
         pid = int(entry.name)
+        fields: list[str] | None = None
         try:
             fields = _linux_stat(pid)
             status = (entry / "status").read_text().splitlines()
@@ -639,9 +663,13 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
         except FileNotFoundError:
             continue
         except (OSError, StopIteration, IndexError, ValueError) as exc:
+            observed = (
+                f" state={fields[0]} ppid={fields[1]} pgrp={fields[2]}"
+                if fields is not None and len(fields) >= 3
+                else ""
+            )
             raise ContainmentUnavailable(
-                f"cannot read complete same-UID proc identity for pid {pid} "
-                f"state={fields[0]} ppid={fields[1]} pgrp={fields[2]}"
+                f"cannot read complete same-UID proc identity for pid {pid}{observed}"
             ) from exc
     return snapshots
 
@@ -912,15 +940,30 @@ def available_host_bytes() -> int:
     a machine nobody else is on. -1 means UNREADABLE, never 0.
     """
     _linux_only("available_host_bytes")
-    try:
-        relative = Path("/proc/self/cgroup").read_text().strip().splitlines()[0].split("::")[-1]
-        cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-        limit = (cgroup / "memory.max").read_text().strip()
-        if limit != "max":
-            current = int((cgroup / "memory.current").read_text().strip())
-            return max(int(limit) - current, 0)
-    except (OSError, IndexError, ValueError):
-        pass
+    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+        try:
+            relative = next(
+                line.split("::", 1)[1]
+                for line in Path("/proc/self/cgroup").read_text().splitlines()
+                if line.startswith("0::")
+            )
+            cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
+            v2_limit = (cgroup / "memory.max").read_text().strip()
+            if v2_limit != "max":
+                current = int((cgroup / "memory.current").read_text().strip())
+                return max(int(v2_limit) - current, 0)
+        except (OSError, StopIteration, ValueError):
+            pass
+    else:
+        try:
+            memory = _cgroup_v1_controller_path("memory")
+            v1_limit = int((memory / "memory.limit_in_bytes").read_text().strip())
+            current = int((memory / "memory.usage_in_bytes").read_text().strip())
+            # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
+            if 0 < v1_limit < (1 << 60):
+                return max(v1_limit - current, 0)
+        except (ContainmentUnavailable, OSError, ValueError):
+            pass
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):
