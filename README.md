@@ -144,6 +144,7 @@ fresh endpoint is `--check`-clean out of the box.
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof
+    uv run python scripts/environment-proof-live.py # th-046 proof-seat cold/rebuild/red journey
     uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
     uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
 
@@ -154,6 +155,23 @@ the same environment materializer the pod later replays, atomically publishes th
 exact measured receipt bytes, and prints their compact digest/length/generation reference. It
 does not accept an expected receipt, author release documents, fetch, resolve, or import endpoint
 code.
+
+The request is ordinary JSON because it is a process input, not an identity document. Its field
+set is closed; every path value is a normalized absolute local path:
+
+```json
+{
+  "format": "cozy.runtime.EnvironmentProofRequest/1",
+  "endpoint_environment_spec": "/proof/endpoint-environment-spec.json",
+  "endpoint_bundle": "/proof/endpoint-bundle.json",
+  "resolved_wheel_set": "/proof/resolved-wheel-set.json",
+  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
+  "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
+  "uv": "/opt/cozy/bin/uv",
+  "python": "/opt/python/3.12/bin/python3.12",
+  "environment_root": "/proof/fresh-environment"
+}
+```
 
 An endpoint whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `describe` refuses the release if PyAV is absent. The descriptor publishes the hard per-field
