@@ -49,7 +49,7 @@ usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args
 verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
-  serve --socket <path>          speak the worker protocol for a coordinator
+  serve --socket <path>          speak the worker protocol for a RecordOwner
   describe [<fn>]                the EndpointDescriptor, without loading weights
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/CAS/credential facts
@@ -245,7 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = read_config()
         if verb == "serve":
             # `serve` never returns a Result: it IS the process, and it runs until the
-            # coordinator closes the session.
+            # RecordOwner closes the session.
             return host_verbs.serve(config, args)
         emit(dispatch(verb, args, opts, config), opts)
         return int(Exit.ok)

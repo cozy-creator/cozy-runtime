@@ -491,7 +491,7 @@ def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str
             raise GrantRefusal(
                 "tree_not_a_directory",
                 f"{ref}: the grant names {root} as a materialized tree and it is not a "
-                "directory; the coordinator minted this address, so the worker substitutes none",
+                "directory; the RecordOwner minted this address, so the worker substitutes none",
             )
         out[ref] = (root, "sha256:" + entry.digest.hex() if entry.digest else "")
     return out
@@ -503,7 +503,7 @@ class PublicationReceipt:
 
     What an attempt actually wrote, as a document with its own identity: the scope it wrote
     under, whose build wrote it, which attempt, and every entry with its digest and length.
-    A coordinator validates it by recomputing this document from what it already holds —
+    A RecordOwner validates it by recomputing this document from what it already holds —
     the publication contract it minted and the manifest on the terminal — and roots and
     projects on the digest. Before this there was no single typed subject per publication,
     so the Creator side was reading the mid-attempt CHECKPOINT lane to infer one, which is
@@ -604,7 +604,7 @@ def write_output(
 
 def abort_outputs(spool: Path) -> int:
     """Abort an attempt's uncommitted outputs. Bytes written under the grant are the
-    coordinator's problem only once a terminal claims them; the spool is ours."""
+    RecordOwner's problem only once a terminal claims them; the spool is ours."""
     removed = 0
     for path in sorted(spool.rglob("*")):
         if path.is_file():

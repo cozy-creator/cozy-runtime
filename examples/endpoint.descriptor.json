@@ -580,7 +580,7 @@
       "request",
       "runtime"
     ],
-    "retryability": "a coordinator projection over these facts; never author-declared",
+    "retryability": "a RecordOwner projection over these facts; never author-declared",
     "terminals": [
       "succeeded",
       "refused",
@@ -805,5 +805,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:338506a6495a9f15bed2528b8a9fa640cc76526ecc8d684f13539c2a28785efe"
+  "surface_digest": "sha256:71ccc9b01cb2d5999a2de5ed49992dbca148f2a8c8dc0381149f35848d9d5ea8"
 }

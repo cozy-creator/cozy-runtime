@@ -726,7 +726,7 @@ def serve() -> None:
         f"{seen['kernel_numeric_error']['plan'].get('delivery')}",
     )
     check(
-        "the chosen VARIANT is named on the plan a coordinator holds",
+        "the chosen VARIANT is named on the plan a RecordOwner holds",
         "'fp8'" in str(seen["latency"]["plan"].get("quantified_choice"))
         and "'fp16'" in str(seen["kernel_numeric_error"]["plan"].get("quantified_choice")),
         "the AttemptPlan document carries `delivery_variant`, so `plan_digest` binds WHICH "

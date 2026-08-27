@@ -319,7 +319,7 @@ def section_e2e() -> None:
         json.dumps(outcome.manifest[:1])[:200],
     )
     check(
-        "one checkpoint DECLARATION reached the coordinator",
+        "one checkpoint DECLARATION reached the RecordOwner",
         len(outcome.checkpoints) == 1 and outcome.checkpoints[0]["outcome"] == "RECORDED",
         json.dumps(outcome.checkpoints)[:220],
     )
@@ -367,7 +367,7 @@ def section_kill() -> None:
         print(f"  reference (uninterrupted) topology {globals()['_E2E_DIGEST'][:31]}…")
     workspace = fresh("kill")
 
-    def hook(coordinator: Any, worker: Any) -> None:
+    def hook(record_owner: Any, worker: Any) -> None:
         """Kill the executor's whole process GROUP once the job is genuinely mid-loop.
 
         Fault injection belongs to the harness, never to a plant switch inside the runtime
@@ -378,7 +378,9 @@ def section_kill() -> None:
         def killer() -> None:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
-                frames = [f for f in coordinator.progress_frames if b'"type": "progress"' in f.data]
+                frames = [
+                    f for f in record_owner.progress_frames if b'"type": "progress"' in f.data
+                ]
                 if len(frames) >= 2 and worker.supervision.current is not None:
                     pid = worker.supervision.current.pid
                     os.killpg(pid, signal.SIGKILL)

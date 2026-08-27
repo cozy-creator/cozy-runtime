@@ -10,7 +10,7 @@ process half): every section exercises the REAL worker control process, the REAL
     nice -n 19 uv run python scripts/lifecycle-live.py
     nice -n 19 uv run python scripts/lifecycle-live.py --tmp /tmp/cozy-lifecycle
 
-Reuses worker-live.py's coordinator (Hub), spawn and dispatch plumbing, but stages its own
+Reuses worker-live.py's RecordOwner (Hub), spawn and dispatch plumbing, but stages its own
 weightless fixture and never touches tensorfs-bench, nvidia-smi or the card — which is what
 lets it run on a hosted macOS or Windows runner where worker-live.py structurally cannot.
 """
@@ -1453,7 +1453,7 @@ def main() -> int:
         hub.ready(ids["hold"], args.observe * 2, since=hub.mark())
 
         wl.head("4. executor crash: SIGKILL the executor mid-hold")
-        # A refused attempt is the coordinator's to retry: re-dispatch a HIGHER attempt
+        # A refused attempt is the RecordOwner's to retry: re-dispatch a HIGHER attempt
         # after a fresh DISPATCHABLE (a post-cancel dispatch can race the poison-triggered
         # rebuild, and the refusal is typed, not a failure of anything).
         attempt_no = 0

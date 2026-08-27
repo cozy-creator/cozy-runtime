@@ -341,7 +341,7 @@ def remove_executor_cgroup(scope: CgroupScope) -> None:
 
 
 def acquire_worker_root_lease(path: Path) -> WorkerRootLease:
-    """Acquire the process-lifetime single-supervisor lease for one worker root."""
+    """Acquire the process-lifetime single-worker lease for one worker root."""
     _posix_only("acquire_worker_root_lease")
     import fcntl
 

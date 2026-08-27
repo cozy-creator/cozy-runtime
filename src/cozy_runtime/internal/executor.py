@@ -623,7 +623,7 @@ class Executor:
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
-            # ignoring is named where a person and a coordinator both see it, so the extras
+            # ignoring is named where a person and a RecordOwner both see it, so the extras
             # this bind dropped and the markers it transcribed ride the bind result.
             "custody": binding.get("custody", "canonical"),
             # THE COMPONENT-USE CONTRACT, as a construction fact. The worker prices a
@@ -1236,7 +1236,7 @@ class Executor:
         """The identity of the DECLARED annotated result surface — never of the value.
 
         A digest over the value document would change with every request and would fence
-        nothing; the coordinator needs to know which CONTRACT the bytes satisfy.
+        nothing; the RecordOwner needs to know which CONTRACT the bytes satisfy.
         """
         from cozy_runtime.internal import schema
 
@@ -1319,7 +1319,7 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     The TAIL is the only part of a reply that can grow, so the tail is what gives way, and
     what it gave up is a NUMBER on `observation_caps` — the same rule the ring already
     follows. A reply that does not fit even empty ships the OUTCOME, which is the one thing
-    a coordinator cannot reconstruct from anywhere else.
+    a RecordOwner cannot reconstruct from anywhere else.
 
     AND THE FALLBACK NEVER CLAIMS SUCCESS. It was written for INVOKE and used for every
     command, and it copied `ok` through while dropping every key that makes an ok reply
@@ -1359,7 +1359,7 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
                 f"the {reply.get('reply')!r} reply does not fit one control frame and the "
                 f"keys it declares ({', '.join(sorted(set(reply) - _MINIMAL_KEYS))[:200]}) "
                 "cannot be dropped without inventing a success. It refuses instead: a "
-                "coordinator acting on a reply that lost its own contents is worse than one "
+                "RecordOwner acting on a reply that lost its own contents is worse than one "
                 "told the reply could not be sent"
             ),
             "outcome": reply.get("outcome"),
@@ -1401,7 +1401,7 @@ def _serialize_result(
     is exactly what `Asset.row()` already publishes and carries no local path.
 
     Output identity comes from the result's own FIELD PATH (`image`, `pair.thumb`,
-    `frames.0`) — a stable name the coordinator can grant against. It is never a list index
+    `frames.0`) — a stable name the RecordOwner can grant against. It is never a list index
     into the grant: two outputs arriving in a different order must still land in their own
     destinations, and position cannot express that.
 

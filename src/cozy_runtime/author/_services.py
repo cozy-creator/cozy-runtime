@@ -660,7 +660,7 @@ class Checkpoints(_Bound):
     What this service could honestly do and what it CLAIMED to do had come apart. The claim
     was that `save()` made bytes durable and returned only once they were. The mechanism was
     a metadata row: the worker fsyncs (run, attempt, operation key, logical key, content
-    digest, length) into its journal and the coordinator records a second copy, while the
+    digest, length) into its journal and the RecordOwner records a second copy, while the
     protocol's `JobCheckpointRequest.artifact` field — the only place bytes could ride — goes
     out empty and no component anywhere copies or stores them. A killed executor took every
     checkpoint with it, and the receipt said otherwise.
@@ -713,7 +713,7 @@ class Checkpoints(_Bound):
                 operation_key=operation_key or logical_key,
                 logical_key=logical_key,
                 # SHA-256, the one identity spelling the platform uses for content (law 1),
-                # so the declaration the coordinator holds is addressable by the same digest.
+                # so the declaration the RecordOwner holds is addressable by the same digest.
                 content_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
                 length=len(raw),
                 path=blob,

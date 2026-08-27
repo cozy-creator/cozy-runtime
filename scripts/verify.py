@@ -762,7 +762,7 @@ def descriptor_sections() -> None:
         )
     print(
         f"  Outcome members: {[f.name for f in dataclasses.fields(Outcome)]} — "
-        "no retryable, no retry_after, no fatal; the coordinator projects those"
+        "no retryable, no retry_after, no fatal; the RecordOwner projects those"
     )
 
     head("byte-identical reproduction across two REAL venvs of one release")

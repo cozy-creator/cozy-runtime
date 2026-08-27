@@ -536,8 +536,8 @@ def arms() -> None:
     good.unlink(missing_ok=True)
 
     # --- THE HEADER CLOSURE, which is the WORKER's own re-check --------------------------
-    # Law 18: a coordinator's authority is not worker safety. The border above is the
-    # coordinator; these plants go straight at the header a worker is handed, which is the
+    # Law 18: a RecordOwner's authority is not worker safety. The border above is the
+    # RecordOwner; these plants go straight at the header a worker is handed, which is the
     # only version of this refusal that protects a worker from a store it did not fill.
     import tensorfs
 

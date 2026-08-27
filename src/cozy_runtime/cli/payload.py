@@ -50,7 +50,7 @@ def primary_field(struct: Json) -> str | None:
 def asset_paths(struct: Json, prefix: str = "") -> tuple[str, ...]:
     """Every asset-typed field path in a rendered result struct, dotted for nesting.
 
-    These ARE the output ids: the coordinator grants one destination per asset field path,
+    These ARE the output ids: the RecordOwner grants one destination per asset field path,
     and a set that does not match what the handler produced refuses the tail whole. Deriving
     them from the descriptor is what makes `--out` a consequence of the endpoint's declared
     result rather than a convention the CLI and the endpoint both have to remember.

@@ -39,10 +39,10 @@ DELETED_SURFACES: Mapping[str, str] = {
     "tuned": "no parallel family-defaults struct or model.tuned exists (§1.2)",
     "callback_on_step_end": "mid-run tensor mutation is an unconfessed quality change (§1.3)",
     "compile": "no compile surface is nameable from author code (§1.3)",
-    "retryable": "author code reports neutral FACTS; retryability is a coordinator "
+    "retryable": "author code reports neutral FACTS; retryability is a RecordOwner "
     "projection over them, never an observation the author writes (§2)",
     "retry_after": "no author-raised retry command exists at any tier (§2)",
-    "fatal": "FATAL is a coordinator projection, not a worker or author observation (§2)",
+    "fatal": "FATAL is a RecordOwner projection, not a worker or author observation (§2)",
 }
 
 

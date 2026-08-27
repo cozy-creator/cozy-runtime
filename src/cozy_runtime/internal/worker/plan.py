@@ -14,8 +14,8 @@ acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
   first, journals second.
 
 The AttemptPlan is a canonical DOCUMENT (tfs-013's writer) so `plan_digest` on
-AttemptAccepted is an identity a coordinator can hold, and the summary beside it is the
-CLOSED observable projection — the coordinator sees what was chosen, not only that
+AttemptAccepted is an identity a RecordOwner can hold, and the summary beside it is the
+CLOSED observable projection — the RecordOwner sees what was chosen, not only that
 something was.
 """
 
@@ -126,7 +126,7 @@ class AttemptPlan:
     """What is on the device right now. A staged rung moves this and never the weights."""
     delivery_variant: str = ""
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
-    identity a coordinator holds, and two plans that read different artifacts of one model
+    identity a RecordOwner holds, and two plans that read different artifacts of one model
     are not the same plan however identical their placement."""
 
     def document(self) -> dict[str, Any]:
@@ -162,7 +162,7 @@ class AttemptPlan:
         A job has no placement ladder to walk because it has no serving residency to trade
         against: it is one run-to-completion attempt that owns its devices for its whole
         life. The document is still a real AttemptPlan so `plan_digest` on AttemptAccepted
-        stays an identity a coordinator can hold — the same fence, one lane over.
+        stays an identity a RecordOwner can hold — the same fence, one lane over.
         """
         return cls(
             delivery="job",
@@ -187,7 +187,7 @@ class AttemptPlan:
 class JobBinding:
     """The local resolution of one `job_descriptor_id` — the JOB lane's `BindingPlan`.
 
-    Same seam, one lane over: the coordinator names the job by DIGEST and never ships a
+    Same seam, one lane over: the RecordOwner names the job by DIGEST and never ships a
     path; the worker resolves that digest against its own records, a small local file under
     `<cozy_home>/job-plans/`. On the network path th-004 ships the build and tfs-003 the
     materialized input trees; nothing below this record can tell the difference.
@@ -318,7 +318,7 @@ class DeclaredBinding:
     first declared use. 0 means every component stays resident."""
     tenancy: str = "local"
     """`local` (single-tenant: capacity never refuses above the floor, it deepens the ladder
-    and confesses) or `shared` (a shortfall is a RESCHEDULE for the coordinator, never a
+    and confesses) or `shared` (a shortfall is a RESCHEDULE for the RecordOwner, never a
     structural-incompatibility claim)."""
     custody: str = "canonical"
     """`canonical` (the border classified every key: a serve-time extra is drift and
@@ -830,7 +830,7 @@ class PlanChooser:
         deepens to the deepest authorized rung with a quantified confession, because the
         person in front of it wants their image, not a lecture about their card.
 
-        SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the coordinator, never a
+        SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the RecordOwner, never a
         structural-incompatibility claim — a different worker may fit it exactly.
         """
         if not activations.enforceable:

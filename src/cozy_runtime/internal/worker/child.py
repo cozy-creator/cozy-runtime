@@ -714,7 +714,7 @@ class ExecutorSupervision:
         THE ADVERTISEMENT GOES WITH IT (cr-007, cl-003). A device process that cannot serve
         must stop SAYING it can at the moment it stops, which is here: the ready-plan set
         empties and `on_invalidate` withdraws dispatchability before this call returns.
-        Advertising READY until the rebuild started spent a coordinator's whole requeue
+        Advertising READY until the rebuild started spent a RecordOwner's whole requeue
         budget on a worker that was about to be healthy.
         """
         with self._lifecycle:

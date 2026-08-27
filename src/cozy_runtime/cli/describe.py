@@ -94,7 +94,7 @@ def _list(body: Mapping[str, Json], document: Mapping[str, Json]) -> Result:
             assert isinstance(doc, dict)
             rows.append((str(doc["name"]), _one_line(doc)))
             if kind == "jobs":
-                # THE ID A COORDINATOR DISPATCHES BY. It is derived, never stored in the
+                # THE ID A RecordOwner DISPATCHES BY. It is derived, never stored in the
                 # document (a digest inside a source-stable surface has no clock a reader
                 # can name), so the only way anyone else gets it is by re-deriving the
                 # canonical form — which cozy-creator was doing in Go. Printing it here is
@@ -172,7 +172,7 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json]) -> Result:
     if doc["kind"] == "job":
         # DERIVED here, and only here. It may not enter the committed descriptor — a
         # `sha256:` inside a source-stable surface leaves a reader no way to know which
-        # clock it came from — but a coordinator dispatches by it, so a verb that would not
+        # clock it came from — but a RecordOwner dispatches by it, so a verb that would not
         # say it forces every consumer to re-derive the canonical form (cl-004 measured one
         # doing exactly that, in Go).
         view["job_descriptor_id"] = desc.job_descriptor_id(body, str(doc["name"]))

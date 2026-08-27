@@ -2,7 +2,7 @@
 
 Structural fence (cozy-runtime.md §7, boundaries.md): this package may import schema and
 typing libraries only. It cannot import cozy_runtime.internal, cozy_runtime.cli, the
-worker protocol, TensorFS, Varena or any coordinator; it cannot read environment or config;
+worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment or config;
 it names no device, allocator, compile or ingest surface. `scripts/fence.py` proves it.
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and

@@ -244,7 +244,7 @@ def bind(
     already established them under the grant. Re-reading the file here to recompute a
     digest — which is what this did — reads every input twice and produces a SECOND
     identity for one object, so a handler comparing `asset.digest` to the one the
-    coordinator granted would find two different spellings of the same bytes.
+    RecordOwner granted would find two different spellings of the same bytes.
     """
     if asset._attempt not in (_UNBOUND, attempt):
         raise CapabilityError(

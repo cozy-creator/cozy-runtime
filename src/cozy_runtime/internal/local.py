@@ -77,7 +77,7 @@ class LocalBindingError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class LocalRequest:
-    """One request, as a coordinator would put it on the wire."""
+    """One request, as a RecordOwner would put it on the wire."""
 
     entrypoint: str
     payload: dict[str, Any]
@@ -90,12 +90,12 @@ class LocalRequest:
     timeout_ms: int = 0
     """The caller's own bound on this attempt, as a DURATION. 0 means none.
 
-    A coordinator mints the absolute deadline when it DISPATCHES, which is what `_dispatch`
+    A RecordOwner mints the absolute deadline when it DISPATCHES, which is what `_dispatch`
     does — a duration written straight into `deadline_unix_ms` is a 1970 timestamp, and
     every attempt under it was silently given the 0.5 s floor.
     """
     #: grant the payload from THIS location instead of a file staged beside the run. A
-    #: coordinator may grant any location it can authorize; the worker still verifies the
+    #: RecordOwner may grant any location it can authorize; the worker still verifies the
     #: bytes it reads against the grant's own digest and length.
     payload_url: str = ""
     #: `entrypoint` (serving) or `job` (run-to-completion). ONE ExecutionSpec mode is named
@@ -107,7 +107,7 @@ class LocalRequest:
     trees: Mapping[str, str] = field(default_factory=dict)
     #: cr-012: the INPUT ASSETS this run grants, as `input_id -> local file`. The key is
     #: the payload FIELD PATH (`photo`, `refs.0`) and the value is a location the
-    #: coordinator can authorize; the worker still verifies every byte it reads against the
+    #: RecordOwner can authorize; the worker still verifies every byte it reads against the
     #: grant's own digest and length, and sniffs the type it was told. Ordered, identified
     #: subjects — never a digest-sorted anonymous list (worker-protocol/01).
     inputs: Mapping[str, str] = field(default_factory=dict)
@@ -389,7 +389,7 @@ class LocalRecordOwner:
     def _plan_id(self) -> str:
         """The binding plan this request runs against, or the typed refusal that it has none.
 
-        A request naming an entrypoint no binding plan covers is an ORDINARY coordinator
+        A request naming an entrypoint no binding plan covers is an ORDINARY RecordOwner
         condition — a stale install, a renamed function, a `--model` for the wrong slot —
         and it has to answer as one. It used to be a bare KeyError inside the message pump,
         which #306 already showed turns a one-line condition into a run that ends with no
@@ -702,11 +702,11 @@ class LocalRecordOwner:
         return f"{self.request.request_id}-{output_id.replace('.', '-')}.bin"
 
     def _on_checkpoint(self, request: pb.JobCheckpointRequest) -> None:
-        """The coordinator half of the DURABLE checkpoint exchange (cr-009).
+        """The RecordOwner half of the DURABLE checkpoint exchange (cr-009).
 
         This is the seam cl-004 and the hub implement for real: the worker already made the
         save durable in its own journal, and this side records the identity and answers with
-        its receipt. The coordinator's answer is a SECOND observation, not a second
+        its receipt. The RecordOwner's answer is a SECOND observation, not a second
         authority — an at-least-once durable message like every other (law 9).
         """
         digest = documents.spell(request.content_digest) if request.content_digest else ""
@@ -777,9 +777,9 @@ class LocalRecordOwner:
 
 
 def _declared_media_type(path: Path) -> str:
-    """What the COORDINATOR declares one input to be (cr-012).
+    """What the RecordOwner declares one input to be (cr-012).
 
-    A local coordinator reads the bytes because it holds them; a hub reads its own record
+    A local RecordOwner reads the bytes because it holds them; a hub reads its own record
     instead. Either way it is a CLAIM, and the worker sniffs what it actually received and
     refuses a disagreement — which is the point of declaring it at all.
     """
@@ -795,7 +795,7 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
     On the network path th-004 ships the build and the JobDescriptor and tfs-003 the
     materialized input trees. Locally it is a
     plain file under `<cozy_home>/job-plans/`, and the worker cannot tell the difference
-    because a coordinator never ships a path either way.
+    because a RecordOwner never ships a path either way.
     """
     directory = cozy_home / "job-plans"
     directory.mkdir(parents=True, exist_ok=True)
@@ -836,29 +836,29 @@ def run_slice(
     plans: dict[str, str] = {}
     plan_refs: dict[str, tuple[str, int]] = {}
     stage_job_plans(config.cozy_home, job_records or [])
-    coordinator = LocalRecordOwner(
+    record_owner = LocalRecordOwner(
         request, plans, plan_refs, workspace, release_id=release_id, auto_ack=auto_ack
     )
     options = options or WorkerOptions(root=workspace / "worker")
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
-    worker = Worker(config, options, coordinator.host)
-    worker.watches.tap = coordinator.tap_progress
+    worker = Worker(config, options, record_owner.host)
+    worker.watches.tap = record_owner.tap_progress
     if record_owner_hook is not None:
-        record_owner_hook(coordinator, worker)
+        record_owner_hook(record_owner, worker)
     started = time.perf_counter()
     exit_code = worker.run()
-    return _collect(coordinator, worker, started, exit_code, delete_journal)
+    return _collect(record_owner, worker, started, exit_code, delete_journal)
 
 
 def _collect(
-    coordinator: LocalRecordOwner,
+    record_owner: LocalRecordOwner,
     worker: Worker,
     started: float,
     exit_code: int,
     delete_journal: bool,
 ) -> SliceOutcome:
-    outcome = SliceOutcome(exit_code=exit_code, ended=coordinator.ended, error=coordinator.error)
+    outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
     outcome.journal = _journal_rows(worker.root / "journal.log")
     outcome.reconciliation = (
         worker.ledger.reconciliations[-1] if worker.ledger.reconciliations else {}
@@ -876,15 +876,15 @@ def _collect(
     outcome.faults = [
         {"reason": fault.reason, "detail": fault.detail} for fault in worker.engine.faults
     ]
-    outcome.progress = len(coordinator.progress_frames)
+    outcome.progress = len(record_owner.progress_frames)
     outcome.executions = worker.engine.executed
-    outcome.checkpoints = list(coordinator.checkpoints)
+    outcome.checkpoints = list(record_owner.checkpoints)
     outcome.publication_scope = (
-        coordinator.scratch_repo() if coordinator.request.kind == "job" else ""
+        record_owner.scratch_repo() if record_owner.request.kind == "job" else ""
     )
 
-    if coordinator.accepted is not None:
-        accepted = coordinator.accepted
+    if record_owner.accepted is not None:
+        accepted = record_owner.accepted
         outcome.accepted = {
             "plan_digest": _spell(accepted.plan_digest),
             # A JOB attempt has NO model construction: no warm pool, no serving pointer, no
@@ -898,8 +898,8 @@ def _collect(
             "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
             "decision_explanation": accepted.plan.decision_explanation,
         }
-    if coordinator.terminal is not None:
-        body = documents.read(coordinator.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+    if record_owner.terminal is not None:
+        body = documents.read(record_owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         outcome.terminal = body
         # The triage read, exactly as cl-006 will do it: take the opaque subject off the
         # terminal, and read the bundle BY KEY, verified against its journaled receipt.
@@ -922,7 +922,7 @@ def _collect(
         if isinstance(inline, str):
             # The typed result rode the terminal INLINE. Read it with the canonical reader
             # that wrote it, never a looser JSON parser: the whole point of the envelope is
-            # that the bytes a coordinator holds and the value a caller sees are one thing.
+            # that the bytes a RecordOwner holds and the value a caller sees are one thing.
             decoded = canonical.parse(_b64(inline))
             outcome.result = decoded if isinstance(decoded, dict) else {"value": decoded}
         outcome.result_schema_digest = str(envelope.get("result_schema_digest", ""))
@@ -932,11 +932,11 @@ def _collect(
             (row["body"] for row in outcome.journal if row.get("kind") == "publication"), {}
         )
         for row in outcome.manifest:
-            path = coordinator.destination(str(row.get("output_id", "")))
+            path = record_owner.destination(str(row.get("output_id", "")))
             if path.is_file():
                 outcome.outputs[str(row["output_id"])] = str(path)
 
-    marks = coordinator.marks
+    marks = record_owner.marks
     outcome.timings = {
         name: round((marks[key] - marks[base]) * 1000, 2)
         for name, key, base in (
