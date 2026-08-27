@@ -121,10 +121,10 @@ class Bound:
 
 @dataclass(frozen=True, slots=True)
 class AssetBound:
-    """cr-012 — the TYPED bound on ONE input-asset field: how big, and of what.
+    """cr-012 — the TYPED bounds on ONE input-asset field.
 
     An input asset is a typed request field, so its limits belong on the field and not in
-    a deployment's config or a downloader's constant. Two facts and no more:
+    a deployment's config or a downloader's constant:
 
     * `max_bytes` — the largest this field admits, enforced BEFORE the entrypoint sees the
       value and (as a deployment-wide cap) before acceptance. A field with no bound takes
@@ -132,6 +132,11 @@ class AssetBound:
     * `media_types` — a NARROWING of the kind's own set (`_media.KIND_MEDIA`). An endpoint
       that decodes only PNG says so; one that lists a type its kind does not admit is a
       conformance error, because widening a kind would promise a decoder nothing has.
+    * `max_decoded_bytes` — the largest immutable RGB8 + float32 PCM value this field may
+      expand to. It is bound into the hydrated asset by the runtime and can only narrow the
+      runtime's hard frame/pixel/channel/sample ceilings. It accounts for the value retained
+      and returned to the handler, not codec working memory or peak process RSS. Request data
+      cannot set it.
 
     COUNT bounds are not here on purpose: `Annotated[list[ImageAsset], Meta(max_length=9)]`
     is msgspec's own, it is already in the descriptor's constraint vocabulary, and a second
@@ -140,15 +145,18 @@ class AssetBound:
 
     max_bytes: int | None = None
     media_types: tuple[str, ...] = ()
+    max_decoded_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        if self.max_bytes is None and not self.media_types:
+        if self.max_bytes is None and not self.media_types and self.max_decoded_bytes is None:
             raise ConformanceError(
-                "AssetBound() declares nothing: give max_bytes or media_types, or drop the "
-                "annotation and take the deployment's cap"
+                "AssetBound() declares nothing: give max_bytes, media_types or "
+                "max_decoded_bytes, or drop the annotation and take the deployment's cap"
             )
-        if self.max_bytes is not None and self.max_bytes <= 0:
-            raise ConformanceError("AssetBound(max_bytes=) must be positive", fields=["max_bytes"])
+        for name in ("max_bytes", "max_decoded_bytes"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ConformanceError(f"AssetBound({name}=) must be positive", fields=[name])
         for media_type in self.media_types:
             if media_type != media_type.strip().lower() or "/" not in media_type:
                 raise ConformanceError(
@@ -160,6 +168,12 @@ class AssetBound:
         """A declared type outside the KIND's own set is a conformance error at describe."""
         from cozy_runtime.author._media import KIND_MEDIA
 
+        if self.max_decoded_bytes is not None and kind not in {"image", "video", "audio"}:
+            raise ConformanceError(
+                f"AssetBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "
+                "ImageAsset, VideoAsset and AudioAsset have a MediaDecoder",
+                fields=["max_decoded_bytes"],
+            )
         allowed = KIND_MEDIA.get(kind, ())
         outside = [m for m in self.media_types if allowed and m not in allowed]
         if outside:

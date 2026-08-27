@@ -113,6 +113,12 @@ def _walk(tp: object, path: str, _seen: frozenset[type]) -> Iterator[Node]:
     base, _ = strip(tp)
     base, _ = unwrap_optional(base)
     if not (isinstance(base, type) and (is_struct(base) or is_dataclass(base))):
+        # A container/union can itself be the member handed down by its parent (for example
+        # ``list[ImageReference | VideoReference]``). Descend it here instead of requiring
+        # every caller to rebuild the same type-tree recursion. This keeps markers,
+        # describe-time bounds, and hydration's declares-assets gate on one walker.
+        for member, suffix in _members(base):
+            yield from walk(member, path=path + suffix, _seen=_seen)
         return
     if base in _seen:
         return

@@ -76,6 +76,12 @@ class OutputError(AuthorError):
     default_code = "output"
 
 
+class RuntimeFailure(AuthorError):
+    """The Runtime broke an already-admitted attempt; the request and author are sound."""
+
+    default_code = "runtime_failure"
+
+
 class Cancelled(AuthorError):
     """The attempt was cancelled. THE cancellation spelling is `ctx.raise_if_cancelled()`."""
 
@@ -154,6 +160,8 @@ def classify(exc: BaseException | None) -> Outcome:
         return Outcome("canceled", origin, exc.code, exc.message, exc.fields)
     if isinstance(exc, InvalidRequest):
         return Outcome("refused", "request", exc.code, exc.message, exc.fields)
+    if isinstance(exc, RuntimeFailure):
+        return Outcome("failed", "runtime", exc.code, exc.message, exc.fields)
     if isinstance(exc, AuthorError):
         return Outcome("failed", "author", exc.code, exc.message, exc.fields)
     if _is_device_oom(exc):

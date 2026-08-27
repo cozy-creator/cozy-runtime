@@ -755,6 +755,17 @@
       ],
       "service": "Egress"
     },
+    "media_decode": {
+      "limits": {
+        "max_attempt_decoded_bytes": 2147483648
+      },
+      "members": [
+        "decode_audio",
+        "decode_image",
+        "decode_video"
+      ],
+      "service": "MediaDecoder"
+    },
     "save": {
       "members": [
         "save_audio",
@@ -794,5 +805,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:572c7e6c9c7387d9e6c7b4d076248aad791d1bafb6a873447e04dd0b90853458"
+  "surface_digest": "sha256:ef2515e83c400c99a92ab2c539c036bf8b062bf07051333341c84751428238a8"
 }

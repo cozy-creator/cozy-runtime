@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, get_args
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
 
@@ -25,7 +25,16 @@ _UNBOUND: Final = ""
 class Asset:
     """A digest-identified immutable blob, referenced by an opaque handle."""
 
-    __slots__ = ("_attempt", "_local", "digest", "media_type", "ref", "size_bytes")
+    __slots__ = (
+        "_attempt",
+        "_input_id",
+        "_local",
+        "_max_decoded_bytes",
+        "digest",
+        "media_type",
+        "ref",
+        "size_bytes",
+    )
 
     kind: ClassVar[str] = "file"
 
@@ -45,6 +54,8 @@ class Asset:
         self.digest = digest
         self._local = local
         self._attempt = attempt
+        self._input_id = ""
+        self._max_decoded_bytes = 0
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.ref!r}, media_type={self.media_type!r})"
@@ -95,6 +106,25 @@ class VideoAsset(Asset):
 
 class FileAsset(Asset):
     kind: ClassVar[str] = "file"
+
+
+def asset_kinds(annotation: object) -> frozenset[str]:
+    """Asset kinds reached through containers/unions, stopping at nested records.
+
+    A bound on ``list[ImageAsset]`` belongs to that field. A bound on
+    ``list[SomeReference]`` does not: the concrete reference record owns the bound on its
+    own asset field. Stopping at records keeps tagged-union reference schemas from growing
+    a second, lossy path-based authority over their leaf fields.
+    """
+    from cozy_runtime.author._walker import strip, unwrap_optional
+
+    base, _ = strip(annotation)
+    base, _ = unwrap_optional(base)
+    if isinstance(base, type):
+        if issubclass(base, Asset):
+            return frozenset({base.kind})
+        return frozenset()
+    return frozenset(kind for argument in get_args(base) for kind in asset_kinds(argument))
 
 
 class Tree:
@@ -198,7 +228,15 @@ class GrantedInput:
 
 
 def bind(
-    asset: Asset, *, local: Path, attempt: str, media_type: str, digest: str, length: int
+    asset: Asset,
+    *,
+    local: Path,
+    attempt: str,
+    media_type: str,
+    digest: str,
+    length: int,
+    max_decoded_bytes: int = 0,
+    input_id: str = "",
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -214,9 +252,11 @@ def bind(
         )
     asset._local = local
     asset._attempt = attempt
+    asset._input_id = input_id
     asset.media_type = media_type
     asset.size_bytes = length
     asset.digest = digest
+    asset._max_decoded_bytes = max_decoded_bytes
 
 
 def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:

@@ -80,6 +80,22 @@ STATIC_ARMS = (
         "def _offload(pipe: object) -> None:\n    pipe.enable_model_cpu_offload()\n",
     ),
     Arm(
+        "endpoint-owns-no-media-decode",
+        ROOT / "examples" / "tiny_h3.py",
+        "def _second_decoder() -> None:\n    import av\n\n    av.open('request.mp4')\n",
+    ),
+    Arm(
+        "endpoint-owns-no-media-decode",
+        ROOT / "examples" / "tiny_h3.py",
+        "def _steal_asset_path(asset: object) -> object:\n    return asset._local\n",
+    ),
+    Arm(
+        "endpoint-owns-no-media-decode",
+        ROOT / "examples" / "tiny_h3.py",
+        "def _library_path_decode(reference: object) -> object:\n"
+        "    return reference.from_file('request.mp4')\n",
+    ),
+    Arm(
         "timing-decides-nothing",
         SRC / "author" / "_observations.py",
         "from cozy_runtime.internal.fill import ResourceLedger\n",

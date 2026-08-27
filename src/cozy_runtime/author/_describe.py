@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, get_args
+from typing import TYPE_CHECKING
 
+from cozy_runtime.author._assets import asset_kinds
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
-from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
 from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY
@@ -72,25 +74,16 @@ def assert_declaration_shape(declaration: object) -> None:
             # hydration is the difference between an endpoint that cannot be built and one
             # that refuses every request that reaches it — a field declaring a media type
             # its kind does not admit promises a decoder this runtime does not have.
-            kind = _asset_kind(node.annotation)
-            if kind:
+            kinds = asset_kinds(node.annotation)
+            if not kinds:
+                raise ConformanceError(
+                    f"{owner}.{node.path} puts AssetBound on a field with no direct asset; "
+                    "put the bound on the concrete asset field instead",
+                    code="asset_bound_target",
+                    fields=[node.path],
+                )
+            for kind in kinds:
                 bound.check_kind(kind)
-
-
-def _asset_kind(annotation: object) -> str:
-    """The asset KIND an annotation reaches, through containers and unions."""
-    from cozy_runtime.author._assets import Asset
-    from cozy_runtime.author._walker import strip, unwrap_optional
-
-    base, _ = strip(annotation)
-    base, _ = unwrap_optional(base)
-    if isinstance(base, type) and issubclass(base, Asset):
-        return str(base.kind)
-    for argument in get_args(base):
-        found = _asset_kind(argument)
-        if found:
-            return found
-    return ""
 
 
 def _separation(surface: Surface) -> None:
@@ -152,6 +145,7 @@ def check(surface: Surface) -> Surface:
     assert_declaration_shape(surface.result_type)
     specs = feature_specs(surface.payload_type)
     _separation(surface)
+    _media_decode_bounds(surface)
 
     # A JOB's `gpu_count` is the override door's CANONICAL case (§1.2/§2): a floor is the
     # number of devices a materialization structurally requires, and a job that shards across
@@ -199,6 +193,54 @@ def check(surface: Surface) -> Surface:
     for binding in surface.model_bindings:
         _check_model(binding)
     return surface
+
+
+def _media_decode_bounds(surface: Surface) -> None:
+    """A decoder capability is useful only over explicitly expansion-bounded media.
+
+    Compressed bytes are already deployment- and field-bounded. Decode has a different
+    amplification factor, so requesting the service without binding every decodable media
+    field would make the most dangerous input the one field an endpoint forgot to annotate.
+    Refuse that endpoint at describe instead of offering a request-time unbounded overload.
+    """
+    if "media_decode" not in surface.capabilities:
+        return
+    reached = 0
+    for node in walk(surface.payload_type):
+        kinds = asset_kinds(node.annotation) & {"image", "video", "audio"}
+        if not kinds:
+            continue
+        reached += 1
+        bound = node.marker(AssetBound)
+        if not isinstance(bound, AssetBound) or bound.max_decoded_bytes is None:
+            raise ConformanceError(
+                f"{surface.name}.{node.path} is decoded by MediaDecoder but declares no "
+                "AssetBound(max_decoded_bytes=...): compressed and decoded size are separate "
+                "limits, and the decoder has no unbounded overload",
+                code="asset_decode_unbounded",
+                fields=[node.path],
+            )
+        if bound.max_decoded_bytes > DEFAULT_DECODE_LIMITS.max_decoded_bytes:
+            raise ConformanceError(
+                f"{surface.name}.{node.path} declares {bound.max_decoded_bytes} decoded bytes, "
+                f"above Runtime's {DEFAULT_DECODE_LIMITS.max_decoded_bytes}-byte hard ceiling",
+                code="asset_decode_limit",
+                fields=[node.path],
+            )
+    if not reached:
+        raise ConformanceError(
+            f"{surface.name} requests MediaDecoder but its payload contains no image, video "
+            "or audio asset field",
+            code="unused_capability",
+        )
+    try:
+        require_decoder_dependency()
+    except CapabilityError as exc:
+        raise ConformanceError(
+            f"{surface.name} declares MediaDecoder but its release cannot import PyAV; "
+            "install cozy-runtime[media] in the endpoint closure",
+            code="media_decoder_dependency",
+        ) from exc
 
 
 def _check_model(binding: ModelBinding) -> None:

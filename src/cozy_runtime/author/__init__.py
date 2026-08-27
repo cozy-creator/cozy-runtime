@@ -26,6 +26,16 @@ from cozy_runtime.author._context import (
     Device,
     RequestView,
 )
+from cozy_runtime.author._decode import (
+    DEFAULT_DECODE_LIMITS,
+    DecodedAudio,
+    DecodedImage,
+    DecodedVideo,
+    DecodeLimits,
+    DecoderUnavailable,
+    MediaDecodeError,
+    MediaDecoder,
+)
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import DELETED_SURFACES, assert_declaration_shape, describe
@@ -106,6 +116,7 @@ from cozy_runtime.author._services import (
 from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
+    "DEFAULT_DECODE_LIMITS",
     "DELETED_SURFACES",
     "JOB_ONLY",
     "NEUTRAL_ERROR_SET",
@@ -138,6 +149,11 @@ __all__ = [
     "ConstructionRecord",
     "Context",
     "DeadlineExceeded",
+    "DecodeLimits",
+    "DecodedAudio",
+    "DecodedImage",
+    "DecodedVideo",
+    "DecoderUnavailable",
     "DefaultResolutionError",
     "DerivedCache",
     "Device",
@@ -150,6 +166,8 @@ __all__ = [
     "Invocation",
     "InvocationResult",
     "Loader",
+    "MediaDecodeError",
+    "MediaDecoder",
     "Model",
     "ModelBinding",
     "ModelDefault",

@@ -32,6 +32,7 @@ from cozy_runtime.author._assets import (
     digest_bytes,
 )
 from cozy_runtime.author._context import Context
+from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._errors import CapabilityError, OutputError
 from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 
@@ -803,6 +804,7 @@ SERVICES: Mapping[str, type] = {
     "scratch": Scratch,
     "checkpoints": Checkpoints,
     "budget": Budget,
+    "media_decode": MediaDecoder,
 }
 
 #: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs

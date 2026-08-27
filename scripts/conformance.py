@@ -23,6 +23,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Annotated
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "examples"))
@@ -31,6 +32,7 @@ import msgspec  # noqa: E402
 
 from cozy_runtime.author import (  # noqa: E402
     App,
+    AssetBound,
     Budget,
     BudgetFacts,
     Cancelled,
@@ -40,12 +42,17 @@ from cozy_runtime.author import (  # noqa: E402
     Context,
     Device,
     FileAsset,
+    ImageAsset,
+    ImageFrame,
     Invocation,
+    MediaDecoder,
     Outputs,
     Scratch,
     Telemetry,
     attempt,
 )
+from cozy_runtime.author._assets import GrantedInput  # noqa: E402
+from cozy_runtime.author._services import Attempt  # noqa: E402
 from cozy_runtime.internal import descriptor as desc  # noqa: E402
 from cozy_runtime.internal.discovery import discover  # noqa: E402
 
@@ -87,6 +94,24 @@ def report(ctx: Context, payload: In) -> Facts:
 
 class Saved(msgspec.Struct):
     file: FileAsset
+
+
+class MediaIn(msgspec.Struct):
+    image: Annotated[
+        ImageAsset,
+        AssetBound(max_bytes=1024, max_decoded_bytes=3),
+    ]
+
+
+class MediaFact(msgspec.Struct):
+    service: str
+
+
+@probe.entrypoint
+def uses_media_decode(payload: MediaIn, decoder: MediaDecoder) -> MediaFact:
+    """Prove the declared service is constructed; the PyAV members have their live driver."""
+    del payload
+    return MediaFact(type(decoder).__name__)
 
 
 @probe.entrypoint
@@ -225,6 +250,25 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
             f"{caps['kept']}/{caps['max_events']} at {caps['held_bytes']} B"
         )
 
+    def media_decode() -> Observation:
+        source = Attempt("media-source", spool / "media-source")
+        source.spool.mkdir(parents=True, exist_ok=True)
+        image = Outputs(source).save_image(ImageFrame(1, 1, b"\x10\x20\x30"))
+        assert image._local is not None
+        grant = GrantedInput(
+            "image", image._local, image.media_type, image.digest, image.size_bytes
+        )
+        inv = Invocation(
+            request_id="media",
+            spool=spool / "media",
+            deadline=time.monotonic() + 30,
+            assets={"image": grant},
+        )
+        envelope, outcome, _ = attempt(probe.get("uses_media_decode"), {"image": "ref"}, inv)
+        assert envelope is not None, outcome
+        assert envelope.result == MediaFact("MediaDecoder"), envelope.result
+        return "handler received the attempt-bound MediaDecoder declared by its signature"
+
     def _job_facts() -> JobFacts:
         saved: list[CheckpointSave] = []
 
@@ -289,6 +333,7 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
     return {
         "save": save,
         "telemetry": telemetry,
+        "media_decode": media_decode,
         "scratch": scratch,
         "checkpoints": checkpoints,
         "budget": budget,

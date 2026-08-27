@@ -524,6 +524,26 @@ def arms() -> None:
             str(exc)[:200],
         )
 
+    try:
+        AssetBound(max_decoded_bytes=0)
+        check("ARM: a zero decoded-size bound refuses", False, "it was accepted")
+    except ConformanceError as exc:
+        check(
+            "ARM: decoded expansion bounds are positive",
+            "max_decoded_bytes" in str(exc),
+            str(exc)[:200],
+        )
+
+    try:
+        AssetBound(max_decoded_bytes=1024).check_kind("file")
+        check("ARM: a decoded bound on FileAsset refuses", False, "it was accepted")
+    except ConformanceError as exc:
+        check(
+            "ARM: only typed media fields can declare decoded expansion",
+            "MediaDecoder" in str(exc),
+            str(exc)[:200],
+        )
+
     # ARM 9 — the bounded reader, both directions.
     from cozy_runtime.internal.egress import EgressRefusal, read_bounded
 
