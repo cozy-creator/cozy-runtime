@@ -27,11 +27,17 @@ from cozy_runtime.author import (  # noqa: E402
     App,
     AssetBound,
     AudioAsset,
+    DecodedAudioChunk,
+    DecodedMediaHeader,
+    DecodedVideoFormat,
+    DecodedVideoFrame,
     ImageAsset,
     ImageFrame,
     Invocation,
+    MediaDecodeError,
     MediaDecoder,
     VideoAsset,
+    _color,
     attempt,
 )
 from cozy_runtime.author._assets import GrantedInput, bind, digest_bytes  # noqa: E402
@@ -201,6 +207,51 @@ def rotated_mp4(av: Any, path: Path, *, hflip: bool) -> None:
             container.mux(packet)
 
 
+def unspecified_hd_mp4(av: Any, path: Path) -> bytes:
+    """BT.709 YUV bytes with cleared tags: Runtime must normalize HD before RGB decode."""
+    width, height = 1280, 720
+    rgb = bytes(
+        channel
+        for y in range(height)
+        for x in range(width)
+        for channel in (
+            x * 255 // (width - 1),
+            y * 255 // (height - 1),
+            (x + y) * 255 // (width + height - 2),
+        )
+    )
+    source = av.VideoFrame(width, height, "rgb24")
+    fill_rgb(source, rgb)
+    reformatter = av.video.reformatter.VideoReformatter()
+    yuv = reformatter.reformat(
+        source,
+        format="yuv420p",
+        src_colorspace="ITU709",
+        dst_colorspace="ITU709",
+        src_color_range="JPEG",
+        dst_color_range="MPEG",
+        dst_color_trc=1,
+        dst_color_primaries=1,
+        threads=1,
+    )
+    yuv.color_primaries = 2
+    yuv.color_trc = 2
+    yuv.colorspace = 2
+    yuv.color_range = 0
+    with av.open(str(path), "w", format="mp4") as container:
+        stream = container.add_stream("libx264", rate=24)
+        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        stream.codec_context.thread_count = 1
+        stream.codec_context.max_b_frames = 0
+        stream.codec_context.options = {"crf": "0", "preset": "ultrafast"}
+        yuv.pts, yuv.time_base = 0, Fraction(1, 24)
+        for packet in stream.encode(yuv):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return rgb
+
+
 def jpeg(av: Any, *, orientation: int) -> bytes:
     frame = av.VideoFrame(4, 2, "rgb24")
     fill_rgb(frame, packed_rgb(frame))
@@ -224,6 +275,43 @@ def jpeg(av: Any, *, orientation: int) -> bytes:
 
 def undecorated_rgb(av: Any, path: Path) -> bytes:
     """The stored pixel plane without applying its presentation transform."""
+    with av.open(str(path), "r") as container:
+        source = next(container.decode(video=0))
+        primaries, transfer, matrix, color_range = _color.normalize(
+            width=int(source.width),
+            height=int(source.height),
+            primaries=int(source.color_primaries),
+            transfer=int(source.color_trc),
+            matrix=int(source.colorspace),
+            color_range=int(source.color_range),
+        )
+        frame = av.video.reformatter.VideoReformatter().reformat(
+            source,
+            format="rgb24",
+            src_colorspace=_color.colorspace(av, matrix),
+            dst_colorspace=_color.colorspace(av, matrix),
+            src_color_range=_color.range_value(av, color_range),
+            dst_color_range=av.video.reformatter.ColorRange.JPEG,
+            dst_color_trc=transfer,
+            dst_color_primaries=primaries,
+            interpolation=(
+                av.video.reformatter.Interpolation.BILINEAR
+                | av.video.reformatter.Interpolation.ACCURATE_RND
+                | av.video.reformatter.Interpolation.BITEXACT
+            ),
+            threads=1,
+        )
+        plane = frame.planes[0]
+        row_bytes = int(frame.width) * 3
+        raw = memoryview(plane)
+        return b"".join(
+            bytes(raw[row * plane.line_size : row * plane.line_size + row_bytes])
+            for row in range(int(frame.height))
+        )
+
+
+def undecorated_image_rgb(av: Any, path: Path) -> bytes:
+    """Image decoder reference; still images have no video color-normalization contract."""
     with av.open(str(path), "r") as container:
         frame = next(container.decode(video=0)).reformat(format="rgb24")
         plane = frame.planes[0]
@@ -535,6 +623,328 @@ def main() -> int:
         and decoded_video.soundtrack.sample_count == 3000
         and decoded_video.soundtrack.start_time == 0,
     )
+    assert decoded_video.soundtrack is not None
+
+    print("section: single-consumer incremental media")
+    streamed_frames: list[DecodedVideoFrame] = []
+    streamed_samples = 0
+    streamed_header: DecodedMediaHeader | None = None
+    with decoder.stream_video(video) as stream:
+        for event in stream:
+            if isinstance(event, DecodedMediaHeader):
+                streamed_header = event
+            elif isinstance(event, DecodedVideoFrame):
+                streamed_frames.append(event)
+            elif isinstance(event, DecodedAudioChunk):
+                streamed_samples += event.sample_count
+    check(
+        "stream_video yields exact RGB clocks and soundtrack samples without a media object",
+        len(streamed_frames) == decoded_video.frame_count
+        and streamed_header is not None
+        and streamed_header.video is not None
+        and (streamed_header.video.width, streamed_header.video.height)
+        == (decoded_video.width, decoded_video.height)
+        and streamed_header.audio is not None
+        and streamed_header.audio.sample_rate == decoded_video.soundtrack.sample_rate
+        and [frame.rgb for frame in streamed_frames] == list(decoded_video.frames_rgb)
+        and [frame.pts for frame in streamed_frames] == list(decoded_video.frame_pts)
+        and streamed_samples == decoded_video.soundtrack.sample_count,
+        f"frames={len(streamed_frames)} samples={streamed_samples}",
+    )
+
+    streamed_audio_samples = 0
+    standalone_header: DecodedMediaHeader | None = None
+    with decoder.stream_audio(audio) as stream:
+        for event in stream:
+            if isinstance(event, DecodedMediaHeader):
+                standalone_header = event
+            else:
+                assert isinstance(event, DecodedAudioChunk)
+                streamed_audio_samples += event.sample_count
+    check(
+        "stream_audio preserves the standalone native sample clock",
+        streamed_audio_samples == decoded_audio.sample_count
+        and standalone_header is not None
+        and standalone_header.video is None
+        and standalone_header.audio is not None
+        and standalone_header.audio.sample_rate == decoded_audio.sample_rate,
+        f"samples={streamed_audio_samples}",
+    )
+
+    def abandon_stream() -> None:
+        with decoder.stream_video(video) as stream:
+            next(stream)
+
+    expects(
+        "a successful context cannot abandon undecoded input",
+        "media_stream_incomplete",
+        abandon_stream,
+        field="video",
+    )
+
+    second_refused = False
+    with decoder.stream_video(video) as first:
+        try:
+            with decoder.stream_video(video):
+                pass
+        except AuthorError as exc:
+            second_refused = exc.code == "media_stream_active"
+        for _event in first:
+            pass
+    check("one decoder admits only one active stream", second_refused)
+
+    with decoder.stream_video(video) as source:
+        saved = out.save_video_stream(source)
+    hydrate(saved.video, input_id="streamed-output", cap=8 << 20)
+    streamed_roundtrip = decoder.decode_video(saved.video)
+    check(
+        "stream decode feeds one fragmented atomic H.264/AAC output",
+        saved.frame_count == decoded_video.frame_count
+        and streamed_roundtrip.frame_count == decoded_video.frame_count
+        and streamed_roundtrip.soundtrack is not None,
+        f"frames={saved.frame_count} audio={saved.decoded_audio_samples}",
+    )
+    with decoder.stream_video(video) as source:
+        repeated = out.save_video_stream(source)
+    check(
+        "the same canonical stream reproduces exact MP4 bytes",
+        repeated.video.digest == saved.video.digest,
+        f"{saved.video.digest} vs {repeated.video.digest}",
+    )
+
+    with decoder.stream_video(video) as source:
+        canonical_events = list(source)
+    pending_before = set(record.pending)
+    expects(
+        "a second stream header aborts without publishing a partial asset",
+        "media_header",
+        lambda: out.save_video_stream(iter((canonical_events[0], canonical_events[0]))),
+    )
+    check(
+        "failed streaming output leaves no pending handle or partial file",
+        set(record.pending) == pending_before and not list(root.glob(".video-*.partial")),
+    )
+
+    wrong_duration = list(canonical_events)
+    for index, event in enumerate(wrong_duration):
+        if isinstance(event, DecodedVideoFrame):
+            wrong_duration[index] = DecodedVideoFrame(
+                width=event.width,
+                height=event.height,
+                rgb=event.rgb,
+                pts=event.pts,
+                duration=event.duration + 1,
+                time_base=event.time_base,
+                pixel_aspect_ratio=event.pixel_aspect_ratio,
+                color_primaries=event.color_primaries,
+                color_transfer=event.color_transfer,
+                color_matrix=event.color_matrix,
+                color_range=event.color_range,
+            )
+            break
+    expects(
+        "a frame duration contradicting the output rate refuses before commit",
+        "video_discontinuity",
+        lambda: out.save_video_stream(iter(wrong_duration)),
+    )
+
+    def corrupt_late() -> Any:
+        for index, event in enumerate(canonical_events):
+            if index == len(canonical_events) - 1:
+                raise MediaDecodeError(
+                    "later shot bytes are corrupt",
+                    code="media_corrupt",
+                    fields=("shots.7.video",),
+                )
+            yield event
+
+    expects(
+        "late-shot corruption preserves its field and commits no partial output",
+        "media_corrupt",
+        lambda: out.save_video_stream(iter(corrupt_late())),
+        field="shots.7.video",
+    )
+    check(
+        "late corruption leaves no new pending or partial streaming output",
+        set(record.pending) == pending_before and not list(root.glob(".video-*.partial")),
+    )
+
+    capped_record = Attempt("stream-cap", root / "stream-cap", max_output_bytes=128)
+    capped_record.spool.mkdir()
+    capped_out = Outputs(capped_record)
+    expects(
+        "the output cap fires during streaming container production",
+        "output_too_large",
+        lambda: capped_out.save_video_stream(iter(canonical_events)),
+    )
+    check(
+        "a cap refusal leaves the bounded output spool empty",
+        not capped_record.pending and not list(capped_record.spool.iterdir()),
+    )
+
+    silent_source = out.save_video(NdLike(frames, (3, 2, 4, 3), "uint8"), fps=24)
+    hydrate(silent_source, input_id="silent-source", cap=8 << 20)
+    with decoder.stream_video(silent_source) as source:
+        silent_saved = out.save_video_stream(source)
+    check(
+        "a silent stream emits no invented audio track",
+        silent_saved.submitted_audio_samples == 0 and silent_saved.decoded_audio_samples == 0,
+    )
+
+    color_width, color_height = 128, 96
+    color_rgb = bytes(
+        channel
+        for y in range(color_height)
+        for x in range(color_width)
+        for channel in (x * 255 // 127, y * 255 // 95, (x + y) * 255 // 222)
+    )
+
+    def color_events(*, primaries: int, transfer: int, matrix: int) -> Any:
+        yield DecodedMediaHeader(
+            video=DecodedVideoFormat(
+                width=color_width,
+                height=color_height,
+                time_base=Fraction(1, 24),
+                pixel_aspect_ratio=Fraction(1, 1),
+                nominal_frame_rate=Fraction(24, 1),
+                color_primaries=primaries,
+                color_transfer=transfer,
+                color_matrix=matrix,
+                color_range=1,
+            ),
+            audio=None,
+        )
+        yield DecodedVideoFrame(
+            width=color_width,
+            height=color_height,
+            rgb=color_rgb,
+            pts=0,
+            duration=1,
+            time_base=Fraction(1, 24),
+            pixel_aspect_ratio=Fraction(1, 1),
+            color_primaries=primaries,
+            color_transfer=transfer,
+            color_matrix=matrix,
+            color_range=1,
+        )
+
+    bt709 = out.save_video_stream(color_events(primaries=1, transfer=1, matrix=1))
+    itu601 = out.save_video_stream(color_events(primaries=6, transfer=6, matrix=5))
+    assert bt709.video._local is not None and itu601.video._local is not None
+    bt709_rgb = undecorated_rgb(av, bt709.video._local)
+    itu601_rgb = undecorated_rgb(av, itu601.video._local)
+    bt709_error = max(abs(left - right) for left, right in zip(color_rgb, bt709_rgb, strict=True))
+    itu601_error = max(abs(left - right) for left, right in zip(color_rgb, itu601_rgb, strict=True))
+    with av.open(str(bt709.video._local)) as color_probe:
+        bt709_matrix = int(color_probe.streams.video[0].codec_context.colorspace)
+    with av.open(str(itu601.video._local)) as color_probe:
+        itu601_matrix = int(color_probe.streams.video[0].codec_context.colorspace)
+    check(
+        "BT.709 and ITU601 use their declared RGB-to-YUV matrices and retain their tags",
+        bt709_matrix == 1
+        and itu601_matrix == 5
+        and bt709_error <= 20
+        and itu601_error <= 20
+        and bt709.video.digest != itu601.video.digest,
+        f"matrix={bt709_matrix}/{itu601_matrix} max_error={bt709_error}/{itu601_error}",
+    )
+
+    unspecified_hd_path = root / "unspecified-hd.mp4"
+    expected_hd = unspecified_hd_mp4(av, unspecified_hd_path)
+    unspecified_hd = input_asset(unspecified_hd_path, ref="unspecified-hd")
+    decoded_hd = decoder.decode_video(unspecified_hd)
+    hd_error = max(
+        abs(left - right) for left, right in zip(expected_hd, decoded_hd.frames_rgb[0], strict=True)
+    )
+    with decoder.stream_video(unspecified_hd) as source:
+        hd_header = next(source)
+        for _event in source:
+            pass
+    assert isinstance(hd_header, DecodedMediaHeader) and hd_header.video is not None
+    check(
+        "unspecified HD tags normalize to the BT.709 matrix before RGB conversion",
+        hd_header.video.color_primaries == 1
+        and hd_header.video.color_transfer == 1
+        and hd_header.video.color_matrix == 1
+        and hd_header.video.color_range == 1
+        and hd_error <= 20,
+        f"facts={hd_header.video} max_error={hd_error}",
+    )
+
+    class NoSnapshotVideo(VideoAsset):
+        def read_bytes(self) -> bytes:
+            raise AssertionError("encoded video was snapshotted")
+
+    direct_asset = NoSnapshotVideo("direct-video")
+    assert video._local is not None
+    bind(
+        direct_asset,
+        local=video._local,
+        attempt="decode-live",
+        media_type=video.media_type,
+        digest=video.digest,
+        length=video.size_bytes,
+        max_decoded_bytes=8 << 20,
+        input_id="direct-video",
+    )
+    direct = decoder.decode_video(direct_asset)
+    check(
+        "snapshot decode also opens the verified spool object directly",
+        direct.frame_count == decoded_video.frame_count,
+    )
+
+    missing_stream = VideoAsset("missing-stream")
+    bind(
+        missing_stream,
+        local=root / "missing-stream.mp4",
+        attempt="decode-live",
+        media_type="video/mp4",
+        digest=digest_bytes(b"missing"),
+        length=7,
+        max_decoded_bytes=8 << 20,
+        input_id="missing-stream",
+    )
+
+    def open_missing_stream() -> None:
+        with decoder.stream_video(missing_stream) as stream:
+            next(stream)
+
+    expects(
+        "lost streamed spool bytes retain Runtime ownership",
+        "media_materialization",
+        open_missing_stream,
+        field="missing-stream",
+    )
+
+    malformed_path = root / "malformed-retained.mp4"
+    malformed_path.write_bytes(b"not an mp4")
+    malformed_stream = VideoAsset("malformed-retained")
+    bind(
+        malformed_stream,
+        local=malformed_path,
+        attempt="decode-live",
+        media_type="video/mp4",
+        digest=digest_bytes(malformed_path.read_bytes()),
+        length=malformed_path.stat().st_size,
+        max_decoded_bytes=8 << 20,
+        input_id="malformed-retained",
+    )
+    before_fds = len(list(Path("/proc/self/fd").iterdir()))
+    failed_streams = []
+    for _ in range(40):
+        failed = decoder.stream_video(malformed_stream)
+        failed_streams.append(failed)
+        try:
+            with failed:
+                pass
+        except AuthorError as exc:
+            assert exc.code == "media_malformed"
+    after_fds = len(list(Path("/proc/self/fd").iterdir()))
+    check(
+        "retaining failed stream handles leaks no file descriptors",
+        after_fds == before_fds and len(failed_streams) == 40,
+        f"fds {before_fds}->{after_fds}",
+    )
 
     print("section: coarse Opus container clock")
     webm_path = root / "coarse.webm"
@@ -598,7 +1008,9 @@ def main() -> int:
         "JPEG EXIF pure rotation applies the exact pixel order without Pillow",
         (jpeg_rotated.width, jpeg_rotated.height) == (2, 4)
         and jpeg_rotated.rgb
-        == reordered_pixels(undecorated_rgb(av, root / "rotated.jpg"), (4, 0, 5, 1, 6, 2, 7, 3)),
+        == reordered_pixels(
+            undecorated_image_rgb(av, root / "rotated.jpg"), (4, 0, 5, 1, 6, 2, 7, 3)
+        ),
     )
     expects(
         "JPEG EXIF mirror refuses instead of sharing the rotation-only path",

@@ -762,7 +762,9 @@
       "members": [
         "decode_audio",
         "decode_image",
-        "decode_video"
+        "decode_video",
+        "stream_audio",
+        "stream_video"
       ],
       "service": "MediaDecoder"
     },
@@ -773,6 +775,7 @@
         "save_file",
         "save_image",
         "save_video",
+        "save_video_stream",
         "temporary_file"
       ],
       "service": "Outputs"
@@ -805,5 +808,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:71ccc9b01cb2d5999a2de5ed49992dbca148f2a8c8dc0381149f35848d9d5ea8"
+  "surface_digest": "sha256:143372e2e4b6f8bc10711e3aad5b76309816737e16005f57278999dfe954fd38"
 }

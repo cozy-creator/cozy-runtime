@@ -1760,7 +1760,7 @@ class AttemptEngine:
                     grants.write_output(
                         attempt.grant,
                         output_id,
-                        blob.read_bytes(),
+                        blob,
                         self.authorizer,
                         # The AUTHOR's declared media type, carried through instead of
                         # replaced by `application/octet-stream`. cl-010 measured the cost

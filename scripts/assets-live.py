@@ -970,6 +970,43 @@ def egress() -> None:
             f"{receipt.length // MIB} MiB copied, {peak / MIB:.2f} MiB peak Python heap",
         )
 
+        with tempfile.TemporaryDirectory(prefix="cozy-output-stream-") as directory:
+            output_root = Path(directory)
+            source = output_root / "source.bin"
+            expected = hashlib.sha256()
+            chunk = b"y" * MIB
+            with source.open("wb") as written:
+                for _ in range(streamed // MIB):
+                    written.write(chunk)
+                    expected.update(chunk)
+            destination = output_root / "published.bin"
+            output_grant = grants.BoundGrant(
+                outputs={
+                    "video": grants.BoundOutput(
+                        "video", f"file://{destination}", streamed, "video/mp4"
+                    )
+                }
+            )
+            tracemalloc.start()
+            output_entry = grants.write_output(
+                output_grant,
+                "video",
+                source,
+                grants.Authorizer(roots=(str(output_root),)),
+                media_type="video/mp4",
+            )
+            _, output_peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            check(
+                "a 64 MiB worker publication streams spool-to-grant without a bytes snapshot",
+                output_entry.length == streamed
+                and output_entry.digest == expected.digest()
+                and output_entry.mime_type == "video/mp4"
+                and destination.stat().st_size == streamed
+                and output_peak < 8 * MIB,
+                f"{output_entry.length // MIB} MiB, {output_peak / MIB:.2f} MiB peak Python heap",
+            )
+
         off = EgressPolicy()
         try:
             fetch(f"http://127.0.0.1:{port}/ok", off)
