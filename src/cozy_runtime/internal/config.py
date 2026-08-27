@@ -137,7 +137,6 @@ ADAPTER_ENV = {
 ADAPTER_CHILD_PLATFORM_ENV = {
     "LANG",
     "LC_ALL",
-    "PATH",
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
     "TZ",
