@@ -549,7 +549,7 @@ def _derive_all(
                     raise ProofRefusal(
                         "model_contract_config_invalid", f"{binding.path}: config is not an object"
                     )
-                config = Config(config_doc, document_digest=source.config.digest)
+                config = Config._verified(config_doc, "config", source.config.digest)
                 contracts: list[dict[str, Any]] = []
                 for variant in source.hardware_variants:
                     raw = _derive_twice(
