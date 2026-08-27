@@ -701,11 +701,23 @@ def main() -> int:
     hydrate(saved.video, input_id="streamed-output", cap=8 << 20)
     streamed_roundtrip = decoder.decode_video(saved.video)
     check(
-        "stream decode feeds one fragmented atomic H.264/AAC output",
+        "stream decode feeds one fragmented atomic H.264/AAC output with probed facts",
         saved.frame_count == decoded_video.frame_count
         and streamed_roundtrip.frame_count == decoded_video.frame_count
-        and streamed_roundtrip.soundtrack is not None,
-        f"frames={saved.frame_count} audio={saved.decoded_audio_samples}",
+        and streamed_roundtrip.soundtrack is not None
+        and saved.width == decoded_video.width
+        and saved.height == decoded_video.height
+        and saved.frame_rate == Fraction(24, 1)
+        and saved.pixel_aspect_ratio == Fraction(1, 1)
+        and saved.video_codec == "h264"
+        and bool(saved.video_profile)
+        and saved.audio is not None
+        and saved.audio.codec == "aac"
+        and bool(saved.audio.profile)
+        and saved.audio.channels == 1
+        and saved.audio.sample_rate == decoded_video.soundtrack.sample_rate
+        and saved.audio.codec_frame_samples == out.video_audio_frame_samples == 1024,
+        f"frames={saved.frame_count} audio={saved.audio.decoded_samples if saved.audio else 0}",
     )
     with decoder.stream_video(video) as source:
         repeated = out.save_video_stream(source)
@@ -791,7 +803,7 @@ def main() -> int:
         silent_saved = out.save_video_stream(source)
     check(
         "a silent stream emits no invented audio track",
-        silent_saved.submitted_audio_samples == 0 and silent_saved.decoded_audio_samples == 0,
+        silent_saved.submitted_audio_samples == 0 and silent_saved.audio is None,
     )
 
     color_width, color_height = 128, 96
