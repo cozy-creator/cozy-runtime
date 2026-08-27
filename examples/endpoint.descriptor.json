@@ -332,9 +332,20 @@
             "name": "references",
             "type": {
               "list": {
+                "tag_field": "kind",
                 "union": [
                   {
                     "fields": [
+                      {
+                        "discriminator": true,
+                        "name": "kind",
+                        "type": {
+                          "literal": [
+                            "audio"
+                          ]
+                        },
+                        "wire": "required"
+                      },
                       {
                         "name": "audio",
                         "type": {
@@ -354,10 +365,22 @@
                         "wire": "optional"
                       }
                     ],
-                    "struct": "AudioReference"
+                    "struct": "AudioReference",
+                    "tag": "audio",
+                    "tag_field": "kind"
                   },
                   {
                     "fields": [
+                      {
+                        "discriminator": true,
+                        "name": "kind",
+                        "type": {
+                          "literal": [
+                            "image"
+                          ]
+                        },
+                        "wire": "required"
+                      },
                       {
                         "name": "image",
                         "type": {
@@ -366,10 +389,22 @@
                         "wire": "required"
                       }
                     ],
-                    "struct": "ImageReference"
+                    "struct": "ImageReference",
+                    "tag": "image",
+                    "tag_field": "kind"
                   },
                   {
                     "fields": [
+                      {
+                        "discriminator": true,
+                        "name": "kind",
+                        "type": {
+                          "literal": [
+                            "video"
+                          ]
+                        },
+                        "wire": "required"
+                      },
                       {
                         "name": "video",
                         "type": {
@@ -406,7 +441,9 @@
                         "wire": "optional"
                       }
                     ],
-                    "struct": "VideoReference"
+                    "struct": "VideoReference",
+                    "tag": "video",
+                    "tag_field": "kind"
                   }
                 ]
               }
@@ -809,5 +846,5 @@
       "service": "Telemetry"
     }
   },
-  "surface_digest": "sha256:ad32b0f3c5eb9b354dfa254ea7d9c9aebb701a83a1748ec5f0e87050e0e25f23"
+  "surface_digest": "sha256:62d7bceed23f7de25dd7c938e31d2026499e5a0f69845c47198a1ba41877582d"
 }

@@ -54,6 +54,7 @@ from cozy_runtime.author import (  # noqa: E402
 from cozy_runtime.author._assets import GrantedInput  # noqa: E402
 from cozy_runtime.author._services import Attempt  # noqa: E402
 from cozy_runtime.internal import descriptor as desc  # noqa: E402
+from cozy_runtime.internal import schema  # noqa: E402
 from cozy_runtime.internal.discovery import discover  # noqa: E402
 
 Observation = str
@@ -105,6 +106,87 @@ class MediaIn(msgspec.Struct):
 
 class MediaFact(msgspec.Struct):
     service: str
+
+
+class TaggedImage(msgspec.Struct, tag="image", tag_field="type"):
+    image: str
+
+
+class TaggedVideo(msgspec.Struct, tag="video", tag_field="type"):
+    video: str
+
+
+class UntaggedReference(msgspec.Struct):
+    file: str
+
+
+class IntegerTagged(msgspec.Struct, tag=1, tag_field="type"):
+    number: int
+
+
+TaggedReference = TaggedImage | TaggedVideo
+
+
+def _tagged_union_conformance() -> str:
+    rendered = schema.render(list[TaggedReference])
+    assert isinstance(rendered, dict) and isinstance(rendered.get("list"), dict), rendered
+    union = rendered["list"]
+    assert union["tag_field"] == "type", union
+    members = union["union"]
+    assert isinstance(members, list) and len(members) == 2, members
+    tags = {member["tag"]: member for member in members}
+    assert set(tags) == {"image", "video"}, tags
+    for tag, member in tags.items():
+        assert member["tag_field"] == "type", member
+        discriminator = member["fields"][0]
+        assert discriminator == {
+            "name": "type",
+            "type": {"literal": [tag]},
+            "wire": "required",
+            "discriminator": True,
+        }, discriminator
+
+    decoder = msgspec.json.Decoder(list[TaggedReference])
+    decoded = decoder.decode(b'[{"type":"image","image":"ref"}]')
+    assert decoded == [TaggedImage("ref")], decoded
+    for invalid in (
+        b'[{"image":"ref"}]',
+        b'[{"type":"audio","image":"ref"}]',
+        b'[{"type":"video","image":"ref"}]',
+    ):
+        try:
+            decoder.decode(invalid)
+        except msgspec.ValidationError:
+            continue
+        raise AssertionError(f"tagged-union decoder accepted {invalid!r}")
+
+    assert schema.render(UntaggedReference | None) == {
+        "union": [
+            "null",
+            {
+                "fields": [{"name": "file", "type": "str", "wire": "required"}],
+                "struct": "UntaggedReference",
+            },
+        ]
+    }
+    single = schema.render(TaggedImage)
+    assert single["fields"][0]["wire"] == "optional", single
+    scalar_union = schema.render(TaggedImage | str)
+    tagged_member = next(member for member in scalar_union["union"] if isinstance(member, dict))
+    assert tagged_member["fields"][0]["wire"] == "optional", tagged_member
+    try:
+        schema.render(TaggedImage | UntaggedReference)
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "tagged_union_incoherent", exc
+    else:
+        raise AssertionError("mixed tagged/untagged union rendered")
+    try:
+        schema.render(TaggedImage | IntegerTagged)
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "tagged_union_incoherent", exc
+    else:
+        raise AssertionError("mixed string/integer tags rendered")
+    return "type=image|video published and missing/unknown/mismatched tags refused"
 
 
 @probe.entrypoint
@@ -354,7 +436,14 @@ def _run_all(spool: Path) -> int:
     context_arms = _context_arms(spool)
     service_arms = _service_arms(spool)
 
-    print("=== conformance: every descriptor-declared Context fact")
+    print("=== conformance: tagged-union descriptor truth")
+    try:
+        print("  tagged_reference    " + _tagged_union_conformance())
+    except Exception as exc:
+        print(f"  tagged_reference    REFUSED — {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    print("\n=== conformance: every descriptor-declared Context fact")
     missing = sorted(declared_context - set(context_arms))
     if missing:
         print(
