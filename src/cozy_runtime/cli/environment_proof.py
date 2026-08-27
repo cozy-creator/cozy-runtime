@@ -65,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Exit.validation,
             )
         request = _read_request(request_path)
-        if _contains(request.environment_root, receipt_path):
+        if receipt_path.is_relative_to(request.environment_root):
             raise CliError(
                 "environment_proof_output_invalid",
                 "receipt output must be outside the environment root",
@@ -228,7 +228,15 @@ def _cli_output_path(value: str) -> Path:
         path = Path.cwd() / path
     if not path.name:
         raise _request_error("receipt output has no filename")
-    return path.parent.resolve(strict=False) / path.name
+    path = path.parent.resolve(strict=False) / path.name
+    if os.path.lexists(path):
+        raise CliError(
+            "environment_proof_receipt_conflict",
+            f"receipt output already exists: {path}",
+            "choose a fresh receipt output for this proof seat",
+            Exit.conflict,
+        )
+    return path
 
 
 def _absolute_path(value: object, name: str) -> Path:
@@ -250,14 +258,6 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _contains(root: Path, path: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
 def _publish_receipt(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = path.parent.lstat()
@@ -272,20 +272,13 @@ def _publish_receipt(path: Path, payload: bytes) -> None:
             os.fsync(handle.fileno())
         try:
             os.link(temporary, path)
-        except FileExistsError:
-            existing = path.lstat()
-            if (
-                not stat.S_ISREG(existing.st_mode)
-                or existing.st_mode & 0o222
-                or path.read_bytes() != payload
-            ):
-                raise CliError(
-                    "environment_proof_receipt_conflict",
-                    f"receipt output already holds different or mutable bytes: {path}",
-                    "choose a new output or preserve the exact immutable prior receipt",
-                    Exit.conflict,
-                ) from None
-            return
+        except FileExistsError as err:
+            raise CliError(
+                "environment_proof_receipt_conflict",
+                f"receipt output was concurrently claimed: {path}",
+                "preserve the winning receipt and choose a new output for another proof",
+                Exit.conflict,
+            ) from err
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory)

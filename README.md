@@ -150,9 +150,10 @@ fresh endpoint is `--check`-clean out of the box.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
-the pinned uv and Python executables, and a fresh environment root. It installs offline through
-the same environment materializer the pod later replays, atomically publishes the materializer's
-exact measured receipt bytes, and prints their compact digest/length/generation reference. It
+the pinned uv and Python executables, a fresh environment root, and a fresh receipt output. It
+installs offline through the same environment materializer the pod later replays, atomically
+publishes the materializer's exact measured receipt bytes, and prints their compact
+digest/length/generation reference. It
 does not accept an expected receipt, author release documents, fetch, resolve, or import endpoint
 code.
 
