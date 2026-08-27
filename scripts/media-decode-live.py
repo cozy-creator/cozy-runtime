@@ -48,8 +48,6 @@ from cozy_runtime.author._decode import (  # noqa: E402
 from cozy_runtime.author._describe import describe  # noqa: E402
 from cozy_runtime.author._errors import AuthorError, ConformanceError  # noqa: E402
 from cozy_runtime.author._services import Attempt, Outputs  # noqa: E402
-from cozy_runtime.internal.descriptor import _services  # noqa: E402
-from cozy_runtime.internal.schema import render  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -564,27 +562,6 @@ def main() -> int:
         "hydration refusals identify the concrete field",
         bad_outcome.code == "asset_media_type" and bad_outcome.fields == ("image",),
         f"code={bad_outcome.code} fields={bad_outcome.fields}",
-    )
-    schema = render(DecodeInput)
-    assert isinstance(schema, dict)
-    fields = schema.get("fields")
-    assert isinstance(fields, list) and isinstance(fields[0], dict)
-    published = fields[0].get("asset_bound")
-    check(
-        "descriptor publishes every effective image decode ceiling",
-        isinstance(published, dict)
-        and published.get("max_decoded_bytes") == 1 << 20
-        and published.get("max_pixels_per_frame") == DEFAULT_DECODE_LIMITS.max_pixels_per_frame,
-    )
-    media_service = _services()["media_decode"]
-    assert isinstance(media_service, dict)
-    aggregate_limits = media_service.get("limits")
-    check(
-        "descriptor publishes the attempt aggregate decoded-value ceiling",
-        isinstance(aggregate_limits, dict)
-        and aggregate_limits.get("max_attempt_decoded_bytes")
-        == DEFAULT_DECODE_LIMITS.max_decoded_bytes
-        and aggregate_limits.get("max_active_streams") == 2,
     )
     hydrate(image, input_id="image", cap=1 << 20)
     decoded_image = decoder.decode_image(image)

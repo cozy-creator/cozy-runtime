@@ -206,7 +206,10 @@ def run(name: str, target_dir: str) -> Result:
             ("package", pkg),
             ("entry", f"{pkg}:app"),
             ("files", str(len(files) + 1)),
-            (descriptor.DIGEST_KEY, str(written.document[descriptor.DIGEST_KEY])),
+            (
+                descriptor.DIGEST_KEY,
+                descriptor.descriptor_digest(descriptor.render(written.document)),
+            ),
         ),
         commands=(
             f"cd {target} && uv sync",

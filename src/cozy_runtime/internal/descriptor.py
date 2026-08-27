@@ -1,65 +1,33 @@
-"""EndpointDescriptor and JobDescriptor — the SCHEMA HOME (cr-003).
+"""The reviewed endpoint descriptor generated from one frozen application.
 
-What the platform emits by EXECUTION, never hand-authored as a second document (§1.0): the
-source-stable surface of one release. Callable names and schemas, signature-derived model
-binding paths with each role class's admissibility stamps, the AuthorCapabilitySet derived
-from each signature, per-public-method ComponentUseContracts, the config and secret schemas,
-the protocol range, the Context/service facts endpoints rely on, and the surface digest.
-
-Three things are deliberately NOT here, each a red arm:
-
-* No candidate code topology. A release is built before any deployment binding exists, and
-  an open slot binds checkpoints that did not exist at build. Destinations, ties, buffers,
-  component membership and cache declarations belong to the ModelConstructionContract,
-  derived per exact (release, factory, artifact snapshot, configs, variant) — cr-004.
-* No fixed-point content: the enclosing release digest, a build timestamp, a machine path,
-  or any mutable-binding/candidate-selected fact. `_fixed_point` proves it over the built
-  document rather than trusting the builders above it.
-* No execution spelling. `def` and `async def` describe IDENTICALLY: the spelling picks
-  where the body runs (§1.2), and a caller cannot observe it.
-
-Identity is `surface_digest` = sha256 over the canonical bytes of the body — every key
-except `surface_digest` itself, which is the one self-reference a document cannot contain.
-The committed `endpoint.descriptor.json` is a pretty PROJECTION of that body: a checked
-cache, never authority.
+The descriptor contains only facts a launch or invocation reader consumes. Its one identity
+is the SHA-256 of the exact deterministic bytes committed as ``endpoint.descriptor.json``;
+there is no digest embedded in the document it identifies.
 """
 
 from __future__ import annotations
 
-import inspect
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
-from cozy_runtime import PYTHON_CONTRACT_VERSION, WIRE_PROTOCOL_PACKAGE
-from cozy_runtime.author import ConformanceError, Context, ModelBinding, Surface
-from cozy_runtime.author._demand import feature_specs
-from cozy_runtime.author._errors import NEUTRAL_ERROR_SET
-from cozy_runtime.author._services import SERVICES
+from cozy_runtime.author import ConformanceError, ModelBinding, Surface
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.protocol import WIRE_MINOR
 
 SCHEMA = "cozy.endpoint.descriptor/1"
 FILE = "endpoint.descriptor.json"
-DIGEST_KEY = "surface_digest"
+DIGEST_KEY = "descriptor_digest"
 
 #: The complete top-level field set. A reader admits EXACTLY these — never a superset.
 TOP_LEVEL_KEYS = frozenset(
     {
-        "schema",
+        "format",
         "application",
-        "protocol",
-        "context_facts",
-        "services",
-        "error_model",
-        "config_schema",
-        "secret_schema",
         "entrypoints",
         "jobs",
-        DIGEST_KEY,
     }
 )
 
@@ -74,29 +42,19 @@ class StaleDescriptor(ConformanceError):
 
 
 def build(found: Discovered) -> dict[str, Json]:
-    """The descriptor BODY for one discovered release. Pure function of the frozen app."""
-    settings: dict[str, Json] = {}
-    secrets: dict[str, Json] = {}
+    """Derive one descriptor from the frozen application."""
     entrypoints: list[Json] = []
     jobs: list[Json] = []
     for surface in found.surfaces:
-        doc = _callable(surface, settings, secrets)
+        doc = _callable(surface)
         (jobs if surface.kind == "job" else entrypoints).append(doc)
     body: dict[str, Json] = {
-        "schema": SCHEMA,
+        "format": SCHEMA,
         "application": found.application,
-        "protocol": _protocol(),
-        "context_facts": _context_facts(),
-        "services": _services(),
-        "error_model": dict(NEUTRAL_ERROR_SET),
-        "config_schema": settings,
-        "secret_schema": secrets,
         "entrypoints": sorted(entrypoints, key=_by_name),
         "jobs": sorted(jobs, key=_by_name),
     }
-    # The declared field set and the built one are the same fact, proven here rather than
-    # kept in step by review.
-    assert set(body) == TOP_LEVEL_KEYS - {DIGEST_KEY}, sorted(set(body) ^ TOP_LEVEL_KEYS)
+    assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
     _fixed_point(body, _binding_values(found.bindings))
     return body
 
@@ -108,78 +66,22 @@ def _by_name(doc: Json) -> str:
     return name
 
 
-def _callable(
-    surface: Surface, settings: dict[str, Json], secrets: dict[str, Json]
-) -> dict[str, Json]:
+def _callable(surface: Surface) -> dict[str, Json]:
     doc: dict[str, Json] = {
         "name": surface.name,
-        "kind": surface.kind,
-        # The AuthorCapabilitySet: a pure function of the parameter list. It names powers
-        # granted to AUTHOR code — journaling, fetching and mandatory telemetry stay
-        # runtime-owned policy and are deliberately not here (§1.3).
-        "capabilities": sorted(surface.capabilities),
-        "gpu": surface.gpu,
         "request": schema.render(surface.payload_type),
         "result": schema.render(surface.result_type),
     }
     if surface.kind == "entrypoint":
-        # DECLARED BUT NOT SERVED (#572d), and only an ENTRYPOINT can be: a job is
-        # dispatched by name through `cozy job` and has no serving set to be absent from.
-        # It stays in the descriptor because it is real code with a real signature and the
-        # descriptor must not lie about the release; the serving set is what excludes it,
-        # so no binding is staged and no request lands.
         doc["hidden"] = surface.hidden
     models = [_model(binding) for binding in surface.model_bindings]
     if models:
         doc["models"] = models
-    features = [
-        {"axis": spec.axis, "field": spec.field, "source": spec.source}
-        for spec in feature_specs(surface.payload_type)
-    ]
-    if features:
-        doc["request_features"] = sorted(features, key=lambda f: (f["axis"], f["field"]))
     if surface.kind == "job":
-        # WHAT THE BODY MAY WRITE, as its own declaration. Grants mint off these two lines
-        # and never off the kind (§2): a job that declares neither is granted no destination.
         doc["publishes"] = surface.publishes
-        doc["emits_media"] = surface.emits_media
-    if surface.preflight is not None:
-        doc["preflight"] = {
-            "identity": surface.preflight.identity,
-            "facts": schema.render(surface.preflight.result_type),
-        }
-    for param in surface.params:
-        if param.capability == "settings" and param.arg is not None:
-            doc["settings"] = _register(settings, param.arg)
-        elif param.capability == "secrets" and param.arg is not None:
-            doc["secrets"] = _register(secrets, param.arg)
-    if surface.resources is not None:
-        doc["resources"] = _resources(surface)
-    if surface.demand_bound is not None:
-        bound = surface.demand_bound
-        declared: dict[str, Json] = {"provenance": bound.provenance, "reason": bound.reason}
-        if bound.vram_bytes is not None:
-            declared["vram_bytes"] = bound.vram_bytes
-        if bound.host_ram_bytes is not None:
-            declared["host_ram_bytes"] = bound.host_ram_bytes
-        doc["demand"] = declared
+        if surface.resources is not None and surface.resources.gpu_count is not None:
+            doc["resources"] = {"gpu_count": surface.resources.gpu_count}
     return doc
-
-
-def _register(into: dict[str, Json], declared: object) -> str:
-    """Typed deployment schemas live ONCE at the root; a callable references one by name."""
-    rendered = schema.render(declared)
-    assert isinstance(rendered, dict)
-    name = str(rendered.get("struct", getattr(declared, "__name__", "schema")))
-    existing = into.get(name)
-    if existing is not None and existing != rendered:
-        raise ConformanceError(
-            f"two different declared schemas are both named {name!r}: the deployment config "
-            "plane keys on the name, so one name is one schema",
-            code="schema_collision",
-        )
-    into[name] = rendered
-    return name
 
 
 def _model(binding: ModelBinding) -> dict[str, Json]:
@@ -198,69 +100,6 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
         },
     }
     return doc
-
-
-def _resources(surface: Surface) -> dict[str, Json]:
-    override = surface.resources
-    assert override is not None
-    doc: dict[str, Json] = {}
-    if override.gpu_count is not None:
-        doc["gpu_count"] = override.gpu_count
-    if override.placement is not None:
-        doc["placement"] = override.placement
-    if override.requires is not None:
-        doc["requires"] = override.requires
-    return doc
-
-
-def _protocol() -> dict[str, Json]:
-    """The declared RANGE this release speaks. Scripts gate on capability tokens, never on
-    version strings (cozy-runtime-cli.md) — this is what a RecordOwner checks admissibility
-    against, not what anyone parses for features."""
-    return {
-        "wire_package": WIRE_PROTOCOL_PACKAGE,
-        "wire_minor_min": 0,
-        "wire_minor_max": WIRE_MINOR,
-        "python_contract_min": PYTHON_CONTRACT_VERSION,
-        "python_contract_max": PYTHON_CONTRACT_VERSION,
-    }
-
-
-def _context_facts() -> list[Json]:
-    """The committed Context inventory, READ from the class rather than restated.
-
-    Every fact here has a live conformance exercise (`internal/conformance.py`): the v1
-    writer-drift lesson is that `ctx.boot_warmup`'s writer was deleted while the contract
-    stood, silently stripping warmup arms fleet-wide.
-    """
-    facts: dict[str, Json] = {}
-    for name in [*Context.__dataclass_fields__, *dir(Context)]:
-        if name.startswith("_") or name in facts:
-            continue
-        member = inspect.getattr_static(Context, name, None)
-        facts[name] = {"name": name, "kind": "method" if callable(member) else "attribute"}
-    return sorted(facts.values(), key=_by_name)
-
-
-def _services() -> dict[str, Json]:
-    """capability -> the service type and the members author code may call."""
-    out: dict[str, Json] = {}
-    for capability, service in sorted(SERVICES.items()):
-        members = sorted(
-            name
-            for name, value in vars(service).items()
-            if not name.startswith("_") and callable(value)
-        )
-        document: dict[str, Json] = {"service": service.__name__, "members": members}
-        if capability == "media_decode":
-            from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MAX_ACTIVE_MEDIA_STREAMS
-
-            document["limits"] = {
-                "max_attempt_decoded_bytes": DEFAULT_DECODE_LIMITS.max_decoded_bytes,
-                "max_active_streams": MAX_ACTIVE_MEDIA_STREAMS,
-            }
-        out[capability] = document
-    return out
 
 
 # -------------------------------------------------------------------- fixed-point scan
@@ -347,9 +186,14 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
 # ------------------------------------------------------------------------ identity + file
 
 
-def surface_digest(body: Mapping[str, Json]) -> str:
-    """sha256 over the canonical bytes of everything EXCEPT the digest field itself."""
-    return canonical.digest({k: v for k, v in body.items() if k != DIGEST_KEY})
+def render(doc: Mapping[str, Json]) -> bytes:
+    """The one deterministic byte representation of an endpoint descriptor."""
+    return canonical.pretty(dict(doc)).encode("utf-8")
+
+
+def descriptor_digest(raw: bytes) -> str:
+    """The exact stored-byte identity shared by every descriptor consumer."""
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
@@ -375,46 +219,21 @@ def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
     )
 
 
-def document(body: Mapping[str, Json]) -> dict[str, Json]:
-    """The committed document: the body plus its own digest, the one derived line a
-    reviewer reads to know the surface contract moved."""
-    return {**body, DIGEST_KEY: surface_digest(body)}
-
-
 def path_of(project: Path) -> Path:
     return project / FILE
 
 
 def write(project: Path, doc: Mapping[str, Json]) -> Path:
     target = path_of(project)
-    target.write_text(canonical.pretty(dict(doc)))
+    target.write_bytes(render(doc))
     return target
 
 
-@dataclass(frozen=True, slots=True)
-class Divergence:
-    """Which pair disagreed, and on what."""
-
-    left: str
-    right: str
-    detail: str
-
-
 def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
-    """Refuse unless two descriptors are the same document, naming the pair and the field."""
-    left_body = {k: v for k, v in left.items() if k != DIGEST_KEY}
-    right_body = {k: v for k, v in right.items() if k != DIGEST_KEY}
-    if canonical.write(left_body) == canonical.write(right_body):
-        declared = left.get(DIGEST_KEY)
-        derived = surface_digest(right_body)
-        if declared is not None and declared != derived:
-            raise StaleDescriptor(
-                f"{names[0]} carries {DIGEST_KEY} {declared} but its own body digests to "
-                f"{derived} — the committed digest line was edited without the body",
-                code="digest_mismatch",
-            )
+    """Refuse unless two descriptors render to the same exact bytes."""
+    if render(left) == render(right):
         return
-    detail = "; ".join(_differences(left_body, right_body)) or "the documents differ"
+    detail = "; ".join(_differences(left, right)) or "the documents differ"
     raise StaleDescriptor(
         f"{names[0]} and {names[1]} are different documents: {detail}",
         code="stale_descriptor",
@@ -462,27 +281,31 @@ def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
         raise StaleDescriptor(f"{source}: {exc}", code="malformed_descriptor") from exc
     if not isinstance(parsed, dict):
         raise StaleDescriptor(f"{source} is not a JSON object", code="malformed_descriptor")
-    # EXACT field set, never a superset (v1's graph-document lesson: an unknown key read as
-    # a legal older document is how a reader goes quiet instead of refusing).
-    unknown = sorted(set(parsed) - TOP_LEVEL_KEYS)
-    if unknown:
+    fields = set(parsed)
+    if fields != TOP_LEVEL_KEYS:
+        missing = sorted(TOP_LEVEL_KEYS - fields)
+        unknown = sorted(fields - TOP_LEVEL_KEYS)
+        problems = []
+        if missing:
+            problems.append(f"missing {', '.join(missing)}")
+        if unknown:
+            problems.append(f"unknown {', '.join(unknown)}")
         raise StaleDescriptor(
-            f"{source} carries unknown top-level field(s) {', '.join(unknown)}: the descriptor "
-            f"schema is exactly {', '.join(sorted(TOP_LEVEL_KEYS))}",
+            f"{source} has {'; '.join(problems)}: the descriptor fields are exactly "
+            f"{', '.join(sorted(TOP_LEVEL_KEYS))}",
             code="unknown_field",
         )
-    declared = parsed.get(DIGEST_KEY)
-    if not isinstance(declared, str) or not canonical.DIGEST_RE.match(declared):
+    if parsed["format"] != SCHEMA:
         raise StaleDescriptor(
-            f"{source}: {DIGEST_KEY} {declared!r} is not `sha256:<64 lowercase hex>` — one digest "
-            "spelling, shared with tensorfs (tfs-013)",
-            code="malformed_digest",
+            f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
+            code="unknown_format",
         )
-    derived = surface_digest({key: value for key, value in parsed.items() if key != DIGEST_KEY})
-    if declared != derived:
+    expected = render(parsed)
+    if raw != expected:
         raise StaleDescriptor(
-            f"{source}: {DIGEST_KEY} {declared} does not match its body {derived}",
-            code="digest_mismatch",
+            f"{source} is not the deterministic descriptor encoding; regenerate it instead "
+            "of editing whitespace or key order",
+            code="noncanonical_descriptor",
         )
     return parsed
 

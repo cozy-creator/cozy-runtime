@@ -455,7 +455,7 @@ def _child_entry(args: Sequence[str]) -> int:
         sandbox.install(allow_write_prefixes=())
         sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
         found = discover_installed(application)
-        installed_descriptor = endpoint_descriptor.document(endpoint_descriptor.build(found))
+        installed_descriptor = endpoint_descriptor.build(found)
         endpoint_descriptor.compare(
             descriptor_doc,
             installed_descriptor,

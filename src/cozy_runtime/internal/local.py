@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from cozy_runtime.internal import canonical, provisioned
+from cozy_runtime.internal import canonical, descriptor, provisioned
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -941,11 +941,7 @@ def weightless_release_documents(
     if not isinstance(entries, list):
         raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
     visible: list[Mapping[str, Any]] = [
-        entry
-        for entry in entries
-        if isinstance(entry, Mapping)
-        and entry.get("kind") == "entrypoint"
-        and entry.get("hidden") is False
+        entry for entry in entries if isinstance(entry, Mapping) and entry.get("hidden") is False
     ]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
@@ -955,7 +951,7 @@ def weightless_release_documents(
             "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
         )
 
-    descriptor_bytes = canonical.write(dict(endpoint_descriptor))
+    descriptor_bytes = descriptor.render(endpoint_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
     plans: dict[str, bytes] = {}
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):

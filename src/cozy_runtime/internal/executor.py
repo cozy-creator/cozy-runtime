@@ -716,12 +716,10 @@ class Executor:
         if not application or not descriptor_path:
             raise RuntimeError("executor requires the canonical installed release identity")
         discovered = discover_installed(application)
-        published = canonical.parse(Path(descriptor_path).read_bytes())
-        if not isinstance(published, dict):
-            raise RuntimeError("staged EndpointDescriptor is not an object")
+        published = descriptor.read_bytes(Path(descriptor_path).read_bytes(), descriptor_path)
         descriptor.compare(
             published,
-            descriptor.document(descriptor.build(discovered)),
+            descriptor.build(discovered),
             ("provisioned EndpointDescriptor", "installed endpoint"),
         )
         self.discovered = discovered

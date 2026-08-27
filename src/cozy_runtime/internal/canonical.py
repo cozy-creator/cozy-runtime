@@ -241,9 +241,9 @@ def _no_constants(name: str) -> Json:
 
 
 def pretty(value: Json) -> str:
-    """The committed file's rendering: sorted, indented, newline-terminated.
+    """Deterministic sorted, indented, newline-terminated review bytes.
 
-    A PROJECTION — never stored as identity, never hashed. Identity is `digest(value)` over
-    the canonical bytes, so reformatting the committed file changes no claim it makes.
+    Each document owner decides whether these or compact JCS bytes are its stored identity.
+    The endpoint descriptor deliberately hashes this exact review rendering.
     """
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"

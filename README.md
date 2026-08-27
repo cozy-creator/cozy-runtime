@@ -119,18 +119,20 @@ endpoint.toml names, freezes it, and stops. Importing a module never registers a
 there is no recursive discovery, no dependency stubbing and no source parser — a red arm
 plants a self-registering sibling module and proves describe cannot see it.
 
-`internal/descriptor.py` is the schema home for `EndpointDescriptor`/`JobDescriptor`: the
-SOURCE-STABLE surface only. It carries no candidate topology (cr-004's
+`internal/descriptor.py` is the schema home for `EndpointDescriptor`/`JobDescriptor`: only
+the launch and invocation facts with current readers. It carries no Runtime-global service
+inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
 no release digest, build timestamp, machine path or mutable binding reached it.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.
 
-`endpoint.descriptor.json` is committed and is a CHECKED CACHE, never authority:
-`describe --check` re-derives and refuses a stale one, and CI runs it. `describe` itself is
-read-only; `--write-descriptor` is the only writer, and `cozy-runtime new` runs it so a
-fresh endpoint is `--check`-clean out of the box.
+`endpoint.descriptor.json` is generated, committed and reviewed. It has one deterministic
+pretty byte representation; `descriptor_digest` is SHA-256 over those exact bytes and is its
+only identity. `describe --check` re-derives the exact bytes, so even a whitespace edit
+refuses. `describe` itself is read-only; `--write-descriptor` is the only writer, and
+`cozy-runtime new` runs it so a fresh endpoint is `--check`-clean out of the box.
 
 ## Commands
 
@@ -141,7 +143,7 @@ fresh endpoint is `--check`-clean out of the box.
     uv run cozy-runtime describe --check # refuse a stale endpoint.descriptor.json (CI)
     uv run python scripts/fence.py       # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
-    uv run python scripts/conformance.py # every descriptor-declared fact has a live writer
+    uv run python scripts/conformance.py # every public Context/service fact has a live writer
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     uv run python scripts/environment-materializer-live.py # cr-027 cold/warm offline receipt proof

@@ -1,53 +1,8 @@
 {
   "application": "tiny_h3:app",
-  "config_schema": {
-    "RefServeSettings": {
-      "fields": [
-        {
-          "default": false,
-          "name": "combined_keyframes",
-          "type": "bool",
-          "wire": "optional"
-        }
-      ],
-      "struct": "RefServeSettings"
-    }
-  },
-  "context_facts": [
-    {
-      "kind": "attribute",
-      "name": "boot_warmup"
-    },
-    {
-      "kind": "attribute",
-      "name": "cancelled"
-    },
-    {
-      "kind": "attribute",
-      "name": "deadline"
-    },
-    {
-      "kind": "attribute",
-      "name": "device"
-    },
-    {
-      "kind": "method",
-      "name": "raise_if_cancelled"
-    },
-    {
-      "kind": "attribute",
-      "name": "request_id"
-    }
-  ],
   "entrypoints": [
     {
-      "capabilities": [
-        "save",
-        "telemetry"
-      ],
-      "gpu": true,
       "hidden": false,
-      "kind": "entrypoint",
       "models": [
         {
           "class": "Fl2VAModel",
@@ -79,25 +34,6 @@
         }
       ],
       "name": "generate",
-      "preflight": {
-        "facts": {
-          "fields": [
-            {
-              "name": "has_visual_condition",
-              "type": "bool",
-              "wire": "required"
-            },
-            {
-              "name": "has_audio_condition",
-              "type": "bool",
-              "wire": "required"
-            }
-          ],
-          "frozen": true,
-          "struct": "H3AdmissionFacts"
-        },
-        "identity": "tiny_h3:preflight_fl"
-      },
       "request": {
         "fields": [
           {
@@ -106,7 +42,6 @@
             "wire": "required"
           },
           {
-            "default": null,
             "name": "first_frame",
             "type": {
               "union": [
@@ -119,7 +54,6 @@
             "wire": "optional"
           },
           {
-            "default": null,
             "name": "last_frame",
             "type": {
               "union": [
@@ -132,16 +66,9 @@
             "wire": "optional"
           },
           {
-            "default": "16:9",
             "name": "aspect_ratio",
-            "shape_axes": [
-              "width",
-              "height",
-              "pixels"
-            ],
             "type": {
-              "enum": "AspectPreset",
-              "values": [
+              "literal": [
                 "16:9",
                 "1:1",
                 "9:16"
@@ -150,11 +77,7 @@
             "wire": "optional"
           },
           {
-            "default": 1,
             "name": "duration_s",
-            "shape_axes": [
-              "frames"
-            ],
             "type": {
               "literal": [
                 1,
@@ -165,13 +88,6 @@
             "wire": "optional"
           },
           {
-            "default": 4,
-            "default_sources": [
-              "code_fallback",
-              "checkpoint_recipe",
-              "adapter_recipe",
-              "request"
-            ],
             "name": "num_inference_steps",
             "type": {
               "literal": [
@@ -183,13 +99,11 @@
             "wire": "omissible"
           },
           {
-            "default": false,
             "name": "mute",
             "type": "bool",
             "wire": "optional"
           },
           {
-            "default": null,
             "name": "seed",
             "type": {
               "union": [
@@ -199,37 +113,8 @@
             },
             "wire": "optional"
           }
-        ],
-        "forbid_unknown_fields": true,
-        "struct": "GenerateInput"
+        ]
       },
-      "request_features": [
-        {
-          "axis": "frames",
-          "field": "duration_s",
-          "source": "shape"
-        },
-        {
-          "axis": "height",
-          "field": "aspect_ratio",
-          "source": "shape"
-        },
-        {
-          "axis": "pixels",
-          "field": "aspect_ratio",
-          "source": "shape"
-        },
-        {
-          "axis": "steps",
-          "field": "num_inference_steps",
-          "source": "field"
-        },
-        {
-          "axis": "width",
-          "field": "aspect_ratio",
-          "source": "shape"
-        }
-      ],
       "result": {
         "fields": [
           {
@@ -254,19 +139,11 @@
             "type": "str",
             "wire": "required"
           }
-        ],
-        "struct": "GenerateOutput"
+        ]
       }
     },
     {
-      "capabilities": [
-        "save",
-        "settings",
-        "telemetry"
-      ],
-      "gpu": true,
       "hidden": false,
-      "kind": "entrypoint",
       "models": [
         {
           "class": "Ref2VAModel",
@@ -298,25 +175,6 @@
         }
       ],
       "name": "generate_ref",
-      "preflight": {
-        "facts": {
-          "fields": [
-            {
-              "name": "has_visual_condition",
-              "type": "bool",
-              "wire": "required"
-            },
-            {
-              "name": "has_audio_condition",
-              "type": "bool",
-              "wire": "required"
-            }
-          ],
-          "frozen": true,
-          "struct": "H3AdmissionFacts"
-        },
-        "identity": "tiny_h3:preflight_ref"
-      },
       "request": {
         "fields": [
           {
@@ -337,7 +195,6 @@
                   {
                     "fields": [
                       {
-                        "discriminator": true,
                         "name": "kind",
                         "type": {
                           "literal": [
@@ -354,7 +211,6 @@
                         "wire": "required"
                       },
                       {
-                        "default": null,
                         "name": "sample_rate",
                         "type": {
                           "union": [
@@ -365,14 +221,12 @@
                         "wire": "optional"
                       }
                     ],
-                    "struct": "AudioReference",
                     "tag": "audio",
                     "tag_field": "kind"
                   },
                   {
                     "fields": [
                       {
-                        "discriminator": true,
                         "name": "kind",
                         "type": {
                           "literal": [
@@ -389,14 +243,12 @@
                         "wire": "required"
                       }
                     ],
-                    "struct": "ImageReference",
                     "tag": "image",
                     "tag_field": "kind"
                   },
                   {
                     "fields": [
                       {
-                        "discriminator": true,
                         "name": "kind",
                         "type": {
                           "literal": [
@@ -413,13 +265,11 @@
                         "wire": "required"
                       },
                       {
-                        "default": false,
                         "name": "soundtrack",
                         "type": "bool",
                         "wire": "optional"
                       },
                       {
-                        "default": null,
                         "name": "fps",
                         "type": {
                           "union": [
@@ -430,7 +280,6 @@
                         "wire": "optional"
                       },
                       {
-                        "default": null,
                         "name": "sample_rate",
                         "type": {
                           "union": [
@@ -441,7 +290,6 @@
                         "wire": "optional"
                       }
                     ],
-                    "struct": "VideoReference",
                     "tag": "video",
                     "tag_field": "kind"
                   }
@@ -451,7 +299,6 @@
             "wire": "required"
           },
           {
-            "default": null,
             "name": "first_frame",
             "type": {
               "union": [
@@ -464,7 +311,6 @@
             "wire": "optional"
           },
           {
-            "default": null,
             "name": "last_frame",
             "type": {
               "union": [
@@ -477,16 +323,9 @@
             "wire": "optional"
           },
           {
-            "default": "16:9",
             "name": "aspect_ratio",
-            "shape_axes": [
-              "width",
-              "height",
-              "pixels"
-            ],
             "type": {
-              "enum": "AspectPreset",
-              "values": [
+              "literal": [
                 "16:9",
                 "1:1",
                 "9:16"
@@ -495,11 +334,7 @@
             "wire": "optional"
           },
           {
-            "default": 1,
             "name": "duration_s",
-            "shape_axes": [
-              "frames"
-            ],
             "type": {
               "literal": [
                 1,
@@ -510,13 +345,6 @@
             "wire": "optional"
           },
           {
-            "default": 4,
-            "default_sources": [
-              "code_fallback",
-              "checkpoint_recipe",
-              "adapter_recipe",
-              "request"
-            ],
             "name": "num_inference_steps",
             "type": {
               "literal": [
@@ -528,13 +356,11 @@
             "wire": "omissible"
           },
           {
-            "default": false,
             "name": "mute",
             "type": "bool",
             "wire": "optional"
           },
           {
-            "default": null,
             "name": "seed",
             "type": {
               "union": [
@@ -544,37 +370,8 @@
             },
             "wire": "optional"
           }
-        ],
-        "forbid_unknown_fields": true,
-        "struct": "RefGenerateInput"
+        ]
       },
-      "request_features": [
-        {
-          "axis": "frames",
-          "field": "duration_s",
-          "source": "shape"
-        },
-        {
-          "axis": "height",
-          "field": "aspect_ratio",
-          "source": "shape"
-        },
-        {
-          "axis": "pixels",
-          "field": "aspect_ratio",
-          "source": "shape"
-        },
-        {
-          "axis": "steps",
-          "field": "num_inference_steps",
-          "source": "field"
-        },
-        {
-          "axis": "width",
-          "field": "aspect_ratio",
-          "source": "shape"
-        }
-      ],
       "result": {
         "fields": [
           {
@@ -599,44 +396,13 @@
             "type": "str",
             "wire": "required"
           }
-        ],
-        "struct": "GenerateOutput"
-      },
-      "settings": "RefServeSettings"
+        ]
+      }
     }
   ],
-  "error_model": {
-    "author_raises": [
-      "InvalidRequest",
-      "UnsupportedInput",
-      "Cancelled",
-      "exception"
-    ],
-    "origins": [
-      "author",
-      "request",
-      "runtime"
-    ],
-    "retryability": "a RecordOwner projection over these facts; never author-declared",
-    "terminals": [
-      "succeeded",
-      "refused",
-      "failed",
-      "canceled"
-    ]
-  },
+  "format": "cozy.endpoint.descriptor/1",
   "jobs": [
     {
-      "capabilities": [
-        "budget",
-        "checkpoints",
-        "save",
-        "scratch",
-        "telemetry"
-      ],
-      "emits_media": false,
-      "gpu": true,
-      "kind": "job",
       "models": [
         {
           "class": "Fl2VAModel",
@@ -685,13 +451,11 @@
               "gt": 0.0,
               "le": 1.0
             },
-            "default": 0.0001,
             "name": "learning_rate",
             "type": "float",
             "wire": "optional"
           },
           {
-            "default": null,
             "name": "resume_from",
             "type": {
               "union": [
@@ -703,20 +467,10 @@
             },
             "wire": "optional"
           }
-        ],
-        "forbid_unknown_fields": true,
-        "struct": "DistillInput"
+        ]
       },
-      "request_features": [
-        {
-          "axis": "steps",
-          "field": "steps",
-          "source": "field"
-        }
-      ],
       "resources": {
-        "gpu_count": 2,
-        "placement": "single_node"
+        "gpu_count": 2
       },
       "result": {
         "fields": [
@@ -747,104 +501,8 @@
             },
             "wire": "required"
           }
-        ],
-        "struct": "DistillResult"
+        ]
       }
     }
-  ],
-  "protocol": {
-    "python_contract_max": "0.0.2",
-    "python_contract_min": "0.0.2",
-    "wire_minor_max": 0,
-    "wire_minor_min": 0,
-    "wire_package": "cozy.worker.v1"
-  },
-  "schema": "cozy.endpoint.descriptor/1",
-  "secret_schema": {},
-  "services": {
-    "adjust": {
-      "members": [
-        "adjusted",
-        "clamp",
-        "warn"
-      ],
-      "service": "Adjustments"
-    },
-    "budget": {
-      "members": [
-        "elapsed_s",
-        "raise_if_exhausted",
-        "remaining_usd",
-        "spent_usd"
-      ],
-      "service": "Budget"
-    },
-    "checkpoints": {
-      "members": [
-        "declare",
-        "save"
-      ],
-      "service": "Checkpoints"
-    },
-    "egress": {
-      "members": [
-        "fetch"
-      ],
-      "service": "Egress"
-    },
-    "media_decode": {
-      "limits": {
-        "max_active_streams": 2,
-        "max_attempt_decoded_bytes": 2147483648
-      },
-      "members": [
-        "decode_audio",
-        "decode_image",
-        "decode_video",
-        "stream_audio",
-        "stream_video"
-      ],
-      "service": "MediaDecoder"
-    },
-    "save": {
-      "members": [
-        "save_audio",
-        "save_bytes",
-        "save_file",
-        "save_image",
-        "save_video",
-        "save_video_stream",
-        "temporary_file"
-      ],
-      "service": "Outputs"
-    },
-    "scratch": {
-      "members": [
-        "checkpoint_dir",
-        "materialize_blob",
-        "mktemp"
-      ],
-      "service": "Scratch"
-    },
-    "secrets": {
-      "members": [],
-      "service": "Secrets"
-    },
-    "settings": {
-      "members": [],
-      "service": "Settings"
-    },
-    "telemetry": {
-      "members": [
-        "log",
-        "metric",
-        "progress",
-        "stage",
-        "step_callback",
-        "training_metric"
-      ],
-      "service": "Telemetry"
-    }
-  },
-  "surface_digest": "sha256:62d7bceed23f7de25dd7c938e31d2026499e5a0f69845c47198a1ba41877582d"
+  ]
 }

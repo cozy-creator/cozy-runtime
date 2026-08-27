@@ -172,19 +172,15 @@ def bench(label, fn, n):
 
 found = discover(project)
 body = descriptor.build(found)
-document = descriptor.document(body)
-pretty = canonical.pretty(document)
-raw = canonical.write(body)
+raw = descriptor.render(body)
 
 bench('descriptor.build (frozen app -> document)', lambda: descriptor.build(found), 200)
-bench('canonical.write (the hashed bytes)', lambda: canonical.write(body), 500)
-bench('surface_digest (canonicalize + sha256)', lambda: descriptor.surface_digest(body), 500)
-bench('canonical.pretty (the committed rendering)', lambda: canonical.pretty(document), 500)
+bench('descriptor.render (the committed bytes)', lambda: descriptor.render(body), 500)
+bench('descriptor_digest (hash exact bytes)', lambda: descriptor.descriptor_digest(raw), 500)
 bench('canonical.parse (read the committed file)', lambda: canonical.parse(raw), 500)
 bench('compare (the --check comparison)',
-      lambda: descriptor.compare(document, document, ('a', 'b')), 500)
-print(f"  {'canonical bytes':<46} {len(raw):9,} B")
-print(f"  {'committed pretty bytes':<46} {len(pretty.encode()):9,} B")
+      lambda: descriptor.compare(body, body, ('a', 'b')), 500)
+print(f"  {'committed exact bytes':<46} {len(raw):9,} B")
 print(f"  {'callables / model slots described':<46} "
       f"{descriptor.counts(body)['entrypoints'] + descriptor.counts(body)['jobs']:5} / "
       f"{descriptor.counts(body)['model_bindings']}")

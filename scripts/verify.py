@@ -620,11 +620,12 @@ def descriptor_sections() -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
         bodies[module] = body
         counts = descriptor.counts(body)
-        size = len(canonical.pretty(descriptor.document(body)).encode())
+        raw = descriptor.render(body)
+        size = len(raw)
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
             f"{counts['model_bindings']} slots · {size:>6,} B pretty · {elapsed_ms:6.1f} ms · "
-            f"{descriptor.surface_digest(body)[:26]}…"
+            f"{descriptor.descriptor_digest(raw)[:26]}…"
         )
 
     head("weights are never loaded — proven by a backend that refuses to be called")
@@ -669,7 +670,8 @@ def descriptor_sections() -> None:
     print(f"  identical:  {pair[0] == pair[1]} ({len(pair[0])} bytes each)")
 
     head("digest sensitivity — a surface change flips it, an unrelated edit does not")
-    base = descriptor.surface_digest(bodies["tiny_h3"])
+    base_raw = descriptor.render(bodies["tiny_h3"])
+    base = descriptor.descriptor_digest(base_raw)
     mutations: dict[str, Callable[[Any], object]] = {
         "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
             {"name": "extra", "type": "int", "wire": "required"}
@@ -680,21 +682,21 @@ def descriptor_sections() -> None:
         "component-use (one method's set)": lambda d: d["entrypoints"][0]["models"][0][
             "component_use"
         ].update(denoise=["fl2va_transformer", "smuggled"]),
-        "capability (a service removed)": lambda d: d["entrypoints"][0]["capabilities"].pop(),
+        "visibility (hidden toggled)": lambda d: d["entrypoints"][0].update(hidden=True),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
         mutate(mutated)
-        moved = descriptor.surface_digest(mutated) != base
+        moved = descriptor.descriptor_digest(descriptor.render(mutated)) != base
         print(f"  {what:34} digest moved: {moved}")
-    reordered = json.loads(json.dumps(bodies["tiny_h3"], indent=8))
+    whitespace_edit = base_raw.replace(b"{\n", b"{\n ", 1)
     print(
         f"  {'reformatted JSON (whitespace only)':34} digest moved: "
-        f"{descriptor.surface_digest(reordered) != base}"
+        f"{descriptor.descriptor_digest(whitespace_edit) != base}"
     )
 
     head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
-    committed = canonical.write(bodies["tiny_h3"])
+    committed = descriptor.render(bodies["tiny_h3"])
     registry = ModelRegistry(release=RELEASE, backend=StagedBackend())
     configs = (("full", art.h3(task="fl2va")), ("baked", art.h3(task="fl2va", baked=True)))
     for label, artifact in configs:
@@ -704,7 +706,7 @@ def descriptor_sections() -> None:
             f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
             + (f", {len(record.destinations)} destinations" if record else "")
         )
-    rederived = canonical.write(descriptor.build(discover(ROOT / "examples")))
+    rederived = descriptor.render(descriptor.build(discover(ROOT / "examples")))
     print(f"  descriptor after both bindings: byte-unchanged = {rederived == committed}")
     print(
         f"  generations now live in the registry: {len(registry.generations())} — "
@@ -715,8 +717,8 @@ def descriptor_sections() -> None:
     # Where the two profiles part, and why. tfs restricts its own header codec harder than
     # RFC 8785; a descriptor carries float bounds, None defaults and non-ASCII literals.
     relaxed = {
-        "digest-uppercase": "descriptor refuses it at the DOCUMENT layer (surface_digest grammar)",
-        "null-value": "null is a legal default value in a request schema",
+        "digest-uppercase": "the endpoint descriptor carries no embedded digest field",
+        "null-value": "null is a legal literal or optional-union member",
         "unicode-nfc": "author literals may be non-ASCII; JCS escapes, tfs forbids",
         "unicode-nfd": "same — normalization is not a canonical-JSON rule",
     }
@@ -771,8 +773,7 @@ def descriptor_sections() -> None:
 
 def _callable_doc(surface: object) -> object:
     """Just the per-callable half, so the two spellings are compared on their own terms."""
-    settings: dict[str, object] = {}
-    return descriptor._callable(cast(Any, surface), settings, {})
+    return descriptor._callable(cast(Any, surface))
 
 
 def reproduce() -> None:

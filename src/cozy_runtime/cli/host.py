@@ -240,9 +240,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         endpoint = Path(weightless_endpoint).expanduser().resolve()
         try:
             found = discover(endpoint)
-            staged = local.stage_weightless_release(
-                config.cozy_home, descriptor.document(descriptor.build(found))
-            )
+            staged = local.stage_weightless_release(config.cozy_home, descriptor.build(found))
         except ConformanceError as exc:
             raise CliError(
                 "validation",
