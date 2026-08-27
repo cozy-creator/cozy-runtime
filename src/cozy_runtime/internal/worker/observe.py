@@ -113,6 +113,8 @@ class SilenceMonitor:
             cursor.sampled = cursor.position
             cursor.still = 0
             cursor.advanced += 1
+            # A wedge that moved again is over; a later one must be a NEW verdict.
+            cursor.wedged = False
             return "advancing"
         cursor.still += 1
         burned = self.busy() if self.busy is not None else -1
@@ -123,6 +125,7 @@ class SilenceMonitor:
                 # WORKING, not wedged. Silence is the absence of narration; a wedge is the
                 # absence of PROGRESS, and a process burning CPU is making some.
                 cursor.still = 0
+                cursor.wedged = False
                 return "busy"
         if cursor.still < self.give_up_after:
             return "silent"
