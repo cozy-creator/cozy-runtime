@@ -17,6 +17,7 @@ here, which is exactly the duplication the CLI reference forbids.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
@@ -153,8 +154,9 @@ _SERVE_FLAGS: dict[str, str] = {
     # which is exactly what puts it in this closed set.
     "--grant-root": "--grant-root",
     "--environment-root": "--environment-root",
+    "--artifact-store": "--artifact-store",
+    "--artifact-object-set": "--artifact-object-set",
     "--artifact-digest": "--artifact-digest",
-    "--project": "--project",
     "--threads": "--threads",
     "--grace": "--grace",
     "--host-budget": "--host-budget",
@@ -168,12 +170,13 @@ _SERVE_FLAGS: dict[str, str] = {
 
 #: Flags that carry no value.
 _SERVE_SWITCHES = ("--no-warm",)
+_WEIGHTLESS_ENDPOINT = "--weightless-endpoint"
 
 
 def serve(config: RuntimeConfig, args: list[str]) -> int:
     """The process entry into cr-007's worker — a TRANSLATION, never a second loop.
 
-    `--socket`/`--cas`/`--out` are the launcher-issued path grants; `_SERVE_FLAGS` are
+    `--socket`/`--out` are the launcher-issued path grants; `_SERVE_FLAGS` are
     the launch facts a launcher must state because nothing can discover them for it —
     identity, release, device envelope, budgets and the grace clock. Everything else —
     directives, grants, config — arrives over the protocol, and always will.
@@ -193,13 +196,14 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         if name in _SERVE_SWITCHES:
             switches.append(name)
             continue
-        if name not in ("--socket", "--cas", "--out") and name not in _SERVE_FLAGS:
+        if name not in ("--socket", "--out", _WEIGHTLESS_ENDPOINT) and name not in _SERVE_FLAGS:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
-                "serve takes --socket <path> [--cas <dir>] [--out <dir>] "
+                "serve takes --socket <path> [--out <dir>] "
                 + " ".join(f"[{f} <value>]" for f in sorted(_SERVE_FLAGS))
-                + " [--no-warm]; directives, grants and config arrive over the protocol",
+                + f" [{_WEIGHTLESS_ENDPOINT} <dir>] [--no-warm]; directives, grants and "
+                "config arrive over the protocol",
                 Exit.usage,
             )
         if not eq:
@@ -217,6 +221,58 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
     argv = ["--listen", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
+    weightless_endpoint = values.get(_WEIGHTLESS_ENDPOINT, "")
+    artifact_flags = ("--artifact-store", "--artifact-object-set")
+    supplied_artifacts = [flag for flag in artifact_flags if flag in values]
+    if weightless_endpoint and supplied_artifacts:
+        raise CliError(
+            "usage",
+            f"{_WEIGHTLESS_ENDPOINT} cannot be combined with {', '.join(supplied_artifacts)}",
+            "choose one launch mode: the explicit local weightless endpoint, or the exact "
+            "provisioned artifact store and object set",
+            Exit.usage,
+        )
+    if weightless_endpoint:
+        from cozy_runtime.author import ConformanceError
+        from cozy_runtime.internal import descriptor, local
+        from cozy_runtime.internal.discovery import discover
+
+        endpoint = Path(weightless_endpoint).expanduser().resolve()
+        try:
+            found = discover(endpoint)
+            staged = local.stage_weightless_release(
+                config.cozy_home, descriptor.document(descriptor.build(found))
+            )
+        except ConformanceError as exc:
+            raise CliError(
+                "validation",
+                str(exc),
+                "repair the endpoint surface before launching its local weightless worker",
+                Exit.validation,
+            ) from exc
+        except RuntimeError as exc:
+            raise CliError(
+                "structural",
+                str(exc),
+                "use the ordinary provisioned launch mode for any model-bearing endpoint",
+                Exit.structural,
+            ) from exc
+        argv += [
+            "--artifact-store",
+            str(staged.artifact_store),
+            "--artifact-object-set",
+            str(staged.artifact_object_set),
+        ]
+        os.chdir(endpoint)
+    elif len(supplied_artifacts) != len(artifact_flags):
+        missing = [flag for flag in artifact_flags if flag not in values]
+        raise CliError(
+            "usage",
+            "ordinary serve requires " + " and ".join(missing),
+            "pass the exact provisioned --artifact-store and --artifact-object-set, or "
+            f"choose {_WEIGHTLESS_ENDPOINT} <dir> explicitly",
+            Exit.usage,
+        )
     for flag, worker_flag in _SERVE_FLAGS.items():
         if flag in values:
             argv += [worker_flag, values[flag]]
@@ -240,7 +296,7 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
     """
     from cozy_runtime.cli import run as run_verb
 
-    records = run_verb.resolved_bindings(config, opts)
+    records, weightless_plans = run_verb.resolved_bindings(config, opts)
     rows = tuple(
         (
             str(record["model_binding_path"]),
@@ -257,9 +313,15 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
     )
     return Result(
         rows=rows,
-        document={"bindings": records} if opts.json else None,
+        document=(
+            {
+                "bindings": records,
+                **({"weightless_plans": weightless_plans} if weightless_plans else {}),
+            }
+            if opts.json
+            else None
+        ),
         lines=()
         if records
         else ("note: this project declares no model binding — nothing to resolve",),
-        next=("cozy-runtime serve --socket <path> — serve these bindings over the protocol",),
     )

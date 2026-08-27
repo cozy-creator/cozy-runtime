@@ -49,7 +49,7 @@ usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args
 verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
-  serve --socket <path>          speak the worker protocol for a RecordOwner
+  serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
   describe [<fn>]                the EndpointDescriptor, without loading weights
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/CAS/credential facts
@@ -83,6 +83,11 @@ pull flags:
 describe flags:
   --write-descriptor  commit endpoint.descriptor.json (bare describe is read-only)
   --check             refuse a stale committed descriptor (exit 13)
+
+serve modes (exactly one):
+  --weightless-endpoint <dir>                 stage a local model-free endpoint
+  --artifact-store <dir> --artifact-object-set <file>
+                                               serve a provisioned release
 
 global flags:
   --json           the full typed result as one JSON document

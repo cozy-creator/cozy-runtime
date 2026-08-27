@@ -81,8 +81,34 @@ class StagedWeightlessRelease:
 
     plans: Mapping[str, str]
     plan_refs: Mapping[str, tuple[str, int]]
+    descriptor: Path
     artifact_store: Path
     artifact_object_set: Path
+
+
+@dataclass(frozen=True, slots=True)
+class WeightlessReleaseDocuments:
+    """Exact bytes behind both local staging and pre-spawn subject resolution."""
+
+    descriptor: bytes
+    plans: Mapping[str, bytes]
+    artifact_object_set: bytes
+
+    def subjects(self) -> tuple[dict[str, Any], ...]:
+        rows: list[dict[str, Any]] = []
+        for entrypoint, raw in sorted(self.plans.items()):
+            ref = _exact_ref(raw)
+            digest = str(ref["digest"])
+            rows.append(
+                {
+                    "entrypoint": entrypoint,
+                    "subject_id": digest,
+                    "kind": "plan",
+                    "digest": digest,
+                    "length": int(ref["length"]),
+                }
+            )
+        return tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,6 +824,52 @@ def stage_weightless_release(
     neither may revive the retired flat binding record.
     """
 
+    documents = weightless_release_documents(endpoint_descriptor)
+    home = cozy_home.resolve()
+    documents_root = home / "binding-documents"
+    plans_root = home / "binding-plans"
+    object_sets_root = home / "artifact-object-sets"
+    artifact_store = home / "store"
+    artifact_store.mkdir(parents=True, exist_ok=True)
+
+    _, descriptor_path = _stage_exact(documents_root, documents.descriptor)
+    plans: dict[str, str] = {}
+    plan_refs: dict[str, tuple[str, int]] = {}
+    plan_documents: dict[str, provisioned.ExactDocument] = {}
+    for entrypoint, plan_bytes in sorted(documents.plans.items()):
+        plan_ref, plan_path = _stage_exact(plans_root, plan_bytes)
+        plan_id = str(plan_ref["digest"])
+        length = int(plan_ref["length"])
+        plans[entrypoint] = plan_id
+        plan_refs[plan_id] = (plan_id, length)
+        plan_documents[plan_id] = provisioned.ExactDocument(
+            provisioned.ArtifactRef(plan_id, length), plan_path, plan_bytes
+        )
+
+    _, artifact_object_set = _stage_exact(object_sets_root, documents.artifact_object_set)
+
+    # Exercise the same closed reader the worker will use after its process boundary. This
+    # proves the local writer produced no private dialect before a caller tries to launch it.
+    selected = provisioned.read_provisioned_release(
+        plan_documents,
+        read_document=provisioned.staged_document_reader(documents_root),
+        endpoint_release="local-weightless",
+        store_root=artifact_store,
+        object_set=provisioned.read_artifact_object_set(documents.artifact_object_set),
+        dtype_widths={},
+    )
+    if set(selected.bindings) != set(plan_refs):
+        raise RuntimeError("the staged local binding set did not survive canonical validation")
+    return StagedWeightlessRelease(
+        plans, plan_refs, descriptor_path, artifact_store, artifact_object_set
+    )
+
+
+def weightless_release_documents(
+    endpoint_descriptor: Mapping[str, Any],
+) -> WeightlessReleaseDocuments:
+    """Construct the exact local weightless documents without choosing storage paths."""
+
     entries = endpoint_descriptor.get("entrypoints")
     if not isinstance(entries, list):
         raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
@@ -816,18 +888,9 @@ def stage_weightless_release(
             "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
         )
 
-    home = cozy_home.resolve()
-    documents_root = home / "binding-documents"
-    plans_root = home / "binding-plans"
-    object_sets_root = home / "artifact-object-sets"
-    artifact_store = home / "store"
-    artifact_store.mkdir(parents=True, exist_ok=True)
-
     descriptor_bytes = canonical.write(dict(endpoint_descriptor))
-    descriptor_ref, _ = _stage_exact(documents_root, descriptor_bytes)
-    plans: dict[str, str] = {}
-    plan_refs: dict[str, tuple[str, int]] = {}
-    plan_documents: dict[str, provisioned.ExactDocument] = {}
+    descriptor_ref = _exact_ref(descriptor_bytes)
+    plans: dict[str, bytes] = {}
     object_refs: list[dict[str, Any]] = []
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
         entrypoint = str(entry.get("name", ""))
@@ -839,15 +902,9 @@ def stage_weightless_release(
                 "format": "cozy.endpoint.EntrypointBindingPlan/1",
             }
         )
-        plan_ref, plan_path = _stage_exact(plans_root, plan_bytes)
-        plan_id = str(plan_ref["digest"])
-        length = int(plan_ref["length"])
-        plans[entrypoint] = plan_id
-        plan_refs[plan_id] = (plan_id, length)
+        plan_ref = _exact_ref(plan_bytes)
+        plans[entrypoint] = plan_bytes
         object_refs.append(plan_ref)
-        plan_documents[plan_id] = provisioned.ExactDocument(
-            provisioned.ArtifactRef(plan_id, length), plan_path, plan_bytes
-        )
 
     object_set_bytes = canonical.write(
         {
@@ -861,26 +918,16 @@ def stage_weightless_release(
             ],
         }
     )
-    _, artifact_object_set = _stage_exact(object_sets_root, object_set_bytes)
+    return WeightlessReleaseDocuments(descriptor_bytes, plans, object_set_bytes)
 
-    # Exercise the same closed reader the worker will use after its process boundary. This
-    # proves the local writer produced no private dialect before a caller tries to launch it.
-    selected = provisioned.read_provisioned_release(
-        plan_documents,
-        read_document=provisioned.staged_document_reader(documents_root),
-        endpoint_release="local-weightless",
-        store_root=artifact_store,
-        object_set=provisioned.read_artifact_object_set(object_set_bytes),
-        dtype_widths={},
-    )
-    if set(selected.bindings) != set(plan_refs):
-        raise RuntimeError("the staged local binding set did not survive canonical validation")
-    return StagedWeightlessRelease(plans, plan_refs, artifact_store, artifact_object_set)
+
+def _exact_ref(raw: bytes) -> dict[str, Any]:
+    return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
 
 
 def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
-    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    ref: dict[str, Any] = {"digest": digest, "length": len(raw)}
+    ref = _exact_ref(raw)
+    digest = str(ref["digest"])
     root.mkdir(parents=True, exist_ok=True)
     path = (root / f"{digest.removeprefix('sha256:')}.json").resolve()
     try:

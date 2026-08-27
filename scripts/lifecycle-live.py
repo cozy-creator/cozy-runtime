@@ -18,6 +18,7 @@ lets it run on a hosted macOS or Windows runner where worker-live.py structurall
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -96,14 +97,18 @@ def hold(payload: HoldInput, ctx: Context) -> HoldOutput:
 ENDPOINT_TOML = '[application]\nobject = "lifecycle_endpoint:app"\n'
 
 
+def write_weightless_project(project: Path) -> None:
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "lifecycle_endpoint.py").write_text(ENDPOINT_SOURCE)
+    (project / "endpoint.toml").write_text(ENDPOINT_TOML)
+
+
 def stage_weightless(home: Path, project: Path) -> Any:
     """Stage this fixture through the production local weightless constructor."""
     from cozy_runtime.internal import descriptor, local
     from cozy_runtime.internal.discovery import discover
 
-    project.mkdir(parents=True, exist_ok=True)
-    (project / "lifecycle_endpoint.py").write_text(ENDPOINT_SOURCE)
-    (project / "endpoint.toml").write_text(ENDPOINT_TOML)
+    write_weightless_project(project)
     found = discover(project)
     return local.stage_weightless_release(home, descriptor.document(descriptor.build(found)))
 
@@ -138,52 +143,66 @@ def start_weightless(
         shutil.rmtree(tmp, ignore_errors=True)
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    staged = stage_weightless(home, project)
-    ids = dict(staged.plans)
+    write_weightless_project(project)
     socket_path = str(tmp / f"control-{len(os.listdir(tmp))}.sock")
-    hub = hub or wl.Hub()
-    hub.directive = wl.serving_directive(
-        RELEASE,
-        sorted(ids.values()),
-        posture or pb.Posture.POSTURE_ACCEPTING,
-        home / "binding-plans",
-    )
-    hub.revision = 1
-    log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "COZY_HOME": str(home),
         "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
     }
+    resolved = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cozy_runtime.cli.main",
+            "--dir",
+            str(project),
+            "--json",
+            "bindings",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=project,
+    )
+    if resolved.returncode:
+        raise SystemExit(
+            f"weightless binding resolution exited {resolved.returncode}: {resolved.stderr.strip()}"
+        )
+    binding_result = json.loads(resolved.stdout)
+    subjects = binding_result.get("weightless_plans", [])
+    if binding_result.get("bindings") != [] or not subjects:
+        raise SystemExit(f"weightless binding resolution returned {binding_result!r}")
+    ids = {str(row["entrypoint"]): str(row["subject_id"]) for row in subjects}
+    hub = hub or wl.Hub()
+    hub.revision = 1
+    log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     (root / "control.addr").unlink(missing_ok=True)
     argv = [
         "nice",
         "-n",
         "19",
         sys.executable,
-        "-c",
-        "import sys; from cozy_runtime.internal.worker.session import main; "
-        "raise SystemExit(main(sys.argv[1:]))",
-        "--listen",
-        f"unix:{socket_path}",
-        "--root",
+        "-m",
+        "cozy_runtime.cli.main",
+        "serve",
+        "--socket",
+        socket_path,
+        "--out",
         str(root),
+        "--weightless-endpoint",
+        str(project),
         *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
         RELEASE,
-        "--artifact-store",
-        str(staged.artifact_store),
-        "--artifact-object-set",
-        str(staged.artifact_object_set),
         "--grace",
         "3.0",
         "--no-warm",
     ]
 
-    def plant_disk_full() -> None:
+    def ignore_file_limit_signal() -> None:
         _signal.signal(_signal.SIGXFSZ, _signal.SIG_IGN)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (rlimit_fsize, rlimit_fsize))
 
     process = subprocess.Popen(
         argv,
@@ -192,12 +211,47 @@ def start_weightless(
         env=env,
         cwd=project,
         bufsize=0,
-        preexec_fn=plant_disk_full if rlimit_fsize else None,
+        preexec_fn=ignore_file_limit_signal if rlimit_fsize else None,
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
+    addr = wl.read_addr(root, process)
+    plan_root = home / "binding-plans"
+    expected_files = {f"{str(row['digest']).removeprefix('sha256:')}.json" for row in subjects}
+    actual_files = {path.name for path in plan_root.glob("*.json")}
+    if actual_files != expected_files:
+        raise SystemExit(
+            "bindings-reported subjects differ from serve-staged plans: "
+            f"reported={sorted(expected_files)} staged={sorted(actual_files)}"
+        )
+    for row in subjects:
+        subject_id = str(row["subject_id"])
+        digest = str(row["digest"])
+        raw = (plan_root / f"{digest.removeprefix('sha256:')}.json").read_bytes()
+        measured = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if (
+            row.get("kind") != "plan"
+            or subject_id != digest
+            or measured != digest
+            or len(raw) != int(row["length"])
+        ):
+            raise SystemExit(f"bindings-reported subject differs from serve-staged bytes: {row!r}")
+    hub.directive = wl.serving_directive(
+        RELEASE,
+        sorted(ids.values()),
+        posture or pb.Posture.POSTURE_ACCEPTING,
+        plan_root,
+    )
+    if rlimit_fsize:
+        # The plant targets the journal append, not local release construction. Apply it
+        # only after the production `serve` path has staged and checked its exact inputs.
+        resource.prlimit(
+            process.pid,
+            resource.RLIMIT_FSIZE,
+            (rlimit_fsize, rlimit_fsize),
+        )
     if connect:
-        hub.connect(wl.read_addr(root, process))
+        hub.connect(addr)
     worker = wl.Worker(home, root, process, hub, log)
     return worker, ids
 
@@ -1001,7 +1055,7 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True)
     root.mkdir(parents=True)
-    stage_weightless(home, project)
+    staged = stage_weightless(home, project)
     detached_file = tmp / "detached.pid"
     endpoint = project / "lifecycle_endpoint.py"
     endpoint.write_text(
@@ -1032,6 +1086,8 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     time.sleep(0.01)
 """
     )
+    previous_cwd = Path.cwd()
+    os.chdir(project)
     base_env = tuple(
         sorted(
             {
@@ -1093,7 +1149,11 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     first_reply = first.call(
         {
             "cmd": "prepare",
-            "binding": {"project": str(project), "model_class": ""},
+            "binding": {
+                "application": "lifecycle_endpoint:app",
+                "descriptor": str(staged.descriptor),
+                "model_class": "",
+            },
             "budgets": {},
         }
     )
@@ -1198,7 +1258,11 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     failed_prepare = guarded_executor.call(
         {
             "cmd": "prepare",
-            "binding": {"project": str(tmp / "missing-project"), "model_class": ""},
+            "binding": {
+                "application": "missing_endpoint:app",
+                "descriptor": str(staged.descriptor),
+                "model_class": "",
+            },
             "budgets": {},
         }
     )
@@ -1324,6 +1388,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         killed == [] and pid_gone(helper.pid, args.observe, "leaderless descendant"),
         f"leader {leader.pid} absent; detached helper birth {helper} was reclaimed by scope",
     )
+    os.chdir(previous_cwd)
 
 
 def main() -> int:

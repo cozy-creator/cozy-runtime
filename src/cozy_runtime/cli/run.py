@@ -29,7 +29,12 @@ from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.local import LocalRequest, SliceOutcome, run_slice
+from cozy_runtime.internal.local import (
+    LocalRequest,
+    SliceOutcome,
+    run_slice,
+    weightless_release_documents,
+)
 from cozy_runtime.internal.worker.session import WorkerOptions
 
 VALUE_FLAGS = (
@@ -251,7 +256,11 @@ def run(
     # `serve` process and the wrong place for a verb whose stdout IS a result document. The
     # narration is not suppressed — it is a real progress channel — it just goes where
     # progress goes, so `--json` emits exactly the document and nothing else.
-    with contextlib.redirect_stdout(sys.stderr):
+    # A local source checkout is the installed release for this one process. The device
+    # executor is exec-first and imports the descriptor's application in a fresh interpreter,
+    # so it must inherit the same explicit project root that discovery used above. Remote
+    # serving imports its wheel from the provisioned environment and never enters this path.
+    with contextlib.chdir(project), contextlib.redirect_stdout(sys.stderr):
         outcome = run_slice(
             config,
             request,
@@ -327,7 +336,9 @@ def _timeout(spelled: str) -> int:
     )
 
 
-def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, Any]]:
+def resolved_bindings(
+    config: RuntimeConfig, opts: Options
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Every declared slot's RESOLVED SELECTION, from the one resolver (cl-010's debt 7).
 
     It prints what `endpoint.toml` SELECTS — the ref, the lane, and which rule won — plus
@@ -356,7 +367,17 @@ def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, An
         for slot in surface.model_bindings
     ]
     if not slots:
-        return []
+        visible = [
+            surface
+            for surface in found.surfaces
+            if surface.kind == "entrypoint" and not surface.hidden
+        ]
+        plans = (
+            list(weightless_release_documents(desc.document(desc.build(found))).subjects())
+            if visible
+            else []
+        )
+        return [], plans
     try:
         # ONE resolve over the WHOLE declared slot set, which is what a serving deployment
         # does: the selection is checked against every slot the release declares, so a
@@ -392,7 +413,7 @@ def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, An
                 "installed": installed is not None,
             }
         )
-    return records
+    return records, []
 
 
 def _render(
