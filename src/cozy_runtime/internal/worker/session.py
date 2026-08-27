@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel, child_env, config, egress, hostfacts, proctree
+from cozy_runtime.internal import accel, child_env, config, egress, environment, hostfacts, proctree
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -166,6 +166,12 @@ class WorkerOptions:
     A launcher that knows its own root states it — cozy-creator passes its local root, a
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
+    environment_root: Path | None = None
+    """The cr-027 materializer root whose receipt-keyed ``generations`` are selectable.
+
+    The provisioner/local installer chooses storage; the worker receives that path and owns
+    no retention or GC policy.  Absent means no already-materialized generation is selectable.
+    """
     project: Path | None = None
     """THIS MACHINE's copy of the endpoint release being served (#563f).
 
@@ -1327,9 +1333,10 @@ class Worker:
 
         WHAT THIS WORKER DOES WITH IT TODAY, said out loud rather than implied: it RECORDS
         the standing authority and reports it back on `applied_artifact_grant_id` /
-        `applied_grant_revision`, so grant landing is observable without an ack lane. It
-        FETCHES nothing, because this worker has no environment materializer — cr-023 owns
-        that lane, and a worker that pretended to fetch would be inventing a materialization.
+        `applied_grant_revision`, so grant landing is observable without an ack lane. It does
+        not reinterpret opaque subjects as a wheel closure: th-044/th-046's canonical
+        manifest-to-CAS join must exist before this handler may invoke cr-027's executable.
+        An externally materialized receipt-keyed generation is still re-measured and used.
         """
         if update.grant_revision < self.grant_revision:
             self.note("grant", f"grant revision {update.grant_revision} ignored (older)")
@@ -1340,8 +1347,8 @@ class Worker:
             "grant",
             f"acquisition authority {update.grant.grant_id or '(unnamed)'} at revision "
             f"{update.grant_revision}: {len(update.grant.subjects)} authorized subject(s), "
-            f"{len(update.grant.locations)} location(s) — recorded, and this worker fetches "
-            "nothing until cr-023's materializer exists",
+            f"{len(update.grant.locations)} location(s) — recorded; opaque subjects are not "
+            "treated as an environment inventory without th-044/th-046's canonical join",
         )
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
@@ -1590,32 +1597,64 @@ class Worker:
         Some missing => ABSENT with a typed fault, and the previous spec keeps serving
         (fallback-retention, #474).
 
-        AND ONE HONEST REFUSAL. `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured
-        `InstalledEnvironmentReceipt` equalled `installed_environment_receipt_digest`; the
-        proto says it is unspeakable otherwise. This worker has no environment materializer
-        at all — cr-023 owns that lane — so when a spec NAMES a receipt digest, the worker
-        cannot say STAGED and does not: it reports MATERIALIZING with a typed fault, holds
-        `converged_revision` behind, and leaves the previous spec serving. That is a door,
-        not a defect, and it is named rather than papered over with a fabricated STAGED.
+        `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured InstalledEnvironmentReceipt
+        equals the expected digest.  A receipt-keyed immutable generation is therefore
+        re-measured here before its Python can become the executor Python.  Missing canonical
+        materializer inputs remain MATERIALIZING; a corrupt/wrong receipt fails typed.
         """
         assert self.placement is not None
         placement = self.placement
         if placement.installed_environment_receipt_digest:
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
-            self.latch(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                    subject=placement.placement_id,
-                    reason="environment_materializer_unbuilt",
-                    detail="the spec names installed_environment_receipt_digest "
-                    f"{documents.spell(placement.installed_environment_receipt_digest)[:23]}… "
-                    "and this worker cannot MEASURE an installed environment: STAGED asserts "
-                    "the receipt matched and is unspeakable otherwise, so materialization "
-                    "stays MATERIALIZING and converged_revision stays behind (cr-023 owns "
-                    "the materializer)",
+            expected = documents.spell(placement.installed_environment_receipt_digest)
+            if self.options.environment_root is None:
+                self.latch(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=placement.placement_id,
+                        reason="environment_materialization_input_missing",
+                        detail=f"receipt {expected} is required, but no --environment-root was "
+                        "provisioned; the worker will not guess a manifest/CAS join",
+                    )
                 )
+                return
+            generation = (
+                self.options.environment_root / "generations" / expected.removeprefix("sha256:")
             )
-            return
+            try:
+                installed = environment.verify_generation(
+                    generation,
+                    receipt_digest=expected,
+                    environment_spec_digest=documents.spell(placement.environment_spec_digest),
+                )
+            except (environment.EnvironmentRefusal, OSError) as exc:
+                reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
+                unavailable = reason in {"environment_receipt_absent", "io_error"}
+                if not unavailable:
+                    placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+                self.latch(
+                    pb.Fault(
+                        kind=(
+                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE
+                            if unavailable
+                            else pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
+                        ),
+                        subject=placement.placement_id,
+                        reason=reason,
+                        detail=safe(str(exc)),
+                    )
+                )
+                return
+            python = str(installed.python)
+            if self.supervision.python != python:
+                self.supervision.python = python
+                if self.supervision.current is not None:
+                    self.supervision.current.poisoned = "installed environment generation changed"
+            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            self.note(
+                "materialization",
+                f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
+            )
         missing: list[str] = []
         for plan_id in placement.plan_ids:
             record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
@@ -3018,6 +3057,11 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="comma-separated directory trees a file:// grant may address (#506b)",
     )
     parser.add_argument(
+        "--environment-root",
+        default="",
+        help="cr-027 materializer root containing receipt-keyed immutable generations",
+    )
+    parser.add_argument(
         "--project",
         default="",
         help="THIS machine's copy of the endpoint release tree; defaults to the working "
@@ -3052,6 +3096,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         python=args.python,
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
+        environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
         project=Path(args.project).resolve() if args.project else Path.cwd(),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
