@@ -5,9 +5,8 @@ types, so nothing a candidate artifact, a binding, a machine or a clock knows ca
 It reuses `author._walker`'s primitives (`strip`, `unwrap_optional`, `is_struct`) rather
 than re-deriving annotation semantics — one answer to "what does this type tree declare".
 
-`ModelDefault[T]` keeps its CONCRETE handler type here and records the wire fact separately:
-`wire: "omissible"` plus the frozen default-source ladder it is eligible for (§1.2). A
-handler still sees `int`, never `int | None`.
+Only the wire grammar Creator consumes is emitted. Python names, default factories and
+decoded in-memory ceilings stay with the installed signature that enforces them.
 """
 
 from __future__ import annotations
@@ -20,31 +19,17 @@ from typing import Literal, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author._assets import (
-    Asset,
-    AudioAsset,
-    FileAsset,
-    ImageAsset,
-    Tree,
-    VideoAsset,
-    asset_kinds,
-)
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
+from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import AssetBound, Shape, _ModelDefaultMarker
-from cozy_runtime.author._walker import MISSING, is_struct, strip, unwrap_optional
+from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
+from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import Json, write
-
-#: The atomic ladder a `ModelDefault` field's value may come from, most authoritative last
-#: (§1.2). Frozen here because the descriptor is what a hub validates catalog rows against.
-DEFAULT_SOURCES = ("code_fallback", "checkpoint_recipe", "adapter_recipe", "request")
 
 _PRIMITIVES: dict[object, str] = {
     bool: "bool",
     int: "int",
     float: "float",
     str: "str",
-    bytes: "bytes",
     type(None): "null",
 }
 
@@ -84,15 +69,12 @@ def _render_bare(tp: object, seen: frozenset[type], *, tag_required: bool = Fals
         return _union(get_args(tp), seen)
     if origin in (list, Sequence):
         args = get_args(tp)
-        return {"list": _render(args[0], seen) if args else "any"}
-    if origin in (set, frozenset):
-        args = get_args(tp)
-        return {"set": _render(args[0], seen) if args else "any"}
-    if origin is tuple:
-        return {"tuple": [_render(a, seen) for a in get_args(tp) if a is not Ellipsis]}
-    if origin is dict:
-        args = get_args(tp)
-        return {"map": [_render(args[0], seen), _render(args[1], seen)] if args else ["any", "any"]}
+        if not args:
+            raise ConformanceError(
+                "an untyped list has no interoperable descriptor spelling",
+                code="unrenderable_type",
+            )
+        return {"list": _render(args[0], seen)}
     if isinstance(tp, type):
         for asset, kind in _ASSET_KINDS:
             if issubclass(tp, asset):
@@ -102,7 +84,7 @@ def _render_bare(tp: object, seen: frozenset[type], *, tag_required: bool = Fals
             # exactly like an asset — the local path is never schema content (§2).
             return {"input": "tree"}
         if issubclass(tp, enum.Enum):
-            return {"enum": tp.__name__, "values": sorted(_literal(m.value) for m in tp)}
+            return {"literal": sorted_union([_literal(m.value) for m in tp])}
         if is_struct(tp):
             return _struct(typing.cast(type[msgspec.Struct], tp), seen, tag_required=tag_required)
     raise ConformanceError(
@@ -160,7 +142,10 @@ def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
 
 def _struct(tp: type[msgspec.Struct], seen: frozenset[type], *, tag_required: bool = False) -> Json:
     if tp in seen:
-        return {"struct_ref": tp.__name__}
+        raise ConformanceError(
+            "recursive structs have no interoperable descriptor spelling",
+            code="unrenderable_type",
+        )
     nested = seen | {tp}
     config = tp.__struct_config__
     fields = [_field(f, nested) for f in msgspec.structs.fields(tp)]
@@ -177,20 +162,12 @@ def _struct(tp: type[msgspec.Struct], seen: frozenset[type], *, tag_required: bo
                 "name": config.tag_field,
                 "type": {"literal": [tag]},
                 "wire": "required" if tag_required else "optional",
-                "discriminator": True,
             },
         )
-    doc: dict[str, Json] = {
-        "struct": tp.__name__,
-        "fields": fields,
-    }
+    doc: dict[str, Json] = {"fields": fields}
     if config.tag is not None:
         doc["tag_field"] = typing.cast(str, config.tag_field)
         doc["tag"] = _literal(config.tag)
-    if config.forbid_unknown_fields:
-        doc["forbid_unknown_fields"] = True
-    if config.frozen:
-        doc["frozen"] = True
     return doc
 
 
@@ -200,64 +177,30 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
     name = field.encode_name
     base, markers = strip(field.type)
     doc: dict[str, Json] = {"name": name, "type": _render(base, seen)}
-    if field.name != name:
-        doc["attribute"] = field.name
     omissible = any(isinstance(m, _ModelDefaultMarker) for m in markers)
     if omissible:
         doc["wire"] = "omissible"
-        doc["default_sources"] = list(DEFAULT_SOURCES)
     elif field.required:
         doc["wire"] = "required"
     else:
         doc["wire"] = "optional"
-    if not field.required:
-        default = _default(field)
-        if default is not MISSING:
-            doc["default"] = default
     constraints = _constraints(markers)
     if constraints:
         doc["constraints"] = constraints
     for marker in markers:
-        if isinstance(marker, Shape):
-            doc["shape_axes"] = list(marker.axes())
         if isinstance(marker, AssetBound):
-            # cr-012: an input asset's TYPED limits belong in the descriptor, because a
-            # client that cannot see the bound can only discover it by being refused. The
-            # media types rendered are what this FIELD admits, already narrowed against its
-            # kind at describe — a client reads one list, not two and an intersection rule.
             bound: dict[str, Json] = {}
             if marker.max_bytes is not None:
                 bound["max_bytes"] = marker.max_bytes
-            if marker.max_decoded_bytes is not None:
-                bound["max_decoded_bytes"] = marker.max_decoded_bytes
-                kinds = asset_kinds(base)
-                if kinds & {"image", "video"}:
-                    bound["max_pixels_per_frame"] = DEFAULT_DECODE_LIMITS.max_pixels_per_frame
-                if "video" in kinds:
-                    bound["max_video_frames"] = DEFAULT_DECODE_LIMITS.max_video_frames
-                if kinds & {"audio", "video"}:
-                    bound["max_audio_channels"] = DEFAULT_DECODE_LIMITS.max_audio_channels
-                    bound["max_audio_samples"] = DEFAULT_DECODE_LIMITS.max_audio_samples
             if marker.media_types:
                 bound["media_types"] = list(marker.media_types)
-            doc["asset_bound"] = bound
+            if bound:
+                doc["asset_bound"] = bound
     return doc
 
 
-def _default(field: msgspec.structs.FieldInfo) -> Json:
-    if field.default_factory is not msgspec.NODEFAULT:
-        return {"factory": True}
-    value = field.default
-    if value is msgspec.NODEFAULT:
-        return MISSING
-    if isinstance(value, enum.Enum):
-        return _literal(value.value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return {"factory": True}
-
-
-_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern", "tz")
+_CONSTRAINTS = ("gt", "ge", "le", "min_length", "max_length")
+_UNSUPPORTED_CONSTRAINTS = ("lt", "multiple_of", "pattern", "tz")
 
 
 def _constraints(markers: Sequence[object]) -> dict[str, Json]:
@@ -265,6 +208,14 @@ def _constraints(markers: Sequence[object]) -> dict[str, Json]:
     for marker in markers:
         if not isinstance(marker, msgspec.Meta):
             continue
+        unsupported = [
+            name for name in _UNSUPPORTED_CONSTRAINTS if getattr(marker, name, None) is not None
+        ]
+        if unsupported:
+            raise ConformanceError(
+                "descriptor constraint(s) are not consumed by Creator: " + ", ".join(unsupported),
+                code="unrenderable_constraint",
+            )
         for name in _CONSTRAINTS:
             value = getattr(marker, name, None)
             if value is not None:

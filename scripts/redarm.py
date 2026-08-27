@@ -1485,7 +1485,7 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
                 return f"NOT PROVEN — {name}: describe failed ({output.strip()[:120]})"
             if "harvested_if_recursive" in output:
                 return f"NOT PROVEN — {name}: a sibling module's registration was harvested"
-            skip = ("counts", "surface_digest", "next")
+            skip = ("counts", "descriptor_digest", "next")
             names = [
                 ln.split(":")[0]
                 for ln in output.splitlines()
@@ -1514,8 +1514,8 @@ def run_stale_descriptor() -> list[str]:
         good = target.read_text()
 
         document = json.loads(good)
-        document["entrypoints"][0]["capabilities"] = ["save", "egress"]
-        target.write_text(json.dumps(document, indent=2, sort_keys=True))
+        document["entrypoints"][0]["request"]["fields"][0]["name"] += "_edited"
+        target.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
         code, output = _describe(project, "--check")
         results.append(
             f"red — stale_descriptor (exit {code}): {_first(output, 'different documents')}"
@@ -1523,21 +1523,29 @@ def run_stale_descriptor() -> list[str]:
             else f"NOT PROVEN — a hand-edited descriptor passed --check (exit {code})"
         )
 
-        committed = good.split('"surface_digest": "')[1][:71]
-        target.write_text(good.replace(committed, "sha256:" + "0" * 64))
+        target.write_text(good.replace("{\n", "{\n ", 1))
         code, output = _describe(project, "--check")
+        detail = _first(output, "deterministic descriptor encoding")
         results.append(
-            f"red — digest_line_edited (exit {code}): {_first(output, 'digests to')}"
+            f"red — descriptor_exact_bytes (exit {code}): {detail}"
             if code == 13
-            else f"NOT PROVEN — an edited digest line passed --check (exit {code})"
+            else f"NOT PROVEN — a whitespace-edited descriptor passed --check (exit {code})"
         )
 
-        target.write_text(good.replace('"schema":', '"smuggled": 1,\n  "schema":'))
+        target.write_text(good.replace('"format":', '"smuggled": 1,\n  "format":'))
         code, output = _describe(project, "--check")
         results.append(
-            f"red — unknown_top_level_field (exit {code}): {_first(output, 'unknown top-level')}"
+            f"red — unknown_top_level_field (exit {code}): {_first(output, 'unknown smuggled')}"
             if code == 13
             else f"NOT PROVEN — an unknown top-level field passed --check (exit {code})"
+        )
+
+        target.write_text(good.replace("cozy.endpoint.descriptor/1", "cozy.endpoint.descriptor/9"))
+        code, output = _describe(project, "--check")
+        results.append(
+            f"red — unknown_descriptor_format (exit {code}): {_first(output, 'is not')}"
+            if code == 13
+            else f"NOT PROVEN — an unknown descriptor format passed --check (exit {code})"
         )
 
         target.unlink()
@@ -1559,8 +1567,8 @@ def run_environment_drift() -> str:
         target = drift / "cozy_runtime" / "internal" / "schema.py"
         target.write_text(
             target.read_text().replace(
-                'DEFAULT_SOURCES = ("code_fallback"',
-                'DEFAULT_SOURCES = ("drifted", "code_fallback"',
+                'doc["wire"] = "required"',
+                'doc["wire"] = "drifted"',
             )
         )
         code, output = _describe(ROOT / "examples", "--check", env={"PYTHONPATH": str(drift)})
@@ -1584,9 +1592,9 @@ def run_fixed_point() -> list[str]:
     )
     plants = (
         ("release_digest", "['entrypoints'][0]['release']", '"sha256:" + "ab" * 32'),
-        ("build_timestamp", "['entrypoints'][0]['kind']", '"2026-08-24T11:02:00Z"'),
-        ("machine_path", "['entrypoints'][0]['kind']", '"/home/fidika/cozy_v2/cozy-runtime"'),
-        ("mutable_binding", "['entrypoints'][0]['kind']", '"cozy/h3-dual@v1"'),
+        ("build_timestamp", "['entrypoints'][0]['name']", '"2026-08-24T11:02:00Z"'),
+        ("machine_path", "['entrypoints'][0]['name']", '"/home/fidika/cozy_v2/cozy-runtime"'),
+        ("mutable_binding", "['entrypoints'][0]['name']", '"cozy/h3-dual@v1"'),
     )
     out = []
     for name, where, value in plants:

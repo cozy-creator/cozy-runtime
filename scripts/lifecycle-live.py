@@ -110,7 +110,7 @@ def stage_weightless(home: Path, project: Path) -> Any:
 
     write_weightless_project(project)
     found = discover(project)
-    return local.stage_weightless_release(home, descriptor.document(descriptor.build(found)))
+    return local.stage_weightless_release(home, descriptor.build(found))
 
 
 def start_weightless(

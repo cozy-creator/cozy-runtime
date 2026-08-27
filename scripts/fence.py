@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import pathlib
 import re
 import sys
@@ -728,9 +729,74 @@ def fence_reviewed_specs_exist() -> list[str]:
     return bad
 
 
+def fence_descriptor_minimality() -> list[str]:
+    """The committed example carries only the descriptor/1 facts with real readers."""
+    path = ROOT / "examples" / "endpoint.descriptor.json"
+    try:
+        document = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{path.relative_to(ROOT)} is not a readable descriptor: {exc}"]
+    bad: list[str] = []
+    expected = {"format", "application", "entrypoints", "jobs"}
+    if set(document) != expected:
+        bad.append(
+            f"{path.relative_to(ROOT)} fields are {sorted(document)}, want {sorted(expected)}"
+        )
+    if document.get("format") != "cozy.endpoint.descriptor/1":
+        bad.append(f"{path.relative_to(ROOT)} has the wrong format")
+    forbidden = {
+        "attribute",
+        "capabilities",
+        "config_schema",
+        "context_facts",
+        "default",
+        "default_sources",
+        "demand",
+        "discriminator",
+        "emits_media",
+        "error_model",
+        "frozen",
+        "gpu",
+        "kind",
+        "max_audio_channels",
+        "max_audio_samples",
+        "max_decoded_bytes",
+        "max_pixels_per_frame",
+        "max_video_frames",
+        "placement",
+        "preflight",
+        "protocol",
+        "request_features",
+        "requires",
+        "schema",
+        "secret_schema",
+        "secrets",
+        "services",
+        "settings",
+        "shape_axes",
+        "struct",
+        "surface_digest",
+        "values",
+    }
+
+    def visit(value: object, where: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in forbidden:
+                    bad.append(f"{where}.{key} is an unused descriptor fact")
+                visit(item, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{where}[{index}]")
+
+    visit(document, "descriptor")
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
+    "descriptor-minimality": fence_descriptor_minimality,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "artifact-object-sets": fence_artifact_object_sets,

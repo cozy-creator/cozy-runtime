@@ -43,25 +43,26 @@ def run(function: str | None, opts: Options, *, write: bool, check: bool) -> Res
             "an endpoint's surface must be valid before it can be described (§1.0)",
             Exit.validation,
         ) from exc
-    document = desc.document(body)
+    raw = desc.render(body)
+    digest = desc.descriptor_digest(raw)
 
     if check:
-        return _check(project, document)
+        return _check(project, body)
     if write:
-        target = desc.write(project, document)
+        target = desc.write(project, body)
         return Result(
             rows=(
                 ("wrote", str(target.relative_to(project) if project != Path() else target)),
                 ("application", str(body["application"])),
-                (desc.DIGEST_KEY, str(document[desc.DIGEST_KEY])),
+                (desc.DIGEST_KEY, digest),
                 ("bytes", str(target.stat().st_size)),
             ),
-            document=document,
+            document=body,
             next=(f"git add {desc.FILE} — the surface contract is reviewed in the diff",),
         )
     if function is not None:
         return _one(body, function)
-    return _list(body, document)
+    return _list(body)
 
 
 def _check(project: Path, derived: Mapping[str, Json]) -> Result:
@@ -80,19 +81,19 @@ def _check(project: Path, derived: Mapping[str, Json]) -> Result:
     return Result(
         rows=(
             ("descriptor", "current"),
-            (desc.DIGEST_KEY, str(derived[desc.DIGEST_KEY])),
+            (desc.DIGEST_KEY, desc.descriptor_digest(desc.render(derived))),
         )
     )
 
 
-def _list(body: Mapping[str, Json], document: Mapping[str, Json]) -> Result:
+def _list(body: Mapping[str, Json]) -> Result:
     rows: list[tuple[str, str]] = []
     for kind in ("entrypoints", "jobs"):
         entries = body[kind]
         assert isinstance(entries, list)
         for doc in entries:
             assert isinstance(doc, dict)
-            rows.append((str(doc["name"]), _one_line(doc)))
+            rows.append((str(doc["name"]), _one_line(doc, kind[:-1])))
             if kind == "jobs":
                 # THE ID A RecordOwner DISPATCHES BY. It is derived, never stored in the
                 # document (a digest inside a source-stable surface has no clock a reader
@@ -108,10 +109,10 @@ def _list(body: Mapping[str, Json], document: Mapping[str, Json]) -> Result:
     counts = desc.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
-    rows.append((desc.DIGEST_KEY, str(document[desc.DIGEST_KEY])))
+    rows.append((desc.DIGEST_KEY, desc.descriptor_digest(desc.render(body))))
     return Result(
         rows=tuple(rows),
-        document=document,
+        document=body,
         next=(
             "cozy-runtime describe <function> — that function's schemas",
             "cozy-runtime describe --write-descriptor — commit the surface contract",
@@ -125,19 +126,16 @@ def _plural(count: int, kind: str) -> str:
     return f"{count} {word if count != 1 else word[:-1]}"
 
 
-def _one_line(doc: Mapping[str, Json]) -> str:
+def _one_line(doc: Mapping[str, Json], kind: str) -> str:
     request = doc["request"]
     result = doc["result"]
     assert isinstance(request, dict) and isinstance(result, dict)
-    caps = doc["capabilities"]
-    assert isinstance(caps, list)
     slots = doc.get("models", [])
     assert isinstance(slots, list)
     parts = [
-        f"{doc['kind']}",
-        f"({request['struct']}) -> {result['struct']}",
-        f"caps: {', '.join(str(c) for c in caps) or 'none'}",
-        f"gpu={str(doc['gpu']).lower()}",
+        kind,
+        f"{len(_as_list(request['fields']))} request fields",
+        f"{len(_as_list(result['fields']))} result fields",
     ]
     if slots:
         parts.append(f"{len(slots)} model binding{'s' if len(slots) != 1 else ''}")
@@ -148,10 +146,11 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
     entrypoints = body["entrypoints"]
     jobs = body["jobs"]
     assert isinstance(entrypoints, list) and isinstance(jobs, list)
-    for doc in [*entrypoints, *jobs]:
-        assert isinstance(doc, dict)
-        if doc["name"] == function:
-            return _schema_view(doc, body)
+    for kind, docs in (("entrypoint", entrypoints), ("job", jobs)):
+        for doc in docs:
+            assert isinstance(doc, dict)
+            if doc["name"] == function:
+                return _schema_view(doc, body, kind)
     known = sorted(str(d["name"]) for d in [*entrypoints, *jobs] if isinstance(d, dict))
     raise CliError(
         "not_found",
@@ -162,14 +161,10 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
     )
 
 
-def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json]) -> Result:
-    rows: list[tuple[str, str]] = [
-        ("function", f"{doc['name']} ({doc['kind']})"),
-        ("capabilities", ", ".join(str(c) for c in _as_list(doc["capabilities"])) or "none"),
-        ("gpu", str(doc["gpu"]).lower()),
-    ]
+def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -> Result:
+    rows: list[tuple[str, str]] = [("function", f"{doc['name']} ({kind})")]
     view: dict[str, Json] = dict(doc)
-    if doc["kind"] == "job":
+    if kind == "job":
         # DERIVED here, and only here. It may not enter the committed descriptor — a
         # `sha256:` inside a source-stable surface leaves a reader no way to know which
         # clock it came from — but a RecordOwner dispatches by it, so a verb that would not
@@ -191,10 +186,6 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json]) -> Result:
         assert isinstance(components, dict)
         for method, names in sorted(components.items()):
             lines.append(f"    {method}: {', '.join(str(n) for n in _as_list(names))}")
-    if (preflight := doc.get("preflight")) is not None:
-        assert isinstance(preflight, dict)
-        lines.append(f"preflight {preflight['identity']}:")
-        lines += _fields(preflight["facts"])
     return Result(rows=tuple(rows), lines=tuple(lines), document=view)
 
 
@@ -209,13 +200,9 @@ def _fields(struct: Json) -> list[str]:
     for field in _as_list(struct["fields"]):
         assert isinstance(field, dict)
         bits = [f"    {field['name']}: {_type(field['type'])}", str(field["wire"])]
-        if "default" in field:
-            bits.append(f"= {field['default']!r}")
         if (constraints := field.get("constraints")) is not None:
             assert isinstance(constraints, dict)
             bits.append("(" + ", ".join(f"{k}={v}" for k, v in sorted(constraints.items())) + ")")
-        if (axes := field.get("shape_axes")) is not None:
-            bits.append(f"axes: {', '.join(str(a) for a in _as_list(axes))}")
         out.append("  ".join(bits))
     return out
 
@@ -224,9 +211,8 @@ def _type(rendered: Json) -> str:
     if isinstance(rendered, str):
         return rendered
     if isinstance(rendered, dict):
-        for key in ("struct", "struct_ref", "enum"):
-            if key in rendered:
-                return str(rendered[key])
+        if "fields" in rendered:
+            return "object"
         if "asset" in rendered:
             return f"{rendered['asset']} asset"
         if "literal" in rendered:
@@ -235,10 +221,4 @@ def _type(rendered: Json) -> str:
             return "|".join(_type(v) for v in _as_list(rendered["union"]))
         if "list" in rendered:
             return f"list[{_type(rendered['list'])}]"
-        if "set" in rendered:
-            return f"set[{_type(rendered['set'])}]"
-        if "tuple" in rendered:
-            return f"tuple[{', '.join(_type(v) for v in _as_list(rendered['tuple']))}]"
-        if "map" in rendered:
-            return f"dict[{', '.join(_type(v) for v in _as_list(rendered['map']))}]"
     return "?"

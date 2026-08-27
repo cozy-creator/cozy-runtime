@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every descriptor-declared Context/service fact, exercised against a REAL invocation.
+"""Every public Context/service fact, exercised against a REAL invocation.
 
 Not a test suite: each arm below runs the production invocation kernel over a real endpoint
 and reports the value the runtime actually WROTE, observed from inside author code. The
@@ -10,14 +10,15 @@ its docstring and its reader all shipped, but `grep -rn "boot_warmup=True" src/`
 nothing — so every `if ctx.boot_warmup:` arm in the fleet was unreachable code and every
 endpoint that had written one had written it for a flag that was permanently False. It was
 found by a human running grep. This script is that grep, mechanized and tied to the
-descriptor: COVERAGE IS ENFORCED — a fact the descriptor declares with no exercise here is a
-refusal, so the fact list and the exercise list cannot drift apart.
+SDK: COVERAGE IS ENFORCED — a public fact with no exercise here is a refusal, so Runtime's
+author contract and the exercise list cannot drift apart.
 
     uv run python scripts/conformance.py
 """
 
 from __future__ import annotations
 
+import inspect
 import sys
 import tempfile
 import time
@@ -52,10 +53,8 @@ from cozy_runtime.author import (  # noqa: E402
     attempt,
 )
 from cozy_runtime.author._assets import GrantedInput  # noqa: E402
-from cozy_runtime.author._services import Attempt  # noqa: E402
-from cozy_runtime.internal import descriptor as desc  # noqa: E402
+from cozy_runtime.author._services import SERVICES, Attempt  # noqa: E402
 from cozy_runtime.internal import schema  # noqa: E402
-from cozy_runtime.internal.discovery import discover  # noqa: E402
 
 Observation = str
 probe = App()
@@ -143,7 +142,6 @@ def _tagged_union_conformance() -> str:
             "name": "type",
             "type": {"literal": [tag]},
             "wire": "required",
-            "discriminator": True,
         }, discriminator
 
     decoder = msgspec.json.Decoder(list[TaggedReference])
@@ -165,7 +163,6 @@ def _tagged_union_conformance() -> str:
             "null",
             {
                 "fields": [{"name": "file", "type": "str", "wire": "required"}],
-                "struct": "UntaggedReference",
             },
         ]
     }
@@ -428,11 +425,12 @@ def main() -> int:
 
 
 def _run_all(spool: Path) -> int:
-    found = discover(ROOT / "examples")
-    body = desc.build(found)
-
-    declared_context = {str(f["name"]) for f in body["context_facts"]}
-    declared_services = set(body["services"])
+    declared_context = {
+        name
+        for name in [*Context.__dataclass_fields__, *dir(Context)]
+        if not name.startswith("_") and not inspect.isclass(getattr(Context, name, None))
+    }
+    declared_services = set(SERVICES)
     context_arms = _context_arms(spool)
     service_arms = _service_arms(spool)
 
@@ -443,11 +441,11 @@ def _run_all(spool: Path) -> int:
         print(f"  tagged_reference    REFUSED — {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    print("\n=== conformance: every descriptor-declared Context fact")
+    print("\n=== conformance: every public Context fact")
     missing = sorted(declared_context - set(context_arms))
     if missing:
         print(
-            f"NO EXERCISE for descriptor-declared Context fact(s): {', '.join(missing)}",
+            f"NO EXERCISE for public Context fact(s): {', '.join(missing)}",
             file=sys.stderr,
         )
         return 1
@@ -464,7 +462,11 @@ def _run_all(spool: Path) -> int:
         if capability not in service_arms:
             # Honest gap, not a silent pass: cr-009 (job services) and cr-012 (egress) own
             # the bodies these capabilities name, so there is nothing to exercise yet.
-            members = body["services"][capability]["members"]
+            members = [
+                name
+                for name, value in vars(SERVICES[capability]).items()
+                if not name.startswith("_") and callable(value)
+            ]
             print(f"  {capability:14} declared, {len(members)} member(s), no body yet — SKIPPED")
             continue
         try:

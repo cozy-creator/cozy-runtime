@@ -267,7 +267,7 @@ def run(
             job_records=job_records,
             workspace=workspace,
             release_id=release_id,
-            endpoint_descriptor=desc.document(body) if kind == "entrypoint" else None,
+            endpoint_descriptor=body if kind == "entrypoint" else None,
             options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
@@ -372,11 +372,7 @@ def resolved_bindings(
             for surface in found.surfaces
             if surface.kind == "entrypoint" and not surface.hidden
         ]
-        plans = (
-            list(weightless_release_documents(desc.document(desc.build(found))).subjects())
-            if visible
-            else []
-        )
+        plans = list(weightless_release_documents(desc.build(found)).subjects()) if visible else []
         return [], plans
     try:
         # ONE resolve over the WHOLE declared slot set, which is what a serving deployment
