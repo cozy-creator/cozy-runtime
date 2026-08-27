@@ -1403,6 +1403,16 @@ def main() -> int:
         help="per-section observation window in seconds — bounds a FAILING run only; a "
         "passing section completes on its own progress, never by this clock",
     )
+    parser.add_argument(
+        "--core-only",
+        action="store_true",
+        help="stop after boot/invoke/cancel/executor-crash/worker-crash/restart",
+    )
+    parser.add_argument(
+        "--expect-containment",
+        choices=("cgroup_v2", "process_tree"),
+        help="require the production selector to publish this durable owner backend",
+    )
     args = parser.parse_args()
     tmp = Path(args.tmp)
     t0 = time.perf_counter()
@@ -1427,6 +1437,14 @@ def main() -> int:
             set(hub.deployment(report).dispatchable_plan_ids) >= set(ids.values()),
             f"{boot_ms:.0f} ms to DISPATCHABLE; executor pid {worker.executor_pid()}",
         )
+        owner = json.loads((worker.root / "executor.owner").read_text())
+        backend = owner.get("scope", {}).get("backend")
+        if args.expect_containment:
+            wl.check(
+                f"the production selector chose {args.expect_containment}",
+                backend == args.expect_containment,
+                f"durable owner backend={backend}",
+            )
 
         wl.head("2. invoke: tick -> ok terminal")
         t1 = time.perf_counter()
@@ -1640,6 +1658,11 @@ def main() -> int:
     finally:
         if worker.process.poll() is None:
             worker.stop()
+
+    if args.core_only:
+        total = time.perf_counter() - t0
+        print(f"\nlifecycle core: {wl.PASS} ok, {wl.FAIL} failed, {total:.1f} s total")
+        return 1 if wl.FAIL else 0
 
     for section in (
         section_reconnect,
