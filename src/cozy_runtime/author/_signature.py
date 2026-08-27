@@ -15,6 +15,7 @@ from typing import Any, Literal, get_args, get_origin
 
 import msgspec
 
+from cozy_runtime.author._artifact_sink import ArtifactOutput
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources, _PreflightMarker
@@ -82,6 +83,7 @@ class Surface:
     gpu: bool
     publishes: bool = False
     emits_media: bool = False
+    artifact_outputs: tuple[ArtifactOutput, ...] = ()
     """What a JOB body may write, as its own declaration. Grants mint off the declaration,
     never off the kind (§2) — a job that declares neither cannot be granted a destination."""
     resources: Resources | None = None
@@ -181,6 +183,7 @@ def analyze(
     kind: Kind,
     publishes: bool = False,
     emits_media: bool = False,
+    artifact_outputs: tuple[ArtifactOutput, ...] = (),
     resources: Resources | None = None,
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
@@ -258,6 +261,7 @@ def analyze(
         gpu=any(p.role == "model" for p in params),
         publishes=publishes,
         emits_media=emits_media,
+        artifact_outputs=artifact_outputs,
         resources=resources,
         demand_bound=demand_bound,
         preflight=spec,

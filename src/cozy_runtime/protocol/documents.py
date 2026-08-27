@@ -61,11 +61,10 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 #: two versions of one document exactly as the name domain-separates two documents. Read
 #: independently per language (#510g) — this map is the reader on this side of the wire.
 #:
-#: Everything is /1 except `AttemptOutcomeBody`, which is /2: rev-2 adds `execution_started`
-#: on top of the frozen wire's `TerminalBody/1` lineage (#480c/#481). Without this map the
-#: worker would digest an outcome body under `AttemptOutcomeBody/1` — a tag no peer computes
-#: — and every outcome would fail its ack comparison against a RecordOwner that reads /2.
-DOC_VERSION = {"cozy.worker.v1.AttemptOutcomeBody": 2}
+#: Everything is /1 except `AttemptOutcomeBody`, whose /3 adds exact committed artifact
+#: receipts to /2's structural `execution_started` bit (th-049). Without this map the worker
+#: would digest an outcome under a tag no rev-5 peer computes.
+DOC_VERSION = {"cozy.worker.v1.AttemptOutcomeBody": 3}
 
 
 def doc_format(full_name: str) -> str:
@@ -200,7 +199,7 @@ def wire_schema_document() -> bytes:
     it names.
 
     The document-version map rides in the document because a document's version IS wire
-    meaning (an `AttemptOutcomeBody/2` is not an `AttemptOutcomeBody/1`) and it lives in the
+    meaning (an `AttemptOutcomeBody/3` is not an `AttemptOutcomeBody/2`) and it lives in the
     writer rather than the descriptor — the one schema fact the descriptor cannot carry.
     """
     from google.protobuf import descriptor_pb2

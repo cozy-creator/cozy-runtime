@@ -49,7 +49,9 @@ KINDS = (
     "job_checkpoint",  # one DURABLE job checkpoint identity + receipt (cr-009)
     "artifact_intent",  # exact grant-bound declaration + monotone writer session (cr-030)
     "artifact_receipt",  # exact TensorFS commit receipt, durable before outcome linkage
+    "artifact_attempt_receipt",  # committed semantic receipt replayed by a later attempt
     "artifact_final",  # one owner-authenticated stored-root disposition (cr-030/th-049)
+    "artifact_finalize_result",  # exact replayable th-049 result bytes
     "publication",  # ONE canonical bundle snapshot per publication (cr-009)
 )
 

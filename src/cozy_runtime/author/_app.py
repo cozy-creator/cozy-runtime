@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
+from cozy_runtime.author._artifact_sink import ArtifactOutput
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources
 from cozy_runtime.author._signature import Kind, Surface, analyze
@@ -44,6 +45,7 @@ class Registration:
     fn: Callable[..., object]
     publishes: bool = False
     emits_media: bool = False
+    artifact_outputs: tuple[ArtifactOutput, ...] = ()
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
@@ -72,6 +74,7 @@ class Registration:
                 kind=self.kind,
                 publishes=self.publishes,
                 emits_media=self.emits_media,
+                artifact_outputs=self.artifact_outputs,
                 resources=self.resources,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
@@ -122,6 +125,7 @@ class App:
             fn,
             name,
             publishes=False,
+            artifact_outputs=(),
             preflight=preflight,
             resources=resources,
             demand=demand,
@@ -139,6 +143,7 @@ class App:
         name: str | None = None,
         publishes: bool = False,
         emits_media: bool = False,
+        artifacts: tuple[ArtifactOutput, ...] = (),
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -151,16 +156,18 @@ class App:
         name: str | None = None,
         publishes: bool = False,
         emits_media: bool = False,
+        artifacts: tuple[ArtifactOutput, ...] = (),
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a RUN-TO-COMPLETION callable (§2).
 
         Structurally separate from serving, and separate in exactly one place: `kind`. What
-        a body may WRITE is its own declaration (`publishes=`, `emits_media=`) — grants mint
-        off the declaration, never off the kind — and everything else about the job is
-        derived from the signature exactly as it is for an entrypoint. There is no
-        JobContext, no second kernel and no serving loop.
+        a body may WRITE is its own declaration (`publishes=`, `emits_media=`, and exact
+        `artifacts=(ArtifactOutput(...),)` slots) — grants mint off the declaration, never
+        off the kind — and everything else about the job is derived from the signature
+        exactly as it is for an entrypoint. There is no JobContext, no second kernel and no
+        serving loop.
         """
         return self._register(
             "job",
@@ -168,6 +175,7 @@ class App:
             name,
             publishes=publishes,
             emits_media=emits_media,
+            artifact_outputs=artifacts,
             preflight=None,
             resources=resources,
             demand=demand,
@@ -180,6 +188,7 @@ class App:
         name: str | None,
         *,
         publishes: bool,
+        artifact_outputs: tuple[ArtifactOutput, ...],
         preflight: Callable[..., object] | None,
         resources: Resources | None,
         demand: Bound | None,
@@ -198,14 +207,15 @@ class App:
                     f"duplicate registration {registered!r}: names are unique per app"
                 )
             self._registry[registered] = Registration(
-                registered,
-                kind,
-                target,
-                publishes,
-                emits_media,
-                resources,
-                demand,
-                preflight,
+                name=registered,
+                kind=kind,
+                fn=target,
+                publishes=publishes,
+                emits_media=emits_media,
+                artifact_outputs=artifact_outputs,
+                resources=resources,
+                demand_bound=demand,
+                preflight=preflight,
                 hidden=hidden,
             )
             return target

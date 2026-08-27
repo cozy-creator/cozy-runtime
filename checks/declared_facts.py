@@ -33,6 +33,10 @@ import msgspec  # noqa: E402
 
 from cozy_runtime.author import (  # noqa: E402
     App,
+    ArtifactCommit,
+    ArtifactOutput,
+    ArtifactSink,
+    ArtifactSource,
     AssetBound,
     Budget,
     BudgetFacts,
@@ -41,6 +45,7 @@ from cozy_runtime.author import (  # noqa: E402
     Checkpoints,
     CheckpointSave,
     Context,
+    CopyComponent,
     Device,
     FileAsset,
     ImageAsset,
@@ -50,7 +55,13 @@ from cozy_runtime.author import (  # noqa: E402
     Outputs,
     Scratch,
     Telemetry,
+    Tree,
     attempt,
+)
+from cozy_runtime.author._artifact_sink import (  # noqa: E402
+    ArtifactBytes,
+    _ArtifactRequest,
+    _ArtifactWriterBackend,
 )
 from cozy_runtime.author._assets import GrantedInput  # noqa: E402
 from cozy_runtime.author._services import SERVICES, Attempt  # noqa: E402
@@ -218,6 +229,24 @@ class JobFacts(msgspec.Struct):
     rate: float
     cap: float
     spent_is_positive: bool
+
+
+class ArtifactFact(msgspec.Struct):
+    output_slot: str
+    snapshot_digest: str
+
+
+@probe.job(artifacts=(ArtifactOutput("checkpoint", 1),))
+def uses_artifact_sink(payload: In, artifacts: ArtifactSink) -> ArtifactFact:
+    del payload
+    with artifacts.open(
+        "checkpoint",
+        sources={"source": Tree("granted-source", digest="sha256:" + "a" * 64)},
+        targets={"copied": CopyComponent("source", "weights")},
+        configs={},
+    ) as writer:
+        committed = writer.commit()
+    return ArtifactFact(committed.output_slot, committed.snapshot_digest)
 
 
 @probe.job
@@ -409,6 +438,57 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
             "after an hour on 2 devices — all from the typed config channel"
         )
 
+    def artifact_sink() -> Observation:
+        declared = probe.get("uses_artifact_sink").surface.artifact_outputs
+        assert declared == (ArtifactOutput("checkpoint", 1),)
+
+        class Backend(_ArtifactWriterBackend):
+            sources: tuple[ArtifactSource, ...] = ()
+            replayed = False
+
+            def source_read_into(
+                self,
+                source: str,
+                component: str,
+                key: str,
+                role: str,
+                offset: int,
+                into: object,
+            ) -> None:
+                del source, component, key, role, offset, into
+                raise AssertionError("the copy-only declaration reads no source payload")
+
+            def add_part(self, component: str, key: str, role: str, data: ArtifactBytes) -> None:
+                del component, key, role, data
+                raise AssertionError("the copy-only declaration adds no part")
+
+            def add_config(self, name: str, data: ArtifactBytes) -> None:
+                del name, data
+                raise AssertionError("the copy-only declaration adds no config")
+
+            def commit(self) -> ArtifactCommit:
+                return ArtifactCommit("checkpoint", "sha256:" + "b" * 64, "sha256:" + "c" * 64)
+
+            def fence(self) -> bool:
+                return False
+
+        def open_writer(_request: _ArtifactRequest) -> Backend:
+            return Backend()
+
+        inv = Invocation(
+            request_id="artifact",
+            spool=spool,
+            deadline=time.monotonic() + 30.0,
+            artifact_sink=open_writer,
+        )
+        envelope, outcome, _ = attempt(probe.get("uses_artifact_sink"), {}, inv)
+        assert envelope is not None, outcome
+        assert envelope.result == ArtifactFact("checkpoint", "sha256:" + "b" * 64)
+        return (
+            "descriptor declares checkpoint/1B and handler received one attempt-bound sink "
+            "with only Runtime-authored commit identities"
+        )
+
     return {
         "save": save,
         "telemetry": telemetry,
@@ -416,6 +496,7 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
         "scratch": scratch,
         "checkpoints": checkpoints,
         "budget": budget,
+        "artifact_sink": artifact_sink,
     }
 
 

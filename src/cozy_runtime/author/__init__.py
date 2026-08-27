@@ -15,17 +15,25 @@ fakes live in `cozy_runtime.author.fakes`.
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifact_sink import (
+    ARTIFACT_MIME_TYPE,
     ArtifactCommit,
+    ArtifactComponentMetadata,
     ArtifactConfig,
+    ArtifactInspection,
+    ArtifactOutput,
     ArtifactPart,
     ArtifactReader,
     ArtifactSink,
+    ArtifactSource,
+    ArtifactSourceConfig,
     ArtifactValue,
+    ArtifactWriter,
     CopyComponent,
     CopyConfig,
     CreateComponent,
     CreateConfig,
     DeriveComponent,
+    DeriveConfig,
 )
 from cozy_runtime.author._assets import (
     Asset,
@@ -140,6 +148,7 @@ from cozy_runtime.author._services import (
 from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
+    "ARTIFACT_MIME_TYPE",
     "DEFAULT_DECODE_LIMITS",
     "DELETED_SURFACES",
     "JOB_ONLY",
@@ -151,11 +160,17 @@ __all__ = [
     "App",
     "Artifact",
     "ArtifactCommit",
+    "ArtifactComponentMetadata",
     "ArtifactConfig",
+    "ArtifactInspection",
+    "ArtifactOutput",
     "ArtifactPart",
     "ArtifactReader",
     "ArtifactSink",
+    "ArtifactSource",
+    "ArtifactSourceConfig",
     "ArtifactValue",
+    "ArtifactWriter",
     "Asset",
     "AssetBound",
     "AudioAsset",
@@ -197,6 +212,7 @@ __all__ = [
     "DecoderUnavailable",
     "DefaultResolutionError",
     "DeriveComponent",
+    "DeriveConfig",
     "DerivedCache",
     "Device",
     "Egress",

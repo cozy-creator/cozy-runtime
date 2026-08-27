@@ -14,7 +14,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 4) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 5) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -53,6 +53,7 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 | `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
 | `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
+| `internal/artifact_transactions.py` | the one grant-bound ArtifactSink transaction: stable identity, fenced writer, TensorFS commit/recovery/disposition |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
@@ -307,7 +308,20 @@ cr-016 over the real attempt kernel.
 `@app.job` over the one invocation kernel, the same worker/executor split, the same
 journal, the same output transaction. What differs is stated out loud and is short — a
 `JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
-(serving never accepts-then-cold-loads; a job has nothing to be warm for), the three job
-services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose path rides
-the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
+(serving never accepts-then-cold-loads; a job has nothing to be warm for), the four job
+services (`Scratch`, `Checkpoints`, `ArtifactSink`, `Budget`), typed input `Tree` fields whose
+path rides the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
+
+`ArtifactSink` is the only large-artifact door. A job declares exact source aliases and one
+closed copy/derive/create target map, then supplies bounded byte readers for new TensorFS
+values/configs. It cannot name a store, path, transaction/session id, repository, publisher,
+or tool. Its decorator declares immutable slots, for example
+`artifacts=(ArtifactOutput("checkpoint", max_new_bytes),)`; those exact rows enter the endpoint
+descriptor and InvocationSpec while ordinary asset outputs remain a separate MIME class. Runtime
+derives the semantic transaction from RecordOwner scope + request + exact
+InvocationSpec + output slot; every executor attempt gets a journaled monotone writer session.
+TensorFS commits the snapshot and retains its root, while Runtime journals the exact immutable
+receipt and recovers the commit-before-journal crash gap by transaction id. Rev 5 carries the
+Runtime receipt in `AttemptOutcomeBody/3` and one authenticated replayable finalize exchange
+adopts or abandons its retained root; `AttemptOutcomeAck` remains acknowledgement only.

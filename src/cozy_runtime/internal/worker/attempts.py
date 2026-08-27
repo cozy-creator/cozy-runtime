@@ -37,6 +37,7 @@ from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any, cast
 
+from cozy_runtime.author._artifact_sink import ARTIFACT_MIME_TYPE
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import artifact_transactions, canonical, egress, seam
@@ -53,7 +54,7 @@ from cozy_runtime.internal.worker.plan import (
     PreparedModel,
     PreparedRequest,
 )
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import artifact_limits, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
@@ -1174,6 +1175,7 @@ class AttemptEngine:
                     granted_outputs={
                         output_id: output.max_bytes
                         for output_id, output in attempt.grant.outputs.items()
+                        if output.mime_type == ARTIFACT_MIME_TYPE
                     },
                 )
             except (artifact_transactions.ArtifactTransactionError, JournalError) as exc:
@@ -1312,6 +1314,11 @@ class AttemptEngine:
                 )
             )
 
+    def finalize_artifact(
+        self, request: pb.ArtifactFinalizeRequest
+    ) -> pb.ArtifactFinalizeResultFrame:
+        return self.artifacts.finalize_request(request, self.owner_scope())
+
     def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
         """ONE attempt: dispatch, freeze point, tail, journaled terminal.
 
@@ -1445,6 +1452,7 @@ class AttemptEngine:
                 "artifact_outputs": {
                     output_id: output.max_bytes
                     for output_id, output in attempt.grant.outputs.items()
+                    if output.mime_type == ARTIFACT_MIME_TYPE
                 },
                 "inputs": inputs,
                 "max_input_bytes": 64 << 20,
@@ -1823,12 +1831,17 @@ class AttemptEngine:
         """
         rows = list(reply.get("outputs", ()))
         spool = attempt.spool
-        if not rows and not attempt.grant.outputs:
+        asset_outputs = {
+            output_id
+            for output_id, output in attempt.grant.outputs.items()
+            if output.mime_type != ARTIFACT_MIME_TYPE
+        }
+        if not rows and not asset_outputs:
             return None, None
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
         produced = {str(row["output_id"]): row for row in rows}
-        granted = set(attempt.grant.outputs)
+        granted = asset_outputs
         if set(produced) != granted:
             grants.abort_outputs(spool)
             return None, (
@@ -1938,6 +1951,7 @@ class AttemptEngine:
         if attempt.kind == "job":
             try:
                 attempt.artifact_receipts = self.artifacts.settle(
+                    request_id=attempt.request_id,
                     attempt_ordinal=attempt.attempt,
                     executor_generation=attempt.executor_generation,
                 )
@@ -1949,17 +1963,22 @@ class AttemptEngine:
                     "artifact_receipt_not_durable: Runtime could not recover/fence the "
                     f"ArtifactSink transaction ({getattr(exc, 'code', type(exc).__name__)})"
                 )
-            if attempt.artifact_receipts:
-                # th-049 is a foreign wire hardcut, not permission to smuggle a private
-                # field into /2. Keep the committed root GC-live and report the missing
-                # transport honestly; the service becomes success-capable when /3 lands.
+            declared_artifacts = {
+                output_id
+                for output_id, output in attempt.grant.outputs.items()
+                if output.mime_type == ARTIFACT_MIME_TYPE
+            }
+            committed_artifacts = {receipt.output_slot for receipt in attempt.artifact_receipts}
+            if status == STATUS.OUTCOME_STATUS_SUCCEEDED and (
+                committed_artifacts != declared_artifacts
+            ):
                 status = STATUS.OUTCOME_STATUS_FAILED
-                cause = CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE
-                origin = ORIGIN.CAUSE_ORIGIN_RUNTIME
+                cause = CAUSE.CAUSE_CODE_AUTHOR_EXCEPTION
+                origin = ORIGIN.CAUSE_ORIGIN_AUTHOR
                 detail = (
-                    "artifact_receipt_transport_unavailable: the artifact committed and its "
-                    "receipt is durable, but worker-protocol AttemptOutcomeBody/3 (th-049) "
-                    "has not landed; Runtime will not claim success while dropping it"
+                    "artifact_output_incomplete: successful job committed artifact slots "
+                    f"{sorted(committed_artifacts) or 'none'}, declaration requires "
+                    f"{sorted(declared_artifacts) or 'none'}"
                 )
         # The grant is released FIRST because reconciliation is a claim about the whole
         # envelope: the opening line was taken before the grant, so the closing one must be
@@ -2001,6 +2020,23 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
+        artifact_receipts = sorted(attempt.artifact_receipts, key=lambda row: row.output_slot)
+        aggregate_receipt_bytes = sum(
+            len(receipt.artifact_receipt_bytes) for receipt in artifact_receipts
+        )
+        if (
+            len(artifact_receipts) > artifact_limits.MAX_ARTIFACT_RECEIPTS
+            or aggregate_receipt_bytes > artifact_limits.MAX_ARTIFACT_RECEIPT_AGGREGATE_BYTES
+            or len({receipt.output_slot for receipt in artifact_receipts}) != len(artifact_receipts)
+        ):
+            raise UndurableOutcome(attempt, "committed artifact receipts violate th-049 caps/order")
+        body.artifact_receipts.extend(
+            pb.ArtifactReceiptRef(
+                artifact_receipt_digest=documents.raw(receipt.artifact_receipt_digest),
+                artifact_receipt_canonical_bytes=receipt.artifact_receipt_bytes,
+            )
+            for receipt in artifact_receipts
+        )
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)
         if receipt is not None:
             body.triage_bundle.CopyFrom(

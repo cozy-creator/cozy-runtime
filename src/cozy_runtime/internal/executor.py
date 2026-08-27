@@ -1104,13 +1104,14 @@ class Executor:
             )
 
         budget = command.get("budget") or {}
-        artifact_commit = None
+        artifact_inspect = None
+        artifact_open = None
         if command.get("artifact_store"):
             artifact_sources = {
                 str(ref): (str(row[0]), int(row[1]))
                 for ref, row in (command.get("artifact_sources") or {}).items()
             }
-            artifact_commit = artifact_transactions.ExecutorArtifactSink(
+            artifact_sink = artifact_transactions.ExecutorArtifactSink(
                 store_root=Path(command["artifact_store"]),
                 spool=spool,
                 granted_sources=artifact_sources,
@@ -1119,7 +1120,9 @@ class Executor:
                     for slot, max_bytes in (command.get("artifact_outputs") or {}).items()
                 },
                 durable=self._durable,
-            ).commit
+            )
+            artifact_inspect = artifact_sink.inspect
+            artifact_open = artifact_sink.open
         started = time.perf_counter()
         started_wall = time.time()
         if self.torch is not None:
@@ -1142,7 +1145,8 @@ class Executor:
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
-                artifact_sink=artifact_commit,
+                artifact_inspect=artifact_inspect,
+                artifact_sink=artifact_open,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),

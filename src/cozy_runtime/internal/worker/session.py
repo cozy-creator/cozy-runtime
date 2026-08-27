@@ -59,6 +59,7 @@ from typing import Any
 
 from cozy_runtime.internal import (
     accel,
+    artifact_transactions,
     child_env,
     egress,
     environment,
@@ -1344,6 +1345,21 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
+        elif kind == "artifact_finalize_request":
+            try:
+                result = self.engine.finalize_artifact(inner)
+            except (artifact_transactions.ArtifactTransactionError, JournalError) as exc:
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                        subject=f"{inner.request_id}/{inner.output_slot}",
+                        reason="artifact_finalize_refused",
+                        detail=safe(str(exc)),
+                    )
+                )
+                self.note("artifact", f"finalize refused: {safe(str(exc))}")
+                return
+            self.send(pb.WorkerFrame(artifact_finalize_result=result))
 
     def apply_artifact_grant(self, update: pb.ArtifactGrantUpdate) -> None:
         """Standing, refreshable ACQUISITION authority, on its OWN lane (§3, #480a).

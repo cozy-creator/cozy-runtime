@@ -234,6 +234,23 @@ def _media_decode_bounds(surface: Surface) -> None:
             "or audio asset field",
             code="unused_capability",
         )
+    artifact_capability = "artifact_sink" in surface.capabilities
+    if artifact_capability != bool(surface.artifact_outputs):
+        raise ConformanceError(
+            f"{surface.name}: ArtifactSink and artifacts=(ArtifactOutput(...),) must be "
+            "declared together; the immutable slot set is what the RecordOwner grants",
+            code="artifact_output_declaration",
+        )
+    output_ids = [output.output_id for output in surface.artifact_outputs]
+    if (
+        output_ids != sorted(set(output_ids))
+        or any(not output_id for output_id in output_ids)
+        or any(output.max_new_bytes <= 0 for output in surface.artifact_outputs)
+    ):
+        raise ConformanceError(
+            f"{surface.name}: artifact outputs must be sorted, unique, named, and positive-byte",
+            code="artifact_output_declaration",
+        )
     try:
         require_decoder_dependency()
     except CapabilityError as exc:

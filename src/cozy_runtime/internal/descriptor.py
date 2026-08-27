@@ -12,7 +12,7 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author import ARTIFACT_MIME_TYPE, ConformanceError, ModelBinding, Surface
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -79,6 +79,15 @@ def _callable(surface: Surface) -> dict[str, Json]:
         doc["models"] = models
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
+        if surface.artifact_outputs:
+            doc["artifact_outputs"] = [
+                {
+                    "output_id": output.output_id,
+                    "mime_type": ARTIFACT_MIME_TYPE,
+                    "max_bytes": output.max_new_bytes,
+                }
+                for output in surface.artifact_outputs
+            ]
         if surface.resources is not None and surface.resources.gpu_count is not None:
             doc["resources"] = {"gpu_count": surface.resources.gpu_count}
     return doc

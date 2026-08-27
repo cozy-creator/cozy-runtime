@@ -30,7 +30,7 @@ this repo's CI `drift` job runs.
 
 from __future__ import annotations
 
-from cozy.worker.v1 import worker_pb2, worker_pb2_grpc
+from cozy.worker.v1 import artifact_limits, worker_pb2, worker_pb2_grpc
 from cozy.worker.v1.wire_identity import SCHEMA_DIGEST, WIRE_MINOR, WIRE_SCHEMA_REV
 from cozy_runtime.protocol import documents
 
@@ -43,6 +43,7 @@ __all__ = [
     "SCHEMA_DIGEST_RAW",
     "WIRE_MINOR",
     "WIRE_SCHEMA_REV",
+    "artifact_limits",
     "documents",
     "worker_pb2",
     "worker_pb2_grpc",

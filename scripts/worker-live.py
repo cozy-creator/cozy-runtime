@@ -1050,7 +1050,7 @@ def terminal_body(terminal: pb.AttemptOutcome) -> dict[str, Any]:
 
 
 def section_fixtures(args: argparse.Namespace) -> None:
-    """The copied bindings and this writer against worker-protocol's schema-rev-4 corpus."""
+    """The copied bindings and this writer against worker-protocol's schema-rev-5 corpus."""
     head("the SCHEMA FENCE is DERIVED here, not declared (#530-A1/#536b)")
     derived = documents.wire_schema_document()
     derived_id = "sha256:" + documents.digest_of(derived).hex()
@@ -1068,7 +1068,7 @@ def section_fixtures(args: argparse.Namespace) -> None:
         f"the document-version map {documents.DOC_VERSION} inside it",
     )
 
-    head("the vendored schema-rev-4 bindings decode the frozen fixture corpus")
+    head("the vendored schema-rev-5 bindings decode the frozen fixture corpus")
     manifest = json.loads((FIXTURES / "MANIFEST.json").read_text())
     bad = []
     for name, row in manifest["positive"].items():
