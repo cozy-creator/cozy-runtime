@@ -5,8 +5,7 @@ __pycache__/
 dist/
 *.egg-info/
 corpus/.venv/
-results/*.txt
-results/*.log
+results/
 corpus/endpoint/imports/
 corpus/pipeline/imports/
 # tokenizer vocabularies: bundled endpoint assets, staged by the harness, not committed

@@ -24,6 +24,7 @@ import json
 import os
 import resource
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -380,7 +381,7 @@ def section_kill() -> None:
                 frames = [f for f in coordinator.progress_frames if b'"type": "progress"' in f.data]
                 if len(frames) >= 2 and worker.supervision.current is not None:
                     pid = worker.supervision.current.pid
-                    worker.supervision.current.kill_group()
+                    os.killpg(pid, signal.SIGKILL)
                     print(f"  killed executor pid {pid} after {len(frames)} progress frames")
                     return
                 time.sleep(0.02)

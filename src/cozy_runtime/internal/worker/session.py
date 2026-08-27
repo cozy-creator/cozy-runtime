@@ -1736,7 +1736,7 @@ class Worker:
             self.latched = "job_executor_absent"
             self._settle()
             return
-        executor.purpose = "job"
+        executor.reserved_for_job = True
         self.note(
             "boot",
             f"job executor generation {executor.incarnation} pid {executor.pid} dialled "
@@ -1844,7 +1844,7 @@ class Worker:
             elif (
                 executor.alive()
                 and not executor.poisoned
-                and executor.purpose == "fresh"
+                and not executor.reserved_for_job
                 and not executor.ready_plans
                 and executor.prepared_model is None
             ):
@@ -2044,7 +2044,6 @@ class Worker:
             executor.construction_key = construction_key
             executor.prepared_binding_set = binding_set
             executor.prepared_model = resolved
-            executor.purpose = "serving"
             for binding in group:
                 if binding.expected_logical_model_digest and (
                     binding.expected_logical_model_digest != digest

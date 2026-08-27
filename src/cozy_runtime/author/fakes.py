@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset
+from cozy_runtime.author._assets import Asset, GrantedInput
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
@@ -154,6 +154,7 @@ def invoke_with_fakes(
     seconds: float = 300.0,
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
+    assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> InvocationResult:
     """Run a handler through the REAL kernel with no GPU, no hub and no coordinator."""
@@ -173,6 +174,7 @@ def invoke_with_fakes(
             secrets=secrets,
             adapters=adapters,
             egress_broker=egress_broker,
+            assets=assets or {},
             max_output_bytes=max_output_bytes,
         ),
         Attempt(request_id, spool, max_output_bytes),

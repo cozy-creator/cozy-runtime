@@ -27,6 +27,7 @@ from typing import Any, cast
 import msgspec
 
 ROOT = Path(__file__).resolve().parent.parent
+RESULTS = ROOT / "results"
 sys.path.insert(0, str(ROOT / "examples"))
 
 import tiny_artifacts as art  # noqa: E402
@@ -51,6 +52,7 @@ from cozy_runtime.author import (  # noqa: E402
     prepare,
     registered_adapters,
 )
+from cozy_runtime.author._assets import GrantedInput  # noqa: E402
 from cozy_runtime.author._services import Attempt  # noqa: E402
 from cozy_runtime.author.fakes import (  # noqa: E402  # noqa: E402
     ResidentBackend,
@@ -236,10 +238,14 @@ def main() -> int:
         models=h3_models.models("generate"),
     )
     print(f"  fl2va: {fl.result}")
-    reference = ROOT / "verify-reference.png"
+    RESULTS.mkdir(exist_ok=True)
+    evidence = Path(tempfile.mkdtemp(prefix="verify-", dir=RESULTS))
+    reference = evidence / "reference.png"
     reference.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
-    clip = ROOT / "verify-clip.wav"
+    clip = evidence / "clip.wav"
     clip.write_bytes(b"RIFF....WAVEfmt ")
+    reference_digest = "sha256:" + hashlib.sha256(reference.read_bytes()).hexdigest()
+    clip_digest = "sha256:" + hashlib.sha256(clip.read_bytes()).hexdigest()
     ref = invoke_with_fakes(
         h3.app.get("generate_ref"),
         {
@@ -254,6 +260,31 @@ def main() -> int:
         },
         models=h3_models.models("generate_ref"),
         settings=h3.RefServeSettings(),
+        assets={
+            "references.0.image": GrantedInput(
+                "references.0.image",
+                reference,
+                "image/png",
+                reference_digest,
+                reference.stat().st_size,
+            ),
+            "references.1.video": GrantedInput(
+                "references.1.video",
+                reference,
+                "video/mp4",
+                reference_digest,
+                reference.stat().st_size,
+                order=1,
+            ),
+            "references.2.audio": GrantedInput(
+                "references.2.audio",
+                clip,
+                "audio/wav",
+                clip_digest,
+                clip.stat().st_size,
+                order=2,
+            ),
+        },
     )
     print(f"  ref2va: {ref.result}")
     print(
@@ -444,6 +475,15 @@ def main() -> int:
         {"prompt": "with a reference", "reference": str(reference), "seed": 3},
         models=models.models("generate_ref"),
         settings=ep.RefSettings(references_enabled=True),
+        assets={
+            "reference": GrantedInput(
+                "reference",
+                reference,
+                "image/png",
+                reference_digest,
+                reference.stat().st_size,
+            )
+        },
     )
     print(f"  facts digest:  {ref_env.facts_digest}")
     print(f"  handler rows:  {ref_env.adjustments}")
@@ -477,13 +517,12 @@ def main() -> int:
         )
     except Exception as exc:
         print(f"  preflight refusal: {type(exc).__name__}: {exc}")
-    print(
-        f"  spool contents after the refusal: {sorted(p.name for p in spool.iterdir())} "
-        f"— the asset was never hydrated"
-    )
-    shutil.rmtree(spool)
+    contents = sorted(p.name for p in spool.iterdir()) if spool.exists() else []
+    print(f"  spool contents after the refusal: {contents} — the asset was never hydrated")
+    shutil.rmtree(spool, ignore_errors=True)
     reference.unlink()
     clip.unlink()
+    evidence.rmdir()
 
     # ---------------------------------------------------------------- async
     head("async def — a PRIVATE event loop per attempt, one attempt at a time")
