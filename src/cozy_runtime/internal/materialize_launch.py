@@ -255,9 +255,7 @@ def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
                 raise LaunchRefusal("grant_response_invalid", f"status={response.status}")
             stated = response.headers.get("Content-Length")
             if stated is not None and stated != str(length):
-                raise LaunchRefusal(
-                    "grant_length_mismatch", f"header {stated}, expected {length}"
-                )
+                raise LaunchRefusal("grant_length_mismatch", f"header {stated}, expected {length}")
             while True:
                 if time.time() >= deadline:
                     raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
@@ -421,9 +419,10 @@ def _provision_pair(
         "length": len(spec_bytes),
     }:
         raise LaunchRefusal("provision_spec_ref_mismatch", "bundle and bootstrap disagree")
-    if _ref(bundle["control_runtime"], "control_runtime") != spec["execution_substrate"][
-        "control_runtime"
-    ]:
+    if (
+        _ref(bundle["control_runtime"], "control_runtime")
+        != spec["execution_substrate"]["control_runtime"]
+    ):
         raise LaunchRefusal("control_runtime_ref_mismatch", "bundle and spec disagree")
     documents = bundle["documents"]
     if not isinstance(documents, list) or len(documents) != len(REQUIRED_DOCUMENT_ROLES):
@@ -482,9 +481,7 @@ def _join_release(
     joins = {
         "endpoint_bundle": build["endpoint_bundle"],
         "endpoint_environment_spec": build["endpoint_environment_spec"],
-        "expected_installed_environment_receipt": build[
-            "expected_installed_environment_receipt"
-        ],
+        "expected_installed_environment_receipt": build["expected_installed_environment_receipt"],
         "resolved_wheel_set": build["resolved_wheel_set"],
         "wheelhouse_manifest": build["wheelhouse_manifest"],
     }
@@ -492,9 +489,10 @@ def _join_release(
         granted = {"digest": grants[role]["digest"], "length": grants[role]["length"]}
         if _ref(value, role) != granted:
             raise LaunchRefusal("endpoint_build_record_mismatch", role)
-    if _ref(build["control_runtime"], "control_runtime") != spec["execution_substrate"][
-        "control_runtime"
-    ]:
+    if (
+        _ref(build["control_runtime"], "control_runtime")
+        != spec["execution_substrate"]["control_runtime"]
+    ):
         raise LaunchRefusal("control_runtime_ref_mismatch", "build record and spec disagree")
     if (
         _ref(build["wheelhouse_manifest"], "wheelhouse_manifest")["digest"]
@@ -563,9 +561,9 @@ def _join_release(
         "descriptor_digest": _ref(endpoint["descriptor"], "descriptor")["digest"],
         "endpoint_release_id": endpoint["endpoint_release_id"],
         "environment_spec_digest": grants["endpoint_environment_spec"]["digest"],
-        "installed_environment_receipt_digest": grants[
-            "expected_installed_environment_receipt"
-        ]["digest"],
+        "installed_environment_receipt_digest": grants["expected_installed_environment_receipt"][
+            "digest"
+        ],
     }
     for name, value in expected.items():
         if placement_spec[name] != value:
@@ -747,12 +745,8 @@ def environment_input(
         str(spec["wheelhouse_manifest_digest"]),
         "wheelhouse_manifest",
     )
-    _ref_matches(
-        bundle["resolved_wheel_set"], resolved_wheel_set_bytes, "resolved_wheel_set"
-    )
-    _ref_matches(
-        bundle["wheelhouse_manifest"], wheelhouse_manifest_bytes, "wheelhouse_manifest"
-    )
+    _ref_matches(bundle["resolved_wheel_set"], resolved_wheel_set_bytes, "resolved_wheel_set")
+    _ref_matches(bundle["wheelhouse_manifest"], wheelhouse_manifest_bytes, "wheelhouse_manifest")
     if bundle["wheelhouse_manifest"] != {
         "digest": spec["wheelhouse_manifest_digest"],
         "length": len(wheelhouse_manifest_bytes),
@@ -784,9 +778,7 @@ def environment_input(
     if set(wheel_paths) != set(digests):
         missing = sorted(set(digests) - set(wheel_paths))
         extra = sorted(set(wheel_paths) - set(digests))
-        raise LaunchRefusal(
-            "wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}"
-        )
+        raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
     grants = tuple(
         environment.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
         for wheel in wheels
@@ -847,9 +839,7 @@ def _document(raw: bytes, name: str) -> dict[str, Any]:
 def _closed(value: object, keys: set[str], name: str) -> None:
     if not isinstance(value, dict) or set(value) != keys:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__
-        raise LaunchRefusal(
-            f"{name}_invalid", f"fields={fields} expected={sorted(keys)}"
-        )
+        raise LaunchRefusal(f"{name}_invalid", f"fields={fields} expected={sorted(keys)}")
 
 
 def _ref_matches(value: object, raw: bytes, name: str, *, allow_extra: bool = False) -> None:

@@ -326,9 +326,7 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
     worker_port = decimal("COZY_ADAPTER_WORKER_INTERNAL_PORT", 65535)
     media_port = decimal("COZY_ADAPTER_MEDIA_INTERNAL_PORT", 65535)
     if worker_port == media_port:
-        raise ConfigError(
-            "adapter_config", "worker and media ports are equal", "fix bootstrap"
-        )
+        raise ConfigError("adapter_config", "worker and media ports are equal", "fix bootstrap")
     provider_pod_id = required("COZY_ADAPTER_PROVIDER_POD_ID")
     if provider_pod_id.strip() != provider_pod_id or len(provider_pod_id) > 256:
         raise ConfigError(
@@ -350,9 +348,7 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         readiness_deadline_unix=decimal("COZY_ADAPTER_READINESS_DEADLINE_UNIX", (1 << 53) - 1),
         child_base_env=tuple(
             sorted(
-                (name, value)
-                for name, value in env.items()
-                if name in ADAPTER_CHILD_PLATFORM_ENV
+                (name, value) for name, value in env.items() if name in ADAPTER_CHILD_PLATFORM_ENV
             )
         ),
     )

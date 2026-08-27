@@ -65,9 +65,7 @@ def certificate(path: Path) -> tuple[bytes, str]:
     return der, ips[0]
 
 
-def runtime_gpus(
-    child_env: tuple[tuple[str, str], ...], *, deadline: int
-) -> list[RuntimeGPU]:
+def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, deadline: int) -> list[RuntimeGPU]:
     """Measure the exact executor-visible NVIDIA inventory, sorted by device index."""
 
     command = [
@@ -167,8 +165,7 @@ def prove_worker_foreign_refusal(
     if (
         frame.WhichOneof("msg") != "claim_ack"
         or frame.claim_ack.accepted
-        or frame.claim_ack.rejection
-        != pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED
+        or frame.claim_ack.rejection != pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED
         or frame.claim_ack.wire_schema_digest != SCHEMA_DIGEST_RAW
     ):
         raise LaunchRefusal("worker_foreign_credential_unproven", "negative Claim was not refused")
