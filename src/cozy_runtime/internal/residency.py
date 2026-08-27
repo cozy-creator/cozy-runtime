@@ -441,8 +441,7 @@ class ComponentResidency:
                 else None
             ),
             "fences": {
-                n: {"passed": f.passed(), "last_used": f.last_used}
-                for n, f in self.fences.items()
+                n: {"passed": f.passed(), "last_used": f.last_used} for n, f in self.fences.items()
             },
             "poisoned": self.poisoned,
             "log": list(self.backend.stage_log[-16:]),

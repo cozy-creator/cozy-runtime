@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import canonical, contract
+from cozy_runtime.internal import descriptor as endpoint_descriptor
 from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 
@@ -164,7 +165,12 @@ def read_provisioned_release(
             descriptor_ref = current_descriptor_ref
             descriptor_doc = read_document(descriptor_ref, "descriptor")
             _verify_exact(descriptor_doc, "descriptor")
-            descriptor = _canonical_object(descriptor_doc.raw, "descriptor")
+            try:
+                descriptor = endpoint_descriptor.read_bytes(
+                    descriptor_doc.raw, str(descriptor_doc.path)
+                )
+            except endpoint_descriptor.StaleDescriptor as exc:
+                raise PlanRefusal("descriptor_invalid", str(exc)) from exc
             documents[descriptor_ref.digest] = descriptor_ref.length
             visible = _visible_entrypoints(descriptor)
         elif current_descriptor_ref != descriptor_ref:
@@ -232,11 +238,7 @@ def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
         raise PlanRefusal("binding_descriptor_invalid", "entrypoints is not an array")
     visible: dict[str, dict[str, Any]] = {}
     for row in entries:
-        if (
-            not isinstance(row, dict)
-            or row.get("kind") != "entrypoint"
-            or row.get("hidden") is not False
-        ):
+        if not isinstance(row, dict) or row.get("hidden") is not False:
             continue
         name = _identifier(row.get("name"), "descriptor.entrypoint.name")
         if name in visible:
