@@ -915,6 +915,12 @@ class Executor:
         # an observed phase bit, not a refusal-code allowlist that drifts as validation grows.
         if outcome.terminal != "succeeded" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
+        # THE RESIDENCY PLANE'S POISON IS THIS PROCESS'S POISON (#613). A mid-mutation
+        # failure or an accounting violation there can fire BEFORE handler entry (admission
+        # runs at scope enter), so the phase bit above cannot see it — and the transaction
+        # is the process, so the worker must replace it either way.
+        if self.residency is not None and self.residency.poisoned:
+            self.poisoned = self.poisoned or f"residency: {self.residency.poisoned[:200]}"
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
