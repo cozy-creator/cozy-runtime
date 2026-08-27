@@ -269,7 +269,11 @@ def _readonly_container_cgroup_v1() -> bool:
         for line in Path("/proc/self/cgroup").read_text().splitlines():
             hierarchy, controller_text, relative_text = line.split(":", 2)
             if hierarchy == "0" and not controller_text:
-                return False
+                # A hybrid kernel can report an unused unified membership even though no
+                # cgroup2 hierarchy is mounted. The caller already proved that
+                # cgroup.controllers is absent; only v1 controller memberships are paths
+                # this backend must account for.
+                continue
             names = frozenset(item for item in controller_text.split(",") if item)
             if not hierarchy.isdigit() or not names or not relative_text.startswith("/"):
                 return False
