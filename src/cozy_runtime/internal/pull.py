@@ -43,9 +43,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 #: How many objects are in flight by default. It is a MEASURED number, not a taste: #566b
@@ -88,6 +89,24 @@ class PullRefusal(Exception):
         self.message = message
         self.remedy = remedy
         self.cause = cause
+
+
+def open_store(tensorfs: Any, root: Path) -> Any:
+    """Open or initialize the one local TensorFS store used by a transport adapter."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        return (
+            tensorfs.Store.open(str(root))
+            if (root / "store.json").is_file()
+            else tensorfs.Store.init(str(root))
+        )
+    except Exception as exc:
+        raise PullRefusal(
+            "border_refused",
+            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
+            "repair the substrate cache mount or launch against an empty store directory",
+        ) from exc
 
 
 # ---------------------------------------------------------------- deadline
@@ -190,7 +209,7 @@ def local_hub(base: str) -> bool:
 # ---------------------------------------------------------------- the hub's read routes
 
 
-def _open(req: urllib.request.Request, deadline: Deadline) -> Any:
+def _open(req: urllib.request.Request, deadline: Deadline, *, no_proxy: bool = False) -> Any:
     """One opener. Redirects are refused rather than followed: a presigned GET has no
     business redirecting, and following one would re-open a URL the guard never saw."""
 
@@ -198,8 +217,27 @@ def _open(req: urllib.request.Request, deadline: Deadline) -> Any:
         def redirect_request(self, *_: Any, **__: Any) -> None:
             return None
 
-    opener = urllib.request.build_opener(NoRedirect)
+    handlers: list[Any] = [NoRedirect]
+    if no_proxy:
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     return opener.open(req, timeout=deadline.remaining())
+
+
+def open_guarded(
+    url: str,
+    deadline: Deadline,
+    *,
+    headers: Mapping[str, str] | None = None,
+    allow_local: bool = False,
+    no_proxy: bool = False,
+) -> Any:
+    """Open one already-authorized URL through the shared guarded transport."""
+
+    guard(url, allow_local=allow_local)
+    return _open(
+        urllib.request.Request(url, headers=dict(headers or {})), deadline, no_proxy=no_proxy
+    )
 
 
 def _json(base: str, path: str, deadline: Deadline, *, token: str = "", body: Any = None) -> Any:
@@ -500,31 +538,176 @@ def pull(
         bytes_total=int(plan["held_bytes"]) + int(plan["wanted_bytes"]),
         presence=dict(plan["presence"]),
     )
-    urls = {r.object_id: r.url for r in declared}
-    allow_local = local_hub(base)
+    _execute_plan(
+        tensorfs,
+        store,
+        plan,
+        result,
+        urls={r.object_id: r.url for r in declared},
+        in_hand={"sha256:" + at.snapshot: doc},
+        deadline=deadline,
+        allow_local=local_hub(base),
+        streams=streams,
+        on_object=on_object,
+    )
+    return result
+
+
+def pull_granted_snapshot(
+    tensorfs: Any,
+    store: Any,
+    snapshot: str,
+    snapshot_length: int,
+    granted: Sequence[Read],
+    *,
+    timeout: float | None = None,
+    session: str = "",
+    streams: int = STREAMS,
+    on_object: Callable[[str, int, bool], None] | None = None,
+) -> PullResult:
+    """Admit one exact SnapshotManifest closure from closed direct HTTPS grants.
+
+    Rental provisioning already carries delivery authority, so resolving a mutable hub ref
+    would add a second meaning clock.  This door instead takes one already-selected root and
+    the exact per-root object rows which TensorFS must verify.  The caller partitions a
+    release-wide ObjectSet by SnapshotManifest reachability; this function deliberately does
+    not guess that a union of several roots is one root's closure.
+
+    Every object, including the root manifest, travels through ``fetch_admit``.  No local
+    provision copy or human-ref artifact index is written, and HTTPS grants never use an
+    inherited proxy or the loopback development carve-out.
+    """
+
+    root = snapshot.removeprefix("sha256:")
+    root_id = "sha256:" + root
+    if (
+        len(root) != 64
+        or any(c not in "0123456789abcdef" for c in root)
+        or not isinstance(snapshot_length, int)
+        or isinstance(snapshot_length, bool)
+        or snapshot_length <= 0
+    ):
+        raise PullRefusal(
+            "artifact_incomplete",
+            f"{snapshot}: not one bounded SnapshotManifest reference",
+            "supply the exact sha256 digest and positive stored-byte length from the binding",
+        )
+    rows = list(granted)
+    if not rows or [row.object_id for row in rows] != sorted(row.object_id for row in rows):
+        raise PullRefusal(
+            "artifact_incomplete",
+            f"{root_id}: direct grants are absent or not sorted by object id",
+            "derive one sorted, unique grant list for this SnapshotManifest closure",
+        )
+    by_id: dict[str, Read] = {}
+    for row in rows:
+        location = urllib.parse.urlsplit(row.url)
+        if (
+            row.object_id in by_id
+            or not row.object_id.startswith("sha256:")
+            or len(row.object_id) != 71
+            or any(c not in "0123456789abcdef" for c in row.object_id[7:])
+            or not isinstance(row.length, int)
+            or isinstance(row.length, bool)
+            or row.length <= 0
+            or location.scheme != "https"
+            or not location.netloc
+            or location.username is not None
+            or location.password is not None
+            or bool(location.fragment)
+        ):
+            raise PullRefusal(
+                "artifact_incomplete",
+                f"{row.object_id}: invalid or duplicate direct grant identity",
+                "author one positive-length HTTPS grant for every exact object id",
+            )
+        by_id[row.object_id] = row
+    root_row = by_id.get(root_id)
+    if root_row is None or root_row.length != snapshot_length:
+        raise PullRefusal(
+            "artifact_incomplete",
+            f"{root_id}: root grant length does not equal {snapshot_length}",
+            "grant the exact SnapshotManifest bytes named by the resolved binding",
+        )
+
+    streams = max(1, int(streams))
+    deadline = Deadline.after(timeout)
+    plan = _plan(
+        tensorfs,
+        store,
+        session or ("provision-" + root[:12]),
+        root,
+        snapshot_length,
+        [(row.object_id, row.length) for row in rows if row.object_id != root_id],
+    )
+    result = PullResult(
+        ref=root_id,
+        snapshot=root,
+        store=str(store.root),
+        streams=streams,
+        declared=len(plan["held"]) + len(plan["wanted"]),
+        held=len(plan["held"]),
+        bytes_held=int(plan["held_bytes"]),
+        bytes_total=int(plan["held_bytes"]) + int(plan["wanted_bytes"]),
+        presence=dict(plan["presence"]),
+    )
+    _execute_plan(
+        tensorfs,
+        store,
+        plan,
+        result,
+        urls={object_id: row.url for object_id, row in by_id.items()},
+        in_hand={},
+        deadline=deadline,
+        allow_local=False,
+        streams=streams,
+        on_object=on_object,
+        no_proxy=True,
+    )
+    return result
+
+
+def _execute_plan(
+    tensorfs: Any,
+    store: Any,
+    plan: Mapping[str, Any],
+    result: PullResult,
+    *,
+    urls: Mapping[str, str],
+    in_hand: Mapping[str, bytes],
+    deadline: Deadline,
+    allow_local: bool,
+    streams: int,
+    on_object: Callable[[str, int, bool], None] | None,
+    no_proxy: bool = False,
+) -> None:
+    """Run one TensorFS-authored plan and require its own completion proof."""
+
     ledger = threading.Lock()
 
     def one(item: tuple[str, int]) -> None:
         object_id, length = item
-        if object_id == "sha256:" + at.snapshot and object_id not in urls:
-            # The root travels on its own route. Its bytes are already in hand and still go
-            # through the door, so a hub that served a manifest for a different checkpoint
-            # is an OBJECT_ID_MISMATCH here rather than a wrong artifact later.
-            source: Any = _Bytes(doc)
-            _admit(tensorfs, store, plan["document"], object_id, source)
+        raw = in_hand.get(object_id)
+        if raw is not None:
+            _admit(tensorfs, store, plan["document"], object_id, _Bytes(raw))
         else:
             url = urls.get(object_id)
             if url is None:
                 raise PullRefusal(
                     "artifact_incomplete",
-                    f"{object_id}: the checkpoint reaches it and the hub authorized no read",
-                    "ask the hub for the object's custody state; a reachable uncustodied "
-                    "object is a catalog defect, not a client error",
+                    f"{object_id}: the SnapshotManifest reaches it and no exact grant exists",
+                    "repair the closed grant plane; Runtime never resolves an ungranted object",
                 )
-            _fetch(tensorfs, store, plan["document"], object_id, url, deadline, allow_local)
-        # The counters are the RESULT, so they are taken once under one lock rather than
-        # incremented from N threads — a byte total that raced would be the one number in
-        # this document nobody could check.
+            _fetch(
+                tensorfs,
+                store,
+                plan["document"],
+                object_id,
+                url,
+                deadline,
+                allow_local,
+                no_proxy=no_proxy,
+            )
         with ledger:
             result.fetched += 1
             result.bytes_moved += length
@@ -538,10 +721,6 @@ def pull(
         done, pending = wait(futures, return_when=FIRST_EXCEPTION)
         failed = next((f for f in done if f.exception() is not None), None)
         if failed is not None:
-            # STOP ASKING. Every object already in flight still finishes at the door (a
-            # thread cannot be interrupted mid-admit and a half-admitted object is exactly
-            # what the border refuses to leave behind), but nothing new is started and the
-            # first refusal is the one the caller sees.
             for f in pending:
                 f.cancel()
             for f in futures:
@@ -550,14 +729,10 @@ def pull(
             first = failed.exception()
             assert first is not None
             raise first
-
-    # The PROOF, and it is not "every GET returned 200": every declared object is installed
-    # and this store's own verification record vouches for it.
     try:
         tensorfs.fetch_complete(store, plan["document"])
     except Exception as exc:
         raise _border(exc, "artifact_incomplete") from exc
-    return result
 
 
 class _Bytes:
@@ -580,10 +755,11 @@ def _fetch(
     url: str,
     deadline: Deadline,
     allow_local: bool,
+    *,
+    no_proxy: bool = False,
 ) -> None:
-    guard(url, allow_local=allow_local)
     try:
-        resp = _open(urllib.request.Request(url), deadline)
+        resp = open_guarded(url, deadline, allow_local=allow_local, no_proxy=no_proxy)
     except urllib.error.HTTPError as exc:
         raise PullRefusal(
             "transfer_failed",

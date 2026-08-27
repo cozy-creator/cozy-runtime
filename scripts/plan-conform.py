@@ -115,7 +115,7 @@ DEVICE = DeviceFacts(
 )
 
 RUNTIME = RuntimeIdentity(
-    release="cozy-runtime/0.0.1",
+    release="cozy-runtime/0.0.2",
     source_digest=canonical.digest({"fixture": "plan-conform"}),
     torch_build="2.13.0+cu130",
 )

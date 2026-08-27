@@ -215,6 +215,7 @@ class LocalCoordinator:
         self,
         request: LocalRequest,
         bindings: dict[str, str],
+        plan_refs: dict[str, tuple[str, int]],
         workspace: Path,
         *,
         release_id: str,
@@ -224,6 +225,7 @@ class LocalCoordinator:
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_plan_id
+        self.plan_refs = plan_refs
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
@@ -515,7 +517,12 @@ class LocalCoordinator:
                         # and a spec that named one would make STAGED unspeakable for a
                         # placement this door can actually serve.
                         binding_plans=[
-                            pb.ArtifactSubject(subject_id=plan_id, kind="plan")
+                            pb.ArtifactSubject(
+                                subject_id=plan_id,
+                                kind="plan",
+                                digest=documents.raw(self.plan_refs[plan_id][0]),
+                                length=self.plan_refs[plan_id][1],
+                            )
                             for plan_id in sorted(set(self.bindings.values()))
                         ],
                     ),
@@ -782,29 +789,11 @@ def _declared_media_type(path: Path) -> str:
         return sniff(handle.read(SNIFF_BYTES)) or "application/octet-stream"
 
 
-def stage_binding_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:
-    """Write the local binding-plan records the worker resolves plan ids against.
-
-    THE SEAM: on the network path these records arrive with th-004's EntrypointBindingPlan
-    document and tfs-003's artifact fetch. Locally the resolution is the one-shot run's own,
-    and it is a plain file under `<cozy_home>/binding-plans/` — the worker cannot tell the
-    difference, because a coordinator never ships a path either way.
-    """
-    directory = cozy_home / "binding-plans"
-    directory.mkdir(parents=True, exist_ok=True)
-    plans: dict[str, str] = {}
-    for record in records:
-        plan_id = str(record["entrypoint_binding_plan_id"])
-        (directory / f"{plan_id.split(':')[-1]}.json").write_text(json.dumps(record, indent=2))
-        plans[str(record["entrypoint"])] = plan_id
-    return plans
-
-
 def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:
     """Write the local JOB plan records the worker resolves job descriptor ids against.
 
-    THE SEAM, one lane over from `stage_binding_plans`: on the network path th-004 ships the
-    build and the JobDescriptor and tfs-003 the materialized input trees. Locally it is a
+    On the network path th-004 ships the build and the JobDescriptor and tfs-003 the
+    materialized input trees. Locally it is a
     plain file under `<cozy_home>/job-plans/`, and the worker cannot tell the difference
     because a coordinator never ships a path either way.
     """
@@ -840,10 +829,15 @@ def run_slice(
     runtime (decisions #249: fault injection belongs to the harness).
     """
     workspace.mkdir(parents=True, exist_ok=True)
-    plans = stage_binding_plans(config.cozy_home, binding_records)
+    if binding_records:
+        raise RuntimeError(
+            "flat local binding records were removed; supply the canonical provisioned closure"
+        )
+    plans: dict[str, str] = {}
+    plan_refs: dict[str, tuple[str, int]] = {}
     stage_job_plans(config.cozy_home, job_records or [])
     coordinator = LocalCoordinator(
-        request, plans, workspace, release_id=release_id, auto_ack=auto_ack
+        request, plans, plan_refs, workspace, release_id=release_id, auto_ack=auto_ack
     )
     options = options or WorkerOptions(root=workspace / "worker")
     if not options.instance_id:

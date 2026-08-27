@@ -316,17 +316,12 @@ def _preview(
 def _store(tensorfs: Any, root: Path) -> Any:
     """Open the local store, creating it on first pull. A worker's first pull is the act
     that gives it a CAS; refusing because the directory is not there yet would be a chore."""
-    root.mkdir(parents=True, exist_ok=True)
     try:
-        return (
-            tensorfs.Store.open(str(root))
-            if (root / "store.json").is_file()
-            else tensorfs.Store.init(str(root))
-        )
-    except Exception as exc:
+        return transport.open_store(tensorfs, root)
+    except transport.PullRefusal as exc:
         raise CliError(
             "validation",
-            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
+            exc.message,
             "point --store at a v2 store root, or at an empty directory to create one",
             Exit.validation,
         ) from exc

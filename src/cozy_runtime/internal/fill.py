@@ -317,6 +317,31 @@ def price_envelope(
     }
 
 
+def complete_device_envelope(
+    header: Mapping[str, Any], construction_destination_bytes: int
+) -> dict[str, Any]:
+    """Join the header's route costs to the MCC's complete destination residency.
+
+    Header rows price the logical destinations and encoding overhead, but cannot see
+    non-persistent derived buffers.  The MCC is the independent deep census that includes
+    both.  The larger destination census stays live beside native payloads and decode
+    scratch, so those two costs are additive rather than alternatives.
+    """
+
+    logical = int(header["destination_bytes"])
+    native = int(header["native_bytes"])
+    decode = int(header["decode_peak_bytes"])
+    destinations = max(logical, construction_destination_bytes)
+    return {
+        **header,
+        "construction_destination_bytes": construction_destination_bytes,
+        "derived_destination_bytes": max(construction_destination_bytes - logical, 0),
+        "required_bytes": destinations + native + decode,
+        "basis": "max(header logical destinations, MCC logical + derived destinations) "
+        "+ selected-route native payload + decode scratch",
+    }
+
+
 # ------------------------------------------------------------------- the TensorFS reader
 
 
@@ -861,7 +886,7 @@ class StreamingFillBackend:
         on_position: Callable[[int], None] | None = None,
         probe_cache: str | Path | None = None,
         decode_scratch_bytes: int = 512 << 20,
-        release: str = "cozy-runtime/0.0.1",
+        release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
         objective: str = "kernel_numeric_error",
     ) -> None:

@@ -57,7 +57,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel, child_env, config, egress, environment, hostfacts, proctree
+from cozy_runtime.internal import (
+    accel,
+    child_env,
+    config,
+    egress,
+    environment,
+    fill,
+    hostfacts,
+    proctree,
+    provisioned,
+)
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
@@ -90,8 +100,6 @@ from cozy_runtime.internal.worker.plan import (
     PlanChooser,
     PlanRefusal,
     PreparedModel,
-    artifact_facts,
-    held_refs,
 )
 from cozy_runtime.protocol import (
     SCHEMA_DIGEST,
@@ -172,20 +180,10 @@ class WorkerOptions:
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
     """
-    project: Path | None = None
-    """THIS MACHINE's copy of the endpoint release being served (#563f).
-
-    A binding-plan record partitions into IDENTITY and RESOLUTION (#506a), and `project` is
-    the RESOLUTION half: the path the machine that WROTE the record put the release's tree
-    at. On that machine it is also this machine's path and the distinction never shows. On a
-    RENTED POD it is a path that does not exist, and discovering an endpoint from it fails
-    as `no_endpoint_toml` naming a directory on somebody else's disk — observed live.
-
-    So a worker resolves against its own root and never the writer's. `--project` states it;
-    absent, it is the process's working directory, which is what every launcher already sets
-    (cozy-creator runs the worker in the generation's source, and a pod's provisioner runs it
-    in the installed generation's source). The record's own `project` stays as recorded
-    evidence of where the WRITER resolved it, and decides nothing here."""
+    artifact_store: Path | None = None
+    """The verified TensorFS store populated from the canonical grouped-root closure."""
+    artifact_object_set: Path | None = None
+    """The exact root-role document used by the shared provisioned-release reader."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -211,6 +209,8 @@ class Placement:
     installed_environment_receipt_digest: bytes
     descriptor_digest: bytes
     plan_ids: tuple[str, ...]
+    plan_refs: dict[str, tuple[str, int]]
+    """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
     #: offline" — the exact state an outgoing spec holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
@@ -359,6 +359,7 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
                 raise documents.DocumentError(
                     "unknown_field", f"PlacementSpec: unknown key {key!r} (a new key is /2)"
                 )
+        prior_subject = ""
         for subject in spec.get("binding_plans", []):
             if not isinstance(subject, dict):
                 raise documents.DocumentError("wrong_type", "an ArtifactSubject is an object")
@@ -367,6 +368,30 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
                     raise documents.DocumentError(
                         "unknown_field", f"ArtifactSubject: unknown key {key!r}"
                     )
+            if set(subject) != {"digest", "kind", "length", "subject_id"}:
+                raise documents.DocumentError(
+                    "artifact_subject_incomplete",
+                    "a binding-plan subject requires subject_id, kind, digest, and length",
+                )
+            subject_id = subject["subject_id"]
+            digest = subject["digest"]
+            length = subject["length"]
+            if (
+                not isinstance(subject_id, str)
+                or not subject_id
+                or subject_id <= prior_subject
+                or subject["kind"] != "plan"
+                or not isinstance(digest, str)
+                or HASH_ENTRY.fullmatch(digest) is None
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or length <= 0
+            ):
+                raise documents.DocumentError(
+                    "artifact_subject_invalid",
+                    "binding-plan subjects are sorted unique exact plan artifacts",
+                )
+            prior_subject = subject_id
     return [entry for entry in placements if isinstance(entry, dict)]
 
 
@@ -1561,6 +1586,9 @@ class Worker:
         plan_ids = tuple(
             str(row.get("subject_id", "")) for row in subjects if row.get("subject_id")
         )
+        plan_refs = {
+            str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
+        }
         self.placement = Placement(
             placement_id=placement_id,
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
@@ -1573,6 +1601,7 @@ class Worker:
             ),
             descriptor_digest=_digest_field(spec.get("descriptor_digest")),
             plan_ids=plan_ids,
+            plan_refs=plan_refs,
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
             # placement_id, new spec digest) retains the outgoing spec as the pin; a fresh
             # placement has none, and an empty pin means replacement is PAUSED — which is
@@ -1656,8 +1685,14 @@ class Worker:
                 f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
             )
         missing: list[str] = []
+        plan_documents: dict[str, provisioned.ExactDocument] = {}
         for plan_id in placement.plan_ids:
-            record = self.config.cozy_home / "binding-plans" / f"{plan_id.split(':')[-1]}.json"
+            plan_digest, plan_length = placement.plan_refs[plan_id]
+            record = (
+                self.config.cozy_home
+                / "binding-plans"
+                / f"{plan_digest.removeprefix('sha256:')}.json"
+            )
             if not record.is_file():
                 missing.append(plan_id)
                 self.engine.fault(
@@ -1669,32 +1704,73 @@ class Worker:
                     )
                 )
                 continue
-            # THE REF RESOLVES HERE, AGAINST THIS MACHINE'S OWN INDEX (#567e) — the same
-            # rule `project` already follows (#563f), applied to `store`, which is its
-            # twin. The record names `cozy/minimax-h3@se-001`; what that ref means on disk
-            # is a question only the machine about to serve it can answer, and it is
-            # answered before the placement can call itself STAGED. An absent artifact is a
-            # typed BINDING_UNAVAILABLE naming what this index does hold, not a fill-time
-            # surprise after a card is already rented and warm.
             try:
-                declared = DeclaredBinding.read(json.loads(record.read_text()))
-                self.bindings[plan_id] = declared.resolve(
-                    artifact_facts(self.config.cozy_home, declared.artifact_ref)
-                    if declared.artifact_ref
-                    else None,
-                    held=held_refs(self.config.cozy_home),
-                )
-            except PlanRefusal as refusal:
+                record_bytes = record.read_bytes()
+            except OSError as exc:
                 missing.append(plan_id)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=plan_id,
-                        reason=refusal.code,
-                        detail=safe(refusal.detail),
+                        reason="binding_plan_unreadable",
+                        detail=safe(str(exc)),
                     )
                 )
                 continue
+            measured_digest = "sha256:" + hashlib.sha256(record_bytes).hexdigest()
+            if len(record_bytes) != plan_length or measured_digest != plan_digest:
+                missing.append(plan_id)
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                        subject=plan_id,
+                        reason="binding_plan_identity_mismatch",
+                        detail=f"measured {measured_digest}/{len(record_bytes)}, expected "
+                        f"{plan_digest}/{plan_length}",
+                    )
+                )
+                continue
+            plan_documents[plan_id] = provisioned.ExactDocument(
+                provisioned.ArtifactRef(plan_digest, plan_length), record, record_bytes
+            )
+        if not missing:
+            try:
+                if self.options.artifact_store is None or self.options.artifact_object_set is None:
+                    raise PlanRefusal(
+                        "artifact_store_required",
+                        "canonical provisioned bindings require the verified TensorFS store "
+                        "and exact root-role document",
+                    )
+                object_set = provisioned.read_artifact_object_set(
+                    self.options.artifact_object_set.read_bytes()
+                )
+                selected = provisioned.read_provisioned_release(
+                    plan_documents,
+                    read_document=provisioned.staged_document_reader(
+                        self.config.cozy_home / "binding-documents"
+                    ),
+                    endpoint_release=placement.endpoint_release_id,
+                    store_root=self.options.artifact_store,
+                    object_set=object_set,
+                    dtype_widths=provisioned.tensorfs_destination_widths(fill.tensorfs_module()),
+                )
+                self.bindings = dict(selected.bindings)
+            except (OSError, PlanRefusal, fill.FillRefusal) as refusal:
+                code = (
+                    refusal.code
+                    if isinstance(refusal, (PlanRefusal, fill.FillRefusal))
+                    else "artifact_object_set_unreadable"
+                )
+                detail = refusal.detail if isinstance(refusal, PlanRefusal) else str(refusal)
+                missing.extend(placement.plan_ids)
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=placement.placement_id,
+                        reason=code,
+                        detail=safe(detail),
+                    )
+                )
         placement.materialization = (
             pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
             if missing
@@ -1923,10 +1999,8 @@ class Worker:
                     {
                         "cmd": "prepare",
                         "binding": {
-                            # THIS machine's root, not the record writer's (#563f). See
-                            # WorkerOptions.project: the record's `project` is the resolution of
-                            # whoever wrote it, and on a rented pod that path is not here.
-                            "project": str(self.options.project or Path.cwd()),
+                            "application": first.application,
+                            "descriptor": first.descriptor_path,
                             "model_class": first.model_class,
                             "model_binding_path": first.model_binding_path,
                             "model_parameter_name": first.model_parameter_name,
@@ -3062,11 +3136,14 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="cr-027 materializer root containing receipt-keyed immutable generations",
     )
     parser.add_argument(
-        "--project",
-        default="",
-        help="THIS machine's copy of the endpoint release tree; defaults to the working "
-        "directory. A binding-plan record's own `project` is the WRITER's resolution and is "
-        "not a path on a rented pod (#563f)",
+        "--artifact-store",
+        required=True,
+        help="verified TensorFS store populated from the provisioned grouped-root object set",
+    )
+    parser.add_argument(
+        "--artifact-object-set",
+        required=True,
+        help="exact canonical grouped root-role document for provisioned binding validation",
     )
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
@@ -3097,7 +3174,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
-        project=Path(args.project).resolve() if args.project else Path.cwd(),
+        artifact_store=Path(args.artifact_store).resolve(),
+        artifact_object_set=Path(args.artifact_object_set).resolve(),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

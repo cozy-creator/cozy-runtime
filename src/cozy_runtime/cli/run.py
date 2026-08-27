@@ -1,12 +1,9 @@
 """`cozy-runtime run` and `cozy-runtime job` — the git-clone contract's load-bearing verbs.
 
-One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` uses:
-`internal.local.run_slice` IS the body, and this module is the LOCAL COORDINATOR adapter
-around it (cozy-runtime-cli.md §Local authority) — it resolves the ref, mints the binding
-plan record, derives the granted output field paths from the descriptor, and maps the
-terminal to an exit code. There is no second execution implementation and no in-process
-direct-call runner: the observational-identity arm proves a CLI run and a direct
-`run_slice` call produce the same result bytes, the same manifest and the same lifecycle.
+One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` uses.
+Weightless entrypoints and jobs remain local. Model-bound entrypoints require Tensorhub's
+canonical selected provision closure; this verb refuses rather than minting a second flat
+binding contract.
 
 What this module DOES NOT do is decide anything the runtime decides. The plan, the ladder,
 the confession and the shortfall all arrive on the outcome; this renders them.
@@ -194,7 +191,6 @@ def run(
     outputs = payload_grammar.asset_paths(doc["result"])
 
     slots = surface.model_bindings
-    record: dict[str, Any] | None = None
     warnings: list[str] = []
     if slots and kind == "job":
         raise CliError(
@@ -207,10 +203,13 @@ def run(
             Exit.structural,
         )
     if slots:
-        record, warn = _binding_record(
-            config, found, surface, function, flags, offline="--offline" in flags
+        raise CliError(
+            "structural",
+            f"{function} declares {len(slots)} model binding path(s), but flat local binding "
+            "records were removed",
+            "run through Tensorhub's selected canonical Plan/RMB/MCC provision closure",
+            Exit.structural,
         )
-        warnings.extend(warn)
 
     job_records: list[dict[str, Any]] = []
     trees: dict[str, str] = {}
@@ -256,7 +255,7 @@ def run(
         outcome = run_slice(
             config,
             request,
-            [record] if record else [],
+            [],
             job_records=job_records,
             workspace=workspace,
             release_id=release_id,
@@ -394,100 +393,6 @@ def resolved_bindings(config: RuntimeConfig, opts: Options) -> list[dict[str, An
             }
         )
     return records
-
-
-def _binding_record(
-    config: RuntimeConfig,
-    found: Any,
-    surface: Any,
-    function: str,
-    flags: Mapping[str, list[str]],
-    *,
-    offline: bool,
-) -> tuple[dict[str, Any], list[str]]:
-    """Resolve this call's ONE model slot into the binding-plan record the worker reads."""
-    slots = surface.model_bindings
-    if len(slots) != 1:
-        raise CliError(
-            "structural",
-            f"{function} declares {len(slots)} model binding paths; this build's local "
-            "coordinator mints ONE binding-plan record per attempt",
-            "multi-slot local runs land with the multi-binding attempt record (cr-008b's "
-            "construction-identity coalescing); the network coordinator already ships many",
-            Exit.structural,
-        )
-    slot = slots[0]
-    try:
-        resolved = binding_table.resolve(
-            slots,
-            found.bindings,
-            overrides=_overrides(flags.get("--model") or [], slots),
-        )
-    except ConformanceError as exc:
-        raise CliError(
-            "validation",
-            str(exc),
-            "code states capability, bindings state selection — name the slot in "
-            "endpoint.toml or pass --model <binding-path>=<ref>",
-            Exit.validation,
-        ) from exc
-    chosen = resolved[slot.path]
-    installed = artifacts.find(config.cozy_home, chosen.ref)
-    if installed is None:
-        if offline:
-            raise CliError(
-                "offline_miss",
-                f"{chosen.ref} is not in the local CAS and --offline forbids fetching it",
-                f"run `cozy-runtime pull {chosen.ref}` once with a network, then rerun offline",
-                Exit.offline_miss,
-                next=(f"cozy-runtime pull {chosen.ref}",),
-            )
-        raise CliError(
-            "not_found",
-            f"{chosen.ref} is not installed locally",
-            f"run `cozy-runtime pull {chosen.ref}` to fetch it into the local CAS",
-            Exit.not_found,
-            next=(f"cozy-runtime pull {chosen.ref}", "cozy-runtime list"),
-        )
-
-    warnings: list[str] = []
-    strict = "--strict-keys" in flags
-    if installed.custody == "local" and not strict:
-        warnings.append(
-            f"{chosen.ref} is a LOCAL bind: extra keys the code does not consume are ignored "
-            "and confessed on the attempt record — pass --strict-keys to refuse instead"
-        )
-
-    # THE RECORD NAMES THE REF, NOT WHAT THIS HOST RESOLVED IT TO (#567e). The index lookup
-    # above stays because it is what makes a miss refuse HERE, before a worker is spawned,
-    # with the pull that fixes it named — but its answer is not copied into the document.
-    # The worker resolves the ref against its own index, which on a local run is this same
-    # index reached by the same reader, so the local answer is unchanged by construction.
-    return {
-        "entrypoint_binding_plan_id": _plan_id(found.application, function),
-        "project": str(found.project),
-        "model_class": slot.class_key,
-        "model_binding_path": slot.path,
-        "model_parameter_name": slot.param,
-        "artifact_ref": chosen.ref,
-        # The CLASS's declared component names — a code fact from the release both machines
-        # hold, never the artifact's component list. `resolve` intersects them.
-        "components": sorted({c for names in slot.components.values() for c in names}),
-        "release": chosen.ref,
-        "host_bytes": 2 * GIB,
-        "pinned_bytes": 256 * MIB,
-        "entrypoint": function,
-        "model_construction_digest": "",
-        "resident_budget_bytes": 0,
-        "tenancy": "local",
-        "strict_keys": strict,
-    }, warnings
-
-
-def _plan_id(application: str, entrypoint: str) -> str:
-    import hashlib
-
-    return "sha256:" + hashlib.sha256(f"ebp/{application}/{entrypoint}".encode()).hexdigest()
 
 
 def _render(

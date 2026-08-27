@@ -24,10 +24,8 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import artifacts as index
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME
 from cozy_runtime.internal.resolution import ROUTE_KERNEL, Variant
@@ -254,97 +252,31 @@ class PreparedModel:
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactFacts:
-    """WHAT ONE MACHINE'S ARTIFACT INDEX SAYS ABOUT ONE REF (#567e).
-
-    A binding record names an artifact by REF, which is identity: `cozy/minimax-h3@se-001`
-    is the same artifact on every machine that holds it. Everything in here is the
-    RESOLUTION of that ref — where the bytes are on THIS disk, which snapshot digest each
-    component reads from, what the border classified, what the hub stamped — and it is
-    produced by the machine that is going to serve, never carried from the one that asked.
-
-    That is #565b's rule (RESOLUTION IS THE RESOLVER'S OWN) applied to `store`, which is
-    `project`'s exact twin: the record used to carry the OWNER's store root and the OWNER's
-    snapshot map, resolved out of the OWNER's index, so a rented pod holding the artifact
-    perfectly was dispatched a record describing a disk it has never seen. The owner could
-    not even mint the record — `cozy run --worker` exited 4 naming its own empty index
-    before a request left the box.
-    """
-
-    store: str
-    config: str
-    components: tuple[str, ...]
-    snapshots: Mapping[str, str]
-    reference_snapshot: str
-    variant: str = ""
-    custody: str = "canonical"
-    vram_floor_bytes: int = 0
-    weight_bytes: int = 0
-    """WHAT THIS ARTIFACT WEIGHS, from the header the border already counted (#569b). It is
-    the fill's declared ceiling, and it is an ARTIFACT fact like every other one here: a
-    coordinator that has never held the bytes cannot state it, and the one that tried
-    stated 7 GiB against a 92.42 GiB model and refused `budget_overrun` on a healthy card
-    with 149 GB free."""
-    stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
-    """The checkpoint's uploader-minted stamp set (#567d), carried from the index row the
-    pull wrote. A model class's keywords join it by membership and fail closed on absence."""
-
-
-@dataclass(frozen=True, slots=True)
 class DeclaredBinding:
-    """What a DEPLOYMENT DECLARES for one `entrypoint_binding_plan_id`. Input only.
+    """Runtime's private resolved value for one canonical Plan -> RMB -> MCC chain.
 
-    The coordinator names the plan by digest and never ships a path; the worker resolves
-    that digest against its own records. At launch the record is a small local file staged
-    under `<cozy_home>/binding-plans/` — th-004 owns the real EntrypointBindingPlan document
-    and tfs-003 the artifact fetch, so this is the SEAM, named, not a pretend hub.
-
-    Every set here is a REAL set: the component order is a tuple, the per-component
-    snapshots are a map, the egress allowlist is a tuple. They arrive comma-packed in the
-    record — a two-sided document whose key names and spellings are cozy-creator's contract
-    as much as this repo's — and `read` unpacks them ONCE, so nothing downstream splits a
-    string again. The singular/plural pairs are gone with them: `component` was the
-    one-element case of `components` and `snapshot` of `snapshots`, and carrying both let
-    them disagree.
+    This is not a document or wire schema. Only the shared provisioned-release reader
+    constructs it after following stored-byte references; paths below are machine resolution.
     """
 
     entrypoint_binding_plan_id: str
     entrypoint: str
-    project: str
-    """WHERE this machine staged the endpoint tree. It is RESOLUTION, not identity: the
-    coordinator digests the plan id over the record's path-free half (#506a), so two hosts
-    that installed the byte-identical release name the same plan while pointing at
-    different directories. Nothing keyed on identity may read it."""
     model_class: str
     model_binding_path: str
     model_parameter_name: str
-    artifact_ref: str
-    """THE MODEL'S WHOLE IDENTITY (#567e): `org/repo[@release]`, the same string on every
-    machine that holds the artifact. It is what the deployment DECLARES; the store root, the
-    per-component snapshot map, the construction config and the stamps are what a machine
-    RESOLVES it to, and those arrive through `resolve` from the serving machine's own index.
-
-    An empty ref with a declared class is not expressible: `read` refuses a half-declared
-    model, and `resolve` refuses a ref the resolver's index does not hold, NAMING what it
-    holds instead. Nothing here ever names a directory, so the plan id is path-free by
-    construction rather than by a writer remembering to partition."""
     release: str
+    application: str = ""
+    """The exact EndpointDescriptor application imported from the installed venv."""
+    descriptor_path: str = ""
+    """Local path to the exact granted descriptor bytes; resolution, never identity."""
     store: str = ""
     config: str = ""
     variant: str = ""
     reference_snapshot: str = ""
     """The RESOLVED reference snapshot: the artifact the `variant` names, and the fallback
     for any component the snapshot map omits. Resolution, not identity."""
-    declared_components: tuple[str, ...] = ()
-    """The component names the bound CLASS declares — a fact about the endpoint release's
-    CODE, which both machines hold, so it is identity and it rides the record. It narrows
-    what gets filled: H3's `Fl2VAModel` declares four of the dual artifact's five, and the
-    unbound sibling transformer is simply outside this construction (§1.1). Empty takes the
-    artifact whole."""
     components: tuple[str, ...] = ()
-    """The ORDERED component set this binding actually constructs: `declared_components`
-    intersected with what the resolver's index says the artifact carries. Resolution —
-    which components an artifact HAS is a fact about the artifact, read where it lives."""
+    """The exact MCC destination order this binding constructs."""
     snapshots: Mapping[str, str] = dataclasses.field(default_factory=dict)
     """component -> snapshot digest. A read plan is COMPLETE over its header (tfs-007), so a
     component cannot be read out of a whole-pipeline snapshot without reading the pipeline;
@@ -471,272 +403,6 @@ class DeclaredBinding:
                 "objective": self.objective,
             }
         )
-
-    @classmethod
-    def read(cls, record: Mapping[str, Any]) -> DeclaredBinding:
-        """Unpack ONE binding-plan record. Its key set is CLOSED and its spellings are a
-        two-sided contract with whoever writes it, so the record's names live here and
-        nowhere else — this is the only place in the runtime that knows them."""
-        unknown = sorted(set(record) - RECORD_KEYS)
-        if unknown:
-            raise PlanRefusal(
-                "binding_plan_unknown_field",
-                f"binding plan record carries {', '.join(unknown)}: the record's key set is "
-                "closed, exactly like the documents it stands in for. A prepare-RESOLVED "
-                "fact (a delivery rung, a construction digest) is not a deployment's to "
-                "write at all",
-            )
-        # A record either declares a MODEL or declares none. Half a declaration — a class
-        # with no artifact ref, a ref with no class — is a deployment that cannot be served
-        # either way, so it refuses here rather than at the fill.
-        declares = {key for key in MODEL_KEYS if str(record.get(key, ""))}
-        if declares and declares != MODEL_KEYS:
-            raise PlanRefusal(
-                "binding_plan_partial_model",
-                f"binding plan record declares {sorted(declares)} and omits "
-                f"{sorted(MODEL_KEYS - declares)}: a binding names a slot and the ref that "
-                "fills it, or names neither. A WEIGHTLESS binding is served (no class, no "
-                "artifact); half of one is a deployment nothing can construct",
-            )
-        missing = sorted(RECORD_REQUIRED - set(record))
-        if missing:
-            raise PlanRefusal(
-                "binding_plan_incomplete",
-                f"binding plan record is missing {', '.join(missing)}",
-            )
-        return cls(
-            entrypoint_binding_plan_id=str(record["entrypoint_binding_plan_id"]),
-            entrypoint=str(record["entrypoint"]),
-            project=str(record["project"]),
-            endpoint_release=str(record.get("endpoint_release", "")),
-            model_class=str(record.get("model_class", "")),
-            model_binding_path=str(record.get("model_binding_path", "")),
-            model_parameter_name=str(record.get("model_parameter_name", "")),
-            artifact_ref=str(record.get("artifact_ref", "")),
-            release=str(record["release"]),
-            declared_components=tuple(str(n) for n in record.get("components") or ()),
-            offered=tuple(
-                _normalize(v if isinstance(v, Variant) else Variant.read(v))
-                for v in record.get("variants") or ()
-            ),
-            objective=str(record.get("objective", "latency")),
-            steps_basis=int(record.get("steps_basis", 20)),
-            host_bytes=int(record.get("host_bytes", 0)),
-            pinned_bytes=int(record.get("pinned_bytes", 0)),
-            resident_budget_bytes=int(record.get("resident_budget_bytes", 0)),
-            tenancy=str(record.get("tenancy", "local")),
-            strict_keys=bool(record.get("strict_keys", False)),
-            expected_logical_model_digest=_digest(
-                str(record.get("model_construction_digest", "")), "model_construction_digest"
-            ),
-            max_input_bytes=int(record.get("max_input_bytes", 64 << 20)),
-            max_inputs_total_bytes=int(record.get("max_inputs_total_bytes", 256 << 20)),
-            egress_allowed_hosts=tuple(
-                str(host) for host in record.get("egress_allowed_hosts") or ()
-            ),
-        )
-
-    def resolve(
-        self, facts: ArtifactFacts | None, *, held: tuple[str, ...] = ()
-    ) -> DeclaredBinding:
-        """Bind this record's artifact REF to the facts THIS machine holds about it (#567e).
-
-        A weightless binding resolves to itself: there is no artifact and nothing to look
-        up. A model binding whose ref the resolver's index does not hold is a typed refusal
-        naming what the index DOES hold — the same answer whichever machine asks, because
-        the question is finally being asked on the machine that would serve.
-
-        Everything the executor is handed downstream is exact by the time it leaves here:
-        one store root, one snapshot per component, one config path, one stamp set. That
-        contract — the core is handed exact facts and never resolves a ref — is unchanged;
-        what moved is WHICH machine does the resolving.
-        """
-        if self.weightless:
-            return self
-        if facts is None:
-            raise PlanRefusal(
-                "artifact_absent",
-                f"{self.artifact_ref} is not in this machine's artifact index, and a binding "
-                "record names an artifact by REF because the store root, the snapshot map "
-                "and the components are the SERVING machine's to resolve (#567e). The "
-                "record's writer cannot answer this question for a machine it is not. This "
-                f"index holds: {', '.join(held) or 'nothing'}",
-                {"artifact_ref": self.artifact_ref, "held": list(held)},
-            )
-        indexed = {
-            str(name): _digest(str(value), f"snapshots[{name}]")
-            for name, value in facts.snapshots.items()
-        }
-        carried = facts.components or tuple(sorted(indexed))
-        # THE INTERSECTION, in the ARTIFACT's order. A class that declares a component the
-        # artifact does not carry is not narrowed silently into working — it keeps the name
-        # and the fill refuses `destination_absent` naming it, which is the one clock where
-        # a mis-declared slot is legible.
-        wanted = set(self.declared_components)
-        components = tuple(n for n in carried if n in wanted) if wanted else carried
-        if wanted - set(carried):
-            components = components + tuple(sorted(wanted - set(carried)))
-        snapshots = {name: indexed[name] for name in components if name in indexed}
-        reference = _digest(facts.reference_snapshot, "snapshot") or (
-            snapshots.get(components[0], "") if components else ""
-        )
-        offered = self.offered or (
-            Variant(
-                name=facts.variant or "default",
-                store=facts.store,
-                snapshot=reference,
-                snapshots=dict(snapshots),
-                reference=True,
-            ),
-        )
-        return dataclasses.replace(
-            self,
-            store=facts.store,
-            config=facts.config,
-            variant=facts.variant,
-            reference_snapshot=reference,
-            components=components,
-            snapshots=snapshots,
-            stamps={k: tuple(v) for k, v in facts.stamps.items()},
-            model_weight_bytes=facts.weight_bytes,
-            custody=facts.custody,
-            vram_floor_bytes=facts.vram_floor_bytes,
-            offered=tuple(_normalize(v) for v in offered),
-        )
-
-
-#: The binding-plan record's CLOSED key set. A two-sided document: cozy-creator writes it and
-#: this is the only place in the runtime that knows its spellings.
-#:
-#: THE RECORD IS NOW IDENTITY ALMOST THROUGHOUT (#567e). #506a partitioned it once and moved
-#: three PATHS (`project`, `store`, `config`) out of the digested half; what it left behind
-#: was the rest of the writer's resolution wearing identity's clothes — `snapshot`,
-#: `snapshots`, `components`, `variant`, `custody`, `vram_floor_bytes` are all answers the
-#: writer got by looking the ref up in ITS OWN artifact index. They are path-free, so the
-#: plan id was fine; they are still unanswerable by a machine that does not hold the
-#: artifact, which is every rented pod. `store` was `project`'s twin and nobody had said so.
-#:
-#: So the model half of the record is now the REF and nothing else, and the eight artifact
-#: facts are gone from the document entirely — not moved to a resolution half, deleted,
-#: because the machine that serves already knows them and reads them from its own index
-#: (`DeclaredBinding.resolve`). `project` stays as recorded evidence of where the WRITER
-#: resolved the endpoint tree and decides nothing (#563f).
-
-RECORD_KEYS = frozenset(
-    {
-        "entrypoint_binding_plan_id",
-        "project",
-        "endpoint_release",
-        "model_class",
-        "model_binding_path",
-        "model_parameter_name",
-        "artifact_ref",
-        "components",
-        "release",
-        "variants",
-        "objective",
-        "steps_basis",
-        "host_bytes",
-        "pinned_bytes",
-        "resident_budget_bytes",
-        "entrypoint",
-        "model_construction_digest",
-        "tenancy",
-        "strict_keys",
-        "max_input_bytes",
-        "max_inputs_total_bytes",
-        "egress_allowed_hosts",
-    }
-)
-
-#: What a record cannot leave out, whether or not it declares a model.
-RECORD_REQUIRED = frozenset({"entrypoint_binding_plan_id", "project", "release", "entrypoint"})
-
-#: The keys that TOGETHER declare one model. A record carries all of them or none of them:
-#: a weightless endpoint declares none and is served without a fill (cl-013).
-#:
-#: FOUR KEYS, and none of them is an artifact FACT (#567e). The slot (class, path,
-#: parameter) plus the artifact's REF is the whole declaration — everything a deployment
-#: can honestly state about a model it may not hold. The old set counted `components`,
-#: `store` and `snapshot`, which is why a record could be complete only on a machine that
-#: had already pulled the artifact: completeness was accidentally being defined as "the
-#: writer resolved it".
-#:
-#: `config` was never in this set and the reason generalizes to all three of its former
-#: neighbours: an artifact's construction config is a document the artifact may or may not
-#: carry, and an absent one is a fact about the artifact rather than half a record. Counting
-#: it made a whole, servable 92.42 GiB H3 artifact read as `binding_plan_partial_model`
-#: (#567c). The same trap with the same shape is what this set is now free of.
-MODEL_KEYS = frozenset(
-    {
-        "model_class",
-        "model_binding_path",
-        "model_parameter_name",
-        "artifact_ref",
-    }
-)
-
-
-def _digest(value: str, what: str) -> str:
-    """The ONE digest spelling, ACCEPTED EITHER WAY.
-
-    A store, a producer and a person each write a digest differently, and a border that
-    PRINTS `sha256:<hex>` while accepting only bare hex makes its own output unusable as its
-    own input (job-001). This normalizes to the one spelling the runtime speaks and refuses
-    anything that is not a digest at all — which is the half that must not be lost: a typo
-    used to travel all the way to the store as an unknown snapshot.
-    """
-    if not value:
-        return ""
-    bare = value.removeprefix("sha256:")
-    if len(bare) == 64 and not bare.strip("0123456789abcdef"):
-        return "sha256:" + bare
-    raise PlanRefusal(
-        "binding_plan_digest",
-        f"{what}: {value[:80]!r} is not a sha256 digest. Both spellings are accepted — "
-        "`sha256:<64 lowercase hex>` and the bare hex — and the runtime speaks the first",
-    )
-
-
-def artifact_facts(cozy_home: Path, ref: str) -> ArtifactFacts | None:
-    """Resolve one artifact REF against THIS machine's own index (#567e).
-
-    The index's layout belongs to `internal/artifacts.py` and is read through it, never
-    re-parsed here: a second reader of those files would be a second layout to keep in step,
-    which is the rule that module states about itself.
-    """
-    row = index.find(cozy_home, ref)
-    if row is None:
-        return None
-    return ArtifactFacts(
-        store=row.store,
-        config=row.config,
-        components=tuple(row.components),
-        snapshots=dict(row.snapshots),
-        reference_snapshot=row.primary if row.snapshots else "",
-        variant=row.variant,
-        custody=row.custody,
-        vram_floor_bytes=row.vram_floor_bytes,
-        weight_bytes=row.bytes,
-        stamps={k: tuple(v) for k, v in row.stamps.items()},
-    )
-
-
-def held_refs(cozy_home: Path) -> tuple[str, ...]:
-    """What this machine's index DOES hold — the remedy half of an `artifact_absent`."""
-    return tuple(sorted(row.ref for row in index.rows(cozy_home)))
-
-
-def _normalize(variant: Variant) -> Variant:
-    """One offered candidate, with its digests in the runtime's spelling."""
-    return dataclasses.replace(
-        variant,
-        snapshot=_digest(variant.snapshot, f"variants[{variant.name}].snapshot"),
-        snapshots={
-            name: _digest(value, f"variants[{variant.name}].snapshots[{name}]")
-            for name, value in sorted(variant.snapshot_map().items())
-        },
-    )
 
 
 #: The CLOSED, ORDERED placement ladder (§3.2). Delivery is `native` at launch — `aot_decode`

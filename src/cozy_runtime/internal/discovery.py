@@ -86,8 +86,36 @@ def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
     """Import the one configured export inside this environment and freeze it."""
     project = project.resolve()
     application = read_application(project)
+    return _discover(application, project, _bindings(project), seconds=seconds, add=project)
+
+
+def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
+    """Freeze one descriptor-named export from the installed endpoint environment.
+
+    A materialized rental has an immutable venv, not a copied source tree or endpoint.toml.
+    The exact EndpointDescriptor supplies the application identity; importing anything else
+    or adding a host path would recreate the source/PYTHONPATH authority the adapter rejects.
+    """
+
+    return _discover(application, Path("/"), {}, seconds=seconds, add=None)
+
+
+def _discover(
+    application: str,
+    project: Path,
+    bindings: Mapping[str, Mapping[str, object]],
+    *,
+    seconds: float,
+    add: Path | None,
+) -> Discovered:
+    if application.count(":") != 1 or not all(part.strip() for part in application.split(":")):
+        raise DiscoveryError(
+            f"{application!r} is not one <module>:<attribute> application",
+            code="application_path",
+        )
     module_name, _, attribute = application.partition(":")
-    with _sys_path(project), _wall_clock(seconds, application):
+    path = _sys_path(add) if add is not None else _no_path()
+    with path, _wall_clock(seconds, application):
         module = _import(module_name, application)
     app = getattr(module, attribute, None)
     if app is None:
@@ -104,7 +132,7 @@ def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
             code="not_an_app",
         )
     surfaces = describe(app)  # duplicate names already refused at registration; this freezes
-    return Discovered(app, application, project, module, surfaces, _bindings(project))
+    return Discovered(app, application, project, module, surfaces, bindings)
 
 
 def _import(module_name: str, application: str) -> ModuleType:
@@ -150,6 +178,13 @@ def _sys_path(project: Path) -> Iterator[None]:
         for entry in added:
             if entry in sys.path:
                 sys.path.remove(entry)
+
+
+@contextmanager
+def _no_path() -> Iterator[None]:
+    """The installed-environment discovery context: intentionally no path mutation."""
+
+    yield
 
 
 @contextmanager

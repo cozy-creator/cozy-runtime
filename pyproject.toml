@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.0.1"
+version = "0.0.2"
 description = "Cozy v2 worker runtime: author surface, supervisor, executor"
 requires-python = ">=3.11"
 # The worker speaks `cozy.worker.v1` (worker-protocol/01), so the bindings' two runtimes are
@@ -18,6 +18,7 @@ dev = ["mypy>=1.13", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
+cozy-materialize-launch = "cozy_runtime.cli.materialize_launch:main"
 
 [build-system]
 requires = ["hatchling"]

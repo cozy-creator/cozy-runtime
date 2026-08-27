@@ -522,7 +522,11 @@ class ConstructionRecord:
 
     @property
     def topology_digest(self) -> str:
-        rows = [f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations]
+        # The published ModelConstructionContract sorts logical destinations by key.  The
+        # serve-side projection must therefore be independent of a module's state_dict walk
+        # order too; otherwise the exact same derived contract can name a different logical
+        # model merely because two equivalent module implementations enumerate differently.
+        rows = sorted(f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations)
         return "blake2b:" + hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
 
     @property
