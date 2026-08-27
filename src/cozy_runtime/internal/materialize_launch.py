@@ -84,6 +84,13 @@ class MaterializedObjects:
     network_cache_degradations: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ProvisionCache:
+    mount_path: Path
+    cache_volume_id: str
+    provider_volume_id: str
+
+
 def prepare_launch(
     config: AdapterConfig,
     *,
@@ -102,7 +109,7 @@ def prepare_launch(
     bundle_bytes = _local_bounded_document(
         config.provision_bundle_path, config.provision_bundle_digest
     )
-    spec, bundle = _provision_pair(spec_bytes, bundle_bytes, config)
+    spec, bundle, cache = _provision_pair(spec_bytes, bundle_bytes, config)
     control_ref = _ref(spec["execution_substrate"]["control_runtime"], "control_runtime")
     _verify_local(control_runtime_wheel, control_ref["digest"], control_ref["length"])
     verify_control_install(control_runtime_wheel)
@@ -144,9 +151,9 @@ def prepare_launch(
             f"missing={sorted(required - granted)} extra={sorted(granted - required)}",
         )
     materialized_objects = _materialize_objects(
-        spec,
         bundle,
         object_set,
+        cache=cache,
         deadline=config.readiness_deadline_unix,
         store_root=artifact_store_root,
     )
@@ -326,7 +333,7 @@ def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
 
 def _provision_pair(
     spec_bytes: bytes, bundle_bytes: bytes, config: AdapterConfig
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], ProvisionCache | None]:
     spec = _document(spec_bytes, "provision_spec")
     bundle = _document(bundle_bytes, "provision_bundle")
     _closed(
@@ -425,20 +432,15 @@ def _provision_pair(
         raise LaunchRefusal("provision_capacity_invalid", "numeric capacity is not positive")
     for name in (
         "accelerator_model",
-        "cache_mount_path",
-        "cache_volume_id",
         "datacenter",
         "provider",
         "provider_offer_key",
         "provider_sku",
-        "provider_volume_id",
     ):
         value = capacity[name]
         if not isinstance(value, str) or not value or value.strip() != value or len(value) > 256:
             raise LaunchRefusal("provision_capacity_invalid", name)
-    cache_mount = Path(capacity["cache_mount_path"])
-    if not cache_mount.is_absolute() or cache_mount == Path("/"):
-        raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path")
+    cache = _provision_cache(capacity)
     image = spec["execution_substrate"]["oci_image"]
     if not isinstance(image, str) or image.count("@") != 1 or not image.split("@", 1)[0]:
         raise LaunchRefusal("provision_substrate_invalid", "OCI image is not digest pinned")
@@ -485,7 +487,25 @@ def _provision_pair(
         if ref["digest"] <= prior:
             raise LaunchRefusal("artifact_grants_invalid", "digests are not sorted unique")
         prior = ref["digest"]
-    return spec, bundle
+    return spec, bundle, cache
+
+
+def _provision_cache(capacity: Mapping[str, Any]) -> ProvisionCache | None:
+    names = ("cache_mount_path", "cache_volume_id", "provider_volume_id")
+    values = tuple(capacity[name] for name in names)
+    if all(value == "" for value in values):
+        return None
+    if any(
+        not isinstance(value, str) or not value or value.strip() != value or len(value) > 256
+        for value in values
+    ):
+        raise LaunchRefusal(
+            "provision_capacity_invalid", "cache tuple is not all present or all empty"
+        )
+    mount_path = Path(values[0])
+    if not mount_path.is_absolute() or mount_path == Path("/"):
+        raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path")
+    return ProvisionCache(mount_path, values[1], values[2])
 
 
 def _join_release(
@@ -711,11 +731,11 @@ def _stage_exact(source: Path, digest: str, length: int, target: Path, root: Pat
 
 
 def _materialize_objects(
-    spec: Mapping[str, Any],
     bundle: Mapping[str, Any],
     object_set: provisioned.ArtifactObjectSet,
     *,
-    deadline: int,
+    cache: ProvisionCache | None,
+    deadline: int | None,
     store_root: Path,
 ) -> MaterializedObjects:
     """Admit each exact model closure into the required worker-local TensorFS CAS."""
@@ -726,11 +746,10 @@ def _materialize_objects(
     missing = sorted(required - set(grants))
     if missing:
         raise LaunchRefusal("object_grant_missing", missing[0])
-    cache_mount = Path(str(spec["capacity"]["cache_mount_path"]))
-    if not cache_mount.is_absolute() or cache_mount == Path("/"):
-        raise LaunchRefusal("provision_capacity_invalid", "cache_mount_path is not specific")
-    cache_root = cache_mount / "tensorfs"
-    _require_separate_store_roots(store_root, cache_mount, cache_root)
+    cache_root: Path | None = None
+    if cache is not None:
+        cache_root = cache.mount_path / "tensorfs"
+        _require_separate_store_roots(store_root, cache.mount_path, cache_root)
     degradations: set[str] = set()
     source_by_object: dict[str, str] = {}
     try:
@@ -743,7 +762,10 @@ def _materialize_objects(
             )
         tensorfs = fill.tensorfs_module()
         store = pull.open_store(tensorfs, store_root)
-        cache_store = _open_cache_store(tensorfs, cache_mount, cache_root, degradations)
+        cache_store = None
+        if cache is not None:
+            assert cache_root is not None
+            cache_store = _open_cache_store(tensorfs, cache.mount_path, cache_root, degradations)
         for group in object_set.roots:
             closure = (group.root, *group.objects)
             rows = sorted(
@@ -757,13 +779,16 @@ def _materialize_objects(
                 ),
                 key=lambda row: row.object_id,
             )
+            timeout = None if deadline is None else float(deadline) - time.time()
+            if timeout is not None and timeout <= 0:
+                raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
             outcome = pull.pull_granted_snapshot(
                 tensorfs,
                 store,
                 group.root.digest,
                 group.root.length,
                 rows,
-                timeout=max(float(deadline) - time.time(), 0.001),
+                timeout=timeout,
                 session="provision-" + group.root.digest.removeprefix("sha256:")[:12],
                 cache_store=cache_store,
             )

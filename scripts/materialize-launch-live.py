@@ -17,8 +17,10 @@ from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     REQUIRED_DOCUMENT_ROLES,
     LaunchRefusal,
+    ProvisionCache,
     _local_bounded_document,
     _materialize_objects,
+    _provision_cache,
     _provision_pair,
 )
 from cozy_runtime.internal.worker.plan import PlanRefusal
@@ -184,8 +186,27 @@ def main() -> int:
             _local_bounded_document(config.provision_bundle_path, config.provision_bundle_digest)
             == bundle_bytes
         )
-        parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
+        parsed_spec, parsed_bundle, parsed_cache = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
+        assert parsed_cache == ProvisionCache(Path("/cache"), "cache-live", "volume-live")
+        assert (
+            _provision_cache(
+                {"cache_mount_path": "", "cache_volume_id": "", "provider_volume_id": ""}
+            )
+            is None
+        )
+        try:
+            _provision_cache(
+                {
+                    "cache_mount_path": "/cache",
+                    "cache_volume_id": "",
+                    "provider_volume_id": "",
+                }
+            )
+        except LaunchRefusal as exc:
+            assert exc.code == "provision_capacity_invalid"
+        else:
+            raise AssertionError("partial optional-cache tuple was accepted")
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}
@@ -203,10 +224,10 @@ def main() -> int:
             "length": 53,
         }
         empty_store = _materialize_objects(
-            {"capacity": {"cache_mount_path": str(root / "empty-cache")}},
             {"artifact_grants": []},
             empty_object_set,
-            deadline=int(time.time()) + 60,
+            cache=None,
+            deadline=None,
             store_root=root / "empty-local-store",
         )
         assert empty_store.store == root / "empty-local-store" and empty_store.store.is_dir()
