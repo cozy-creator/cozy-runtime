@@ -17,7 +17,6 @@ ref in code would be selecting its own input, which is a binding's job and never
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from typing import Any
@@ -35,6 +34,7 @@ from cozy_runtime.author import (
     Telemetry,
     Tree,
     UnsupportedInput,
+    canonical_json,
 )
 
 app = App()
@@ -150,8 +150,8 @@ def census(
         )
 
     projection = {name: [[row["key"], row["shape"]] for row in done[name]] for name in sorted(done)}
-    body = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
-    topology = "sha256:" + hashlib.sha256(body).hexdigest()
+    body = canonical_json.encode(projection)
+    topology = canonical_json.digest(projection)
     # DECLARED, not saved: the durable-save door is disabled while the ArtifactSink is
     # unbuilt (#553a). The component trees under `scratch.checkpoint_dir` are what a
     # retried attempt of this run actually reads back, and they are written above.
