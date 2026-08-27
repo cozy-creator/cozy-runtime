@@ -2118,26 +2118,10 @@ class Worker:
                     "boot",
                     f"prepare REFUSED for {first.entrypoint_binding_plan_id[:20]}: "
                     f"{reply.get('code')} - {detail} "
-                    f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B / ledger "
-                    f"{reply.get('peak_ledger_vram_bytes', 0)} B was LIVE when it failed; "
-                    f"after rollback the allocator holds "
-                    f"{reply.get('allocator_bytes', -1)} B and the device has "
-                    f"{reply.get('device_free_bytes', -1)} B free"
-                    # A ROLLBACK THAT CANNOT PROVE ITS RETURN SAYS SO, HERE. The retained
-                    # bytes are why the next attempt in this worker refuses before it
-                    # begins, so they belong beside the refusal that produced them.
-                    + (
-                        ""
-                        if (reply.get("rollback") or {}).get("complete", True)
-                        else (
-                            f"; ROLLBACK INCOMPLETE: claimed "
-                            f"{(reply.get('rollback') or {}).get('claimed_bytes')} B, the "
-                            f"allocator returned "
-                            f"{(reply.get('rollback') or {}).get('returned_bytes')} B, "
-                            f"{(reply.get('rollback') or {}).get('retained_bytes')} B are "
-                            "still held and stay CHARGED on the ledger"
-                        )
-                    )
+                    f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
+                    f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
+                    f"the device has {reply.get('device_free_bytes', -1)} B free. The executor "
+                    "is poisoned and replaced; the card returns with the process (#613)]"
                     + "]",
                 )
                 # A failed construction owns no retry policy. Retire its possibly retained

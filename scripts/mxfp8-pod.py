@@ -300,7 +300,6 @@ def fill_arm(arm: str) -> tuple[Any, Any, Any]:
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
         topology_of,
     )
@@ -311,7 +310,6 @@ def fill_arm(arm: str) -> tuple[Any, Any, Any]:
     backend = StreamingFillBackend(
         books,
         rows,
-        ledger=ResourceLedger(budgets={"vram": 8 * GIB, "pinned": 256 * MIB}),
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
@@ -356,14 +354,13 @@ def fill() -> None:
         f"over {backend.decoded['flushes']} flush(es)",
     )
     print(
-        f"  fill       {took:.1f}s wall, ledger {json.dumps(backend.ledger.rows()['decode'])} "
-        f"decode B, peak alloc {torch.cuda.max_memory_allocated() / MIB:.0f} MiB"
+        f"  fill       {took:.1f}s wall, "
+        f"peak alloc {torch.cuda.max_memory_allocated() / MIB:.0f} MiB"
     )
     check(
-        "the DECODE scratch was charged and released — nothing outlives the fill",
-        backend.ledger.charged["decode"] == 0 and backend.ledger.peak["decode"] > 0,
-        f"peak {backend.ledger.peak['decode'] / MIB:.1f} MiB charged, "
-        f"{backend.ledger.charged['decode']} B still held",
+        "the DECODE scratch was freed behind the fence — nothing outlives the fill",
+        not backend.scratch and backend.decoded["flushes"] > 0,
+        f"{backend.decoded['flushes']} flush(es), scratch map empty after commit",
     )
     globals()["_MX"] = (backend, model)
 
@@ -464,7 +461,6 @@ def compare() -> None:
                 "control_relative_frobenius": noise,
                 "control_snr_db": noise_snr,
                 "decode": mx_backend.decoded,
-                "decode_scratch_peak_bytes": mx_backend.ledger.peak["decode"],
             },
             indent=1,
         )

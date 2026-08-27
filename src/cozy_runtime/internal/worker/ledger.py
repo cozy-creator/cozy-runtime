@@ -407,9 +407,10 @@ class Ledger:
         }
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))
-        rows = facts.get("ledger", {})
-        self.registered = int(rows.get("pinned", {}).get("peak", 0))
-        self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
+        pinned = facts.get("pinned", {})
+        self.registered = int(pinned.get("registered_bytes", 0))
+        # The ring is closed by the time facts cross the seam: nothing is DMA-live.
+        self.pinned_in_flight = 0
         # A generation is the ONLY thing that re-establishes this ledger. §3.2's rule is that
         # reservations are executor-generation-scoped and the ledger restarts WITH the new
         # generation, never reconstructed from device state. A successful construction
@@ -473,9 +474,6 @@ class Ledger:
         if isinstance(residency, dict):
             self.resident = {k: int(v) for k, v in (residency.get("resident") or {}).items()}
             self.evicted = {k: int(v) for k, v in (residency.get("evicted") or {}).items()}
-        rows = probe.get("ledger", {})
-        if rows:
-            self.pinned_in_flight = int(rows.get("staging", {}).get("charged", 0))
 
     def rebaseline(self, why: str) -> int:
         """Re-establish the resident baseline after real work that is NOT an attempt.

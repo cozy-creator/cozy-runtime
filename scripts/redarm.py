@@ -122,7 +122,7 @@ STATIC_ARMS = (
     Arm(
         "timing-decides-nothing",
         SRC / "author" / "_observations.py",
-        "from cozy_runtime.internal.fill import ResourceLedger\n",
+        "from cozy_runtime.internal.fill import StreamingFillBackend\n",
     ),
     Arm(
         "timing-decides-nothing",
@@ -381,15 +381,18 @@ LIVE_ARMS = (
     # the REAL H3 numbers — a 92.42 GiB stored / 128.31 GiB logical N-ary artifact whose
     # transformer is fp8-stored — so the fence is provable without a card.
     (
-        "decode-scratch-rides-the-device-budget",
-        "from cozy_runtime.internal.fill import ResourceLedger\n"
-        "l = ResourceLedger(budgets={'vram': 97_544_751_472, 'pinned': 1 << 30})\n"
-        "l.grant({'vram': 97_544_751_472}, 'the four served components')\n"
-        # The decode scratch is DEVICE memory. Before the fix it had no budget at all and
-        # was charged to a counter the refusal never printed, so a fill could hold its whole
-        # vram budget AND its scratch and still report itself inside its envelope.
-        "l.grant({'decode': 691_011_584}, 'decode scratch for the fp8 transformer')\n",
-        "decode needs 691011584 B, 0 B free",
+        "decode-scratch-rides-the-device-envelope",
+        "from cozy_runtime.internal.fill import price_envelope\n"
+        # The decode scratch is DEVICE memory. It used to ride a fill-local counter that
+        # the refusal never printed (#574b); since #613 the only arithmetic is admission,
+        # and the envelope must carry the scratch beside the destinations or a fill can
+        # be admitted at its weights alone.
+        "env = price_envelope([('transformer', 40_225_668_192, 20_958_085_592, 'decoded_float')], 512 << 20)\n"
+        "assert env['decode_peak_bytes'] > 0\n"
+        "assert env['required_bytes'] == env['destination_bytes'] + env['decode_peak_bytes']\n"
+        "raise SystemExit('decode scratch of %d B rides the device envelope: %d B required' "
+        "% (env['decode_peak_bytes'], env['required_bytes']))\n",
+        "rides the device envelope",
     ),
     (
         "stored-bytes-are-not-resident-bytes",

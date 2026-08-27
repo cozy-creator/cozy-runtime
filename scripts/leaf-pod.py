@@ -322,7 +322,6 @@ def fill_arm(arm: str, objective: str) -> tuple[Any, Any]:
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
         topology_of,
     )
@@ -333,7 +332,6 @@ def fill_arm(arm: str, objective: str) -> tuple[Any, Any]:
     backend = StreamingFillBackend(
         books,
         rows,
-        ledger=ResourceLedger(budgets={"vram": 16 * GIB, "pinned": 512 * MIB}),
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
@@ -385,19 +383,15 @@ def fill() -> None:
     )
     block = leaf_backend.components["block"]
     leaf_resident = sum(int(t.numel() * t.element_size()) for _, t in _tensors(block))
-    ledger = leaf_backend.ledger.rows()
     print(
         f"  fill       {took:.1f}s wall; module {leaf_resident / MIB:.1f} MiB, "
-        f"allocator +{leaf_alloc / MIB:.1f} MiB, peak +{leaf_peak / MIB:.1f} MiB\n"
-        f"  ledger     vram charged {ledger['vram']['charged'] / MIB:.1f} MiB, "
-        f"peak {ledger['vram']['peak'] / MIB:.1f} MiB; "
-        f"decode charged {ledger['decode']['charged']} B, peak {ledger['decode']['peak']} B"
+        f"allocator +{leaf_alloc / MIB:.1f} MiB, peak +{leaf_peak / MIB:.1f} MiB"
     )
     check(
-        "the LEDGER settled to the measured truth, and native roles were never scratch",
-        leaf_backend.vram_charge["block"] == leaf_resident and ledger["decode"]["peak"] == 0,
-        f"charged {ledger['vram']['charged']} B == module {leaf_resident} B; the decode "
-        "class stayed at zero because a native role is residency, not scratch",
+        "the priced bytes settled to the measured truth, and no scratch outlived the fill",
+        leaf_backend.vram_charge["block"] == leaf_resident and not leaf_backend.scratch,
+        f"priced {leaf_backend.vram_charge['block']} B == module {leaf_resident} B; "
+        "native roles are residency, not scratch (#613: no fill-local ledger exists)",
     )
 
     # THE SAME ARTIFACT, the SAME card, the OTHER objective. This is the whole of #517d's
@@ -443,7 +437,6 @@ def fill() -> None:
                 "ratio": ratio,
                 "allocator_bytes": leaf_alloc,
                 "allocator_peak_bytes": leaf_peak,
-                "ledger": ledger,
                 "replacements": [r.document() for r in leaf_backend.replaced.values()],
             },
             indent=1,

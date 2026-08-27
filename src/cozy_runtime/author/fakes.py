@@ -212,7 +212,7 @@ class FillEvent:
 class _RecordingBackend:
     route: str
     events: list[FillEvent] = field(default_factory=list)
-    rolled_back: list[str] = field(default_factory=list)
+    poisoned: list[str] = field(default_factory=list)
 
     @property
     def filled_bytes(self) -> int:
@@ -236,9 +236,9 @@ class _RecordingBackend:
         """No device copies to fence — the freeze point is cr-005's `StreamingFillBackend`."""
         return None
 
-    def rollback(self, keys: Sequence[str]) -> None:
-        """Construction is TRANSACTIONAL: a failure rolls fills back as a unit (§1.1)."""
-        self.rolled_back.extend(keys)
+    def poison(self, keys: Sequence[str]) -> None:
+        """Construction is TRANSACTIONAL: a failure abandons the fills as a unit (§1.1)."""
+        self.poisoned.extend(keys)
         self.events = [e for e in self.events if e.key not in set(keys)]
 
 

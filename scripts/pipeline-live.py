@@ -545,7 +545,6 @@ def section_sources(args: argparse.Namespace) -> None:
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
         topology_of,
     )
@@ -564,7 +563,6 @@ def section_sources(args: argparse.Namespace) -> None:
     backend = StreamingFillBackend(
         checkpoints,
         rows,
-        ledger=ResourceLedger(budgets={"vram": 7 * GIB, "pinned": 256 * MIB}),
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
@@ -636,7 +634,6 @@ def section_poison(args: argparse.Namespace) -> None:
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
         _tensors,
         topology_of,
@@ -646,9 +643,8 @@ def section_poison(args: argparse.Namespace) -> None:
     have = snapshots()
     checkpoints = {"vae": Checkpoint(str(STORE), have["vae"])}
     rows = checkpoints["vae"].rows("vae")
-    ledger = ResourceLedger(budgets={"vram": 2 * GIB, "pinned": 256 * MIB})
     backend = StreamingFillBackend(
-        checkpoints, rows, ledger=ledger, window_bytes=4 * MIB, slots=16, readers=16, inflight=8
+        checkpoints, rows, window_bytes=4 * MIB, slots=16, readers=16, inflight=8
     )
     backend.hold_lease = True
     config = json.loads(CONFIG.read_text())
@@ -953,7 +949,7 @@ def fill_once(component: str) -> dict[str, Any]:
 
     from cozy_runtime.author._loader import TensorSpec
     from cozy_runtime.internal.encoding import TORCH_DTYPES
-    from cozy_runtime.internal.fill import Checkpoint, ResourceLedger
+    from cozy_runtime.internal.fill import Checkpoint
     from cozy_runtime.internal.fill import StreamingFillBackend as Backend
 
     spellings = {name: getattr(torch, torch_name) for name, torch_name in TORCH_DTYPES.items()}
@@ -962,7 +958,6 @@ def fill_once(component: str) -> dict[str, Any]:
     backend = Backend(
         {component: checkpoint},
         rows,
-        ledger=ResourceLedger(budgets={"vram": 6 * GIB, "pinned": 256 * MIB}),
         window_bytes=4 * MIB,
         slots=16,
         readers=16,

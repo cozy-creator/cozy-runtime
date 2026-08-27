@@ -328,7 +328,7 @@ def unet_config() -> dict[str, Any]:
 
 
 def _fill(
-    store: str, snap: str, *, scratch: int = 512 * MIB, budgets: dict[str, int] | None = None
+    store: str, snap: str, *, scratch: int = 512 * MIB
 ) -> tuple[Any, Any, Any]:
     """Construct + fill the real SDXL UNet from one snapshot. Returns (backend, model, torch)."""
     import torch
@@ -339,7 +339,6 @@ def _fill(
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
         topology_of,
     )
@@ -349,9 +348,6 @@ def _fill(
     backend = StreamingFillBackend(
         checkpoints,
         rows,
-        ledger=ResourceLedger(
-            budgets=budgets or {"vram": 7 * GIB, "pinned": 256 * MIB},
-        ),
         window_bytes=4 * MIB,
         slots=16,
         readers=16,
@@ -410,7 +406,6 @@ def dequant() -> None:
     print(f"  routes     {routes}")
     print(f"  digests    {digests}")
     print(f"  decode     {backend.stats['decode']}")
-    print(f"  ledger     {json.dumps(backend.ledger.rows())}")
     print(
         f"  fill       {backend.stats['fill_ms']} ms "
         f"({backend.stats['stream_ms']} stream + {backend.stats['materialize_ms']} materialize)"
@@ -495,8 +490,7 @@ def dequant() -> None:
         f"  BANKED     decode {backend.stats['decode']['tensors']} tensors / "
         f"{backend.stats['decode']['bytes'] / GIB:.3f} GiB stored in "
         f"{backend.stats['decode']['ms']} ms across "
-        f"{backend.stats['decode']['flushes']} flush(es); peak decode scratch charged "
-        f"{backend.ledger.peak['decode'] / MIB:.0f} MiB"
+        f"{backend.stats['decode']['flushes']} flush(es)"
     )
     backend.close()
     for name in list(backend.components):
@@ -938,8 +932,7 @@ def bench() -> None:
             "decode_ms": backend.stats["decode"]["ms"],
             "decoded_tensors": backend.stats["decode"]["tensors"],
             "peak_vram_gib": torch.cuda.max_memory_allocated() / GIB,
-            "weights_gib": backend.ledger.peak["vram"] / GIB,
-            "scratch_mib": backend.ledger.peak["decode"] / MIB,
+            "weights_gib": sum(backend.vram_charge.values()) / GIB,
             "step_ms": step_ms,
             "evicted_gib": evicted["bytes"] / GIB,
         }
@@ -1212,27 +1205,32 @@ def arms() -> None:
     )
 
     # --- the FIT arm, on the real 4.78 GiB artifact --------------------------------
-    # "too-small scope refuses before allocation; no OOM-as-control-flow" (done-when),
-    # for the class cr-006 ADDS to the ledger: decode scratch. The envelope is granted
-    # WHOLE before the stream, so a budget that cannot hold it refuses naming need and
-    # have — not an allocator error somewhere inside 743 decodes.
-    from cozy_runtime.internal.fill import FillRefusal
+    # "too-small scope refuses before allocation; no OOM-as-control-flow" (done-when).
+    # Since #613 the fill plane keeps no counter: ADMISSION is the executor's arithmetic
+    # over `price_envelope`, so this arm proves the envelope carries the decode scratch
+    # BESIDE the destinations — a plan admitted at its weights alone is the defect.
+    from cozy_runtime.internal.fill import Checkpoint, price_envelope
 
-    require_quiet_card()
-    torch.cuda.empty_cache()
-    code = detail = ""
-    try:
-        _fill(
-            str(STORE),
-            snapshot(),
-            budgets={"vram": 7 * GIB, "pinned": 256 * MIB, "decode": 64 * MIB},
-        )
-    except FillRefusal as exc:
-        code, detail = exc.code, str(exc)
+    header_rows = Checkpoint(str(STORE), snapshot()).rows("unet")
+    env = price_envelope(
+        [
+            (
+                r.component,
+                int(r.nbytes),
+                int(r.stored_nbytes),
+                "verbatim" if r.encoded.alias == "plain/1" else "decoded_float",
+            )
+            for r in header_rows
+        ],
+        64 * MIB,
+    )
     check(
-        "a decode envelope the budget cannot hold refuses NAMING NEED AND HAVE",
-        code == "budget_overrun" and "decode" in detail,
-        f"[{code}] {detail[:240]}",
+        "the admission envelope prices the decode scratch BESIDE the destinations",
+        env["decode_peak_bytes"] > 0
+        and env["required_bytes"]
+        == env["destination_bytes"] + env["native_bytes"] + env["decode_peak_bytes"],
+        f"destinations {env['destination_bytes']} B + decode {env['decode_peak_bytes']} B "
+        f"= required {env['required_bytes']} B",
     )
 
 

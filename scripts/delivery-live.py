@@ -319,8 +319,7 @@ def exec_conform(spec_path: Path, out_path: Path) -> None:
             "unet_fill_ms": backend.stats["fill_ms"],
             "unet_decode_ms": backend.stats["decode"]["ms"],
             "unet_stored_bytes": backend.stats["lease_bytes"],
-            "unet_weights_bytes": backend.ledger.peak["vram"],
-            "unet_scratch_bytes": backend.ledger.peak["decode"],
+            "unet_weights_bytes": sum(backend.vram_charge.values()),
         }
         outputs[record["name"]] = prediction
         backend.close()

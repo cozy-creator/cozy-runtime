@@ -372,7 +372,11 @@ class Backend(Protocol):
 
     def commit(self) -> None: ...
 
-    def rollback(self, keys: Sequence[str]) -> None: ...
+    def poison(self, keys: Sequence[str]) -> None:
+        """Abort a construction whose fill failed. The backend marks the generation
+        unusable; it does not promise to free anything — the executor process is the
+        transaction and its replacement reclaims the card (cr-025, decisions #613)."""
+        ...
 
 
 @dataclass(slots=True)
@@ -394,7 +398,7 @@ class _NullBackend:
     def commit(self) -> None:
         return None
 
-    def rollback(self, keys: Sequence[str]) -> None:
+    def poison(self, keys: Sequence[str]) -> None:
         return None
 
 
@@ -816,7 +820,7 @@ class Loader:
                 total += self._artifact.topology[d.key].nbytes
             self._backend.commit()
         except Exception:
-            self._backend.rollback(done)
+            self._backend.poison(done)
             raise
         return len(done), total
 

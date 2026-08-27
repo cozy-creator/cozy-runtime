@@ -702,7 +702,6 @@ def make_model(consent: str | None) -> Any:
 def _backend(objective: str, **kwargs: Any) -> Any:
     from cozy_runtime.internal.fill import (
         Checkpoint,
-        ResourceLedger,
         StreamingFillBackend,
     )
 
@@ -712,7 +711,6 @@ def _backend(objective: str, **kwargs: Any) -> Any:
     backend = StreamingFillBackend(
         books,
         rows,
-        ledger=ResourceLedger(budgets={"vram": 1 << 30, "pinned": 64 << 20}),
         window_bytes=1 << 20,
         slots=4,
         readers=4,
@@ -871,7 +869,7 @@ def fill() -> None:
             getattr(cause, "code", "") == "leaf_unconsented",
             f"[{getattr(cause, 'code', type(cause).__name__)}] {str(cause)[:260]}",
         )
-    backend.rollback([])
+    backend.poison([])
 
     # ...and the SAME artifact, the SAME card, with the declaration present.
     backend, rows = _backend("footprint")
@@ -913,29 +911,24 @@ def fill() -> None:
     resident = sum(int(t.numel() * t.element_size()) for _, t in _tensors(block))
     float_bytes = sum(r.freed_bytes for r in backend.replaced.values())
     stored = sum(r.stored_bytes for r in backend.replaced.values())
-    ledger = backend.ledger.rows()
+    allocator = torch.cuda.memory_allocated() - before_alloc
     print(
         f"  residency  encoded weights {stored} B vs bf16 {float_bytes} B "
         f"({stored / float_bytes:.4f}x); whole component {resident} B; "
-        f"ledger vram charged {ledger['vram']['charged']} B, peak {ledger['vram']['peak']} B"
+        f"allocator +{allocator} B live after the fill"
     )
     check(
-        "the LEDGER settled to the measured truth, not to arithmetic",
-        backend.vram_charge["block"] == resident
-        and ledger["vram"]["charged"] == resident
-        and ledger["vram"]["peak"] > resident,
-        f"charged {ledger['vram']['charged']} B == module {resident} B, and the peak "
-        f"{ledger['vram']['peak']} B is higher because the float destinations and the "
-        "payload are BOTH live for the length of one flush",
+        "the component's priced bytes settled to the MEASURED truth, not to arithmetic",
+        backend.vram_charge["block"] == resident,
+        f"priced {backend.vram_charge['block']} B == module {resident} B (no ledger exists "
+        "to settle since #613; the process is the transaction)",
     )
     check(
-        "the decode scratch class was never charged for bytes that stayed",
-        ledger["decode"]["charged"] == 0 and ledger["decode"]["peak"] == 0,
-        "a native role is not scratch: charging it to `decode` and releasing it in the "
-        "`finally` would tell the ledger the component gave back memory it still holds",
+        "no decode scratch outlives the fill",
+        not backend.scratch,
+        "a native role is the resident weight and a decoded role's scratch is freed behind "
+        "the decode fence; the scratch map is empty after commit",
     )
-    allocator = torch.cuda.memory_allocated() - before_alloc
-    print(f"  allocator  +{allocator} B live after the fill (ledger says {resident} B)")
 
     x = torch.randn(96, 224, dtype=torch.bfloat16, device="cuda") * 0.5
     with torch.inference_mode():
@@ -1104,7 +1097,7 @@ def arms() -> None:
             exc.code == "incomplete_fill",
             f"[{exc.code}] {exc.args[0][:190]}",
         )
-    partial.rollback(list(live))
+    partial.poison(list(live))
 
     # ARM 7 — a PARKED encoded component. Staging re-fills the checkpoint's own keys, which
     # stop being this module's keys the moment a leaf lands, so the two plans are refused
@@ -1122,7 +1115,7 @@ def arms() -> None:
             exc.code == "leaf_topology",
             f"[{exc.code}] {exc.args[0][:200]}",
         )
-    parking.rollback([])
+    parking.poison([])
 
     # ARM 8 — the OUTPUT DTYPE law. A leaf built for one contract dtype must not quietly
     # emit another; the probe checks it and so does this.

@@ -642,8 +642,8 @@ def descriptor_sections() -> None:
         def commit(self) -> None:
             raise AssertionError("describe reached a commit — no generation exists here")
 
-        def rollback(self, keys: Sequence[str]) -> None:
-            raise AssertionError("describe reached a rollback — nothing was ever filled")
+        def poison(self, keys: Sequence[str]) -> None:
+            raise AssertionError("describe reached a poison — nothing was ever filled")
 
     installed = Refusing()
     before = len(registered_adapters())

@@ -222,7 +222,6 @@ class Executor:
         from cozy_runtime.internal.fill import (
             Checkpoint,
             FillRefusal,
-            ResourceLedger,
             StreamingFillBackend,
             complete_device_envelope,
             dtype_name,
@@ -375,9 +374,6 @@ class Executor:
                 "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
         checkpoints, rows = surveyed[plan.variant]
-        ledger = ResourceLedger(
-            budgets={"vram": budgets["declared_weight_bytes"], "pinned": budgets["pinned"]}
-        )
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
         # worker can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
@@ -400,7 +396,6 @@ class Executor:
         backend = StreamingFillBackend(
             checkpoints,
             rows,
-            ledger=ledger,
             on_position=position,
             window_bytes=binding.get("window_bytes", 4 << 20),
             slots=binding.get("slots", 16),
@@ -432,7 +427,6 @@ class Executor:
         declared = int(budgets["declared_weight_bytes"])
         envelope = complete_device_envelope(backend.device_envelope(), declared)
         required = int(envelope["required_bytes"])
-        ledger.budgets["vram"] = required
         memory = accel.allocation(torch, self.device_kind)
         allocatable = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
@@ -463,7 +457,6 @@ class Executor:
                     "available_bytes": int(allocatable),
                     "evidence_class": "measured",
                 },
-                "ledger": ledger.rows(),
             }
         artifact = Artifact(
             next(v for v in offered if v.name == plan.variant).snapshot,
@@ -516,19 +509,13 @@ class Executor:
             # ordinary outcome of a neighbour holding the card, and it carries the two
             # numbers an operator needs (cr-005).
             oom = refusal is None
-            if oom:
-                # A device OOM must roll back like any other fill failure. cr-005's
-                # transaction unwinds on a typed FillRefusal, which an allocator error is
-                # not — so without this the destinations stay allocated and the refusal
-                # reports "after rollback the allocator holds 2,375,322,112 B", which is an
-                # honest report of a rollback that did not happen. Measured exactly that on
-                # a contended card. The generation is poisoned either way and the executor
-                # is replaced, but a worker holding 2.4 GiB it can never use until the
-                # process dies is a worker whose ledger tells the truth about a lie.
-                backend.rollback(())
-            backend.release_lease()
-            accel.synchronize(torch, self.device_kind)
-            accel.release_cached(torch, self.device_kind)
+            # NO ROLLBACK (#613). The loader's abort already poisoned the backend for a
+            # typed refusal; an allocator OOM that escaped it is poisoned here. Nothing
+            # frees a byte in this process: the prepare latch is consumed, the worker
+            # replaces the executor and external reclaim returns the card. What follows
+            # is EVIDENCE — the allocator and driver as they stood when the fill failed.
+            if backend.state != "poisoned":
+                backend.poison(())
             memory = accel.allocation(torch, self.device_kind)
             free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
             code = "device_shortfall" if refusal is None else refusal.code
@@ -539,19 +526,13 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:400],
                 "state": backend.state,
                 "peak_allocator_bytes": accel.peak_allocated(torch, self.device_kind),
-                # BOTH DEVICE CLASSES. `peak["vram"]` alone reported 85.4 GiB for a fill
-                # that also held decode scratch, and the difference read as unexplained.
-                "peak_ledger_vram_bytes": ledger.peak_device,
-                "peak_ledger_destinations_bytes": ledger.peak["vram"],
                 "allocator_bytes": memory["allocated_bytes"],
                 "device_free_bytes": free,
                 "device_total_bytes": total,
-                "ledger": ledger.rows(),
                 "envelope": envelope,
-                # WHAT THE ROLLBACK PROVED, read off the allocator. A rollback that could
-                # not prove its return is the reason the NEXT attempt refuses, so the
-                # refusal that caused it carries the evidence.
-                "rollback": backend.rollback_report,
+                # WHAT THE FILL HELD when it failed. The process is replaced, so these
+                # numbers explain the refusal rather than promise a return.
+                "poison": backend.poison_report,
             }
             if oom:
                 reply["shortfall"] = {
@@ -642,7 +623,7 @@ class Executor:
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
             "rss_bytes": _rss(),
-            "ledger": ledger.rows(),
+            "pinned": dict(backend.pinned),
             "store": backend.stats.get("store", {}),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
             "torch_version": torch.__version__,
@@ -687,7 +668,9 @@ class Executor:
                 run_id=run_id(plan_digest, device_facts.tuple_key(), binding["release"]),
                 stored_bytes=sum(r.stored_nbytes for r in rows),
                 resident_bytes=sum(backend.vram_charge.values()),
-                scratch_bytes=int(ledger.peak.get("decode", 0)),
+                # Decode scratch is PRICED by the envelope and no longer metered by a
+                # fill-local counter (#613); -1 is the spelling for NOT MEASURED.
+                scratch_bytes=-1,
                 fill_ms=int(backend.stats["fill_ms"]),
                 decode_ms=int(backend.decoded["ms"]),
                 reference_deviation_rel_l2=(
@@ -1282,7 +1265,6 @@ class Executor:
             "ready": self.ready,
             "poisoned": self.poisoned,
             "env_intact": _env_intact(),
-            "ledger": self.backend.ledger.rows() if self.backend else {},
         }
 
 

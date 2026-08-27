@@ -150,7 +150,7 @@ class CountingBackend:
     def commit(self) -> None:
         self.committed = True
 
-    def rollback(self, keys: Sequence[str]) -> None:
+    def poison(self, keys: Sequence[str]) -> None:
         self.filled.clear()
 
 
