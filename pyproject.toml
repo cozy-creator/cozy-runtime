@@ -37,13 +37,19 @@ members = ["packages/*"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src", "scripts", "examples"]
+files = [
+    "src",
+    "scripts",
+    "proofs/support",
+    "proofs/fixtures/model-contract-endpoint/src",
+    "examples",
+]
 # The bindings live under the PROTO PACKAGE PATH (`src/cozy/worker/v1`) and are PEP 420
 # namespace packages — no `__init__.py`, because protoc writes none and the copy is
 # byte-identical. mypy needs the source roots stated for that, or it maps
 # `src/cozy/worker/v1/wire_identity.py` to bare `wire_identity`.
 explicit_package_bases = true
-mypy_path = "src:scripts:examples"
+mypy_path = "src:scripts:proofs/support:proofs/fixtures/model-contract-endpoint/src:examples"
 # The two derive-* runners live with the corpus they drive: they are torch-shaped code for
 # the corpus venv, and checking them against a torch that is not installed produces
 # confident nonsense. They are exercised by RUNNING them.
