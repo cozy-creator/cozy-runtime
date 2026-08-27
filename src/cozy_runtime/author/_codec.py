@@ -323,10 +323,14 @@ class EncodedVideoFacts:
     height: int
     frame_count: int
     frame_rate: Fraction
+    pixel_aspect_ratio: Fraction
     video_codec: str
+    video_profile: str | None
     audio_codec: str
+    audio_profile: str | None
     audio_channels: int
     audio_sample_rate: int
+    audio_frame_samples: int
     audio_decoded_samples: int
     color_primaries: int
     color_transfer: int
@@ -637,15 +641,34 @@ def probe_mp4(path: Path) -> EncodedVideoFacts:
         if video_frames == 0 or width <= 0 or height <= 0 or frame_rate <= 0 or color_facts is None:
             raise OutputError("encoded MP4 has no valid video clock", code="output_probe")
         audio = audios[0] if audios else None
+        pixel_aspect_ratio = Fraction(video.sample_aspect_ratio or 1)
+        if pixel_aspect_ratio <= 0:
+            raise OutputError("encoded MP4 has no valid pixel aspect ratio", code="output_probe")
+        if audio is not None and int(audio.codec_context.frame_size or 0) <= 0:
+            raise OutputError("encoded MP4 has no audio codec-frame size", code="output_probe")
         return EncodedVideoFacts(
             width=width,
             height=height,
             frame_count=video_frames,
             frame_rate=frame_rate,
+            pixel_aspect_ratio=pixel_aspect_ratio,
             video_codec=str(video.codec_context.name),
+            video_profile=(
+                str(video.codec_context.profile)
+                if video.codec_context.profile is not None
+                else None
+            ),
             audio_codec=str(audio.codec_context.name) if audio is not None else "",
+            audio_profile=(
+                str(audio.codec_context.profile)
+                if audio is not None and audio.codec_context.profile is not None
+                else None
+            ),
             audio_channels=int(audio.codec_context.channels or 0) if audio is not None else 0,
             audio_sample_rate=int(audio.codec_context.sample_rate or 0) if audio is not None else 0,
+            audio_frame_samples=int(audio.codec_context.frame_size or 0)
+            if audio is not None
+            else 0,
             audio_decoded_samples=audio_samples,
             color_primaries=color_facts[0],
             color_transfer=color_facts[1],

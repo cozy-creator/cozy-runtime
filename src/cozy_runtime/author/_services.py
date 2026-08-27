@@ -177,13 +177,35 @@ class ImageFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class SavedAudioFacts:
+    """Audio facts re-probed from one committed streaming MP4."""
+
+    codec: str
+    profile: str | None
+    channels: int
+    sample_rate: int
+    codec_frame_samples: int
+    decoded_samples: int
+
+
+@dataclass(frozen=True, slots=True)
 class SavedVideo:
-    """One atomically committed streaming MP4 plus the facts re-probed from its bytes."""
+    """One atomically committed streaming MP4 plus facts re-probed from its bytes."""
 
     video: VideoAsset
+    width: int
+    height: int
     frame_count: int
+    frame_rate: Fraction
+    pixel_aspect_ratio: Fraction
+    video_codec: str
+    video_profile: str | None
+    color_primaries: int
+    color_transfer: int
+    color_matrix: int
+    color_range: int
+    audio: SavedAudioFacts | None
     submitted_audio_samples: int
-    decoded_audio_samples: int
 
 
 @runtime_checkable
@@ -248,6 +270,12 @@ class Outputs(_Bound):
     its declared bounds; nothing is durable until the handler returns it (§3.4 step 1)."""
 
     __slots__ = ()
+
+    @property
+    def video_audio_frame_samples(self) -> int:
+        """The fixed audio codec quantum used by ``save_video_stream``."""
+
+        return _codec.AAC_FRAME_SAMPLES
 
     def save_image(self, image: object, *, format: str = "png") -> ImageAsset:
         if format != "png":
@@ -424,6 +452,7 @@ class Outputs(_Bound):
                 or facts.height != video_format.height
                 or facts.frame_count != frame_count
                 or facts.frame_rate != video_format.nominal_frame_rate
+                or facts.pixel_aspect_ratio != video_format.pixel_aspect_ratio
                 or facts.color_primaries != video_format.color_primaries
                 or facts.color_transfer != video_format.color_transfer
                 or facts.color_matrix != video_format.color_matrix
@@ -431,7 +460,16 @@ class Outputs(_Bound):
                 or facts.video_codec != "h264"
                 or (audio_format is None and facts.audio_codec)
                 or (audio_format is not None and facts.audio_codec != "aac")
-                or facts.audio_decoded_samples - audio_samples not in (0, _codec.AAC_FRAME_SAMPLES)
+                or (
+                    audio_format is not None
+                    and (
+                        facts.audio_channels != audio_format.channels
+                        or facts.audio_sample_rate != audio_format.sample_rate
+                        or facts.audio_frame_samples != self.video_audio_frame_samples
+                    )
+                )
+                or facts.audio_decoded_samples - audio_samples
+                not in (0, self.video_audio_frame_samples)
             ):
                 raise OutputError(
                     "streaming MP4 probe disagrees with submitted media: "
@@ -461,9 +499,30 @@ class Outputs(_Bound):
             registered = True
             return SavedVideo(
                 video=asset,
+                width=facts.width,
+                height=facts.height,
                 frame_count=facts.frame_count,
+                frame_rate=facts.frame_rate,
+                pixel_aspect_ratio=facts.pixel_aspect_ratio,
+                video_codec=facts.video_codec,
+                video_profile=facts.video_profile,
+                color_primaries=facts.color_primaries,
+                color_transfer=facts.color_transfer,
+                color_matrix=facts.color_matrix,
+                color_range=facts.color_range,
+                audio=(
+                    SavedAudioFacts(
+                        codec=facts.audio_codec,
+                        profile=facts.audio_profile,
+                        channels=facts.audio_channels,
+                        sample_rate=facts.audio_sample_rate,
+                        codec_frame_samples=facts.audio_frame_samples,
+                        decoded_samples=facts.audio_decoded_samples,
+                    )
+                    if audio_format is not None
+                    else None
+                ),
                 submitted_audio_samples=audio_samples,
-                decoded_audio_samples=facts.audio_decoded_samples,
             )
         except AuthorError:
             raise
