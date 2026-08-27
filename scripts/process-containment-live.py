@@ -50,14 +50,67 @@ def cleanup_scope(scope: proctree.ProcessTreeScope) -> None:
                 wait_absent(process, 1.0)
 
 
+def prove_unwritable_refusals(root: Path) -> None:
+    mount = root / "selector-cgroup"
+    intermediate = mount / "parent"
+    membership = intermediate / "member"
+    membership.mkdir(parents=True)
+    lineage = (mount, intermediate, membership)
+    controls = tuple(
+        directory / name for directory in lineage for name in ("tasks", "cgroup.procs")
+    )
+    for control in controls:
+        control.touch()
+        control.chmod(0o444)
+    for directory in reversed(lineage):
+        directory.chmod(0o555)
+    try:
+        proctree._require_cgroup_lineage_unwritable(mount, membership)
+
+        intermediate.chmod(0o755)
+        try:
+            proctree._require_cgroup_lineage_unwritable(mount, membership)
+        except proctree.ContainmentUnavailable as exc:
+            if "can write cgroup-v1 directory" not in str(exc):
+                raise
+        else:
+            raise RuntimeError("writable intermediate cgroup directory was accepted")
+        intermediate.chmod(0o555)
+
+        migration = membership / "tasks"
+        migration.chmod(0o644)
+        try:
+            proctree._require_cgroup_lineage_unwritable(mount, membership)
+        except proctree.ContainmentUnavailable as exc:
+            if "can write cgroup-v1 migration control" not in str(exc):
+                raise
+        else:
+            raise RuntimeError("writable cgroup migration control was accepted")
+        migration.chmod(0o444)
+    finally:
+        for directory in lineage:
+            directory.chmod(0o755)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmp", default="/tmp/cozy-process-containment")
     parser.add_argument("--observe", type=float, default=10.0)
+    parser.add_argument("--expect-nonzero-capability-refusal", action="store_true")
     args = parser.parse_args()
+    if args.expect_nonzero_capability_refusal:
+        try:
+            proctree._prove_zero_cgroup_capabilities()
+        except proctree.ContainmentUnavailable as exc:
+            if "nonzero fields=" not in str(exc):
+                raise
+            print(f"nonzero_capability_refused=true reason={exc}")
+            return 0
+        raise RuntimeError("nonzero effective/permitted capability set was accepted")
     root = Path(args.tmp)
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
+    prove_unwritable_refusals(root)
     home = root / "home"
     home.mkdir()
     helper_file = root / "detached.pid"
@@ -136,9 +189,15 @@ def main() -> int:
         device_process=lambda _pid: accel.ProcessMemory("absent", 0),
     )
     try:
-        killed = successor.sweep_orphans()
+        recorded = successor._read_owner()
+        if recorded is None:
+            raise RuntimeError("durable owner disappeared before focused reclaim")
+        # This host uses cgroup v2, so it cannot pass the production v1 selector. Exercise
+        # the process-tree reclaim mechanism directly here; lifecycle-live on RunPod proves
+        # the production selection and recovery revalidation together.
+        successor._reclaim_owner(recorded, "focused process-tree mechanics")
         wait_absent(detached, args.observe)
-        if killed or successor._read_owner() is not None:
+        if successor._read_owner() is not None:
             raise RuntimeError("leaderless owner did not clear after exact reclaim")
         if not proctree.same_process(wrong):
             raise RuntimeError("a wrong-token sibling was killed as collateral")
@@ -149,6 +208,8 @@ def main() -> int:
         wait_absent(wrong, args.observe)
 
     print("process_backend=process_tree")
+    print("writable_cgroup_lineage_refused=true")
+    print("writable_cgroup_migration_refused=true")
     print("spawn_bound_before_continue=true")
     print(f"leader_gone=true detached_reclaimed={detached.pid}")
     print("wrong_token_survived=true")

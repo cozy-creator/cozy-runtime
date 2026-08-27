@@ -935,6 +935,14 @@ class ExecutorSupervision:
         owner = self._read_owner()
         if owner is None:
             return []
+        if isinstance(owner.scope, proctree.ProcessTreeScope):
+            try:
+                proctree.validate_process_tree_host()
+            except (proctree.ContainmentUnavailable, proctree.ProcessTreeUnsupported) as exc:
+                raise ExecutorGone(
+                    f"cannot recover process-tree executor ownership on this host: {exc}; "
+                    "ownership retained and successor spawn refused"
+                ) from exc
         was_present = owner.process is not None and proctree.same_process(owner.process)
         self._reclaim_owner(owner, why)
         return [owner.process.pid] if was_present and owner.process is not None else []

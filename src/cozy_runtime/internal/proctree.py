@@ -179,7 +179,6 @@ def arm_subreaper() -> None:
 class _CgroupMount:
     root: Path
     target: Path
-    options: frozenset[str]
     controllers: frozenset[str]
 
 
@@ -208,7 +207,6 @@ def _cgroup_v1_mounts() -> tuple[_CgroupMount, ...]:
             _CgroupMount(
                 root=_mount_path(fields[3]),
                 target=_mount_path(fields[4]),
-                options=frozenset(fields[5].split(",")),
                 controllers=frozenset(fields[separator + 3].split(",")),
             )
         )
@@ -286,13 +284,82 @@ def _full_proc_visibility() -> bool:
     return True
 
 
-def _prove_readonly_container_cgroup_v1() -> None:
+def _prove_zero_cgroup_capabilities() -> None:
+    try:
+        rows: dict[str, str] = {}
+        for line in Path("/proc/self/status").read_text().splitlines():
+            name, separator, value = line.partition(":")
+            if name in {"CapEff", "CapPrm"}:
+                if not separator or name in rows:
+                    raise ValueError("capability fields differ")
+                rows[name] = value.strip()
+        if set(rows) != {"CapEff", "CapPrm"}:
+            raise ValueError("capability fields differ")
+        capabilities = {name: int(value, 16) for name, value in rows.items()}
+    except (OSError, ValueError) as exc:
+        raise ContainmentUnavailable("cannot prove the worker capability set") from exc
+    nonzero = [name for name, value in capabilities.items() if value]
+    if nonzero:
+        raise ContainmentUnavailable(
+            f"process-tree backend requires zero effective and permitted capabilities; "
+            f"nonzero fields={sorted(nonzero)}"
+        )
+
+
+def _effective_writable(path: Path) -> bool:
+    if os.access not in os.supports_effective_ids:
+        raise ContainmentUnavailable("effective-credential access checks are unavailable")
+    try:
+        return os.access(path, os.W_OK, effective_ids=True)
+    except (NotImplementedError, OSError) as exc:
+        raise ContainmentUnavailable(f"cannot check effective write authority for {path}") from exc
+
+
+def _require_cgroup_lineage_unwritable(mount_target: Path, resolved: Path) -> None:
+    try:
+        suffix = resolved.relative_to(mount_target)
+    except ValueError as exc:
+        raise ContainmentUnavailable(
+            f"cgroup-v1 membership {resolved} is outside mount {mount_target}"
+        ) from exc
+    lineage = [mount_target]
+    for part in suffix.parts:
+        lineage.append(lineage[-1] / part)
+    for directory in lineage:
+        try:
+            if not stat.S_ISDIR(directory.stat().st_mode):
+                raise ContainmentUnavailable(f"cgroup-v1 lineage {directory} is not a directory")
+        except OSError as exc:
+            raise ContainmentUnavailable(f"cannot inspect cgroup-v1 lineage {directory}") from exc
+        if _effective_writable(directory):
+            raise ContainmentUnavailable(
+                f"worker credentials can write cgroup-v1 directory {directory}"
+            )
+        for name in ("tasks", "cgroup.procs"):
+            control = directory / name
+            try:
+                if not stat.S_ISREG(control.stat().st_mode):
+                    raise ContainmentUnavailable(
+                        f"cgroup-v1 migration control {control} is not a regular file"
+                    )
+            except OSError as exc:
+                raise ContainmentUnavailable(
+                    f"cannot inspect cgroup-v1 migration control {control}"
+                ) from exc
+            if _effective_writable(control):
+                raise ContainmentUnavailable(
+                    f"worker credentials can write cgroup-v1 migration control {control}"
+                )
+
+
+def _prove_unwritable_container_cgroup_v1() -> None:
     """Require every fact behind the narrow first-party process-tree backend.
 
-    A marker alone proves little and a read-only cgroup alone can be an ordinary host.
-    Selection requires their conjunction, non-root execution, a genuine v1 membership for
-    every controller, read-only backing mounts, full same-UID proc visibility, and working
-    pidfds.  Unified v2 is checked by the caller first and never reaches this path.
+    A marker alone proves little and an inaccessible cgroup alone can be an ordinary host.
+    Selection requires their conjunction, non-root execution, zero effective and permitted
+    capabilities, a genuine v1 membership for every controller, no effective write access
+    to its cgroup lineage or migration controls, full same-UID proc visibility, and working
+    pidfds. Unified v2 is checked by the caller first and never reaches this path.
     """
 
     if os.geteuid() == 0:
@@ -301,6 +368,7 @@ def _prove_readonly_container_cgroup_v1() -> None:
         raise ContainmentUnavailable(
             "process-tree backend found no regular uid-0 non-writable container marker"
         )
+    _prove_zero_cgroup_capabilities()
     try:
         memberships: list[tuple[frozenset[str], Path]] = []
         for line in Path("/proc/self/cgroup").read_text().splitlines():
@@ -335,10 +403,7 @@ def _prove_readonly_container_cgroup_v1() -> None:
                 f"{len(candidates)} containing mount paths"
             )
         mount, path = candidates[0]
-        if "ro" not in mount.options:
-            raise ContainmentUnavailable(
-                f"cgroup-v1 controller mount {mount.target} for {path} is not read-only"
-            )
+        _require_cgroup_lineage_unwritable(mount.target, path)
     if not _full_proc_visibility():
         raise ContainmentUnavailable("full same-UID /proc visibility is unavailable")
     try:
@@ -347,14 +412,22 @@ def _prove_readonly_container_cgroup_v1() -> None:
         raise ContainmentUnavailable("pidfd open/send proof failed") from exc
 
 
+def validate_process_tree_host() -> None:
+    """Revalidate every point-in-time fact required by the process-tree backend."""
+    _linux_only("validate_process_tree_host")
+    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+        raise ContainmentUnavailable("process-tree backend is forbidden on cgroup v2")
+    _prove_unwritable_container_cgroup_v1()
+
+
 def create_executor_scope(namespace: str) -> ExecutorScope:
     """Select and create the strongest proven executor scope on this Linux host."""
     _linux_only("create_executor_scope")
     if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
-        # Unified v2 always keeps the kernel scope path.  A read-only or undelegated v2
+        # Unified v2 always keeps the kernel scope path. A read-only or undelegated v2
         # hierarchy refuses in create_executor_cgroup; it never silently falls back.
         return create_executor_cgroup(namespace)
-    _prove_readonly_container_cgroup_v1()
+    validate_process_tree_host()
     return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES))
 
 
