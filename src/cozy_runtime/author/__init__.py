@@ -1,7 +1,8 @@
 """The author-facing surface — the ONLY cozy-runtime package endpoint/job code imports.
 
 Structural fence (cozy-runtime.md §7, boundaries.md): this package may import schema and
-typing libraries only. It cannot import cozy_runtime.internal, cozy_runtime.cli, the
+typing libraries and the pure canonical-JSON facade only. It cannot import
+cozy_runtime.internal, cozy_runtime.cli, the
 worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment or config;
 it names no device, allocator, compile or ingest surface. `checks/architecture.py` proves it.
 
@@ -11,6 +12,7 @@ complete set of things an endpoint author touches, minus the codec plane (cr-017
 fakes live in `cozy_runtime.author.fakes`.
 """
 
+from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._assets import (
     Asset,
@@ -219,6 +221,7 @@ __all__ = [
     "VideoAsset",
     "assert_declaration_shape",
     "attempt",
+    "canonical_json",
     "classify",
     "describe",
     "invoke",

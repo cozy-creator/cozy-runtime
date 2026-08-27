@@ -444,7 +444,7 @@ def fence_canonical_numbers() -> list[str]:
     import struct
 
     sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical
+    from cozy_runtime.author import canonical_json
 
     bad: list[str] = []
     path = ROOT / "vectors" / "es6-numbers.txt"
@@ -452,7 +452,7 @@ def fence_canonical_numbers() -> list[str]:
     for line in rows:
         raw, expected = line.split(" ", 1)
         value = struct.unpack("<d", bytes.fromhex(raw))[0]
-        got = canonical.write(value).decode()
+        got = canonical_json.encode(value).decode()
         if got != expected:
             bad.append(f"{raw}: wrote {got!r}, ES6 says {expected!r}")
     if not rows:
