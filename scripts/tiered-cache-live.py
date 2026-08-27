@@ -7,19 +7,21 @@ import hashlib
 import io
 import shutil
 import threading
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
+from unittest import mock
 
 import tensorfs
 
 from cozy_runtime.internal import provisioned, pull
 from cozy_runtime.internal.materialize_launch import (
+    LOCAL_ARTIFACT_STORE_ROOT,
     LaunchRefusal,
+    ProvisionCache,
     _materialize_objects,
     _open_cache_store,
 )
@@ -64,13 +66,26 @@ def _cloud_hydrate(
     url: str,
     *,
     session: str,
+    objects: tuple[provisioned.ArtifactRef, ...] = (),
+    object_urls: Mapping[str, str] | None = None,
+    streams: int = 1,
+    on_object: Callable[[str, int, bool], None] | None = None,
 ) -> pull.PullResult:
-    plan = pull._plan(tensorfs, store, session, ref.digest, ref.length, [(ref.digest, ref.length)])
+    root = ref.digest.removeprefix("sha256:") if objects else ref.digest
+    declared = objects or (ref,)
+    plan = pull._plan(
+        tensorfs,
+        store,
+        session,
+        root,
+        ref.length,
+        [(item.digest, item.length) for item in declared],
+    )
     result = pull.PullResult(
         ref=ref.digest,
         snapshot=ref.digest.removeprefix("sha256:"),
         store=str(store.root),
-        streams=1,
+        streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
         held=len(plan["held"]),
         bytes_held=int(plan["held_bytes"]),
@@ -83,12 +98,12 @@ def _cloud_hydrate(
         store,
         plan,
         result,
-        urls={ref.digest: url},
+        urls={ref.digest: url, **(object_urls or {})},
         in_hand={},
-        deadline=pull.Deadline.after(10),
+        deadline=pull.Deadline(),
         allow_local=True,
-        streams=1,
-        on_object=None,
+        streams=streams,
+        on_object=on_object,
         no_proxy=True,
         cache_store=cache_store,
     )
@@ -142,10 +157,10 @@ def main() -> int:
             ]
             warm_local = root / "warm-local"
             warm = _materialize_objects(
-                {"capacity": {"cache_mount_path": str(cache_mount)}},
                 {"artifact_grants": grants},
                 object_set,
-                deadline=int(time.time()) + 10,
+                cache=ProvisionCache(cache_mount, "cache-live", "provider-volume-live"),
+                deadline=None,
                 store_root=warm_local,
             )
             assert warm.store == warm_local and warm.store != cache_root
@@ -172,6 +187,87 @@ def main() -> int:
                 == "verified"
             )
             cache_store = tensorfs.Store.init(str(cache_root))
+
+            # No attached cache means no cache path operation: the exact cloud closure
+            # lands in the same worker-local store used by production, with no degradation.
+            assert Path("/var/lib/cozy/store") == LOCAL_ARTIFACT_STORE_ROOT
+            cloud_only_set = provisioned.ArtifactObjectSet(
+                (provisioned.ModelRoot(manifest_ref, (segment_ref,)),)
+            )
+            cloud_only_grants = [
+                {
+                    "digest": ref.digest,
+                    "length": ref.length,
+                    "url": f"https://delivery.invalid/{ref.digest[7:]}",
+                }
+                for ref in sorted(
+                    (manifest_ref, segment_ref),
+                    key=lambda item: item.digest,
+                )
+            ]
+            server.objects = {
+                manifest_ref.digest: manifest,
+                segment_ref.digest: segment,
+            }
+
+            def local_cloud_pull(
+                tensorfs_module: Any,
+                store: Any,
+                snapshot: str,
+                snapshot_length: int,
+                granted: list[pull.Read],
+                *,
+                timeout: float | None = None,
+                session: str = "",
+                streams: int = pull.STREAMS,
+                on_object: Callable[[str, int, bool], None] | None = None,
+                cache_store: Any | None = None,
+            ) -> pull.PullResult:
+                assert tensorfs_module is tensorfs
+                assert timeout is None and cache_store is None
+                rows = list(granted)
+                assert snapshot == manifest_ref.digest and snapshot_length == manifest_ref.length
+                assert {row.object_id for row in rows} == {
+                    manifest_ref.digest,
+                    segment_ref.digest,
+                }
+                return _cloud_hydrate(
+                    store,
+                    manifest_ref,
+                    None,
+                    f"http://127.0.0.1:{server.server_port}/{manifest_ref.digest[7:]}",
+                    session=session,
+                    objects=(segment_ref,),
+                    object_urls={
+                        segment_ref.digest: (
+                            f"http://127.0.0.1:{server.server_port}/{segment_ref.digest[7:]}"
+                        )
+                    },
+                    streams=streams,
+                    on_object=on_object,
+                )
+
+            cloud_only_local = root / "cloud-only-local"
+            with mock.patch.object(pull, "pull_granted_snapshot", side_effect=local_cloud_pull):
+                cloud_only = _materialize_objects(
+                    {"artifact_grants": cloud_only_grants},
+                    cloud_only_set,
+                    cache=None,
+                    deadline=None,
+                    store_root=cloud_only_local,
+                )
+            cloud_only_bytes = manifest_ref.length + segment_ref.length
+            assert cloud_only.sources == {
+                "cloud": {"bytes": cloud_only_bytes, "objects": 2},
+                "local": {"bytes": 0, "objects": 0},
+                "network_cache": {"bytes": 0, "objects": 0},
+            }
+            assert not cloud_only.network_cache_degradations
+            cloud_only_store = tensorfs.Store.open(str(cloud_only_local))
+            assert all(
+                cloud_only_store.verify(ref.digest[7:])["verdict"] == "verified"
+                for ref in (manifest_ref, segment_ref)
+            )
 
             # A corrupt cache body commits nothing locally before the cloud fallback runs.
             corrupt_raw = b"correct-cloud-object"
@@ -311,10 +407,10 @@ def main() -> int:
             alias_store = alias_mount / "tensorfs"
             try:
                 _materialize_objects(
-                    {"capacity": {"cache_mount_path": str(alias_mount)}},
                     {"artifact_grants": []},
                     provisioned.ArtifactObjectSet(()),
-                    deadline=int(time.time()) + 10,
+                    cache=ProvisionCache(alias_mount, "cache-alias", "provider-volume-alias"),
+                    deadline=None,
                     store_root=alias_store,
                 )
             except LaunchRefusal as exc:
