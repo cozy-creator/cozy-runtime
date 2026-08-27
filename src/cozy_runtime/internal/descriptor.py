@@ -1,13 +1,13 @@
 """The reviewed endpoint descriptor generated from one frozen application.
 
-The descriptor contains only facts a launch or invocation reader consumes. Its one identity
-is the SHA-256 of the exact deterministic bytes committed as ``endpoint.descriptor.json``;
-there is no digest embedded in the document it identifies.
+The committed ``endpoint.descriptor.json`` is a readable projection. Its one identity is
+SHA-256 over the canonical JSON encoding of its content, so indentation, whitespace and key
+order can never change ``descriptor_digest``. The digest is derived and is not embedded in
+the document it identifies.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -187,13 +187,18 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
 
 
 def render(doc: Mapping[str, Json]) -> bytes:
-    """The one deterministic byte representation of an endpoint descriptor."""
+    """The deterministic, readable repository projection."""
     return canonical.pretty(dict(doc)).encode("utf-8")
 
 
-def descriptor_digest(raw: bytes) -> str:
-    """The exact stored-byte identity shared by every descriptor consumer."""
-    return "sha256:" + hashlib.sha256(raw).hexdigest()
+def canonical_bytes(doc: Mapping[str, Json]) -> bytes:
+    """The semantic descriptor bytes used for identity and control-plane transport."""
+    return canonical.write(dict(doc))
+
+
+def descriptor_digest(doc: Mapping[str, Json]) -> str:
+    """The descriptor's formatting-invariant semantic identity."""
+    return canonical.digest(dict(doc))
 
 
 def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
@@ -230,8 +235,8 @@ def write(project: Path, doc: Mapping[str, Json]) -> Path:
 
 
 def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
-    """Refuse unless two descriptors render to the same exact bytes."""
-    if render(left) == render(right):
+    """Refuse unless two descriptors have the same content."""
+    if canonical_bytes(left) == canonical_bytes(right):
         return
     detail = "; ".join(_differences(left, right)) or "the documents differ"
     raise StaleDescriptor(
@@ -274,7 +279,7 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
 
 
 def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
-    """Read one exact descriptor artifact without assuming it has a project-tree path."""
+    """Read one descriptor projection without making its formatting part of identity."""
     try:
         parsed = canonical.parse(raw)
     except canonical.CanonicalError as exc:
@@ -299,13 +304,6 @@ def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
         raise StaleDescriptor(
             f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
             code="unknown_format",
-        )
-    expected = render(parsed)
-    if raw != expected:
-        raise StaleDescriptor(
-            f"{source} is not the deterministic descriptor encoding; regenerate it instead "
-            "of editing whitespace or key order",
-            code="noncanonical_descriptor",
         )
     return parsed
 

@@ -483,7 +483,9 @@ class Executor:
             min(destinations, resident_budget) if resident_budget else destinations
         )
         required = (
-            resident_destinations + int(envelope["native_bytes"]) + int(envelope["decode_peak_bytes"])
+            resident_destinations
+            + int(envelope["native_bytes"])
+            + int(envelope["decode_peak_bytes"])
         )
         envelope = {
             **envelope,

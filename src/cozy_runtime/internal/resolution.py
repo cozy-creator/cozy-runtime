@@ -826,7 +826,11 @@ def script_plan(
         components=tuple(components),
     )
     variant = Variant(
-        name="script", store=store, snapshot=snapshot, snapshots=dict(snapshots or {}), reference=True
+        name="script",
+        store=store,
+        snapshot=snapshot,
+        snapshots=dict(snapshots or {}),
+        reference=True,
     )
     return resolve(
         variants=[variant],

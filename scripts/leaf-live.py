@@ -843,18 +843,14 @@ def fill() -> None:
     """The rung itself: a real artifact, the real fill plane, real leaves installed."""
     import torch
 
-    from cozy_runtime.internal.fill import FillRefusal, _tensors, dtype_name
+    from cozy_runtime.internal.fill import FillRefusal, _tensors
 
     head("fill — the native rung end to end: consent, replacement, census, ledger")
 
     # ARM, RED FIRST: an endpoint that never declared consent gets the typed refusal, and
     # gets it before a destination is reserved.
     backend, rows = _backend("footprint")
-    if not any(
-        backend.resolved[r.key].route
-        == "encoded_gemm"
-        for r in rows
-    ):
+    if not any(backend.resolved[r.key].route == "encoded_gemm" for r in rows):
         check(
             "this card qualifies the native leaf",
             False,

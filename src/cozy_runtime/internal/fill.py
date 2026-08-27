@@ -1029,7 +1029,9 @@ class StreamingFillBackend:
         """
         resolved = self.resolved.get(key)
         if resolved is None:
-            raise _refuse("plan_divergence", f"{key}: the resolved plan names no such destination", [key])
+            raise _refuse(
+                "plan_divergence", f"{key}: the resolved plan names no such destination", [key]
+            )
         actual = (row.encoded.encoding, tuple(row.shape), dtype_name(row.dtype))
         planned = (resolved.encoding, tuple(resolved.geometry), resolved.output_dtype)
         if actual != planned:

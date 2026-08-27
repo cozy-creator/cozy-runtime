@@ -254,7 +254,6 @@ def carrier() -> None:
 
     from cozy_runtime.internal.encoding import (
         MicroScaledDequant,
-        Selector,
         digests_of,
         launch_providers,
         measure_device,

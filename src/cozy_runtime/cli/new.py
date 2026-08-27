@@ -208,7 +208,7 @@ def run(name: str, target_dir: str) -> Result:
             ("files", str(len(files) + 1)),
             (
                 descriptor.DIGEST_KEY,
-                descriptor.descriptor_digest(descriptor.render(written.document)),
+                descriptor.descriptor_digest(written.document),
             ),
         ),
         commands=(

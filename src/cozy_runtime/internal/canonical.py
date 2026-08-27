@@ -243,7 +243,7 @@ def _no_constants(name: str) -> Json:
 def pretty(value: Json) -> str:
     """Deterministic sorted, indented, newline-terminated review bytes.
 
-    Each document owner decides whether these or compact JCS bytes are its stored identity.
-    The endpoint descriptor deliberately hashes this exact review rendering.
+    Projections are never identity. Semantic document digests use :func:`write`; exact-byte
+    artifact digests are explicitly owned by the artifact or blob boundary.
     """
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"

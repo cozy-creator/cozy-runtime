@@ -122,8 +122,19 @@ def _prepare(args: argparse.Namespace) -> None:
     descriptor_path = args.descriptor.resolve()
     descriptor_bytes = descriptor_path.read_bytes()
     descriptor_doc = _parse_json(descriptor_bytes)
-    if not isinstance(descriptor_doc, dict):
-        raise ProofFailure("fixture descriptor is not an object")
+    if not isinstance(descriptor_doc, dict) or set(descriptor_doc) != {
+        "application",
+        "entrypoints",
+        "format",
+        "jobs",
+    }:
+        raise ProofFailure("fixture descriptor is not one closed EndpointDescriptor/1")
+    _require(
+        descriptor_doc.get("format") == "cozy.endpoint.descriptor/1",
+        "fixture descriptor has the wrong format",
+    )
+    descriptor_bytes = _canonical(descriptor_doc)
+    descriptor_path = _write(inputs / "endpoint-descriptor.json", descriptor_bytes)
     hidden = [
         row["name"]
         for row in descriptor_doc["entrypoints"]
