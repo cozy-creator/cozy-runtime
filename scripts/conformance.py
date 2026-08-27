@@ -120,6 +120,10 @@ class UntaggedReference(msgspec.Struct):
     file: str
 
 
+class IntegerTagged(msgspec.Struct, tag=1, tag_field="type"):
+    number: int
+
+
 TaggedReference = TaggedImage | TaggedVideo
 
 
@@ -165,12 +169,23 @@ def _tagged_union_conformance() -> str:
             },
         ]
     }
+    single = schema.render(TaggedImage)
+    assert single["fields"][0]["wire"] == "optional", single
+    scalar_union = schema.render(TaggedImage | str)
+    tagged_member = next(member for member in scalar_union["union"] if isinstance(member, dict))
+    assert tagged_member["fields"][0]["wire"] == "optional", tagged_member
     try:
         schema.render(TaggedImage | UntaggedReference)
     except Exception as exc:
         assert getattr(exc, "code", "") == "tagged_union_incoherent", exc
     else:
         raise AssertionError("mixed tagged/untagged union rendered")
+    try:
+        schema.render(TaggedImage | IntegerTagged)
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "tagged_union_incoherent", exc
+    else:
+        raise AssertionError("mixed string/integer tags rendered")
     return "type=image|video published and missing/unknown/mismatched tags refused"
 
 
