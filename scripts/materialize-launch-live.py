@@ -44,6 +44,16 @@ def ref(raw: bytes) -> Ref:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="cozy-materialize-launch-") as raw_root:
         root = Path(raw_root)
+        vectors: dict[str, tuple[bytes, provisioned.ArtifactObjectSet]] = {}
+        for line in (ROOT / "vectors" / "artifact-object-sets.jsonl").read_text().splitlines():
+            vector = cast(ObjectSetVector, json.loads(line))
+            raw = canonical.write(vector["document"])
+            assert raw == vector["canonical"].encode()
+            assert "sha256:" + hashlib.sha256(raw).hexdigest() == vector["digest"]
+            vectors[vector["name"]] = (raw, provisioned.read_artifact_object_set(raw))
+        empty_bytes, empty_object_set = vectors["empty"]
+        object_set_ref = ref(empty_bytes)
+
         token = "1" * 64
         document = b"x"
         document_ref = ref(document)
@@ -51,7 +61,7 @@ def main() -> int:
         spec = {
             "acquisition_attempt_id": "attempt-live",
             "acquisition_attempt_ordinal": 1,
-            "artifact_object_set": document_ref,
+            "artifact_object_set": object_set_ref,
             "capacity": {
                 "accelerator_count": 1,
                 "accelerator_model": "NVIDIA H200",
@@ -84,7 +94,11 @@ def main() -> int:
         spec_bytes = canonical.write(spec)
         spec_ref = ref(spec_bytes)
         documents = [
-            {**document_ref, "role": role, "url": f"https://delivery.invalid/{role}"}
+            {
+                **(object_set_ref if role == "artifact_object_set" else document_ref),
+                "role": role,
+                "url": f"https://delivery.invalid/{role}",
+            }
             for role in REQUIRED_DOCUMENT_ROLES
         ]
         bundle = {
@@ -127,14 +141,6 @@ def main() -> int:
         parsed_spec, parsed_bundle = _provision_pair(spec_bytes, bundle_bytes, config)
         assert parsed_spec == spec and parsed_bundle == bundle
 
-        vectors: dict[str, tuple[bytes, provisioned.ArtifactObjectSet]] = {}
-        for line in (ROOT / "vectors" / "artifact-object-sets.jsonl").read_text().splitlines():
-            vector = cast(ObjectSetVector, json.loads(line))
-            raw = canonical.write(vector["document"])
-            assert raw == vector["canonical"].encode()
-            assert "sha256:" + hashlib.sha256(raw).hexdigest() == vector["digest"]
-            vectors[vector["name"]] = (raw, provisioned.read_artifact_object_set(raw))
-        empty_bytes, empty_object_set = vectors["empty"]
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}
         local_weightless = local.weightless_release_documents(
