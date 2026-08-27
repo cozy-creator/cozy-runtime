@@ -39,7 +39,7 @@ from typing import Any, cast
 
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical, egress, seam
+from cozy_runtime.internal import artifact_transactions, canonical, egress, seam
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -266,6 +266,14 @@ class AttemptRecord:
     prepared: PreparedRequest | None = None
     #: cr-009's PublicationReceipt document, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
+    artifact_receipts: list[artifact_transactions.StoredReceipt] = dataclasses_field(
+        default_factory=list
+    )
+    """Committed cr-030 receipts recovered and journaled before terminal construction.
+
+    th-049 owns their exact outcome-document spelling; until that foreign hardcut lands,
+    this worker keeps the durable internal facts and invents no private wire field.
+    """
 
     def begin_reclaim(self) -> bool:
         """Win the completion race, or report that natural finalization won first."""
@@ -354,7 +362,9 @@ class AttemptEngine:
         jobs: Mapping[str, JobBinding],
         spool_root: Path,
         scratch_root: Path,
+        artifact_store_root: Path,
         instance_id: str,
+        owner_scope: Callable[[], str],
         send: Callable[[pb.WorkerFrame], None],
         progress: Callable[[str, int, dict[str, Any]], None],
         bundles: triage.BundleStore,
@@ -381,6 +391,9 @@ class AttemptEngine:
         #: whole point is that the next attempt resumes from what the killed one left.
         #: Found live: the kill arm resumed from nothing until this moved out.
         self.scratch_root = scratch_root
+        self.artifact_store_root = artifact_store_root
+        self.artifacts = artifact_transactions.ArtifactCoordinator(journal, artifact_store_root)
+        self.owner_scope = owner_scope
         self.instance_id = instance_id
         self.send = send
         self.progress = progress
@@ -1133,6 +1146,66 @@ class AttemptEngine:
           * the SAME identity replays it and writes nothing a second time;
           * the same key with DIFFERENT bytes is a CONFLICT, never a replacement.
         """
+        if str(frame.get("kind")) == "artifact_open":
+            if attempt.job is None or attempt.spool is None:
+                return {
+                    "ok": False,
+                    "code": "artifact_not_job",
+                    "detail": "ArtifactSink is available only inside an accepted job attempt",
+                }
+            try:
+                opened = self.artifacts.open(
+                    owner_authority_scope=self.owner_scope(),
+                    request_id=attempt.request_id,
+                    invocation_spec_digest=documents.spell(attempt.digest),
+                    attempt_ordinal=attempt.attempt,
+                    executor_generation=attempt.executor_generation,
+                    spool=attempt.spool,
+                    staged_name=str(frame.get("staged_name", "")),
+                    staged_digest=str(frame.get("staged_digest", "")),
+                    staged_length=int(frame.get("staged_length", 0)),
+                    granted_sources={
+                        ref: (
+                            digest,
+                            attempt.grant.inputs[f"{grants.TREE_PREFIX}{ref}"].length,
+                        )
+                        for ref, (_, digest) in attempt.trees.items()
+                    },
+                    granted_outputs={
+                        output_id: output.max_bytes
+                        for output_id, output in attempt.grant.outputs.items()
+                    },
+                )
+            except (artifact_transactions.ArtifactTransactionError, JournalError) as exc:
+                return {
+                    "ok": False,
+                    "code": getattr(exc, "code", "artifact_open_refused"),
+                    "detail": str(exc),
+                }
+            return {"ok": True, **opened}
+        if str(frame.get("kind")) == "artifact_commit":
+            if attempt.job is None or attempt.spool is None:
+                return {
+                    "ok": False,
+                    "code": "artifact_not_job",
+                    "detail": "ArtifactSink is available only inside an accepted job attempt",
+                }
+            try:
+                committed = self.artifacts.commit(
+                    transaction=str(frame.get("transaction_id", "")),
+                    writer_session_id=int(frame.get("writer_session_id", 0)),
+                    spool=attempt.spool,
+                    staged_name=str(frame.get("staged_name", "")),
+                    staged_digest=str(frame.get("staged_digest", "")),
+                    staged_length=int(frame.get("staged_length", 0)),
+                )
+            except (artifact_transactions.ArtifactTransactionError, JournalError) as exc:
+                return {
+                    "ok": False,
+                    "code": getattr(exc, "code", "artifact_commit_refused"),
+                    "detail": str(exc),
+                }
+            return {"ok": True, **committed}
         if str(frame.get("kind")) != "checkpoint":
             return {
                 "ok": False,
@@ -1358,6 +1431,21 @@ class AttemptEngine:
                 "spool": str(spool),
                 "scratch": str(attempt.scratch) if attempt.scratch else "",
                 "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
+                # Runtime-private ArtifactSink grant. The store path never reaches author
+                # code; source/output meaning is the worker-verified InvocationSpec
+                # projection, with no URL or credential on the executor side.
+                "artifact_store": str(self.artifact_store_root),
+                "artifact_sources": {
+                    ref: [
+                        digest,
+                        attempt.grant.inputs[f"{grants.TREE_PREFIX}{ref}"].length,
+                    ]
+                    for ref, (_, digest) in attempt.trees.items()
+                },
+                "artifact_outputs": {
+                    output_id: output.max_bytes
+                    for output_id, output in attempt.grant.outputs.items()
+                },
                 "inputs": inputs,
                 "max_input_bytes": 64 << 20,
                 "budget": {
@@ -1847,6 +1935,32 @@ class AttemptEngine:
         that a crash between the two leaves an unreferenced bundle (harmless, readable)
         rather than a terminal pointing at nothing.
         """
+        if attempt.kind == "job":
+            try:
+                attempt.artifact_receipts = self.artifacts.settle(
+                    attempt_ordinal=attempt.attempt,
+                    executor_generation=attempt.executor_generation,
+                )
+            except (artifact_transactions.ArtifactTransactionError, JournalError) as exc:
+                status = STATUS.OUTCOME_STATUS_FAILED
+                cause = CAUSE.CAUSE_CODE_LOCAL_SAFETY
+                origin = ORIGIN.CAUSE_ORIGIN_WORKER
+                detail = (
+                    "artifact_receipt_not_durable: Runtime could not recover/fence the "
+                    f"ArtifactSink transaction ({getattr(exc, 'code', type(exc).__name__)})"
+                )
+            if attempt.artifact_receipts:
+                # th-049 is a foreign wire hardcut, not permission to smuggle a private
+                # field into /2. Keep the committed root GC-live and report the missing
+                # transport honestly; the service becomes success-capable when /3 lands.
+                status = STATUS.OUTCOME_STATUS_FAILED
+                cause = CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE
+                origin = ORIGIN.CAUSE_ORIGIN_RUNTIME
+                detail = (
+                    "artifact_receipt_transport_unavailable: the artifact committed and its "
+                    "receipt is durable, but worker-protocol AttemptOutcomeBody/3 (th-049) "
+                    "has not landed; Runtime will not claim success while dropping it"
+                )
         # The grant is released FIRST because reconciliation is a claim about the whole
         # envelope: the opening line was taken before the grant, so the closing one must be
         # taken after its release or every attempt reports its own grant as a leak.

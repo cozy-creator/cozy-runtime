@@ -90,6 +90,8 @@ class CopyConfig:
 class CreateConfig:
     """Admit exact newly produced config bytes through the object plane."""
 
+    media_type: str
+    length: int
     data: ArtifactBytes
 
 
@@ -178,4 +180,3 @@ def _ordered_unique(values: Sequence[str], what: str) -> tuple[str, ...]:
     if any(not value for value in ordered) or len(set(ordered)) != len(ordered):
         raise CapabilityError(f"{what} must be non-empty and unique", code="artifact_declaration")
     return ordered
-
