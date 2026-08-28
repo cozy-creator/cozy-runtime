@@ -26,10 +26,18 @@ def digest(raw: bytes) -> str:
 
 
 def build_wheel(
-    root: Path, distribution: str, package: str, value: str, *, owner: str
+    root: Path,
+    distribution: str,
+    package: str,
+    value: str,
+    *,
+    owner: str,
+    tag: str = "py3-none-any",
+    requires_python: str = "",
+    requires_dist: tuple[str, ...] = (),
 ) -> tuple[overlay.Wheel, Path]:
-    filename = f"{distribution.replace('-', '_')}-1.0.0-py3-none-any.whl"
-    wheel_root = root / f"{distribution}-{value}"
+    filename = f"{distribution.replace('-', '_')}-1.0.0-{tag}.whl"
+    wheel_root = root / f"{distribution}-{value}-{tag.replace('.', '_')}"
     wheel_root.mkdir()
     path = wheel_root / filename
     info = f"{distribution.replace('-', '_')}-1.0.0.dist-info"
@@ -37,8 +45,10 @@ def build_wheel(
         f"{package}/__init__.py": f"VALUE = {value!r}\n".encode(),
         f"{info}/METADATA": (
             f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0.0\n"
+            + (f"Requires-Python: {requires_python}\n" if requires_python else "")
+            + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires_dist)
         ).encode(),
-        f"{info}/WHEEL": b"Wheel-Version: 1.0\nTag: py3-none-any\n",
+        f"{info}/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
     }
     record = []
     for name, raw in sorted(entries.items()):
@@ -57,7 +67,7 @@ def build_wheel(
             filename=filename,
             digest=digest(raw),
             length=len(raw),
-            tags=("py3-none-any",),
+            tags=(tag,),
             owner=owner,
             import_roots=(package,),
         ),
@@ -68,13 +78,19 @@ def build_wheel(
 def base_manifest(path: Path) -> str:
     raw = canonical.write(
         {
-            "base_distributions": [{"distribution": "base-control", "version": "1.0.0"}],
-            "base_import_roots": [{"providers": ["base-control"], "root": "base_control"}],
+            "base_distributions": [
+                {"distribution": "base-control", "version": "1.0.0"},
+                {"distribution": "numpy", "version": "2.0.0"},
+            ],
+            "base_import_roots": [
+                {"providers": ["base-control"], "root": "base_control"},
+                {"providers": ["numpy"], "root": "numpy"},
+            ],
             "format": "WheelhouseManifest/2",
             "platform_target": {
                 "accelerator_abi": "none",
                 "accelerator_backend": "none",
-                "libc": "glibc",
+                "libc": "glibc2.39",
                 "os_arch": "linux/amd64",
                 "python_abi": "cp312",
             },
@@ -213,6 +229,85 @@ def main() -> int:
         else:
             raise AssertionError("corrupt first arrival was admitted")
 
+        abi3_project = build_wheel(
+            wheels,
+            "proof-abi3",
+            "proof_abi3",
+            "abi3",
+            owner="project",
+            tag="cp310-abi3-manylinux_2_17_x86_64",
+            requires_python=">=3.10",
+        )
+        abi3 = overlay.materialize(
+            source("abi3", family, abi3_project, custom_one),
+            root / "abi3-installed",
+            python=Path(sys.executable),
+            base_manifest=manifest,
+        )
+        assert (abi3.import_root / "proof_abi3" / "__init__.py").is_file()
+
+        incompatible_cases = {
+            "overlay_wheel_platform_incompatible": build_wheel(
+                wheels,
+                "proof-new-manylinux",
+                "proof_new_manylinux",
+                "new-manylinux",
+                owner="project",
+                tag="cp312-cp312-manylinux_2_40_x86_64",
+            ),
+            "overlay_python_incompatible": build_wheel(
+                wheels,
+                "proof-new-python",
+                "proof_new_python",
+                "new-python",
+                owner="project",
+                requires_python=">=3.13",
+            ),
+            "overlay_dependency_base_conflict": build_wheel(
+                wheels,
+                "proof-numpy-pin",
+                "proof_numpy_pin",
+                "numpy-pin",
+                owner="project",
+                requires_dist=("numpy==1.0.0",),
+            ),
+            "overlay_dependency_missing": build_wheel(
+                wheels,
+                "proof-marker",
+                "proof_marker",
+                "marker",
+                owner="project",
+                requires_dist=("missing-package; python_version >= '3.12'",),
+            ),
+        }
+        for code, bad_project in incompatible_cases.items():
+            try:
+                overlay.materialize(
+                    source(code, family, bad_project, custom_one),
+                    root / f"red-{code}",
+                    python=Path(sys.executable),
+                    base_manifest=manifest,
+                )
+            except overlay.OverlayRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"{code} was admitted")
+
+        false_marker = build_wheel(
+            wheels,
+            "proof-false-marker",
+            "proof_false_marker",
+            "false-marker",
+            owner="project",
+            requires_dist=("missing-package; python_version < '3.12'",),
+        )
+        overlay.materialize(
+            source("false-marker", family, false_marker, custom_one),
+            root / "false-marker-installed",
+            python=Path(sys.executable),
+            base_manifest=manifest,
+        )
+
         cache_root = root / "acquisition"
         cache = cache_root / "cache"
         cache.mkdir(parents=True)
@@ -270,6 +365,12 @@ def main() -> int:
                     "changed_stat_rehashed": True,
                     "restart_rehashed": True,
                     "corrupt_first_arrival_refused": True,
+                    "abi3_older_floor_admitted": True,
+                    "manylinux_newer_floor_refused": True,
+                    "requires_python_refused": True,
+                    "active_marker_missing_dependency_refused": True,
+                    "inactive_marker_ignored": True,
+                    "base_version_conflict_refused": True,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
