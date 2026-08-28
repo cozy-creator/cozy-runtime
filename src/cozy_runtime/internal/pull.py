@@ -324,9 +324,10 @@ def resolve(
     vocabulary, and a client that resolved locally would need a copy of it that goes stale.
     """
     q = urllib.parse.urlencode({"ref": ref, **({"lane": lane} if lane else {})})
-    doc = _json(base, f"/v1/resolve?{q}", deadline, token=token)
+    doc = _json(base, f"/v1/models/resolve?{q}", deadline, token=token)
     # The hub's own spelling for "the exact bytes this ref names". `checkpoint_id` is what
-    # `/v1/resolve` returns and `snapshot_id` is what the checkpoint listing returns; both
+    # `/v1/models/resolve` returns and `snapshot_id` is what the checkpoint listing returns;
+    # both
     # are read rather than one of them being assumed, because a client that guessed would
     # fail on whichever route it did not test against.
     snapshot = str(
@@ -348,7 +349,7 @@ def resolve(
         raise PullRefusal(
             "hub_refused",
             f"{ref}: the hub resolved a checkpoint without its model identity",
-            "upgrade the hub; /v1/resolve must return the owning model",
+            "upgrade the hub; /v1/models/resolve must return the owning model",
             cause=json.dumps(doc)[:400],
         )
     return Resolved(
