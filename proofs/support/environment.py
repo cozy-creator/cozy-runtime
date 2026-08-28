@@ -248,9 +248,11 @@ def _release(
             "descriptor": _ref(descriptor),
             "endpoint_release_id": "proof-release",
             "evaluated_config": _ref(evaluated),
-            "format": "tensorhub.endpoint_bundle/1",
+            "format": "tensorhub.endpoint_bundle/2",
             "project_wheel": _wheel(project),
             "resolved_wheel_set": _ref(resolved),
+            "source_archive": _ref(b"proof-source"),
+            "source_lock": _ref(b"proof-lock"),
             "wheelhouse_manifest": _ref(wheelhouse),
         }
     )
