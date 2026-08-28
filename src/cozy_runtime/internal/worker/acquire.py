@@ -448,10 +448,11 @@ class Acquirer:
             bundle_ref, self._authorized_length(bundle_ref, "endpoint_bundle")
         ).read_bytes()
         bundle = self._parse(bundle_bytes, "endpoint_bundle")
-        source_archive_ref = self._ref(bundle.get("source_archive"), "source_archive")
-        source_lock_ref = self._ref(bundle.get("source_lock"), "source_lock")
-        self.fetch(*source_archive_ref)
-        self.fetch(*source_lock_ref)
+        # Archive and lock prove how the project wheel was published; they are
+        # not executable placement bytes. Validate their exact references but
+        # fetch only the project/custom wheels the worker can actually run.
+        self._ref(bundle.get("source_archive"), "source_archive")
+        self._ref(bundle.get("source_lock"), "source_lock")
         resolved_ref = self._ref(bundle.get("resolved_wheel_set"), "resolved_wheel_set")
         wheelhouse_bundle_ref = self._ref(bundle.get("wheelhouse_manifest"), "wheelhouse_manifest")
         if wheelhouse_bundle_ref[0] != wheelhouse_ref:
