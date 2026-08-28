@@ -36,8 +36,7 @@ from cozy_runtime.internal.config import AdapterConfig
 
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
-RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
-WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
+RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/2"
 # The base-worker-image bootstrap creates exactly this container-local Runtime data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -485,7 +484,6 @@ def endpoint_overlay_input(
     spec = _document(environment_spec_bytes, "environment_spec")
     bundle = _document(endpoint_bundle_bytes, "endpoint_bundle")
     resolved = _document(resolved_wheel_set_bytes, "resolved_wheel_set")
-    wheelhouse = _document(wheelhouse_manifest_bytes, "wheelhouse_manifest")
     _closed(
         spec,
         {
@@ -530,10 +528,6 @@ def endpoint_overlay_input(
         raise LaunchRefusal(
             "source_lock_ref_mismatch", "bundle source lock and resolved set disagree"
         )
-    _closed(wheelhouse, {"format", "platform_target", "wheels"}, "wheelhouse_manifest")
-    if wheelhouse["format"] != WHEELHOUSE_MANIFEST_FORMAT:
-        raise LaunchRefusal("wheelhouse_manifest_format", str(wheelhouse["format"]))
-
     _require_digest(spec["endpoint_bundle_digest"], "environment_spec.endpoint_bundle_digest")
     _require_digest(spec["project_wheel_digest"], "environment_spec.project_wheel_digest")
     _require_digest(
@@ -545,6 +539,12 @@ def endpoint_overlay_input(
         str(spec["wheelhouse_manifest_digest"]),
         "wheelhouse_manifest",
     )
+    try:
+        base_manifest = overlay.parse_base_manifest(
+            wheelhouse_manifest_bytes, str(spec["wheelhouse_manifest_digest"])
+        )
+    except overlay.OverlayRefusal as exc:
+        raise LaunchRefusal(exc.code, exc.detail) from exc
     _ref_matches(bundle["resolved_wheel_set"], resolved_wheel_set_bytes, "resolved_wheel_set")
     _ref_matches(bundle["wheelhouse_manifest"], wheelhouse_manifest_bytes, "wheelhouse_manifest")
     if bundle["wheelhouse_manifest"] != {
@@ -559,24 +559,24 @@ def endpoint_overlay_input(
             "wheelhouse_manifest_ref_mismatch", "resolved set and environment spec disagree"
         )
     if not isinstance(spec["platform_target"], dict) or not (
-        spec["platform_target"] == resolved["platform_target"] == wheelhouse["platform_target"]
+        spec["platform_target"]
+        == resolved["platform_target"]
+        == dict(base_manifest.platform_target)
     ):
         raise LaunchRefusal("platform_target_mismatch", "release documents disagree")
 
-    project = _wheel(bundle["project_wheel"], "project")
+    project = _wheel(bundle["project_wheel"], "project", import_roots=True)
     if project.digest != spec["project_wheel_digest"]:
         raise LaunchRefusal("project_wheel_mismatch", project.digest)
     wheels = [project]
-    wheels.extend(_wheels(resolved["wheels"], "bundle"))
-    wheels.extend(_wheels(wheelhouse["wheels"], "wheelhouse"))
+    wheels.extend(_wheels(resolved["wheels"], "bundle", import_roots=True))
     digests = [wheel.digest for wheel in wheels]
     distributions = [wheel.distribution for wheel in wheels]
     if len(digests) != len(set(digests)):
         raise LaunchRefusal("wheel_digest_duplicate", "one digest has multiple owners")
     if len(distributions) != len(set(distributions)):
         raise LaunchRefusal("wheel_distribution_duplicate", "one distribution has multiple owners")
-    granted_wheels = [wheel for wheel in wheels if wheel.owner != "base"]
-    granted_digests = {wheel.digest for wheel in granted_wheels}
+    granted_digests = {wheel.digest for wheel in wheels}
     if set(wheel_paths) != granted_digests:
         missing = sorted(granted_digests - set(wheel_paths))
         extra = sorted(set(wheel_paths) - granted_digests)
@@ -585,10 +585,10 @@ def endpoint_overlay_input(
         environment_spec_digest=_digest(environment_spec_bytes),
         base_family_digest=_digest(wheelhouse_manifest_bytes),
         project_wheel_digest=project.digest,
-        wheels=tuple(granted_wheels),
+        wheels=tuple(wheels),
         grants=tuple(
             overlay.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
-            for wheel in granted_wheels
+            for wheel in wheels
         ),
     )
 
@@ -633,10 +633,10 @@ def _matches(raw: bytes, digest: str, name: str) -> None:
         )
 
 
-def _wheels(value: object, owner: str) -> list[overlay.Wheel]:
+def _wheels(value: object, owner: str, *, import_roots: bool = False) -> list[overlay.Wheel]:
     if not isinstance(value, list):
         raise LaunchRefusal(f"{owner}_wheel_inventory_invalid", "wheels is not a list")
-    wheels = [_wheel(row, owner) for row in value]
+    wheels = [_wheel(row, owner, import_roots=import_roots) for row in value]
     names = [wheel.distribution for wheel in wheels]
     if names != sorted(names) or len(names) != len(set(names)):
         raise LaunchRefusal(
@@ -645,26 +645,50 @@ def _wheels(value: object, owner: str) -> list[overlay.Wheel]:
     return wheels
 
 
-def _wheel(value: object, owner: str) -> overlay.Wheel:
+def _wheel(value: object, owner: str, *, import_roots: bool = False) -> overlay.Wheel:
     keys = {"digest", "distribution", "filename", "length", "tags", "version"}
+    if import_roots:
+        keys.add("import_roots")
     if not isinstance(value, dict) or set(value) != keys:
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel row has the wrong fields")
     digest = value["digest"]
     _require_digest(digest, f"{owner}_wheel.digest")
-    strings = (value["distribution"], value["filename"], value["version"])
-    if not all(isinstance(item, str) and item for item in strings):
+    distribution = value["distribution"]
+    filename = value["filename"]
+    version = value["version"]
+    strings = (distribution, filename, version)
+    if (
+        not all(isinstance(item, str) and item for item in strings)
+        or not overlay.normalized_distribution(str(distribution))
+        or not overlay.valid_wheel_filename(str(filename))
+        or not overlay.valid_wheel_version(str(version))
+    ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel strings are empty or invalid")
     length = value["length"]
     tags = value["tags"]
-    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
-        raise LaunchRefusal(f"{owner}_wheel_invalid", "length is not positive")
+    if (
+        not isinstance(length, int)
+        or isinstance(length, bool)
+        or length <= 0
+        or length > overlay.MAX_WHEEL_BYTES
+    ):
+        raise LaunchRefusal(f"{owner}_wheel_invalid", "length is not positive and bounded")
     if (
         not isinstance(tags, list)
         or not tags
-        or not all(isinstance(tag, str) and tag for tag in tags)
+        or not all(isinstance(tag, str) and overlay.valid_wheel_tag(tag) for tag in tags)
         or tags != sorted(set(tags))
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "tags are not non-empty sorted unique")
+    roots = value.get("import_roots", [])
+    if (
+        not isinstance(roots, list)
+        or not all(isinstance(root, str) and overlay.valid_import_root(root) for root in roots)
+        or roots != sorted(set(roots))
+    ):
+        raise LaunchRefusal(
+            f"{owner}_wheel_invalid", "import_roots are not sorted unique identifiers"
+        )
     return overlay.Wheel(
         distribution=value["distribution"],
         version=value["version"],
@@ -672,7 +696,8 @@ def _wheel(value: object, owner: str) -> overlay.Wheel:
         digest=str(digest),
         length=length,
         tags=tuple(tags),
-        owner={"project": "project", "bundle": "custom", "wheelhouse": "base"}[owner],
+        owner={"project": "project", "bundle": "custom"}[owner],
+        import_roots=tuple(roots),
     )
 
 

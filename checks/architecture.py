@@ -13,6 +13,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   delivery-plan-observation
   pod-media-grant-root
   measured-backend-version
+  base-ownership-vectors
 """
 
 from __future__ import annotations
@@ -568,6 +569,203 @@ def fence_torch_free_import() -> list[str]:
                     f"{module_of(path)}:{node.lineno} imports torch at module scope — the "
                     "harness imports it inside a function so the base package stays torch-free"
                 )
+    return bad
+
+
+def fence_base_ownership_vectors() -> list[str]:
+    """Run the strict complete-base parser over frozen v2/refusal vectors."""
+
+    import hashlib
+    import importlib
+    import tempfile
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import canonical, overlay
+
+    materialize_launch = importlib.import_module("cozy_runtime.internal.materialize_launch")
+
+    bad: list[str] = []
+    path = ROOT / "vectors" / "base-ownership.jsonl"
+    names: set[str] = set()
+    rows = [line for line in path.read_text().splitlines() if line.strip()]
+    for line_number, line in enumerate(rows, 1):
+        vector = json.loads(line)
+        if not isinstance(vector, dict):
+            bad.append(f"{path}:{line_number}: vector is not an object")
+            continue
+        name = vector.get("name")
+        document = vector.get("document")
+        expected = vector.get("expect")
+        if (
+            not isinstance(name, str)
+            or name in names
+            or not isinstance(document, dict)
+            or not isinstance(expected, str)
+        ):
+            bad.append(f"{path}:{line_number}: vector fields are incomplete or duplicated")
+            continue
+        names.add(name)
+        raw = canonical.write(document)
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        try:
+            overlay.parse_base_manifest(raw, digest)
+            got = "ok"
+        except overlay.OverlayRefusal as exc:
+            got = exc.code
+        if got != expected:
+            bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
+    wanted = {"legacy-v1-refused", "minimal-complete-v2", "unknown-provider-refused"}
+    if names != wanted:
+        bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
+    cross = ROOT / "vectors" / "tensorhub-base-worker-image-wheelhouse-v2.json"
+    raw = cross.read_bytes()
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if len(raw) != 23_687 or digest != (
+        "sha256:4cbfafc9afcfe3bbc148070bf394a1d585ded4d5f9a6a33795c6e6a924ce1d0a"
+    ):
+        bad.append(
+            f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
+        )
+    try:
+        manifest = overlay.parse_base_manifest(raw, digest)
+    except overlay.OverlayRefusal as exc:
+        bad.append(f"{cross}: Runtime refused Tensorhub bytes: {exc.code}: {exc.detail}")
+    else:
+        census = (
+            len(manifest.base_distributions),
+            len(manifest.base_import_roots),
+            len(manifest.wheels),
+        )
+        if census != (82, 359, 5):
+            bad.append(f"{cross}: ownership census is {census}, want (82, 359, 5)")
+
+        def counted_wheel(index: int, owner: str) -> overlay.Wheel:
+            label = "project" if owner == "project" else f"custom-{index:03d}"
+            distribution = f"cr027-{label}"
+            return overlay.Wheel(
+                distribution=distribution,
+                version="1.0.0",
+                filename=f"{distribution}-1.0.0-py3-none-any.whl",
+                digest="sha256:" + hashlib.sha256(label.encode()).hexdigest(),
+                length=1,
+                tags=("py3-none-any",),
+                owner=owner,
+                import_roots=(distribution.replace("-", "_"),),
+            )
+
+        project = counted_wheel(0, "project")
+
+        def counted_input(custom_count: int) -> overlay.Input:
+            wheels = (
+                project,
+                *(counted_wheel(index, "custom") for index in range(custom_count)),
+            )
+            return overlay.Input(
+                environment_spec_digest="sha256:" + "1" * 64,
+                base_family_digest=digest,
+                project_wheel_digest=project.digest,
+                wheels=wheels,
+                grants=(),
+            )
+
+        admitted = overlay._verify_inventory(counted_input(127), manifest)
+        if len(admitted) != 128:
+            bad.append(f"cr-027 wheel-count boundary admitted {len(admitted)} rows, want 128")
+        try:
+            overlay._verify_inventory(counted_input(128), manifest)
+        except overlay.OverlayRefusal as exc:
+            if exc.code != "overlay_wheel_set_invalid" or exc.detail != "129":
+                bad.append(
+                    "cr-027 128-custom refusal was "
+                    f"{exc.code}:{exc.detail}, want overlay_wheel_set_invalid:129"
+                )
+        else:
+            bad.append("cr-027 admitted 128 custom wheels plus the project wheel")
+    contract_root = ROOT / "vectors" / "tensorhub-wheel-contract"
+    bundle_bytes = (contract_root / "endpoint-bundle.json").read_bytes()
+    environment_bytes = (contract_root / "endpoint-environment-spec.json").read_bytes()
+    index_bytes = (contract_root / "fixture-index.json").read_bytes()
+    project_bytes = (contract_root / "project-wheel.json").read_bytes()
+    resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
+    exact_contract = {
+        "endpoint-bundle.json": (
+            bundle_bytes,
+            "f8844101d181e4dee7e483c87e37f349b140121f2d9d3b0d43c4c36d7d0f1f5f",
+        ),
+        "endpoint-environment-spec.json": (
+            environment_bytes,
+            "f3e0c5394b030dbda2645813252f5063f1f6023a170574576f5a798e7c9d2988",
+        ),
+        "fixture-index.json": (
+            index_bytes,
+            "13a543eb8530559d4e7aa539e48cb8cf86feed4698c473362d12808b1a50906e",
+        ),
+        "project-wheel.json": (
+            project_bytes,
+            "e374821cce113ced053fe870c067fb2252ad32b649b5539ebb4847bf639aed22",
+        ),
+        "resolved-wheel-set.json": (
+            resolved_bytes,
+            "b9c9c9e31ed22390e9ed15df2c206bea86184e205aaf22ef23d9cdc3d78240ac",
+        ),
+    }
+    for name, (payload, want_digest) in exact_contract.items():
+        got_digest = hashlib.sha256(payload).hexdigest()
+        if got_digest != want_digest:
+            bad.append(f"{contract_root / name}: exact Tensorhub bytes hash to {got_digest}")
+    try:
+        bundle = canonical.parse_canonical(bundle_bytes)
+        fixture = canonical.parse_canonical(index_bytes)
+        project = canonical.parse_canonical(project_bytes)
+        resolved = canonical.parse_canonical(resolved_bytes)
+    except canonical.CanonicalError as exc:
+        bad.append(f"{contract_root}: Tensorhub wheel contract is noncanonical: {exc}")
+        return bad
+    if (
+        not isinstance(bundle, dict)
+        or not isinstance(fixture, dict)
+        or not isinstance(project, dict)
+        or not isinstance(resolved, dict)
+        or bundle.get("project_wheel") != project
+    ):
+        bad.append(f"{contract_root}: project WheelFact differs from EndpointBundle bytes")
+        return bad
+    wheel_files = fixture.get("wheel_files")
+    if not isinstance(wheel_files, dict) or not all(
+        isinstance(digest, str) and isinstance(name, str) for digest, name in wheel_files.items()
+    ):
+        bad.append(f"{contract_root}: fixture wheel file map is invalid")
+        return bad
+    try:
+        joined = materialize_launch.endpoint_overlay_input(
+            environment_spec_bytes=environment_bytes,
+            endpoint_bundle_bytes=bundle_bytes,
+            resolved_wheel_set_bytes=resolved_bytes,
+            wheelhouse_manifest_bytes=raw,
+            wheel_paths={digest: contract_root / name for digest, name in wheel_files.items()},
+        )
+    except Exception as exc:
+        bad.append(f"{contract_root}: Runtime refused Tensorhub-authored join: {exc}")
+    else:
+        facts = [(wheel.distribution, wheel.owner, wheel.import_roots) for wheel in joined.wheels]
+        if facts != [
+            ("proof-endpoint", "project", ("project_endpoint",)),
+            ("proof-custom", "custom", ("proof_custom",)),
+        ]:
+            bad.append(f"{contract_root}: Runtime joined wheel facts as {facts}")
+        else:
+            try:
+                with tempfile.TemporaryDirectory(prefix="cozy-th-wheel-contract-") as temporary:
+                    installed = overlay.materialize(
+                        joined,
+                        pathlib.Path(temporary),
+                        base_manifest=cross,
+                        python=pathlib.Path(sys.executable),
+                    )
+                    if not installed.generation.is_dir():
+                        bad.append(f"{contract_root}: exact Tensorhub overlay was not published")
+            except overlay.OverlayRefusal as exc:
+                bad.append(f"{contract_root}: exact Tensorhub wheels refused: {exc}")
     return bad
 
 
@@ -1138,6 +1336,7 @@ FENCES = {
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "artifact-object-sets": fence_artifact_object_sets,
+    "base-ownership-vectors": fence_base_ownership_vectors,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "env-authority": fence_env_authority,
