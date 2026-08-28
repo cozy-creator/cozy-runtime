@@ -261,6 +261,35 @@ LIVE_ARMS = (
         "credential_field",
     ),
     (
+        # cr-051: the value guard inspects bytes and is the real defence; the NAME guard's
+        # residual value is a credential in an unrecognised format. It must not eat the most
+        # obvious fields an inference endpoint emits — `tokens_per_second` and
+        # `output_tokens` — while still refusing a field named for a credential.
+        "observation-metric-names-are-not-credentials",
+        "from cozy_runtime.author._observations import EventRing, ObservationRefusal\n"
+        "ring = EventRing()\n"
+        "admitted = ('tokens_per_second', 'output_tokens', 'input_tokens', 'total_tokens',\n"
+        "            'token_count', 'eos_token', 'kernel_signature', 'signatures')\n"
+        "for name in admitted:\n"
+        "    ring.emit('metric', name, 1.0)\n"
+        "    ring.emit('log', 'decoded', 'info', **{name: 1})\n"
+        "assert ring.caps()['refused'] == 0, ring.caps()\n"
+        "refused = ('token', 'signature', 'access_token', 'api_token', 'refresh_token',\n"
+        "           'session_token', 'oauth_token', 'api_signature', 'auth_token',\n"
+        "           'api_key', 'password', 'private_key', 'cookie')\n"
+        "for name in refused:\n"
+        "    try:\n"
+        "        ring.emit('log', 'fetching', 'info', **{name: 'ya29.a0Af'})\n"
+        "    except ObservationRefusal as exc:\n"
+        "        assert exc.code == 'credential_field', (name, exc.code)\n"
+        "    else:\n"
+        "        raise SystemExit('ADMITTED a credential-named field: ' + name)\n"
+        "assert ring.caps()['refused'] == len(refused), ring.caps()\n"
+        "raise SystemExit('admitted %d descriptive names, refused %d credential names'\n"
+        "    % (len(admitted), len(refused)))\n",
+        "admitted 8 descriptive names, refused 13 credential names",
+    ),
+    (
         "observation-credential-value",
         "from cozy_runtime.author._observations import EventRing\n"
         "EventRing().emit('log', 'signed the url', "

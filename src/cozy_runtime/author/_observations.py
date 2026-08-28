@@ -59,10 +59,23 @@ MAX_TRACKS = 32
 #: Fixed per-row bookkeeping charged against `MAX_RING_BYTES` beside the row's own text.
 ROW_OVERHEAD = 96
 
-#: Field/parameter names that carry credentials. Matching one is a REFUSAL, not a redaction.
+#: Names that are credential-shaped WHEREVER they appear as a whole `_.-`-delimited segment.
+#: Nothing an inference handler measures is called one of these, so position does not matter.
 _SECRET_NAME = re.compile(
-    r"(?i)(^|[_.-])(tokens?|secrets?|passwo?rds?|passwd|api_?keys?|auth|authorization"
-    r"|bearer|credentials?|private_?key|session_?key|cookie|signature|access_?key)([_.-]|$)"
+    r"(?i)(^|[_.-])(secrets?|passwo?rds?|passwd|api_?keys?|auth|authorization"
+    r"|bearer|credentials?|private_?key|session_?key|cookie|access_?key)([_.-]|$)"
+)
+#: `token` and `signature` are the two credential words that are ALSO ordinary telemetry
+#: nouns: `output_tokens`, `tokens_per_second` and `eos_token` are counts, rates and
+#: vocabulary — the most obvious fields an inference endpoint emits — and refusing them made
+#: the guard a false positive at the one boundary it exists to protect. They are
+#: credential-shaped only when the name IS the bare word, or ends in it in the SINGULAR
+#: directly after a credential qualifier. A plural, a trailing word, or an unqualified
+#: `eos_token` is a description; `access_token` and `api_signature` are still an identity.
+_SECRET_NAME_QUALIFIED = re.compile(
+    r"(?i)^(token|signature)$"
+    r"|(^|[_.-])(access|api|app|bearer|client|csrf|id|oauth|refresh|sas|security"
+    r"|session|xsrf)[_.-](token|signature)$"
 )
 #: Value shapes that carry credentials — signed URLs and the common bearer/key spellings.
 _SECRET_VALUE = re.compile(
@@ -87,7 +100,7 @@ def _text(value: str, cap: int, what: str) -> str:
 
 
 def _no_secret(where: str, text: str) -> None:
-    if _SECRET_NAME.search(where) is not None:
+    if _SECRET_NAME.search(where) is not None or _SECRET_NAME_QUALIFIED.search(where) is not None:
         raise ObservationRefusal(
             f"observation field {where!r} is credential-shaped: telemetry is retained, "
             "shipped and rendered, so a secret-named field is refused at the emit boundary "

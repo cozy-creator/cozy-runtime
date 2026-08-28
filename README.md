@@ -76,7 +76,9 @@ shed, and an O(1) time accumulator (`Attribution`) that makes inference step tim
 without one retained row per step — 324 ns per step against a ~100 ms handler leg. Progress
 frames are never retained; their durable form is that accumulator plus the monotone position
 the silence detector reads. A credential-shaped field is REFUSED at the emit boundary, not
-redacted downstream.
+redacted downstream — where `token` and `signature`, which are also ordinary telemetry nouns,
+are credential-shaped only bare or directly qualified (`access_token`), so `tokens_per_second`
+and `output_tokens` are admitted.
 
 **Every terminal attempt commits one `WorkerTriageBundle`** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
