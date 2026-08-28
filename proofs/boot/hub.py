@@ -143,8 +143,10 @@ def author(
         sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
     evaluated = release.add(canonical({"format": "proof.EvaluatedConfig/1"}), "config")
-    source_archive = release.add(b"cr-049-boot-proof-source", "source")
-    source_lock = release.add(b"cr-049-boot-proof-lock", "lock")
+    # These exact refs prove publication provenance but are deliberately not
+    # runtime grant subjects. The executable source payload is project_wheel.
+    source_archive = b"cr-049-boot-proof-source"
+    source_lock = b"cr-049-boot-proof-lock"
     bundle = release.add(
         canonical(
             {
