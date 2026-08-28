@@ -25,6 +25,7 @@ from cozy_runtime.internal.materialize_launch import (
     _open_cache_store,
     materialize_objects,
 )
+from cozy_runtime.internal.worker import acquire
 
 
 def _ref(raw: bytes) -> provisioned.ArtifactRef:
@@ -160,6 +161,11 @@ def main() -> int:
                 deadline=None,
                 store_root=warm_local,
             )
+            warm_observation = acquire.AcquisitionObservation()
+            warm_observation.start("model")
+            acquire.observe_model_sources(warm_observation, warm)
+            warm_observation.finish("model")
+            warm_leg = warm_observation.snapshot().model
             assert warm.store == warm_local and warm.store != cache_root
             assert warm.sources == {
                 "cloud": {"bytes": 0, "objects": 0},
@@ -169,6 +175,11 @@ def main() -> int:
                     "objects": 3,
                 },
             }
+            assert warm_leg.downloaded_bytes == 0
+            assert warm_leg.reused_bytes == (
+                manifest_ref.length + second_manifest_ref.length + segment_ref.length
+            )
+            assert warm_leg.ended_monotonic_ns >= warm_leg.started_monotonic_ns > 0
             shutil.rmtree(cache_root)
             warm_store = tensorfs.Store.open(str(warm_local))
             assert (
@@ -247,6 +258,11 @@ def main() -> int:
                     deadline=None,
                     store_root=cloud_only_local,
                 )
+            cold_observation = acquire.AcquisitionObservation(lambda _value: 1 / 0)
+            cold_observation.start("model")
+            acquire.observe_model_sources(cold_observation, cloud_only)
+            cold_observation.finish("model")
+            cold_leg = cold_observation.snapshot().model
             cloud_only_bytes = manifest_ref.length + segment_ref.length
             assert cloud_only.sources == {
                 "cloud": {"bytes": cloud_only_bytes, "objects": 2},
@@ -254,6 +270,9 @@ def main() -> int:
                 "network_cache": {"bytes": 0, "objects": 0},
             }
             assert not cloud_only.network_cache_degradations
+            assert cold_leg.downloaded_bytes == cloud_only_bytes
+            assert cold_leg.reused_bytes == 0
+            assert cold_leg.ended_monotonic_ns >= cold_leg.started_monotonic_ns > 0
             cloud_only_store = tensorfs.Store.open(str(cloud_only_local))
             assert all(
                 cloud_only_store.verify(ref.digest[7:])["verdict"] == "verified"

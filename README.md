@@ -203,13 +203,21 @@ receipt and base-family manifest; it does not walk or re-hash every installed fi
 is baked in the image and endpoint bytecode is compiled once during overlay publication. The
 executor starts with image Python and APPENDS the overlay import root after image-owned paths.
 
-On a remote placement, schema-rev-6 `PlacementSpec/2` names one exact
+On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control
 convergence lane starts three independent legs together: endpoint project/custom wheels,
 binding/model documents, and the exact model-object closure into TensorFS. Source/model
 downloads therefore overlap; READY still joins the overlay, TensorFS closure, binding
 resolution, and device construction. A grant refresh re-drives the same accepted revision
 without changing its identity.
+
+Schema rev 7 exposes that work as observation only. `PlacementStatus.acquisition` retains
+endpoint/model start and end values from one process-monotonic clock plus cumulative
+downloaded/reused bytes. Partial states are emitted while either leg runs; terminal values
+remain attached to that placement spec. These values are never read by admission,
+materialization, convergence, fallback, or readiness code. Cold proof checks interval overlap;
+warm proof checks zero downloaded endpoint bytes and exact verified reuse, while the real
+TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
 The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
