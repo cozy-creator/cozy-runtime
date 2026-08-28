@@ -166,6 +166,19 @@ class CheckpointFaultCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CHECKPOINT_FAULT_CODE_NOT_JOB_MODE: _ClassVar[CheckpointFaultCode]
     CHECKPOINT_FAULT_CODE_STALE_SEQUENCE: _ClassVar[CheckpointFaultCode]
     CHECKPOINT_FAULT_CODE_QUOTA_EXCEEDED: _ClassVar[CheckpointFaultCode]
+
+class ArtifactFinalizeDisposition(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    ARTIFACT_FINALIZE_DISPOSITION_UNSPECIFIED: _ClassVar[ArtifactFinalizeDisposition]
+    ARTIFACT_FINALIZE_DISPOSITION_ADOPT: _ClassVar[ArtifactFinalizeDisposition]
+    ARTIFACT_FINALIZE_DISPOSITION_ABANDON: _ClassVar[ArtifactFinalizeDisposition]
+    ARTIFACT_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED: _ClassVar[ArtifactFinalizeDisposition]
+
+class ArtifactFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    ARTIFACT_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[ArtifactFinalizeOutcome]
+    ARTIFACT_FINALIZE_OUTCOME_ADOPTED: _ClassVar[ArtifactFinalizeOutcome]
+    ARTIFACT_FINALIZE_OUTCOME_ABANDONED: _ClassVar[ArtifactFinalizeOutcome]
 POSTURE_UNSPECIFIED: Posture
 POSTURE_ACCEPTING: Posture
 POSTURE_DRAINING: Posture
@@ -278,9 +291,16 @@ CHECKPOINT_FAULT_CODE_UNKNOWN_ATTEMPT: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_NOT_JOB_MODE: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_STALE_SEQUENCE: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_QUOTA_EXCEEDED: CheckpointFaultCode
+ARTIFACT_FINALIZE_DISPOSITION_UNSPECIFIED: ArtifactFinalizeDisposition
+ARTIFACT_FINALIZE_DISPOSITION_ADOPT: ArtifactFinalizeDisposition
+ARTIFACT_FINALIZE_DISPOSITION_ABANDON: ArtifactFinalizeDisposition
+ARTIFACT_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED: ArtifactFinalizeDisposition
+ARTIFACT_FINALIZE_OUTCOME_UNSPECIFIED: ArtifactFinalizeOutcome
+ARTIFACT_FINALIZE_OUTCOME_ADOPTED: ArtifactFinalizeOutcome
+ARTIFACT_FINALIZE_OUTCOME_ABANDONED: ArtifactFinalizeOutcome
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_grant_update")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_grant_update", "artifact_finalize_request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -289,6 +309,7 @@ class RecordOwnerFrame(_message.Message):
     CHECKPOINT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_ACK_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_GRANT_UPDATE_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_FINALIZE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -297,10 +318,11 @@ class RecordOwnerFrame(_message.Message):
     checkpoint_receipt: JobCheckpointReceipt
     snapshot_ack: SnapshotAck
     artifact_grant_update: ArtifactGrantUpdate
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_grant_update: _Optional[_Union[ArtifactGrantUpdate, _Mapping]] = ...) -> None: ...
+    artifact_finalize_request: ArtifactFinalizeRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_grant_update: _Optional[_Union[ArtifactGrantUpdate, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
-    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot")
+    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result")
     CLAIM_ACK_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ACCEPTED_FIELD_NUMBER: _ClassVar[int]
@@ -309,6 +331,7 @@ class WorkerFrame(_message.Message):
     CHECKPOINT_REQUEST_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINT_ACK_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_FINALIZE_RESULT_FIELD_NUMBER: _ClassVar[int]
     claim_ack: ClaimAck
     observed_state: ObservedWorkerState
     attempt_accepted: AttemptAccepted
@@ -317,7 +340,8 @@ class WorkerFrame(_message.Message):
     checkpoint_request: JobCheckpointRequest
     checkpoint_ack: JobCheckpointAck
     snapshot: WorkerSnapshot
-    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ...) -> None: ...
+    artifact_finalize_result: ArtifactFinalizeResultFrame
+    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResultFrame, _Mapping]] = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof", "wire_schema_digest")
@@ -808,7 +832,7 @@ class AttemptOutcome(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ..., outcome_canonical_bytes: _Optional[bytes] = ..., placement_id: _Optional[str] = ...) -> None: ...
 
 class AttemptOutcomeBody(_message.Message):
-    __slots__ = ("request_id", "attempt_ordinal", "invocation_spec_digest", "status", "output_manifest", "metrics", "triage_bundle", "safe_message", "cause", "result", "execution_started")
+    __slots__ = ("request_id", "attempt_ordinal", "invocation_spec_digest", "status", "output_manifest", "metrics", "triage_bundle", "safe_message", "cause", "result", "execution_started", "artifact_receipts")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -820,6 +844,7 @@ class AttemptOutcomeBody(_message.Message):
     CAUSE_FIELD_NUMBER: _ClassVar[int]
     RESULT_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_STARTED_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RECEIPTS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     attempt_ordinal: int
     invocation_spec_digest: str
@@ -831,7 +856,108 @@ class AttemptOutcomeBody(_message.Message):
     cause: OutcomeCause
     result: ResultEnvelope
     execution_started: bool
-    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[str] = ..., status: _Optional[_Union[OutcomeStatus, str]] = ..., output_manifest: _Optional[_Union[OutputManifest, _Mapping]] = ..., metrics: _Optional[_Union[AttemptMetrics, _Mapping]] = ..., triage_bundle: _Optional[_Union[TriageBundleRef, _Mapping]] = ..., safe_message: _Optional[str] = ..., cause: _Optional[_Union[OutcomeCause, _Mapping]] = ..., result: _Optional[_Union[ResultEnvelope, _Mapping]] = ..., execution_started: bool = ...) -> None: ...
+    artifact_receipts: _containers.RepeatedCompositeFieldContainer[ArtifactReceiptRef]
+    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[str] = ..., status: _Optional[_Union[OutcomeStatus, str]] = ..., output_manifest: _Optional[_Union[OutputManifest, _Mapping]] = ..., metrics: _Optional[_Union[AttemptMetrics, _Mapping]] = ..., triage_bundle: _Optional[_Union[TriageBundleRef, _Mapping]] = ..., safe_message: _Optional[str] = ..., cause: _Optional[_Union[OutcomeCause, _Mapping]] = ..., result: _Optional[_Union[ResultEnvelope, _Mapping]] = ..., execution_started: bool = ..., artifact_receipts: _Optional[_Iterable[_Union[ArtifactReceiptRef, _Mapping]]] = ...) -> None: ...
+
+class ArtifactReceiptRef(_message.Message):
+    __slots__ = ("artifact_receipt_digest", "artifact_receipt_canonical_bytes")
+    ARTIFACT_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RECEIPT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    artifact_receipt_digest: bytes
+    artifact_receipt_canonical_bytes: bytes
+    def __init__(self, artifact_receipt_digest: _Optional[bytes] = ..., artifact_receipt_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class ArtifactReceipt(_message.Message):
+    __slots__ = ("owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "tensorfs_receipt_digest", "tensorfs_receipt_canonical_bytes")
+    OWNER_AUTHORITY_SCOPE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    owner_authority_scope: str
+    request_id: str
+    invocation_spec_digest: str
+    output_slot: str
+    artifact_transaction_id: str
+    tensorfs_receipt_digest: str
+    tensorfs_receipt_canonical_bytes: bytes
+    def __init__(self, owner_authority_scope: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[str] = ..., tensorfs_receipt_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class ArtifactFinalizeDecision(_message.Message):
+    __slots__ = ("owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot", "disposition", "artifact_receipt_digest", "scratch_root_id")
+    OWNER_AUTHORITY_SCOPE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    DISPOSITION_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SCRATCH_ROOT_ID_FIELD_NUMBER: _ClassVar[int]
+    owner_authority_scope: str
+    request_id: str
+    invocation_spec_digest: str
+    output_slot: str
+    disposition: ArtifactFinalizeDisposition
+    artifact_receipt_digest: str
+    scratch_root_id: str
+    def __init__(self, owner_authority_scope: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., disposition: _Optional[_Union[ArtifactFinalizeDisposition, str]] = ..., artifact_receipt_digest: _Optional[str] = ..., scratch_root_id: _Optional[str] = ...) -> None: ...
+
+class ArtifactFinalizeResult(_message.Message):
+    __slots__ = ("owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot", "outcome", "artifact_receipt")
+    OWNER_AUTHORITY_SCOPE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    owner_authority_scope: str
+    request_id: str
+    invocation_spec_digest: str
+    output_slot: str
+    outcome: ArtifactFinalizeOutcome
+    artifact_receipt: ArtifactReceiptRef
+    def __init__(self, owner_authority_scope: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., outcome: _Optional[_Union[ArtifactFinalizeOutcome, str]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptRef, _Mapping]] = ...) -> None: ...
+
+class ArtifactFinalizeRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "decision_digest", "decision_canonical_bytes")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    DECISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    DECISION_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    request_id: str
+    invocation_spec_digest: bytes
+    output_slot: str
+    decision_digest: bytes
+    decision_canonical_bytes: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., decision_digest: _Optional[bytes] = ..., decision_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class ArtifactFinalizeResultFrame(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "result_digest", "result_canonical_bytes")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    RESULT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RESULT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    request_id: str
+    invocation_spec_digest: bytes
+    output_slot: str
+    result_digest: bytes
+    result_canonical_bytes: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., result_digest: _Optional[bytes] = ..., result_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class ResultEnvelope(_message.Message):
     __slots__ = ("result_schema_digest", "inline_result", "result_blob", "adjustments", "checkpoint_ref")
