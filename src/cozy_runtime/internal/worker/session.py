@@ -253,6 +253,13 @@ class Placement:
     retained_fallback_spec_digest: bytes = b""
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutorDeath:
+    """One exact child exit awaiting the serialized device lane's rebuild decision."""
+
+    executor: child.Executor
+
+
 @dataclass(slots=True)
 class OwnershipFence:
     """WHO may drive this worker, and on WHICH stream (02 §0/§4).
@@ -653,7 +660,7 @@ class Worker:
         #: dispatched it did not.
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
         self.watches = WatchFanout(PROGRESS_QUEUE)
-        self.work: queue.Queue[AttemptRecord | None] = queue.Queue()
+        self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
         # Slow source/custom-wheel and model-document acquisition never runs on a control
         # stream thread. One lane serializes revisions; the revision check after every slow
         # leg discards a superseded result before it can move serving state.
@@ -661,6 +668,7 @@ class Worker:
         self.stop = threading.Event()
         self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
+        self.supervision.on_exit = self.executor_exited
         self.connected = threading.Event()
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
@@ -851,6 +859,25 @@ class Worker:
             self.set_job_ready(False)
         else:
             self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
+
+    def executor_exited(self, executor: child.Executor) -> None:
+        """Withdraw an exact dead incarnation and ask the device lane to rebuild it.
+
+        The pidfd watcher does not reap.  Invalidation clears the ready-plan set and moves
+        admission before this callback returns; replacement remains queued behind whichever
+        attempt already owns the serialized lane.  Both transitions target ``executor``, so
+        a watcher for E1 cannot invalidate or rebuild E2.
+        """
+
+        with self.control_lock:
+            rebuild = self.dispatchable()
+            if not self.supervision.invalidate(
+                executor,
+                f"executor incarnation {executor.incarnation} pid {executor.pid} exited",
+            ):
+                return
+            if rebuild and not self.stop.is_set():
+                self.work.put(ExecutorDeath(executor))
 
     def executor_changed(self, executor: child.Executor | None) -> None:
         """Move the ledger at the same boundary that publishes executor ownership.
@@ -2956,9 +2983,13 @@ class Worker:
     def device_lane(self) -> None:
         """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild."""
         while not self.stop.is_set():
-            attempt = self.work.get()
-            if attempt is None:
+            item = self.work.get()
+            if item is None:
                 return
+            if isinstance(item, ExecutorDeath):
+                self.rebuild_exited(item.executor)
+                continue
+            attempt = item
             if self.admit(attempt):
                 self.execute(attempt)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
@@ -3130,9 +3161,23 @@ class Worker:
         with self.control_lock:
             self._rebuild_locked(why)
 
+    def rebuild_exited(self, executor: child.Executor) -> None:
+        """Rebuild only if the queued death still names the owned dead incarnation."""
+
+        with self.control_lock:
+            if self.supervision.current is not executor or executor.alive():
+                return
+            self._rebuild_locked(
+                f"observed exit of executor incarnation {executor.incarnation} pid {executor.pid}"
+            )
+
     def _rebuild_locked(self, why: str) -> None:
         """Rebuild while desired-state convergence is excluded."""
-        self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING, "executor rebuild")
+        job = self.accepted.mode == "job"
+        if job:
+            self.set_job_ready(False)
+        else:
+            self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING, "executor rebuild")
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
         current = self.supervision.current
@@ -3144,11 +3189,20 @@ class Worker:
         except ExecutorGone as exc:
             self.note("recovery", f"respawn failed: {exc}")
             self.latched = f"executor_respawn_failed: {exc}"[:200]
-            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "respawn failed")
+            if job:
+                self.set_job_ready(False)
+            else:
+                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "respawn failed")
             self._settle()
             return
         self.bump_admission("executor respawned")
-        self.activate_executor()
+        if job:
+            executor = self.supervision.current
+            assert executor is not None
+            executor.reserved_for_job = True
+            self.set_job_ready(True)
+        else:
+            self.activate_executor()
         self.note(
             "recovery",
             f"dispatchable again in {(time.perf_counter() - started) * 1000:.0f} ms at "

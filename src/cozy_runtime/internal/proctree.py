@@ -22,6 +22,7 @@ import errno
 import hashlib
 import os
 import secrets
+import select
 import signal
 import stat
 import sys
@@ -101,6 +102,34 @@ class ProcessIdentity:
 
     pid: int
     started_ticks: int
+
+
+@dataclass(slots=True)
+class ProcessExitObserver:
+    """A pollable kernel handle for one exact process birth.
+
+    Waiting on the pidfd reports exit without reaping the child.  The unreaped zombie keeps
+    its numeric PID pinned until executor retirement also proves driver absence, which is the
+    lifecycle ordering :mod:`cozy_runtime.internal.worker.child` requires.
+    """
+
+    process: ProcessIdentity
+    descriptor: int
+
+    def wait(self) -> None:
+        while True:
+            try:
+                readable, _, _ = select.select([self.descriptor], [], [])
+            except InterruptedError:
+                continue
+            if readable:
+                return
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        os.close(self.descriptor)
+        self.descriptor = -1
 
 
 @dataclass(slots=True)
@@ -665,6 +694,12 @@ def _open_pidfd(process: ProcessIdentity) -> int:
         os.close(descriptor)
         raise ProcessLookupError(process.pid)
     return descriptor
+
+
+def observe_process_exit(process: ProcessIdentity) -> ProcessExitObserver:
+    """Open the exact-birth, non-reaping exit observer used by executor supervision."""
+
+    return ProcessExitObserver(process, _open_pidfd(process))
 
 
 def signal_process(process: ProcessIdentity, sig: int) -> None:

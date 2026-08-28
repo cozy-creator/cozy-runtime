@@ -3,7 +3,7 @@
 
 One run, six core sections, no model, no CAS, no GPU: boot -> invoke -> cooperative cancel ->
 executor crash -> worker kill + orphan check -> journal recovery, then the control-spine and
-executor-egress arms (`--only <name>` runs one of those alone). This is the sequence
+executor-liveness and egress arms (`--only <name>` runs one of those alone). This is the sequence
 a platform port must pass before it may call itself a port (cr-020 items 1-5, cr-021's
 process half): every section exercises the REAL worker control process, the REAL executor spawn path
 (trampoline seal included), and the REAL protocol bytes — only the endpoint is weightless.
@@ -1085,6 +1085,110 @@ def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
         hub.close()
 
 
+def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
+    """cr-024: idle death withdraws capacity and rebuilds without an offer."""
+
+    wl.head("16. idle executor liveness: withdraw immediately, rebuild on the device lane")
+    tmp = Path(base + "-idle-liveness")
+    worker, ids = start_weightless(tmp, instance_id="ins-idle-liveness", fresh=True)
+    hub = worker.hub
+    try:
+        initial = hub.ready(ids["hold"], args.observe * 2)
+        first = hub.deployment(initial)
+        first_pid = executor_pid_of(worker, args.observe)
+        first_generation = first.executor_generation
+        first_admission = initial.admission_generation
+        since = hub.mark()
+
+        os.kill(first_pid, signal.SIGKILL)
+        withdrawn = hub.wait(
+            lambda m: (
+                m.observed_state
+                if m.WhichOneof("msg") == "observed_state"
+                and m.observed_state.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
+                and hub.deployment(m.observed_state).serving
+                == pb.ServingState.SERVING_STATE_ACTIVATING
+                and not hub.deployment(m.observed_state).dispatchable_plan_ids
+                else None
+            ),
+            args.observe,
+            "idle executor capacity withdrawal",
+            since,
+        )
+        wl.check(
+            "idle child exit withdraws admission before any offer observes stale capacity",
+            withdrawn.admission_generation > first_admission,
+            f"pid {first_pid}, admission {first_admission}->{withdrawn.admission_generation}, "
+            f"serving={pb.ServingState.Name(hub.deployment(withdrawn).serving)}",
+        )
+
+        recovered = hub.ready(ids["hold"], args.observe * 2, since=since)
+        second_pid = executor_pid_of(worker, args.observe)
+        second_generation = hub.deployment(recovered).executor_generation
+        wl.check(
+            "the exact idle death rebuilds automatically with no offer as a trigger",
+            second_pid != first_pid
+            and second_generation == first_generation + 1
+            and pid_gone(first_pid, args.observe, "idle dead executor")
+            and not hub.terminals(),
+            f"pid {first_pid}->{second_pid}, generation "
+            f"{first_generation}->{second_generation}, outcomes={len(hub.terminals())}",
+        )
+
+        since = hub.mark()
+        wl.dispatch(
+            hub,
+            tmp,
+            ids["hold"],
+            request_id="req-exit-race",
+            payload={"seconds": 120.0},
+            release=RELEASE,
+            outputs=0,
+        )
+        hub.wait(
+            lambda m: (
+                m.attempt_accepted
+                if m.WhichOneof("msg") == "attempt_accepted"
+                and m.attempt_accepted.request_id == "req-exit-race"
+                else None
+            ),
+            args.observe,
+            "exit-race attempt accepted",
+            since,
+        )
+        os.kill(second_pid, signal.SIGKILL)
+        terminal = hub.wait(
+            lambda m: (
+                m.attempt_outcome
+                if m.WhichOneof("msg") == "attempt_outcome"
+                and m.attempt_outcome.request_id == "req-exit-race"
+                else None
+            ),
+            args.observe,
+            "exit-race outcome",
+            since,
+        )
+        body = wl.terminal_body(terminal)
+        raced_recovery = hub.ready(ids["hold"], args.observe * 2, since=since)
+        third_pid = executor_pid_of(worker, args.observe)
+        third_generation = hub.deployment(raced_recovery).executor_generation
+        outcomes = hub.terminals("req-exit-race", 1)
+        wl.check(
+            "watcher and attempt-side death observations produce one outcome and one rebuild",
+            body["status"] == 5
+            and body["cause"]["code"] == 16
+            and len(outcomes) == 1
+            and third_pid != second_pid
+            and third_generation == second_generation + 1,
+            f"status={body['status']} cause={body.get('cause', {}).get('code')} "
+            f"outcomes={len(outcomes)} pid {second_pid}->{third_pid}, generation "
+            f"{second_generation}->{third_generation}",
+        )
+    finally:
+        worker.stop()
+        hub.close()
+
+
 def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     """cr-024: exercise supervision directly, including races the wire serializes."""
     from cozy_runtime.internal import accel, proctree
@@ -1544,6 +1648,7 @@ SECTIONS = {
     "live-delivery": section_live_delivery,
     "claim-convergence": section_claim_convergence_fence,
     "generation-replacement": section_generation_replacement,
+    "idle-liveness": section_idle_executor_liveness,
     "supervision-atomicity": section_supervision_atomicity,
     "egress": section_executor_egress,
 }
