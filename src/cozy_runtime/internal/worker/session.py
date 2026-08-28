@@ -3354,6 +3354,7 @@ class Worker:
             device_name=facts.gpu_name,
             device_memory_total_bytes=facts.vram_total_bytes,
             driver_version=facts.driver_version,
+            backend_version=facts.cuda_version,
             host_ram_total_bytes=facts.host_ram_total_bytes,
             vcpu_count=facts.vcpu_count,
             unreadable=list(facts.unreadable),

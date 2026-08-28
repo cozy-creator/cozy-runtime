@@ -177,6 +177,11 @@ OMISSION_ARMS = (
         SRC / "cli" / "materialize_launch.py",
         '        "--no-warm",\n',
     ),
+    OmissionArm(
+        "measured-backend-version",
+        SRC / "internal" / "worker" / "session.py",
+        "            backend_version=facts.cuda_version,\n",
+    ),
 )
 
 #: A committed bundle, edited on disk afterwards, must be a DETECTED corruption rather than
