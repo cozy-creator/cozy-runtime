@@ -11,6 +11,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   one-address-predicate
   dynamic-pods-skip-boot-warm
   delivery-plan-observation
+  pod-media-grant-root
 """
 
 from __future__ import annotations
@@ -1010,6 +1011,56 @@ def fence_delivery_plan_observation() -> list[str]:
     return bad
 
 
+def fence_pod_media_grant_root() -> list[str]:
+    """The fixed adapter declares cozy-pod/podmedia's one exact shared filesystem root."""
+
+    path = SRC / "cli" / "materialize_launch.py"
+    tree = ast.parse(path.read_text())
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "MEDIA_ROOT" for target in node.targets
+        )
+    ]
+    if len(assignments) != 1:
+        return [
+            f"{path.relative_to(ROOT)}: MEDIA_ROOT has {len(assignments)} authorities; "
+            "cozy-pod and Runtime share one fixed root"
+        ]
+    value = assignments[0].value
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "Path"
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Constant)
+        and value.args[0].value == "/var/lib/cozy/media"
+    ):
+        return [
+            f"{path.relative_to(ROOT)}: MEDIA_ROOT must equal cozy-pod's exact "
+            "`/var/lib/cozy/media` root"
+        ]
+    source = (
+        ast.get_source_segment(
+            path.read_text(),
+            next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_worker_command"
+            ),
+        )
+        or ""
+    )
+    if "grant_roots = str(MEDIA_ROOT)" not in source:
+        return [
+            f"{path.relative_to(ROOT)}: fixed worker argv no longer derives --grant-root "
+            "from MEDIA_ROOT"
+        ]
+    return []
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -1032,6 +1083,7 @@ FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
     "delivery-plan-observation": fence_delivery_plan_observation,
+    "pod-media-grant-root": fence_pod_media_grant_root,
 }
 
 

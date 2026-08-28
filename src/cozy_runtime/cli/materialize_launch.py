@@ -34,7 +34,10 @@ from cozy_runtime.internal.materialize_launch import (
 )
 
 WORKER_ROOT = Path("/run/cozy/worker")
-MEDIA_ROOT = Path("/run/cozy/media")
+# Shared with cozy-pod's podmedia server. This is persistent pod data, unlike /run's
+# restart-local control state: PutInput returns file:// paths beneath this exact root and
+# the worker's grant authorizer must recognize the same tree without widening it.
+MEDIA_ROOT = Path("/var/lib/cozy/media")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

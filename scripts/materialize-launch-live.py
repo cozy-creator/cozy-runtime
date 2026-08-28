@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict, cast
 
-from cozy_runtime.cli.materialize_launch import _worker_command
+from cozy_runtime.cli.materialize_launch import MEDIA_ROOT, _worker_command
 from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
 from cozy_runtime.internal.config import (
     ConfigError,
@@ -29,6 +29,7 @@ from cozy_runtime.internal.materialize_launch import (
     materialize_objects,
 )
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.grants import Authorizer, GrantRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import SCHEMA_DIGEST
@@ -379,6 +380,24 @@ def main() -> int:
         )
         assert command.count("--no-warm") == 1
         assert command.index("serve") < command.index("--no-warm") < command.index("--socket")
+        grant_root = command[command.index("--grant-root") + 1]
+        assert grant_root == str(MEDIA_ROOT) == "/var/lib/cozy/media"
+        authorizer = Authorizer(roots=(grant_root,))
+        # podmedia PutInput returns a payload path below its fixed mediaRoot. Exercise the
+        # worker's real closed call table and root selector against that returned shape.
+        payload_url = "file:///var/lib/cozy/media/inputs/invocation-live/payload.json"
+        authorizer.authorize("grant_input_read", "GET", payload_url, {"input_id": "payload"})
+        assert authorizer.allowed == 1 and authorizer.refusals == []
+        for outside in (
+            "file:///run/cozy/media/inputs/invocation-live/payload.json",
+            "file:///var/lib/cozy/media-other/inputs/invocation-live/payload.json",
+        ):
+            try:
+                authorizer.authorize("grant_input_read", "GET", outside, {"input_id": "payload"})
+            except GrantRefusal as exc:
+                assert exc.code == "grant_path_outside_roots"
+            else:
+                raise AssertionError(f"outside podmedia path {outside!r} was authorized")
         # The hardcut is specific to fixed generic substrates. A hand-started/local worker
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
