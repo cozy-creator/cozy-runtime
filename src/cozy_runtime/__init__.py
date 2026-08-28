@@ -6,7 +6,7 @@
 # from it, which is the whole lesson of a `WIRE_MINOR` that agreed while the bytes did not.
 from cozy_runtime.protocol import SCHEMA_DIGEST, WIRE_MINOR, WIRE_SCHEMA_REV
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # The two independent semvers reported by `cozy-runtime version`.
 PYTHON_CONTRACT_VERSION = "0.0.2"
