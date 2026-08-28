@@ -1,17 +1,21 @@
-"""Private generation-reuse and tamper proof below the public proof-seat CLI.
+"""Private generation-reuse, wheel-store, and tamper proof below the public proof-seat CLI.
 
 The public environment proof deliberately requires a fresh root. Production replay reuses an
-already published receipt-keyed generation, so these checks honestly exercise Runtime internals
-without pretending they are part of the public CLI contract.
+already published receipt-keyed generation, and production materialization hardlinks from the
+shared wheel store, so these checks honestly exercise Runtime internals without pretending they
+are part of the public CLI contract.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from cozy_runtime.internal import environment
@@ -87,11 +91,121 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment_spec_digest=source.environment_spec_digest,
         ),
     )
+    _store_proof(root, source, uv, python, expected, expected_digest)
     print(
         "private environment materializer: publish-race and receipt-keyed reuse retained exact "
-        "receipt bytes; unrecorded and tampered installed bytes refused"
+        "receipt bytes; unrecorded and tampered installed bytes refused; wheel-store "
+        "materialization shared inodes at byte-identical receipts, survived concurrency, and "
+        "refused a cross-device store and a tampered store entry"
     )
     return 0
+
+
+def _store_proof(
+    root: Path,
+    source: environment.EnvironmentInput,
+    uv: Path,
+    python: Path,
+    expected: bytes,
+    expected_digest: str,
+) -> None:
+    """The store must share inodes, change no receipt byte, and fail closed."""
+
+    store = root / "wheel-store"
+
+    foreign = Path("/dev/shm") / f"cozy-wheel-store-{os.getpid()}"
+    try:
+        _refusal(
+            "wheel_store_cross_device",
+            lambda: environment.materialize(
+                source,
+                root / "environment-store-xdev",
+                uv=uv,
+                python=python,
+                store=foreign,
+            ),
+        )
+    finally:
+        shutil.rmtree(foreign, ignore_errors=True)
+
+    # Two placements materializing at once must not corrupt or half-populate an entry.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        raced = [
+            future.result()
+            for future in [
+                pool.submit(
+                    environment.materialize,
+                    source,
+                    root / f"environment-store-{name}",
+                    uv=uv,
+                    python=python,
+                    store=store,
+                )
+                for name in ("a", "b")
+            ]
+        ]
+    for installed in raced:
+        _require(
+            installed.receipt_bytes == expected,
+            "wheel-store materialization changed the receipt bytes",
+        )
+        _require(installed.receipt_digest == expected_digest, "wheel-store receipt digest differs")
+
+    # A third generation, now certainly a full store hit, must hardlink rather than unpack.
+    third = environment.materialize(
+        source, root / "environment-store-c", uv=uv, python=python, store=store
+    )
+    _require(third.receipt_bytes == expected, "store-hit materialization changed receipt bytes")
+
+    shared = 0
+    for path in sorted(_site(third.generation).rglob("*")):
+        if not path.is_file():
+            continue
+        info = path.stat()
+        _require(not path.is_symlink(), f"store linked a symlink: {path}")
+        _require(not info.st_mode & 0o222, f"store linked a writable file: {path}")
+        if info.st_nlink > 1:
+            shared += 1
+    _require(shared > 0, "store-hit generation shares no inode with the store")
+
+    entries = sorted(p for p in store.rglob("entry.json"))
+    _require(bool(entries), "store published no entry")
+    for entry in entries:
+        document = json.loads(entry.read_bytes())
+        _require(
+            document.get("format") == "cozy.runtime.WheelStoreEntry/1",
+            f"store entry has the wrong format: {entry}",
+        )
+        _require(not entry.stat().st_mode & 0o222, f"store entry is mutable: {entry}")
+
+    # A poisoned store entry is caught by RECORD verification, not trusted into a generation.
+    victim = _project_file(store)
+    original = victim.read_bytes()
+    mode = victim.stat().st_mode
+    victim.chmod(mode | stat.S_IWUSR)
+    victim.write_bytes(b"VALUE = 'store tamper'\n")
+    victim.chmod(mode)
+    try:
+        _refusal(
+            "installed_record_mismatch",
+            lambda: environment.materialize(
+                source,
+                root / "environment-store-tampered",
+                uv=uv,
+                python=python,
+                store=store,
+            ),
+        )
+    finally:
+        victim.chmod(mode | stat.S_IWUSR)
+        victim.write_bytes(original)
+        victim.chmod(mode)
+
+
+def _project_file(store: Path) -> Path:
+    matches = sorted(store.rglob("tree/lib/python*/site-packages/proof_environment_project/*.py"))
+    _require(len(matches) == 1, f"store holds {len(matches)} project sources, wanted one")
+    return matches[0]
 
 
 def _refusal(code: str, call: Callable[[], object]) -> None:
