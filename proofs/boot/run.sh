@@ -1,6 +1,6 @@
 #!/bin/sh
 # cr-048 + cr-049 boot proof: build this tree's wheel and the endpoint fixture, install only
-# the Runtime/base family into the substrate stand-in, and BOOT with no provision document.
+# the Runtime/base family into the base-worker-image stand-in, and BOOT with no provision document.
 # The pod then receives its FIRST placement and must fetch, overlay, and serve it.
 set -eu
 
@@ -27,7 +27,7 @@ cp "$here/Dockerfile" "$here/pod.py" "$here/hub.py" "$here/nvidia-smi" \
     "$repo/proofs/support/proof_data.py" "$proof_root/context/"
 
 nice -n 19 docker build --quiet -t "$image" "$proof_root/context" >/dev/null
-# THE SUBSTRATE'S CGROUP GRANT, in its local form. execution-substrates hands the pod a
+# THE WORKER'S CGROUP GRANT, in its local form. The launcher hands the pod a
 # DELEGATED cgroup-v2 subtree, and internal/proctree.py refuses to run an executor without
 # one — it never silently falls back to a weaker scope, which is the property, not an
 # inconvenience. `--cgroupns=private` gives the container its own namespaced cgroup root

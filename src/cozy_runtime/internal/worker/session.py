@@ -1179,9 +1179,9 @@ class Worker:
     ) -> None:
         """ClaimAck + the one recovery snapshot, for a claim this worker can actually serve.
 
-        `worker_artifact_digest` is where SUBSTRATE identity rides and NOWHERE ELSE
+        `worker_artifact_digest` is where BASE-WORKER-IMAGE identity rides and NOWHERE ELSE
         (#487/#489): it is evidence about a MACHINE, never identity of an ENVIRONMENT, which
-        is why `EndpointEnvironmentSpec` has no substrate key at all.
+        is why `EndpointEnvironmentSpec` has no base-worker-image key at all.
         """
         ack = pb.ClaimAck(
             accepted=True,
@@ -1907,7 +1907,7 @@ class Worker:
                     reason="environment_materialization_input_missing",
                     detail=f"receipt {expected} is required, but this worker was launched "
                     "without --environment-root and --artifact-store; the worker will not "
-                    "guess where a substrate put endpoint overlays or TensorFS objects",
+                    "guess where the worker put endpoint overlays or TensorFS objects",
                 ),
                 terminal=False,
             )
@@ -3547,7 +3547,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         default="",
         help="the worker ARTIFACT's provenance digest, `sha256:<64 hex>`; absent stays "
         "absent. Was --image-digest: a native worker has no OCI image (#481), and this is "
-        "the one field substrate identity rides (#487/#489)",
+        "the one field base-worker-image identity rides (#487/#489)",
     )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")

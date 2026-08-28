@@ -504,7 +504,7 @@ def main() -> int:
                 assert exc.code == "grant_path_outside_roots"
             else:
                 raise AssertionError(f"outside podmedia path {outside!r} was authorized")
-        # The hardcut is specific to fixed generic substrates. A hand-started/local worker
+        # The hardcut is specific to fixed base worker images. A hand-started/local worker
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
         prove_worker_warm_policy(root / "worker-policy")

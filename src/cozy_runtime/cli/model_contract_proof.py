@@ -1,6 +1,6 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
-The command runs from the installed substrate Python plus a receipt-keyed endpoint overlay.
+The command runs from the base worker image's Python plus a receipt-keyed endpoint overlay.
 It verifies that small overlay receipt and base-family join, then delegates endpoint import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete

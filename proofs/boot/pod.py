@@ -490,7 +490,8 @@ def main() -> int:
         "LANG": "C.UTF-8",
         # The artifact origin is this proof's own HTTPS listener, so the pod trusts its
         # certificate the way a pod trusts any private CA: through the ONE platform name the
-        # substrate already passes through (`config.ADAPTER_CHILD_PLATFORM_ENV`). No new
+        # base-worker-image bootstrap already passes through
+        # (`config.ADAPTER_CHILD_PLATFORM_ENV`). No new
         # adapter variable, and no verification is skipped anywhere.
         "SSL_CERT_FILE": str(origin_certificate),
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",

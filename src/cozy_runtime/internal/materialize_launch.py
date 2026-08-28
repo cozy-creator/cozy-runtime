@@ -38,7 +38,7 @@ ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
-# execution-substrates creates and grants the runtime exactly this container-local data root.
+# The base-worker-image bootstrap creates exactly this container-local Runtime data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
 BOOT_ROOT = LOCAL_DATA_ROOT / "boot"
@@ -108,12 +108,12 @@ def prepare_boot(
     Tensorhub stops polling at the same instant either way, so all it decides is whether
     the operator reads a reason or reads silence.
 
-    THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the substrate-baked
-    control-Runtime wheel and reported the digest so "the hub learns a value". But the hub
-    pinned that image BY DIGEST — tensorhub registers a substrate as `name@sha256:…` and
-    refuses a tag — so the wheel inside it is a fact the hub CHOSE, not one the pod can
-    teach it. Hashing image-resident bytes to echo them back proves something the OCI
-    digest already proved before this process existed.
+    THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the control-Runtime wheel
+    baked into the base worker image and reported the digest so "the hub learns a value".
+    But the hub pinned that image BY DIGEST — tensorhub registers a base worker image as
+    `name@sha256:…` and refuses a tag — so the wheel inside it is a fact the hub CHOSE,
+    not one the pod can teach it. Hashing image-resident bytes to echo them back proves
+    something the OCI digest already proved before this process existed.
 
     THE EMPTY OBJECT SET STAYS. It is not a claim to anybody: it is the document the
     worker started three lines later demands by its launch grammar (`--artifact-object-set`

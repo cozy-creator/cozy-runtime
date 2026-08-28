@@ -1,4 +1,4 @@
-"""Fixed generic-substrate boot adapter entrypoint.
+"""Fixed base-worker-image boot adapter entrypoint.
 
 The pod boots to READY-BUT-EMPTY. No provision document is read and nothing is fetched —
 GPU inventory measured, worker started with zero placements, both listeners proven to
@@ -7,7 +7,7 @@ over rev-2's `DesiredPlacementSet` from the connected RecordOwner, and is treate
 identically to placements 2..N — it is FETCHED through the standing `ArtifactGrant` and
 MATERIALIZED by the same acquisition walk every later revision runs (cr-049).
 
-Nothing here re-measures the pod's own image. The hub pinned the substrate by OCI digest
+Nothing here re-measures the pod's own image. The hub pinned the base worker image by OCI digest
 before this process existed, so every byte baked into it is already attested; the pod
 reports only what it OBSERVED — its GPUs, its listeners, the token hashes it was handed.
 """
@@ -93,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             CliError(
                 err.code,
                 err.detail,
-                "repair the substrate image or the create-time environment and launch a "
+                "repair the base worker image or the create-time environment and launch a "
                 "new attempt",
                 Exit.structural,
             ),
@@ -178,7 +178,7 @@ def _worker_command(
         "-m",
         "cozy_runtime.cli.main",
         "serve",
-        # A generic substrate becomes useful by staging the requested endpoint and model,
+        # A base worker image becomes useful by staging the requested endpoint and model,
         # not by running an arbitrary synthetic inference before it can advertise the
         # placement. Endpoint code is dynamic and untrusted to be cheap: a handler blocked
         # in its first CUDA read previously left an otherwise prepared pod ACTIVATING
@@ -199,7 +199,7 @@ def _worker_command(
         boot_id,
         # No `--release-id`: a pod that hosts no placement HAS no endpoint release, and the
         # worker's empty `release_id` is the honest answer an owner reads back. No
-        # `--artifact-digest` for the same reason: the only substrate identity this pod
+        # `--artifact-digest` for the same reason: the only base-worker-image identity this pod
         # could measure is its own image, which the hub pinned by digest, so "absent stays
         # absent" (#481) is the honest answer there too.
         "--devices",

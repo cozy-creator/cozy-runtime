@@ -184,9 +184,9 @@ loading, or output quality.
 
 The environment proof likewise builds and installs the exact Runtime wheel before invoking its
 public command from `/` with `PYTHONPATH` unset. Its base packages are installed once in the
-driver, exactly like an official PyTorch substrate. The command hashes and inspects only the
-project/custom wheels, extracts them into private staging, precompiles that small overlay, and
-atomically publishes it. Cold and independent rebuilds produce the same compact receipt.
+driver, matching the base worker image. The command hashes and inspects only the project/custom
+wheels, extracts them into private staging, precompiles that small overlay, and atomically
+publishes it. Cold and independent rebuilds produce the same compact receipt.
 
 ### Installed base plus endpoint overlay
 

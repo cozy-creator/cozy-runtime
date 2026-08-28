@@ -106,7 +106,7 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class AdapterConfig:
-    """The fixed execution-substrate handoff to ``cozy-materialize-launch``.
+    """The fixed base-worker-image handoff to ``cozy-materialize-launch``.
 
     THE POD BOOTS ON ENVIRONMENT ALONE (cr-048). The retired
     ``tensorhub.rental_provision_spec/1`` + ``_bundle/1`` pair was a second, boot-only
@@ -247,7 +247,10 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
 
 
 def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConfig:
-    """Read the substrate adapter seam once, with no loose ``COZY_ADAPTER_*`` extension."""
+    """Read the base-worker-image adapter seam once.
+
+    No loose ``COZY_ADAPTER_*`` extension is admitted.
+    """
 
     global _adapter_read
     if _adapter_read:
@@ -262,7 +265,8 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         raise ConfigError(
             "adapter_config",
             "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed adapter",
-            "install and execute the substrate-owned control Runtime wheel without source paths",
+            "install and execute the control Runtime wheel owned by the base worker image "
+            "without source paths",
         )
     if unknown := sorted(
         name for name in env if name.startswith("COZY_ADAPTER_") and name not in ADAPTER_ENV
@@ -270,7 +274,7 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         raise ConfigError(
             "adapter_config",
             f"unknown adapter environment variable {unknown[0]}",
-            "use the closed execution-substrate adapter handoff",
+            "use the closed base-worker-image adapter handoff",
         )
 
     def required(name: str) -> str:
@@ -279,7 +283,7 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
             raise ConfigError(
                 "adapter_config",
                 f"required adapter environment variable {name} is absent",
-                "launch only through the generic execution-substrate bootstrap",
+                "launch only through the generic base-worker-image bootstrap",
             )
         return value
 

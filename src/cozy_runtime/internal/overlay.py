@@ -1,6 +1,6 @@
-"""Small endpoint overlays over the immutable substrate Python environment.
+"""Small endpoint overlays over the immutable base-worker-image Python environment.
 
-The substrate image already owns Python, Torch/CUDA, cozy-runtime, TensorFS, and their
+The base worker image already owns Python, Torch/CUDA, cozy-runtime, TensorFS, and their
 common dependencies. A placement therefore materializes only the endpoint project wheel
 and optional endpoint-owned custom wheels. It never creates a venv, resolves a dependency,
 copies a base package, or re-hashes the base environment's RECORD tree.

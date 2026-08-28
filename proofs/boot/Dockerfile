@@ -1,4 +1,4 @@
-# Runtime-side stand-in for the official PyTorch substrate. The base Python has the control
+# Runtime-side stand-in for the base worker image. The base Python has the control
 # Runtime and its small dependencies installed once; the endpoint wheel remains only in the
 # proof origin and must arrive through ArtifactGrant after boot.
 ARG PYTHON_IMAGE=python:3.12-slim
