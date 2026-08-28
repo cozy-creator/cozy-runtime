@@ -84,13 +84,15 @@ written and fsynced BEFORE its write receipt is journaled and before the termina
 it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
 killed executor is therefore explainable from a directory, with no live process and no SSH.
 
-**The worker's grant table is FILESYSTEM-ONLY, in both directions** (cr-042). Every row of
-`internal/worker/grants.py`'s closed `HUB_CALLS` table is `file://`, so an InvocationSpec
-cannot name an exfiltration target whatever the endpoint produced — a granted output
-destination is a path on this machine or it is refused. `OutputAccess.url` on the wire says
-"presigned upload URL"; honouring it DELETES this property and is a new adversary rung, not
-a completion. Armed by `scripts/worker-live.py grants` end to end and by
-`scripts/assets-live.py egress` at the table.
+**Every granted destination is CONTROL-PLANE-MINTED** (cr-042). The closed `HUB_CALLS` table
+in `internal/worker/grants.py` spends a grant minted for one invocation, so nothing the
+endpoint produced — and nothing a request body can influence — chooses where bytes land; a
+destination with no row is a SECURITY EVENT. Every row is `file://` today.
+`OutputAccess.url`'s "presigned upload URL" is the PLANNED public route — tensorhub mints
+it, R2 sits behind it, the worker never holds the credential — and lands WITH host
+validation of the minted URL: that, not a filesystem-only table, is what keeps the property.
+Armed by `scripts/worker-live.py grants` end to end and `scripts/assets-live.py egress` at
+the table.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
 installs `sandbox.refuse_network`, so endpoint or job code that dials is refused typed at

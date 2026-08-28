@@ -8,7 +8,7 @@ hydration, the real executor and the real endpoint, and prints numbers.
   kill       the executor dies mid-attempt: the terminal converges, the spool is cleaned
   arms       the typed red arms, each planted for real
   egress     a real HTTP server: allowlist, per-hop SSRF, the bounded reader, the ONE
-             address predicate both downloaders call, and the write-inert grant table
+             address predicate both downloaders call, and the closed grant table
   debts      cl-010's three cozy-runtime debts, exercised through the product surfaces
   all        every section above, in order
 """
@@ -901,10 +901,10 @@ def egress() -> None:
                 f"{malformed_grant_refusals}/2 typed refusals",
             )
 
-            # cr-042: the WRITE-INERT invariant, at the unit the closed table decides it in.
-            # worker-live's `grants` section proves the same refusal end to end; this one is
-            # here so a contributor honouring `OutputAccess.url`'s "presigned upload URL"
-            # sees it fail beside the table row they just widened.
+            # cr-042: the closed table decides the destination, at the unit it decides it
+            # in; worker-live's `grants` section proves the same refusal end to end. The
+            # `https://` output row `OutputAccess.url` reserves is PLANNED — whoever adds it
+            # lands host validation of the minted URL and rewrites this arm around it.
             exfiltrating = grants.BoundGrant(
                 outputs={
                     "image": grants.BoundOutput(
@@ -922,10 +922,11 @@ def egress() -> None:
             except grants.GrantRefusal as exc:
                 exfiltration_refused = exc.code
             check(
-                "ARM: a granted output destination ON THE NETWORK is unwritable, whoever minted it",
+                "ARM: a destination the closed table has no row for is unwritable — there is "
+                "no `https://` output row yet",
                 exfiltration_refused in ("hub_call_unauthorized", "grant_transport"),
-                f"{exfiltration_refused or 'it wrote'} — every HUB_CALLS row is `file://`, "
-                "so an InvocationSpec cannot name an exfiltration target",
+                f"{exfiltration_refused or 'it wrote'} — every HUB_CALLS row is `file://` "
+                "today, so a destination the table never minted a row for does not resolve",
             )
 
             inside_parent = grant_root / "parent"

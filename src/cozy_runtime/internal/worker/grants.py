@@ -14,16 +14,19 @@ is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and repor
 `Fault`, because a worker asking for something it was never granted is a fact an operator
 must see. Nothing widens the table at runtime; a new call site is a new reviewed row.
 
-**THE WORKER IS WRITE-INERT TO THE NETWORK, in both directions, and that is deliberate.**
-Every row of `HUB_CALLS` is `file://`: the local deployment's own spool or CAS, resolved by
-`_local` and held inside the declared grant roots. Nothing a grant can say moves a byte onto
-the network — an output destination is a path on this machine or it is refused, so an
-InvocationSpec cannot name an exfiltration target, whatever the endpoint produced.
-`scripts/worker-live.py grants` proves it against a planted
-`https://exfiltrate.example/upload` destination: `hub_call_unauthorized`, a SECURITY EVENT.
-The `OutputAccess.url` field says "presigned upload URL" (`worker.proto`) and adding the row
-that honours it DELETES this property — that is a new adversary rung, not a completion, and
-it needs its own decision.
+**EVERY DESTINATION IS CONTROL-PLANE-MINTED, never named by request content.** The grant is
+minted for one invocation and spent here, so nothing the endpoint produced — and nothing a
+request body can influence — chooses where bytes land: a destination the table has no row
+for refuses typed, and `scripts/worker-live.py grants` plants
+`https://exfiltrate.example/upload` for the `hub_call_unauthorized` SECURITY EVENT. Every
+row is `file://` TODAY, resolved by `_local` inside the declared grant roots.
+`OutputAccess.url`'s "presigned upload URL" (`worker.proto`) is the PLANNED public route —
+tensorhub mints it, R2 sits behind it, the worker never holds the credential — so that row
+is a completion, and whoever lands it lands HOST VALIDATION of the minted URL with it. That
+is what keeps the property; a `file://`-only table never did — `scripts/lifecycle-live.py
+--only egress` watches a `ctypes` connect(2) LAND from inside the serving executor, so a
+hostile endpoint already holds a socket. The rung is the fence's own, below: a careless
+endpoint and a malicious GRANT, never a malicious endpoint.
 
 cr-012 shipped an `https://` INPUT row and an `EgressPolicy` allowlist for it. Both are gone
 (cr-042): `DeclaredBinding.egress_allowed_hosts` never had a writer, so the row refused every
@@ -87,11 +90,11 @@ class HubCall:
 #: The COMPLETE set of calls this worker may make. Read it as the security boundary it
 #: is: anything not spelled here cannot be dialled, whoever asks.
 #:
-#: INVARIANT (cr-042): every row is `file://`. The worker moves granted bytes between the
-#: local filesystem and this process and NOWHERE else, which is what makes an exfiltrating
-#: output destination unrepresentable rather than merely unusual. A row with a network
-#: scheme in it — the `presigned upload URL` `OutputAccess.url` invites — deletes that
-#: property. Proven by `scripts/worker-live.py grants`.
+#: Every row is `file://` TODAY. The `https://` output row `OutputAccess.url` reserves
+#: ("presigned upload URL") is PLANNED, not forbidden — land it WITH host validation of the
+#: control-plane-minted URL, because what this table holds is that a destination is minted
+#: for the invocation and never named by request content, not that bytes stay off the
+#: network (cr-042). Armed by `scripts/worker-live.py grants`.
 HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_input_read",
