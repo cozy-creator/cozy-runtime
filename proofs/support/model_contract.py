@@ -99,19 +99,29 @@ def _prepare(args: argparse.Namespace) -> None:
     )
     _require(len(base_pairs) == 5, "proof base does not carry five control wheels")
     target = _target()
+    profile = {
+        "accelerator_build": target["accelerator_abi"],
+        "os_cpu": "linux-x86",
+        "python_abi": target["python_abi"],
+        "torch_release": "2.13.0",
+    }
     base_distributions, base_import_roots = _installed_base_ownership()
     wheelhouse = _canonical(
         {
             "base_distributions": base_distributions,
             "base_import_roots": base_import_roots,
-            "format": "WheelhouseManifest/2",
+            "compatibility_profile": profile,
+            "format": "WheelhouseManifest/3",
+            "minimum_cuda_version": "12.6",
+            "minimum_driver_version": "560.28.03",
             "platform_target": target,
             "wheels": [_wheel(entry, import_roots=True) for entry, _ in base_pairs],
         }
     )
     resolved = _canonical(
         {
-            "format": "ResolvedWheelSet/2",
+            "compatibility_profile": profile,
+            "format": "ResolvedWheelSet/3",
             "lock_digest": _digest(b"proof-lock"),
             "platform_target": target,
             "wheelhouse_manifest_digest": _digest(wheelhouse),
@@ -156,6 +166,7 @@ def _prepare(args: argparse.Namespace) -> None:
     )
     spec = documents.canonical_bytes(
         pb.EndpointEnvironmentSpec(
+            compatibility_profile=pb.CompatibilityProfile(**profile),
             platform_target=pb.PlatformTarget(**target),
             endpoint_bundle_digest=documents.digest_of(bundle),
             project_wheel_digest=documents.raw(project.digest),

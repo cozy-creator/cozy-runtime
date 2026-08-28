@@ -35,8 +35,8 @@ from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
-ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
-RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/2"
+ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/2"
+RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
 # The base-worker-image bootstrap creates exactly this container-local Runtime data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -520,6 +520,7 @@ def endpoint_overlay_input(
     _closed(
         spec,
         {
+            "compatibility_profile",
             "endpoint_bundle_digest",
             "format",
             "platform_target",
@@ -551,7 +552,14 @@ def endpoint_overlay_input(
     source_lock = _ref(bundle["source_lock"], "source_lock")
     _closed(
         resolved,
-        {"format", "lock_digest", "platform_target", "wheelhouse_manifest_digest", "wheels"},
+        {
+            "compatibility_profile",
+            "format",
+            "lock_digest",
+            "platform_target",
+            "wheelhouse_manifest_digest",
+            "wheels",
+        },
         "resolved_wheel_set",
     )
     if resolved["format"] != RESOLVED_WHEEL_SET_FORMAT:
@@ -597,6 +605,12 @@ def endpoint_overlay_input(
         == dict(base_manifest.platform_target)
     ):
         raise LaunchRefusal("platform_target_mismatch", "release documents disagree")
+    if not isinstance(spec["compatibility_profile"], dict) or not (
+        spec["compatibility_profile"]
+        == resolved["compatibility_profile"]
+        == dict(base_manifest.compatibility_profile)
+    ):
+        raise LaunchRefusal("compatibility_profile_mismatch", "release documents disagree")
 
     project = _wheel(bundle["project_wheel"], "project", import_roots=True)
     if project.digest != spec["project_wheel_digest"]:

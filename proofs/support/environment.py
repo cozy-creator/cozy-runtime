@@ -351,15 +351,24 @@ def _release(
     wheel_paths: Mapping[str, Path],
     *,
     import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
-    resolved_format: str = "ResolvedWheelSet/2",
+    resolved_format: str = "ResolvedWheelSet/3",
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
+    profile = {
+        "accelerator_build": target["accelerator_abi"],
+        "os_cpu": "linux-x86",
+        "python_abi": target["python_abi"],
+        "torch_release": "2.13.0",
+    }
     wheelhouse = _canonical(
         {
             "base_distributions": base_distributions,
             "base_import_roots": base_import_roots,
-            "format": "WheelhouseManifest/2",
+            "compatibility_profile": profile,
+            "format": "WheelhouseManifest/3",
+            "minimum_cuda_version": "12.6",
+            "minimum_driver_version": "560.28.03",
             "platform_target": dict(target),
             "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
         }
@@ -372,6 +381,7 @@ def _release(
         resolved_rows.append(row)
     resolved = _canonical(
         {
+            "compatibility_profile": profile,
             "format": resolved_format,
             "lock_digest": _digest(b"proof-lock"),
             "platform_target": dict(target),
@@ -396,6 +406,7 @@ def _release(
     )
     spec = documents.canonical_bytes(
         pb.EndpointEnvironmentSpec(
+            compatibility_profile=pb.CompatibilityProfile(**profile),
             platform_target=pb.PlatformTarget(**target),
             endpoint_bundle_digest=documents.digest_of(bundle),
             project_wheel_digest=documents.raw(project.digest),

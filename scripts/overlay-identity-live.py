@@ -86,7 +86,15 @@ def base_manifest(path: Path) -> str:
                 {"providers": ["base-control"], "root": "base_control"},
                 {"providers": ["numpy"], "root": "numpy"},
             ],
-            "format": "WheelhouseManifest/2",
+            "compatibility_profile": {
+                "accelerator_build": "none",
+                "os_cpu": "linux-x86",
+                "python_abi": "cp312",
+                "torch_release": "2.13.0",
+            },
+            "format": "WheelhouseManifest/3",
+            "minimum_cuda_version": "12.6",
+            "minimum_driver_version": "560.28.03",
             "platform_target": {
                 "accelerator_abi": "none",
                 "accelerator_backend": "none",

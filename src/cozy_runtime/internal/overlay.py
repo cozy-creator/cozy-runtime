@@ -47,7 +47,7 @@ WHEEL_EXTRACTION_FORMAT = "cozy.runtime.EndpointWheelExtraction/1"
 WHEEL_EXTRACTION_IDENTITY_NAME = "endpoint-wheel-extraction.json"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
-WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/2"
+WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/3"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
@@ -64,6 +64,9 @@ _WHEEL_TAG = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0
 _SAFE_MEMBER = re.compile(r"^[^/][^\x00]*$")
 _PLATFORM_TARGET_FIELDS = frozenset(
     {"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"}
+)
+_COMPATIBILITY_PROFILE_FIELDS = frozenset(
+    {"accelerator_build", "os_cpu", "python_abi", "torch_release"}
 )
 
 
@@ -94,6 +97,9 @@ class BaseManifest:
     """The complete immutable Python ownership of one base worker image."""
 
     platform_target: tuple[tuple[str, str], ...]
+    compatibility_profile: tuple[tuple[str, str], ...]
+    minimum_cuda_version: str
+    minimum_driver_version: str
     wheels: tuple[Wheel, ...]
     base_distributions: tuple[tuple[str, str], ...]
     base_import_roots: tuple[tuple[str, tuple[str, ...]], ...]
@@ -406,7 +412,10 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     fields = {
         "base_distributions",
         "base_import_roots",
+        "compatibility_profile",
         "format",
+        "minimum_cuda_version",
+        "minimum_driver_version",
         "platform_target",
         "wheels",
     }
@@ -421,11 +430,35 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         or not all(isinstance(item, str) and item for item in platform.values())
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
+    profile = value["compatibility_profile"]
+    if (
+        not isinstance(profile, dict)
+        or set(profile) != _COMPATIBILITY_PROFILE_FIELDS
+        or not all(isinstance(item, str) and item for item in profile.values())
+        or profile["accelerator_build"] != platform["accelerator_abi"]
+        or profile["python_abi"] != platform["python_abi"]
+        or profile["os_cpu"] != "linux-x86"
+        or platform["os_arch"] != "linux/amd64"
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", profile["torch_release"]) is None
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
+    minimum_cuda = value["minimum_cuda_version"]
+    minimum_driver = value["minimum_driver_version"]
+    if (
+        not isinstance(minimum_cuda, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is None
+        or not isinstance(minimum_driver, str)
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is None
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid CUDA or driver floor")
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
     wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
     return BaseManifest(
         platform_target=tuple(sorted(platform.items())),
+        compatibility_profile=tuple(sorted(profile.items())),
+        minimum_cuda_version=minimum_cuda,
+        minimum_driver_version=minimum_driver,
         wheels=wheels,
         base_distributions=distributions,
         base_import_roots=roots,
