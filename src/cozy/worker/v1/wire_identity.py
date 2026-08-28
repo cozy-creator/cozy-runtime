@@ -4,6 +4,6 @@ WIRE_MINOR is the ADDITIVE linear train position (03 §1.3) and does NOT move fo
 in-place revision, so it is not a staleness fence. SCHEMA_DIGEST is (#530-A1).
 """
 
-WIRE_MINOR = 0
-WIRE_SCHEMA_REV = 4
-SCHEMA_DIGEST = "sha256:f22c1ca89c51c5c16e9d7541a3b91e9b38dd8bf423e2b619db7e6eb6cef10469"
+WIRE_MINOR = 1
+WIRE_SCHEMA_REV = 5
+SCHEMA_DIGEST = "sha256:aa9b8a42cedb1f5fcebd6cb191551b449f267e18ec194c376c6ba631e47a608f"
