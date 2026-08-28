@@ -34,10 +34,11 @@ clamps or reconciles a counter after that.
 on the stream that consumed it. Returning a slot with a live copy is a typed refusal, not
 a race — `lease_live`.
 
-**Read order is the STORE's, write order is the CONTRACT's.** The DestinationSet says which
-keys; TensorFS decides how to touch the disk for them. Since tfs-007 that split falls exactly
-on the boundary: this plane hands over the code-topology traversal and the store plans and
-reads it, while every delivered batch names the destination its bytes belong to.
+**Read order is the CONSTRUCTION's, byte location is the STORE's.** The construction census
+gives the complete ordered DestinationSet to TensorFS; the header is lookup data that says
+where those tensors' bytes live, never a second traversal authority. TensorFS validates and
+plans the supplied traversal, while every delivered batch names the destination its bytes
+belong to.
 
 **Verification is the store's job, and since tfs-007 it is done BY the store.** The interim
 Python CAS reader is gone (decisions #264): `Checkpoint` opens a real TensorFS store through
@@ -54,6 +55,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import hashlib
 import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -422,7 +424,12 @@ class Checkpoint:
         self._aliases = aliases()
 
     def rows(self, component: str) -> list[PlanRow]:
-        """The header's table for one component, in the header's own key order."""
+        """The header's lookup rows for one component.
+
+        Their iteration order has no execution authority. Plan resolution surveys each row
+        before construction; the later construction census supplies the traversal that
+        TensorFS validates and executes.
+        """
         table = self.header["components"].get(component)
         if table is None:
             raise _refuse(
@@ -661,6 +668,29 @@ def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     }
 
 
+def _traversal_digest(keys: Sequence[str]) -> str:
+    """Identity of one exact destination sequence, without importing a document codec."""
+    digest = hashlib.sha256()
+    for key in keys:
+        raw = key.encode("utf-8")
+        digest.update(len(raw).to_bytes(4, "big"))
+        digest.update(raw)
+    return "sha256:" + digest.hexdigest()
+
+
+def _require_construction_order(value: object, component: str) -> str:
+    """Admit TensorFS's construction-order token and no benchmark/header order."""
+    order = str(value)
+    if order != "construction":
+        raise _refuse(
+            "plan_divergence",
+            f"{component}: TensorFS returned order {order!r} for the construction's "
+            "destination traversal; header/key order is not executable",
+            [component],
+        )
+    return order
+
+
 @dataclass(frozen=True, slots=True)
 class LeafReplacement:
     """One destination that became a MODULE instead of a tensor. The substitution, as data.
@@ -854,8 +884,11 @@ class StreamingFillBackend:
             if isinstance(checkpoint, Mapping)
             else {row.component: checkpoint for row in rows}
         )
+        # Lookup only. Header iteration order must not become execution order: canonical JSON
+        # sorted it lexically (`blocks.10` before `blocks.2`), and the deterministic CBOR
+        # hardcut requires the ordered tensor rows to agree with the construction traversal.
+        # In both cases `_stream` receives the exact order from `fill`'s enqueue transaction.
         self.plan = {row.key: row for row in rows}
-        self.order = [row.key for row in rows]
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
         #: The BACKEND this generation is filled on. Memory metering and reclaim go through
@@ -882,7 +915,7 @@ class StreamingFillBackend:
         self.leases: dict[str, Any] = {}
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
-        self.expected: dict[str, tuple[str, ...]] = {}
+        self.expected: dict[str, frozenset[str]] = {}
         self.components: dict[str, Any] = {}
         #: components this generation OWNS but is not holding on device right now. Their
         #: modules live on `meta`, so re-staging is a reservation plus a fill, never a copy
@@ -1156,16 +1189,18 @@ class StreamingFillBackend:
     # -- reservation -------------------------------------------------------------
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
-        """The contract's COMPLETE DestinationSets, and the verified read lease.
+        """The checkpoint's complete destination key sets, and the verified read lease.
 
-        Commit refuses on any key that never arrives, which is what makes a narrow component
-        declaration authoritative. The LEASE is acquired here rather than at commit, and the
-        ordering is the point: TensorFS verifies every object in the snapshot when the hold
-        registers, so a corrupt or truncated artifact refuses BEFORE this plane reserves a
-        single byte of device memory. The interim reader could only discover that mid-stream,
-        with gigabytes of destinations already live.
+        These are membership facts for commit, not a traversal. The ordered DestinationSet
+        arrives later from the construction census and must agree with them. The LEASE is
+        acquired here rather than at commit: TensorFS verifies every object in the snapshot
+        when the hold registers, so a corrupt or truncated artifact refuses BEFORE this plane
+        reserves a single byte of device memory. The interim reader could only discover that
+        mid-stream, with gigabytes of destinations already live.
         """
-        self.expected = {name: tuple(keys) for name, keys in sets.items()}
+        # Completeness is a SET question. Retaining header iteration here would create a
+        # second, accidental order authority even though commit only asks which keys arrived.
+        self.expected = {name: frozenset(keys) for name, keys in sets.items()}
         for name in sets:
             self._acquire(name)
         self.stats["lease_bytes"] = sum(int(v.bytes) for v in self.leases.values())
@@ -1557,13 +1592,13 @@ class StreamingFillBackend:
         if self.state == "open":
             self.state = "ready"
             return
-        missing = [
+        missing = sorted(
             key
             for name, keys in self.expected.items()
             if name in self.components
             for key in keys
             if key not in self.enqueued
-        ]
+        )
         if missing:
             raise _refuse(
                 "incomplete_fill",
@@ -1782,8 +1817,8 @@ class StreamingFillBackend:
         self.parked.pop(name, None)
         for destination in fresh.destinations:
             self.fill(destination.key, destination.spec, fresh.live[destination.key])
-        expected = tuple(self.expected.get(name, ()))
-        missing = [key for key in expected if key not in self.enqueued]
+        expected = self.expected.get(name, frozenset())
+        missing = sorted(key for key in expected if key not in self.enqueued)
         if missing:
             raise _refuse(
                 "incomplete_fill",
@@ -1992,11 +2027,10 @@ class StreamingFillBackend:
     def _stream(self, ring: StagingRing) -> int:
         """The store streams; this plane splices and fences.
 
-        cr-005's rule survives the reader swap and is now split across the boundary exactly
-        where it belongs: READ ORDER IS THE STORE'S — TensorFS plans the disk touches for
-        the traversal it is given — and WRITE ORDER IS THE CONTRACT'S, because the traversal
-        handed over IS the contract's DestinationSet order and every batch item carries the
-        destination it belongs to.
+        cr-005's rule survives the reader swap and is split across the boundary exactly where
+        it belongs: ORDER IS THE CONSTRUCTION'S — `Loader._fill` enqueues the exact census
+        traversal — and BYTE LOCATION IS THE STORE'S. TensorFS validates and plans that
+        DestinationSet traversal, and every batch item carries the destination it belongs to.
 
         Queue depth is a MEASURED requirement, not a preference: tfs-018 found 3.5x between
         depth 1 and depth 4 on this store, tfs-005 confirmed it, and tfs-007 confirmed it a
@@ -2011,7 +2045,11 @@ class StreamingFillBackend:
         as its tensor decodes, so the decode envelope is a bounded rolling window rather
         than a second whole copy of the component.
         """
-        rows = [self.plan[key] for key in self.order if key in self.enqueued]
+        # `dict` preserves insertion order. `Loader._fill` calls `fill` in the construction
+        # census order, and component restage does the same from its fresh census. Reading the
+        # lookup table here instead silently changed H3's order to 0, 1, 10, 11, 2 under the
+        # canonical JSON header.
+        rows = [self.plan[key] for key in self.enqueued]
         if not rows:
             return 0
         by_component: dict[str, list[PlanRow]] = {}
@@ -2121,6 +2159,20 @@ class StreamingFillBackend:
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
             plan = self.checkpoints[component].read_plan(traversal, self.window_bytes, (component,))
+            order = _require_construction_order(plan.order, component)
+            traversal_digest = _traversal_digest([row.key for row in group])
+            history: list[dict[str, Any]] = self.stats.setdefault("traversals", [])
+            history.append(
+                {
+                    "component": component,
+                    "order": order,
+                    "tensors": len(group),
+                    "digest": traversal_digest,
+                    "first": group[0].key,
+                    "last": group[-1].key,
+                }
+            )
+            del history[:-64]
             expect = sum(row.stored_nbytes for row in group)
             if int(plan.bytes) != expect:
                 raise _refuse(
@@ -2162,6 +2214,8 @@ class StreamingFillBackend:
             self._mark(
                 "component_stream_begin",
                 component=component,
+                order=order,
+                traversal_digest=traversal_digest,
                 rows=len(group),
                 stored_bytes=expect,
                 logical_bytes=sum(row.nbytes for row in group),

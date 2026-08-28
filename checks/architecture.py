@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Seventeen fences, each provable red by planting the violation (`scripts/redarm.py`):
+Twenty fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
   endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
-  module-name-vocabulary · seam-budget-vocabulary
+  module-name-vocabulary · seam-budget-vocabulary · construction-fill-order
 """
 
 from __future__ import annotations
@@ -923,6 +923,47 @@ def fence_document_kinds() -> list[str]:
     return bad
 
 
+def fence_construction_fill_order() -> list[str]:
+    """cr-041: stored-header presentation is never a Runtime traversal authority."""
+    bad: list[str] = []
+    source = (SRC / "internal" / "fill.py").read_text()
+    if re.search(r"self\.order\s*=", source):
+        bad.append(
+            "src/cozy_runtime/internal/fill.py: retains a second `self.order` authority; "
+            "the enqueue transaction is the construction traversal"
+        )
+    if "rows = [self.plan[key] for key in self.enqueued]" not in source:
+        bad.append(
+            "src/cozy_runtime/internal/fill.py: the TensorFS traversal no longer comes "
+            "directly from construction-order enqueues"
+        )
+    if "order = _require_construction_order(plan.order, component)" not in source:
+        bad.append(
+            "src/cozy_runtime/internal/fill.py: a non-construction TensorFS plan no longer "
+            "refuses before copies"
+        )
+    if 'self.stats.setdefault("traversals", [])' not in source:
+        bad.append(
+            "src/cozy_runtime/internal/fill.py: exact traversal evidence is no longer banked"
+        )
+    derivation = (SRC / "internal" / "derive.py").read_text()
+    if "tuple(sorted(rich.sets" in derivation:
+        bad.append(
+            "src/cozy_runtime/internal/derive.py: alphabetically sorts DestinationSets "
+            "instead of preserving the Loader census"
+        )
+    if "destination_sets=_ordered_destination_sets(shallow, rich)" not in derivation:
+        bad.append(
+            "src/cozy_runtime/internal/derive.py: MCC order no longer comes from the "
+            "Loader's state_dict census"
+        )
+    proof = (ROOT / "scripts" / "mxfp8-live.py").read_text()
+    for spelling in ("json.loads(book.header_bytes)", "json.loads(raw)"):
+        if spelling in proof:
+            bad.append(f"scripts/mxfp8-live.py: {spelling} bypasses TensorFS's CozyTensors codec")
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -943,6 +984,7 @@ FENCES = {
     "endpoint-owns-no-residency": fence_endpoint_owns_no_residency,
     "endpoint-owns-no-media-decode": fence_endpoint_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
+    "construction-fill-order": fence_construction_fill_order,
 }
 
 

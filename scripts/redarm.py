@@ -37,6 +37,18 @@ STATIC_ARMS = (
         SRC / "internal" / "executor.py",
         "def _planted_seam(budgets: dict[str, int]) -> int:\n    return budgets['vram']\n",
     ),
+    Arm(
+        "construction-fill-order",
+        SRC / "internal" / "fill.py",
+        "\n\ndef _planted_header_order(rows: list[object]) -> None:\n"
+        "    self.order = [row.key for row in rows]\n",
+    ),
+    Arm(
+        "construction-fill-order",
+        SRC / "internal" / "derive.py",
+        "\n\ndef _planted_mcc_order(rich: object) -> object:\n"
+        "    return tuple(sorted(rich.sets, key=lambda row: row.component))\n",
+    ),
     Arm("package-imports", SRC / "author" / "_app.py", "import cozy_runtime.internal.config\n"),
     Arm("package-imports", SRC / "internal" / "config.py", "from cozy_runtime.cli import io\n"),
     Arm(

@@ -27,7 +27,6 @@ import base64
 import json
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -385,7 +384,10 @@ def carrier() -> None:
     # this script wrote. The store is the artifact identity, and a proof that reads its own
     # input back proves nothing about the store.
     provider = MicroScaledDequant(digests_of("mxfp8/1")[0])
-    entries = json.loads(book.header_bytes)["components"]["c"]
+    # CozyTensors bytes are opaque outside TensorFS. `Checkpoint` already asked the
+    # compiled facade to parse and validate this exact header against its spec closure;
+    # use that projection instead of coupling a Runtime proof to the stored codec.
+    entries = book.header["components"]["c"]
     lease = book.acquire()
     worst_ref = 0
     worst_src = 0.0
@@ -457,7 +459,7 @@ def arms() -> None:
         launch_providers,
         measure_device,
     )
-    from cozy_runtime.internal.fill import FillRefusal, servability_for_script, store_refusals
+    from cozy_runtime.internal.fill import FillRefusal, servability_for_script
     from cozy_runtime.internal.probe import qualify
     from cozy_runtime.internal.worker.refusal import SIDE, classify
 
@@ -543,59 +545,9 @@ def arms() -> None:
         path.unlink(missing_ok=True)
     good.unlink(missing_ok=True)
 
-    # --- THE HEADER CLOSURE, which is the WORKER's own re-check --------------------------
-    # Law 18: a RecordOwner's authority is not worker safety. The border above is the
-    # RecordOwner; these plants go straight at the header a worker is handed, which is the
-    # only version of this refusal that protects a worker from a store it did not fill.
-    import tensorfs
-
-    if (STORE / "objects").is_dir() and tensorfs.ingest_installed(tensorfs.Store.open(str(STORE))):
-        store = tensorfs.Store.open(str(STORE))
-        snapshot = str(tensorfs.ingest_installed(store)[-1])
-        raw = store.snapshot(snapshot)["header"]
-
-        def closure() -> Any:
-            c = tensorfs.Closure()
-            for ref in tensorfs.parse_header(raw)["encodings"]:
-                c.insert(store.document(str(ref["sha256"])))
-            return c
-
-        key = next(
-            k
-            for k, v in json.loads(raw)["components"]["c"].items()
-            if "scale" in v.get("parts", {})
-        )
-        mutations: tuple[tuple[str, Callable[[dict[str, Any]], object]], ...] = (
-            (
-                "a scale grid at the wrong block count",
-                lambda e: e["parts"]["scale"].__setitem__("shape", [64, 2]),
-            ),
-            (
-                "a scale role carried as f32",
-                lambda e: e["parts"]["scale"].__setitem__("dtype", "f32"),
-            ),
-            ("the scale role dropped entirely", lambda e: e["parts"].pop("scale")),
-        )
-        for label, mutate in mutations:
-            document = json.loads(raw)
-            mutate(document["components"]["c"][key])
-            planted = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
-            code = detail = ""
-            try:
-                with store_refusals("planted header"):
-                    tensorfs.parse_header(planted, closure())
-            except FillRefusal as exc:
-                code, detail = exc.code, str(exc)
-            except Exception as exc:
-                code, detail = f"UNTRANSLATED:{type(exc).__name__}", str(exc)
-            want = "dtype_mismatch" if "f32" in label else "carrier_geometry"
-            check(
-                f"{label} refuses TYPED through the closed registry",
-                code == want,
-                f"[{code}] {detail[:190]}",
-            )
-
-    # --- THE SIDES, which decide whose remedy gets printed --------------------------------
+    # TensorFS owns hostile stored-header bytes and their codec corpus. Runtime owns the
+    # resulting refusal classification and remedy; it never authors a second header codec
+    # merely to plant malformed bytes here.
     for code, side in (
         ("carrier_geometry", "data"),
         ("role_mismatch", "reader"),

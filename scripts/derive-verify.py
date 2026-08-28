@@ -245,6 +245,46 @@ def section_derive_equals_serve() -> None:
     )
 
 
+def section_destination_order() -> None:
+    head("destination order: construction traversal, never header-key order")
+    cfg = config(blocks=12)
+    derived = run(h3.Fl2VAModel, cfg)
+    destination = next(
+        row.keys
+        for row in derived.contract.destination_sets
+        if row.component == "fl2va_transformer"
+    )
+    lexical = tuple(sorted(destination))
+    check(
+        "the H3 construction walks block 2 before block 10",
+        destination.index("fl2va_transformer.blocks.2.attn_q.weight")
+        < destination.index("fl2va_transformer.blocks.10.attn_q.weight"),
+        "construction walks blocks 0, 1, 2, …, 10, 11",
+    )
+    check(
+        "a canonical header-key traversal is observably the wrong order",
+        lexical != destination
+        and lexical.index("fl2va_transformer.blocks.10.attn_q.weight")
+        < lexical.index("fl2va_transformer.blocks.2.attn_q.weight"),
+        "lexical walks blocks 0, 1, 10, 11, 2",
+    )
+
+    backend = CountingBackend()
+    run(
+        h3.Fl2VAModel,
+        cfg,
+        topology=topology_of(derived),
+        mode="serve",
+        backend=backend,
+    )
+    filled = tuple(key for key in backend.filled if key.startswith("fl2va_transformer."))
+    check(
+        "the serve transaction enqueues the exact DestinationSet traversal",
+        filled == destination,
+        f"{len(filled)}/{len(destination)} transformer destinations in exact order",
+    )
+
+
 def derive_filled(result: Any) -> int:
     return sum(1 for _ in result.observations.real_allocations)
 
@@ -291,6 +331,11 @@ def section_agreement() -> None:
         lambda: contract.check_agreement(_with_short_set(c), [t.key for t in c.logical_tensors]),
         code="incomplete_destination_set",
     )
+    red(
+        "a DestinationSet with the right keys in the wrong order refuses",
+        lambda: contract.check_agreement(_with_reordered_set(c), covered),
+        code="census_order_disagreement",
+    )
 
 
 def _with_duplicate(c: Any) -> Any:
@@ -306,6 +351,15 @@ def _with_short_set(c: Any) -> Any:
             dataclasses.replace(first, keys=first.keys[:-1]),
             *c.destination_sets[1:],
         ),
+    )
+
+
+def _with_reordered_set(c: Any) -> Any:
+    first = c.destination_sets[0]
+    keys = (first.keys[1], first.keys[0], *first.keys[2:])
+    return dataclasses.replace(
+        c,
+        destination_sets=(dataclasses.replace(first, keys=keys), *c.destination_sets[1:]),
     )
 
 
@@ -1122,6 +1176,7 @@ def main() -> int:
         section_determinism,
         section_identity,
         section_derive_equals_serve,
+        section_destination_order,
         section_agreement,
         section_unrepresentable,
         section_h3_structures,
