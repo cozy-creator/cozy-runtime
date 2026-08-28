@@ -56,6 +56,11 @@ STATIC_ARMS = (
         "\n\ndef _planted_stale_delivery_reader(delivery: dict[str, object]) -> object:\n"
         "    return delivery['cost_class']\n",
     ),
+    Arm(
+        "pod-media-grant-root",
+        SRC / "cli" / "materialize_launch.py",
+        "\nMEDIA_ROOT = Path('/run/cozy/media')\n",
+    ),
     # cr-042: the third private-address check, planted in the module whose own header says
     # the defect is "there were two downloaders and only one had the check".
     Arm(
