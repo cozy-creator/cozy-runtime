@@ -60,7 +60,6 @@ from typing import Any
 from cozy_runtime.internal import (
     accel,
     child_env,
-    egress,
     environment,
     fill,
     hostfacts,
@@ -1780,13 +1779,6 @@ class Worker:
             else pb.MaterializationState.MATERIALIZATION_STATE_STAGED
         )
         self.engine.bindings = self.bindings
-        hosts = sorted(
-            {host for binding in self.bindings.values() for host in binding.egress_allowed_hosts}
-        )
-        self.engine.egress = egress.EgressPolicy(
-            allowed_hosts=tuple(hosts),
-            allow_private=any(b.tenancy == "local" for b in self.bindings.values()),
-        )
         self.note(
             "desired_state",
             f"revision {revision} accepted: placement "

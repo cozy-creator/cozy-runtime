@@ -39,7 +39,7 @@ from typing import Any, cast
 
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical, egress, seam
+from cozy_runtime.internal import canonical, seam
 from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -410,10 +410,6 @@ class AttemptEngine:
         #: the journaled receipt. Identity replays; the same key with different bytes is a
         #: CONFLICT and never a replacement (§2).
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
-        #: cr-012's egress boundary, rebuilt from the applied binding at each directive.
-        #: A default `EgressPolicy()` has an EMPTY allowlist, which means no egress at all —
-        #: the fail-closed state is the one you get by not configuring anything.
-        self.egress = egress.EgressPolicy()
 
     def fault(self, row: pb.Fault) -> None:
         """Record ONE fault, bounded. Readers take the last 8; the tail past that is memory
@@ -692,7 +688,6 @@ class AttemptEngine:
                 attempt.grant,
                 self.authorizer,
                 spool=spool,
-                policy=self.egress,
                 max_bytes=binding.max_input_bytes if binding else 64 << 20,
                 max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
             )
@@ -1378,7 +1373,9 @@ class AttemptEngine:
             "headroom_bytes": attempt.plan.headroom_bytes,
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
-            # reaches the executor, which has no outbound network at all.
+            # reaches the executor. What the executor CAN still do is dial one of its own,
+            # which is why it installs `sandbox.refuse_network` (cr-042); that fence bounds
+            # a buggy endpoint at the Python layer and is not a kernel bound.
             "inputs": inputs,
             "max_input_bytes": attempt.declared.max_input_bytes,
         }
@@ -1708,7 +1705,6 @@ class AttemptEngine:
             attempt.grant,
             "payload",
             self.authorizer,
-            self.egress,
             cap=PAYLOAD_MAX_BYTES,
         )
         value = json.loads(data)

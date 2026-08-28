@@ -4,6 +4,20 @@ Everything that pulls bytes into this runtime from an address someone else minte
 through here. That is the point: the failure mode this module exists against is not "the
 SSRF check was wrong", it is "there were two downloaders and only one had the check".
 
+`blocked()` is that one check, and it is the WHOLE address decision for every downloader:
+`pull.guard` calls it, `EgressPolicy.check_addresses` calls it, and the
+`one-address-predicate` fence (`checks/architecture.py`, red-armed in `scripts/redarm.py`)
+reddens if a third chain appears. The two used to be separate hand-written class lists that
+differed by `is_reserved`/`is_unspecified` and coincided only because CPython folds those
+into `is_private` for v4 — an agreement by accident is the drift this module is for.
+
+`fetch_into` has NO production caller today (cr-042 deleted the worker's `https://` input
+grant row, whose allowlist never had a writer). It stays because it is the boundary the two
+named consumers must enter through — th-008's hub-minted input URLs and cr-012's author
+`Egress` capability — and because `scripts/assets-live.py egress` arms it against a real
+server. Whoever lands either consumer lands its allowlist writer with it; a second
+downloader beside this one is the defect above, restated.
+
 **A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
 and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that
 UNDER-runs is equally a refusal — a truncated read that returns short bytes is how a digest
@@ -48,6 +62,36 @@ CHUNK = 1 << 20
 
 #: The redirect budget. A chain longer than this is a loop or an evasion, either way no.
 MAX_REDIRECTS = 4
+
+
+#: The address classes no downloader in this runtime connects to. ONE list: `pull.guard`
+#: and `EgressPolicy.check_addresses` were two hand-written chains that differed by
+#: `is_reserved`/`is_unspecified` and agreed only by CPython accident, which is exactly the
+#: "two downloaders, one check" defect this module exists against (cr-042). The
+#: `one-address-predicate` fence in `checks/architecture.py` reddens if a third appears.
+_CLASSES: tuple[tuple[str, str], ...] = (
+    ("private", "is_private"),
+    ("loopback", "is_loopback"),
+    ("link-local", "is_link_local"),
+    ("multicast", "is_multicast"),
+    ("reserved", "is_reserved"),
+    ("unspecified", "is_unspecified"),
+)
+
+
+def blocked(address: str) -> str:
+    """Why `address` is not fetchable, or `""` when it is a public routable address."""
+    parsed = ipaddress.ip_address(address)
+    named = [name for name, attribute in _CLASSES if getattr(parsed, attribute)]
+    return ", ".join(named)
+
+
+def resolve(host: str, port: int | None = None) -> list[str]:
+    """EVERY answer for `host`. One resolver call for every caller that then asks
+    `blocked()` about what came back — a caller that resolves for itself can check a
+    different set of answers than it connects over."""
+    answers = socket.getaddrinfo(host, port or None, proto=socket.IPPROTO_TCP)
+    return [str(answer[4][0]) for answer in answers]
 
 
 class EgressRefusal(Exception):
@@ -135,7 +179,7 @@ class EgressPolicy:
     def check_addresses(self, host: str, port: int) -> list[str]:
         """Resolve and check EVERY answer. Returns them so a caller can log what it saw."""
         try:
-            answers = socket.getaddrinfo(host, port or None, proto=socket.IPPROTO_TCP)
+            answers = resolve(host, port)
         except OSError as exc:
             raise EgressRefusal(
                 "egress_unresolvable",
@@ -143,26 +187,17 @@ class EgressPolicy:
                 "is not an address it will connect to",
             ) from exc
         seen: list[str] = []
-        for answer in answers:
-            address = str(answer[4][0])
+        for address in answers:
             seen.append(address)
             if self.allow_private:
                 continue
-            parsed = ipaddress.ip_address(address)
-            if (
-                parsed.is_private
-                or parsed.is_loopback
-                or parsed.is_link_local
-                or parsed.is_multicast
-                or parsed.is_reserved
-                or parsed.is_unspecified
-            ):
+            why = blocked(address)
+            if why:
                 raise EgressRefusal(
                     "egress_blocked_address",
-                    f"{host!r} resolves to {address}, which is private, loopback, "
-                    "link-local, multicast or reserved. EVERY answer is checked, not the "
-                    "first: a name with one public answer and one 169.254.169.254 is the "
-                    "metadata-service bypass with an extra step",
+                    f"{host!r} resolves to {address}, which is {why}. EVERY answer is "
+                    "checked, not the first: a name with one public answer and one "
+                    "169.254.169.254 is the metadata-service bypass with an extra step",
                 )
         if not seen:
             raise EgressRefusal("egress_unresolvable", f"{host!r} resolved to nothing")
