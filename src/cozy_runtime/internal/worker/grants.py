@@ -686,7 +686,7 @@ class PublicationReceipt:
     mode: str
     """`job` or `serving`. One rule for both, so there is one spelling of the field."""
     grant_id: str
-    """The publication contract's scope — the scratch repo a job's writes are rewritten
+    """The publication contract's scope — the scratch model a job's writes are rewritten
     into. Empty on the serving lane, which publishes into granted destinations only."""
     build_id: str
     subject_id: str

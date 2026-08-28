@@ -1,8 +1,9 @@
 """Binding resolution: `endpoint.toml` defaults -> `--model` -> the deploy binding.
 
-Code states CAPABILITY; selection is a BINDING (§1.0/§1.1). Author code never names a repo,
+Code states CAPABILITY; selection is a BINDING (§1.0/§1.1). Author code never names a model,
 release, checkpoint or adapter — so this module lives outside the author fence, reads the
-repo's `endpoint.toml`, and speaks the same one binding vocabulary the deploy side does.
+endpoint repository's `endpoint.toml`, and speaks the same one binding vocabulary the deploy
+side does.
 
 `endpoint.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
 speaks (a bare-venv `run` with no `--model`). Production authority is the hub-side binding
@@ -37,7 +38,7 @@ class Binding:
 
 
 def read_table(endpoint_toml: Path) -> Mapping[str, Mapping[str, object]]:
-    """The `[bindings.*]` table of a repo's endpoint.toml, unresolved."""
+    """The endpoint repository's unresolved `[bindings.*]` table."""
     data = tomllib.loads(endpoint_toml.read_text())
     table = data.get("bindings", {})
     if not isinstance(table, dict):
@@ -91,13 +92,20 @@ def resolve(
 
 
 def _ref(entry: Mapping[str, object], key: str) -> str:
-    repo = entry.get("repo")
-    if not isinstance(repo, str) or not repo:
+    unknown = sorted(set(entry) - {"model", "release", "lane"})
+    if unknown:
         raise ConformanceError(
-            f"[bindings.{key!r}] declares no repo=", code="bindings", fields=[key]
+            f"[bindings.{key!r}] has unknown fields: {', '.join(unknown)}",
+            code="bindings",
+            fields=[key, *unknown],
+        )
+    model = entry.get("model")
+    if not isinstance(model, str) or not model:
+        raise ConformanceError(
+            f"[bindings.{key!r}] declares no model=", code="bindings", fields=[key]
         )
     release = entry.get("release")
-    return f"{repo}@{release}" if isinstance(release, str) and release else repo
+    return f"{model}@{release}" if isinstance(release, str) and release else model
 
 
 def _lane(entry: Mapping[str, object]) -> str | None:

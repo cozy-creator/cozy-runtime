@@ -89,7 +89,7 @@ def _parse(args: list[str]) -> tuple[str, dict[str, str], set[str]]:
         raise CliError(
             "usage",
             f"pull takes exactly one ref, got {len(rest)}",
-            "cozy-runtime pull <org/repo[@release|@sha256:...]> --hub <url>",
+            "cozy-runtime pull <org/model[@release|@sha256:...]> --hub <url>",
             Exit.usage,
         )
     return rest[0], flags, on
@@ -214,8 +214,8 @@ def _installed_ref(named: str, ref: str, release: str) -> str:
     """The ref the local index files this artifact under.
 
     `--as` wins verbatim — it is the operator saying what to call it. Otherwise the pulled
-    ref keeps its RELEASE and loses only its digest pin: `org/repo@v2` installed as
-    `org/repo` would be a row for a different artifact under a name that already means
+    ref keeps its RELEASE and loses only its digest pin: `org/model@v2` installed as
+    `org/model` would be a row for a different artifact under a name that already means
     something else. A digest-pinned ref names no release, so the hub's resolved one is used
     when the hub had one to give.
     """

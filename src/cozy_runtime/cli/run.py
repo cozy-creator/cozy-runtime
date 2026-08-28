@@ -293,7 +293,7 @@ def _input_trees(values: Sequence[str]) -> dict[str, str]:
                 "usage",
                 f"--input {value!r} is not <ref>=<directory>",
                 "grant one materialized input tree per typed Tree field: "
-                "--input org/repo@release=/path/to/tree",
+                "--input org/model@release=/path/to/tree",
                 Exit.usage,
             )
         resolved = Path(path).expanduser().resolve()

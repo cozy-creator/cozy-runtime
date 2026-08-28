@@ -63,7 +63,7 @@ object = "{pkg}:app"
 
 # Default bindings only — endpoint.toml is a default, never a source of truth.
 # [bindings."MyModel"]
-# repo = "org/repo@release"
+# model = "org/model@release"
 """
 
 

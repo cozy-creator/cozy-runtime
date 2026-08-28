@@ -14,6 +14,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   pod-media-grant-root
   measured-backend-version
   base-ownership-vectors
+  typed-model-binding
 """
 
 from __future__ import annotations
@@ -365,7 +366,7 @@ def fence_endpoint_owns_no_media_decode() -> list[str]:
 
 def fence_no_identifiers() -> list[str]:
     """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
-    repo, release, checkpoint or adapter ref, in bindings or in string literals.
+    model, release, checkpoint or adapter ref, in bindings or in string literals.
 
     Code states capability; SELECTION is a binding (endpoint.toml, `--model`, the deploy
     binding). Identity is exclusively deployment-side, so branching on one is unspellable.
@@ -1331,6 +1332,31 @@ def fence_measured_backend_version() -> list[str]:
     return bad
 
 
+def fence_typed_model_binding() -> list[str]:
+    """Endpoint defaults name a `model`; the retired generic binding key cannot return."""
+
+    bad: list[str] = []
+    paths = [
+        ROOT / "examples" / "endpoint.toml",
+        ROOT / "corpus" / "endpoint" / "endpoint.toml",
+        ROOT / "corpus" / "pipeline" / "endpoint.toml",
+    ]
+    for path in paths:
+        document = tomllib.loads(path.read_text())
+        bindings = document.get("bindings", {})
+        if not isinstance(bindings, dict):
+            bad.append(f"{path.relative_to(ROOT)}: [bindings] is not a table")
+            continue
+        for name, value in bindings.items():
+            if not isinstance(value, dict) or not isinstance(value.get("model"), str):
+                bad.append(f"{path.relative_to(ROOT)}: binding {name!r} does not name its model")
+            if "repo" in value:
+                bad.append(
+                    f"{path.relative_to(ROOT)}: binding {name!r} uses retired generic repo key"
+                )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -1356,6 +1382,7 @@ FENCES = {
     "delivery-plan-observation": fence_delivery_plan_observation,
     "pod-media-grant-root": fence_pod_media_grant_root,
     "measured-backend-version": fence_measured_backend_version,
+    "typed-model-binding": fence_typed_model_binding,
 }
 
 

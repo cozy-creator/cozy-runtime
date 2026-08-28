@@ -8,5 +8,5 @@
 object = "sdxl_gpu:app"
 
 [bindings."SdxlUnetModel"]
-repo = "cozy/sdxl-unet"
+model = "cozy/sdxl-unet"
 release = "cr-005"

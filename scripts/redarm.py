@@ -86,6 +86,7 @@ STATIC_ARMS = (
     ),
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
     Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
+    Arm("typed-model-binding", ROOT / "examples" / "endpoint.toml", '\nrepo = "legacy/model"\n'),
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
@@ -892,7 +893,7 @@ analyze(handler, name='handler', kind='entrypoint')
 class Slot:
     def __init__(self, cls, **policy): ...
 
-def handler(payload: In, model: sd.SdxlModel = Slot(sd.SdxlModel, repo='cozy/sdxl')) -> Meta:
+def handler(payload: In, model: sd.SdxlModel = Slot(sd.SdxlModel, model='cozy/sdxl')) -> Meta:
     return Meta(ok=True)
 
 analyze(handler, name='handler', kind='entrypoint')
