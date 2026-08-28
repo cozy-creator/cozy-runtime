@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Twenty-one fences, each provable red by planting the violation (`scripts/redarm.py`):
+Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports
   env-authority · single-config · no-interactive · excluded-keywords
@@ -9,6 +9,7 @@ Twenty-one fences, each provable red by planting the violation (`scripts/redarm.
   endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
   one-address-predicate
+  dynamic-pods-skip-boot-warm
 """
 
 from __future__ import annotations
@@ -957,6 +958,34 @@ def fence_construction_fill_order() -> list[str]:
     return bad
 
 
+def fence_dynamic_pods_skip_boot_warm() -> list[str]:
+    """The fixed remote adapter must never run endpoint inference before dispatchability."""
+
+    path = SRC / "cli" / "materialize_launch.py"
+    tree = ast.parse(path.read_text())
+    command = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_worker_command"
+        ),
+        None,
+    )
+    if command is None:
+        return [f"{path.relative_to(ROOT)}: fixed dynamic-pod worker command is gone"]
+    returned = [node.value for node in ast.walk(command) if isinstance(node, ast.Return)]
+    if not any(
+        isinstance(value, ast.List)
+        and any(isinstance(item, ast.Constant) and item.value == "--no-warm" for item in value.elts)
+        for value in returned
+    ):
+        return [
+            f"{path.relative_to(ROOT)}: fixed dynamic-pod child argv omits `--no-warm`; "
+            "endpoint inference can block activation before DISPATCHABLE"
+        ]
+    return []
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -977,6 +1006,7 @@ FENCES = {
     "document-kinds": fence_document_kinds,
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,
+    "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
 }
 
 

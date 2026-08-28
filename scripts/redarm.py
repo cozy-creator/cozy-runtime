@@ -29,6 +29,13 @@ class Arm:
     plant: str
 
 
+@dataclass(frozen=True, slots=True)
+class OmissionArm:
+    fence: str
+    path: pathlib.Path
+    remove: str
+
+
 STATIC_ARMS = (
     Arm("env-authority", SRC / "internal" / "child_env.py", "import os\nS = os.environ.get('X')\n"),
     Arm(
@@ -150,6 +157,14 @@ STATIC_ARMS = (
         "from cozy_runtime.internal.worker.attempts import AttemptEngine as _E\n\n\n"
         "def second_engine() -> object:\n"
         "    return AttemptEngine()\n",
+    ),
+)
+
+OMISSION_ARMS = (
+    OmissionArm(
+        "dynamic-pods-skip-boot-warm",
+        SRC / "cli" / "materialize_launch.py",
+        '        "--no-warm",\n',
     ),
 )
 
@@ -1312,6 +1327,36 @@ def run_static(arm: Arm) -> str:
     return f"red — {arm.fence} ({arm.path.relative_to(ROOT)}): {line}"
 
 
+def run_omission(arm: OmissionArm) -> str:
+    """Remove one required spelling, observe its fence red, then restore exact bytes."""
+
+    original = arm.path.read_text()
+    if original.count(arm.remove) != 1:
+        return f"NOT PROVEN — {arm.fence} omission matched {original.count(arm.remove)} places"
+    try:
+        arm.path.write_text(original.replace(arm.remove, "", 1))
+        checked = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "checks" / "architecture.py"),
+                "--only",
+                arm.fence,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
+        )
+        code, output = checked.returncode, checked.stdout + checked.stderr
+    finally:
+        arm.path.write_text(original)
+    if code == 0:
+        return f"NOT PROVEN — {arm.fence} stayed green with the required argv flag omitted"
+    lines = output.splitlines()
+    line = next((ln.strip() for ln in lines if arm.path.name in ln), lines[0])
+    return f"red — {arm.fence} omission ({arm.path.relative_to(ROOT)}): {line}"
+
+
 def run_live(name: str, source: str, expect: str) -> str:
     out = subprocess.run(
         [sys.executable, "-c", source], capture_output=True, text=True, cwd=ROOT, check=False
@@ -1654,6 +1699,7 @@ def main() -> int:
         print("refusing to plant: the tree is already fence-red", file=sys.stderr)
         return 1
     results = [run_static(a) for a in STATIC_ARMS]
+    results += [run_omission(a) for a in OMISSION_ARMS]
     results += [run_live(*a) for a in LIVE_ARMS]
     results += [run_live(name, PRELUDE + body, expect) for name, body, expect in AUTHOR_ARMS]
     results += [run_live(name, MODEL_PRELUDE + body, expect) for name, body, expect in MODEL_ARMS]
