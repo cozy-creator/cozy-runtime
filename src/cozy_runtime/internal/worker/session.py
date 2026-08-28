@@ -1439,13 +1439,18 @@ class Worker:
             f"{len(self.grant.locations)} location(s), expiring {self.grant.expires_at_unix}",
         )
         revision = self.accepted.accepted_desired_state_revision
+        candidate = self.pending or self.placement
         if (
             not idempotent
-            and self.placement is not None
+            and candidate is not None
             and self.accepted.converged_revision < revision
+            and candidate.materialization != pb.MaterializationState.MATERIALIZATION_STATE_FAILED
         ):
             # REFRESHING ACCESS NEVER CHANGES IDENTITY: this re-runs convergence against the
             # SAME accepted set bytes. No revision, set digest, or placement identity moves.
+            # A terminal content/receipt refusal is different: it is a verdict about this
+            # desired spec, so a newer ACCESS grant cannot make it retryable. Only a new
+            # desired revision clears that latch (cr-023 fallback-retention clause 5).
             self.note("grant", f"re-driving convergence for revision {revision} on the refresh")
             self.latched = ""
             self.schedule_convergence(revision)
