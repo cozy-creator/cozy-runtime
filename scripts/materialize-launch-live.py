@@ -483,8 +483,11 @@ def main() -> int:
                     "pci_bus_id": "00000000:01:00.0",
                 }
             ],
+            control_runtime_digest_value="sha256:" + "3" * 64,
         )
         assert command.count("--no-warm") == 1
+        assert command[command.index("--control-runtime-digest") + 1] == "sha256:" + "3" * 64
+        assert command[command.index("--executor-uid") + 1] == "65533"
         assert command.index("serve") < command.index("--no-warm") < command.index("--socket")
         grant_root = command[command.index("--grant-root") + 1]
         assert grant_root == str(MEDIA_ROOT) == "/var/lib/cozy/media"

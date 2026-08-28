@@ -18,6 +18,7 @@ import http.server
 import ssl
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -257,6 +258,7 @@ class _Origin(http.server.BaseHTTPRequestHandler):
     overlap_subjects: ClassVar[frozenset[str]] = frozenset()
     overlap_barrier: ClassVar[threading.Barrier | None] = None
     overlapped: ClassVar[set[str]] = set()
+    delayed_model_subject: ClassVar[str] = ""
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
@@ -272,6 +274,10 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             assert barrier is not None
             barrier.wait(timeout=10)
             _Origin.overlapped.add(spelled)
+            if spelled == _Origin.delayed_model_subject:
+                # Keep the model leg observably live after the endpoint wheel is admitted;
+                # the Runtime proof must spawn its executor during this window.
+                time.sleep(2)
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Type", "application/octet-stream")
@@ -289,6 +295,7 @@ def serve_artifacts(release: Release, certificate: Path, key: Path, port: int) -
     _Origin.overlap_subjects = frozenset({source, models})
     _Origin.overlap_barrier = threading.Barrier(2)
     _Origin.overlapped = set()
+    _Origin.delayed_model_subject = models
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Origin)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(certificate), str(key))

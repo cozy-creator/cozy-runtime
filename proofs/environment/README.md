@@ -6,7 +6,8 @@ Python support prepares exact protocol documents and inspects stored bytes; shel
 Runtime process boundary.
 
 The public proof seat is deliberately one-shot and requires a fresh root. The separate private
-materializer proof covers receipt-keyed generation reuse and post-publication tamper refusals.
+materializer proof covers content-keyed reuse, wheel-pool sharing and post-publication tamper
+refusals.
 
 The driver measures its complete installed distribution/import-root inventory into
 `WheelhouseManifest/2`. A real fake NumPy is base-installed. One arriving `numpy` wheel refuses

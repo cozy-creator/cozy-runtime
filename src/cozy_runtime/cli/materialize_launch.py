@@ -15,7 +15,10 @@ reports only what it OBSERVED — its GPUs, its listeners, the token hashes it w
 from __future__ import annotations
 
 import contextlib
+import os
+import select
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -23,17 +26,23 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import readiness
+from cozy_runtime.internal import proctree, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
     LaunchRefusal,
     PreparedBoot,
+    control_runtime_digest,
     prepare_boot,
 )
 
 WORKER_ROOT = Path("/run/cozy/worker")
+POD_EXECUTOR_UID = 65533
+POD_EXECUTOR_GID = 65533
+POD_SUPERVISOR_UID = 65532
+POD_SUPERVISOR_GID = 65532
+SUPERVISOR_STOP_FD = 3
 # Shared with pod-supervisor's podmedia server. This is persistent pod data, unlike /run's
 # restart-local control state: PutInput returns file:// paths beneath this exact root and
 # the worker's grant authorizer must recognize the same tree without widening it.
@@ -51,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if argv:
             raise LaunchRefusal("adapter_arguments_forbidden", "fixed adapter takes no arguments")
         config = read_adapter_config()
+        _arm_supervisor_lifetime()
         boot_id = readiness.pod_boot_id(config.pod_boot_id_path)
         certificate_der = readiness.certificate(config.tls_cert_path)
         gpus = readiness.runtime_gpus(
@@ -83,8 +93,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             media_internal_port=config.media_internal_port,
             gpus=gpus,
         )
-        readiness.publish(config.receipt_payload_path, payload)
-        return _supervise(process)
+        # pod-supervisor drops to its request-serving uid before this handoff arrives. The
+        # adapter is the sole writer; the supervisor gets read-only ownership of the exact
+        # inode only after its bytes are flushed and before its atomic link is published.
+        readiness.publish(
+            config.receipt_payload_path,
+            payload,
+            owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
+        )
+        return _supervise(process, supervisor_fd=SUPERVISOR_STOP_FD)
     except ConfigError as err:
         emit_error(CliError(err.name, err.message, err.remedy, err.code), opts)
         return int(err.code)
@@ -137,10 +154,9 @@ def _start_worker(
     child_env = dict(config.child_base_env)
     child_env.update(
         {
-            # `sha256:`-PREFIXED, and the prefix is the whole grammar (#560g): a bare hex
-            # entry is parsed as a PATH to a hash file, so the joined bare hashes this
-            # passed before made every renter Claim refuse on a rented pod. The adapter
-            # holds a literal hash SET, so it must spell one.
+            # Creator remains the private pod's sole RecordOwner. It holds the renter token
+            # preimage and both media and WorkerControl verify against the same bounded hash
+            # set the pod received; no Hub-owned Claim credential exists in this process.
             "COZY_ACCESS_TOKEN_SHA256": ",".join(
                 "sha256:" + item for item in config.renter_token_sha256
             ),
@@ -148,7 +164,13 @@ def _start_worker(
             "PYTHONNOUSERSITE": "1",
         }
     )
-    command = _worker_command(config, prepared, boot_id, gpus)
+    command = _worker_command(
+        config,
+        prepared,
+        boot_id,
+        gpus,
+        control_runtime_digest_value=control_runtime_digest(),
+    )
     return subprocess.Popen(
         command,
         cwd="/",
@@ -159,11 +181,33 @@ def _start_worker(
     )
 
 
+def _arm_supervisor_lifetime() -> None:
+    """Bind the root adapter to PID1 and its one fixed EOF-only stop pipe."""
+
+    try:
+        info = os.fstat(SUPERVISOR_STOP_FD)
+    except OSError as exc:
+        raise LaunchRefusal("supervisor_stop_pipe_absent", "inherited fd 3 is absent") from exc
+    if not stat.S_ISFIFO(info.st_mode):
+        raise LaunchRefusal("supervisor_stop_pipe_invalid", "inherited fd 3 is not a pipe")
+    parent = os.getppid()
+    try:
+        proctree.arm_parent_death()
+    except (OSError, proctree.ProcessTreeUnsupported) as exc:
+        raise LaunchRefusal("supervisor_parent_death_unavailable", str(exc)) from exc
+    if os.getppid() != parent:
+        raise LaunchRefusal(
+            "supervisor_parent_changed", "pod-supervisor exited while PDEATHSIG was armed"
+        )
+
+
 def _worker_command(
     config: object,
     prepared: PreparedBoot,
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
+    *,
+    control_runtime_digest_value: str,
 ) -> list[str]:
     """The fixed dynamic-pod worker argv, kept pure so the launch contract is executable."""
 
@@ -197,11 +241,18 @@ def _worker_command(
         config.acquisition_attempt_id,
         "--instance-id",
         boot_id,
-        # No `--release-id`: a pod that hosts no placement HAS no endpoint release, and the
-        # worker's empty `release_id` is the honest answer an owner reads back. No
-        # `--artifact-digest` for the same reason: the only base-worker-image identity this pod
-        # could measure is its own image, which the hub pinned by digest, so "absent stays
-        # absent" (#481) is the honest answer there too.
+        # No `--release-id`: a pod that hosts no placement HAS no endpoint release. The
+        # artifact field carries the image-owned CONTROL RUNTIME WHEEL identity measured
+        # from the baked complete WheelhouseManifest, never an OCI self-reference.
+        "--control-runtime-digest",
+        control_runtime_digest_value,
+        # The trusted worker stays root. Every endpoint executor crosses the trampoline
+        # into this fixed unprivileged identity after no_new_privs; inability to make that
+        # transition is a pre-bind structural refusal.
+        "--executor-uid",
+        str(POD_EXECUTOR_UID),
+        "--executor-gid",
+        str(POD_EXECUTOR_GID),
         "--devices",
         devices,
         "--grant-root",
@@ -221,26 +272,46 @@ def _worker_command(
     ]
 
 
-def _supervise(process: subprocess.Popen[bytes]) -> int:
+def _supervise(process: subprocess.Popen[bytes], *, supervisor_fd: int) -> int:
     """Keep the adapter coupled to its worker.
 
     pod-supervisor owns media and whole-pod supervision.
     """
 
     stopped = False
+    invalid_stop_pipe = False
     terminate_at = 0.0
 
-    def stop(signum: int, frame: object) -> None:
+    os.set_blocking(supervisor_fd, False)
+    stop_poll = select.poll()
+    stop_poll.register(supervisor_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+
+    def request_stop() -> None:
         nonlocal stopped, terminate_at
         stopped = True
-        if process.poll() is None:
+        if process.poll() is None and not terminate_at:
             process.terminate()
-            terminate_at = terminate_at or time.monotonic()
+            terminate_at = time.monotonic()
+
+    def stop(signum: int, frame: object) -> None:
+        del signum, frame
+        request_stop()
 
     prior_term = signal.signal(signal.SIGTERM, stop)
     prior_int = signal.signal(signal.SIGINT, stop)
     try:
         while True:
+            if stop_poll.poll(0):
+                chunk = os.read(supervisor_fd, 1)
+                if chunk:
+                    invalid_stop_pipe = True
+                    print(
+                        "materialize-launch: supervisor stop pipe carried data; only EOF "
+                        "is a command",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                request_stop()
             try:
                 code = process.wait(timeout=0.25)
                 break
@@ -255,6 +326,9 @@ def _supervise(process: subprocess.Popen[bytes]) -> int:
     finally:
         signal.signal(signal.SIGTERM, prior_term)
         signal.signal(signal.SIGINT, prior_int)
+        os.close(supervisor_fd)
+    if invalid_stop_pipe:
+        return int(Exit.structural)
     if stopped:
         return int(Exit.ok)
     if code == 0:

@@ -34,9 +34,11 @@ placement that took a private door would prove nothing about the tenth:
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import json
+import os
 import platform
 import queue
 import secrets
@@ -67,6 +69,75 @@ WORKER_PORT = 43100
 MEDIA_PORT = 43101
 ARTIFACT_PORT = 43102
 DEADLINE = int(time.time()) + 1800
+
+
+def access_as(path: Path, uid: int, gid: int, flags: int) -> bool:
+    """One DAC probe in a short child; no Python runs after the identity transition."""
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            descriptor = os.open(path, flags)
+            os.close(descriptor)
+        except OSError:
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) == 0
+
+
+def prove_adapter_parent_death() -> None:
+    """The exact adapter arming code kills its process when its direct parent exits."""
+
+    source = """
+import os
+import time
+from cozy_runtime.cli.materialize_launch import _arm_supervisor_lifetime
+
+read_fd, write_fd = os.pipe()
+if read_fd != 3:
+    os.dup2(read_fd, 3)
+    os.close(read_fd)
+pid = os.fork()
+if pid == 0:
+    os.close(write_fd)
+    _arm_supervisor_lifetime()
+    time.sleep(60)
+    os._exit(99)
+print(pid, flush=True)
+time.sleep(0.5)
+os._exit(0)
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", source],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert parent.stdout is not None
+    child_pid = int(parent.stdout.readline().strip())
+    assert parent.wait(timeout=5) == 0
+    deadline = time.monotonic() + 5
+    state = ""
+    while time.monotonic() < deadline:
+        try:
+            status = Path(f"/proc/{child_pid}/status").read_text()
+        except OSError:
+            state = "gone"
+            break
+        state = next(
+            (line.split()[1] for line in status.splitlines() if line.startswith("State:")),
+            "",
+        )
+        if state == "Z":
+            break
+        time.sleep(0.05)
+    assert state in {"gone", "Z"}, f"adapter child survived parent exit in state {state!r}"
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(child_pid, os.WNOHANG)
+
 
 RETIRED_RECEIPT_FIELDS = (
     "acquisition_attempt_id",
@@ -197,7 +268,7 @@ class RecordOwner:
     tenth, and "placement 1 is treated identically to placements 2..N" is the property.
     """
 
-    def __init__(self, certificate: Path, token: str) -> None:
+    def __init__(self, certificate: Path, token: bytes) -> None:
         credentials = grpc.ssl_channel_credentials(certificate.read_bytes())
         self.channel = grpc.secure_channel(
             f"127.0.0.1:{WORKER_PORT}",
@@ -229,7 +300,7 @@ class RecordOwner:
                     record_owner_epoch=self.epoch,
                     record_owner_id="cr-049-boot-proof",
                     wire_minor=WIRE_MINOR,
-                    proof=token.encode(),
+                    proof=token,
                     wire_schema_digest=SCHEMA_DIGEST_RAW,
                 )
             )
@@ -378,12 +449,20 @@ def desired_state(placement_set: bytes, revision: int) -> pb.DesiredWorkerState:
     )
 
 
-def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict[str, Any]:
+def serve_one_attempt(
+    owner: RecordOwner,
+    plan_id: str,
+    release_id: str,
+    *,
+    text: str = "cr-049",
+    count: int = 2,
+    request_id: str = "cr049-req-1",
+) -> dict[str, Any]:
     """One real attempt against the endpoint installed in the materialized generation."""
 
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"text": "cr-049", "count": 2}).encode()
-    payload_path = MEDIA_ROOT / "payload.json"
+    payload = json.dumps({"text": text, "count": count}).encode()
+    payload_path = MEDIA_ROOT / f"{request_id}-payload.json"
     payload_path.write_bytes(payload)
     payload_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     spec = pb.InvocationSpec(
@@ -411,7 +490,7 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
         pb.RecordOwnerFrame(
             attempt_offer=owner.envelope(
                 pb.AttemptOffer(
-                    request_id="cr049-req-1",
+                    request_id=request_id,
                     attempt_ordinal=1,
                     invocation_spec_digest=spec_digest,
                     invocation_spec_canonical_bytes=canonical_bytes,
@@ -436,6 +515,7 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
     )
     frame = owner.await_frame("attempt_outcome", seconds=300)
     outcome = frame.attempt_outcome
+    assert outcome.request_id == request_id
     body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
     owner.send(
         pb.RecordOwnerFrame(
@@ -477,16 +557,28 @@ def author_release() -> hub.Release:
 
 
 def main() -> int:
+    prove_adapter_parent_death()
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(STATE, 65532, 65532)
+    STATE.chmod(0o700)
+    stop_read, stop_write = os.pipe()
+    if stop_read != 3:
+        os.dup2(stop_read, 3)
+        os.close(stop_read)
+        stop_read = 3
+    os.set_inheritable(stop_read, True)
     certificate, key = mint_tls()
     origin_certificate, origin_key = mint_origin_tls()
     boot_id = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     (STATE / "pod-boot-id").write_text(boot_id + "\n")
-    # The renter mints the token and tells NOBODY; the hub holds only the hash. The proof
-    # holds both because it is playing both roles, and it hands the pod only the hash.
+    # Creator is the private pod's sole RecordOwner. It mints the renter token and hands
+    # the pod only its hash; the proof holds the preimage because it plays Creator.
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     serve_media(certificate, key, token)
+    # Authoring also installs the stand-in's exact complete base manifest. The adapter now
+    # measures its cozy-runtime wheel fact before it starts the control worker.
+    release = author_release()
 
     environment = {
         "LANG": "C.UTF-8",
@@ -515,7 +607,9 @@ def main() -> int:
         cwd="/",
         env=environment,
         stdin=subprocess.DEVNULL,
+        pass_fds=(stop_read,),
     )
+    os.close(stop_read)
     receipt_path = Path(environment["COZY_ADAPTER_RECEIPT_PAYLOAD_PATH"])
     try:
         while not receipt_path.exists():
@@ -525,6 +619,11 @@ def main() -> int:
                 raise SystemExit("the adapter never published a readiness receipt")
             time.sleep(0.1)
         payload = receipt_path.read_bytes()
+        receipt_info = receipt_path.stat()
+        assert (receipt_info.st_uid, receipt_info.st_gid) == (65532, 65532)
+        assert receipt_info.st_mode & 0o777 == 0o400
+        assert access_as(receipt_path, 65532, 65532, os.O_RDONLY)
+        assert not access_as(receipt_path, 65533, 65533, os.O_RDONLY)
         receipt = json.loads(payload)
         note(f"receipt published: {len(payload)} B, {len(receipt)} fields")
 
@@ -551,7 +650,7 @@ def main() -> int:
         assert not Path("/var/lib/cozy/provision").exists()
         note("artifact store empty, object set empty, no environment generation")
 
-        owner = RecordOwner(certificate, token)
+        owner = RecordOwner(certificate, token.encode())
         try:
             empty = owner.await_state(
                 lambda state: state.worker_phase != pb.WorkerPhase.WORKER_PHASE_UNSPECIFIED,
@@ -567,14 +666,21 @@ def main() -> int:
             assert owner.snapshot.get("held_attempts", []) == []
             assert ack.worker_id == "ra-cr048bootproof", ack
             assert ack.worker_release_id == "", ack
-            assert ack.worker_artifact_digest == "", ack
+            base_manifest = json.loads(
+                Path("/opt/cozy/base-runtime/WheelhouseManifest.json").read_bytes()
+            )
+            runtime_digest = next(
+                row["digest"]
+                for row in base_manifest["wheels"]
+                if row["distribution"] == "cozy-runtime"
+            )
+            assert ack.control_runtime_digest == runtime_digest, ack
             note(
                 f"renter Claim ACCEPTED: phase={pb.WorkerPhase.Name(empty.worker_phase)} "
                 f"placements=0 release_id={ack.worker_release_id!r}"
             )
 
             # ---- cr-049: the pod is empty; make it serve, over this same stream ----------
-            release = author_release()
             hub.serve_artifacts(release, origin_certificate, origin_key, ARTIFACT_PORT)
             note(
                 f"artifact origin serving {len(release.objects)} exact object(s) on "
@@ -648,17 +754,48 @@ def main() -> int:
                 )
                 for state in owner.states
             ), "no partial acquisition observation was emitted"
+            assert any(
+                state.placements
+                and state.placements[0].executor_generation > 0
+                and state.placements[0].acquisition.endpoint.ended_monotonic_ns > 0
+                and state.placements[0].acquisition.model.started_monotonic_ns > 0
+                and state.placements[0].acquisition.model.ended_monotonic_ns == 0
+                for state in owner.states
+            ), "executor did not spawn after endpoint admission while model hydration continued"
             note(f"CONVERGED: {describe(staged)}")
             note("endpoint-source and model-object-set GETs overlapped at the origin barrier")
 
             # THE POD BUILT ONLY THE ENDPOINT OVERLAY and derived the hub's exact receipt.
             expected = "sha256:" + hashlib.sha256(release.receipt).hexdigest()
-            generation = ENVIRONMENT_ROOT / "generations" / expected.removeprefix("sha256:")
-            assert generation.is_dir(), f"no generation at {generation}"
-            assert (generation / "endpoint-overlay-receipt.json").read_bytes() == release.receipt, (
-                "the pod's receipt bytes differ from the hub's"
+            receipt_path = (
+                ENVIRONMENT_ROOT / "receipts" / f"{expected.removeprefix('sha256:')}.json"
             )
+            receipt_value = json.loads(release.receipt)
+            content_identity = json.dumps(
+                {
+                    "base_family_digest": receipt_value["base_family_digest"],
+                    "format": "cozy.runtime.EndpointOverlayContent/1",
+                    "wheel_digests": sorted(
+                        row["digest"] for row in receipt_value["overlay_wheels"]
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            content_digest = hashlib.sha256(content_identity).hexdigest()
+            generation = ENVIRONMENT_ROOT / "contents" / content_digest
+            assert generation.is_dir(), f"no generation at {generation}"
+            assert receipt_path.read_bytes() == release.receipt, "the pod receipt differs"
+            assert (
+                generation / "endpoint-overlay-content.json"
+            ).read_bytes() == content_identity, "the installed-content identity differs"
             assert (generation / "site-packages" / "proof_cli_endpoint").is_dir()
+            endpoint_file = generation / "site-packages" / "proof_cli_endpoint" / "__init__.py"
+            assert access_as(endpoint_file, 65533, 65533, os.O_RDONLY)
+            assert not access_as(endpoint_file, 65533, 65533, os.O_WRONLY)
+            assert not access_as(receipt_path, 65533, 65533, os.O_RDONLY)
+            journal = STATE.parent / "worker" / "journal.log"
+            assert journal.is_file() and not access_as(journal, 65533, 65533, os.O_RDONLY)
             # THE WORKER FETCHED THE REACHABLE CLOSURE AND NOTHING ELSE. The grant
             # authorizes the evaluated config too, and no document in the walk names it, so
             # it stays INERT and unfetched — rev-2 §3's rule that a grant may authorize more
@@ -684,6 +821,34 @@ def main() -> int:
             assert served["body"]["execution_started"] is True, served["body"]
             assert served["result"] == {"text": "cr-049cr-049"}, served
             note(f"SERVED one attempt: {served['result']} from the materialized environment")
+
+            isolation = serve_one_attempt(
+                owner,
+                staged.placements[0].dispatchable_plan_ids[0],
+                hub.ENDPOINT_RELEASE,
+                text="__cozy_isolation_probe__",
+                count=1,
+                request_id="cr045-isolation-probe",
+            )
+            isolation_facts = json.loads(isolation["result"]["text"])
+            assert isolation_facts == {
+                "euid": 65533,
+                "worker_proc_mem_refused": True,
+                "worker_secret_read_refused": True,
+            }, isolation_facts
+            note(
+                "actual endpoint executor ran as uid 65533 and refused worker journal plus "
+                "/proc/<worker>/mem"
+            )
+
+            first_executor_generation = staged.placements[0].executor_generation
+            first_scratch = STATE.parent / "scratch" / f"generation-{first_executor_generation}"
+            assert first_scratch.is_dir() and first_scratch.stat().st_uid == 65533
+            scratch_sentinel = first_scratch / "executor-private"
+            scratch_sentinel.write_bytes(b"generation one\n")
+            os.chown(scratch_sentinel, 65533, 65533)
+            scratch_sentinel.chmod(0o600)
+            assert access_as(scratch_sentinel, 65533, 65533, os.O_RDONLY)
 
             # Leave observed state, then request the exact same placement again. Every
             # endpoint byte is already verified in the artifact cache and the empty model
@@ -722,6 +887,10 @@ def main() -> int:
             )
             assert warm_acquisition.model.downloaded_bytes == 0
             assert warm_acquisition.model.reused_bytes == 0
+            successor_generation = warm.placements[0].executor_generation
+            assert successor_generation > first_executor_generation
+            assert not first_scratch.exists(), "retired executor scratch survived replacement"
+            assert (STATE.parent / "scratch" / f"generation-{successor_generation}").is_dir()
             note(
                 "WARM acquisition downloaded 0 B and reused "
                 f"{warm_acquisition.endpoint.reused_bytes} endpoint B"
@@ -795,17 +964,20 @@ def main() -> int:
         finally:
             owner.close()
     finally:
-        adapter.terminate()
+        # PID1's capability-free cooperative stop: EOF, not a signal to the root child.
+        os.close(stop_write)
         try:
-            adapter.wait(timeout=20)
+            code = adapter.wait(timeout=20)
         except subprocess.TimeoutExpired:
             adapter.kill()
-            adapter.wait(timeout=20)
+            code = adapter.wait(timeout=20)
+        assert code == 0, f"adapter stop-pipe shutdown exited {code}"
     print(
         "boot proof: PASS — ready and empty with no provision document, then a first "
-        "DesiredPlacementSet fetched with observed overlapping legs, overlaid, served, "
-        "warm-reused at zero download, and a following mismatched revision refused with "
-        "the converged placement still serving",
+        "DesiredPlacementSet fetched with observed overlapping legs and early executor spawn; "
+        "the uid-65533 endpoint refused worker secret/proc access, scratch rotated, warm reuse "
+        "downloaded zero bytes, a mismatched revision retained serving, and fd3 EOF stopped "
+        "the root worker cooperatively",
         flush=True,
     )
     return 0

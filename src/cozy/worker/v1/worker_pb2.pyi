@@ -364,7 +364,7 @@ class Claim(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., proof: _Optional[bytes] = ..., wire_schema_digest: _Optional[bytes] = ...) -> None: ...
 
 class ClaimAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "accepted", "rejection", "wire_minor", "worker_id", "worker_instance_id", "worker_release_id", "worker_artifact_digest", "git_commit", "resources", "wire_schema_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "accepted", "rejection", "wire_minor", "worker_id", "worker_instance_id", "worker_release_id", "control_runtime_digest", "git_commit", "resources", "wire_schema_digest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -374,7 +374,7 @@ class ClaimAck(_message.Message):
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_RELEASE_ID_FIELD_NUMBER: _ClassVar[int]
-    WORKER_ARTIFACT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_RUNTIME_DIGEST_FIELD_NUMBER: _ClassVar[int]
     GIT_COMMIT_FIELD_NUMBER: _ClassVar[int]
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
     WIRE_SCHEMA_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -387,14 +387,14 @@ class ClaimAck(_message.Message):
     worker_id: str
     worker_instance_id: str
     worker_release_id: str
-    worker_artifact_digest: str
+    control_runtime_digest: str
     git_commit: str
     resources: WorkerResources
     wire_schema_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., accepted: bool = ..., rejection: _Optional[_Union[ClaimRejection, str]] = ..., wire_minor: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., worker_release_id: _Optional[str] = ..., worker_artifact_digest: _Optional[str] = ..., git_commit: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., wire_schema_digest: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., accepted: bool = ..., rejection: _Optional[_Union[ClaimRejection, str]] = ..., wire_minor: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., worker_release_id: _Optional[str] = ..., control_runtime_digest: _Optional[str] = ..., git_commit: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., wire_schema_digest: _Optional[bytes] = ...) -> None: ...
 
 class BootFailure(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "worker_id", "worker_instance_id", "reason", "detail", "resources", "worker_artifact_digest", "worker_release_id")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "worker_id", "worker_instance_id", "reason", "detail", "resources", "control_runtime_digest", "worker_release_id")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -403,7 +403,7 @@ class BootFailure(_message.Message):
     REASON_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
-    WORKER_ARTIFACT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_RUNTIME_DIGEST_FIELD_NUMBER: _ClassVar[int]
     WORKER_RELEASE_ID_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
@@ -413,9 +413,9 @@ class BootFailure(_message.Message):
     reason: BootFailureReason
     detail: str
     resources: WorkerResources
-    worker_artifact_digest: str
+    control_runtime_digest: str
     worker_release_id: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., reason: _Optional[_Union[BootFailureReason, str]] = ..., detail: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., worker_artifact_digest: _Optional[str] = ..., worker_release_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., reason: _Optional[_Union[BootFailureReason, str]] = ..., detail: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., control_runtime_digest: _Optional[str] = ..., worker_release_id: _Optional[str] = ...) -> None: ...
 
 class WorkerSnapshot(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "snapshot_id", "snapshot_digest", "snapshot_canonical_bytes", "accepted_placement_set_canonical_bytes")

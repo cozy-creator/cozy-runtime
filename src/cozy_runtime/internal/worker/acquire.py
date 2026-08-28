@@ -1,6 +1,6 @@
 """cr-049: the ACQUISITION walk — a desired spec plus a standing grant become local bytes.
 
-`converge_placement` used to only VERIFY: it read a receipt-keyed generation that something
+`converge_placement` used to only VERIFY: it read a receipt-selected generation that something
 else had already built and binding-plan records something else had already staged. Nothing
 built or staged them, because cr-048 retired the boot closure that did. This module is the
 missing door.
@@ -28,7 +28,7 @@ no second fetcher.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,6 +130,32 @@ class AcquisitionObservation:
             return
 
 
+class VerifiedArtifactCache:
+    """One worker-boot's stable-file receipts for exact acquisition bytes.
+
+    The table is deliberately memory-only: restart loses every receipt and therefore
+    re-hashes cached bytes once.  Within a boot, root-owned cache files may be trusted only
+    while their complete stat identity remains unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._files: dict[str, overlay.VerifiedFile] = {}
+
+    def trusted(self, digest: str, length: int, path: Path) -> overlay.VerifiedFile | None:
+        with self._lock:
+            receipt = self._files.get(digest)
+            return (
+                receipt if receipt is not None and receipt.matches(path, digest, length) else None
+            )
+
+    def record(self, digest: str, length: int, path: Path) -> overlay.VerifiedFile:
+        receipt = overlay.VerifiedFile.record(path, digest, length)
+        with self._lock:
+            self._files[digest] = receipt
+        return receipt
+
+
 def observe_model_sources(
     observation: AcquisitionObservation, outcome: materialize_launch.MaterializedObjects
 ) -> None:
@@ -209,6 +235,8 @@ class AcquiredPlacement:
     documents: tuple[str, ...]
     wheels: int
     fetched_bytes: int
+    verified_bytes: int
+    trusted_reuse_bytes: int
 
 
 class Acquirer:
@@ -229,6 +257,7 @@ class Acquirer:
         object_sets_root: Path,
         artifact_store: Path,
         python: Path,
+        verified_cache: VerifiedArtifactCache | None = None,
         on_observation: Any = None,
     ) -> None:
         self.grant = grant
@@ -239,10 +268,14 @@ class Acquirer:
         self.object_sets_root = object_sets_root
         self.artifact_store = artifact_store
         self.python = python
+        self.verified_cache = verified_cache or VerifiedArtifactCache()
         self.fetched_bytes = 0
+        self.verified_bytes = 0
+        self.trusted_reuse_bytes = 0
         self.wheels = 0
         self._fetch_lock = Lock()
         self._new_digests: set[str] = set()
+        self._metric_digests: set[str] = set()
         self._observed_digests: dict[LegName, set[str]] = {"endpoint": set(), "model": set()}
         self._thread = local()
         self.observation = AcquisitionObservation(on_observation)
@@ -292,17 +325,29 @@ class Acquirer:
         deadline = self._deadline()
         target = self.cache_root / digest.removeprefix("sha256:")
         already = target.exists()
+        trusted = self.verified_cache.trusted(digest, length, target)
+        trusted_before = trusted is not None
         try:
-            path = materialize_launch.fetch_exact(
-                {"digest": digest, "length": length, "url": url},
-                self.cache_root,
-                deadline=deadline,
-                allow_local=self.grant.local(),
-            )
+            if trusted is not None:
+                path = target
+            else:
+                path = materialize_launch.fetch_exact(
+                    {"digest": digest, "length": length, "url": url},
+                    self.cache_root,
+                    deadline=deadline,
+                    allow_local=self.grant.local(),
+                )
+                trusted = self.verified_cache.record(digest, length, path)
         except materialize_launch.LaunchRefusal as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH
-                if exc.code in {"grant_identity_mismatch", "grant_length_mismatch"}
+                if exc.code
+                in {
+                    "grant_identity_mismatch",
+                    "grant_length_mismatch",
+                    "local_artifact_digest_mismatch",
+                    "local_artifact_invalid",
+                }
                 else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                 exc.code,
                 exc.detail,
@@ -314,6 +359,12 @@ class Acquirer:
             if not already and digest not in self._new_digests and target == path:
                 self._new_digests.add(digest)
                 self.fetched_bytes += length
+            if digest not in self._metric_digests:
+                self._metric_digests.add(digest)
+                if trusted_before:
+                    self.trusted_reuse_bytes += length
+                else:
+                    self.verified_bytes += length
             leg = getattr(self._thread, "leg", None)
             if observe and leg in self._observed_digests:
                 observed = self._observed_digests[leg]
@@ -328,7 +379,12 @@ class Acquirer:
 
     # ---- the walk ---------------------------------------------------------------------
 
-    def acquire(self, placement: Any) -> AcquiredPlacement:
+    def acquire(
+        self,
+        placement: Any,
+        *,
+        on_endpoint_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
+    ) -> AcquiredPlacement:
         """Fetch, build, and stage everything one PlacementSpec reaches. Fail closed."""
 
         # The endpoint closure and model-object closure are the two observed legs. They
@@ -339,6 +395,8 @@ class Acquirer:
             endpoint_future = pool.submit(self._run_endpoint, placement)
             model_future = pool.submit(self._run_model, placement)
             installed, plans, staged = endpoint_future.result()
+            if on_endpoint_ready is not None:
+                on_endpoint_ready(installed)
             object_set, model_objects = model_future.result()
         return AcquiredPlacement(
             installed=installed,
@@ -348,6 +406,8 @@ class Acquirer:
             documents=staged,
             wheels=self.wheels,
             fetched_bytes=self.fetched_bytes,
+            verified_bytes=self.verified_bytes,
+            trusted_reuse_bytes=self.trusted_reuse_bytes,
         )
 
     def _run_endpoint(
@@ -381,7 +441,8 @@ class Acquirer:
                 "PlacementSpec/2 names one exact model_object_set subject",
             )
         raw = self.fetch(digest, length, observe=False).read_bytes()
-        self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self.object_sets_root.chmod(0o755)
         try:
             object_set = provisioned.read_artifact_object_set(raw)
         except Exception as exc:
@@ -467,12 +528,21 @@ class Acquirer:
         self._parse(wheelhouse_bytes, "wheelhouse_manifest")
 
         wheel_paths: dict[str, Path] = {}
+        verified_wheels: dict[str, overlay.VerifiedFile] = {}
         for row in (
             bundle.get("project_wheel"),
             *self._rows(resolved.get("wheels"), "resolved_wheel_set"),
         ):
             digest, length = self._wheel_ref(row)
             wheel_paths[digest] = self.fetch(digest, length)
+            verified = self.verified_cache.trusted(digest, length, wheel_paths[digest])
+            if verified is None:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                    "wheel_verification_receipt_absent",
+                    digest,
+                )
+            verified_wheels[digest] = verified
         self.wheels = len(wheel_paths)
 
         try:
@@ -482,6 +552,7 @@ class Acquirer:
                 resolved_wheel_set_bytes=resolved_bytes,
                 wheelhouse_manifest_bytes=wheelhouse_bytes,
                 wheel_paths=wheel_paths,
+                verified_wheels=verified_wheels,
             )
             return overlay.materialize(
                 source,
@@ -501,8 +572,10 @@ class Acquirer:
     def _bindings(self, placement: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Stage the plan records and every document those plans REACH."""
 
-        self.plans_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.documents_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.plans_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self.documents_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self.plans_root.chmod(0o755)
+        self.documents_root.chmod(0o755)
         staged: list[str] = []
         descriptor_digest = documents.spell(placement.descriptor_digest)
         for plan_id in placement.plan_ids:
@@ -567,7 +640,7 @@ class Acquirer:
             return
         temporary = root / f".stage-{digest.removeprefix('sha256:')[:16]}"
         temporary.write_bytes(raw)
-        temporary.chmod(0o400)
+        temporary.chmod(0o444)
         temporary.replace(target)
 
     def _authorized_length(self, digest: str, name: str) -> int:

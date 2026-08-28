@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from collections.abc import Mapping
 from typing import Literal
 
@@ -35,6 +37,28 @@ class EchoResult(msgspec.Struct):
 
 @app.entrypoint
 def echo(payload: EchoRequest) -> EchoResult:
+    if payload.text == "__cozy_isolation_probe__":
+        worker_pid = os.getppid()
+
+        def refused(path: str) -> bool:
+            try:
+                descriptor = os.open(path, os.O_RDONLY)
+            except OSError:
+                return True
+            os.close(descriptor)
+            return False
+
+        return EchoResult(
+            json.dumps(
+                {
+                    "euid": os.geteuid(),
+                    "worker_secret_read_refused": refused("/run/cozy/worker/journal.log"),
+                    "worker_proc_mem_refused": refused(f"/proc/{worker_pid}/mem"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     return EchoResult(payload.text * payload.count)
 
 

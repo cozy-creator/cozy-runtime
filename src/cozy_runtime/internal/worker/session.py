@@ -186,7 +186,7 @@ class WorkerOptions:
     #: owner reading an empty `release_id` learns the truth, and an owner reading a plausible
     #: lie learns nothing it can act on.
     release_id: str = ""
-    artifact_digest: str = ""
+    control_runtime_digest: str = ""
     git_commit: str = ""
     python: str = ""
     devices: str = "0"
@@ -196,7 +196,7 @@ class WorkerOptions:
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
     environment_root: Path | None = None
-    """The cr-027 materializer root whose receipt-keyed ``generations`` are selectable.
+    """The materializer root whose receipt refs select content-keyed immutable overlays.
 
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
@@ -218,6 +218,9 @@ class WorkerOptions:
     host_budget: int = 8 << 30
     pinned_budget: int = 512 << 20
     no_warm: bool = False
+    executor_uid: int = -1
+    executor_gid: int = -1
+    """Fixed endpoint identity, or ``-1/-1`` for the native same-user development lane."""
 
 
 @dataclass(slots=True)
@@ -537,7 +540,7 @@ class AccessTokenSet:
             self.entries, self.size, self.stamp = found, info.st_size, info.st_mtime
         self.unreadable = ""
 
-    def admits(self, presented: str) -> bool:
+    def admits(self, presented: bytes) -> bool:
         """Hash what was presented and compare it into the live set, constant-time.
 
         One-directional on purpose: this answers whether a token is one of ours and can
@@ -547,7 +550,7 @@ class AccessTokenSet:
         self.reload()
         with self.lock:
             entries = self.entries
-        digest = "sha256:" + hashlib.sha256(presented.strip().encode()).hexdigest()
+        digest = "sha256:" + hashlib.sha256(presented).hexdigest()
         admitted = False
         for entry in entries:
             if hmac.compare_digest(digest, entry):
@@ -575,6 +578,10 @@ class Worker:
         self.host = host
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
+        if options.executor_uid >= 0:
+            # Set before any endpoint child exists and before the worker starts serving.
+            # The uid split closes ordinary ptrace; non-dumpable is the explicit second belt.
+            proctree.deny_process_inspection()
         self.fence = OwnershipFence(worker_boot_id=f"boot-{uuid.uuid4().hex[:20]}")
         self.accepted = AcceptedDesiredState()
         #: The non-attempt narration lane. In NEITHER fence half (#484): it is neither an
@@ -603,6 +610,9 @@ class Worker:
             python=options.python or sys.executable,
             base_env=config.child_base_env,
             cozy_home=config.cozy_home,
+            executor_uid=options.executor_uid,
+            executor_gid=options.executor_gid,
+            scratch_root=self.root.parent / "scratch",
         )
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
@@ -694,6 +704,9 @@ class Worker:
         #: placement that reaches artifacts this worker does not hold then reports a typed
         #: fault instead of fetching from nowhere.
         self.grant = acquire.StandingGrant()
+        # Same-boot verification receipts. A worker restart intentionally loses this table
+        # and re-hashes every retained cache file once before trusting it again.
+        self.verified_artifacts = acquire.VerifiedArtifactCache()
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
@@ -1078,7 +1091,7 @@ class Worker:
         # compares against the credential its own launcher minted. Both are constant-time
         # and neither ever renders what it holds into a refusal.
         if self.access is not None:
-            if not self.access.admits(claim.proof.decode(errors="replace")):
+            if not self.access.admits(claim.proof):
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED, self.access.why_not()
                 )
@@ -1206,9 +1219,9 @@ class Worker:
     ) -> None:
         """ClaimAck + the one recovery snapshot, for a claim this worker can actually serve.
 
-        `worker_artifact_digest` is where BASE-WORKER-IMAGE identity rides and NOWHERE ELSE
-        (#487/#489): it is evidence about a MACHINE, never identity of an ENVIRONMENT, which
-        is why `EndpointEnvironmentSpec` has no base-worker-image key at all.
+        `control_runtime_digest` is the exact image-owned cozy-runtime wheel fact from
+        WheelhouseManifest/2. OCI identity remains the provider-readback axis; neither is
+        substituted for the other.
         """
         ack = pb.ClaimAck(
             accepted=True,
@@ -1217,7 +1230,7 @@ class Worker:
             worker_id=self.options.worker_id,
             worker_instance_id=self.options.instance_id,
             worker_release_id=self.options.release_id,
-            worker_artifact_digest=self.options.artifact_digest,
+            control_runtime_digest=self.options.control_runtime_digest,
             git_commit=self.options.git_commit,
             resources=self.resources(),
         )
@@ -1911,7 +1924,7 @@ class Worker:
                 self.await_settled(attempt)
 
     def _acquire(self, placement: Placement, revision: int) -> overlay.InstalledOverlay | None:
-        """Fetch what the spec REACHES and publish the receipt-keyed generation it names.
+        """Fetch what the spec reaches and join its receipt to content-keyed installed bytes.
 
         Returns the installed generation, or None having already typed the fault and left the
         outgoing placement serving.
@@ -1944,13 +1957,13 @@ class Worker:
                 terminal=False,
             )
             return None
-        generation = (
-            self.options.environment_root / "generations" / expected.removeprefix("sha256:")
+        receipt = (
+            self.options.environment_root / "receipts" / f"{expected.removeprefix('sha256:')}.json"
         )
         # A standing grant re-drives the full reachability walk even when the overlay is
         # already present: that is how warm reuse is measured honestly for BOTH endpoint
         # and model legs. A preinstalled generation with no grant may still open locally.
-        if not generation.exists() or self.grant.authorized():
+        if not receipt.exists() or self.grant.authorized():
             if self.options.artifact_cache is None:
                 self._materialization_failed(
                     placement,
@@ -1981,7 +1994,7 @@ class Worker:
                 )
                 return None
             try:
-                acquired = acquire.Acquirer(
+                acquirer = acquire.Acquirer(
                     self.grant,
                     cache_root=self.options.artifact_cache,
                     environment_root=self.options.environment_root,
@@ -1990,8 +2003,40 @@ class Worker:
                     object_sets_root=self.options.environment_root.parent / "model-object-sets",
                     artifact_store=self.options.artifact_store,
                     python=Path(sys.executable),
+                    verified_cache=self.verified_artifacts,
                     on_observation=lambda value: self._observe_acquisition(placement, value),
-                ).acquire(placement)
+                )
+
+                def endpoint_ready(installed: overlay.InstalledOverlay) -> None:
+                    """Start cold interpreter/Torch import while model bytes still hydrate."""
+
+                    if revision != self.accepted.accepted_desired_state_revision:
+                        return
+                    # One executor is the entire device lane. An outgoing placement keeps
+                    # serving untouched until the ordinary staged handoff; early spawn is
+                    # available only from a standing start.
+                    if self.supervision.current is not None:
+                        return
+                    self.supervision.use_overlay(str(installed.python), str(installed.import_root))
+                    try:
+                        executor = self.supervision.spawn(imposed=self.imposed())
+                    except ExecutorGone as exc:
+                        raise acquire.AcquisitionRefusal(
+                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            "executor_early_spawn_failed",
+                            str(exc),
+                        ) from exc
+                    self.note(
+                        "boot",
+                        f"generation {executor.incarnation} pid {executor.pid} spawned "
+                        "after endpoint overlay admission while model hydration continued",
+                    )
+                    # Make the overlap externally observable immediately; otherwise the
+                    # next state frame might be the model leg's terminal update and the
+                    # optimization would exist without a proof surface.
+                    self._observe_acquisition(placement, acquirer.observation.snapshot())
+
+                acquired = acquirer.acquire(placement, on_endpoint_ready=endpoint_ready)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,
@@ -2030,13 +2075,15 @@ class Worker:
                 f"{len(acquired.plans)} plan(s) and {len(acquired.documents)} reached "
                 f"document(s), hydrated {acquired.model_objects} model object(s) — "
                 f"{acquired.fetched_bytes} new byte(s) — and published "
-                f"generation {acquired.installed.generation}",
+                f"content {acquired.installed.content_digest} at "
+                f"{acquired.installed.generation}; verified {acquired.verified_bytes} byte(s), "
+                f"trusted same-boot reuse {acquired.trusted_reuse_bytes} byte(s)",
             )
         # Open the small receipt and base-family document. Wheel bytes were hashed before
         # atomic publication; image-resident bytes are already fixed by the OCI digest.
         try:
             installed = overlay.open_generation(
-                generation,
+                self.options.environment_root,
                 receipt_digest=expected,
                 environment_spec_digest=documents.spell(placement.environment_spec_digest),
             )
@@ -2431,6 +2478,14 @@ class Worker:
 
         for group in by_construction.values():
             first = group[0]
+            generation_probe = (
+                self.supervision.generation_scratch(executor.incarnation) / "probe"
+                if getattr(self.supervision, "isolated", False)
+                else self.config.cozy_home / "probe"
+            )
+            generation_probe.mkdir(parents=True, exist_ok=True)
+            if getattr(self.supervision, "isolated", False):
+                self.supervision.grant_directory(generation_probe, executor.incarnation)
             started = time.perf_counter()
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
@@ -2460,11 +2515,11 @@ class Worker:
                             "stamps": {k: list(v) for k, v in first.stamps.items()},
                             "custody": first.custody,
                             "strict_keys": first.strict_keys,
-                            "probe_cache": str(self.config.cozy_home / "probe"),
+                            "probe_cache": str(generation_probe),
                             "variants": [dataclasses.asdict(offer) for offer in first.offered],
                             "objective": first.objective,
                             "steps_basis": first.steps_basis,
-                            "delivery_cache": str(self.config.cozy_home / "probe"),
+                            "delivery_cache": str(generation_probe),
                         },
                         "budgets": {
                             # cr-037/law 19: a prediction BASIS, not a budget — the wire
@@ -3446,7 +3501,7 @@ class Worker:
             detail=f"{detail} | disk invoice: {json.dumps(invoice, sort_keys=True)}"[:1024],
             resources=self.resources(),
             worker_release_id=self.options.release_id,
-            worker_artifact_digest=self.options.artifact_digest,
+            control_runtime_digest=self.options.control_runtime_digest,
         )
 
     def run(self) -> int:
@@ -3558,7 +3613,7 @@ class Worker:
 
 
 #: A provenance digest is `sha256:` plus 64 lowercase hex, or it is not one.
-_ARTIFACT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_CONTROL_RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 #: The loopback names a worker may serve plaintext, and without a bootstrap credential.
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
@@ -3602,11 +3657,10 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--instance-id", default="")
     parser.add_argument("--release-id", default="")
     parser.add_argument(
-        "--artifact-digest",
+        "--control-runtime-digest",
         default="",
-        help="the worker ARTIFACT's provenance digest, `sha256:<64 hex>`; absent stays "
-        "absent. Was --image-digest: a native worker has no OCI image (#481), and this is "
-        "the one field base-worker-image identity rides (#487/#489)",
+        help="the exact image-owned cozy-runtime wheel digest from WheelhouseManifest/2; "
+        "absent for native workers",
     )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
@@ -3619,7 +3673,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-root",
         default="",
-        help="cr-027 endpoint-overlay root containing receipt-keyed immutable generations",
+        help="endpoint-overlay root containing exact receipts and content-keyed generations",
     )
     parser.add_argument(
         "--artifact-cache",
@@ -3643,14 +3697,32 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--host-budget", type=int, default=8 << 30)
     parser.add_argument("--pinned-budget", type=int, default=512 << 20)
     parser.add_argument("--no-warm", action="store_true")
+    parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
+    parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
 
-    if args.artifact_digest and not _ARTIFACT_DIGEST.fullmatch(args.artifact_digest):
+    if args.control_runtime_digest and not _CONTROL_RUNTIME_DIGEST.fullmatch(
+        args.control_runtime_digest
+    ):
         print(
-            f"[worker] --artifact-digest {args.artifact_digest!r} is not `sha256:<64 hex>`: a "
-            "provenance digest is measured or it is absent, never approximated",
+            f"[worker] --control-runtime-digest {args.control_runtime_digest!r} is not "
+            "`sha256:<64 hex>`: the image-owned Runtime wheel digest is measured or absent",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
+    isolated = args.executor_uid >= 0 or args.executor_gid >= 0
+    if isolated and (
+        args.executor_uid <= 0
+        or args.executor_gid <= 0
+        or os.geteuid() != 0
+        or args.executor_uid == os.geteuid()
+    ):
+        print(
+            "[worker] refusing executor identity split: --executor-uid/--executor-gid must "
+            "name a positive non-worker identity and the trusted worker must run as root",
             file=sys.stderr,
             flush=True,
         )
@@ -3660,7 +3732,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         worker_id=args.worker_id,
         instance_id=args.instance_id or instance_identity(Path(args.root)),
         release_id=args.release_id,
-        artifact_digest=args.artifact_digest,
+        control_runtime_digest=args.control_runtime_digest,
         git_commit=args.git_commit,
         python=args.python,
         devices=args.devices,
@@ -3675,6 +3747,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         host_budget=args.host_budget,
         pinned_budget=args.pinned_budget,
         no_warm=args.no_warm,
+        executor_uid=args.executor_uid,
+        executor_gid=args.executor_gid,
     )
     listen = args.listen
     if listen.startswith("unix:"):

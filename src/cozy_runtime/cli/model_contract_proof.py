@@ -1,6 +1,6 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
-The command runs from the base worker image's Python plus a receipt-keyed endpoint overlay.
+The command runs from base worker image Python plus a receipt-selected content overlay.
 It verifies that small overlay receipt and base-family join, then delegates endpoint import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
@@ -364,13 +364,23 @@ def _document_bytes(path: Path, name: str) -> bytes:
 
 
 def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOverlay:
+    if request.environment_generation.parent.name != "contents":
+        raise ProofRefusal(
+            "model_contract_environment_generation_invalid",
+            "installed content is not below the environment root's contents directory",
+        )
     installed = overlay.open_generation(
-        request.environment_generation,
+        request.environment_generation.parent.parent,
         receipt_digest=request.installed_environment_receipt.digest,
         environment_spec_digest=request.environment_spec_digest,
         base_manifest=request.wheelhouse_manifest,
         reused=True,
     )
+    if installed.generation != request.environment_generation:
+        raise ProofRefusal(
+            "model_contract_environment_generation_mismatch",
+            "placement receipt resolves to different installed content",
+        )
     if len(installed.receipt_bytes) != request.installed_environment_receipt.length:
         raise ProofRefusal(
             "model_contract_environment_receipt_mismatch",

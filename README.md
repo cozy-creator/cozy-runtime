@@ -14,7 +14,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 7) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 8) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -208,11 +208,23 @@ the manifest's providers or a duplicate project/custom root before extraction or
 There is no `/1` reader and no
 hardcoded protected-root list.
 
-Runtime then hashes each arriving endpoint wheel once and publishes one read-only overlay by
-atomic rename. Reuse reads the small receipt and base-family manifest; it does not walk or re-hash
-every installed file. Base bytecode is baked in the image and endpoint bytecode is compiled once
-during overlay publication. The executor starts with image Python and APPENDS the overlay import
-root after image-owned paths.
+Runtime hashes each arriving endpoint wheel once. A worker-boot-local verified-file receipt binds
+its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
+stat change or worker restart re-hashes before trust. Overlay admission consumes the receipt instead
+of hashing the same wheel again. Each verified wheel is extracted once into a root-owned immutable
+pool keyed below the base family and extraction format. Installed content is keyed by
+`(base_family_digest, sorted wheel digests)` and composed with collision-checked hardlinks, so a
+metadata-only environment-spec change shares one compiled content tree and a one-wheel change
+shares every unchanged installed inode. The spec-specific receipt remains a separate exact join.
+
+The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
+and drops endpoint execution to uid/gid 65533. Receipts, acquisition cache, journal and worker
+credentials remain root-only. Content is root-owned/read-only, and executor scratch/probe state is
+private to one incarnation and deleted before the fixed uid is reused. A worker that cannot perform
+the identity split refuses before binding. Native/local development keeps its explicit same-user
+lane. Base bytecode is baked in the image and endpoint bytecode is compiled once per content
+identity. The executor starts with image Python and appends the exact content import root after
+image-owned paths.
 
 An overlay contains exactly one project wheel and at most 127 custom wheels. The Runtime bound is
 128 total endpoint-owned wheels, counting the project; 128 custom rows plus the project refuses
@@ -220,11 +232,12 @@ before any grant or ZIP is opened.
 
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control
-convergence lane starts three independent legs together: endpoint project/custom wheels,
-binding/model documents, and the exact model-object closure into TensorFS. Source/model
-downloads therefore overlap; READY still joins the overlay, TensorFS closure, binding
-resolution, and device construction. A grant refresh re-drives the same accepted revision
-without changing its identity.
+convergence lane starts endpoint and model acquisition together. As soon as endpoint overlay and
+binding documents are admitted from a standing start, Runtime spawns the executor so interpreter
+and Torch import overlap continued TensorFS hydration; model preparation/fill still waits for the
+exact model closure. READY remains the join of overlay, TensorFS closure, binding resolution and
+device construction. An outgoing placement is never disturbed by this optimization, and a grant
+refresh re-drives the same accepted revision without changing its identity.
 
 Schema rev 7 exposes that work as observation only. `PlacementStatus.acquisition` retains
 endpoint/model start and end values from one process-monotonic clock plus cumulative
@@ -269,7 +282,7 @@ set is closed; every path value is a normalized absolute local path:
 }
 ```
 
-The receipt-keyed overlay then exposes
+The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
 it verifies the overlay/base-family join, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
@@ -285,7 +298,7 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 ```json
 {
   "format": "cozy.runtime.ModelConstructionProofRequest/1",
-  "environment_generation": "/proof/environment/generations/<receipt>",
+  "environment_generation": "/proof/environment/contents/<content-identity>",
   "environment_spec_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
   "project_wheel_digest": "sha256:<64 lowercase hex>",
