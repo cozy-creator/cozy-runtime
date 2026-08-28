@@ -2234,8 +2234,13 @@ class Worker:
                 f"construction ({len(executor.ready_plans)} binding plan(s))",
             )
             if executor.ready_plans:
-                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
+                # The high-water mark moves BEFORE the edge is published. `set_serving`
+                # reports immediately — dispatchability is an edge — and `converged_revision`
+                # CLAMPS itself back until serving actually says DISPATCHABLE, so writing it
+                # first cannot publish an early claim, while writing it second published one
+                # frame that said DISPATCHABLE and not-converged in the same breath.
                 self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
             else:
                 self.latched = "logical model digest mismatch"
                 self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
@@ -2496,9 +2501,11 @@ class Worker:
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
             self._settle()
             return
-        self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
         if not self.latched:
+            # Before the edge, for the reason above: the clamp in `converged_revision` is
+            # what keeps this honest, and the ORDER is what keeps it consistent.
             self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+        self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
 
     def run_warm_pass(self) -> bool:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""

@@ -31,4 +31,12 @@ cp "$here/Dockerfile" "$here/pod.py" "$here/hub.py" "$here/nvidia-smi" \
     "$repo/proofs/support/proof_data.py" "$proof_root/context/"
 
 nice -n 19 docker build --quiet -t "$image" "$proof_root/context" >/dev/null
-nice -n 19 docker run --rm --name "$container" --network none "$image"
+# THE SUBSTRATE'S CGROUP GRANT, in its local form. execution-substrates hands the pod a
+# DELEGATED cgroup-v2 subtree, and internal/proctree.py refuses to run an executor without
+# one — it never silently falls back to a weaker scope, which is the property, not an
+# inconvenience. `--cgroupns=private` gives the container its own namespaced cgroup root
+# and docker mounts THAT subtree rw; the container reaches no host cgroup and still has no
+# network at all. Bind-mounting the host's /sys/fs/cgroup would have handed the proof the
+# host root instead, which is why it is not what this does.
+nice -n 19 docker run --rm --name "$container" --network none \
+    --cgroupns=private --privileged "$image"

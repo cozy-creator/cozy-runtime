@@ -12,7 +12,7 @@ RUN apt-get update \
 COPY wheels/ /wheels/
 # The wheelhouse the RELEASE names, downloaded once at image build. The materialized venv
 # installs these offline from exact bytes; nothing is resolved at convergence time.
-RUN python -m pip download --no-deps --only-binary=:all: -d /wheels/deps \
+RUN python -m pip download --only-binary=:all: -d /wheels/deps \
       msgspec protobuf grpcio
 RUN python -m pip install --no-cache-dir /wheels/cozy_runtime-*.whl \
       /wheels/proof_cli_endpoint-*.whl \

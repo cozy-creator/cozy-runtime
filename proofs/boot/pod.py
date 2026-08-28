@@ -90,6 +90,41 @@ def note(line: str) -> None:
     print(f"[boot-proof] {line}", flush=True)
 
 
+def mint_origin_tls() -> tuple[Path, Path]:
+    """The ARTIFACT ORIGIN's own keypair, which is the hub's and not the pod's.
+
+    It is separate on purpose: the pod's certificate is bound to `DNS:cozy-worker` and
+    `readiness.certificate` refuses any other SAN on it, because that certificate is the one
+    a renter pins. The origin is a different peer with a different name, so it gets a
+    different key — which is also what a real deployment looks like.
+    """
+
+    certificate, key = STATE / "origin.crt", STATE / "origin.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=cozy-artifact-origin",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return certificate, key
+
+
 def mint_tls() -> tuple[Path, Path]:
     certificate, key = STATE / "tls.crt", STATE / "tls.key"
     subprocess.run(
@@ -109,9 +144,7 @@ def mint_tls() -> tuple[Path, Path]:
             "-subj",
             "/CN=cozy-worker",
             "-addext",
-            # The artifact origin is served on loopback with the same keypair, so the IP SAN
-            # is what the worker's own TLS verification of the grant location checks.
-            "subjectAltName=DNS:cozy-worker,IP:127.0.0.1",
+            "subjectAltName=DNS:cozy-worker",
         ],
         check=True,
         capture_output=True,
@@ -343,7 +376,6 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
     payload = json.dumps({"text": "cr-049", "count": 2}).encode()
     payload_path = MEDIA_ROOT / "payload.json"
     payload_path.write_bytes(payload)
-    output_path = MEDIA_ROOT / "echo.json"
     payload_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     spec = pb.InvocationSpec(
         endpoint_release_id=release_id,
@@ -359,7 +391,9 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
                 order=0,
             )
         ],
-        outputs=[pb.OutputBinding(output_id="result", max_bytes=1 << 20)],
+        # `echo` returns a typed struct, not an artifact: it names no outputs, so the
+        # grant names none either. Exact set equality between produced and granted outputs
+        # is enforced by the tail, so an invented destination would refuse the attempt.
     )
     spec.serving.entrypoint_binding_plan_id = plan_id
     spec.serving.attempt_binding_id = plan_id
@@ -386,7 +420,6 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
                         file_base_url=f"file://{MEDIA_ROOT}",
                         expires_at_unix=DEADLINE,
                         inputs=[pb.InputAccess(input_id="payload", url=f"file://{payload_path}")],
-                        outputs=[pb.OutputAccess(output_id="result", url=f"file://{output_path}")],
                     ),
                 )
             )
@@ -407,7 +440,9 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
             )
         )
     )
-    return {"body": body, "output": output_path}
+    envelope = body.get("result", {})
+    inline = base64.b64decode(str(envelope.get("inline_result", "")))
+    return {"body": body, "result": json.loads(inline) if inline else None}
 
 
 def author_release() -> hub.Release:
@@ -437,6 +472,7 @@ def author_release() -> hub.Release:
 def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     certificate, key = mint_tls()
+    origin_certificate, origin_key = mint_origin_tls()
     boot_id = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     (STATE / "pod-boot-id").write_text(boot_id + "\n")
     # The renter mints the token and tells NOBODY; the hub holds only the hash. The proof
@@ -451,7 +487,7 @@ def main() -> int:
         # certificate the way a pod trusts any private CA: through the ONE platform name the
         # substrate already passes through (`config.ADAPTER_CHILD_PLATFORM_ENV`). No new
         # adapter variable, and no verification is skipped anywhere.
-        "SSL_CERT_FILE": str(certificate),
+        "SSL_CERT_FILE": str(origin_certificate),
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "1",
         "COZY_ADAPTER_RENTAL_ID": "rental-cr048bootproof",
@@ -544,7 +580,7 @@ def main() -> int:
 
             # ---- cr-049: the pod is empty; make it serve, over this same stream ----------
             release = author_release()
-            hub.serve_artifacts(release, certificate, key, ARTIFACT_PORT)
+            hub.serve_artifacts(release, origin_certificate, origin_key, ARTIFACT_PORT)
             note(
                 f"artifact origin serving {len(release.objects)} exact object(s) on "
                 f"127.0.0.1:{ARTIFACT_PORT}; the hub measured receipt "
@@ -594,20 +630,31 @@ def main() -> int:
                 generation / "installed-environment-receipt.json"
             ).read_bytes() == release.receipt, "the pod's receipt bytes differ from the hub's"
             assert (generation / "venv" / "bin" / "python").exists()
-            fetched = sorted(p.name for p in ARTIFACT_CACHE.iterdir())
-            assert len(fetched) == len(release.objects), fetched
+            # THE WORKER FETCHED THE REACHABLE CLOSURE AND NOTHING ELSE. The grant
+            # authorizes the evaluated config too, and no document in the walk names it, so
+            # it stays INERT and unfetched — rev-2 §3's rule that a grant may authorize more
+            # than a spec reaches, observed rather than asserted.
+            fetched = {"sha256:" + p.name for p in ARTIFACT_CACHE.iterdir()}
+            reached = {d for d, kind in release.kinds.items() if kind != "config"}
+            inert = {d for d, kind in release.kinds.items() if kind == "config"}
+            assert fetched == reached, sorted(fetched ^ reached)
+            assert inert and not (fetched & inert), sorted(inert)
             note(
-                f"the pod fetched {len(fetched)} exact object(s) and published generation "
-                f"{generation.name[:16]}… whose receipt is byte-identical to the hub's"
+                f"the pod fetched the {len(fetched)} object(s) the spec REACHES, left "
+                f"{len(inert)} authorized-but-unreached subject(s) inert, and published "
+                f"generation {generation.name[:16]}… whose receipt is byte-identical to "
+                "the hub's"
             )
 
             served = serve_one_attempt(
                 owner, staged.placements[0].dispatchable_plan_ids[0], hub.ENDPOINT_RELEASE
             )
-            assert served["body"]["status"] == "ATTEMPT_STATUS_SUCCEEDED", served["body"]
-            result = json.loads(Path(served["output"]).read_bytes())
-            assert result == {"text": "cr-049cr-049"}, result
-            note(f"SERVED one attempt: {result} from the materialized environment")
+            assert served["body"]["status"] == pb.OutcomeStatus.OUTCOME_STATUS_SUCCEEDED, served[
+                "body"
+            ]
+            assert served["body"]["execution_started"] is True, served["body"]
+            assert served["result"] == {"text": "cr-049cr-049"}, served
+            note(f"SERVED one attempt: {served['result']} from the materialized environment")
 
             # ---- the red arm: an incoming spec the grant does not authorize --------------
             broken = release.placement_set.replace(
