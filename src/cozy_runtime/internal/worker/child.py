@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel, proctree, spawn
-from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
+from cozy_runtime.internal.child_env import BYTECODE_CACHE_ENV, EXECUTOR_SCOPE_ENV
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 from cozy_runtime.internal.worker.plan import PreparedModel
@@ -236,6 +236,9 @@ class ExecutorSupervision:
     ) -> None:
         self.root = root
         self.python = python
+        self.bytecode_cache = ""
+        """The interpreter's generation-keyed bytecode tree; moves with `python` only, via
+        `use_generation`, because a tree keyed to another generation is worse than none."""
         self.base_env = base_env
         self.cozy_home = cozy_home
         self.root.mkdir(parents=True, exist_ok=True)
@@ -542,6 +545,15 @@ class ExecutorSupervision:
                 )
             return self._spawn_locked(imposed=imposed)
 
+    def use_generation(self, python: str, bytecode_cache: str) -> bool:
+        """Point the executor at one generation's interpreter and its bytecode tree."""
+
+        if (self.python, self.bytecode_cache) == (python, bytecode_cache):
+            return False
+        self.python = python
+        self.bytecode_cache = bytecode_cache
+        return True
+
     def _spawn_locked(self, *, imposed: dict[str, str]) -> Executor:
         """Spawn while `_lifecycle` is held; publish only after a verified hello."""
         recorded = self._read_owner()
@@ -573,6 +585,8 @@ class ExecutorSupervision:
             "COZY_EXECUTOR_SOCKET": self.socket_path,
             "COZY_HOME": str(self.cozy_home),
         }
+        if self.bytecode_cache:
+            imposed[BYTECODE_CACHE_ENV] = self.bytecode_cache
         started = time.perf_counter()
         spawned: spawn.Spawned | None = None
         process: proctree.ProcessIdentity | None = None
