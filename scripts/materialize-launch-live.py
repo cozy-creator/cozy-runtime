@@ -10,11 +10,17 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import TypedDict, cast
+from types import SimpleNamespace
+from typing import Any, TypedDict, cast
 
 from cozy_runtime.cli.materialize_launch import _worker_command
 from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
-from cozy_runtime.internal.config import ConfigError, read_adapter_config
+from cozy_runtime.internal.config import (
+    ConfigError,
+    Credentials,
+    RuntimeConfig,
+    read_adapter_config,
+)
 from cozy_runtime.internal.materialize_launch import (
     EMPTY_ARTIFACT_OBJECT_SET,
     LaunchRefusal,
@@ -22,9 +28,11 @@ from cozy_runtime.internal.materialize_launch import (
     _publish_exact,
     materialize_objects,
 )
+from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import PlanRefusal
-from cozy_runtime.internal.worker.session import WorkerOptions
+from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import SCHEMA_DIGEST
+from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,6 +51,103 @@ class ObjectSetVector(TypedDict):
 
 def ref(raw: bytes) -> Ref:
     return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
+
+
+class PolicyExecutor:
+    """A live worker-session seam double: every executor command is counted, never hidden."""
+
+    def __init__(self) -> None:
+        self.ready_plans = {"plan-live"}
+        self.calls: list[str] = []
+
+    def alive(self) -> bool:
+        return True
+
+    def call(self, command: dict[str, Any], **_options: Any) -> dict[str, Any]:
+        name = str(command["cmd"])
+        self.calls.append(name)
+        if name == "warm":
+            return {
+                "ok": True,
+                "outcome": "skipped",
+                "reason": "policy proof fixture",
+                "boot_warmup_observed": False,
+            }
+        assert name == "probe"
+        return {}
+
+
+class PolicySupervision:
+    def __init__(self, executor: PolicyExecutor) -> None:
+        self.current = executor
+
+    def owns(self, executor: object) -> bool:
+        return executor is self.current
+
+
+def policy_worker(
+    root: Path, *, environment_root: Path | None, no_warm: bool
+) -> tuple[Worker, PolicyExecutor]:
+    """A real Worker carrying controlled executor ownership and one ready binding."""
+
+    options = WorkerOptions(
+        root=root,
+        environment_root=environment_root,
+        artifact_store=root / "store",
+        artifact_object_set=root / "object-set.json",
+        no_warm=no_warm,
+    )
+    worker = Worker(
+        RuntimeConfig(cozy_home=root.parent / "home", credentials=Credentials()),
+        options,
+        InMemoryControlHost(),
+    )
+    executor = PolicyExecutor()
+    worker.supervision = cast(Any, PolicySupervision(executor))
+    worker.bindings = {"plan-live": cast(Any, SimpleNamespace(entrypoint="probe"))}
+    worker.placement = Placement(
+        placement_id="placement-live",
+        spec_digest=b"s" * 32,
+        endpoint_release_id="cozy/probe@live",
+        environment_spec_digest=b"e" * 32,
+        installed_environment_receipt_digest=b"i" * 32,
+        descriptor_digest=b"d" * 32,
+        model_object_set=("sha256:" + "0" * 64, 53),
+        plan_ids=("plan-live",),
+        plan_refs={},
+        materialization=pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
+        serving=pb.ServingState.SERVING_STATE_ACTIVATING,
+    )
+    worker.accepted.mode = "serving"
+    worker.accepted.accepted_desired_state_revision = 7
+    return worker, executor
+
+
+def prove_worker_warm_policy(root: Path) -> None:
+    """The worker-owned hardcut, plus both unchanged local policy arms."""
+
+    dynamic, dynamic_executor = policy_worker(
+        root / "dynamic", environment_root=root / "environments", no_warm=False
+    )
+    dynamic._finish_activation()
+    assert dynamic_executor.calls == []
+    assert dynamic.options.no_warm is False  # the worker hardcut is independent of argv
+    assert dynamic.placement is not None
+    assert dynamic.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+    assert dynamic.accepted.converged_revision == 7 and dynamic.settled.is_set()
+    assert any(
+        row.kind == "warm" and "dynamic placement worker" in row.step for row in dynamic.activity
+    )
+
+    local, local_executor = policy_worker(root / "local", environment_root=None, no_warm=False)
+    assert local.run_warm_pass() is True
+    assert local_executor.calls == ["warm", "probe"]
+
+    explicit_skip, explicit_executor = policy_worker(
+        root / "explicit-skip", environment_root=None, no_warm=True
+    )
+    assert explicit_skip.run_warm_pass() is True
+    assert explicit_executor.calls == []
 
 
 def mint_certificate(root: Path, name: str, san: str) -> Path:
@@ -168,6 +273,7 @@ def main() -> int:
         # The hardcut is specific to fixed generic substrates. A hand-started/local worker
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
+        prove_worker_warm_policy(root / "worker-policy")
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}

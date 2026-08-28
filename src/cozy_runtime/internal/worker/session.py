@@ -2566,6 +2566,11 @@ class Worker:
                 f"{len(self.bindings) - len(self.failed_bindings)} of {len(self.bindings)} "
                 f"binding(s) prepared; faulted: " + ", ".join(sorted(self.failed_bindings)),
             )
+        self._finish_activation()
+
+    def _finish_activation(self) -> None:
+        """Run optional warm work, then publish the activation edge or its typed failure."""
+
         if not self.run_warm_pass():
             self.latched = "executor_lost_during_warm"
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
@@ -2579,7 +2584,22 @@ class Worker:
 
     def run_warm_pass(self) -> bool:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
+        # Dynamic placement workers execute endpoint source only for a real invocation,
+        # after the placement is DISPATCHABLE. Their environment root is the structural
+        # identity of that mode; the adapter's `--no-warm` remains a belt, but correctness
+        # cannot depend on one argv translation surviving every launch layer. A real pod
+        # proved why: its model prepared successfully, then a synthetic warm handler blocked
+        # forever in its first CUDA scalar read and kept the placement ACTIVATING.
+        if self.options.environment_root is not None:
+            self.note(
+                "warm",
+                "dynamic placement worker: boot warm pass disabled; endpoint execution "
+                "begins only after DISPATCHABLE",
+            )
+            executor = self.supervision.current
+            return executor is not None and self.supervision.owns(executor)
         if self.options.no_warm:
+            self.note("warm", "boot warm pass disabled by launch option")
             executor = self.supervision.current
             return executor is not None and self.supervision.owns(executor)
         executor = self.supervision.current
