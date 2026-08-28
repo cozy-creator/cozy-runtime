@@ -21,8 +21,10 @@ from typing import Any
 from proof_data import ProofFailure, Wheel
 from proof_data import canonical as _canonical
 from proof_data import digest as _digest
+from proof_data import installed_base_ownership as _installed_base_ownership
 from proof_data import inventory as _inventory
 from proof_data import json_file as _json
+from proof_data import pack_installed as _pack_installed
 from proof_data import parse_canonical as _parse_canonical
 from proof_data import read_json as _read_json
 from proof_data import ref as _ref
@@ -43,10 +45,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     prepare = sub.add_parser("prepare")
     prepare.add_argument("root", type=Path)
+    prepare.add_argument("runtime", type=Path)
     prepare.add_argument("project", type=Path)
     prepare.add_argument("resolved", type=Path)
-    prepare.add_argument("wheelhouse", type=Path)
     prepare.add_argument("torch", type=Path)
+    prepare.add_argument("numpy", type=Path)
+    prepare.add_argument("numpy_shadow", type=Path)
+    prepare.add_argument("shared_root_a", type=Path)
+    prepare.add_argument("shared_root_b", type=Path)
     prepare.add_argument("python", type=Path)
 
     sub.add_parser("verify").add_argument("root", type=Path)
@@ -83,14 +89,31 @@ def _prepare(args: argparse.Namespace) -> None:
     inputs.mkdir()
     variants.mkdir()
 
+    runtime_path = args.runtime.resolve()
     project_path = args.project.resolve()
     resolved_path = args.resolved.resolve()
-    wheelhouse_path = args.wheelhouse.resolve()
     torch_path = args.torch.resolve()
+    runtime = _inventory(runtime_path)
     project = _inventory(project_path)
     resolved = _inventory(resolved_path)
-    wheelhouse = _inventory(wheelhouse_path)
     torch = _inventory(torch_path)
+    numpy = _inventory(args.numpy.resolve())
+    numpy_shadow = _inventory(args.numpy_shadow.resolve())
+    shared_root_a = _inventory(args.shared_root_a.resolve())
+    shared_root_b = _inventory(args.shared_root_b.resolve())
+    base_wheel_root = variants / "base-wheels"
+    base_wheel_root.mkdir()
+    dependency_paths = [
+        _pack_installed(base_wheel_root, name)
+        for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
+    ]
+    base_wheels = tuple(
+        sorted(
+            (runtime, *(_inventory(path) for path in dependency_paths)),
+            key=lambda wheel: wheel.distribution,
+        )
+    )
+    _require(len(base_wheels) == 5, "proof base does not carry five control wheels")
 
     normal_paths = {
         project.digest: project_path,
@@ -101,12 +124,29 @@ def _prepare(args: argparse.Namespace) -> None:
         _target(),
         project,
         (resolved,),
-        (wheelhouse,),
+        base_wheels,
         normal_paths,
     )
     for name in ("cold", "rebuild", "race-first", "race-second", "inside"):
         _request(root, name, normal, root / f"environment-{name}", args.python)
     _request(root, "reuse", normal, root / "environment-cold", args.python)
+
+    legacy_resolved = _release(
+        inputs / "resolved-v1",
+        _target(),
+        project,
+        (resolved,),
+        base_wheels,
+        normal_paths,
+        resolved_format="ResolvedWheelSet/1",
+    )
+    _request(
+        root,
+        "resolved-v1",
+        legacy_resolved,
+        root / "environment-resolved-v1",
+        args.python,
+    )
 
     missing = dict(normal)
     missing["wheel_files"] = {
@@ -137,10 +177,26 @@ def _prepare(args: argparse.Namespace) -> None:
         _target(),
         project,
         (replace(resolved, filename="renamed-2.0.0-py3-none-any.whl"),),
-        (wheelhouse,),
+        base_wheels,
         normal_paths,
     )
     _request(root, "renamed", renamed, root / "environment-renamed", args.python)
+
+    oversized_fact = _release(
+        inputs / "oversized-fact",
+        _target(),
+        project,
+        (replace(resolved, length=(2 << 30) + 1),),
+        base_wheels,
+        normal_paths,
+    )
+    _request(
+        root,
+        "oversized-fact",
+        oversized_fact,
+        root / "environment-oversized-fact",
+        args.python,
+    )
 
     duplicate_path = variants / "duplicate" / resolved.filename
     duplicate_path.parent.mkdir()
@@ -155,7 +211,7 @@ def _prepare(args: argparse.Namespace) -> None:
         _target(),
         project,
         (duplicate,),
-        (wheelhouse,),
+        base_wheels,
         {
             project.digest: project_path,
             duplicate.digest: duplicate_path,
@@ -180,7 +236,7 @@ def _prepare(args: argparse.Namespace) -> None:
         _target(),
         project,
         (expanded,),
-        (wheelhouse,),
+        base_wheels,
         {
             project.digest: project_path,
             expanded.digest: expanded_path,
@@ -210,10 +266,79 @@ def _prepare(args: argparse.Namespace) -> None:
         cuda_target,
         project,
         (resolved,),
-        (wheelhouse, torch),
+        base_wheels,
         normal_paths,
     )
     _request(root, "cuda", cuda, root / "environment-cuda", args.python)
+
+    base_distribution = _release(
+        inputs / "base-distribution",
+        _target(),
+        project,
+        (numpy,),
+        base_wheels,
+        {project.digest: project_path, numpy.digest: args.numpy.resolve()},
+    )
+    _request(
+        root,
+        "base-distribution",
+        base_distribution,
+        root / "environment-base-distribution",
+        args.python,
+    )
+
+    base_import_root = _release(
+        inputs / "base-import-root",
+        _target(),
+        project,
+        (numpy_shadow,),
+        base_wheels,
+        {project.digest: project_path, numpy_shadow.digest: args.numpy_shadow.resolve()},
+    )
+    _request(
+        root,
+        "base-import-root",
+        base_import_root,
+        root / "environment-base-import-root",
+        args.python,
+    )
+
+    lying_import_root = _release(
+        inputs / "lying-import-root",
+        _target(),
+        project,
+        (numpy_shadow,),
+        base_wheels,
+        {project.digest: project_path, numpy_shadow.digest: args.numpy_shadow.resolve()},
+        import_root_overrides={numpy_shadow.distribution: ("declared_new_root",)},
+    )
+    _request(
+        root,
+        "lying-import-root",
+        lying_import_root,
+        root / "environment-lying-import-root",
+        args.python,
+    )
+
+    duplicate_import_root = _release(
+        inputs / "duplicate-import-root",
+        _target(),
+        project,
+        (shared_root_a, shared_root_b),
+        base_wheels,
+        {
+            project.digest: project_path,
+            shared_root_a.digest: args.shared_root_a.resolve(),
+            shared_root_b.digest: args.shared_root_b.resolve(),
+        },
+    )
+    _request(
+        root,
+        "duplicate-import-root",
+        duplicate_import_root,
+        root / "environment-duplicate-import-root",
+        args.python,
+    )
 
 
 def _release(
@@ -223,22 +348,34 @@ def _release(
     resolved_wheels: Sequence[Wheel],
     wheelhouse_wheels: Sequence[Wheel],
     wheel_paths: Mapping[str, Path],
+    *,
+    import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
+    resolved_format: str = "ResolvedWheelSet/2",
 ) -> dict[str, object]:
     root.mkdir()
+    base_distributions, base_import_roots = _installed_base_ownership()
     wheelhouse = _canonical(
         {
-            "format": "WheelhouseManifest/1",
+            "base_distributions": base_distributions,
+            "base_import_roots": base_import_roots,
+            "format": "WheelhouseManifest/2",
             "platform_target": dict(target),
-            "wheels": [_wheel(wheel) for wheel in wheelhouse_wheels],
+            "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
         }
     )
+    resolved_rows = []
+    for wheel in resolved_wheels:
+        row = _wheel(wheel, import_roots=True)
+        if import_root_overrides and wheel.distribution in import_root_overrides:
+            row["import_roots"] = list(import_root_overrides[wheel.distribution])
+        resolved_rows.append(row)
     resolved = _canonical(
         {
-            "format": "ResolvedWheelSet/1",
+            "format": resolved_format,
             "lock_digest": _digest(b"proof-lock"),
             "platform_target": dict(target),
             "wheelhouse_manifest_digest": _digest(wheelhouse),
-            "wheels": [_wheel(wheel) for wheel in resolved_wheels],
+            "wheels": resolved_rows,
         }
     )
     descriptor = _canonical({"format": "proof.EndpointDescriptor/1"})
@@ -249,7 +386,7 @@ def _release(
             "endpoint_release_id": "proof-release",
             "evaluated_config": _ref(evaluated),
             "format": "tensorhub.endpoint_bundle/2",
-            "project_wheel": _wheel(project),
+            "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),
             "source_archive": _ref(b"proof-source"),
             "source_lock": _ref(b"proof-lock"),

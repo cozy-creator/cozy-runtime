@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from proof_data import Wheel, canonical, digest, inventory, ref, wheel
+from proof_data import Wheel, canonical, digest, installed_base_ownership, inventory, ref, wheel
 
 from cozy_runtime.internal import canonical as canon
 from cozy_runtime.internal import descriptor as desc
@@ -110,13 +110,18 @@ def author(
     release = Release()
     project = release.add_wheel(project_wheel)
     house = sorted((inventory(path) for path in wheelhouse_wheels), key=lambda e: e.distribution)
+    if len(house) != 5:
+        raise AssertionError(f"boot proof base carries {len(house)} control wheels, want 5")
 
+    base_distributions, base_import_roots = installed_base_ownership()
     wheelhouse = release.add(
         canonical(
             {
-                "format": "WheelhouseManifest/1",
+                "base_distributions": base_distributions,
+                "base_import_roots": base_import_roots,
+                "format": "WheelhouseManifest/2",
                 "platform_target": dict(target),
-                "wheels": [wheel(entry) for entry in house],
+                "wheels": [wheel(entry, import_roots=True) for entry in house],
             }
         ),
         "wheelhouse",
@@ -124,7 +129,7 @@ def author(
     resolved = release.add(
         canonical(
             {
-                "format": "ResolvedWheelSet/1",
+                "format": "ResolvedWheelSet/2",
                 "lock_digest": digest(b"cr-049-boot-proof-lock"),
                 "platform_target": dict(target),
                 "wheelhouse_manifest_digest": digest(wheelhouse),
@@ -154,7 +159,7 @@ def author(
                 "endpoint_release_id": ENDPOINT_RELEASE,
                 "evaluated_config": ref(evaluated),
                 "format": "tensorhub.endpoint_bundle/2",
-                "project_wheel": wheel(project),
+                "project_wheel": wheel(project, import_roots=True),
                 "resolved_wheel_set": ref(resolved),
                 "source_archive": ref(source_archive),
                 "source_lock": ref(source_lock),

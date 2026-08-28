@@ -196,12 +196,27 @@ therefore installs only its deterministic project wheel and optional exact custo
 never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
 archives after extraction.
 
-The image's OCI digest owns image-resident integrity. Runtime checks the small baked
-`WheelhouseManifest` identity, rejects distribution/import-root shadowing, hashes each arriving
-endpoint wheel once, and publishes one read-only overlay by atomic rename. Reuse reads the small
-receipt and base-family manifest; it does not walk or re-hash every installed file. Base bytecode
-is baked in the image and endpoint bytecode is compiled once during overlay publication. The
-executor starts with image Python and APPENDS the overlay import root after image-owned paths.
+The image's OCI digest owns image-resident integrity. `WheelhouseManifest/2` is the complete
+canonical ownership document for that image: its existing platform target and exact control-wheel
+rows travel with every installed normalized distribution/version and every top-level import root's
+sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
+sorted unique import roots: the five control rows in `WheelhouseManifest/2`, the project row in
+`EndpointBundle/2`, and each custom row in `ResolvedWheelSet/2`. Runtime strictly parses those exact bytes, rejects
+a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
+roots, requires custom declarations to equal the measurement, and rejects a root collision with
+the manifest's providers or a duplicate project/custom root before extraction or publication.
+There is no `/1` reader and no
+hardcoded protected-root list.
+
+Runtime then hashes each arriving endpoint wheel once and publishes one read-only overlay by
+atomic rename. Reuse reads the small receipt and base-family manifest; it does not walk or re-hash
+every installed file. Base bytecode is baked in the image and endpoint bytecode is compiled once
+during overlay publication. The executor starts with image Python and APPENDS the overlay import
+root after image-owned paths.
+
+An overlay contains exactly one project wheel and at most 127 custom wheels. The Runtime bound is
+128 total endpoint-owned wheels, counting the project; 128 custom rows plus the project refuses
+before any grant or ZIP is opened.
 
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control

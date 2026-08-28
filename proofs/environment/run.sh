@@ -30,7 +30,8 @@ fi
 
 mkdir "$proof_root/build"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$repo"
-for fixture in environment-project environment-resolved environment-wheelhouse fake-torch; do
+for fixture in environment-project environment-resolved environment-wheelhouse fake-torch \
+    fake-numpy numpy-shadow shared-root-a shared-root-b; do
     UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" \
         "$repo/proofs/fixtures/$fixture"
 done
@@ -43,20 +44,30 @@ resolved_wheel=$(find "$proof_root/build" -maxdepth 1 \
 wheelhouse_wheel=$(find "$proof_root/build" -maxdepth 1 \
     -name 'proof_environment_wheelhouse-*.whl' -print)
 torch_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'torch-*.whl' -print)
+numpy_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'numpy-*.whl' -print)
+numpy_shadow_wheel=$(find "$proof_root/build" -maxdepth 1 \
+    -name 'proof_numpy_shadow-*.whl' -print)
+shared_root_a_wheel=$(find "$proof_root/build" -maxdepth 1 \
+    -name 'proof_shared_root_a-*.whl' -print)
+shared_root_b_wheel=$(find "$proof_root/build" -maxdepth 1 \
+    -name 'proof_shared_root_b-*.whl' -print)
 test -n "$runtime_wheel" && test -n "$project_wheel" && test -n "$resolved_wheel"
 test -n "$wheelhouse_wheel" && test -n "$torch_wheel"
+test -n "$numpy_wheel" && test -n "$numpy_shadow_wheel"
+test -n "$shared_root_a_wheel" && test -n "$shared_root_b_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
 UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
-    "$runtime_wheel" "$wheelhouse_wheel" "$torch_wheel"
+    "$runtime_wheel" "$wheelhouse_wheel" "$torch_wheel" "$numpy_wheel"
 driver_python="$proof_root/driver/bin/python"
 proof="$proof_root/driver/bin/cozy-environment-proof"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
     ALL_PROXY=http://127.0.0.1:9 \
-    "$driver_python" "$support" prepare "$proof_root" "$project_wheel" \
-    "$resolved_wheel" "$wheelhouse_wheel" "$torch_wheel" "$driver_python")
+    "$driver_python" "$support" prepare "$proof_root" "$runtime_wheel" "$project_wheel" \
+    "$resolved_wheel" "$torch_wheel" "$numpy_wheel" \
+    "$numpy_shadow_wheel" "$shared_root_a_wheel" "$shared_root_b_wheel" "$driver_python")
 
 run_proof() {
     name=$1
@@ -108,11 +119,19 @@ run_refusal missing 6 wheel_grant_set_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
 run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
+run_refusal oversized-fact 6 bundle_wheel_invalid no
 run_refusal duplicate 6 overlay_wheel_member_invalid no
 run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
+run_refusal resolved-v1 6 resolved_wheel_set_format no
+run_refusal base-distribution 6 overlay_shadows_base_distribution no
+grep -q 'image_version=1.0.0' "$proof_root/base-distribution.stderr"
+run_refusal base-import-root 6 overlay_shadows_base_import no
+grep -q 'image_providers=numpy' "$proof_root/base-import-root.stderr"
+run_refusal lying-import-root 6 overlay_wheel_import_roots_mismatch no
+run_refusal duplicate-import-root 6 overlay_import_root_duplicate no
 
 set +e
 run_proof race-first "$proof_root/receipt-race.json" \
@@ -134,4 +153,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; exact endpoint bytes, isolated imports over the installed base, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; v1 documents refused; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact endpoint bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"

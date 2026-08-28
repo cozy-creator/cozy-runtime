@@ -18,7 +18,6 @@ import compileall
 import csv
 import errno
 import hashlib
-import json
 import os
 import py_compile
 import re
@@ -39,6 +38,7 @@ RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
 RECEIPT_NAME = "endpoint-overlay-receipt.json"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
+WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/2"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
@@ -47,18 +47,14 @@ MAX_METADATA_BYTES = 4 << 20
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
+_NORMALIZED_DISTRIBUTION = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127}$")
+_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}\.whl$")
+_IMPORT_ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_WHEEL_TAG = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*$")
 _SAFE_MEMBER = re.compile(r"^[^/][^\x00]*$")
-_PROTECTED_IMPORT_ROOTS = frozenset(
-    {
-        "cozy",
-        "cozy_runtime",
-        "nvidia",
-        "tensorfs",
-        "torch",
-        "torchaudio",
-        "torchvision",
-        "triton",
-    }
+_PLATFORM_TARGET_FIELDS = frozenset(
+    {"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"}
 )
 
 
@@ -80,7 +76,26 @@ class Wheel:
     length: int
     tags: tuple[str, ...]
     owner: str
-    """Exactly ``project`` or ``custom``."""
+    """Exactly ``project``, ``custom``, or image-owned ``base``."""
+    import_roots: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BaseManifest:
+    """The complete immutable Python ownership of one base worker image."""
+
+    platform_target: tuple[tuple[str, str], ...]
+    wheels: tuple[Wheel, ...]
+    base_distributions: tuple[tuple[str, str], ...]
+    base_import_roots: tuple[tuple[str, tuple[str, ...]], ...]
+
+    @property
+    def distribution_versions(self) -> dict[str, str]:
+        return dict(self.base_distributions)
+
+    @property
+    def root_providers(self) -> dict[str, tuple[str, ...]]:
+        return dict(self.base_import_roots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +148,8 @@ def materialize(
     if expected_receipt_digest:
         _require_digest(expected_receipt_digest, "expected_receipt_digest")
 
-    base_names = _base_distributions(base_manifest, source.base_family_digest)
-    wheels = _verify_inventory(source, base_names)
+    base = _read_base_manifest(base_manifest, source.base_family_digest)
+    wheels = _verify_inventory(source, base)
     receipt_bytes = canonical.write(_receipt(source, wheels))
     receipt_digest = _sha(receipt_bytes)
     if expected_receipt_digest and receipt_digest != expected_receipt_digest:
@@ -154,7 +169,7 @@ def materialize(
             python=python,
         )
 
-    inspected = _verify_grants(source, wheels)
+    inspected = _verify_grants(source, wheels, base)
     generations.mkdir(parents=True, exist_ok=True)
     staging = root / f".overlay-staging-{uuid.uuid4().hex}"
     try:
@@ -244,7 +259,7 @@ def open_generation(
     base_digest = value.get("base_family_digest")
     if not isinstance(base_digest, str):
         raise OverlayRefusal("overlay_receipt_invalid", "base family is not a digest")
-    _base_distributions(base_manifest, base_digest)
+    _read_base_manifest(base_manifest, base_digest)
     if generation.name != receipt_digest.removeprefix("sha256:"):
         raise OverlayRefusal("overlay_generation_wrong_key", str(generation))
     import_root = generation / OVERLAY_DIR
@@ -264,30 +279,186 @@ def open_generation(
     )
 
 
-def _base_distributions(path: Path, expected_digest: str) -> frozenset[str]:
+def _read_base_manifest(path: Path, expected_digest: str) -> BaseManifest:
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise OverlayRefusal("base_family_manifest_unreadable", str(exc)) from exc
+    return parse_base_manifest(raw, expected_digest)
+
+
+def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
+    """Strictly parse one canonical complete base-worker-image ownership manifest."""
+
+    _require_digest(expected_digest, "base_family_digest")
     if _sha(raw) != expected_digest:
-        raise OverlayRefusal("base_family_mismatch", f"{path} does not name {expected_digest}")
+        raise OverlayRefusal("base_family_mismatch", f"manifest does not name {expected_digest}")
     try:
-        value = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise OverlayRefusal("base_family_manifest_invalid", type(exc).__name__) from exc
-    rows = value.get("wheels") if isinstance(value, dict) else None
-    if not isinstance(rows, list):
+        value = canonical.parse_canonical(raw)
+    except canonical.CanonicalError as exc:
+        raise OverlayRefusal("base_family_manifest_invalid", str(exc)) from exc
+    fields = {
+        "base_distributions",
+        "base_import_roots",
+        "format",
+        "platform_target",
+        "wheels",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise OverlayRefusal("base_family_manifest_invalid", "wrong fields")
+    if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
+        raise OverlayRefusal("base_family_manifest_invalid", "wrong format")
+    platform = value["platform_target"]
+    if (
+        not isinstance(platform, dict)
+        or set(platform) != _PLATFORM_TARGET_FIELDS
+        or not all(isinstance(item, str) and item for item in platform.values())
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
+    distributions = _base_distribution_rows(value["base_distributions"])
+    roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
+    wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
+    return BaseManifest(
+        platform_target=tuple(sorted(platform.items())),
+        wheels=wheels,
+        base_distributions=distributions,
+        base_import_roots=roots,
+    )
+
+
+def _base_distribution_rows(value: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list) or not value:
+        raise OverlayRefusal("base_family_manifest_invalid", "base_distributions is not a list")
+    rows: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"distribution", "version"}:
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid distribution row")
+        distribution = item["distribution"]
+        version = item["version"]
+        if (
+            not isinstance(distribution, str)
+            or not normalized_distribution(distribution)
+            or distribution == "python-stdlib"
+            or not isinstance(version, str)
+            or not valid_wheel_version(version)
+        ):
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid distribution row")
+        rows.append((distribution, version))
+    if rows != sorted(rows) or len({name for name, _ in rows}) != len(rows):
+        raise OverlayRefusal(
+            "base_family_manifest_invalid", "base_distributions is not sorted unique"
+        )
+    return tuple(rows)
+
+
+def _base_import_root_rows(
+    value: object, distributions: dict[str, str]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not isinstance(value, list) or not value:
+        raise OverlayRefusal("base_family_manifest_invalid", "base_import_roots is not a list")
+    rows: list[tuple[str, tuple[str, ...]]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"providers", "root"}:
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid import-root row")
+        root = item["root"]
+        providers = item["providers"]
+        if (
+            not isinstance(root, str)
+            or not valid_import_root(root)
+            or not isinstance(providers, list)
+            or not providers
+            or not all(
+                isinstance(provider, str)
+                and (provider == "python-stdlib" or normalized_distribution(provider))
+                and (provider == "python-stdlib" or provider in distributions)
+                for provider in providers
+            )
+            or providers != sorted(set(providers))
+        ):
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid import-root row")
+        rows.append((root, tuple(providers)))
+    if rows != sorted(rows) or len({root for root, _ in rows}) != len(rows):
+        raise OverlayRefusal(
+            "base_family_manifest_invalid", "base_import_roots is not sorted unique"
+        )
+    return tuple(rows)
+
+
+def _base_wheel_rows(
+    value: object,
+    distributions: dict[str, str],
+    root_providers: dict[str, tuple[str, ...]],
+) -> tuple[Wheel, ...]:
+    if not isinstance(value, list) or not value:
         raise OverlayRefusal("base_family_manifest_invalid", "wheels is not a list")
-    names: set[str] = set()
-    for row in rows:
-        name = _name(row.get("distribution", "")) if isinstance(row, dict) else ""
-        if not name or name in names:
-            raise OverlayRefusal("base_family_manifest_invalid", name or "distribution")
-        names.add(name)
-    return frozenset(names)
+    wheels: list[Wheel] = []
+    for item in value:
+        keys = {
+            "digest",
+            "distribution",
+            "filename",
+            "import_roots",
+            "length",
+            "tags",
+            "version",
+        }
+        if not isinstance(item, dict) or set(item) != keys:
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid wheel row")
+        distribution = item["distribution"]
+        version = item["version"]
+        digest = item["digest"]
+        filename = item["filename"]
+        length = item["length"]
+        tags = item["tags"]
+        import_roots = item["import_roots"]
+        if (
+            not isinstance(distribution, str)
+            or not normalized_distribution(distribution)
+            or not isinstance(version, str)
+            or not valid_wheel_version(version)
+            or distributions.get(distribution) != version
+            or not isinstance(digest, str)
+            or _DIGEST.fullmatch(digest) is None
+            or not isinstance(filename, str)
+            or not valid_wheel_filename(filename)
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            or length > MAX_WHEEL_BYTES
+            or not isinstance(tags, list)
+            or not tags
+            or not all(isinstance(tag, str) and valid_wheel_tag(tag) for tag in tags)
+            or tags != sorted(set(tags))
+            or not isinstance(import_roots, list)
+            or not all(isinstance(root, str) and valid_import_root(root) for root in import_roots)
+            or import_roots != sorted(set(import_roots))
+            or any(distribution not in root_providers.get(root, ()) for root in import_roots)
+        ):
+            raise OverlayRefusal(
+                "base_family_manifest_invalid",
+                f"invalid wheel row: distribution={distribution!r} version={version!r} "
+                f"filename={filename!r}",
+            )
+        wheels.append(
+            Wheel(
+                distribution,
+                version,
+                filename,
+                digest,
+                length,
+                tuple(tags),
+                "base",
+                tuple(import_roots),
+            )
+        )
+    if [wheel.distribution for wheel in wheels] != sorted(
+        wheel.distribution for wheel in wheels
+    ) or len({wheel.distribution for wheel in wheels}) != len(wheels):
+        raise OverlayRefusal("base_family_manifest_invalid", "wheels is not sorted unique")
+    return tuple(wheels)
 
 
-def _verify_inventory(source: Input, base_names: frozenset[str]) -> tuple[Wheel, ...]:
+def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
     if not source.wheels or len(source.wheels) > 128:
         raise OverlayRefusal("overlay_wheel_set_invalid", str(len(source.wheels)))
     names: set[str] = set()
@@ -299,18 +470,31 @@ def _verify_inventory(source: Input, base_names: frozenset[str]) -> tuple[Wheel,
         _require_digest(wheel.digest, "wheel.digest")
         if (
             not name
-            or wheel.distribution != name
-            or not wheel.version
-            or not wheel.filename.endswith(".whl")
+            or not normalized_distribution(wheel.distribution)
+            or not valid_wheel_version(wheel.version)
+            or not valid_wheel_filename(wheel.filename)
             or wheel.length <= 0
             or wheel.length > MAX_WHEEL_BYTES
             or not wheel.tags
+            or not all(valid_wheel_tag(tag) for tag in wheel.tags)
             or tuple(sorted(set(wheel.tags))) != wheel.tags
             or wheel.owner not in {"project", "custom"}
         ):
             raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
-        if name in base_names:
-            raise OverlayRefusal("overlay_shadows_base_distribution", name)
+        base_version = base.distribution_versions.get(name)
+        if base_version is not None:
+            raise OverlayRefusal(
+                "overlay_shadows_base_distribution",
+                f"distribution={name} overlay_version={wheel.version} image_version={base_version}",
+            )
+        if wheel.import_roots != tuple(sorted(set(wheel.import_roots))) or not all(
+            valid_import_root(root) for root in wheel.import_roots
+        ):
+            raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
+        for root in wheel.import_roots:
+            providers = base.root_providers.get(root)
+            if providers is not None:
+                raise _base_import_collision(wheel, root, providers)
         if name in names or wheel.digest in digests:
             raise OverlayRefusal("overlay_wheel_duplicate", name)
         names.add(name)
@@ -324,7 +508,9 @@ def _verify_inventory(source: Input, base_names: frozenset[str]) -> tuple[Wheel,
     return tuple(sorted(ordered, key=lambda row: row.distribution))
 
 
-def _verify_grants(source: Input, wheels: Sequence[Wheel]) -> tuple[_Inspected, ...]:
+def _verify_grants(
+    source: Input, wheels: Sequence[Wheel], base: BaseManifest
+) -> tuple[_Inspected, ...]:
     grants = {grant.digest: grant for grant in source.grants}
     expected = {wheel.digest for wheel in wheels}
     if len(grants) != len(source.grants) or set(grants) != expected:
@@ -343,11 +529,21 @@ def _verify_grants(source: Input, wheels: Sequence[Wheel]) -> tuple[_Inspected, 
             raise OverlayRefusal("overlay_wheel_unreadable", str(grant.path)) from exc
         if size != wheel.length or _hash_file(grant.path) != wheel.digest:
             raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
-        inspected.append(_inspect(wheel, grant.path))
+        inspected.append(_inspect(wheel, grant.path, base))
+    root_owners: dict[str, str] = {}
+    for item in inspected:
+        for root in item.import_roots:
+            prior = root_owners.get(root)
+            if prior is not None:
+                raise OverlayRefusal(
+                    "overlay_import_root_duplicate",
+                    f"root={root} distributions={prior},{item.wheel.distribution}",
+                )
+            root_owners[root] = item.wheel.distribution
     return tuple(inspected)
 
 
-def _inspect(wheel: Wheel, path: Path) -> _Inspected:
+def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
     filename = wheel.filename.removesuffix(".whl").split("-")
     if (
         len(filename) < 5
@@ -367,6 +563,7 @@ def _inspect(wheel: Wheel, path: Path) -> _Inspected:
                 posix = PurePosixPath(name)
                 if (
                     not _SAFE_MEMBER.fullmatch(name)
+                    or "\\" in name
                     or posix.is_absolute()
                     or ".." in posix.parts
                     or name in names
@@ -416,9 +613,17 @@ def _inspect(wheel: Wheel, path: Path) -> _Inspected:
                 raise OverlayRefusal("overlay_wheel_record_missing", wheel.filename)
             _verify_record(archive, record_name, names)
             roots = _import_roots(names)
-            protected = roots & _PROTECTED_IMPORT_ROOTS
-            if protected:
-                raise OverlayRefusal("overlay_shadows_base_import", sorted(protected)[0])
+            measured_roots = tuple(sorted(roots))
+            if wheel.import_roots != measured_roots:
+                raise OverlayRefusal(
+                    "overlay_wheel_import_roots_mismatch",
+                    f"distribution={wheel.distribution} declared={list(wheel.import_roots)} "
+                    f"measured={list(measured_roots)}",
+                )
+            for root in measured_roots:
+                providers = base.root_providers.get(root)
+                if providers is not None:
+                    raise _base_import_collision(wheel, root, providers)
             return _Inspected(wheel, path, members, roots)
     except OverlayRefusal:
         raise
@@ -456,13 +661,24 @@ def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) 
 def _import_roots(names: set[str]) -> frozenset[str]:
     roots: set[str] = set()
     for name in names:
-        first = PurePosixPath(name).parts[0]
-        if first.endswith((".dist-info", ".data")):
+        installed = _install_path(name)
+        if installed is None:
+            continue
+        first = installed.parts[0]
+        if first.endswith((".dist-info", ".egg-info", ".libs")) or first == "__pycache__":
             continue
         root = first.partition(".")[0]
-        if root.isidentifier():
+        if valid_import_root(root):
             roots.add(root)
     return frozenset(roots)
+
+
+def _base_import_collision(wheel: Wheel, root: str, providers: tuple[str, ...]) -> OverlayRefusal:
+    return OverlayRefusal(
+        "overlay_shadows_base_import",
+        f"root={root} overlay_distribution={wheel.distribution} "
+        f"image_providers={','.join(providers)}",
+    )
 
 
 def _extract(wheels: Sequence[_Inspected], site: Path) -> None:
@@ -520,6 +736,26 @@ def _require_digest(value: str, name: str) -> None:
 
 def _name(value: str) -> str:
     return _NORMALIZE.sub("-", value).lower()
+
+
+def normalized_distribution(value: str) -> bool:
+    return _NORMALIZED_DISTRIBUTION.fullmatch(value) is not None and _name(value) == value
+
+
+def valid_wheel_version(value: str) -> bool:
+    return _VERSION.fullmatch(value) is not None
+
+
+def valid_wheel_filename(value: str) -> bool:
+    return _FILENAME.fullmatch(value) is not None and PurePosixPath(value).name == value
+
+
+def valid_import_root(value: str) -> bool:
+    return _IMPORT_ROOT.fullmatch(value) is not None
+
+
+def valid_wheel_tag(value: str) -> bool:
+    return _WHEEL_TAG.fullmatch(value) is not None
 
 
 def _sha(data: bytes) -> str:

@@ -7,25 +7,19 @@ driver owns every process transition and invokes the installed public Runtime co
 from __future__ import annotations
 
 import argparse
-import base64
-import csv
-import hashlib
-import importlib.metadata
-import io
 import platform
-import stat
 import sys
-import zipfile
-from collections.abc import Mapping, Sequence
-from email.parser import BytesParser
-from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 from proof_data import ProofFailure
 from proof_data import canonical as _canonical
 from proof_data import digest as _digest
+from proof_data import installed_base_ownership as _installed_base_ownership
 from proof_data import inventory as _inventory
 from proof_data import json_file as _json
+from proof_data import pack_installed as _pack_installed
 from proof_data import parse_canonical as _parse_canonical
 from proof_data import parse_json as _parse_json
 from proof_data import read_json as _read_json
@@ -94,27 +88,30 @@ def _prepare(args: argparse.Namespace) -> None:
 
     runtime_path = args.runtime_wheel.resolve()
     endpoint_path = args.endpoint_wheel.resolve()
-    torch_path = args.torch_wheel.resolve()
     dependency_paths = [
         _pack_installed(wheels, name)
         for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
     ]
     project = _inventory(endpoint_path)
     base_pairs = sorted(
-        [(_inventory(path), path) for path in (runtime_path, torch_path, *dependency_paths)],
+        [(_inventory(path), path) for path in (runtime_path, *dependency_paths)],
         key=lambda pair: pair[0].distribution,
     )
+    _require(len(base_pairs) == 5, "proof base does not carry five control wheels")
     target = _target()
+    base_distributions, base_import_roots = _installed_base_ownership()
     wheelhouse = _canonical(
         {
-            "format": "WheelhouseManifest/1",
+            "base_distributions": base_distributions,
+            "base_import_roots": base_import_roots,
+            "format": "WheelhouseManifest/2",
             "platform_target": target,
-            "wheels": [_wheel(entry) for entry, _ in base_pairs],
+            "wheels": [_wheel(entry, import_roots=True) for entry, _ in base_pairs],
         }
     )
     resolved = _canonical(
         {
-            "format": "ResolvedWheelSet/1",
+            "format": "ResolvedWheelSet/2",
             "lock_digest": _digest(b"proof-lock"),
             "platform_target": target,
             "wheelhouse_manifest_digest": _digest(wheelhouse),
@@ -150,7 +147,7 @@ def _prepare(args: argparse.Namespace) -> None:
             "endpoint_release_id": "proof-release",
             "evaluated_config": _ref(config),
             "format": "tensorhub.endpoint_bundle/2",
-            "project_wheel": _wheel(project),
+            "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),
             "source_archive": _ref(b"proof-source"),
             "source_lock": _ref(b"proof-lock"),
@@ -313,38 +310,6 @@ def _observation(path: Path) -> dict[str, Any]:
     return value
 
 
-def _pack_installed(root: Path, distribution: str) -> Path:
-    installed = importlib.metadata.distribution(distribution)
-    files: dict[str, bytes] = {}
-    record = ""
-    for member in installed.files or ():
-        name = PurePosixPath(str(member)).as_posix()
-        if ".." in PurePosixPath(name).parts or name.endswith(
-            ("/INSTALLER", "/RECORD", "/REQUESTED", "/direct_url.json", "/uv_cache.json")
-        ):
-            continue
-        path = cast(Path, installed.locate_file(member))
-        if path.is_file():
-            files[name] = path.read_bytes()
-        if name.endswith(".dist-info/METADATA"):
-            record = str(PurePosixPath(name).parent / "RECORD")
-    _require(
-        bool(record and files), f"installed distribution has no wheel inventory: {distribution}"
-    )
-    rows = [[name, _record_hash(raw), str(len(raw))] for name, raw in sorted(files.items())]
-    rows.append([record, "", ""])
-    rendered = io.StringIO(newline="")
-    csv.writer(rendered, lineterminator="\n").writerows(rows)
-    files[record] = rendered.getvalue().encode()
-    wheel_meta = next(raw for name, raw in files.items() if name.endswith(".dist-info/WHEEL"))
-    tags = BytesParser().parsebytes(wheel_meta).get_all("Tag") or []
-    _require(bool(tags), f"installed distribution has no wheel tag: {distribution}")
-    normalized = str(installed.metadata["Name"]).replace("-", "_")
-    path = root / f"{normalized}-{installed.version}-{tags[0]}.whl"
-    _zip(path, files)
-    return path
-
-
 def _target() -> dict[str, str]:
     libc_name, libc_version = platform.libc_ver()
     return {
@@ -354,20 +319,6 @@ def _target() -> dict[str, str]:
         "os_arch": "linux/amd64",
         "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
     }
-
-
-def _record_hash(raw: bytes) -> str:
-    encoded = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
-    return "sha256=" + encoded
-
-
-def _zip(path: Path, files: Mapping[str, bytes]) -> None:
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as wheel:
-        for name, raw in sorted(files.items()):
-            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (stat.S_IFREG | 0o644) << 16
-            wheel.writestr(info, raw)
 
 
 def _tree(root: Path) -> dict[str, bytes]:
