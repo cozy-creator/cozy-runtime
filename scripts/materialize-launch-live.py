@@ -29,7 +29,7 @@ from cozy_runtime.internal.materialize_launch import (
     materialize_objects,
 )
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.plan import PlanRefusal
+from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import SCHEMA_DIGEST
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -59,6 +59,17 @@ class PolicyExecutor:
     def __init__(self) -> None:
         self.ready_plans = {"plan-live"}
         self.calls: list[str] = []
+        self.prepare_reply: dict[str, Any] | None = None
+        self.incarnation = 1
+        self.pid = 999_999
+        self.poisoned = ""
+        self.construction_key = ""
+        self.prepared_binding_set: frozenset[str] = frozenset()
+        self.prepared_model: object | None = None
+        self.reserved_for_job = False
+        self.spawned_at = 1.0
+        self.ready_at = 1.001
+        self.hello = {"no_new_privs": "1", "oom_score_adj": "0", "torch_loaded": True}
 
     def alive(self) -> bool:
         return True
@@ -66,6 +77,9 @@ class PolicyExecutor:
     def call(self, command: dict[str, Any], **_options: Any) -> dict[str, Any]:
         name = str(command["cmd"])
         self.calls.append(name)
+        if name == "prepare":
+            assert self.prepare_reply is not None
+            return self.prepare_reply
         if name == "warm":
             return {
                 "ok": True,
@@ -148,6 +162,101 @@ def prove_worker_warm_policy(root: Path) -> None:
     )
     assert explicit_skip.run_warm_pass() is True
     assert explicit_executor.calls == []
+
+
+def prepared_binding() -> DeclaredBinding:
+    return DeclaredBinding(
+        entrypoint_binding_plan_id="plan-live",
+        entrypoint="probe",
+        model_class="ProbeModel",
+        model_binding_path="probe.models.model",
+        model_parameter_name="model",
+        release="cozy/probe-model@live",
+        application="probe_endpoint:app",
+        descriptor_path="/verified/endpoint.descriptor.json",
+        store="/verified/store",
+        config="/verified/model.json",
+        variant="plain",
+        reference_snapshot="sha256:" + "a" * 64,
+        components=("model",),
+        snapshots={"model": "sha256:" + "a" * 64},
+    )
+
+
+def prepare_reply() -> dict[str, Any]:
+    """A nonempty current Plan.wire_document projection, including the plural censuses."""
+
+    return {
+        "ok": True,
+        "model_construction_digest": "sha256:" + "b" * 64,
+        "constructed_model_digest": "sha256:" + "c" * 64,
+        "facts": {
+            "filled": 1,
+            "filled_bytes": 4096,
+            "fill_ms": 1.0,
+            "allocator_bytes": 4096,
+            "reserved_bytes": 4096,
+            "resident": {"model": 4096},
+            "parked": [],
+            "gpu_name": "proof-device",
+        },
+        "delivery": {
+            "rung": "verbatim",
+            "variant": "plain",
+            "delivery": "verbatim",
+            "materialization": "",
+            "label": "verbatim",
+            "plan_digest": "sha256:" + "d" * 64,
+            "routes": {"verbatim": 1},
+            "kernels": {"library_float": 1},
+            "objective": "latency",
+            "calibrated": False,
+            "confession": "",
+        },
+    }
+
+
+def prove_delivery_activation(root: Path) -> None:
+    """A real prepare reply crosses delivery narration, dynamic skip, and readiness."""
+
+    worker, executor = policy_worker(
+        root / "plain-delivery", environment_root=root / "environments", no_warm=False
+    )
+    binding = prepared_binding()
+    worker.bindings = {binding.entrypoint_binding_plan_id: binding}
+    worker.engine.bindings = worker.bindings
+    executor.ready_plans.clear()
+    executor.prepare_reply = prepare_reply()
+    worker.activate_executor()
+    assert executor.calls == ["prepare"]
+    assert worker.placement is not None
+    assert worker.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+    assert worker.accepted.converged_revision == 7
+    assert any(
+        row.kind == "delivery"
+        and "kernels library_float x1" in row.step
+        and "uncalibrated" in row.step
+        for row in worker.activity
+    )
+    assert any(
+        row.kind == "warm" and "dynamic placement worker" in row.step for row in worker.activity
+    )
+
+    # Any later schema/observer defect is a typed OFFLINE state, not a dead convergence
+    # thread silently marooning the placement in ACTIVATING.
+    broken, broken_executor = policy_worker(
+        root / "broken-observation", environment_root=root / "environments", no_warm=False
+    )
+    broken_binding = prepared_binding()
+    broken.bindings = {broken_binding.entrypoint_binding_plan_id: broken_binding}
+    broken.engine.bindings = broken.bindings
+    broken_executor.ready_plans.clear()
+    broken_executor.prepare_reply = {"ok": True}
+    broken.activate_executor()
+    assert broken.placement is not None
+    assert broken.placement.serving == pb.ServingState.SERVING_STATE_OFFLINE
+    assert broken.latched == "activation_exception"
+    assert broken.engine.faults[-1].reason == "activation_exception"
 
 
 def mint_certificate(root: Path, name: str, san: str) -> Path:
@@ -274,6 +383,7 @@ def main() -> int:
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
         prove_worker_warm_policy(root / "worker-policy")
+        prove_delivery_activation(root / "delivery-activation")
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}

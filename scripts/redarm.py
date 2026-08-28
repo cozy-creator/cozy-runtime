@@ -50,6 +50,12 @@ STATIC_ARMS = (
         "\n\ndef _planted_mcc_order(rich: object) -> object:\n"
         "    return tuple(sorted(rich.sets, key=lambda row: row.component))\n",
     ),
+    Arm(
+        "delivery-plan-observation",
+        SRC / "internal" / "worker" / "session.py",
+        "\n\ndef _planted_stale_delivery_reader(delivery: dict[str, object]) -> object:\n"
+        "    return delivery['cost_class']\n",
+    ),
     # cr-042: the third private-address check, planted in the module whose own header says
     # the defect is "there were two downloaders and only one had the check".
     Arm(
