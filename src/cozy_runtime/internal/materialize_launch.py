@@ -43,12 +43,19 @@ ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
+#: The one offline materializer's `uv`, baked by the substrate beside the control Runtime.
+#: A PATH, never a switch: `environment.materialize` pins the exact binary identity.
+MATERIALIZER_UV = Path("/opt/cozy/control-runtime/uv")
 # execution-substrates creates and grants the runtime exactly this container-local data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
 BOOT_ROOT = LOCAL_DATA_ROOT / "boot"
 ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
 LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
+#: Where the dynamic acquisition lane writes the exact bytes a placement reaches (cr-049).
+#: Under the durable-for-this-pod data root, not /run: a wheel set is large and a replay
+#: after a crash must find the complete objects it already fetched.
+ARTIFACT_CACHE_ROOT = LOCAL_DATA_ROOT / "artifacts"
 PLANS_ROOT = Path("/run/cozy/binding-plans")
 BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
 #: The canonical EMPTY ArtifactObjectSet. A pod that boots with no placement holds no
@@ -76,6 +83,7 @@ class PreparedBoot:
     control_runtime_wheel_length: int
     artifact_store: Path
     artifact_object_set: Path
+    artifact_cache: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +112,7 @@ def prepare_boot(
     *,
     boot_root: Path = BOOT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
+    artifact_cache_root: Path = ARTIFACT_CACHE_ROOT,
     control_runtime_wheel: Path = CONTROL_RUNTIME_WHEEL,
 ) -> PreparedBoot:
     """Bring the pod to READY-BUT-EMPTY and MEASURE what the hub will compare.
@@ -129,6 +138,7 @@ def prepare_boot(
     verify_control_install(control_runtime_wheel)
     wheel_digest, wheel_length = _measure_local(control_runtime_wheel)
     _directory(artifact_store_root)
+    _directory(artifact_cache_root)
     _directory(boot_root)
     object_set = boot_root / "artifact-object-set.json"
     _publish_exact(object_set, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
@@ -137,6 +147,7 @@ def prepare_boot(
         control_runtime_wheel_length=wheel_length,
         artifact_store=artifact_store_root,
         artifact_object_set=object_set,
+        artifact_cache=artifact_cache_root,
     )
 
 
