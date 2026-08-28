@@ -409,11 +409,6 @@ def _ref(value: object, name: str, *, allow_extra: bool = False) -> dict[str, An
     return {"digest": digest, "length": length}
 
 
-def _local_exact(path: Path, digest: str, length: int) -> bytes:
-    _verify_local(path, digest, length)
-    return path.read_bytes()
-
-
 def _verify_local(path: Path, digest: str, length: int) -> None:
     _require_digest(digest, "local.digest")
     try:
