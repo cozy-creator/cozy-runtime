@@ -52,7 +52,7 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import accel, canonical, child_env, descriptor
+from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
@@ -940,8 +940,11 @@ class Executor:
                 models=self.models,
                 progress=progress,
                 # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                # Every value is a path inside this attempt's own spool; this process has
-                # no outbound network and never resolves an address of its own.
+                # Every value is a path inside this attempt's own spool: this process is
+                # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
+                # handler that dials one anyway is refused rather than merely unexpected.
+                # That fence is Python-level (cr-042) — it bounds a buggy endpoint, not a
+                # hostile one, and there is no netns or seccomp under it.
                 assets=_granted_inputs(command),
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
             ),
@@ -1528,6 +1531,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _capture_seal()
+    # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
+    # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
+    # Python-level egress from endpoint and job code; it is not a kernel bound and
+    # `sandbox.refuse_network` says exactly which adversary that leaves.
+    sandbox.refuse_network(
+        "the executor is handed verified files in its attempt spool and never an address "
+        "(cr-012). Endpoint code that dials is a bug, and this is where the bug stops",
+        allow_unix_seam=True,
+    )
     channel = connect(args.socket)
     executor = Executor(
         channel,

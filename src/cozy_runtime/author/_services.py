@@ -751,8 +751,9 @@ class Egress(_Bound):
     """Worker-brokered outbound HTTP (`net`) — connector endpoints only (§1.3).
 
     Injection and capability derivation are this issue's; the BROKER is cr-012's and its
-    consumer is se-006. With no broker installed the call refuses typed — the executor
-    keeps zero outbound network either way, so there is nothing here to fall back to.
+    consumer is se-006. With no broker installed the call refuses typed, and the executor's
+    own `sandbox.refuse_network` fence (cr-042) refuses a direct dial in its place, so
+    there is nothing here to fall back to.
     """
 
     __slots__ = ("_broker",)

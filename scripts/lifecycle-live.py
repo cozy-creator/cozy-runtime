@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """The WEIGHTLESS worker lifecycle, live: the platform port's acceptance run (#450).
 
-One run, six sections, no model, no CAS, no GPU: boot -> invoke -> cooperative cancel ->
-executor crash -> worker kill + orphan check -> journal recovery. This is the sequence
+One run, six core sections, no model, no CAS, no GPU: boot -> invoke -> cooperative cancel ->
+executor crash -> worker kill + orphan check -> journal recovery, then the control-spine and
+executor-egress arms (`--only <name>` runs one of those alone). This is the sequence
 a platform port must pass before it may call itself a port (cr-020 items 1-5, cr-021's
 process half): every section exercises the REAL worker control process, the REAL executor spawn path
 (trampoline seal included), and the REAL protocol bytes — only the endpoint is weightless.
 
     nice -n 19 uv run python scripts/lifecycle-live.py
     nice -n 19 uv run python scripts/lifecycle-live.py --tmp /tmp/cozy-lifecycle
+    nice -n 19 uv run python scripts/lifecycle-live.py --only egress
 
 Reuses worker-live.py's RecordOwner (Hub), spawn and dispatch plumbing, but stages its own
 weightless fixture and never touches tensorfs-bench, nvidia-smi or the card — which is what
@@ -48,7 +50,7 @@ RELEASE = "cozy/lifecycle@live"
 #: The fixture endpoint, written into the run's tmp dir. `tick` returns immediately;
 #: `hold` runs for payload.seconds checking the cooperative-cancel signal — the payload
 #: value is each section's PLANT (how long the attempt would run if nobody stopped it),
-#: not a timeout of the harness's.
+#: not a timeout of the harness's. `dial`/`dial_native` are section 17's egress plants.
 ENDPOINT_SOURCE = '''\
 """Weightless lifecycle fixture: no model, no torch, no device."""
 
@@ -92,6 +94,48 @@ def hold(payload: HoldInput, ctx: Context) -> HoldOutput:
         ctx.raise_if_cancelled()
         time.sleep(0.05)
     return HoldOutput(held=time.monotonic() - started)
+
+
+class DialInput(msgspec.Struct, forbid_unknown_fields=True):
+    port: int
+
+
+class DialOutput(msgspec.Struct):
+    rc: int
+    how: str
+
+
+@app.entrypoint
+def dial(payload: DialInput) -> DialOutput:
+    """cr-042 section 17's PLANT: endpoint code dialling a reachable address, in Python."""
+    import socket
+
+    sock = socket.create_connection(("127.0.0.1", payload.port), timeout=5)
+    sock.close()
+    return DialOutput(rc=0, how="socket.create_connection")
+
+
+@app.entrypoint
+def dial_native(payload: DialInput) -> DialOutput:
+    """The SAME dial, below CPython. `ctypes` reaches `connect(2)` without raising any audit
+    event, so this measures exactly what the executor's Python fence does NOT bound."""
+    import ctypes
+    import socket
+    import struct
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+    if fd < 0:
+        return DialOutput(rc=-1, how="libc.socket failed")
+    address = (
+        struct.pack("H", socket.AF_INET)
+        + struct.pack("!H", payload.port)
+        + socket.inet_aton("127.0.0.1")
+        + bytes(8)
+    )
+    rc = libc.connect(fd, ctypes.create_string_buffer(address, 16), 16)
+    libc.close(fd)
+    return DialOutput(rc=int(rc), how="ctypes -> libc connect(2)")
 '''
 
 ENDPOINT_TOML = '[application]\nobject = "lifecycle_endpoint:app"\n'
@@ -1393,6 +1437,115 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     os.chdir(previous_cwd)
 
 
+def section_executor_egress(args: argparse.Namespace, base: str) -> None:
+    """cr-042: what the executor's "no outbound network" claim IS, both halves, live.
+
+    The executor runs in PID 1's network namespace with no seccomp filter, so a reachable
+    address really is reachable from it — this section establishes that FIRST, by dialling
+    the harness's own listener from inside the real serving executor through `ctypes`, and
+    watching the listener accept. Only then is the Python dial run: same address, same
+    process, refused by `sandbox.refuse_network` before a packet leaves.
+
+    Both halves are asserted because either alone is a lie. The refusal alone would read as
+    "the executor cannot reach the network"; the connection alone would read as "the fence
+    does nothing". Together they are the exact claim the comments in `internal/executor.py`
+    and `internal/worker/grants.py` make: a bound on a BUGGY endpoint at the Python layer,
+    and no bound at all on a hostile one (law 15's third rung, unarmed and named).
+    """
+    import socket as _socket
+    import threading
+
+    wl.head("17. egress: a Python dial REFUSES; the same dial below CPython does not")
+    tmp = Path(base + "-egress")
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    accepted: list[str] = []
+
+    def accept_forever() -> None:
+        while True:
+            try:
+                conn, peer = listener.accept()
+            except OSError:
+                return
+            accepted.append(f"{peer[0]}:{peer[1]}")
+            conn.close()
+
+    threading.Thread(target=accept_forever, daemon=True).start()
+
+    worker, ids = start_weightless(tmp, instance_id="ins-egress", fresh=True)
+    hub = worker.hub
+    try:
+        hub.ready(ids["dial_native"], args.observe * 4)
+        wl.dispatch(
+            hub,
+            tmp,
+            ids["dial_native"],
+            request_id="req-dial-native",
+            payload={"port": port},
+            release=RELEASE,
+            outputs=0,
+        )
+        body = wl.terminal_body(terminal_for(hub, "req-dial-native", args.observe))
+        deadline = time.monotonic() + 5.0
+        while not accepted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        wl.check(
+            "THE PREMISE: the executor CAN reach the network — a ctypes connect(2) lands",
+            body["status"] == 1 and len(accepted) == 1,
+            f"status={body['status']}, the harness listener on 127.0.0.1:{port} accepted "
+            f"{accepted or 'nothing'} from inside the executor: no netns, no seccomp",
+        )
+
+        since = hub.mark()
+        hub.ready(ids["dial"], args.observe * 4, since=since)
+        wl.dispatch(
+            hub,
+            tmp,
+            ids["dial"],
+            request_id="req-dial",
+            payload={"port": port},
+            release=RELEASE,
+            outputs=0,
+        )
+        body = wl.terminal_body(terminal_for(hub, "req-dial", args.observe, since))
+        said = json.dumps(body)
+        wl.check(
+            "THE FENCE: the same address dialled through Python is refused, typed",
+            body["status"] == 3 and "no_network" in said,
+            f"status={body['status']}, {body.get('cause', {}).get('safe_message', said)[:160]}",
+        )
+        wl.check(
+            "and no packet left: the listener still shows only the ctypes connection",
+            len(accepted) == 1,
+            f"accepted={accepted} — the refusal fires on the first NETWORK_EVENTS spelling "
+            "the dial reaches (`socket.getaddrinfo` here), before any connect(2)",
+        )
+    finally:
+        worker.stop()
+        hub.close()
+        listener.close()
+
+
+#: The post-core sections, by name. `--only <name>` runs one without the boot/invoke/cancel
+#: spine, which is what makes a single arm cheap to rerun on a shared machine.
+SECTIONS = {
+    "reconnect": section_reconnect,
+    "boot-failure": section_boot_failure,
+    "undurable": section_undurable,
+    "identity": section_identity,
+    "ownership": section_ownership,
+    "window": section_window,
+    "live-delivery": section_live_delivery,
+    "claim-convergence": section_claim_convergence_fence,
+    "generation-replacement": section_generation_replacement,
+    "supervision-atomicity": section_supervision_atomicity,
+    "egress": section_executor_egress,
+}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmp", default="/tmp/cozy-lifecycle")
@@ -1409,6 +1562,13 @@ def main() -> int:
         help="stop after boot/invoke/cancel/executor-crash/worker-crash/restart",
     )
     parser.add_argument(
+        "--only",
+        action="append",
+        choices=sorted(SECTIONS),
+        default=[],
+        help="run only these post-core sections, skipping the core spine",
+    )
+    parser.add_argument(
         "--expect-containment",
         choices=("cgroup_v2", "process_tree"),
         help="require the production selector to publish this durable owner backend",
@@ -1416,6 +1576,16 @@ def main() -> int:
     args = parser.parse_args()
     tmp = Path(args.tmp)
     t0 = time.perf_counter()
+
+    if args.only:
+        for name in args.only:
+            SECTIONS[name](args, args.tmp)
+        total = time.perf_counter() - t0
+        print(
+            f"\nlifecycle {'+'.join(args.only)}: {wl.PASS} ok, {wl.FAIL} failed, "
+            f"{total:.1f} s total"
+        )
+        return 1 if wl.FAIL else 0
 
     wl.head("1. boot: weightless worker, no card, no CAS")
     worker, ids = start_weightless(tmp, instance_id="ins-lifecycle", fresh=True)
@@ -1664,18 +1834,7 @@ def main() -> int:
         print(f"\nlifecycle core: {wl.PASS} ok, {wl.FAIL} failed, {total:.1f} s total")
         return 1 if wl.FAIL else 0
 
-    for section in (
-        section_reconnect,
-        section_boot_failure,
-        section_undurable,
-        section_identity,
-        section_ownership,
-        section_window,
-        section_live_delivery,
-        section_claim_convergence_fence,
-        section_generation_replacement,
-        section_supervision_atomicity,
-    ):
+    for section in SECTIONS.values():
         section(args, args.tmp)
 
     total = time.perf_counter() - t0

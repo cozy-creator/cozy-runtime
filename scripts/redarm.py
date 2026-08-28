@@ -49,6 +49,14 @@ STATIC_ARMS = (
         "\n\ndef _planted_mcc_order(rich: object) -> object:\n"
         "    return tuple(sorted(rich.sets, key=lambda row: row.component))\n",
     ),
+    # cr-042: the third private-address check, planted in the module whose own header says
+    # the defect is "there were two downloaders and only one had the check".
+    Arm(
+        "one-address-predicate",
+        SRC / "internal" / "pull.py",
+        "\n\ndef _planted_second_ssrf_check(addr: object) -> bool:\n"
+        "    return addr.is_private or addr.is_loopback\n",
+    ),
     Arm("package-imports", SRC / "author" / "_app.py", "import cozy_runtime.internal.config\n"),
     Arm("package-imports", SRC / "internal" / "config.py", "from cozy_runtime.cli import io\n"),
     Arm(

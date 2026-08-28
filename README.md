@@ -84,6 +84,23 @@ written and fsynced BEFORE its write receipt is journaled and before the termina
 it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
 killed executor is therefore explainable from a directory, with no live process and no SSH.
 
+**The worker's grant table is FILESYSTEM-ONLY, in both directions** (cr-042). Every row of
+`internal/worker/grants.py`'s closed `HUB_CALLS` table is `file://`, so an InvocationSpec
+cannot name an exfiltration target whatever the endpoint produced — a granted output
+destination is a path on this machine or it is refused. `OutputAccess.url` on the wire says
+"presigned upload URL"; honouring it DELETES this property and is a new adversary rung, not
+a completion. Armed by `scripts/worker-live.py grants` end to end and by
+`scripts/assets-live.py egress` at the table.
+
+**The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
+installs `sandbox.refuse_network`, so endpoint or job code that dials is refused typed at
+the first `NETWORK_EVENTS` spelling. That bounds a BUGGY endpoint (law 15's same-tenant
+rung). It is not a kernel bound: the executor runs in the worker's own network namespace
+with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
+hook. `scripts/lifecycle-live.py --only egress` observes both halves against one reachable
+address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
+handed over as spool paths; the executor is never given an address.
+
 **Liveness is silence-bounded, never clocked.** Progress means an advancing monotone position;
 a wedge is consecutive observations that find the position unchanged. `give_up_after` counts
 observations, not seconds — there is no boot timeout and there will not be one — and the

@@ -35,9 +35,7 @@ enters at `fetch_admit`, and the proof is still `fetch_complete`.
 
 from __future__ import annotations
 
-import ipaddress
 import json
-import socket
 import threading
 import time
 import urllib.error
@@ -48,6 +46,8 @@ from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from cozy_runtime.internal import egress
 
 #: How many objects are in flight by default. It is a MEASURED number, not a taste: #566b
 #: swept the same pods, the same bucket and the same presigned GETs and found the per-stream
@@ -154,6 +154,11 @@ def guard(url: str, *, allow_local: bool) -> str:
     worker a proxy into its own metadata service. `allow_local` is the DEV carve-out and it
     is explicit — it is true only when the hub base itself is a loopback address, so a
     developer's localhost hub works and a production hub can never hand a worker one.
+
+    WHICH addresses are unfetchable is `egress.blocked`'s and only its (cr-042). This
+    function once carried its own four-class chain; the two lists differed and agreed only
+    by CPython accident. What stays here is what is genuinely this leg's: the scheme rule,
+    the plaintext-http rule, and the typed `PullRefusal` vocabulary.
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -168,7 +173,7 @@ def guard(url: str, *, allow_local: bool) -> str:
             "source_not_allowed", f"{url[:120]}: no host", "supply an absolute http(s) URL"
         )
     try:
-        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80))
+        answers = egress.resolve(host, parts.port or (443 if parts.scheme == "https" else 80))
     except OSError as exc:
         raise PullRefusal(
             "hub_unreachable",
@@ -176,13 +181,12 @@ def guard(url: str, *, allow_local: bool) -> str:
             "check the host name and this machine's DNS",
             cause=str(exc),
         ) from exc
-    for info in infos:
-        addr = ipaddress.ip_address(info[4][0])
-        local = addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast
-        if local and not allow_local:
+    for address in answers:
+        why = egress.blocked(address)
+        if why and not allow_local:
             raise PullRefusal(
                 "source_not_allowed",
-                f"{host} resolves to {addr}, which is not a public address",
+                f"{host} resolves to {address}, which is {why} and not a public address",
                 "a worker does not fetch artifact bytes from its own network; if this is a "
                 "development hub, point --hub at it directly and it is admitted explicitly",
             )
@@ -199,11 +203,10 @@ def local_hub(base: str) -> bool:
     """Whether the HUB ITSELF is loopback. The only thing that opens the http/private door."""
     host = urllib.parse.urlsplit(base).hostname or ""
     try:
-        return all(
-            ipaddress.ip_address(i[4][0]).is_loopback for i in socket.getaddrinfo(host, None)
-        )
+        answers = egress.resolve(host)
     except (OSError, ValueError):
         return False
+    return bool(answers) and all("loopback" in egress.blocked(a) for a in answers)
 
 
 # ---------------------------------------------------------------- the hub's read routes

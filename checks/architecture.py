@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Twenty fences, each provable red by planting the violation (`scripts/redarm.py`):
+Twenty-one fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
   endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
   module-name-vocabulary · seam-budget-vocabulary · construction-fill-order
+  one-address-predicate
 """
 
 from __future__ import annotations
@@ -923,6 +924,35 @@ def fence_document_kinds() -> list[str]:
     return bad
 
 
+#: cr-042: the address-class attributes only `internal/egress.py` may name. Two downloaders
+#: each grew their own chain and the two differed; this is the fence that stops a third.
+ADDRESS_CLASSES = re.compile(
+    r"\.is_(?:private|loopback|link_local|multicast|reserved|unspecified)\b"
+)
+ADDRESS_PREDICATE_OWNER = "internal/egress.py"
+
+
+def fence_one_address_predicate() -> list[str]:
+    """cr-042: ONE private/unroutable-address predicate, in the module that owns egress."""
+    bad: list[str] = []
+    for path in py_files():
+        rel = path.relative_to(SRC).as_posix()
+        if rel == ADDRESS_PREDICATE_OWNER:
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if ADDRESS_PREDICATE_OWNER in line or ADDRESS_CLASSES.search(line) is None:
+                continue
+            bad.append(
+                f"{path.relative_to(ROOT)}:{lineno}: classifies an address itself; "
+                f"`egress.blocked()` is the ONE predicate every downloader calls — a second "
+                "chain is how two downloaders came to disagree (cr-042)"
+            )
+    owner = (SRC / ADDRESS_PREDICATE_OWNER).read_text()
+    if "def blocked(address: str) -> str:" not in owner:
+        bad.append(f"src/cozy_runtime/{ADDRESS_PREDICATE_OWNER}: `blocked()` is gone")
+    return bad
+
+
 def fence_construction_fill_order() -> list[str]:
     """cr-041: stored-header presentation is never a Runtime traversal authority."""
     bad: list[str] = []
@@ -992,6 +1022,7 @@ FENCES = {
     "endpoint-owns-no-media-decode": fence_endpoint_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
     "construction-fill-order": fence_construction_fill_order,
+    "one-address-predicate": fence_one_address_predicate,
 }
 
 
