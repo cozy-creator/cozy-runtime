@@ -15,13 +15,11 @@ from typing import TypedDict, cast
 from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
-    REQUIRED_DOCUMENT_ROLES,
+    EMPTY_ARTIFACT_OBJECT_SET,
     LaunchRefusal,
-    ProvisionCache,
-    _local_bounded_document,
-    _materialize_objects,
-    _provision_cache,
-    _provision_pair,
+    _measure_local,
+    _publish_exact,
+    materialize_objects,
 )
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.protocol import SCHEMA_DIGEST
@@ -83,74 +81,17 @@ def main() -> int:
             assert "sha256:" + hashlib.sha256(raw).hexdigest() == vector["digest"]
             vectors[vector["name"]] = (raw, provisioned.read_artifact_object_set(raw))
         empty_bytes, empty_object_set = vectors["empty"]
-        object_set_ref = ref(empty_bytes)
 
         token = "1" * 64
-        document = b"x"
-        document_ref = ref(document)
-        control_ref = {"digest": "sha256:" + "2" * 64, "length": 4096}
-        spec = {
-            "acquisition_attempt_id": "attempt-live",
-            "acquisition_attempt_ordinal": 1,
-            "artifact_object_set": object_set_ref,
-            "capacity": {
-                "accelerator_count": 1,
-                "accelerator_model": "NVIDIA H200",
-                "cache_mount_path": "/cache",
-                "cache_volume_id": "cache-live",
-                "datacenter": "US",
-                "minimum_local_disk_bytes": 1 << 30,
-                "provider": "local",
-                "provider_offer_key": "offer-live",
-                "provider_sku": "h200-sxm",
-                "provider_volume_id": "volume-live",
-            },
-            "execution_substrate": {
-                "control_runtime": control_ref,
-                "oci_image": "cozy/substrate@sha256:" + "3" * 64,
-                "wheelhouse_manifest_digest": "sha256:" + "4" * 64,
-            },
-            "format": "tensorhub.rental_provision_spec/1",
-            "initial_placement_set": document_ref,
-            "network": {
-                "media_port": 43101,
-                "media_protocol": "https",
-                "worker_port": 43100,
-                "worker_protocol": "cozy.worker.v1",
-                "worker_wire_schema_digest": SCHEMA_DIGEST,
-            },
-            "renter_token_sha256": [token],
-            "rental_id": "rental-live",
-        }
-        spec_bytes = canonical.write(spec)
-        spec_ref = ref(spec_bytes)
-        documents = [
-            {
-                **(object_set_ref if role == "artifact_object_set" else document_ref),
-                "role": role,
-                "url": f"https://delivery.invalid/{role}",
-            }
-            for role in REQUIRED_DOCUMENT_ROLES
-        ]
-        bundle = {
-            "artifact_grants": [],
-            "control_runtime": control_ref,
-            "documents": documents,
-            "format": "tensorhub.rental_provision_bundle/1",
-            "provision_spec": spec_ref,
-        }
-        bundle_bytes = canonical.write(bundle)
-        bundle_ref = ref(bundle_bytes)
         env = {
             "AWS_SECRET_ACCESS_KEY": "must-not-cross",
             "HF_TOKEN": "must-not-cross",
             "LANG": "C.UTF-8",
             "PATH": "/usr/bin",
             "RUNPOD_API_KEY": "must-not-cross",
-            "COZY_ADAPTER_PROVISION_SPEC_PATH": str(root / "spec.json"),
-            "COZY_ADAPTER_PROVISION_SPEC_DIGEST": str(spec_ref["digest"]),
-            "COZY_ADAPTER_PROVISION_BUNDLE_PATH": str(root / "bundle.json"),
-            "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST": str(bundle_ref["digest"]),
+            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "attempt-live",
+            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "1",
+            "COZY_ADAPTER_RENTAL_ID": "rental-live",
             "COZY_ADAPTER_POD_BOOT_ID_PATH": str(root / "boot-id"),
             "COZY_ADAPTER_TLS_CERT_PATH": str(root / "tls.crt"),
             "COZY_ADAPTER_TLS_KEY_PATH": str(root / "tls.key"),
@@ -172,41 +113,43 @@ def main() -> int:
             assert exc.name == "adapter_config" and "unknown" in exc.message
         else:
             raise AssertionError("retired provider identity entered the adapter handoff")
+        # cr-048's RETIRED HALF, as a negative arm: the adapter handoff is an allowlist, so
+        # a bootstrap that still delivers the provision-closure names fails by name here
+        # rather than fetching two documents nothing reads.
+        for retired in (
+            "COZY_ADAPTER_PROVISION_SPEC_PATH",
+            "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
+            "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
+            "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+        ):
+            try:
+                read_adapter_config({**env, retired: "sha256:" + "0" * 64})
+            except ConfigError as exc:
+                assert exc.name == "adapter_config" and "unknown" in exc.message
+            else:
+                raise AssertionError(f"retired boot-closure name {retired} was accepted")
+        for name in (
+            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
+            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
+            "COZY_ADAPTER_RENTAL_ID",
+        ):
+            try:
+                read_adapter_config({k: v for k, v in env.items() if k != name})
+            except ConfigError as exc:
+                assert exc.name == "adapter_config" and "absent" in exc.message
+            else:
+                raise AssertionError(f"{name} is not required by the adapter handoff")
+        try:
+            read_adapter_config({**env, "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "0"})
+        except ConfigError as exc:
+            assert exc.name == "adapter_config"
+        else:
+            raise AssertionError("a non-positive attempt ordinal was accepted")
         config = read_adapter_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
-        assert 0 < len(spec_bytes) < canonical.DOC_MAX_BYTES
-        assert 0 < len(bundle_bytes) < canonical.DOC_MAX_BYTES
-        config.provision_spec_path.write_bytes(spec_bytes)
-        config.provision_bundle_path.write_bytes(bundle_bytes)
-        assert (
-            _local_bounded_document(config.provision_spec_path, config.provision_spec_digest)
-            == spec_bytes
-        )
-        assert (
-            _local_bounded_document(config.provision_bundle_path, config.provision_bundle_digest)
-            == bundle_bytes
-        )
-        parsed_spec, parsed_bundle, parsed_cache = _provision_pair(spec_bytes, bundle_bytes, config)
-        assert parsed_spec == spec and parsed_bundle == bundle
-        assert parsed_cache == ProvisionCache(Path("/cache"), "cache-live", "volume-live")
-        assert (
-            _provision_cache(
-                {"cache_mount_path": "", "cache_volume_id": "", "provider_volume_id": ""}
-            )
-            is None
-        )
-        try:
-            _provision_cache(
-                {
-                    "cache_mount_path": "/cache",
-                    "cache_volume_id": "",
-                    "provider_volume_id": "",
-                }
-            )
-        except LaunchRefusal as exc:
-            assert exc.code == "provision_capacity_invalid"
-        else:
-            raise AssertionError("partial optional-cache tuple was accepted")
+        assert config.acquisition_attempt_id == "attempt-live"
+        assert config.acquisition_attempt_ordinal == 1
+        assert config.rental_id == "rental-live"
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}
@@ -223,8 +166,25 @@ def main() -> int:
             "digest": "sha256:d60755ff474871fce1e9705850245780895c1d2b798750f7692962c2d64d8856",
             "length": 53,
         }
-        empty_store = _materialize_objects(
-            {"artifact_grants": []},
+        assert local_weightless.artifact_object_set == EMPTY_ARTIFACT_OBJECT_SET
+        boot_root = root / "boot"
+        boot_root.mkdir()
+        published = boot_root / "artifact-object-set.json"
+        _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
+        _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
+        assert published.read_bytes() == EMPTY_ARTIFACT_OBJECT_SET
+        try:
+            _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET + b"\n", boot_root)
+        except LaunchRefusal as exc:
+            assert exc.code == "boot_document_conflict"
+        else:
+            raise AssertionError("a different boot document overwrote the published bytes")
+        wheel_stand_in = root / "control-runtime.whl"
+        wheel_stand_in.write_bytes(b"control-runtime-wheel-bytes")
+        assert _measure_local(wheel_stand_in) == (ref(b"control-runtime-wheel-bytes")["digest"], 27)
+
+        empty_store = materialize_objects(
+            {},
             empty_object_set,
             cache=None,
             deadline=None,
@@ -407,6 +367,8 @@ def main() -> int:
                         "name": "health",
                     },
                 ],
+                "format": "cozy.endpoint.descriptor/1",
+                "jobs": [],
             }
         )
         descriptor_ref = ref(descriptor_bytes)
@@ -605,14 +567,18 @@ def main() -> int:
             assert exc.code == "tls_certificate_invalid"
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
+        control_digest, control_length = _measure_local(wheel_stand_in)
         payload = readiness.receipt_payload(
-            spec=spec,
-            provision_spec_digest=str(spec_ref["digest"]),
-            provision_bundle_digest=str(bundle_ref["digest"]),
+            acquisition_attempt_id=config.acquisition_attempt_id,
+            acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
+            rental_id=config.rental_id,
+            renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
-            installed_receipt_digest="sha256:" + "5" * 64,
-            placement_set_digest=str(document_ref["digest"]),
+            control_runtime_wheel_digest=control_digest,
+            control_runtime_wheel_length=control_length,
+            worker_internal_port=config.worker_internal_port,
+            media_internal_port=config.media_internal_port,
             gpus=[
                 {
                     "device_index": 0,
@@ -623,20 +589,30 @@ def main() -> int:
                     "pci_bus_id": "00000000:01:00.0",
                 }
             ],
-            artifact_sources={
-                "cloud": {"bytes": 0, "objects": 0},
-                "local": {"bytes": 36, "objects": 2},
-                "network_cache": {"bytes": 0, "objects": 0},
-            },
-            network_cache_degradations=(),
         )
         receipt = canonical.parse_canonical(payload)
         assert isinstance(receipt, dict)
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
-        assert receipt["artifact_sources"]["local"] == {"bytes": 36, "objects": 2}
         assert receipt["acquisition_attempt_id"] == "attempt-live"
+        assert receipt["acquisition_attempt_ordinal"] == 1
+        assert receipt["rental_id"] == "rental-live"
+        assert receipt["observed_renter_token_sha256"] == [token]
+        assert receipt["worker_wire_schema_digest"] == SCHEMA_DIGEST
+        assert receipt["measured_control_runtime_wheel_digest"] == control_digest
+        assert receipt["measured_control_runtime_wheel_length"] == control_length
         assert "provider_pod_id" not in receipt
+        # cr-048: an EMPTY boot has staged nothing, so the receipt asserts nothing about a
+        # closure. Per-placement observed state is the rev-2 wire's job, continuously.
+        for retired in (
+            "artifact_sources",
+            "measured_installed_environment_receipt_digest",
+            "network_cache_degradations",
+            "provision_bundle_digest",
+            "provision_spec_digest",
+            "staged_placement_set_digest",
+        ):
+            assert retired not in receipt
         readiness.publish(config.receipt_payload_path, payload)
         assert config.receipt_payload_path.read_bytes() == payload
         readiness.publish(config.receipt_payload_path, payload)

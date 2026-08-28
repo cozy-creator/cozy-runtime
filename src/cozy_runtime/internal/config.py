@@ -106,12 +106,19 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class AdapterConfig:
-    """The fixed execution-substrate handoff to ``cozy-materialize-launch``."""
+    """The fixed execution-substrate handoff to ``cozy-materialize-launch``.
 
-    provision_spec_path: Path
-    provision_spec_digest: str
-    provision_bundle_path: Path
-    provision_bundle_digest: str
+    THE POD BOOTS ON ENVIRONMENT ALONE (cr-048). The retired
+    ``tensorhub.rental_provision_spec/1`` + ``_bundle/1`` pair was a second, boot-only
+    delivery lane for the closure that rev-2's ``DesiredPlacementSet`` + ``ArtifactGrantUpdate``
+    already carry after the RecordOwner connects. What the spec document actually smuggled
+    was three small identity facts the receipt has to echo for the hub's binder; they are
+    named here explicitly instead.
+    """
+
+    acquisition_attempt_id: str
+    acquisition_attempt_ordinal: int
+    rental_id: str
     pod_boot_id_path: Path
     tls_cert_path: Path
     tls_key_path: Path
@@ -123,11 +130,15 @@ class AdapterConfig:
     child_base_env: tuple[tuple[str, str], ...]
 
 
+# The CLOSED adapter handoff. It is an ALLOWLIST, not a passthrough: `read_adapter_config`
+# refuses any other `COZY_ADAPTER_*` name by name, so every addition here is deliberate.
+# cr-048 removed four (the two provision-document path/digest pairs) and added three: the
+# attempt identity the readiness receipt must echo for tensorhub's binder, which until now
+# rode inside the provision spec document for exactly that reason and nothing else.
 ADAPTER_ENV = {
-    "COZY_ADAPTER_PROVISION_SPEC_PATH",
-    "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
-    "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
-    "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
+    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
+    "COZY_ADAPTER_RENTAL_ID",
     "COZY_ADAPTER_POD_BOOT_ID_PATH",
     "COZY_ADAPTER_TLS_CERT_PATH",
     "COZY_ADAPTER_TLS_KEY_PATH",
@@ -169,7 +180,6 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
 _read: bool = False
 _adapter_read: bool = False
 
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -280,11 +290,11 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
             )
         return value
 
-    def digest(name: str) -> str:
+    def bounded(name: str) -> str:
         value = required(name)
-        if _DIGEST.fullmatch(value) is None:
+        if value.strip() != value or len(value) > 256:
             raise ConfigError(
-                "adapter_config", f"{name} is not sha256:<64 lowercase hex>", "fix bootstrap"
+                "adapter_config", f"{name} is not one bounded untrimmed identifier", "fix bootstrap"
             )
         return value
 
@@ -324,10 +334,9 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
     if worker_port == media_port:
         raise ConfigError("adapter_config", "worker and media ports are equal", "fix bootstrap")
     parsed = AdapterConfig(
-        provision_spec_path=path("COZY_ADAPTER_PROVISION_SPEC_PATH"),
-        provision_spec_digest=digest("COZY_ADAPTER_PROVISION_SPEC_DIGEST"),
-        provision_bundle_path=path("COZY_ADAPTER_PROVISION_BUNDLE_PATH"),
-        provision_bundle_digest=digest("COZY_ADAPTER_PROVISION_BUNDLE_DIGEST"),
+        acquisition_attempt_id=bounded("COZY_ADAPTER_ACQUISITION_ATTEMPT_ID"),
+        acquisition_attempt_ordinal=decimal("COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL", 1 << 31),
+        rental_id=bounded("COZY_ADAPTER_RENTAL_ID"),
         pod_boot_id_path=path("COZY_ADAPTER_POD_BOOT_ID_PATH"),
         tls_cert_path=path("COZY_ADAPTER_TLS_CERT_PATH"),
         tls_key_path=path("COZY_ADAPTER_TLS_KEY_PATH"),
