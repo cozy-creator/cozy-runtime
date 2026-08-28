@@ -61,6 +61,14 @@ STATIC_ARMS = (
         SRC / "cli" / "materialize_launch.py",
         "\nMEDIA_ROOT = Path('/run/cozy/media')\n",
     ),
+    Arm(
+        "measured-backend-version",
+        SRC / "internal" / "hostfacts.py",
+        "\n\ndef _cuda_version() -> str:\n"
+        "    # Planted old authority: driver maximum 13.0, not installed toolkit 12.6.\n"
+        "    subprocess.run(['nvidia-smi', '--display=COMPUTE'])\n"
+        "    return '13.0'\n",
+    ),
     # cr-042: the third private-address check, planted in the module whose own header says
     # the defect is "there were two downloaders and only one had the check".
     Arm(

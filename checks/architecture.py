@@ -1063,7 +1063,7 @@ def fence_pod_media_grant_root() -> list[str]:
 
 
 def fence_measured_backend_version() -> list[str]:
-    """WorkerResources carries HostFacts' measured backend version, never a launch value."""
+    """Installed torch metadata is the torch-free backend authority, never driver maximum."""
 
     path = SRC / "internal" / "worker" / "session.py"
     source = path.read_text()
@@ -1081,14 +1081,54 @@ def fence_measured_backend_version() -> list[str]:
         None,
     )
     body = ast.get_source_segment(source, resources) if resources is not None else None
+    bad: list[str] = []
     if body is None:
         return [f"{path.relative_to(ROOT)}: Worker.resources is gone"]
     if "backend_version=facts.cuda_version" not in body.replace(" ", ""):
-        return [
+        bad.append(
             f"{path.relative_to(ROOT)}: WorkerResources.backend_version does not come "
             "directly from HostFacts.cuda_version"
-        ]
-    return []
+        )
+
+    facts_path = SRC / "internal" / "hostfacts.py"
+    facts_source = facts_path.read_text()
+    facts_tree = ast.parse(facts_source)
+    for node in ast.walk(facts_tree):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names = [node.module]
+        if any(name == "torch" or name.startswith("torch.") for name in names):
+            bad.append(
+                f"{facts_path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}: imports torch"
+            )
+    helper = next(
+        (
+            node
+            for node in facts_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_installed_cuda_version"
+        ),
+        None,
+    )
+    helper_body = ast.get_source_segment(facts_source, helper) if helper is not None else None
+    if helper_body is None:
+        bad.append(f"{facts_path.relative_to(ROOT)}: installed CUDA metadata reader is gone")
+        return bad
+    if "subprocess" in helper_body or "nvidia-smi" in helper_body:
+        bad.append(
+            f"{facts_path.relative_to(ROOT)}: installed backend version reaches the driver; "
+            "nvidia-smi reports a maximum, not the image toolkit"
+        )
+    for spelling in ("sysconfig.get_paths()", '"torch" / "version.py"', "ast.parse"):
+        if spelling not in helper_body:
+            bad.append(
+                f"{facts_path.relative_to(ROOT)}: installed backend reader no longer uses "
+                f"its required {spelling} boundary"
+            )
+    if "def _cuda_version(" in facts_source:
+        bad.append(f"{facts_path.relative_to(ROOT)}: retired driver-maximum CUDA reader returned")
+    return bad
 
 
 FENCES = {

@@ -303,6 +303,69 @@ def prove_backend_version(root: Path) -> None:
     assert "cuda_version" in absent.unreadable
 
 
+def prove_installed_backend_authority(root: Path) -> None:
+    """Image metadata beats the driver's maximum; bad metadata invents no version."""
+
+    purelib = root / "purelib"
+    version_file = purelib / "torch" / "version.py"
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text(
+        "from typing import Optional\n"
+        "__version__ = '2.13.0+cu126'\n"
+        "debug = False\n"
+        "cuda: Optional[str] = '12.6'\n"
+        "git_version = 'final-image-proof'\n"
+        "hip: Optional[str] = None\n",
+    )
+    # A driver advertising CUDA 13.0 is deliberately present as the tempting wrong fact.
+    # The installed-toolkit reader never asks for it and returns torch's exact 12.6 literal.
+    driver_max = SimpleNamespace(stdout="CUDA Version : 13.0\n")
+    with patch("subprocess.run", return_value=driver_max) as queried:
+        version, unreadable = hostfacts._installed_cuda_version(
+            {"purelib": str(purelib), "platlib": str(purelib)}
+        )
+    assert (version, unreadable) == ("12.6", False)
+    assert queried.call_count == 0
+
+    missing, missing_unreadable = hostfacts._installed_cuda_version(
+        {"purelib": str(root / "missing"), "platlib": str(root / "missing")}
+    )
+    assert missing == "" and missing_unreadable is True
+
+    for index, malformed in enumerate(
+        (
+            "cuda = build_cuda_version()\n",
+            "cuda = 'driver maximum 13.0'\n",
+            "cuda = '12.6'\ncuda = '13.0'\n",
+        )
+    ):
+        bad_root = root / f"malformed-{index}"
+        bad = bad_root / "torch" / "version.py"
+        bad.parent.mkdir(parents=True)
+        bad.write_text(malformed)
+        value, bad_unreadable = hostfacts._installed_cuda_version(
+            {"purelib": str(bad_root), "platlib": str(bad_root)}
+        )
+        assert value == "" and bad_unreadable is True
+
+    cpu_root = root / "cpu"
+    cpu = cpu_root / "torch" / "version.py"
+    cpu.parent.mkdir(parents=True)
+    cpu.write_text("cuda = None\n")
+    assert hostfacts._installed_cuda_version(
+        {"purelib": str(cpu_root), "platlib": str(cpu_root)}
+    ) == ("", False)
+
+    # Measurement propagates unreadability under the WIRE field's name. It never fills the
+    # empty version from the driver query that still measures device/driver facts.
+    with (
+        patch.object(hostfacts, "_installed_cuda_version", return_value=("", True)),
+        patch("subprocess.run", side_effect=OSError("nvidia-smi absent")),
+    ):
+        facts = hostfacts.measure()
+    assert facts.cuda_version == "" and "backend_version" in facts.unreadable
+
+
 def mint_certificate(root: Path, name: str, san: str) -> Path:
     certificate, key = root / f"{name}.crt", root / f"{name}.key"
     subprocess.run(
@@ -447,6 +510,7 @@ def main() -> int:
         prove_worker_warm_policy(root / "worker-policy")
         prove_delivery_activation(root / "delivery-activation")
         prove_backend_version(root / "backend-version")
+        prove_installed_backend_authority(root / "installed-backend")
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}

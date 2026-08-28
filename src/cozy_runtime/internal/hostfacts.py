@@ -10,11 +10,18 @@ than one that fails).
 
 from __future__ import annotations
 
+import ast
 import os
 import platform
+import re
 import subprocess
 import sys
+import sysconfig
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
+
+TORCH_VERSION_MAX_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,12 +88,15 @@ def measure() -> HostFacts:
     except (ValueError, OSError):
         pages = 0
         unreadable.append("host_ram_total_bytes")
+    cuda_version, cuda_unreadable = _installed_cuda_version()
+    if cuda_unreadable:
+        unreadable.append("backend_version")
     return HostFacts(
         gpu_name=gpu_name,
         gpu_sm=gpu_sm,
         vram_total_bytes=vram,
         driver_version=driver,
-        cuda_version=_cuda_version(),
+        cuda_version=cuda_version,
         platform=platform.platform()[:120],
         host_ram_total_bytes=pages,
         vcpu_count=os.cpu_count() or 0,
@@ -95,19 +105,68 @@ def measure() -> HostFacts:
     )
 
 
-def _cuda_version() -> str:
-    """The driver's CUDA version, read WITHOUT importing torch or creating a context."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query", "--display=COMPUTE"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    for line in out.splitlines():
-        if "CUDA Version" in line:
-            return line.split(":")[-1].strip()
-    return ""
+def _installed_cuda_version(paths: Mapping[str, str] | None = None) -> tuple[str, bool]:
+    """Installed torch toolkit literal and whether that evidence was unreadable.
+
+    The worker must not import torch or create a CUDA context to describe its image. Python's
+    own install scheme already locates the distribution, and torch's generated ``version.py``
+    records the toolkit it was built against as one top-level literal. Read only that bounded
+    file and parse it as syntax; the driver's maximum supported CUDA version is a different
+    fact and is never a fallback.
+    """
+
+    install_paths = sysconfig.get_paths() if paths is None else paths
+    candidates: list[Path] = []
+    for key in ("purelib", "platlib"):
+        root = install_paths.get(key, "")
+        candidate = Path(root) / "torch" / "version.py" if root else None
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    documents: list[bytes] = []
+    for candidate in candidates:
+        try:
+            with candidate.open("rb") as handle:
+                raw = handle.read(TORCH_VERSION_MAX_BYTES + 1)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "", True
+        if len(raw) > TORCH_VERSION_MAX_BYTES:
+            return "", True
+        documents.append(raw)
+    if not documents:
+        return "", True
+
+    versions: list[str] = []
+    for raw in documents:
+        try:
+            tree = ast.parse(raw.decode("utf-8"), filename="torch/version.py")
+        except (UnicodeDecodeError, SyntaxError):
+            return "", True
+        assignments: list[ast.expr] = []
+        for node in tree.body:
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "cuda" for target in node.targets
+            ):
+                value = node.value
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "cuda"
+                and node.value is not None
+            ):
+                value = node.value
+            if value is not None:
+                assignments.append(value)
+        if len(assignments) != 1 or not isinstance(assignments[0], ast.Constant):
+            return "", True
+        literal = assignments[0].value
+        if literal is None:
+            versions.append("")  # a well-formed CPU-only torch build: measured absent
+        elif isinstance(literal, str) and re.fullmatch(r"\d+\.\d+(?:\.\d+)?", literal):
+            versions.append(literal)
+        else:
+            return "", True
+    return (versions[0], False) if len(set(versions)) == 1 else ("", True)
