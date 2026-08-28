@@ -25,7 +25,7 @@ impossible: a registry change that moves a digest now breaks selection loudly at
 
 **The decode target is the CONTRACT's dtype, and the contract cannot express an encoding.**
 `ModelConstructionContract` names destinations and nothing else — no parts, no scale_of, no
-dequantize (contract.py's `FORBIDDEN_VOCABULARY` makes that an import-time proof). So the
+dequantize (contract.py's `_ROW_FIELDS` equality makes that an import-time proof). So the
 decode target is the destination's own dtype, the header's logical dtype must equal it, and
 a disagreement is cr-005's `dtype_mismatch` unchanged.
 

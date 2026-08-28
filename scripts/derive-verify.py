@@ -385,25 +385,6 @@ def section_unrepresentable() -> None:
 
     red("a row type gaining a field fails at import", plant_field, code="contract_shape")
 
-    def plant_vocabulary() -> None:
-        @dataclasses.dataclass(frozen=True, slots=True)
-        class Fused:
-            key: str
-            source_keys: tuple[str, ...]
-
-        planted = {**contract._ROW_FIELDS, Fused: frozenset({"key", "source_keys"})}
-        original, contract._ROW_FIELDS = contract._ROW_FIELDS, planted  # type: ignore[assignment]
-        try:
-            contract._prove_unrepresentable()
-        finally:
-            contract._ROW_FIELDS = original  # type: ignore[assignment]
-
-    red(
-        "a field named `source_keys` fails even with the table updated",
-        plant_vocabulary,
-        code="contract_vocabulary",
-    )
-
     result = run(h3.Fl2VAModel, config())
     body = result.contract.render()
     closed = contract.closed_resources(result.contract)

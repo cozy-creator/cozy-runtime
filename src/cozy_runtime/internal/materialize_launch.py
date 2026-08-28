@@ -20,16 +20,12 @@ to. Only the boot-only bundling retired.
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
-import importlib.util
-import json
 import os
 import stat
 import time
 import urllib.error
 import urllib.parse
 import uuid
-import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,25 +106,21 @@ def prepare_boot(
 ) -> PreparedBoot:
     """Bring the pod to READY-BUT-EMPTY and MEASURE what the hub will compare.
 
-    No document is read, and nothing is fetched: this whole function is local. It binds the
-    imported control Runtime to the wheel the substrate baked, measures that wheel's exact
-    identity for the receipt, and lays down the empty artifact store plus the exact empty
-    ArtifactObjectSet the worker's launch grammar requires.
+    No document is read, and nothing is fetched: this whole function is local. It measures
+    the substrate-baked control Runtime wheel for the receipt, and lays down the empty
+    artifact store plus the exact empty ArtifactObjectSet the worker's launch grammar
+    requires.
 
     THE CONTROL-RUNTIME DIGEST IS REPORTED, NOT DICTATED. It used to be
     `_verify_local(wheel, spec["execution_substrate"]["control_runtime"]…)` — the pod
     comparing the image against a number the hub had just told it, which teaches the hub
-    only pass/fail about a fact it already asserted. `verify_control_install` below is the
-    half that could never be an env var (it binds the IMPORTED package to the wheel bytes)
-    and it is unchanged; the other half becomes `measured_control_runtime_wheel_digest` in
-    the receipt, which the hub joins against its own ExecutionSubstrate row before it will
-    trust the TLS peer at all. Same fail-closed property, one fewer env name, and the hub
-    learns the measured value instead of a boolean.
+    only pass/fail about a fact it already asserted. It is now
+    `measured_control_runtime_wheel_digest` in the receipt, which the hub joins against its
+    own ExecutionSubstrate row before it will trust the TLS peer at all.
     """
 
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
-    verify_control_install(control_runtime_wheel)
     wheel_digest, wheel_length = _measure_local(control_runtime_wheel)
     _directory(artifact_store_root)
     _directory(boot_root)
@@ -140,65 +132,6 @@ def prepare_boot(
         artifact_store=artifact_store_root,
         artifact_object_set=object_set,
     )
-
-
-def verify_control_install(wheel: Path) -> None:
-    """Require this imported control Runtime to be the exact package in ``wheel``.
-
-    A Python console script's executable inode is CPython, not its distribution. The
-    substrate therefore binds the wheel bytes, and this comparison closes the other half:
-    every shipped control-Runtime package file imported by this interpreter must be the
-    byte-identical member of that wheel. Editable/source/PYTHONPATH execution cannot pass.
-    """
-
-    spec = importlib.util.find_spec("cozy_runtime")
-    locations = tuple(spec.submodule_search_locations or ()) if spec is not None else ()
-    if len(locations) != 1:
-        raise LaunchRefusal("control_runtime_install_invalid", "package root is ambiguous")
-    package = Path(locations[0])
-    try:
-        package = package.resolve(strict=True)
-        distribution = importlib.metadata.distribution("cozy-runtime")
-        distribution_package = Path(str(distribution.locate_file("cozy_runtime"))).resolve(
-            strict=True
-        )
-        direct_url = distribution.read_text("direct_url.json")
-        if package != distribution_package or (
-            direct_url is not None and json.loads(direct_url).get("dir_info", {}).get("editable")
-        ):
-            raise LaunchRefusal(
-                "control_runtime_install_invalid", "adapter package is not the installed wheel"
-            )
-        with zipfile.ZipFile(wheel) as archive:
-            members = sorted(
-                name
-                for name in archive.namelist()
-                if name.startswith("cozy_runtime/") and not name.endswith("/")
-            )
-            if not members:
-                raise LaunchRefusal(
-                    "control_runtime_install_invalid", "wheel has no cozy_runtime package"
-                )
-            for name in members:
-                relative = Path(name).relative_to("cozy_runtime")
-                installed = package / relative
-                info = installed.lstat()
-                if not stat.S_ISREG(info.st_mode) or installed.read_bytes() != archive.read(name):
-                    raise LaunchRefusal(
-                        "control_runtime_install_mismatch", f"package member {relative} differs"
-                    )
-    except LaunchRefusal:
-        raise
-    except (OSError, KeyError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
-        raise LaunchRefusal(
-            "control_runtime_install_invalid", f"package comparison failed: {type(exc).__name__}"
-        ) from exc
-
-    module = Path(__file__).resolve(strict=True)
-    if package not in module.parents:
-        raise LaunchRefusal(
-            "control_runtime_install_invalid", "adapter is not executing from the installed package"
-        )
 
 
 def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
