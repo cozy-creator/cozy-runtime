@@ -103,6 +103,22 @@ def tfs_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def construction_order() -> Path:
+    """Write the exact synthetic endpoint census TensorFS requires for artifact authorship."""
+    from cozy_runtime.author._loader import census as walk_census
+
+    rows: list[list[str]] = []
+    for destination in walk_census(LeafBlock(None)).destinations:
+        component, separator, local = destination.key.partition(".")
+        if not separator or component != destination.component:
+            raise RuntimeError(f"malformed construction destination {destination.key!r}")
+        rows.append([component, local])
+    WORK.mkdir(parents=True, exist_ok=True)
+    path = WORK / "construction-order.json"
+    path.write_text(json.dumps(rows, separators=(",", ":")))
+    return path
+
+
 def _rel(got: Any, want: Any) -> float:
     return float((got.double() - want.double()).norm() / want.double().norm().clamp(min=1e-30))
 
@@ -638,6 +654,8 @@ def carrier() -> None:
         "block=fp8-rowwise/1",
         "--source",
         f"block={CARRIER}",
+        "--order",
+        str(construction_order()),
         "--session",
         session,
         "--tenant",
@@ -647,9 +665,16 @@ def carrier() -> None:
     if run.returncode or install.returncode:
         check("ingest", False, (run.stderr + install.stderr)[:300])
         raise SystemExit(1)
-    import tensorfs
-
-    snapshot = str(tensorfs.ingest_installed(tensorfs.Store.open(str(STORE)))[-1])
+    snapshot = next(
+        (
+            word.removeprefix("sha256:")
+            for word in install.stdout.split()
+            if word.startswith("sha256:") and len(word) == 71
+        ),
+        "",
+    )
+    if not snapshot:
+        raise RuntimeError("ingest install returned no exact snapshot identity")
     (WORK / "snapshot.txt").write_text(snapshot)
     print(f"  snapshot   {snapshot[:30]}…  carrier {CARRIER.stat().st_size} B")
 

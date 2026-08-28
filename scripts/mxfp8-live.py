@@ -80,6 +80,34 @@ def tfs_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def construction_order() -> Path:
+    """Write the exact synthetic endpoint census TensorFS requires for artifact authorship."""
+    import torch
+    from torch import nn
+
+    from cozy_runtime.author._loader import census as walk_census
+
+    root = nn.Module()
+    root.block = nn.Module()
+    root.block.norm = nn.RMSNorm(64, dtype=torch.bfloat16, elementwise_affine=True)
+    root.block.attn = nn.Module()
+    root.block.attn.out_proj = nn.Linear(224, 64, bias=False, dtype=torch.bfloat16)
+    root.block.mlp = nn.Module()
+    root.block.mlp.fc2 = nn.Linear(448, 32, bias=False, dtype=torch.bfloat16)
+    holder = type("Mxfp8Construction", (), {"components": {"c": root}})()
+
+    rows: list[list[str]] = []
+    for destination in walk_census(holder).destinations:
+        component, separator, local = destination.key.partition(".")
+        if not separator or component != destination.component:
+            raise RuntimeError(f"malformed construction destination {destination.key!r}")
+        rows.append([component, local])
+    WORK.mkdir(parents=True, exist_ok=True)
+    path = WORK / "construction-order.json"
+    path.write_text(json.dumps(rows, separators=(",", ":")))
+    return path
+
+
 # --------------------------------------------------------------------------- the encoder
 
 #: The producing job's quantizer, transcribed from `cozy_jobs/quantize.py` and from nothing
@@ -315,6 +343,8 @@ def carrier() -> None:
         "c=mxfp8/1",
         "--source",
         f"c={CARRIER}",
+        "--order",
+        str(construction_order()),
         "--session",
         session,
         "--tenant",
@@ -325,9 +355,16 @@ def carrier() -> None:
         check("ingest", False, (run.stderr + install.stderr)[:300])
         return
 
-    import tensorfs
-
-    snapshot = str(tensorfs.ingest_installed(tensorfs.Store.open(str(STORE)))[-1])
+    snapshot = next(
+        (
+            word.removeprefix("sha256:")
+            for word in install.stdout.split()
+            if word.startswith("sha256:") and len(word) == 71
+        ),
+        "",
+    )
+    if not snapshot:
+        raise RuntimeError("ingest install returned no exact snapshot identity")
     book = Checkpoint(str(STORE), snapshot)
     rows = book.rows("c")
     print(f"  snapshot   {snapshot[:30]}…  {len(rows)} tensors")

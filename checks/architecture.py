@@ -961,6 +961,13 @@ def fence_construction_fill_order() -> list[str]:
     for spelling in ("json.loads(book.header_bytes)", "json.loads(raw)"):
         if spelling in proof:
             bad.append(f"scripts/mxfp8-live.py: {spelling} bypasses TensorFS's CozyTensors codec")
+    for name in ("leaf-live.py", "mxfp8-live.py", "quant-live.py", "leaf-pod.py", "mxfp8-pod.py"):
+        producer = (ROOT / "scripts" / name).read_text()
+        if '"--order"' not in producer:
+            bad.append(
+                f"scripts/{name}: an artifact-producing ingest does not supply an exact "
+                "construction-order document"
+            )
     return bad
 
 

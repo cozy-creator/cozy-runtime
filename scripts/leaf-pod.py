@@ -30,6 +30,7 @@ copied so the two lanes cannot drift. It is not claimed to be H3's forward. It d
 need to be: every arm runs the IDENTICAL module and differs only in how its weights
 compute, so a wiring error moves all arms together and the deltas stay attributable.
 
+    # First place the exact current H3 block order at /root/leaf/construction-order.json.
     PYTHONPATH=/root python3 leaf-pod.py all
 """
 
@@ -47,6 +48,7 @@ from typing import Any
 
 ROOT = Path("/root/leaf")
 STORE = ROOT / "store"
+ORDER = ROOT / "construction-order.json"
 TFS = "/root/tfs"
 RELEASE = "cozy/h3-block@leaf"
 MIB = 1 << 20
@@ -182,6 +184,11 @@ def fetch() -> None:
 
 def ingest() -> None:
     head("ingest — both arms through the REAL border into one store")
+    if not ORDER.is_file():
+        raise SystemExit(
+            f"missing {ORDER}: supply the exact block subset of the current H3 "
+            "ModelConstruction traversal; carrier or lexical order is not executable"
+        )
     if not (STORE / "objects").is_dir():
         STORE.mkdir(parents=True, exist_ok=True)
         tfs_cli("store", "init", str(STORE))
@@ -209,6 +216,8 @@ def ingest() -> None:
             f"block={encoding}",
             "--source",
             f"block={source}",
+            "--order",
+            str(ORDER),
             "--session",
             arm,
             "--tenant",
