@@ -205,6 +205,7 @@ def author(
         raise RuntimeError("the weightless closure and the bundle name different descriptors")
     plans = [release.add(raw, "plan") for _, raw in sorted(weightless.plans.items())]
     release.plan_refs = sorted((digest(raw), len(raw)) for raw in plans)
+    model_object_set = release.add(weightless.artifact_object_set, "model_object_set")
 
     placements = [
         {
@@ -223,6 +224,12 @@ def author(
                 "endpoint_release_id": ENDPOINT_RELEASE,
                 "environment_spec_digest": digest(spec),
                 "installed_environment_receipt_digest": digest(installed.receipt_bytes),
+                "model_object_set": {
+                    "digest": digest(model_object_set),
+                    "kind": "model_object_set",
+                    "length": len(model_object_set),
+                    "subject_id": digest(model_object_set),
+                },
             },
         }
     ]
@@ -236,6 +243,9 @@ class _Origin(http.server.BaseHTTPRequestHandler):
     """Exact bytes at their own content address. No redirect, no transform, no listing."""
 
     objects: ClassVar[dict[str, bytes]] = {}
+    overlap_subjects: ClassVar[frozenset[str]] = frozenset()
+    overlap_barrier: ClassVar[threading.Barrier | None] = None
+    overlapped: ClassVar[set[str]] = set()
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
@@ -246,6 +256,11 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if spelled in _Origin.overlap_subjects:
+            barrier = _Origin.overlap_barrier
+            assert barrier is not None
+            barrier.wait(timeout=10)
+            _Origin.overlapped.add(spelled)
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Type", "application/octet-stream")
@@ -258,8 +273,17 @@ class _Origin(http.server.BaseHTTPRequestHandler):
 
 def serve_artifacts(release: Release, certificate: Path, key: Path, port: int) -> None:
     _Origin.objects = dict(release.objects)
+    source = next(digest for digest, kind in release.kinds.items() if kind == "wheel")
+    models = next(digest for digest, kind in release.kinds.items() if kind == "model_object_set")
+    _Origin.overlap_subjects = frozenset({source, models})
+    _Origin.overlap_barrier = threading.Barrier(2)
+    _Origin.overlapped = set()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Origin)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(certificate), str(key))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def overlap_proven() -> bool:
+    return _Origin.overlapped == set(_Origin.overlap_subjects)

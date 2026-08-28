@@ -543,7 +543,7 @@ def serving_directive(
 ) -> pb.DesiredWorkerState:
     """The full-replace DesiredWorkerState carrying a CONTENT-ADDRESSED DesiredPlacementSet.
 
-    The set travels as its exact canonical `PlacementSet/1` bytes plus their digest; the
+    The set travels as its exact canonical `PlacementSet/2` bytes plus their digest; the
     worker RECOMPUTES before it parses a field (§4). The duplicate structured form the
     frozen wire carried is deleted, so there is no second place for the set to disagree
     with itself.
@@ -562,6 +562,8 @@ def serving_directive(
                 length=len(raw),
             )
         )
+    empty_object_set = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
+    object_set_digest = "sha256:" + hashlib.sha256(empty_object_set).hexdigest()
     placement_set = pb.PlacementSet(
         placements=[
             pb.Placement(
@@ -569,6 +571,12 @@ def serving_directive(
                 spec=pb.PlacementSpec(
                     endpoint_release_id=release,
                     binding_plans=subjects,
+                    model_object_set=pb.ArtifactSubject(
+                        digest=documents.raw(object_set_digest),
+                        subject_id=object_set_digest,
+                        kind="model_object_set",
+                        length=len(empty_object_set),
+                    ),
                 ),
             )
         ]

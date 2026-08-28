@@ -235,6 +235,7 @@ def materialize_objects(
     cache: CacheMount | None,
     deadline: int | None,
     store_root: Path,
+    allow_local: bool = False,
 ) -> MaterializedObjects:
     """Admit each exact model closure into the required worker-local TensorFS CAS.
 
@@ -293,6 +294,7 @@ def materialize_objects(
                 timeout=timeout,
                 session="provision-" + group.root.digest.removeprefix("sha256:")[:12],
                 cache_store=cache_store,
+                allow_local=allow_local,
             )
             for object_id, source in outcome.sources.items():
                 source_by_object.setdefault(object_id, source)

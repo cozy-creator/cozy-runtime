@@ -212,9 +212,10 @@ def main() -> int:
                 streams: int = pull.STREAMS,
                 on_object: Callable[[str, int, bool], None] | None = None,
                 cache_store: Any | None = None,
+                allow_local: bool = False,
             ) -> pull.PullResult:
                 assert tensorfs_module is tensorfs
-                assert timeout is None and cache_store is None
+                assert timeout is None and cache_store is None and not allow_local
                 rows = list(granted)
                 assert snapshot == manifest_ref.digest and snapshot_length == manifest_ref.length
                 assert {row.object_id for row in rows} == {

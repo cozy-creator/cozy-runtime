@@ -5,5 +5,5 @@ in-place revision, so it is not a staleness fence. SCHEMA_DIGEST is (#530-A1).
 """
 
 WIRE_MINOR = 1
-WIRE_SCHEMA_REV = 5
-SCHEMA_DIGEST = "sha256:aa9b8a42cedb1f5fcebd6cb191551b449f267e18ec194c376c6ba631e47a608f"
+WIRE_SCHEMA_REV = 6
+SCHEMA_DIGEST = "sha256:b5cd4430ef6d8b17e4d6d4126cd68ad132e069cae03339deb1476d928e1b3309"

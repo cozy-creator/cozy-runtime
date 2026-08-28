@@ -202,7 +202,7 @@ class Placement:
     """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
     RecordOwner-minted routing + journal key; it is never invocation identity.
 
-    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/1` document
+    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/2` document
     nested in the accepted set bytes. A single-placement replace is this SAME `placement_id`
     carrying a NEW spec digest, which is why routing survives an in-place release rollout.
     """
@@ -213,9 +213,11 @@ class Placement:
     environment_spec_digest: bytes
     installed_environment_receipt_digest: bytes
     descriptor_digest: bytes
+    model_object_set: tuple[str, int]
     plan_ids: tuple[str, ...]
     plan_refs: dict[str, tuple[str, int]]
     """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
+    model_object_set_path: Path | None = None
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
     #: offline" — the exact state an outgoing spec holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
@@ -1641,6 +1643,7 @@ class Worker:
         plan_refs = {
             str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
         }
+        model_object_set = dict(spec.get("model_object_set", {}))
         candidate = Placement(
             placement_id=placement_id,
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
@@ -1652,6 +1655,10 @@ class Worker:
                 spec.get("installed_environment_receipt_digest")
             ),
             descriptor_digest=_digest_field(spec.get("descriptor_digest")),
+            model_object_set=(
+                str(model_object_set.get("digest", "")),
+                int(model_object_set.get("length", 0)),
+            ),
             plan_ids=plan_ids,
             plan_refs=plan_refs,
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
@@ -1751,15 +1758,24 @@ class Worker:
                 f"{documents.spell(candidate.spec_digest)[:23]}… is materializing"
             )
 
-        installed = self._acquire(candidate, revision)
-        if installed is None:
+        installed = (
+            self._acquire(candidate, revision)
+            if candidate.installed_environment_receipt_digest
+            else None
+        )
+        if candidate.installed_environment_receipt_digest and installed is None:
+            return
+        if installed is None and not self._bind_preinstalled_object_set(candidate):
             return
         if revision != self.accepted.accepted_desired_state_revision:
             self.note("materialization", f"revision {revision} was superseded after acquisition")
             return
-        changed = self.supervision.use_overlay(str(installed.python), str(installed.import_root))
-        if changed and self.supervision.current is not None:
-            self.supervision.current.poisoned = "endpoint overlay generation changed"
+        if installed is not None:
+            changed = self.supervision.use_overlay(
+                str(installed.python), str(installed.import_root)
+            )
+            if changed and self.supervision.current is not None:
+                self.supervision.current.poisoned = "endpoint overlay generation changed"
 
         bindings = self._resolve_bindings(candidate)
         if bindings is None:
@@ -1797,6 +1813,32 @@ class Worker:
         )
         self.prepare_executor()
 
+    def _bind_preinstalled_object_set(self, placement: Placement) -> bool:
+        """Bind the local/native lane's already-staged exact model-object set."""
+
+        path = self.options.artifact_object_set
+        expected_digest, expected_length = placement.model_object_set
+        try:
+            raw = path.read_bytes() if path is not None else b""
+        except OSError:
+            raw = b""
+        measured = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
+        if len(raw) != expected_length or measured != expected_digest:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                    subject=placement.placement_id,
+                    reason="model_object_set_identity_mismatch",
+                    detail=f"staged {measured}/{len(raw)}, expected "
+                    f"{expected_digest}/{expected_length}",
+                ),
+                terminal=True,
+            )
+            return False
+        placement.model_object_set_path = path
+        return True
+
     def await_drained(self) -> None:
         """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
 
@@ -1830,7 +1872,7 @@ class Worker:
                 terminal=True,
             )
             return None
-        if self.options.environment_root is None:
+        if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
                 pb.Fault(
@@ -1838,8 +1880,8 @@ class Worker:
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
                     detail=f"receipt {expected} is required, but this worker was launched "
-                    "without --environment-root; the worker will not guess where a "
-                    "substrate put endpoint overlays",
+                    "without --environment-root and --artifact-store; the worker will not "
+                    "guess where a substrate put endpoint overlays or TensorFS objects",
                 ),
                 terminal=False,
             )
@@ -1884,6 +1926,8 @@ class Worker:
                     environment_root=self.options.environment_root,
                     plans_root=self.config.cozy_home / "binding-plans",
                     documents_root=self.config.cozy_home / "binding-documents",
+                    object_sets_root=self.options.environment_root.parent / "model-object-sets",
+                    artifact_store=self.options.artifact_store,
                     python=Path(sys.executable),
                 ).acquire(placement)
             except acquire.AcquisitionRefusal as exc:
@@ -1917,11 +1961,13 @@ class Worker:
                     terminal=isinstance(exc, overlay.OverlayRefusal),
                 )
                 return None
+            placement.model_object_set_path = acquired.object_set
             self.note(
                 "materialization",
                 f"revision {revision} acquired {acquired.wheels} wheel(s), "
                 f"{len(acquired.plans)} plan(s) and {len(acquired.documents)} reached "
-                f"document(s) — {acquired.fetched_bytes} new byte(s) — and published "
+                f"document(s), hydrated {acquired.model_objects} model object(s) — "
+                f"{acquired.fetched_bytes} new byte(s) — and published "
                 f"generation {acquired.installed.generation}",
             )
         # Open the small receipt and base-family document. Wheel bytes were hashed before
@@ -2018,9 +2064,13 @@ class Worker:
                         "canonical provisioned bindings require the verified TensorFS store "
                         "and exact model-root document",
                     )
-                object_set = provisioned.read_artifact_object_set(
-                    self.options.artifact_object_set.read_bytes()
-                )
+                object_set_path = placement.model_object_set_path
+                if object_set_path is None:
+                    raise PlanRefusal(
+                        "model_object_set_required",
+                        "the placement has no staged exact model object-set document",
+                    )
+                object_set = provisioned.read_artifact_object_set(object_set_path.read_bytes())
                 selected = provisioned.read_provisioned_release(
                     plan_documents,
                     read_document=provisioned.staged_document_reader(

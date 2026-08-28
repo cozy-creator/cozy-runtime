@@ -896,8 +896,8 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
 
 
 def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None:
-    """A claim waits for convergence; an old stream never finishes under the new fence."""
-    wl.head("15. claim, snapshot, and convergence are one ownership transition")
+    """A claim stays responsive during convergence and snapshots both honest clocks."""
+    wl.head("15. claim and snapshot stay live while convergence works off-stream")
     tmp = Path(base + "-claim-convergence")
     worker, ids = start_weightless(tmp, instance_id="ins-claim-convergence", fresh=True)
     old = worker.hub
@@ -947,19 +947,14 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
 
         claimant = threading.Thread(target=claim, daemon=True, name="claim-during-convergence")
         claimant.start()
-        time.sleep(0.5)
+        claimant.join(args.observe)
         early_acks = [m for m in list(successor.seen) if m.WhichOneof("msg") == "claim_ack"]
         wl.check(
-            "a successor claim cannot acknowledge while the previous stream is converging",
-            not early_acks and not connected.is_set(),
-            f"convergence is blocked in a real prepare RPC; successor emitted {len(early_acks)} "
-            "ClaimAck frame(s)",
+            "a successor claim ACKS while slow convergence remains blocked",
+            len(early_acks) == 1 and connected.is_set(),
+            f"convergence is blocked in a real prepare RPC; successor emitted "
+            f"{len(early_acks)} ClaimAck frame(s)",
         )
-
-        release.touch()
-        claimant.join(args.observe * 4)
-        if claimant.is_alive():
-            raise TimeoutError("the successor claim did not complete after convergence")
         if connect_error:
             raise connect_error[0]
         if not successor.connected.wait(args.observe):
@@ -967,11 +962,19 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
 
         snapshot = successor.snapshot_document
         wl.check(
-            "the successor snapshot is wholly after convergence, never an intermediate state",
+            "the successor snapshot reports accepted intent ahead of observed convergence",
             int(snapshot.get("accepted_desired_state_revision", 0)) == 2
-            and int(snapshot.get("converged_revision", 0)) == 2,
+            and int(snapshot.get("converged_revision", 0)) == 1,
             f"snapshot accepted={snapshot.get('accepted_desired_state_revision')} "
             f"converged={snapshot.get('converged_revision')}",
+        )
+
+        release.touch()
+        converged = successor.ready(ids["tick"], args.observe * 4)
+        wl.check(
+            "the off-stream lane converges after the blocked import is released",
+            converged.converged_revision == 2,
+            f"converged_revision={converged.converged_revision}",
         )
 
         old_generations = {

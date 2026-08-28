@@ -608,7 +608,9 @@ def main() -> int:
             assert staged.placements[0].placement_id == hub.PLACEMENT_ID, describe(staged)
             assert staged.placements[0].dispatchable_plan_ids, describe(staged)
             assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+            assert hub.overlap_proven(), "endpoint wheel and model object-set fetches serialized"
             note(f"CONVERGED: {describe(staged)}")
+            note("endpoint-source and model-object-set GETs overlapped at the origin barrier")
 
             # THE POD BUILT ONLY THE ENDPOINT OVERLAY and derived the hub's exact receipt.
             expected = "sha256:" + hashlib.sha256(release.receipt).hexdigest()

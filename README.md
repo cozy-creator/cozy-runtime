@@ -14,7 +14,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 5) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 6) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -202,6 +202,14 @@ endpoint wheel once, and publishes one read-only overlay by atomic rename. Reuse
 receipt and base-family manifest; it does not walk or re-hash every installed file. Base bytecode
 is baked in the image and endpoint bytecode is compiled once during overlay publication. The
 executor starts with image Python and APPENDS the overlay import root after image-owned paths.
+
+On a remote placement, schema-rev-6 `PlacementSpec/2` names one exact
+`model_object_set` subject. The standing grant supplies access only. The non-control
+convergence lane starts three independent legs together: endpoint project/custom wheels,
+binding/model documents, and the exact model-object closure into TensorFS. Source/model
+downloads therefore overlap; READY still joins the overlay, TensorFS closure, binding
+resolution, and device construction. A grant refresh re-drives the same accepted revision
+without changing its identity.
 
 The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed

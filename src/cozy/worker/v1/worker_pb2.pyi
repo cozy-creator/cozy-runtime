@@ -518,18 +518,20 @@ class Placement(_message.Message):
     def __init__(self, placement_id: _Optional[str] = ..., spec: _Optional[_Union[PlacementSpec, _Mapping]] = ...) -> None: ...
 
 class PlacementSpec(_message.Message):
-    __slots__ = ("endpoint_release_id", "environment_spec_digest", "installed_environment_receipt_digest", "descriptor_digest", "binding_plans")
+    __slots__ = ("endpoint_release_id", "environment_spec_digest", "installed_environment_receipt_digest", "descriptor_digest", "binding_plans", "model_object_set")
     ENDPOINT_RELEASE_ID_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     INSTALLED_ENVIRONMENT_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTOR_DIGEST_FIELD_NUMBER: _ClassVar[int]
     BINDING_PLANS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_OBJECT_SET_FIELD_NUMBER: _ClassVar[int]
     endpoint_release_id: str
     environment_spec_digest: bytes
     installed_environment_receipt_digest: bytes
     descriptor_digest: bytes
     binding_plans: _containers.RepeatedCompositeFieldContainer[ArtifactSubject]
-    def __init__(self, endpoint_release_id: _Optional[str] = ..., environment_spec_digest: _Optional[bytes] = ..., installed_environment_receipt_digest: _Optional[bytes] = ..., descriptor_digest: _Optional[bytes] = ..., binding_plans: _Optional[_Iterable[_Union[ArtifactSubject, _Mapping]]] = ...) -> None: ...
+    model_object_set: ArtifactSubject
+    def __init__(self, endpoint_release_id: _Optional[str] = ..., environment_spec_digest: _Optional[bytes] = ..., installed_environment_receipt_digest: _Optional[bytes] = ..., descriptor_digest: _Optional[bytes] = ..., binding_plans: _Optional[_Iterable[_Union[ArtifactSubject, _Mapping]]] = ..., model_object_set: _Optional[_Union[ArtifactSubject, _Mapping]] = ...) -> None: ...
 
 class ArtifactSubject(_message.Message):
     __slots__ = ("digest", "subject_id", "kind", "length")

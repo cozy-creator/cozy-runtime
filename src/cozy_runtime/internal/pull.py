@@ -571,6 +571,7 @@ def pull_granted_snapshot(
     streams: int = STREAMS,
     on_object: Callable[[str, int, bool], None] | None = None,
     cache_store: Any | None = None,
+    allow_local: bool = False,
 ) -> PullResult:
     """Admit one exact SnapshotManifest closure from closed direct HTTPS grants.
 
@@ -667,7 +668,7 @@ def pull_granted_snapshot(
         urls={object_id: row.url for object_id, row in by_id.items()},
         in_hand={},
         deadline=deadline,
-        allow_local=False,
+        allow_local=allow_local,
         streams=streams,
         on_object=on_object,
         no_proxy=True,
