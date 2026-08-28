@@ -17,7 +17,6 @@ from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     EMPTY_ARTIFACT_OBJECT_SET,
     LaunchRefusal,
-    _measure_local,
     _publish_exact,
     materialize_objects,
 )
@@ -179,9 +178,6 @@ def main() -> int:
             assert exc.code == "boot_document_conflict"
         else:
             raise AssertionError("a different boot document overwrote the published bytes")
-        wheel_stand_in = root / "control-runtime.whl"
-        wheel_stand_in.write_bytes(b"control-runtime-wheel-bytes")
-        assert _measure_local(wheel_stand_in) == (ref(b"control-runtime-wheel-bytes")["digest"], 27)
 
         empty_store = materialize_objects(
             {},
@@ -567,7 +563,6 @@ def main() -> int:
             assert exc.code == "tls_certificate_invalid"
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
-        control_digest, control_length = _measure_local(wheel_stand_in)
         payload = readiness.receipt_payload(
             acquisition_attempt_id=config.acquisition_attempt_id,
             acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
@@ -575,8 +570,6 @@ def main() -> int:
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
-            control_runtime_wheel_digest=control_digest,
-            control_runtime_wheel_length=control_length,
             worker_internal_port=config.worker_internal_port,
             media_internal_port=config.media_internal_port,
             gpus=[
@@ -599,13 +592,15 @@ def main() -> int:
         assert receipt["rental_id"] == "rental-live"
         assert receipt["observed_renter_token_sha256"] == [token]
         assert receipt["worker_wire_schema_digest"] == SCHEMA_DIGEST
-        assert receipt["measured_control_runtime_wheel_digest"] == control_digest
-        assert receipt["measured_control_runtime_wheel_length"] == control_length
         assert "provider_pod_id" not in receipt
-        # cr-048: an EMPTY boot has staged nothing, so the receipt asserts nothing about a
-        # closure. Per-placement observed state is the rev-2 wire's job, continuously.
+        # An EMPTY boot has staged nothing, so the receipt asserts nothing about a closure;
+        # per-placement observed state is the rev-2 wire's job, continuously. And the pod
+        # measures nothing about its own image: the hub pinned that image by OCI digest,
+        # so a control-Runtime digest echoed back is a value the reader already chose.
         for retired in (
             "artifact_sources",
+            "measured_control_runtime_wheel_digest",
+            "measured_control_runtime_wheel_length",
             "measured_installed_environment_receipt_digest",
             "network_cache_degradations",
             "provision_bundle_digest",

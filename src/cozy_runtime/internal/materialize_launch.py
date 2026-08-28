@@ -38,7 +38,6 @@ ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
-CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
 # execution-substrates creates and grants the runtime exactly this container-local data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -70,8 +69,6 @@ class LaunchRefusal(Exception):
 class PreparedBoot:
     """What a pod knows about itself once it is ready and still empty."""
 
-    control_runtime_wheel_digest: str
-    control_runtime_wheel_length: int
     artifact_store: Path
     artifact_object_set: Path
 
@@ -102,36 +99,36 @@ def prepare_boot(
     *,
     boot_root: Path = BOOT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
-    control_runtime_wheel: Path = CONTROL_RUNTIME_WHEEL,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY and MEASURE what the hub will compare.
+    """Bring the pod to READY-BUT-EMPTY: check the deadline, lay two roots, publish one
+    empty document. Nothing is read, nothing is fetched, nothing is hashed.
 
-    No document is read, and nothing is fetched: this whole function is local. It measures
-    the substrate-baked control Runtime wheel for the receipt, and lays down the empty
-    artifact store plus the exact empty ArtifactObjectSet the worker's launch grammar
-    requires.
+    The deadline check converts a boot that is already too late into a NAMED refusal.
+    Tensorhub stops polling at the same instant either way, so all it decides is whether
+    the operator reads a reason or reads silence.
 
-    THE CONTROL-RUNTIME DIGEST IS REPORTED, NOT DICTATED. It used to be
-    `_verify_local(wheel, spec["execution_substrate"]["control_runtime"]…)` — the pod
-    comparing the image against a number the hub had just told it, which teaches the hub
-    only pass/fail about a fact it already asserted. It is now
-    `measured_control_runtime_wheel_digest` in the receipt, which the hub joins against its
-    own ExecutionSubstrate row before it will trust the TLS peer at all.
+    THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the substrate-baked
+    control-Runtime wheel and reported the digest so "the hub learns a value". But the hub
+    pinned that image BY DIGEST — tensorhub registers a substrate as `name@sha256:…` and
+    refuses a tag — so the wheel inside it is a fact the hub CHOSE, not one the pod can
+    teach it. Hashing image-resident bytes to echo them back proves something the OCI
+    digest already proved before this process existed.
+
+    THE EMPTY OBJECT SET STAYS. It is not a claim to anybody: it is the document the
+    worker started three lines later demands by its launch grammar (`--artifact-object-set`
+    is required), reads unconditionally the moment a placement carries plans, and compares
+    against the model roots that placement uses. Empty is the TRUE answer for a pod holding
+    no objects, and it is what lets a weightless placement converge with no grant lane at
+    all; withholding it would turn that convergence into a BINDING_UNAVAILABLE fault.
     """
 
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
-    wheel_digest, wheel_length = _measure_local(control_runtime_wheel)
     _directory(artifact_store_root)
     _directory(boot_root)
     object_set = boot_root / "artifact-object-set.json"
     _publish_exact(object_set, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
-    return PreparedBoot(
-        control_runtime_wheel_digest=wheel_digest,
-        control_runtime_wheel_length=wheel_length,
-        artifact_store=artifact_store_root,
-        artifact_object_set=object_set,
-    )
+    return PreparedBoot(artifact_store=artifact_store_root, artifact_object_set=object_set)
 
 
 def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
@@ -426,26 +423,6 @@ def _verify_local(path: Path, digest: str, length: int) -> None:
     got = "sha256:" + measured.hexdigest()
     if got != digest:
         raise LaunchRefusal("local_artifact_digest_mismatch", f"measured {got}, expected {digest}")
-
-
-def _measure_local(path: Path) -> tuple[str, int]:
-    """Measure one local regular file's exact identity. Reported, never asserted."""
-
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise LaunchRefusal("local_artifact_unreadable", f"{path}: {exc}") from exc
-    if (
-        not path.is_absolute()
-        or not stat.S_ISREG(info.st_mode)
-        or not 0 < info.st_size <= MAX_ARTIFACT_BYTES
-    ):
-        raise LaunchRefusal("local_artifact_invalid", str(path))
-    measured = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(CHUNK_BYTES):
-            measured.update(chunk)
-    return "sha256:" + measured.hexdigest(), info.st_size
 
 
 def _publish_exact(target: Path, payload: bytes, root: Path) -> None:

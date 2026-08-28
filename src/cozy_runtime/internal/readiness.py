@@ -220,25 +220,25 @@ def receipt_payload(
     renter_token_sha256: Sequence[str],
     pod_boot_id_value: str,
     certificate_der: bytes,
-    control_runtime_wheel_digest: str,
-    control_runtime_wheel_length: int,
     worker_internal_port: int,
     media_internal_port: int,
     gpus: list[RuntimeGPU],
 ) -> bytes:
     """The PodReadinessReceipt/1 payload: everything the pod MEASURED about itself.
 
-    cr-048's field set. Six fields left with the boot closure — `provision_spec_digest`,
-    `provision_bundle_digest`, `measured_installed_environment_receipt_digest`,
-    `staged_placement_set_digest`, `artifact_sources`, `network_cache_degradations` — because
-    a pod that boots empty has staged nothing, and a boot-frozen "staged" claim is exactly
-    the acceptance-as-reality shape #473 retired. That state is per-placement observed state
-    on the rev-2 wire (`converged_revision`, MaterializationState x ServingState), reported
-    continuously instead of asserted once.
+    Eight fields left with the boot closure. Six went with cr-048 —
+    `provision_spec_digest`, `provision_bundle_digest`,
+    `measured_installed_environment_receipt_digest`, `staged_placement_set_digest`,
+    `artifact_sources`, `network_cache_degradations` — because a pod that boots empty has
+    staged nothing, and a boot-frozen "staged" claim is exactly the acceptance-as-reality
+    shape #473 retired. That state is per-placement observed state on the rev-2 wire
+    (`converged_revision`, MaterializationState x ServingState), reported continuously
+    instead of asserted once.
 
-    `measured_control_runtime_wheel_digest` arrived in their place: the substrate-baked
-    control Runtime wheel, measured on the pod, for the hub to join against the
-    ExecutionSubstrate row it provisioned.
+    `measured_control_runtime_wheel_digest`/`_length` went next, and for a different
+    reason: they were image-resident bytes measured on the pod and reported back to the
+    hub that had already pinned the image BY DIGEST. A value the reader chose is not a
+    value the reader learns.
 
     The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
     spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
@@ -249,8 +249,6 @@ def receipt_payload(
             "acquisition_attempt_id": acquisition_attempt_id,
             "acquisition_attempt_ordinal": acquisition_attempt_ordinal,
             "format": "cozy.pod-readiness/1",
-            "measured_control_runtime_wheel_digest": control_runtime_wheel_digest,
-            "measured_control_runtime_wheel_length": control_runtime_wheel_length,
             "media_foreign_credential_refused": True,
             "media_internal_port": media_internal_port,
             "media_listener_bound": True,

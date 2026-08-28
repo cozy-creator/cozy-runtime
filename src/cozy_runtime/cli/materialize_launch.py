@@ -1,10 +1,14 @@
 """Fixed generic-substrate boot adapter entrypoint.
 
-cr-048: the pod boots to READY-BUT-EMPTY. No provision document is read and nothing is
-fetched — control runtime verified, GPU inventory measured, worker started with zero
-placements, both listeners proven to refuse a foreign credential, receipt published. The
-first placement arrives afterwards over rev-2's `DesiredPlacementSet` from the connected
-RecordOwner, and is treated identically to placements 2..N.
+The pod boots to READY-BUT-EMPTY. No provision document is read and nothing is fetched —
+GPU inventory measured, worker started with zero placements, both listeners proven to
+refuse a foreign credential, receipt published. The first placement arrives afterwards
+over rev-2's `DesiredPlacementSet` from the connected RecordOwner, and is treated
+identically to placements 2..N.
+
+Nothing here re-measures the pod's own image. The hub pinned the substrate by OCI digest
+before this process existed, so every byte baked into it is already attested; the pod
+reports only what it OBSERVED — its GPUs, its listeners, the token hashes it was handed.
 """
 
 from __future__ import annotations
@@ -74,8 +78,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
-            control_runtime_wheel_digest=prepared.control_runtime_wheel_digest,
-            control_runtime_wheel_length=prepared.control_runtime_wheel_length,
             worker_internal_port=config.worker_internal_port,
             media_internal_port=config.media_internal_port,
             gpus=gpus,
@@ -162,9 +164,10 @@ def _start_worker(
         "--instance-id",
         boot_id,
         # No `--release-id`: a pod that hosts no placement HAS no endpoint release, and the
-        # worker's empty `release_id` is the honest answer an owner reads back.
-        "--artifact-digest",
-        prepared.control_runtime_wheel_digest,
+        # worker's empty `release_id` is the honest answer an owner reads back. No
+        # `--artifact-digest` for the same reason: the only substrate identity this pod
+        # could measure is its own image, which the hub pinned by digest, so "absent stays
+        # absent" (#481) is the honest answer there too.
         "--devices",
         devices,
         "--grant-root",

@@ -12,9 +12,9 @@ What it proves, and every line of it is measured rather than asserted by constru
 
   * the adapter boots on eleven environment names and reads no document at all;
   * the receipt carries the attempt identity that used to ride the provision spec;
-  * the receipt carries the MEASURED control-Runtime wheel digest, and it equals the
-    wheel the image actually baked (the check that replaced the spec's `control_runtime`);
-  * the six closure fields are GONE from the receipt;
+  * the receipt says NOTHING about the pod's own image — the eight retired fields, the
+    control-Runtime wheel measurement among them, are absent, and the worker reports an
+    empty `worker_artifact_digest` rather than a hash of bytes the hub itself pinned;
   * both listeners bound and both refused a foreign credential;
   * the worker admits the renter's real token and reports ZERO placements, an empty
     accepted set, and no endpoint release — ready, and empty.
@@ -50,6 +50,12 @@ DEADLINE = int(time.time()) + 300
 
 RETIRED_RECEIPT_FIELDS = (
     "artifact_sources",
+    # The pod does not measure its own image. Tensorhub registers an execution substrate
+    # as `name@sha256:…` and refuses a tag, so the control-Runtime wheel baked inside it
+    # is a fact the hub CHOSE; hashing it on the pod to report it back proves nothing the
+    # OCI digest had not already proven before this process started.
+    "measured_control_runtime_wheel_digest",
+    "measured_control_runtime_wheel_length",
     "measured_installed_environment_receipt_digest",
     "network_cache_degradations",
     "provision_bundle_digest",
@@ -169,8 +175,9 @@ def claim_worker(certificate: Path, token: str) -> dict[str, Any]:
                 generation, worker_boot = ack.control_stream_generation, ack.worker_boot_id
                 observed["worker_boot_id"] = ack.worker_boot_id
                 # `worker_artifact_digest` is where SUBSTRATE identity rides and nowhere
-                # else (#487/#489): the pod tells the RecordOwner which control Runtime it
-                # is running, and it is the same measurement the receipt carries.
+                # else (#487/#489), and the only substrate identity a pod could measure
+                # from inside is its own image — which the hub pinned by digest. So it is
+                # ABSENT here, the way `worker_release_id` is: #481's "absent stays absent".
                 observed["worker_id"] = ack.worker_id
                 observed["release_id"] = ack.worker_release_id
                 observed["artifact_digest"] = ack.worker_artifact_digest
@@ -269,13 +276,10 @@ def main() -> int:
         for field in RETIRED_RECEIPT_FIELDS:
             assert field not in receipt, f"{field} survived the closure retirement"
 
-        # THE CHECK THAT REPLACED THE SPEC'S `control_runtime` REF. The pod measured the
-        # baked wheel; tensorhub joins this against its own ExecutionSubstrate row. Here
-        # the proof plays the hub and does exactly that join against the image.
-        measured = hashlib.sha256(CONTROL_WHEEL.read_bytes()).hexdigest()
-        assert receipt["measured_control_runtime_wheel_digest"] == "sha256:" + measured
-        assert receipt["measured_control_runtime_wheel_length"] == CONTROL_WHEEL.stat().st_size
-        note(f"measured control-Runtime wheel sha256:{measured[:16]}… joins the image")
+        # THE POD NEVER OPENED ITS OWN IMAGE. The wheel is right there at its fixed path
+        # and the receipt says nothing about it: what the hub pinned, the hub knows.
+        assert CONTROL_WHEEL.is_file(), "the substrate stand-in did not bake the wheel"
+        note(f"{len(RETIRED_RECEIPT_FIELDS)} image/closure fields absent from the receipt")
 
         # READY, AND EMPTY: nothing was materialized, because nothing named anything.
         object_set = Path("/var/lib/cozy/boot/artifact-object-set.json").read_bytes()
@@ -293,8 +297,7 @@ def main() -> int:
         assert observed["snapshot"].get("held_attempts", []) == []
         assert observed["worker_id"] == "ra-cr048bootproof", observed
         assert observed["release_id"] == "", observed
-        expected_digest = receipt["measured_control_runtime_wheel_digest"]
-        assert observed["artifact_digest"] == expected_digest, observed
+        assert observed["artifact_digest"] == "", observed
         note(
             f"renter Claim ACCEPTED: phase={observed['phase']} "
             f"placements={observed['placements']} release_id={observed['release_id']!r}"
