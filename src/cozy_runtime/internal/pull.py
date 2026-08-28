@@ -318,7 +318,7 @@ class Resolved:
 def resolve(
     base: str, ref: str, deadline: Deadline, *, lane: str = "", token: str = ""
 ) -> Resolved:
-    """`org/repo[@release|@sha256:...]` -> one exact checkpoint, decided by the HUB.
+    """`org/model[@release|@sha256:...]` -> one exact checkpoint, decided by the HUB.
 
     Resolution is not re-implemented here on purpose: the hub owns the release/lane
     vocabulary, and a client that resolved locally would need a copy of it that goes stale.
@@ -342,8 +342,15 @@ def resolve(
             "check the ref and the lane selector; `--lane` narrows a release with several",
             cause=json.dumps(doc)[:400],
         )
-    repo = str(doc.get("repo") or doc.get("ref") or ref).split("@")[0]
-    org, _, name = repo.partition("/")
+    model = str(doc.get("model") or "").split("@")[0]
+    org, separator, name = model.partition("/")
+    if not separator or not org or not name:
+        raise PullRefusal(
+            "hub_refused",
+            f"{ref}: the hub resolved a checkpoint without its model identity",
+            "upgrade the hub; /v1/resolve must return the owning model",
+            cause=json.dumps(doc)[:400],
+        )
     return Resolved(
         org=org,
         name=name,
@@ -388,7 +395,7 @@ def reads(base: str, at: Resolved, deadline: Deadline, *, token: str = "") -> li
     lengths and digests are handed to the border as the EXPECTATION each object must meet,
     and an object that arrives as anything else is refused, not accepted with a warning.
     """
-    path = f"/v1/repos/{at.org}/{at.name}/checkpoints/{at.path_id}/reads"
+    path = f"/v1/models/{at.org}/{at.name}/checkpoints/{at.path_id}/reads"
     doc = _json(base, path, deadline, token=token, body={})
     out = [Read(str(r["object_id"]), int(r["length"]), str(r["url"])) for r in doc.get("reads", [])]
     if not out:
@@ -409,7 +416,7 @@ def manifest(base: str, at: Resolved, deadline: Deadline) -> bytes:
     them against the digest the ref resolved to, so a hub that served the wrong manifest is
     caught at the door rather than believed.
     """
-    url = base.rstrip("/") + f"/v1/repos/{at.org}/{at.name}/checkpoints/{at.path_id}/manifest"
+    url = base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/checkpoints/{at.path_id}/manifest"
     guard(url, allow_local=local_hub(base))
     try:
         with _open(urllib.request.Request(url), deadline) as resp:

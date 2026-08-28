@@ -6,7 +6,7 @@ serving real R2 objects and observes what it does. Every arm is either a real tr
 real refusal; nothing here is mocked, and the hostile sources in the door arms are hostile in
 exactly the way a network is (a flipped byte, a body that ends early, a reset socket).
 
-  scripts/pull-live.py --hub URL --ref org/repo@sha256:... --store DIR [--source DIR]
+  scripts/pull-live.py --hub URL --ref org/model@sha256:... --store DIR [--source DIR]
   scripts/pull-live.py --hub URL --ref ... --phases door,arms
 
 Phases: pull (fetch it, prove it) · row (the index row the fill plane can actually serve,

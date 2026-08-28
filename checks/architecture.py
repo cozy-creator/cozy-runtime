@@ -365,7 +365,7 @@ def fence_endpoint_owns_no_media_decode() -> list[str]:
 
 def fence_no_identifiers() -> list[str]:
     """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
-    repo, release, checkpoint or adapter ref, in bindings or in string literals.
+    model, release, checkpoint or adapter ref, in bindings or in string literals.
 
     Code states capability; SELECTION is a binding (endpoint.toml, `--model`, the deploy
     binding). Identity is exclusively deployment-side, so branching on one is unspellable.

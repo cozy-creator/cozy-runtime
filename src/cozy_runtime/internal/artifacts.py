@@ -1,6 +1,6 @@
 """THE LOCAL ARTIFACT INDEX — this machine's inventory of installed checkpoints.
 
-It answers ONE question: what does the ref `org/repo[@release]` mean on THIS disk — which
+It answers ONE question: what does the ref `org/model[@release]` mean on THIS disk — which
 store root, which snapshot per component, which construction config, which custody, which
 uploader-minted stamps. A row is a projection of what TensorFS's ingest border hands back,
 never a second description of the bytes: `bytes` is copied from the header, and the index
@@ -44,7 +44,7 @@ class ArtifactRefError(ValueError):
 
 SCHEMA = "cozy.runtime.LocalArtifact/1"
 DIRECTORY = "artifacts"
-#: `org/repo`, optionally `@release`. A bare ref resolves on tensorhub only (never a foreign
+#: `org/model`, optionally `@release`. A bare ref resolves on tensorhub only (never a foreign
 #: fallback), which is a `pull` concern; here it is only the index key's grammar.
 REF = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$")
 
@@ -124,8 +124,8 @@ def install(cozy_home: Path, artifact: Artifact) -> Path:
     """Record one installed artifact. Idempotent: identical facts rewrite the same bytes."""
     if not REF.match(artifact.ref):
         raise ArtifactRefError(
-            f"{artifact.ref!r} is not a ref: org/repo[@release]",
-            "refs are org/repo with an optional @release; a filesystem path is admitted "
+            f"{artifact.ref!r} is not a model ref: org/model[@release]",
+            "model refs are org/model with an optional @release; a filesystem path is admitted "
             "through `cozy-runtime ingest` first",
         )
     target = directory(cozy_home)
@@ -168,7 +168,7 @@ def rows(cozy_home: Path, prefix: str = "") -> list[Artifact]:
 
 
 def find(cozy_home: Path, ref: str) -> Artifact | None:
-    """Exact ref, then the bare `org/repo` prefix when only one release is installed."""
+    """Exact ref, then the bare `org/model` prefix when only one release is installed."""
     installed = rows(cozy_home)
     for row in installed:
         if row.ref == ref:
