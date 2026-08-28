@@ -10,6 +10,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   construction-fill-order
   one-address-predicate
   dynamic-pods-skip-boot-warm
+  delivery-plan-observation
 """
 
 from __future__ import annotations
@@ -986,6 +987,29 @@ def fence_dynamic_pods_skip_boot_warm() -> list[str]:
     return []
 
 
+def fence_delivery_plan_observation() -> list[str]:
+    """Delivery narration consumes the current plural kernel census, never retired keys."""
+
+    path = SRC / "internal" / "worker" / "session.py"
+    source = path.read_text()
+    bad: list[str] = []
+    stale = re.compile(r"delivery\[['\"](?:cost_class|kernel)['\"]\]")
+    for lineno, line in enumerate(source.splitlines(), 1):
+        if stale.search(line):
+            bad.append(
+                f"{path.relative_to(ROOT)}:{lineno}: delivery observation reads a retired "
+                "singular/cost key; Plan.wire_document carries `kernels` and no cost_class"
+            )
+    if 'self.note("delivery", _delivery_observation(delivery))' not in source:
+        bad.append(
+            f"{path.relative_to(ROOT)}: prepare no longer sends delivery narration through "
+            "the total current-schema renderer"
+        )
+    if re.search(r"census\(['\"]kernels['\"]\)", source) is None:
+        bad.append(f"{path.relative_to(ROOT)}: current `kernels` census is not observed")
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -1007,6 +1031,7 @@ FENCES = {
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
+    "delivery-plan-observation": fence_delivery_plan_observation,
 }
 
 

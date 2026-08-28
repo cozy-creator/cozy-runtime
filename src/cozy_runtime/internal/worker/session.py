@@ -52,7 +52,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -142,6 +142,29 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 #: `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own admission instead
 #: of growing this worker's held set.
 ADMISSION_WINDOW = 1
+
+
+def _delivery_observation(delivery: Mapping[str, Any]) -> str:
+    """Render only the current resolution-plan projection; narration never gates serving."""
+
+    def census(name: str) -> str:
+        value = delivery.get(name)
+        if not isinstance(value, Mapping):
+            return "unreported"
+        rows = ", ".join(f"{key} x{count}" for key, count in sorted(value.items()))
+        return rows or "none"
+
+    materialization = str(delivery.get("materialization") or "verbatim")
+    calibrated = "calibrated" if delivery.get("calibrated") else "uncalibrated"
+    confession = str(delivery.get("confession") or "")
+    return (
+        f"{delivery.get('variant', '')!r} / {delivery.get('label', 'unlabelled')} on rung "
+        f"{delivery.get('rung', 'unreported')} "
+        f"({delivery.get('delivery', 'unreported')}/{materialization}; "
+        f"routes {census('routes')}; kernels {census('kernels')}; {calibrated}) chosen on "
+        f"the {delivery.get('objective', 'unreported')} axis"
+        + (f" - {confession}" if confession else "")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1814,7 +1837,7 @@ class Worker:
             f"{len(candidate.plan_ids)} binding plan(s) resolved, "
             f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
-        self.prepare_executor()
+        self.activate_executor()
 
     def _bind_preinstalled_object_set(self, placement: Placement) -> bool:
         """Bind the local/native lane's already-staged exact model-object set."""
@@ -2221,6 +2244,27 @@ class Worker:
 
     # ------------------------------------------------------------- activation
 
+    def activate_executor(self) -> None:
+        """Contain every activation defect as observable OFFLINE state, never a dead lane."""
+
+        try:
+            self.prepare_executor()
+        except Exception as exc:
+            detail = safe(f"{type(exc).__name__}: {exc}")[:1024]
+            subject = self.placement.placement_id if self.placement is not None else "placement"
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=subject,
+                    reason="activation_exception",
+                    detail=detail,
+                )
+            )
+            self.latched = "activation_exception"
+            self.note("boot", f"activation failed after staging: {detail}"[:256])
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+            self._settle()
+
     def prepare_executor(self) -> None:
         """ACTIVATION: prepare the executor BEFORE the placement becomes DISPATCHABLE.
 
@@ -2546,14 +2590,7 @@ class Worker:
                 f"parked={reply['facts'].get('parked', [])}",
             )
             if delivery:
-                self.note(
-                    "delivery",
-                    f"{delivery['variant']!r} on rung {delivery['rung']} "
-                    f"({delivery['delivery']}/{delivery['materialization'] or 'verbatim'}, "
-                    f"{delivery['cost_class']} decode, {delivery['kernel']} kernel) chosen "
-                    f"on the {delivery['objective']} axis"
-                    + (f" — {delivery['confession']}" if delivery.get("confession") else ""),
-                )
+                self.note("delivery", _delivery_observation(delivery))
         # A placement with NO working binding has nothing to serve and says so; one with
         # any working binding becomes dispatchable and refuses only what actually failed.
         if len(self.failed_bindings) >= len(self.bindings):
@@ -3106,7 +3143,7 @@ class Worker:
             self._settle()
             return
         self.bump_admission("executor respawned")
-        self.prepare_executor()
+        self.activate_executor()
         self.note(
             "recovery",
             f"dispatchable again in {(time.perf_counter() - started) * 1000:.0f} ms at "
