@@ -14,11 +14,16 @@ The mechanism itself has one meaning:
 It never downloads, resolves, builds, reads an index, imports a source tree, or uses host
 site-packages.  A staging directory is not selectable.  Only a complete generation containing
 its canonical receipt is atomically renamed into the receipt-keyed generation namespace.
+
+A published generation is immutable and RECORD-closed, so the interpreter that runs it cannot
+cache bytecode inside it.  :func:`bytecode_cache` names the receipt-keyed tree beside it that
+the executor is pointed at instead; it holds no identity and nothing verifies it.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
 import errno
 import hashlib
@@ -44,6 +49,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 RECEIPT_FORMAT = "cozy.worker.v1.InstalledEnvironmentReceipt/1"
 RECEIPT_NAME = "installed-environment-receipt.json"
+BYTECODE_DIR = "bytecode"
 MAX_WHEEL_BYTES = 8 << 30
 MAX_WHEEL_MEMBERS = 200_000
 MAX_WHEEL_EXPANDED_BYTES = 32 << 30
@@ -136,6 +142,8 @@ class InstalledEnvironment:
     receipt_bytes: bytes
     receipt_digest: str
     reused: bool
+    bytecode_cache: Path
+    """``PYTHONPYCACHEPREFIX`` for this generation's interpreter; see :func:`bytecode_cache`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,14 +178,13 @@ def materialize(
     env = _sealed_env(base_env or {})
     _verify_uv(uv, env)
     _verify_host_target(target, python, env)
-    inspected = _verify_grants(source)
     if expected_receipt_digest and not _DIGEST.fullmatch(expected_receipt_digest):
         raise EnvironmentRefusal("environment_receipt_digest_invalid", expected_receipt_digest)
 
     generations = root / "generations"
-    generations.mkdir(parents=True, exist_ok=True)
     expected_generation = generations / expected_receipt_digest.removeprefix("sha256:")
     if expected_receipt_digest and expected_generation.exists():
+        _open_bytecode_cache(root, expected_receipt_digest)
         return verify_generation(
             expected_generation,
             receipt_digest=expected_receipt_digest,
@@ -185,6 +192,12 @@ def materialize(
             reused=True,
         )
 
+    # Wheel bytes are hashed only on the path that installs them.  The reuse return above
+    # opens no wheel and needs none: an expected receipt digest already names the exact
+    # generation, and re-measuring it is `verify_generation`'s job.  This is not a bypass
+    # -- that branch returns or raises, so nothing reaches an install unverified.
+    inspected = _verify_grants(source)
+    generations.mkdir(parents=True, exist_ok=True)
     shard = _open_store(store, root, python) if store is not None else None
     staging = root / f".staging-{uuid.uuid4().hex}"
     try:
@@ -270,16 +283,37 @@ def materialize(
             _remove_tree(staging)
             reused = True
         _fsync_dir(generations)
-        return verify_generation(
+        _open_bytecode_cache(root, receipt_digest)
+        return _measure_generation(
             final,
             receipt_digest=receipt_digest,
             environment_spec_digest=source.environment_spec_digest,
             reused=reused,
+            # The RECORD pass above measured every `record_digest` in the receipt from these
+            # exact bytes, and only modes and the directory name changed after it, so a
+            # second full pass here would re-read what this call just wrote.  A generation
+            # this process did NOT write -- the lost publish race -- is measured in full.
+            verify_installed=reused,
         )
     except Exception:
         if staging.exists():
             _remove_tree(staging)
         raise
+
+
+def bytecode_cache(root: Path, receipt_digest: str) -> Path:
+    """This generation's ``PYTHONPYCACHEPREFIX``: keyed by receipt digest, OUTSIDE the venv.
+
+    CPython cannot cache bytecode inside a published generation -- ``_make_immutable`` clears
+    every write bit, ``verify_generation`` refuses a writable file, and a ``.pyc`` in
+    site-packages is an ``installed_unrecorded_file`` REFUSAL rather than merely an unwritten
+    file -- so every executor start recompiled every module it imported, forever.  The prefix
+    moves the cache out of the venv entirely; the receipt digest keys it so two generations
+    can neither share nor poison each other's bytecode.  An absent or unwritable tree costs
+    only speed: CPython creates what it can and silently skips what it cannot.
+    """
+
+    return root / BYTECODE_DIR / receipt_digest.removeprefix("sha256:")
 
 
 def verify_generation(
@@ -289,8 +323,29 @@ def verify_generation(
     environment_spec_digest: str,
     reused: bool = True,
 ) -> InstalledEnvironment:
-    """Re-measure a published generation before it is allowed to call itself staged."""
+    """Re-measure a published generation before it is allowed to call itself staged.
 
+    The standalone verifier, and the only thing between a corrupted-on-disk generation and
+    an executor: it re-hashes every installed file against its ``RECORD``.
+    """
+
+    return _measure_generation(
+        generation,
+        receipt_digest=receipt_digest,
+        environment_spec_digest=environment_spec_digest,
+        reused=reused,
+        verify_installed=True,
+    )
+
+
+def _measure_generation(
+    generation: Path,
+    *,
+    receipt_digest: str,
+    environment_spec_digest: str,
+    reused: bool,
+    verify_installed: bool,
+) -> InstalledEnvironment:
     receipt_path = generation / RECEIPT_NAME
     try:
         receipt_bytes = receipt_path.read_bytes()
@@ -366,7 +421,8 @@ def verify_generation(
         prior = distribution
         expected[distribution] = (version, record_digest)
     venv = generation / "venv"
-    _verify_installed(venv, expected)
+    if verify_installed:
+        _verify_installed(venv, expected)
     if generation.stat().st_mode & 0o222:
         raise EnvironmentRefusal("environment_generation_mutable", str(generation))
     for path in generation.rglob("*"):
@@ -378,6 +434,9 @@ def verify_generation(
         receipt_bytes=receipt_bytes,
         receipt_digest=receipt_digest,
         reused=reused,
+        # The generation namespace is `<root>/generations/<key>`, which this call has
+        # already required by refusing any other key; the bytecode tree is its sibling.
+        bytecode_cache=bytecode_cache(generation.parent.parent, receipt_digest),
     )
 
 
@@ -821,6 +880,16 @@ def _verify_uv(uv: Path, env: Mapping[str, str]) -> None:
     result = _run([str(uv), "--version"], env, "uv_version_unreadable")
     if result.stdout.strip() != PINNED_UV_VERSION:
         raise EnvironmentRefusal("uv_identity_mismatch", result.stdout.strip())
+
+
+def _open_bytecode_cache(root: Path, receipt_digest: str) -> Path:
+    """Create the generation's bytecode tree.  A cache that cannot be created is not fatal:
+    it is not part of any identity, and an executor that cannot cache still runs."""
+
+    tree = bytecode_cache(root, receipt_digest)
+    with contextlib.suppress(OSError):
+        tree.mkdir(parents=True, exist_ok=True, mode=0o755)
+    return tree
 
 
 def _open_store(store: Path, root: Path, python: Path) -> wheelstore.WheelStore:

@@ -1673,11 +1673,11 @@ class Worker:
                     )
                 )
                 return
-            python = str(installed.python)
-            if self.supervision.python != python:
-                self.supervision.python = python
-                if self.supervision.current is not None:
-                    self.supervision.current.poisoned = "installed environment generation changed"
+            changed = self.supervision.use_generation(
+                str(installed.python), str(installed.bytecode_cache)
+            )
+            if changed and self.supervision.current is not None:
+                self.supervision.current.poisoned = "installed environment generation changed"
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             self.note(
                 "materialization",

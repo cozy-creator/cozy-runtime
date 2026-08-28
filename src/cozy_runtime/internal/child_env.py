@@ -55,12 +55,18 @@ ERASED_PREFIXES: tuple[str, ...] = (
     "COMFY_",
     "OMP_",
     "MKL_",
+    # Imposed below from the generation's identity; an ambient value would point the
+    # executor's bytecode cache at a tree that names a different generation.
+    "PYTHONPYCACHEPREFIX",
 )
 
 #: The fill plane's capture directory, named here because the allowlist row and the config
 #: authority's reader must spell it identically and this is the table both read.
 FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
 EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
+#: The generation-keyed bytecode tree, named here for the same reason: the allowlist row
+#: and `internal/environment.py`'s producer must spell it identically.
+BYTECODE_CACHE_ENV = "PYTHONPYCACHEPREFIX"
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here. Class-B impose vocabulary
@@ -103,6 +109,15 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "worker.process_tree_scope",
         "non-secret exact process identity inherited by first-party descendants when a "
         "credential-unwritable cgroup-v1 container cannot supply a kernel subtree",
+    ),
+    ProjectedVar(
+        BYTECODE_CACHE_ENV,
+        "environment.InstalledEnvironment.bytecode_cache",
+        "the executor's venv is immutable and RECORD-closed, so CPython can cache no "
+        "bytecode inside it and recompiled every module it imported on every start "
+        "(1.35 s of a 2.62 s `import torch`). This points the cache at the generation's "
+        "own tree outside the venv; a path, not a switch, and an absent tree only costs "
+        "speed",
     ),
     ProjectedVar(
         FILL_FORENSICS_DIR,

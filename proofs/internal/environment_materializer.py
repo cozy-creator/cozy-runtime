@@ -13,12 +13,15 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
-from cozy_runtime.internal import environment
+from cozy_runtime.internal import child_env, environment, spawn
 from cozy_runtime.internal.materialize_launch import environment_input
 
 
@@ -60,6 +63,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     _require(warm.reused, "receipt-keyed replay did not report reuse")
     _require(warm.receipt_bytes == expected, "receipt-keyed replay changed receipt bytes")
 
+    _bytecode_proof(warm, source)
+    _reuse_grant_proof(root, source, environment_root, uv, python, expected, expected_digest)
+
     site = _site(warm.generation)
     site_mode = site.stat().st_mode
     site.chmod(site_mode | stat.S_IWUSR)
@@ -91,14 +97,132 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment_spec_digest=source.environment_spec_digest,
         ),
     )
+    # The reuse path is the last guard before an executor runs: `materialize` must refuse the
+    # same corruption `verify_generation` just refused, not hand back a generation because its
+    # receipt file still hashes correctly.
+    _refusal(
+        "installed_record_mismatch",
+        partial(
+            environment.materialize,
+            source,
+            environment_root,
+            uv=uv,
+            python=python,
+            expected_receipt_digest=warm.receipt_digest,
+        ),
+    )
     _store_proof(root, source, uv, python, expected, expected_digest)
     print(
         "private environment materializer: publish-race and receipt-keyed reuse retained exact "
         "receipt bytes; unrecorded and tampered installed bytes refused; wheel-store "
         "materialization shared inodes at byte-identical receipts, survived concurrency, and "
-        "refused a cross-device store and a tampered store entry"
+        "refused a cross-device store and a tampered store entry; bytecode cached to the "
+        "generation-keyed tree outside the immutable venv and was reused there; reuse "
+        "skipped unreadable grants while every installing path still refused them"
     )
     return 0
+
+
+def _bytecode_proof(
+    warm: environment.InstalledEnvironment, source: environment.EnvironmentInput
+) -> None:
+    """Bytecode must reach a generation-keyed tree OUTSIDE the venv, and stay reused.
+
+    Nothing timed here: the mechanism is what is proven.  An immutable, RECORD-closed venv
+    cannot hold a ``.pyc`` at all -- it would be an ``installed_unrecorded_file`` refusal --
+    so the only question worth an arm is whether the bytecode lands outside it and survives.
+    """
+
+    tree = warm.bytecode_cache
+    _require(
+        tree.name == warm.receipt_digest.removeprefix("sha256:")
+        and tree.parent.name == environment.BYTECODE_DIR,
+        f"the bytecode tree {tree} is not keyed by the receipt digest",
+    )
+    _require(warm.generation not in tree.parents, f"bytecode tree {tree} is inside the venv")
+    _require(tree.is_dir(), "materialization did not open the bytecode tree")
+    # The whole point is that the tree reaches the child: an allowlist row that the ERASE
+    # pass does not clear, or one the seal drops, would leave every start recompiling.
+    ambient = (("PATH", "/usr/bin"), (child_env.BYTECODE_CACHE_ENV, "/ambient/poison"))
+    base = tuple((k, v) for k, v in ambient if not child_env.erased(k))
+    sealed = spawn.seal(base, {child_env.BYTECODE_CACHE_ENV: str(tree)})
+    _require(
+        sealed.get(child_env.BYTECODE_CACHE_ENV) == str(tree),
+        "the executor seal does not carry the generation's bytecode tree",
+    )
+
+    # Executor-shaped: the sealed environment only, and no -I/-E, which would ignore it.
+    env = {"PATH": "/usr/bin", child_env.BYTECODE_CACHE_ENV: str(tree)}
+    probe = [str(warm.python), "-s", "-c", "import proof_environment_project"]
+    subprocess.run(probe, env=env, check=True, capture_output=True)
+    cached = sorted(tree.rglob("*.pyc"))
+    site = _site(warm.generation)
+    _require(bool(cached), "an executor-shaped start cached no bytecode")
+    _require(
+        any(str(site) in str(path) for path in cached),
+        f"no installed module's bytecode reached {tree}",
+    )
+    _require(
+        not list((warm.generation / "venv").rglob("__pycache__")),
+        "bytecode landed inside the immutable venv",
+    )
+    stamps = {path: path.stat().st_mtime_ns for path in cached}
+    subprocess.run(probe, env=env, check=True, capture_output=True)
+    _require(
+        {path: path.stat().st_mtime_ns for path in sorted(tree.rglob("*.pyc"))} == stamps,
+        "a warm start rewrote its cached bytecode instead of reusing it",
+    )
+    environment.verify_generation(
+        warm.generation,
+        receipt_digest=warm.receipt_digest,
+        environment_spec_digest=source.environment_spec_digest,
+    )
+
+
+def _reuse_grant_proof(
+    root: Path,
+    source: environment.EnvironmentInput,
+    environment_root: Path,
+    uv: Path,
+    python: Path,
+    expected: bytes,
+    expected_digest: str,
+) -> None:
+    """Wheel bytes are hashed on the path that installs them -- and on every such path."""
+
+    absent = replace(
+        source,
+        grants=tuple(replace(grant, path=root / "no-such-wheel") for grant in source.grants),
+    )
+    reused = environment.materialize(
+        absent,
+        environment_root,
+        uv=uv,
+        python=python,
+        expected_receipt_digest=expected_digest,
+    )
+    _require(
+        reused.reused and reused.receipt_bytes == expected,
+        "reuse of a published generation did not survive unreadable grants",
+    )
+    # A reuse that finds no generation must install, and installing must verify: an expected
+    # digest is not a licence to skip the wheels.
+    for target, digest in (
+        (root / "environment-grant-cold", ""),
+        (root / "environment-grant-absent", expected_digest),
+    ):
+        _refusal(
+            "wheel_blob_unreadable",
+            partial(
+                environment.materialize,
+                absent,
+                target,
+                uv=uv,
+                python=python,
+                expected_receipt_digest=digest,
+            ),
+        )
+        _require(not target.exists(), f"a refused materialization left {target}")
 
 
 def _store_proof(
