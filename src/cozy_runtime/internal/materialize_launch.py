@@ -39,6 +39,8 @@ CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
 PROVISION_ROOT = LOCAL_DATA_ROOT / "provision"
 ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
+# Same filesystem as ENVIRONMENT_ROOT by construction: the store hardlinks into every venv.
+WHEEL_STORE_ROOT = LOCAL_DATA_ROOT / "wheel-store"
 LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
 PLANS_ROOT = Path("/run/cozy/binding-plans")
 BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
@@ -97,6 +99,7 @@ def prepare_launch(
     uv: Path,
     provision_root: Path = PROVISION_ROOT,
     environment_root: Path = ENVIRONMENT_ROOT,
+    wheel_store_root: Path = WHEEL_STORE_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
     plans_root: Path = PLANS_ROOT,
     control_runtime_wheel: Path = CONTROL_RUNTIME_WHEEL,
@@ -169,6 +172,7 @@ def prepare_launch(
         environment_root,
         uv=uv,
         expected_receipt_bytes=document_bytes["expected_installed_environment_receipt"],
+        store=wheel_store_root,
     )
     _stage_refs(release["plans"], artifact_paths, plans_root)
     _stage_refs(release["binding_documents"], artifact_paths, BINDING_DOCUMENTS_ROOT)
@@ -1082,6 +1086,7 @@ def materialize_exact(
     *,
     uv: Path,
     expected_receipt_bytes: bytes,
+    store: Path | None = None,
 ) -> environment.InstalledEnvironment:
     """Materialize and require byte identity with th-046's proof-seat receipt."""
 
@@ -1098,6 +1103,7 @@ def materialize_exact(
             root,
             uv=uv,
             expected_receipt_digest=expected_digest,
+            store=store,
         )
     except environment.EnvironmentRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc

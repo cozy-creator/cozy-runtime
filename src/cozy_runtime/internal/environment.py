@@ -38,7 +38,7 @@ from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, wheelstore
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -52,6 +52,7 @@ MAX_METADATA_BYTES = 4 << 20
 PINNED_UV_VERSION = "uv 0.9.18"
 PINNED_UV_LENGTH = 55_339_456
 PINNED_UV_DIGEST = "sha256:7f73d66b9767a281c2cae604b7cd0b6eaa1f0dda5ae28b9067e6de745d9593eb"
+_LAYOUT_FORMAT = "cozy.runtime.WheelStoreLayout/1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
 _GLIBC = re.compile(r"^glibc([0-9]+)\.([0-9]+)$")
@@ -154,8 +155,16 @@ def materialize(
     python: Path = Path(sys.executable),
     base_env: Mapping[str, str] | None = None,
     expected_receipt_digest: str = "",
+    store: Path | None = None,
 ) -> InstalledEnvironment:
-    """Install and atomically publish one exact generation, or refuse without selecting it."""
+    """Install and atomically publish one exact generation, or refuse without selecting it.
+
+    ``store`` names a first-party digest-keyed wheel store on the same filesystem.  Wheels it
+    already holds are hardlinked in instead of unpacked; wheels it does not are unpacked by
+    the same sealed ``uv pip install`` as before and then harvested into it.  The store never
+    resolves, downloads, or adds a distribution: the exact inventory still decides everything,
+    and every linked byte is still re-hashed against its ``RECORD``.
+    """
 
     spec, target = _verify_input(source)
     env = _sealed_env(base_env or {})
@@ -176,11 +185,11 @@ def materialize(
             reused=True,
         )
 
+    shard = _open_store(store, root, python) if store is not None else None
     staging = root / f".staging-{uuid.uuid4().hex}"
     try:
         staging.mkdir(parents=False, mode=0o700)
         venv = staging / "venv"
-        install_wheels = _stage_wheels(inspected, staging / "wheelhouse")
         _run(
             [
                 str(uv),
@@ -199,32 +208,45 @@ def materialize(
         )
         _strip_uv_venv_files(venv)
         venv_python = _venv_python(venv)
-        _run(
-            [
-                str(uv),
-                "pip",
-                "install",
-                "--python",
-                str(venv_python),
-                "--no-python-downloads",
-                "--no-deps",
-                "--no-build",
-                "--no-index",
-                "--no-config",
-                "--no-cache",
-                "--offline",
-                *(str(w.path) for w in install_wheels),
-            ],
-            env,
-            "wheel_install_failed",
+        linked = (
+            frozenset(w.entry.digest for w in inspected if shard.holds(w.entry.digest))
+            if shard is not None
+            else frozenset()
         )
-        relocated_scripts = _relocate_console_scripts(venv)
-        _strip_installer_paths(venv, relocated_scripts)
+        held = tuple(w for w in inspected if w.entry.digest in linked)
+        unpack = tuple(w for w in inspected if w.entry.digest not in linked)
+        if unpack:
+            staged = _stage_wheels(unpack, staging / "wheelhouse")
+            _run(
+                [
+                    str(uv),
+                    "pip",
+                    "install",
+                    "--python",
+                    str(venv_python),
+                    "--no-python-downloads",
+                    "--no-deps",
+                    "--no-build",
+                    "--no-index",
+                    "--no-config",
+                    "--no-cache",
+                    "--offline",
+                    *(str(w.path) for w in staged),
+                ],
+                env,
+                "wheel_install_failed",
+            )
+            relocated_scripts = _relocate_console_scripts(venv)
+            _strip_installer_paths(venv, relocated_scripts)
+            if shard is not None:
+                _publish_store(shard, venv, unpack)
+        if shard is not None:
+            _link_store(shard, venv, held)
         records = _verify_installed(
-            venv, {wheel.distribution: (wheel.version, "") for wheel in install_wheels}
+            venv, {wheel.distribution: (wheel.version, "") for wheel in inspected}
         )
         _verify_installed_target(venv_python, target, env)
-        receipt_bytes = canonical.write(_receipt(source, spec, target, install_wheels, records))
+        receipt_bytes = canonical.write(_receipt(source, spec, target, inspected, records))
         receipt_digest = _sha(receipt_bytes)
         if expected_receipt_digest and receipt_digest != expected_receipt_digest:
             raise EnvironmentRefusal(
@@ -232,7 +254,8 @@ def materialize(
                 f"measured {receipt_digest}, expected {expected_receipt_digest}",
             )
         final = generations / receipt_digest.removeprefix("sha256:")
-        _remove_tree(staging / "wheelhouse")
+        if (staging / "wheelhouse").exists():
+            _remove_tree(staging / "wheelhouse")
         receipt_path = staging / RECEIPT_NAME
         _write_durable(receipt_path, receipt_bytes)
         _make_immutable(staging)
@@ -496,10 +519,7 @@ def _verify_installed(venv: Path, expected: Mapping[str, tuple[str, str]]) -> di
         raise EnvironmentRefusal("venv_invalid", str(exc)) from exc
     if "include-system-site-packages = false" not in cfg_text.lower():
         raise EnvironmentRefusal("system_site_packages_enabled", str(cfg))
-    sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
-    if len(sites) != 1:
-        raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
-    site = sites[0]
+    site = _site_packages(venv)
     if site.is_symlink():
         raise EnvironmentRefusal("installed_unowned_symlink", str(site))
     measured: dict[str, tuple[str, Path]] = {}
@@ -580,10 +600,7 @@ def _relocate_console_scripts(venv: Path) -> frozenset[Path]:
 def _strip_installer_paths(venv: Path, relocated_scripts: frozenset[Path]) -> None:
     """Delete uv staging metadata and restamp only relocated console-script RECORD rows."""
 
-    sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
-    if len(sites) != 1:
-        raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
-    site = sites[0]
+    site = _site_packages(venv)
     unclaimed = set(relocated_scripts)
     for dist_info in site.glob("*.dist-info"):
         generated = [
@@ -630,11 +647,9 @@ def _strip_installer_paths(venv: Path, relocated_scripts: frozenset[Path]) -> No
 def _strip_uv_venv_files(venv: Path) -> None:
     """Remove uv's unowned bootstrap before wheels can claim either path."""
 
-    sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
-    if len(sites) != 1:
-        raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
+    site = _site_packages(venv)
     for name in ("_virtualenv.pth", "_virtualenv.py"):
-        path = sites[0] / name
+        path = site / name
         if path.exists():
             path.unlink()
 
@@ -808,6 +823,57 @@ def _verify_uv(uv: Path, env: Mapping[str, str]) -> None:
         raise EnvironmentRefusal("uv_identity_mismatch", result.stdout.strip())
 
 
+def _open_store(store: Path, root: Path, python: Path) -> wheelstore.WheelStore:
+    """Bind the store shard for this venv layout, or refuse before anything is unpacked."""
+
+    try:
+        return wheelstore.WheelStore.open(
+            store,
+            root,
+            layout={
+                "format": _LAYOUT_FORMAT,
+                "python": str(python),
+                "uv_digest": PINNED_UV_DIGEST,
+                "uv_version": PINNED_UV_VERSION,
+            },
+        )
+    except wheelstore.WheelStoreRefusal as exc:
+        raise EnvironmentRefusal(exc.code, exc.detail) from exc
+
+
+def _publish_store(
+    shard: wheelstore.WheelStore, venv: Path, wheels: Sequence[_InspectedWheel]
+) -> None:
+    """Harvest what uv just unpacked so the next venv links it instead of unpacking it."""
+
+    site = _site_packages(venv)
+    try:
+        installed = wheelstore.installed_distributions(
+            venv, site, {wheel.distribution: wheel.entry.digest for wheel in wheels}
+        )
+        for distribution in installed:
+            shard.publish(distribution, venv)
+    except wheelstore.WheelStoreRefusal as exc:
+        raise EnvironmentRefusal(exc.code, exc.detail) from exc
+
+
+def _link_store(
+    shard: wheelstore.WheelStore, venv: Path, wheels: Sequence[_InspectedWheel]
+) -> None:
+    try:
+        for wheel in wheels:
+            shard.link_in(wheel.entry.digest, venv)
+    except wheelstore.WheelStoreRefusal as exc:
+        raise EnvironmentRefusal(exc.code, exc.detail) from exc
+
+
+def _site_packages(venv: Path) -> Path:
+    sites = list(venv.glob("lib/python*/site-packages")) + list(venv.glob("Lib/site-packages"))
+    if len(sites) != 1:
+        raise EnvironmentRefusal("site_packages_ambiguous", str(venv))
+    return sites[0]
+
+
 def _stage_wheels(
     wheels: Sequence[_InspectedWheel], wheelhouse: Path
 ) -> tuple[_InspectedWheel, ...]:
@@ -890,12 +956,7 @@ def _make_immutable(root: Path) -> None:
             path.chmod(path.stat().st_mode & ~0o222)
 
 
-def _remove_tree(root: Path) -> None:
-    for path in root.rglob("*"):
-        if not path.is_symlink():
-            path.chmod(path.stat().st_mode | stat.S_IWUSR)
-    root.chmod(root.stat().st_mode | stat.S_IWUSR)
-    shutil.rmtree(root)
+_remove_tree = wheelstore.remove_tree
 
 
 def _fsync_dir(path: Path) -> None:

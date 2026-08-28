@@ -165,9 +165,31 @@ The environment proof likewise builds and installs the exact Runtime wheel befor
 public command from `/` with `PYTHONPATH` unset and offline process settings. Normal fixture
 packages replace generated source strings. The public path proves independent builds, exact
 receipt identity, isolated imports, atomic publication, and bounded refusals. The proof seat
-requires a fresh root by contract, so receipt-keyed reuse and installed-tree tamper refusals live
-in the explicitly private `proofs/internal/environment_materializer.py` check rather than
-masquerading as CLI behavior.
+requires a fresh root by contract, so receipt-keyed reuse, wheel-store sharing, and installed-tree
+tamper refusals live in the explicitly private `proofs/internal/environment_materializer.py`
+check rather than masquerading as CLI behavior.
+
+### Shared wheel store
+
+`internal/wheelstore.py` is a first-party, immutable, digest-keyed store of unpacked wheel trees
+at `/var/lib/cozy/wheel-store`, hardlinked into every venv. Without it each generation unpacked
+the whole Torch family again and shared zero inodes: two generations of one real 57-wheel CUDA
+endpoint cost 15 GB of disk and ~48 s each. With it the second generation costs 39 KB and ~26 s,
+at a byte-identical receipt.
+
+The hermetic seal is unchanged — still `--no-config --no-index --offline --no-deps --no-build
+--no-cache` under `_sealed_env`. uv's own cache stays off: it is mutable, ambient, undigested
+state, and under endpoint stacking it would be a cross-tenant poisoning surface. The store is an
+input, not a resolver. It never downloads, never resolves, and never adds a distribution the
+exact inventory did not name, and it cannot poison a generation: every linked byte is re-hashed
+against its distribution's `RECORD` and every `record_digest` is re-measured into the receipt.
+
+Wheels the store already holds are hardlinked in; wheels it does not are unpacked by the same
+sealed `uv pip install` and then harvested into it, so the store fills itself and a substrate
+image can pre-populate it by materializing once. Entries are built in a private staging
+directory and renamed into place, so concurrent placements see an entry complete or absent.
+A store that cannot hardlink into the environments root fails closed with
+`wheel_store_cross_device` before anything is unpacked.
 
 The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed

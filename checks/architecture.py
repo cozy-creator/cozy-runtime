@@ -880,6 +880,8 @@ DOCUMENT_KINDS = {
     "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
     "cozy.runtime.ResolvedExecutionPlan/1": "internal/resolution.py",
     "cozy.runtime.TriageWriteReceipt/1": "internal/worker/triage.py",
+    "cozy.runtime.WheelStoreEntry/1": "internal/wheelstore.py",
+    "cozy.runtime.WheelStoreLayout/1": "internal/environment.py",
     "cozy.runtime.WitnessBoot/1": "internal/witness.py",
     "cozy.runtime.WitnessDeath/1": "internal/witness.py",
     "cozy.runtime.WorkerTriageBundle/1": "internal/worker/triage.py",
