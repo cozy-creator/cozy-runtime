@@ -5,10 +5,10 @@ Go-authored `vectors/base-worker-image-wheelhouse.json` after its stored-byte ha
 canonical no-newline payload the image embeds, not the repository-text spelling reparsed or
 reserialized by Runtime.
 
-- Producing Tensorhub commit: `3d40b38a19d8e3ede6c44c11b6208ba686afd390`
+- Producing Tensorhub commit: `36f5eb95961802fd5c90090e23cbf44938341da5`
 
 - Length: 23,687 bytes
-- SHA-256: `4cbfafc9afcfe3bbc148070bf394a1d585ded4d5f9a6a33795c6e6a924ce1d0a`
+- SHA-256: `d27017b3b0173a373ce70df3dabaea285f4b85646a730daec3b3c0765b7430c8`
 - Census: 82 normalized distributions, 359 import roots, 5 control wheels
 
 `checks/architecture.py --only base-ownership-vectors` runs Runtime's real strict parser over
