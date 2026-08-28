@@ -266,6 +266,13 @@ class ExecutorSupervision:
         worker has no business publishing one. See `invalidate`."""
         self.on_change: Callable[[Executor | None], None] | None = None
         """Session-owned projection updated at the same publication/clear boundary."""
+        self.on_exit: Callable[[Executor], None] | None = None
+        """Session-owned reaction to an exact current child becoming waitable.
+
+        The watcher never reaps.  It reports the exact :class:`Executor` handle so the
+        session can invalidate only that incarnation and serialize any rebuild with device
+        work; a stale watcher has no authority over a successor.
+        """
         self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]] | None] = queue.Queue()
         self._launcher: threading.Thread | None = None
         self._launcher_lock = threading.Lock()
@@ -589,6 +596,7 @@ class ExecutorSupervision:
         process: proctree.ProcessIdentity | None = None
         owner: OwnerRecord | None = None
         conn: socket.socket | None = None
+        exit_published: threading.Event | None = None
         try:
             try:
                 owner = OwnerRecord(proctree.create_executor_scope(self._scope_namespace))
@@ -662,11 +670,17 @@ class ExecutorSupervision:
                     f"parent {executor.hello.get('ppid')}"
                 )
             executor.ready_at = time.perf_counter()
+            exit_published = self._start_exit_watcher(executor)
             self.current = executor
             if self.on_change is not None:
                 self.on_change(executor)
+            exit_published.set()
             return executor
         except BaseException as exc:
+            if exit_published is not None:
+                # Release a watcher installed before publication.  `current` either still
+                # names this exact child or never did; the session callback rechecks it.
+                exit_published.set()
             if conn is not None:
                 with contextlib.suppress(OSError):
                     conn.close()
@@ -688,6 +702,38 @@ class ExecutorSupervision:
                 except (ExecutorGone, proctree.ContainmentUnavailable) as cleanup:
                     raise ExecutorGone(f"{exc}; {cleanup}") from exc
             raise
+
+    def _start_exit_watcher(self, executor: Executor) -> threading.Event:
+        """Install one exact-child observer before ``current`` is published.
+
+        Opening the pidfd is synchronous, so a worker never advertises an executor it cannot
+        observe.  The thread waits for publication before notifying the session, closing the
+        only race where a very short-lived child could exit between hello and ``current``.
+        """
+
+        observer = proctree.observe_process_exit(executor.process)
+        published = threading.Event()
+
+        def wait_for_exit() -> None:
+            try:
+                observer.wait()
+            finally:
+                observer.close()
+            published.wait()
+            callback = self.on_exit
+            if callback is not None:
+                callback(executor)
+
+        try:
+            threading.Thread(
+                target=wait_for_exit,
+                daemon=True,
+                name=f"executor-exit-{executor.incarnation}",
+            ).start()
+        except BaseException:
+            observer.close()
+            raise
+        return published
 
     def _abort_spawn(
         self, pid: int, process: proctree.ProcessIdentity | None, owner: OwnerRecord
