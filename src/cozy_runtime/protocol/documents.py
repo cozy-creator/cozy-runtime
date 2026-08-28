@@ -65,6 +65,7 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 #: set to desired-state identity. AttemptOutcomeBody/3 carries committed artifact receipts.
 DOC_VERSION = {
     "cozy.worker.v1.AttemptOutcomeBody": 3,
+    "cozy.worker.v1.EndpointEnvironmentSpec": 2,
     "cozy.worker.v1.PlacementSet": 2,
     "cozy.worker.v1.PlacementSpec": 2,
     "cozy.worker.v1.WorkerSnapshotBody": 2,

@@ -115,12 +115,21 @@ def author(
         raise AssertionError(f"boot proof base carries {len(house)} control wheels, want 5")
 
     base_distributions, base_import_roots = installed_base_ownership()
+    profile = {
+        "accelerator_build": target["accelerator_abi"],
+        "os_cpu": "linux-x86",
+        "python_abi": target["python_abi"],
+        "torch_release": "2.13.0",
+    }
     wheelhouse = release.add(
         canonical(
             {
                 "base_distributions": base_distributions,
                 "base_import_roots": base_import_roots,
-                "format": "WheelhouseManifest/2",
+                "compatibility_profile": profile,
+                "format": "WheelhouseManifest/3",
+                "minimum_cuda_version": "12.6",
+                "minimum_driver_version": "560.28.03",
                 "platform_target": dict(target),
                 "wheels": [wheel(entry, import_roots=True) for entry in house],
             }
@@ -130,7 +139,8 @@ def author(
     resolved = release.add(
         canonical(
             {
-                "format": "ResolvedWheelSet/2",
+                "compatibility_profile": profile,
+                "format": "ResolvedWheelSet/3",
                 "lock_digest": digest(b"cr-049-boot-proof-lock"),
                 "platform_target": dict(target),
                 "wheelhouse_manifest_digest": digest(wheelhouse),
@@ -172,6 +182,7 @@ def author(
     spec = release.add(
         documents.canonical_bytes(
             pb.EndpointEnvironmentSpec(
+                compatibility_profile=pb.CompatibilityProfile(**profile),
                 platform_target=pb.PlatformTarget(**target),
                 endpoint_bundle_digest=documents.digest_of(bundle),
                 project_wheel_digest=documents.raw(project.digest),

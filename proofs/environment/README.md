@@ -10,7 +10,7 @@ materializer proof covers content-keyed reuse, wheel-pool sharing and post-publi
 refusals.
 
 The driver measures its complete installed distribution/import-root inventory into
-`WheelhouseManifest/2`. A real fake NumPy is base-installed. One arriving `numpy` wheel refuses
+`WheelhouseManifest/3`. A real fake NumPy is base-installed. One arriving `numpy` wheel refuses
 with the image-owned version, and a differently named wheel exporting `numpy` refuses with the
 base provider before any overlay root or receipt exists. A lying `import_roots` fact also refuses
 against measured ZIP members. The ordinary resolved fixture exports a genuinely new root and

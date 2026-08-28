@@ -14,7 +14,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 8) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 9) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -196,12 +196,12 @@ therefore installs only its deterministic project wheel and optional exact custo
 never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
 archives after extraction.
 
-The image's OCI digest owns image-resident integrity. `WheelhouseManifest/2` is the complete
+The image's OCI digest owns image-resident integrity. `WheelhouseManifest/3` is the complete
 canonical ownership document for that image: its existing platform target and exact control-wheel
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
-sorted unique import roots: the five control rows in `WheelhouseManifest/2`, the project row in
-`EndpointBundle/2`, and each custom row in `ResolvedWheelSet/2`. Runtime strictly parses those exact bytes, rejects
+sorted unique import roots: the five control rows in `WheelhouseManifest/3`, the project row in
+`EndpointBundle/2`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.

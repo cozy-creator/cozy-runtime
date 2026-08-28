@@ -282,6 +282,7 @@ source = { editable = "." }
 dependencies = [
     { name = "grpcio" },
     { name = "msgspec" },
+    { name = "packaging" },
     { name = "protobuf" },
 ]
 
@@ -312,6 +313,7 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
     { name = "msgspec", specifier = ">=0.19" },
+    { name = "packaging", specifier = ">=24" },
     { name = "protobuf", specifier = ">=6.31" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.6" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.6" },

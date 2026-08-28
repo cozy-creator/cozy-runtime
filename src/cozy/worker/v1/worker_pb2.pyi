@@ -546,16 +546,30 @@ class ArtifactSubject(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., subject_id: _Optional[str] = ..., kind: _Optional[str] = ..., length: _Optional[int] = ...) -> None: ...
 
 class EndpointEnvironmentSpec(_message.Message):
-    __slots__ = ("platform_target", "endpoint_bundle_digest", "project_wheel_digest", "wheelhouse_manifest_digest")
+    __slots__ = ("platform_target", "endpoint_bundle_digest", "project_wheel_digest", "wheelhouse_manifest_digest", "compatibility_profile")
     PLATFORM_TARGET_FIELD_NUMBER: _ClassVar[int]
     ENDPOINT_BUNDLE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROJECT_WHEEL_DIGEST_FIELD_NUMBER: _ClassVar[int]
     WHEELHOUSE_MANIFEST_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    COMPATIBILITY_PROFILE_FIELD_NUMBER: _ClassVar[int]
     platform_target: PlatformTarget
     endpoint_bundle_digest: bytes
     project_wheel_digest: bytes
     wheelhouse_manifest_digest: bytes
-    def __init__(self, platform_target: _Optional[_Union[PlatformTarget, _Mapping]] = ..., endpoint_bundle_digest: _Optional[bytes] = ..., project_wheel_digest: _Optional[bytes] = ..., wheelhouse_manifest_digest: _Optional[bytes] = ...) -> None: ...
+    compatibility_profile: CompatibilityProfile
+    def __init__(self, platform_target: _Optional[_Union[PlatformTarget, _Mapping]] = ..., endpoint_bundle_digest: _Optional[bytes] = ..., project_wheel_digest: _Optional[bytes] = ..., wheelhouse_manifest_digest: _Optional[bytes] = ..., compatibility_profile: _Optional[_Union[CompatibilityProfile, _Mapping]] = ...) -> None: ...
+
+class CompatibilityProfile(_message.Message):
+    __slots__ = ("torch_release", "accelerator_build", "python_abi", "os_cpu")
+    TORCH_RELEASE_FIELD_NUMBER: _ClassVar[int]
+    ACCELERATOR_BUILD_FIELD_NUMBER: _ClassVar[int]
+    PYTHON_ABI_FIELD_NUMBER: _ClassVar[int]
+    OS_CPU_FIELD_NUMBER: _ClassVar[int]
+    torch_release: str
+    accelerator_build: str
+    python_abi: str
+    os_cpu: str
+    def __init__(self, torch_release: _Optional[str] = ..., accelerator_build: _Optional[str] = ..., python_abi: _Optional[str] = ..., os_cpu: _Optional[str] = ...) -> None: ...
 
 class PlatformTarget(_message.Message):
     __slots__ = ("os_arch", "libc", "python_abi", "accelerator_backend", "accelerator_abi")

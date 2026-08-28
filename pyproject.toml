@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 # package path its own import lines name — never depended on as a repo. Byte-identity is
 # what `worker-protocol/scripts/vendored-diff.sh` checks (#536d), and it is why the copy no
 # longer carries the old import rewrite.
-dependencies = ["msgspec>=0.19", "protobuf>=6.31", "grpcio>=1.76"]
+dependencies = ["msgspec>=0.19", "protobuf>=6.31", "grpcio>=1.76", "packaging>=24"]
 
 [dependency-groups]
 # Pinned dev tooling: CI and scripts/redarm.py both need these on the venv, not behind

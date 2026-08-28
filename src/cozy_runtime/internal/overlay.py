@@ -30,7 +30,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
+
+from packaging.markers import default_environment
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.tags import Tag, parse_tag
+from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical
 
@@ -41,7 +47,7 @@ WHEEL_EXTRACTION_FORMAT = "cozy.runtime.EndpointWheelExtraction/1"
 WHEEL_EXTRACTION_IDENTITY_NAME = "endpoint-wheel-extraction.json"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
-WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/2"
+WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/3"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
@@ -58,6 +64,9 @@ _WHEEL_TAG = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0
 _SAFE_MEMBER = re.compile(r"^[^/][^\x00]*$")
 _PLATFORM_TARGET_FIELDS = frozenset(
     {"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"}
+)
+_COMPATIBILITY_PROFILE_FIELDS = frozenset(
+    {"accelerator_build", "os_cpu", "python_abi", "torch_release"}
 )
 
 
@@ -88,6 +97,9 @@ class BaseManifest:
     """The complete immutable Python ownership of one base worker image."""
 
     platform_target: tuple[tuple[str, str], ...]
+    compatibility_profile: tuple[tuple[str, str], ...]
+    minimum_cuda_version: str
+    minimum_driver_version: str
     wheels: tuple[Wheel, ...]
     base_distributions: tuple[tuple[str, str], ...]
     base_import_roots: tuple[tuple[str, tuple[str, ...]], ...]
@@ -180,6 +192,8 @@ class _Inspected:
     path: Path
     members: tuple[zipfile.ZipInfo, ...]
     import_roots: frozenset[str]
+    requires_python: str | None
+    requirements: tuple[Requirement, ...]
 
 
 def materialize(
@@ -398,7 +412,10 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     fields = {
         "base_distributions",
         "base_import_roots",
+        "compatibility_profile",
         "format",
+        "minimum_cuda_version",
+        "minimum_driver_version",
         "platform_target",
         "wheels",
     }
@@ -413,11 +430,35 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         or not all(isinstance(item, str) and item for item in platform.values())
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
+    profile = value["compatibility_profile"]
+    if (
+        not isinstance(profile, dict)
+        or set(profile) != _COMPATIBILITY_PROFILE_FIELDS
+        or not all(isinstance(item, str) and item for item in profile.values())
+        or profile["accelerator_build"] != platform["accelerator_abi"]
+        or profile["python_abi"] != platform["python_abi"]
+        or profile["os_cpu"] != "linux-x86"
+        or platform["os_arch"] != "linux/amd64"
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", profile["torch_release"]) is None
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
+    minimum_cuda = value["minimum_cuda_version"]
+    minimum_driver = value["minimum_driver_version"]
+    if (
+        not isinstance(minimum_cuda, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is None
+        or not isinstance(minimum_driver, str)
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is None
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid CUDA or driver floor")
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
     wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
     return BaseManifest(
         platform_target=tuple(sorted(platform.items())),
+        compatibility_profile=tuple(sorted(profile.items())),
+        minimum_cuda_version=minimum_cuda,
+        minimum_driver_version=minimum_driver,
         wheels=wheels,
         base_distributions=distributions,
         base_import_roots=roots,
@@ -589,6 +630,7 @@ def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
             valid_import_root(root) for root in wheel.import_roots
         ):
             raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
+        _require_compatible_tags(wheel, base)
         for root in wheel.import_roots:
             providers = base.root_providers.get(root)
             if providers is not None:
@@ -650,6 +692,7 @@ def _verify_grants(
                     f"root={root} distributions={prior},{item.wheel.distribution}",
                 )
             root_owners[root] = item.wheel.distribution
+    _verify_python_requirements(inspected, base)
     return tuple(inspected)
 
 
@@ -734,7 +777,23 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                 providers = base.root_providers.get(root)
                 if providers is not None:
                     raise _base_import_collision(wheel, root, providers)
-            return _Inspected(wheel, path, members, roots)
+            requires_python = parsed.get("Requires-Python")
+            requirements: list[Requirement] = []
+            try:
+                for value in parsed.get_all("Requires-Dist", []):
+                    requirements.append(Requirement(value))
+            except InvalidRequirement as exc:
+                raise OverlayRefusal(
+                    "overlay_requirement_invalid", f"{wheel.distribution}: {exc}"
+                ) from exc
+            return _Inspected(
+                wheel,
+                path,
+                members,
+                roots,
+                requires_python,
+                tuple(requirements),
+            )
     except OverlayRefusal:
         raise
     except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
@@ -789,6 +848,136 @@ def _base_import_collision(wheel: Wheel, root: str, providers: tuple[str, ...]) 
         f"root={root} overlay_distribution={wheel.distribution} "
         f"image_providers={','.join(providers)}",
     )
+
+
+def _target_python(base: BaseManifest) -> tuple[int, int]:
+    target = dict(base.platform_target)
+    match = re.fullmatch(r"cp([0-9])([0-9]{2})", target.get("python_abi", ""))
+    if match is None:
+        raise OverlayRefusal(
+            "base_family_manifest_invalid", "python_abi is not the cpNNN profile spelling"
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def _target_platforms(base: BaseManifest) -> frozenset[str]:
+    target = dict(base.platform_target)
+    os_arch = target.get("os_arch")
+    libc = target.get("libc")
+    if os_arch != "linux/amd64":
+        raise OverlayRefusal(
+            "overlay_platform_unsupported", f"semantic wheel admission has no seat for {os_arch}"
+        )
+    match = re.fullmatch(r"glibc([0-9]+)\.([0-9]+)", libc or "")
+    if match is None or int(match.group(1)) != 2:
+        raise OverlayRefusal(
+            "base_family_manifest_invalid", f"linux/x86 base has unsupported libc {libc!r}"
+        )
+    minor = int(match.group(2))
+    platforms = {"any", "linux_x86_64"}
+    platforms.update(f"manylinux_2_{floor}_x86_64" for floor in range(5, minor + 1))
+    if minor >= 17:
+        platforms.add("manylinux2014_x86_64")
+    if minor >= 12:
+        platforms.add("manylinux2010_x86_64")
+    if minor >= 5:
+        platforms.add("manylinux1_x86_64")
+    return frozenset(platforms)
+
+
+def _compatible_tags(base: BaseManifest) -> frozenset[Tag]:
+    major, minor = _target_python(base)
+    interpreter = f"cp{major}{minor}"
+    platforms = _target_platforms(base)
+    tags: set[Tag] = set()
+    for platform in platforms:
+        tags.add(Tag(interpreter, interpreter, platform))
+        tags.add(Tag(interpreter, "none", platform))
+        for stable_minor in range(2, minor + 1):
+            tags.add(Tag(f"cp{major}{stable_minor}", "abi3", platform))
+        tags.add(Tag(f"py{major}{minor}", "none", platform))
+        tags.add(Tag(f"py{major}", "none", platform))
+    return frozenset(tags)
+
+
+def _require_compatible_tags(wheel: Wheel, base: BaseManifest) -> None:
+    declared: set[Tag] = set()
+    try:
+        for value in wheel.tags:
+            declared.update(parse_tag(value))
+    except ValueError as exc:
+        raise OverlayRefusal("overlay_wheel_tag_invalid", wheel.filename) from exc
+    if declared.isdisjoint(_compatible_tags(base)):
+        raise OverlayRefusal(
+            "overlay_wheel_platform_incompatible",
+            f"distribution={wheel.distribution} tags={','.join(wheel.tags)} "
+            f"target={dict(base.platform_target)}",
+        )
+
+
+def _marker_environment(base: BaseManifest) -> dict[str, str]:
+    major, minor = _target_python(base)
+    environment = cast(dict[str, str], default_environment())
+    environment.update(
+        {
+            "implementation_name": "cpython",
+            "implementation_version": f"{major}.{minor}.0",
+            "os_name": "posix",
+            "platform_machine": "x86_64",
+            "platform_python_implementation": "CPython",
+            "python_full_version": f"{major}.{minor}.0",
+            "python_version": f"{major}.{minor}",
+            "sys_platform": "linux",
+        }
+    )
+    return environment
+
+
+def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManifest) -> None:
+    environment = _marker_environment(base)
+    python = Version(environment["python_full_version"])
+    versions = base.distribution_versions
+    versions.update({item.wheel.distribution: item.wheel.version for item in inspected})
+    for item in inspected:
+        if item.requires_python:
+            try:
+                supported = SpecifierSet(item.requires_python).contains(python, prereleases=True)
+            except InvalidSpecifier as exc:
+                raise OverlayRefusal(
+                    "overlay_requires_python_invalid",
+                    f"{item.wheel.distribution}: {item.requires_python}",
+                ) from exc
+            if not supported:
+                raise OverlayRefusal(
+                    "overlay_python_incompatible",
+                    f"distribution={item.wheel.distribution} "
+                    f"requires_python={item.requires_python} "
+                    f"target={python}",
+                )
+        for requirement in item.requirements:
+            if requirement.marker is not None and not requirement.marker.evaluate(environment):
+                continue
+            name = _name(requirement.name)
+            installed = versions.get(name)
+            if installed is None:
+                raise OverlayRefusal(
+                    "overlay_dependency_missing",
+                    f"distribution={item.wheel.distribution} requirement={requirement}",
+                )
+            try:
+                accepted = not requirement.specifier or requirement.specifier.contains(
+                    Version(installed), prereleases=True
+                )
+            except InvalidVersion as exc:
+                raise OverlayRefusal(
+                    "base_family_manifest_invalid", f"{name} has invalid version {installed!r}"
+                ) from exc
+            if not accepted:
+                raise OverlayRefusal(
+                    "overlay_dependency_base_conflict",
+                    f"distribution={item.wheel.distribution} requirement={requirement} "
+                    f"base_or_overlay_version={installed}",
+                )
 
 
 def _extract(wheels: Sequence[_Inspected], site: Path) -> None:
