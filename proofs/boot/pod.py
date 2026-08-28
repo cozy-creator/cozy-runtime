@@ -213,6 +213,7 @@ class RecordOwner:
         self.admission_generation = 0
         self.claim_ack: pb.ClaimAck | None = None
         self.snapshot: dict[str, Any] = {}
+        self.states: list[pb.ObservedWorkerState] = []
 
         def frames() -> Any:
             while (frame := self.outbound.get()) is not None:
@@ -286,6 +287,9 @@ class RecordOwner:
             )
         elif kind == "observed_state":
             self.admission_generation = frame.observed_state.admission_generation
+            retained = pb.ObservedWorkerState()
+            retained.CopyFrom(frame.observed_state)
+            self.states.append(retained)
         return frame
 
     def await_state(self, predicate: Any, why: str, *, seconds: float) -> pb.ObservedWorkerState:
@@ -609,6 +613,38 @@ def main() -> int:
             assert staged.placements[0].dispatchable_plan_ids, describe(staged)
             assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
             assert hub.overlap_proven(), "endpoint wheel and model object-set fetches serialized"
+            cold_acquisition = staged.placements[0].acquisition
+            assert cold_acquisition.endpoint.started_monotonic_ns > 0
+            assert cold_acquisition.model.started_monotonic_ns > 0
+            assert cold_acquisition.endpoint.ended_monotonic_ns >= (
+                cold_acquisition.endpoint.started_monotonic_ns
+            )
+            assert cold_acquisition.model.ended_monotonic_ns >= (
+                cold_acquisition.model.started_monotonic_ns
+            )
+            assert max(
+                cold_acquisition.endpoint.started_monotonic_ns,
+                cold_acquisition.model.started_monotonic_ns,
+            ) <= min(
+                cold_acquisition.endpoint.ended_monotonic_ns,
+                cold_acquisition.model.ended_monotonic_ns,
+            ), "terminal acquisition intervals do not overlap"
+            assert cold_acquisition.endpoint.downloaded_bytes > 0
+            assert cold_acquisition.endpoint.reused_bytes == 0
+            assert any(
+                state.placements
+                and (
+                    (
+                        state.placements[0].acquisition.endpoint.started_monotonic_ns > 0
+                        and state.placements[0].acquisition.endpoint.ended_monotonic_ns == 0
+                    )
+                    or (
+                        state.placements[0].acquisition.model.started_monotonic_ns > 0
+                        and state.placements[0].acquisition.model.ended_monotonic_ns == 0
+                    )
+                )
+                for state in owner.states
+            ), "no partial acquisition observation was emitted"
             note(f"CONVERGED: {describe(staged)}")
             note("endpoint-source and model-object-set GETs overlapped at the origin barrier")
 
@@ -646,16 +682,58 @@ def main() -> int:
             assert served["result"] == {"text": "cr-049cr-049"}, served
             note(f"SERVED one attempt: {served['result']} from the materialized environment")
 
+            # Leave observed state, then request the exact same placement again. Every
+            # endpoint byte is already verified in the artifact cache and the empty model
+            # set reaches zero model bytes: both legs must download zero on the warm pass.
+            empty_set, _ = documents.identity(pb.PlacementSet())
+            owner.send(
+                pb.RecordOwnerFrame(desired_state=owner.envelope(desired_state(empty_set, 2)))
+            )
+            owner.await_state(
+                lambda state: state.accepted_desired_state_revision == 2 and not state.placements,
+                "the explicit empty placement set",
+                seconds=60,
+            )
+            owner.send(
+                pb.RecordOwnerFrame(
+                    desired_state=owner.envelope(desired_state(release.placement_set, 3))
+                )
+            )
+            warm = owner.await_state(
+                lambda state: (
+                    state.accepted_desired_state_revision == 3
+                    and state.converged_revision == 3
+                    and placement_is(
+                        state,
+                        pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
+                        pb.ServingState.SERVING_STATE_DISPATCHABLE,
+                    )
+                ),
+                "warm zero-download placement convergence",
+                seconds=300,
+            )
+            warm_acquisition = warm.placements[0].acquisition
+            assert warm_acquisition.endpoint.downloaded_bytes == 0
+            assert warm_acquisition.endpoint.reused_bytes == (
+                cold_acquisition.endpoint.downloaded_bytes
+            )
+            assert warm_acquisition.model.downloaded_bytes == 0
+            assert warm_acquisition.model.reused_bytes == 0
+            note(
+                "WARM acquisition downloaded 0 B and reused "
+                f"{warm_acquisition.endpoint.reused_bytes} endpoint B"
+            )
+
             # ---- the red arm: an incoming spec the grant does not authorize --------------
             broken = release.placement_set.replace(
                 expected.encode(),
                 (b"sha256:" + b"ee" * 32),
             )
             assert broken != release.placement_set
-            owner.send(pb.RecordOwnerFrame(desired_state=owner.envelope(desired_state(broken, 2))))
+            owner.send(pb.RecordOwnerFrame(desired_state=owner.envelope(desired_state(broken, 4))))
             refused = owner.await_state(
                 lambda state: (
-                    state.accepted_desired_state_revision == 2
+                    state.accepted_desired_state_revision == 4
                     and any(f.reason == "overlay_receipt_mismatch" for f in state.faults)
                 ),
                 "a typed refusal of the unauthorized revision",
@@ -663,7 +741,7 @@ def main() -> int:
             )
             # FALLBACK-RETENTION: the converged placement never stopped serving, and the
             # convergence fact stayed behind the accepted one rather than lying.
-            assert refused.converged_revision == 1, describe(refused)
+            assert refused.converged_revision == 3, describe(refused)
             # The status reports what the placement ACTUALLY HOLDS: the outgoing spec, on
             # disk and serving. The incoming failure is the typed fault beside it.
             assert placement_is(
@@ -675,7 +753,7 @@ def main() -> int:
                 refused.placements[0].placement_spec_digest
                 == staged.placements[0].placement_spec_digest
             ), describe(refused)
-            note(f"mismatched revision 2 REFUSED, outgoing keeps serving: {describe(refused)}")
+            note(f"mismatched revision 4 REFUSED, outgoing keeps serving: {describe(refused)}")
         finally:
             owner.close()
     finally:
@@ -687,8 +765,9 @@ def main() -> int:
             adapter.wait(timeout=20)
     print(
         "boot proof: PASS — ready and empty with no provision document, then a first "
-        "DesiredPlacementSet fetched, overlaid, served, and a following mismatched "
-        "revision refused with the converged placement still serving",
+        "DesiredPlacementSet fetched with observed overlapping legs, overlaid, served, "
+        "warm-reused at zero download, and a following mismatched revision refused with "
+        "the converged placement still serving",
         flush=True,
     )
     return 0

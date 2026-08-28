@@ -32,14 +32,15 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
-from typing import Any, TypeAlias
+from threading import Lock, local
+from typing import Any, Literal, TypeAlias
 
 from cozy_runtime.internal import canonical, materialize_launch, overlay, provisioned, pull
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 FaultKind: TypeAlias = pb.FaultKind
+LegName: TypeAlias = Literal["endpoint", "model"]
 
 #: Documents in the walk are small and bounded; a wheel is capped by `fetch_exact` itself.
 MAX_DOCUMENT_BYTES = 64 << 20
@@ -53,6 +54,92 @@ class AcquisitionRefusal(Exception):
         self.kind: FaultKind = kind
         self.code = code
         self.detail = detail
+
+
+@dataclass(slots=True)
+class _Leg:
+    started: int = 0
+    ended: int = 0
+    downloaded: int = 0
+    reused: int = 0
+
+
+class AcquisitionObservation:
+    """Observation-only acquisition clocks and byte counters.
+
+    No method returns a verdict and callback failures are swallowed deliberately: telemetry
+    cannot gate fetch, materialization, acceptance, or convergence.
+    """
+
+    def __init__(self, callback: Any = None) -> None:
+        self._lock = Lock()
+        self._legs = {"endpoint": _Leg(), "model": _Leg()}
+        self._callback = callback
+
+    def start(self, leg: LegName) -> None:
+        with self._lock:
+            row = self._legs[leg]
+            row.started = max(1, time.monotonic_ns())
+            row.ended = 0
+            row.downloaded = 0
+            row.reused = 0
+            snapshot = self._snapshot_locked()
+        self._publish(snapshot)
+
+    def add(self, leg: LegName, *, downloaded: int = 0, reused: int = 0) -> None:
+        with self._lock:
+            row = self._legs[leg]
+            if row.started == 0:
+                return
+            row.downloaded += max(0, downloaded)
+            row.reused += max(0, reused)
+            snapshot = self._snapshot_locked()
+        self._publish(snapshot)
+
+    def finish(self, leg: LegName) -> None:
+        with self._lock:
+            row = self._legs[leg]
+            if row.started == 0:
+                return
+            row.ended = max(row.started, time.monotonic_ns())
+            snapshot = self._snapshot_locked()
+        self._publish(snapshot)
+
+    def snapshot(self) -> pb.PlacementAcquisitionObservation:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> pb.PlacementAcquisitionObservation:
+        value = pb.PlacementAcquisitionObservation()
+        for name, row in self._legs.items():
+            if row.started == 0:
+                continue
+            target = getattr(value, name)
+            target.started_monotonic_ns = row.started
+            target.ended_monotonic_ns = row.ended
+            target.downloaded_bytes = row.downloaded
+            target.reused_bytes = row.reused
+        return value
+
+    def _publish(self, snapshot: pb.PlacementAcquisitionObservation) -> None:
+        if self._callback is None:
+            return
+        try:
+            self._callback(snapshot)
+        except Exception:
+            return
+
+
+def observe_model_sources(
+    observation: AcquisitionObservation, outcome: materialize_launch.MaterializedObjects
+) -> None:
+    """Project TensorFS source evidence into the model leg's counters."""
+
+    observation.add(
+        "model",
+        downloaded=outcome.sources["cloud"]["bytes"],
+        reused=(outcome.sources["local"]["bytes"] + outcome.sources["network_cache"]["bytes"]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +229,7 @@ class Acquirer:
         object_sets_root: Path,
         artifact_store: Path,
         python: Path,
+        on_observation: Any = None,
     ) -> None:
         self.grant = grant
         self.cache_root = cache_root
@@ -155,6 +243,9 @@ class Acquirer:
         self.wheels = 0
         self._fetch_lock = Lock()
         self._new_digests: set[str] = set()
+        self._observed_digests: dict[LegName, set[str]] = {"endpoint": set(), "model": set()}
+        self._thread = local()
+        self.observation = AcquisitionObservation(on_observation)
 
     # ---- the one door bytes enter through -------------------------------------------
 
@@ -175,7 +266,7 @@ class Acquirer:
             )
         return self.grant.expires_at_unix
 
-    def fetch(self, digest: str, length: int) -> Path:
+    def fetch(self, digest: str, length: int, *, observe: bool = True) -> Path:
         """Fetch one AUTHORIZED digest. Authority is checked before a socket is opened."""
 
         authorized = self.grant.subjects.get(digest)
@@ -223,6 +314,16 @@ class Acquirer:
             if not already and digest not in self._new_digests and target == path:
                 self._new_digests.add(digest)
                 self.fetched_bytes += length
+            leg = getattr(self._thread, "leg", None)
+            if observe and leg in self._observed_digests:
+                observed = self._observed_digests[leg]
+                if digest not in observed:
+                    observed.add(digest)
+                    self.observation.add(
+                        leg,
+                        downloaded=0 if already else length,
+                        reused=length if already else 0,
+                    )
         return path
 
     # ---- the walk ---------------------------------------------------------------------
@@ -230,16 +331,15 @@ class Acquirer:
     def acquire(self, placement: Any) -> AcquiredPlacement:
         """Fetch, build, and stage everything one PlacementSpec reaches. Fail closed."""
 
-        # Endpoint code/custom wheels and the model/binding closure are independent legs.
-        # Start them together; model bytes dominate a cold pod, so the small overlay must
-        # never serialize in front of that transfer.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="cozy-acquire") as pool:
-            environment_future = pool.submit(self._environment, placement)
-            bindings_future = pool.submit(self._bindings, placement)
-            models_future = pool.submit(self._models, placement)
-            installed = environment_future.result()
-            plans, staged = bindings_future.result()
-            object_set, model_objects = models_future.result()
+        # The endpoint closure and model-object closure are the two observed legs. They
+        # start together. Binding/model documents are small endpoint control bytes and ride
+        # the endpoint leg; model-object-set document bytes are identity and excluded from
+        # the model byte counter by protocol definition.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
+            endpoint_future = pool.submit(self._run_endpoint, placement)
+            model_future = pool.submit(self._run_model, placement)
+            installed, plans, staged = endpoint_future.result()
+            object_set, model_objects = model_future.result()
         return AcquiredPlacement(
             installed=installed,
             object_set=object_set,
@@ -249,6 +349,26 @@ class Acquirer:
             wheels=self.wheels,
             fetched_bytes=self.fetched_bytes,
         )
+
+    def _run_endpoint(
+        self, placement: Any
+    ) -> tuple[overlay.InstalledOverlay, tuple[str, ...], tuple[str, ...]]:
+        self._thread.leg = "endpoint"
+        self.observation.start("endpoint")
+        try:
+            installed = self._environment(placement)
+            plans, staged = self._bindings(placement)
+            return installed, plans, staged
+        finally:
+            self.observation.finish("endpoint")
+
+    def _run_model(self, placement: Any) -> tuple[Path, int]:
+        self._thread.leg = "model"
+        self.observation.start("model")
+        try:
+            return self._models(placement)
+        finally:
+            self.observation.finish("model")
 
     def _models(self, placement: Any) -> tuple[Path, int]:
         """Fetch the exact object-set document, then hydrate every model root into TensorFS."""
@@ -260,7 +380,7 @@ class Acquirer:
                 "model_object_set_absent",
                 "PlacementSpec/2 names one exact model_object_set subject",
             )
-        raw = self.fetch(digest, length).read_bytes()
+        raw = self.fetch(digest, length, observe=False).read_bytes()
         self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             object_set = provisioned.read_artifact_object_set(raw)
@@ -289,7 +409,7 @@ class Acquirer:
                 )
             locations[object_digest] = location
         try:
-            materialize_launch.materialize_objects(
+            outcome = materialize_launch.materialize_objects(
                 locations,
                 object_set,
                 cache=None,
@@ -303,6 +423,7 @@ class Acquirer:
                 exc.code,
                 exc.detail,
             ) from exc
+        observe_model_sources(self.observation, outcome)
         self._stage(self.object_sets_root, digest, raw)
         return self.object_sets_root / _name(digest), len(object_set.refs)
 
@@ -327,6 +448,10 @@ class Acquirer:
             bundle_ref, self._authorized_length(bundle_ref, "endpoint_bundle")
         ).read_bytes()
         bundle = self._parse(bundle_bytes, "endpoint_bundle")
+        source_archive_ref = self._ref(bundle.get("source_archive"), "source_archive")
+        source_lock_ref = self._ref(bundle.get("source_lock"), "source_lock")
+        self.fetch(*source_archive_ref)
+        self.fetch(*source_lock_ref)
         resolved_ref = self._ref(bundle.get("resolved_wheel_set"), "resolved_wheel_set")
         wheelhouse_bundle_ref = self._ref(bundle.get("wheelhouse_manifest"), "wheelhouse_manifest")
         if wheelhouse_bundle_ref[0] != wheelhouse_ref:

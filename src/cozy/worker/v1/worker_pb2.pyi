@@ -666,7 +666,7 @@ class ObservedWorkerState(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_generation: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., applied_artifact_grant_id: _Optional[str] = ..., applied_grant_revision: _Optional[int] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_generation", "dispatchable_plan_ids", "materializable_plan_ids", "faults", "accelerator", "placement_spec_digest", "materialization", "serving", "retained_fallback_spec_digest")
+    __slots__ = ("placement_id", "executor_generation", "dispatchable_plan_ids", "materializable_plan_ids", "faults", "accelerator", "placement_spec_digest", "materialization", "serving", "retained_fallback_spec_digest", "acquisition")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_GENERATION_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_PLAN_IDS_FIELD_NUMBER: _ClassVar[int]
@@ -677,6 +677,7 @@ class PlacementStatus(_message.Message):
     MATERIALIZATION_FIELD_NUMBER: _ClassVar[int]
     SERVING_FIELD_NUMBER: _ClassVar[int]
     RETAINED_FALLBACK_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ACQUISITION_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     executor_generation: int
     dispatchable_plan_ids: _containers.RepeatedScalarFieldContainer[str]
@@ -687,7 +688,28 @@ class PlacementStatus(_message.Message):
     materialization: MaterializationState
     serving: ServingState
     retained_fallback_spec_digest: bytes
-    def __init__(self, placement_id: _Optional[str] = ..., executor_generation: _Optional[int] = ..., dispatchable_plan_ids: _Optional[_Iterable[str]] = ..., materializable_plan_ids: _Optional[_Iterable[str]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_spec_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_spec_digest: _Optional[bytes] = ...) -> None: ...
+    acquisition: PlacementAcquisitionObservation
+    def __init__(self, placement_id: _Optional[str] = ..., executor_generation: _Optional[int] = ..., dispatchable_plan_ids: _Optional[_Iterable[str]] = ..., materializable_plan_ids: _Optional[_Iterable[str]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_spec_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_spec_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ...) -> None: ...
+
+class PlacementAcquisitionObservation(_message.Message):
+    __slots__ = ("endpoint", "model")
+    ENDPOINT_FIELD_NUMBER: _ClassVar[int]
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    endpoint: AcquisitionLegObservation
+    model: AcquisitionLegObservation
+    def __init__(self, endpoint: _Optional[_Union[AcquisitionLegObservation, _Mapping]] = ..., model: _Optional[_Union[AcquisitionLegObservation, _Mapping]] = ...) -> None: ...
+
+class AcquisitionLegObservation(_message.Message):
+    __slots__ = ("started_monotonic_ns", "ended_monotonic_ns", "downloaded_bytes", "reused_bytes")
+    STARTED_MONOTONIC_NS_FIELD_NUMBER: _ClassVar[int]
+    ENDED_MONOTONIC_NS_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOADED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    REUSED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    started_monotonic_ns: int
+    ended_monotonic_ns: int
+    downloaded_bytes: int
+    reused_bytes: int
+    def __init__(self, started_monotonic_ns: _Optional[int] = ..., ended_monotonic_ns: _Optional[int] = ..., downloaded_bytes: _Optional[int] = ..., reused_bytes: _Optional[int] = ...) -> None: ...
 
 class AcceleratorQualification(_message.Message):
     __slots__ = ("qualified", "capabilities", "recommended_max_bytes", "pinned_capacity_bytes", "h2d_gbps_measured", "d2h_gbps_measured", "torch_version", "unreadable")

@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +218,9 @@ class Placement:
     plan_refs: dict[str, tuple[str, int]]
     """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
     model_object_set_path: Path | None = None
+    acquisition: pb.PlacementAcquisitionObservation = field(
+        default_factory=pb.PlacementAcquisitionObservation
+    )
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
     #: offline" — the exact state an outgoing spec holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
@@ -1889,7 +1892,10 @@ class Worker:
         generation = (
             self.options.environment_root / "generations" / expected.removeprefix("sha256:")
         )
-        if not generation.exists():
+        # A standing grant re-drives the full reachability walk even when the overlay is
+        # already present: that is how warm reuse is measured honestly for BOTH endpoint
+        # and model legs. A preinstalled generation with no grant may still open locally.
+        if not generation.exists() or self.grant.authorized():
             if self.options.artifact_cache is None:
                 self._materialization_failed(
                     placement,
@@ -1929,6 +1935,7 @@ class Worker:
                     object_sets_root=self.options.environment_root.parent / "model-object-sets",
                     artifact_store=self.options.artifact_store,
                     python=Path(sys.executable),
+                    on_observation=lambda value: self._observe_acquisition(placement, value),
                 ).acquire(placement)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
@@ -2001,6 +2008,15 @@ class Worker:
             f"opened overlay receipt {expected[:23]}… at {installed.generation}",
         )
         return installed
+
+    def _observe_acquisition(
+        self, placement: Placement, value: pb.PlacementAcquisitionObservation
+    ) -> None:
+        """Publish observation-only partial/terminal progress; never decide convergence."""
+
+        placement.acquisition.CopyFrom(value)
+        if placement is self.placement and self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def _resolve_bindings(self, placement: Placement) -> dict[str, DeclaredBinding] | None:
         """Re-measure every staged plan record, then read the ONE provisioned release."""
@@ -3226,7 +3242,7 @@ class Worker:
         # DISJOINT by construction (the proto says so): a plan is either servable now or
         # still to be materialized, never counted in both.
         materializable = sorted(set(self.placement.plan_ids) - set(dispatchable))
-        return pb.PlacementStatus(
+        status = pb.PlacementStatus(
             placement_id=self.placement.placement_id,
             placement_spec_digest=self.placement.spec_digest,
             materialization=self.placement.materialization,
@@ -3248,6 +3264,9 @@ class Worker:
                 )
             ],
         )
+        if self.placement.acquisition.ListFields():
+            status.acquisition.CopyFrom(self.placement.acquisition)
+        return status
 
     def job_capacity(self) -> pb.JobCapacity:
         """How many JOB attempts this worker can take right now (cr-009)."""
