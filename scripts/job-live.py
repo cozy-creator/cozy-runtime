@@ -340,7 +340,7 @@ def section_e2e() -> None:
         outcome.accepted.get("quantified_choice", "")[:160],
     )
     check(
-        "publication is rewritten into job SCRATCH, outside the public repo grammar",
+        "publication is rewritten into job scratch, outside the public model grammar",
         outcome.publication_scope == "local/_job-job-1",
         outcome.publication_scope,
     )

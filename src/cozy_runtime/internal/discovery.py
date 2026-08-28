@@ -59,7 +59,7 @@ def read_application(project: Path) -> str:
     path = project / "endpoint.toml"
     if not path.is_file():
         raise DiscoveryError(
-            f"{path} does not exist: an endpoint is a repo with endpoint.toml naming its "
+            f"{path} does not exist: an endpoint repository has endpoint.toml naming its "
             'one app export ([application] object = "my_endpoint:app")',
             code="no_endpoint_toml",
         )

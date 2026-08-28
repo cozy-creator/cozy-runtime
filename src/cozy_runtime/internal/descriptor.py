@@ -118,6 +118,7 @@ _FORBIDDEN_KEYS = frozenset(
         "timestamp",
         "created_at",
         "generated_at",
+        "model",
         "repo",
         "lane",
         "checkpoint",
@@ -133,15 +134,15 @@ _FORBIDDEN_KEYS = frozenset(
 
 def _binding_values(bindings: Mapping[str, Mapping[str, object]]) -> frozenset[str]:
     """Every spelling of a binding an endpoint.toml states — the parts AND the composed ref,
-    because `repo` and `release` are stored apart but named together everywhere else."""
+    because `model` and `release` are stored apart but named together everywhere else."""
     values: set[str] = set()
     for entry in bindings.values():
         for value in entry.values():
             if isinstance(value, str):
                 values.add(value)
-        repo, release = entry.get("repo"), entry.get("release")
-        if isinstance(repo, str):
-            values.add(f"{repo}@{release}" if isinstance(release, str) else repo)
+        model, release = entry.get("model"), entry.get("release")
+        if isinstance(model, str):
+            values.add(f"{model}@{release}" if isinstance(release, str) else model)
     return frozenset(values)
 
 

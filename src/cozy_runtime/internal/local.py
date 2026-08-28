@@ -157,8 +157,8 @@ class LocalRequest:
     #: identified subjects — never a digest-sorted anonymous list (worker-protocol/01).
     inputs: Mapping[str, LocalInput] = field(default_factory=dict)
     org: str = "local"
-    """The publishing org. A job's outputs are hub-rewritten into the SCRATCH repo
-    `<org>/_job-<request-id>` — the underscore is deliberately outside the public repo
+    """The publishing org. A job's outputs are hub-rewritten into the scratch model
+    `<org>/_job-<request-id>` — the underscore is deliberately outside the public model
     grammar, so no user ref can squat a job's scratch, and promotion out of it is always an
     explicit later act under the caller's own credentials (jobs.md)."""
 
@@ -194,7 +194,7 @@ class SliceOutcome:
     exit_code: int = 0
     journal_deleted: bool = False
     #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
-    #: the scratch repo its outputs were rewritten into.
+    #: the scratch model its outputs were rewritten into.
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     publication_scope: str = ""
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
@@ -641,14 +641,14 @@ class LocalRecordOwner:
         )
         return directive
 
-    def scratch_repo(self) -> str:
-        """The opaque SCRATCH repo a job's publishes are rewritten into.
+    def scratch_model(self) -> str:
+        """The opaque scratch model a job's publishes are rewritten into.
 
-        The underscore is deliberately outside the public repo grammar (`artifacts.REF`
+        The underscore is deliberately outside the public model grammar (`artifacts.REF`
         admits `[a-zA-Z0-9]` first), so no user ref can ever squat a job's scratch. Promotion
         OUT of scratch is an explicit later act under the caller's own credentials; a verdict
         stamps metadata and never gates persistence — a failed run's writes still land. The
-        wire request id is hashed because a repository name is authority, not identity.
+        wire request id is hashed because a model name is authority, not identity.
         """
         return f"{self.request.org}/_job-{opaque_key('job-repository', self.request.request_id)}"
 
@@ -656,7 +656,7 @@ class LocalRecordOwner:
         """What this run authorizes the job to write, by output id. Minted from the job's own
         DECLARATION (`publishes=`/`emits_media=`), never from the fact that it is a job."""
         return pb.PublicationContract(
-            grant_id=self.scratch_repo(),
+            grant_id=self.scratch_model(),
             outputs=[
                 pb.OutputBinding(output_id=output_id, max_bytes=64 << 20)
                 for output_id in self.request.outputs
@@ -1147,7 +1147,7 @@ def _collect(
     outcome.executions = worker.engine.executed
     outcome.checkpoints = list(record_owner.checkpoints)
     outcome.publication_scope = (
-        record_owner.scratch_repo() if record_owner.request.kind == "job" else ""
+        record_owner.scratch_model() if record_owner.request.kind == "job" else ""
     )
     if record_owner.spec_document:
         outcome.invocation = {

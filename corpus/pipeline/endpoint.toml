@@ -5,5 +5,5 @@
 object = "sdxl_txt2img:app"
 
 [bindings."SdxlPipelineModel"]
-repo = "cozy/sdxl-pipeline"
+model = "cozy/sdxl-pipeline"
 release = "cr-008b"
