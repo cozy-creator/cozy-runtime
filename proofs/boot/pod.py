@@ -56,7 +56,9 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 STATE = Path("/run/cozy/pod")
-MEDIA_ROOT = Path("/run/cozy/media")
+# The adapter gives the worker this exact co-resident media root. Keeping a second proof-only
+# spelling made the real attempt fail at the grant-root fence before the convergence arms ran.
+MEDIA_ROOT = Path("/var/lib/cozy/media")
 WHEELS = Path("/wheels")
 ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
 ARTIFACT_CACHE = Path("/var/lib/cozy/artifacts")
@@ -755,6 +757,41 @@ def main() -> int:
                 == staged.placements[0].placement_spec_digest
             ), describe(refused)
             note(f"mismatched revision 4 REFUSED, outgoing keeps serving: {describe(refused)}")
+
+            # A GRANT refresh repairs access; it cannot repair a terminal verdict about the
+            # desired spec's exact receipt bytes. Before this arm existed, every newer grant
+            # cleared the latch, repeated the full acquisition walk, and appended the same
+            # `overlay_receipt_mismatch` fault again while claiming failures were latched.
+            mismatch_faults = sum(
+                fault.reason == "overlay_receipt_mismatch" for fault in refused.faults
+            )
+            owner.send(
+                pb.RecordOwnerFrame(artifact_grant_update=owner.envelope(grant_update(release, 2)))
+            )
+            refreshed = owner.await_state(
+                lambda state: state.applied_grant_revision == 2,
+                "the refreshed grant beside a terminal materialization failure",
+                seconds=60,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                owner.pump(deadline)
+            after_refresh = owner.states[-1]
+            assert after_refresh.accepted_desired_state_revision == 4, describe(after_refresh)
+            assert after_refresh.converged_revision == 3, describe(after_refresh)
+            assert placement_is(
+                after_refresh,
+                pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
+                pb.ServingState.SERVING_STATE_DISPATCHABLE,
+            ), describe(after_refresh)
+            assert (
+                sum(fault.reason == "overlay_receipt_mismatch" for fault in after_refresh.faults)
+                == mismatch_faults
+            ), "a grant refresh repeated a terminal materialization fault"
+            note(
+                "grant revision 2 landed without re-driving terminal revision 4: "
+                f"{describe(refreshed)}"
+            )
         finally:
             owner.close()
     finally:
