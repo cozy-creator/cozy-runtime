@@ -12,6 +12,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   dynamic-pods-skip-boot-warm
   delivery-plan-observation
   pod-media-grant-root
+  measured-backend-version
 """
 
 from __future__ import annotations
@@ -1061,6 +1062,35 @@ def fence_pod_media_grant_root() -> list[str]:
     return []
 
 
+def fence_measured_backend_version() -> list[str]:
+    """WorkerResources carries HostFacts' measured backend version, never a launch value."""
+
+    path = SRC / "internal" / "worker" / "session.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    worker = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Worker"),
+        None,
+    )
+    resources = next(
+        (
+            node
+            for node in (worker.body if worker is not None else [])
+            if isinstance(node, ast.FunctionDef) and node.name == "resources"
+        ),
+        None,
+    )
+    body = ast.get_source_segment(source, resources) if resources is not None else None
+    if body is None:
+        return [f"{path.relative_to(ROOT)}: Worker.resources is gone"]
+    if "backend_version=facts.cuda_version" not in body.replace(" ", ""):
+        return [
+            f"{path.relative_to(ROOT)}: WorkerResources.backend_version does not come "
+            "directly from HostFacts.cuda_version"
+        ]
+    return []
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
@@ -1084,6 +1114,7 @@ FENCES = {
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
     "delivery-plan-observation": fence_delivery_plan_observation,
     "pod-media-grant-root": fence_pod_media_grant_root,
+    "measured-backend-version": fence_measured_backend_version,
 }
 
 

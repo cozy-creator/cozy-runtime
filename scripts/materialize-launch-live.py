@@ -12,9 +12,19 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict, cast
+from unittest.mock import patch
 
 from cozy_runtime.cli.materialize_launch import MEDIA_ROOT, _worker_command
-from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
+from cozy_runtime.internal import (
+    canonical,
+    contract,
+    fill,
+    hostfacts,
+    local,
+    provisioned,
+    pull,
+    readiness,
+)
 from cozy_runtime.internal.config import (
     ConfigError,
     Credentials,
@@ -260,6 +270,39 @@ def prove_delivery_activation(root: Path) -> None:
     assert broken.engine.faults[-1].reason == "activation_exception"
 
 
+def prove_backend_version(root: Path) -> None:
+    """The ClaimAck resource source carries measured CUDA version, and invents none."""
+
+    worker, _ = policy_worker(root / "worker", environment_root=root / "env", no_warm=False)
+    measured = hostfacts.HostFacts(
+        gpu_name="NVIDIA proof GPU",
+        vram_total_bytes=24 << 30,
+        driver_version="999.1",
+        cuda_version="13.2",
+        platform="proof-linux",
+        host_ram_total_bytes=64 << 30,
+        vcpu_count=16,
+        backend="cuda",
+    )
+    with patch.object(hostfacts, "measure", return_value=measured):
+        resources = worker.resources()
+    assert resources.backend == "cuda"
+    assert resources.backend_version == "13.2"
+    assert resources.driver_version == "999.1"  # distinct measured fields stay distinct
+
+    unmeasured = hostfacts.HostFacts(
+        gpu_name="NVIDIA proof GPU",
+        driver_version="999.1",
+        cuda_version="",
+        backend="cuda",
+        unreadable=("cuda_version",),
+    )
+    with patch.object(hostfacts, "measure", return_value=unmeasured):
+        absent = worker.resources()
+    assert absent.backend_version == ""
+    assert "cuda_version" in absent.unreadable
+
+
 def mint_certificate(root: Path, name: str, san: str) -> Path:
     certificate, key = root / f"{name}.crt", root / f"{name}.key"
     subprocess.run(
@@ -403,6 +446,7 @@ def main() -> int:
         assert WorkerOptions(root / "local-worker").no_warm is False
         prove_worker_warm_policy(root / "worker-policy")
         prove_delivery_activation(root / "delivery-activation")
+        prove_backend_version(root / "backend-version")
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}
