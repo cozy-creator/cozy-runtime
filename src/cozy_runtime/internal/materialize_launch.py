@@ -34,7 +34,7 @@ from typing import Any
 from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
-ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
+ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
@@ -513,12 +513,16 @@ def endpoint_overlay_input(
             "format",
             "project_wheel",
             "resolved_wheel_set",
+            "source_archive",
+            "source_lock",
             "wheelhouse_manifest",
         },
         "endpoint_bundle",
     )
     if bundle["format"] != ENDPOINT_BUNDLE_FORMAT:
         raise LaunchRefusal("endpoint_bundle_format", str(bundle["format"]))
+    _ref(bundle["source_archive"], "source_archive")
+    source_lock = _ref(bundle["source_lock"], "source_lock")
     _closed(
         resolved,
         {"format", "lock_digest", "platform_target", "wheelhouse_manifest_digest", "wheels"},
@@ -527,6 +531,10 @@ def endpoint_overlay_input(
     if resolved["format"] != RESOLVED_WHEEL_SET_FORMAT:
         raise LaunchRefusal("resolved_wheel_set_format", str(resolved["format"]))
     _require_digest(resolved["lock_digest"], "resolved_wheel_set.lock_digest")
+    if source_lock["digest"] != resolved["lock_digest"]:
+        raise LaunchRefusal(
+            "source_lock_ref_mismatch", "bundle source lock and resolved set disagree"
+        )
     _closed(wheelhouse, {"format", "platform_target", "wheels"}, "wheelhouse_manifest")
     if wheelhouse["format"] != WHEELHOUSE_MANIFEST_FORMAT:
         raise LaunchRefusal("wheelhouse_manifest_format", str(wheelhouse["format"]))

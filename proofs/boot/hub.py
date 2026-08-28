@@ -143,15 +143,19 @@ def author(
         sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
     evaluated = release.add(canonical({"format": "proof.EvaluatedConfig/1"}), "config")
+    source_archive = release.add(b"cr-049-boot-proof-source", "source")
+    source_lock = release.add(b"cr-049-boot-proof-lock", "lock")
     bundle = release.add(
         canonical(
             {
                 "descriptor": ref(descriptor_bytes),
                 "endpoint_release_id": ENDPOINT_RELEASE,
                 "evaluated_config": ref(evaluated),
-                "format": "tensorhub.endpoint_bundle/1",
+                "format": "tensorhub.endpoint_bundle/2",
                 "project_wheel": wheel(project),
                 "resolved_wheel_set": ref(resolved),
+                "source_archive": ref(source_archive),
+                "source_lock": ref(source_lock),
                 "wheelhouse_manifest": ref(wheelhouse),
             }
         ),
