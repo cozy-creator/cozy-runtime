@@ -35,6 +35,7 @@ from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 PLATFORM = sys.platform
 
 _PR_SET_PDEATHSIG = 1
+_PR_SET_DUMPABLE = 4
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_SET_NO_NEW_PRIVS = 38
 
@@ -200,6 +201,18 @@ def arm_subreaper() -> None:
     """
     _linux_only("arm_subreaper")
     _prctl(_PR_SET_CHILD_SUBREAPER, 1)
+
+
+def deny_process_inspection() -> None:
+    """Make the trusted worker non-dumpable before an endpoint child exists.
+
+    The pod executor runs as a different uid, which already closes ordinary same-uid
+    ptrace.  Keeping the worker non-dumpable makes the intended boundary explicit and
+    prevents a future credential transition from silently reopening ``/proc/<pid>/mem``.
+    """
+
+    _linux_only("deny_process_inspection")
+    _prctl(_PR_SET_DUMPABLE, 0)
 
 
 @dataclass(frozen=True, slots=True)

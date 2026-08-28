@@ -26,7 +26,7 @@ import stat
 import sys
 import uuid
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
@@ -35,7 +35,10 @@ from typing import Any
 from cozy_runtime.internal import canonical
 
 RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
-RECEIPT_NAME = "endpoint-overlay-receipt.json"
+CONTENT_FORMAT = "cozy.runtime.EndpointOverlayContent/1"
+CONTENT_IDENTITY_NAME = "endpoint-overlay-content.json"
+WHEEL_EXTRACTION_FORMAT = "cozy.runtime.EndpointWheelExtraction/1"
+WHEEL_EXTRACTION_IDENTITY_NAME = "endpoint-wheel-extraction.json"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/2"
@@ -103,6 +106,52 @@ class BlobGrant:
     digest: str
     length: int
     path: Path
+    verified: VerifiedFile | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedFile:
+    """A same-boot receipt for one already-hashed immutable cache file."""
+
+    digest: str
+    length: int
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def record(cls, path: Path, digest: str, length: int) -> VerifiedFile:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise OverlayRefusal("overlay_wheel_unreadable", str(path)) from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_size != length:
+            raise OverlayRefusal("overlay_wheel_identity_changed", str(path))
+        return cls(
+            digest=digest,
+            length=length,
+            device=info.st_dev,
+            inode=info.st_ino,
+            mtime_ns=info.st_mtime_ns,
+            ctime_ns=info.st_ctime_ns,
+        )
+
+    def matches(self, path: Path, digest: str, length: int) -> bool:
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
+        return (
+            self.digest == digest
+            and self.length == length
+            and stat.S_ISREG(info.st_mode)
+            and info.st_size == length
+            and info.st_dev == self.device
+            and info.st_ino == self.inode
+            and info.st_mtime_ns == self.mtime_ns
+            and info.st_ctime_ns == self.ctime_ns
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +170,7 @@ class InstalledOverlay:
     python: Path
     receipt_bytes: bytes
     receipt_digest: str
+    content_digest: str
     reused: bool
 
 
@@ -140,7 +190,12 @@ def materialize(
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     expected_receipt_digest: str = "",
 ) -> InstalledOverlay:
-    """Verify and atomically publish only endpoint-owned packages."""
+    """Verify and atomically publish endpoint content plus a placement receipt.
+
+    Installed bytes are keyed only by the base family and sorted wheel digests.  The
+    environment spec remains in the small placement receipt, so two specs with identical
+    wheels join the same compiled content without weakening the receipt join.
+    """
 
     _require_digest(source.environment_spec_digest, "environment_spec_digest")
     _require_digest(source.base_family_digest, "base_family_digest")
@@ -157,66 +212,85 @@ def materialize(
             "overlay_receipt_mismatch",
             f"derived {receipt_digest}, expected {expected_receipt_digest}",
         )
-    generations = root / "generations"
-    final = generations / receipt_digest.removeprefix("sha256:")
-    if final.exists():
+    content_bytes = canonical.write(_content_identity(source, wheels))
+    content_digest = _sha(content_bytes)
+    contents = root / "contents"
+    wheel_pools = root / "wheel-pools"
+    receipts = root / "receipts"
+    final = contents / content_digest.removeprefix("sha256:")
+    receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
+    if receipt_path.exists():
         return open_generation(
-            final,
+            root,
             receipt_digest=receipt_digest,
             environment_spec_digest=source.environment_spec_digest,
             base_manifest=base_manifest,
             reused=True,
             python=python,
         )
-
-    inspected = _verify_grants(source, wheels, base)
-    generations.mkdir(parents=True, exist_ok=True)
-    staging = root / f".overlay-staging-{uuid.uuid4().hex}"
-    try:
-        site = staging / OVERLAY_DIR
-        site.mkdir(parents=True, mode=0o700)
-        _extract(inspected, site)
-        # Endpoint code is small, but it should still pay compilation once at intake rather
-        # than once per executor. The base image's much larger bytecode is already baked.
-        if not compileall.compile_dir(
-            site,
-            quiet=1,
-            force=True,
-            workers=1,
-            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
-            stripdir=str(site),
-            prependdir=str(final / OVERLAY_DIR),
-        ):
-            raise OverlayRefusal("overlay_bytecode_failed", str(site))
-        _write_once(staging / RECEIPT_NAME, receipt_bytes)
-        _make_read_only(staging)
-        _fsync_dir(staging)
+    reused = final.exists()
+    inspected = None if reused else _verify_grants(source, wheels, base)
+    _require_owned_root(root)
+    contents.mkdir(parents=True, exist_ok=True, mode=0o700)
+    wheel_pools.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # The executor receives one exact import-root path. Search without directory listing is
+    # sufficient to reach it; write remains root-only and receipts remain fully private.
+    contents.chmod(0o711)
+    wheel_pools.chmod(0o700)
+    receipts.chmod(0o700)
+    if not reused:
+        assert inspected is not None
+        pools = {
+            item.wheel.digest: _publish_wheel_pool(wheel_pools, source.base_family_digest, item)
+            for item in inspected
+        }
+        staging = root / f".overlay-staging-{uuid.uuid4().hex}"
         try:
-            os.rename(staging, final)
-            final.chmod(0o555)
-            reused = False
-        except OSError as exc:
-            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                raise
-            _remove_tree(staging)
-            reused = True
-        _fsync_dir(generations)
-        return open_generation(
-            final,
-            receipt_digest=receipt_digest,
-            environment_spec_digest=source.environment_spec_digest,
-            base_manifest=base_manifest,
-            reused=reused,
-            python=python,
-        )
-    except Exception:
-        if staging.exists():
-            _remove_tree(staging)
-        raise
+            site = staging / OVERLAY_DIR
+            site.mkdir(parents=True, mode=0o700)
+            _compose_wheel_pools(pools, wheels, site)
+            # Endpoint code is small, but it should still pay compilation once at intake
+            # rather than once per executor. Base bytecode is already baked in the image.
+            if not compileall.compile_dir(
+                site,
+                quiet=1,
+                force=True,
+                workers=1,
+                invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+                stripdir=str(site),
+                prependdir=str(final / OVERLAY_DIR),
+            ):
+                raise OverlayRefusal("overlay_bytecode_failed", str(site))
+            _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+            _make_read_only(staging)
+            _fsync_dir(staging)
+            try:
+                os.rename(staging, final)
+                final.chmod(0o555)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                _remove_tree(staging)
+                reused = True
+            _fsync_dir(contents)
+        except Exception:
+            if staging.exists():
+                _remove_tree(staging)
+            raise
+    _publish_receipt(receipt_path, receipt_bytes, receipts)
+    return open_generation(
+        root,
+        receipt_digest=receipt_digest,
+        environment_spec_digest=source.environment_spec_digest,
+        base_manifest=base_manifest,
+        reused=reused,
+        python=python,
+    )
 
 
 def open_generation(
-    generation: Path,
+    root: Path,
     *,
     receipt_digest: str,
     environment_spec_digest: str,
@@ -224,7 +298,7 @@ def open_generation(
     reused: bool = True,
     python: Path = Path(sys.executable),
 ) -> InstalledOverlay:
-    """Open a complete overlay without re-hashing its installed files.
+    """Open immutable content through one exact placement receipt without tree hashes.
 
     The receipt and base-family manifest are small identity documents. The endpoint wheel
     bytes were hashed before atomic publication; the official image's OCI digest already
@@ -234,12 +308,13 @@ def open_generation(
 
     _require_digest(receipt_digest, "receipt_digest")
     _require_digest(environment_spec_digest, "environment_spec_digest")
+    receipt_path = root / "receipts" / f"{receipt_digest.removeprefix('sha256:')}.json"
     try:
-        receipt_bytes = (generation / RECEIPT_NAME).read_bytes()
+        receipt_bytes = receipt_path.read_bytes()
     except OSError as exc:
         raise OverlayRefusal("overlay_receipt_absent", str(exc)) from exc
     if _sha(receipt_bytes) != receipt_digest:
-        raise OverlayRefusal("overlay_receipt_corrupt", str(generation / RECEIPT_NAME))
+        raise OverlayRefusal("overlay_receipt_corrupt", str(receipt_path))
     try:
         value = canonical.parse_canonical(receipt_bytes)
     except canonical.CanonicalError as exc:
@@ -260,12 +335,34 @@ def open_generation(
     if not isinstance(base_digest, str):
         raise OverlayRefusal("overlay_receipt_invalid", "base family is not a digest")
     _read_base_manifest(base_manifest, base_digest)
-    if generation.name != receipt_digest.removeprefix("sha256:"):
-        raise OverlayRefusal("overlay_generation_wrong_key", str(generation))
+    content_digest = _content_digest_from_receipt(value)
+    generation = root / "contents" / content_digest.removeprefix("sha256:")
+    try:
+        identity_bytes = (generation / CONTENT_IDENTITY_NAME).read_bytes()
+    except OSError as exc:
+        raise OverlayRefusal("overlay_content_absent", str(exc)) from exc
+    if _sha(identity_bytes) != content_digest:
+        raise OverlayRefusal("overlay_content_identity_corrupt", str(generation))
+    try:
+        identity = canonical.parse_canonical(identity_bytes)
+    except canonical.CanonicalError as exc:
+        raise OverlayRefusal("overlay_content_identity_invalid", str(exc)) from exc
+    if identity != _content_identity_from_receipt(value):
+        raise OverlayRefusal("overlay_content_identity_mismatch", str(generation))
     import_root = generation / OVERLAY_DIR
     if not import_root.is_dir():
         raise OverlayRefusal("overlay_import_root_absent", str(import_root))
-    if generation.stat().st_mode & 0o222 or import_root.stat().st_mode & 0o222:
+    owner = os.geteuid()
+    boundaries = (root, root / "contents", root / "receipts")
+    if (
+        any(path.stat().st_uid != owner or path.stat().st_mode & 0o022 for path in boundaries)
+        or generation.stat().st_uid != owner
+        or import_root.stat().st_uid != owner
+        or receipt_path.stat().st_uid != owner
+        or generation.stat().st_mode & 0o222
+        or import_root.stat().st_mode & 0o222
+        or receipt_path.stat().st_mode & 0o222
+    ):
         raise OverlayRefusal("overlay_generation_mutable", str(generation))
     if not python.is_file():
         raise OverlayRefusal("overlay_python_absent", str(python))
@@ -275,6 +372,7 @@ def open_generation(
         python=python,
         receipt_bytes=receipt_bytes,
         receipt_digest=receipt_digest,
+        content_digest=content_digest,
         reused=reused,
     )
 
@@ -524,10 +622,22 @@ def _verify_grants(
         if grant.length != wheel.length:
             raise OverlayRefusal("overlay_grant_length_mismatch", wheel.digest)
         try:
-            size = grant.path.stat().st_size
+            info = grant.path.lstat()
         except OSError as exc:
             raise OverlayRefusal("overlay_wheel_unreadable", str(grant.path)) from exc
-        if size != wheel.length or _hash_file(grant.path) != wheel.digest:
+        verified = grant.verified
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != wheel.length
+            or verified is None
+            or not verified.matches(grant.path, wheel.digest, wheel.length)
+        ):
+            # The trusted local proof seat has no acquisition receipt, so it verifies here.
+            # Production acquisition always supplies one and therefore never hashes a wheel
+            # a second time after fetch_exact already admitted it.
+            if info.st_size != wheel.length or _hash_file(grant.path) != wheel.digest:
+                raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
+        elif verified.digest != wheel.digest:
             raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
         inspected.append(_inspect(wheel, grant.path, base))
     root_owners: dict[str, str] = {}
@@ -701,6 +811,77 @@ def _extract(wheels: Sequence[_Inspected], site: Path) -> None:
                 target.chmod(0o500 if target.suffix in {".so", ".pyd", ".dll"} else 0o400)
 
 
+def _wheel_pool_identity(base_family_digest: str, wheel_digest: str) -> dict[str, str]:
+    return {
+        "base_family_digest": base_family_digest,
+        "format": WHEEL_EXTRACTION_FORMAT,
+        "wheel_digest": wheel_digest,
+    }
+
+
+def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspected) -> Path:
+    """Extract one verified wheel once under the image/runtime extraction semantics."""
+
+    identity_bytes = canonical.write(
+        _wheel_pool_identity(base_family_digest, inspected.wheel.digest)
+    )
+    pool_digest = _sha(identity_bytes)
+    final = pools / pool_digest.removeprefix("sha256:")
+    if final.exists():
+        try:
+            existing = (final / WHEEL_EXTRACTION_IDENTITY_NAME).read_bytes()
+        except OSError as exc:
+            raise OverlayRefusal("overlay_wheel_pool_invalid", str(exc)) from exc
+        if existing != identity_bytes or final.stat().st_uid != os.geteuid():
+            raise OverlayRefusal("overlay_wheel_pool_invalid", str(final))
+        return final / "tree"
+    staging = pools.parent / f".wheel-staging-{uuid.uuid4().hex}"
+    try:
+        tree = staging / "tree"
+        tree.mkdir(parents=True, mode=0o700)
+        _extract((inspected,), tree)
+        _write_once(staging / WHEEL_EXTRACTION_IDENTITY_NAME, identity_bytes)
+        _make_read_only(staging)
+        _fsync_dir(staging)
+        try:
+            os.rename(staging, final)
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
+            _remove_tree(staging)
+        _fsync_dir(pools)
+    except Exception:
+        if staging.exists():
+            _remove_tree(staging)
+        raise
+    return final / "tree"
+
+
+def _compose_wheel_pools(pools: Mapping[str, Path], wheels: Sequence[Wheel], site: Path) -> None:
+    """Compose one content generation with hardlinks to immutable per-wheel trees."""
+
+    written: set[Path] = set()
+    for wheel in sorted(wheels, key=lambda item: item.digest):
+        pool = pools[wheel.digest]
+        if not pool.is_dir():
+            raise OverlayRefusal("overlay_wheel_pool_invalid", str(pool))
+        for source in sorted(pool.rglob("*")):
+            relative = source.relative_to(pool)
+            target = site / relative
+            if source.is_symlink():
+                raise OverlayRefusal("overlay_wheel_pool_invalid", str(source))
+            if source.is_dir():
+                if target.exists() and not target.is_dir():
+                    raise OverlayRefusal("overlay_install_path_collision", relative.as_posix())
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                continue
+            if target in written or target.exists():
+                raise OverlayRefusal("overlay_install_path_collision", relative.as_posix())
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.link(source, target)
+            written.add(target)
+
+
 def _install_path(name: str) -> PurePosixPath | None:
     path = PurePosixPath(name)
     first = path.parts[0]
@@ -727,6 +908,71 @@ def _receipt(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
         ],
         "project_wheel_digest": source.project_wheel_digest,
     }
+
+
+def _content_identity(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
+    return {
+        "base_family_digest": source.base_family_digest,
+        "format": CONTENT_FORMAT,
+        "wheel_digests": sorted(wheel.digest for wheel in wheels),
+    }
+
+
+def _content_identity_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    rows = receipt.get("overlay_wheels")
+    if not isinstance(rows, list) or not rows:
+        raise OverlayRefusal("overlay_receipt_invalid", "overlay_wheels is empty")
+    digests: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+            "digest",
+            "distribution",
+            "owner",
+            "version",
+        }:
+            raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel row is not closed")
+        digest = row.get("digest")
+        if not isinstance(digest, str):
+            raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel digest is absent")
+        _require_digest(digest, "overlay_wheels.digest")
+        digests.append(digest)
+    if len(set(digests)) != len(digests):
+        raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel digests repeat")
+    base = receipt.get("base_family_digest")
+    if not isinstance(base, str):
+        raise OverlayRefusal("overlay_receipt_invalid", "base family is absent")
+    _require_digest(base, "base_family_digest")
+    return {
+        "base_family_digest": base,
+        "format": CONTENT_FORMAT,
+        "wheel_digests": sorted(digests),
+    }
+
+
+def _content_digest_from_receipt(receipt: Mapping[str, Any]) -> str:
+    return _sha(canonical.write(_content_identity_from_receipt(receipt)))
+
+
+def _require_owned_root(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = root.lstat()
+    if not root.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise OverlayRefusal("overlay_root_owner_mismatch", str(root))
+    root.chmod(0o711)
+
+
+def _publish_receipt(path: Path, payload: bytes, receipts: Path) -> None:
+    temporary = receipts / f".receipt-{uuid.uuid4().hex}"
+    _write_once(temporary, payload)
+    temporary.chmod(0o400)
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        if path.read_bytes() != payload:
+            raise OverlayRefusal("overlay_receipt_conflict", str(path)) from None
+    finally:
+        temporary.unlink(missing_ok=True)
+    _fsync_dir(receipts)
 
 
 def _require_digest(value: str, name: str) -> None:

@@ -124,7 +124,10 @@ def prepare_boot(
 
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
-    _directory(artifact_store_root)
+    # Endpoint executors read verified TensorFS objects but never publish them. Root owns
+    # the store; execute/read bits admit the fixed executor uid without making any object
+    # or directory writable to it.
+    _directory(artifact_store_root, mode=0o755)
     _directory(artifact_cache_root)
     _directory(boot_root)
     object_set = boot_root / "artifact-object-set.json"
@@ -455,12 +458,12 @@ def _publish_exact(target: Path, payload: bytes, root: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _directory(path: Path) -> None:
+def _directory(path: Path, *, mode: int = 0o700) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = path.lstat()
     if not path.is_absolute() or not stat.S_ISDIR(info.st_mode):
         raise LaunchRefusal("provision_store_invalid", str(path))
-    path.chmod(0o700)
+    path.chmod(mode)
 
 
 def _fsync(path: Path) -> None:
@@ -471,6 +474,35 @@ def _fsync(path: Path) -> None:
         os.close(descriptor)
 
 
+def control_runtime_digest(
+    manifest_path: Path = overlay.DEFAULT_BASE_MANIFEST,
+) -> str:
+    """Read the exact image-owned control Runtime wheel identity.
+
+    This is not the OCI manifest digest and it is not accepted from provider environment.
+    The registered base worker image bakes the complete wheelhouse manifest; Runtime
+    validates those exact canonical bytes and reports its one ``cozy-runtime`` wheel fact
+    so the hub can compare it with the selected image record.
+    """
+
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as exc:
+        raise LaunchRefusal("control_runtime_manifest_unreadable", str(exc)) from exc
+    manifest_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    try:
+        manifest = overlay.parse_base_manifest(raw, manifest_digest)
+    except overlay.OverlayRefusal as exc:
+        raise LaunchRefusal(exc.code, exc.detail) from exc
+    matches = [wheel.digest for wheel in manifest.wheels if wheel.distribution == "cozy-runtime"]
+    if len(matches) != 1:
+        raise LaunchRefusal(
+            "control_runtime_identity_invalid",
+            f"base manifest names {len(matches)} cozy-runtime wheels",
+        )
+    return matches[0]
+
+
 def endpoint_overlay_input(
     *,
     environment_spec_bytes: bytes,
@@ -478,6 +510,7 @@ def endpoint_overlay_input(
     resolved_wheel_set_bytes: bytes,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
+    verified_wheels: Mapping[str, overlay.VerifiedFile] | None = None,
 ) -> overlay.Input:
     """Join exact publication documents and endpoint-only wheel grants."""
 
@@ -587,7 +620,12 @@ def endpoint_overlay_input(
         project_wheel_digest=project.digest,
         wheels=tuple(wheels),
         grants=tuple(
-            overlay.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
+            overlay.BlobGrant(
+                wheel.digest,
+                wheel.length,
+                wheel_paths[wheel.digest],
+                (verified_wheels or {}).get(wheel.digest),
+            )
             for wheel in wheels
         ),
     )

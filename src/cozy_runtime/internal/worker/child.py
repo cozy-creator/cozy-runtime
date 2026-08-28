@@ -24,6 +24,7 @@ import contextlib
 import json
 import os
 import queue
+import shutil
 import signal
 import socket
 import threading
@@ -232,6 +233,9 @@ class ExecutorSupervision:
         python: str,
         base_env: tuple[tuple[str, str], ...],
         cozy_home: Path,
+        executor_uid: int = -1,
+        executor_gid: int = -1,
+        scratch_root: Path | None = None,
         device_process: Callable[[int], accel.ProcessMemory] | None = None,
     ) -> None:
         self.root = root
@@ -240,7 +244,15 @@ class ExecutorSupervision:
         """The endpoint-only import root appended after image-owned packages."""
         self.base_env = base_env
         self.cozy_home = cozy_home
+        self.executor_uid = executor_uid
+        self.executor_gid = executor_gid
+        self.scratch_root = scratch_root
         self.root.mkdir(parents=True, exist_ok=True)
+        if self.isolated:
+            # Group execute admits the fixed executor to the named socket/cancel paths but
+            # not to list or read the worker's journal, owner record, or credentials.
+            os.chown(self.root, 0, self.executor_gid)
+            self.root.chmod(0o710)
         self._scope_namespace = proctree.executor_scope_namespace(self.root)
         try:
             self._root_lease = proctree.acquire_worker_root_lease(self.root / "worker.lock")
@@ -276,6 +288,49 @@ class ExecutorSupervision:
         self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]] | None] = queue.Queue()
         self._launcher: threading.Thread | None = None
         self._launcher_lock = threading.Lock()
+
+    @property
+    def isolated(self) -> bool:
+        return self.executor_uid >= 0 and self.executor_gid >= 0
+
+    def grant_directory(self, path: Path, generation: int) -> None:
+        """Hand one already-populated attempt/scratch directory to the current child."""
+
+        if not self.isolated:
+            return
+        current = self.current
+        if current is None or current.incarnation != generation:
+            raise ExecutorGone(
+                f"cannot grant {path}: executor generation {generation} is not current"
+            )
+        os.chown(path, self.executor_uid, self.executor_gid)
+        path.chmod(0o700)
+
+    def generation_scratch(self, generation: int) -> Path:
+        if self.scratch_root is None:
+            raise ExecutorGone("executor scratch root is absent")
+        if not self.isolated:
+            return self.scratch_root
+        return self.scratch_root / f"generation-{generation}"
+
+    def _prepare_generation_scratch(self) -> None:
+        if not self.isolated:
+            return
+        if self.scratch_root is None:
+            raise ExecutorGone("isolated executor scratch root is absent")
+        self.scratch_root.mkdir(parents=True, exist_ok=True)
+        os.chown(self.scratch_root, 0, 0)
+        self.scratch_root.chmod(0o711)
+        # No old executor exists while _spawn_locked holds the lifecycle lock. Remove every
+        # retired generation before making the successor reachable; a fixed uid therefore
+        # cannot read a previous incarnation's scratch even though the numeric uid is reused.
+        for entry in self.scratch_root.iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                raise ExecutorGone(f"unexpected entry in executor scratch root: {entry}")
+            shutil.rmtree(entry)
+        generation = self.generation_scratch(self.incarnation)
+        generation.mkdir(mode=0o700)
+        os.chown(generation, self.executor_uid, self.executor_gid)
 
     @property
     def _owner_path(self) -> Path:
@@ -577,10 +632,14 @@ class ExecutorSupervision:
                 raise ExecutorGone(refusal)
             Path(self.socket_path).unlink(missing_ok=True)
             self._listener = listener(self.socket_path)
+            if self.isolated:
+                os.chown(self.socket_path, 0, self.executor_gid)
+                os.chmod(self.socket_path, 0o660)
         if self.spawns:
             # A RESPAWN bumps the transport fence, and with it the readiness fence: a fresh
             # executor has no state, so no incarnation bump can leave readiness unmoved.
             self.incarnation += 1
+        self._prepare_generation_scratch()
         self.spawns += 1
         imposed = {
             **imposed,
@@ -623,6 +682,8 @@ class ExecutorSupervision:
                 imposed=imposed,
                 cwd=str(self.root),
                 scope=owner.scope,
+                uid=self.executor_uid,
+                gid=self.executor_gid,
             )
             process = proctree.process_identity(spawned.pid)
             if isinstance(owner.scope, proctree.ProcessTreeScope):

@@ -269,7 +269,7 @@ def receipt_payload(
     )
 
 
-def publish(path: Path, payload: bytes) -> None:
+def publish(path: Path, payload: bytes, *, owner: tuple[int, int] | None = None) -> None:
     """Publish atomically once; an exact replay converges and different bytes refuse."""
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -280,6 +280,13 @@ def publish(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if owner is not None:
+            os.chown(temporary, owner[0], owner[1])
+            owned = os.open(temporary, os.O_RDONLY)
+            try:
+                os.fsync(owned)
+            finally:
+                os.close(owned)
         try:
             os.link(temporary, path)
         except FileExistsError:
@@ -291,6 +298,10 @@ def publish(path: Path, payload: bytes) -> None:
                 ) from exc
             if existing != payload:
                 raise LaunchRefusal("readiness_receipt_conflict", "receipt bytes differ") from None
+            if owner is not None and (path.stat().st_uid, path.stat().st_gid) != owner:
+                raise LaunchRefusal(
+                    "readiness_receipt_owner_mismatch", "existing receipt has the wrong owner"
+                ) from None
             return
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:

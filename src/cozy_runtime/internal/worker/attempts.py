@@ -691,6 +691,8 @@ class AttemptEngine:
                 max_bytes=binding.max_input_bytes if binding else 64 << 20,
                 max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
             )
+            if getattr(self.supervision, "isolated", False):
+                self.supervision.grant_directory(spool, attempt.executor_generation)
         except grants.GrantRefusal as exc:
             # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
             # absent grant entry are facts about the REQUEST; an expired grant or an
@@ -784,8 +786,15 @@ class AttemptEngine:
         # retried attempt the SAME tree, which is the whole of resume. It is created here,
         # before acceptance, so a job never discovers at step 40,000 that it has nowhere
         # durable to write.
-        attempt.scratch = self.scratch_root / opaque_key("job-scratch", attempt.request_id)
+        scratch_root = (
+            self.supervision.generation_scratch(attempt.executor_generation)
+            if getattr(self.supervision, "isolated", False)
+            else self.scratch_root
+        )
+        attempt.scratch = scratch_root / opaque_key("job-scratch", attempt.request_id)
         attempt.scratch.mkdir(parents=True, exist_ok=True)
+        if getattr(self.supervision, "isolated", False):
+            self.supervision.grant_directory(attempt.scratch, attempt.executor_generation)
 
         attempt.opened = self.ledger.snapshot()
         try:
@@ -1255,6 +1264,8 @@ class AttemptEngine:
         )
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
+        if getattr(self.supervision, "isolated", False):
+            self.supervision.grant_directory(spool, attempt.executor_generation)
         attempt.state = "running"
         attempt.executions += 1
         self.executed += 1

@@ -16,7 +16,7 @@ import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from proof_data import ProofFailure, Wheel
 from proof_data import canonical as _canonical
@@ -37,6 +37,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
+CONTENT_FORMAT = "cozy.runtime.EndpointOverlayContent/1"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -450,17 +451,37 @@ def _success(root: Path, name: str, receipt: bytes) -> dict[str, Any]:
         observation["length"] == len(receipt), f"{name} observation length is not stored bytes"
     )
     generation = Path(str(observation["generation"]))
-    _require(generation.name == digest.removeprefix("sha256:"), f"{name} generation is mis-keyed")
-    _require(generation.is_dir(), f"{name} generation is absent")
+    value = _parse_canonical(receipt)
+    _require(isinstance(value, dict), f"{name} receipt is not an object")
+    receipt_value = cast(dict[str, Any], value)
+    rows = receipt_value.get("overlay_wheels")
+    _require(isinstance(rows, list), f"{name} receipt wheel rows are absent")
+    wheel_rows = cast(list[dict[str, Any]], rows)
+    content = _canonical(
+        {
+            "base_family_digest": receipt_value.get("base_family_digest"),
+            "format": CONTENT_FORMAT,
+            "wheel_digests": sorted(str(row.get("digest")) for row in wheel_rows),
+        }
+    )
+    content_digest = _digest(content)
+    _require(
+        generation.name == content_digest.removeprefix("sha256:"),
+        f"{name} installed content is not keyed by base family plus wheel digests",
+    )
+    _require(generation.is_dir(), f"{name} installed content is absent")
+    _require(
+        (generation / "endpoint-overlay-content.json").read_bytes() == content,
+        f"{name} installed-content identity disagrees with its receipt",
+    )
     _require(
         not list((root / f"environment-{name}").glob(".staging-*")), f"{name} staging survived"
     )
     external = root / f"receipt-{name}.json"
     _require(external.read_bytes() == receipt, f"{name} external receipt changed while read")
     _require(external.stat().st_mode & 0o222 == 0, f"{name} external receipt is writable")
-    value = _parse_canonical(receipt)
     _require(
-        isinstance(value, dict) and value.get("format") == RECEIPT_FORMAT,
+        receipt_value.get("format") == RECEIPT_FORMAT,
         f"{name} receipt format is not v1",
     )
     return observation
