@@ -12,15 +12,18 @@ import time
 from pathlib import Path
 from typing import TypedDict, cast
 
+from cozy_runtime.cli.materialize_launch import _worker_command
 from cozy_runtime.internal import canonical, contract, fill, local, provisioned, pull, readiness
 from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.materialize_launch import (
     EMPTY_ARTIFACT_OBJECT_SET,
     LaunchRefusal,
+    PreparedBoot,
     _publish_exact,
     materialize_objects,
 )
 from cozy_runtime.internal.worker.plan import PlanRefusal
+from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import SCHEMA_DIGEST
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -145,6 +148,26 @@ def main() -> int:
         config = read_adapter_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
         assert config.acquisition_attempt_id == "attempt-live"
+        command = _worker_command(
+            config,
+            PreparedBoot(root / "store", root / "object-set.json", root / "cache"),
+            "boot-live",
+            [
+                {
+                    "device_index": 0,
+                    "device_name": "NVIDIA RTX 4090",
+                    "device_uuid": "GPU-live",
+                    "driver_version": "999.0",
+                    "memory_bytes": 24 << 30,
+                    "pci_bus_id": "00000000:01:00.0",
+                }
+            ],
+        )
+        assert command.count("--no-warm") == 1
+        assert command.index("serve") < command.index("--no-warm") < command.index("--socket")
+        # The hardcut is specific to fixed generic substrates. A hand-started/local worker
+        # keeps the existing opt-in behavior and may still choose to run its warm pass.
+        assert WorkerOptions(root / "local-worker").no_warm is False
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}

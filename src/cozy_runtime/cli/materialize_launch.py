@@ -131,7 +131,6 @@ def _start_worker(
     assert isinstance(config, AdapterConfig)
     WORKER_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     (WORKER_ROOT / "control.addr").unlink(missing_ok=True)
-    devices = ",".join(str(row["device_index"]) for row in gpus)
     child_env = dict(config.child_base_env)
     child_env.update(
         {
@@ -146,13 +145,43 @@ def _start_worker(
             "PYTHONNOUSERSITE": "1",
         }
     )
+    command = _worker_command(config, prepared, boot_id, gpus)
+    return subprocess.Popen(
+        command,
+        cwd="/",
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        stdout=None,
+        stderr=None,
+    )
+
+
+def _worker_command(
+    config: object,
+    prepared: PreparedBoot,
+    boot_id: str,
+    gpus: list[readiness.RuntimeGPU],
+) -> list[str]:
+    """The fixed dynamic-pod worker argv, kept pure so the launch contract is executable."""
+
+    from cozy_runtime.internal.config import AdapterConfig
+
+    assert isinstance(config, AdapterConfig)
+    devices = ",".join(str(row["device_index"]) for row in gpus)
     grant_roots = str(MEDIA_ROOT)
-    command = [
+    return [
         sys.executable,
         "-I",
         "-m",
         "cozy_runtime.cli.main",
         "serve",
+        # A generic substrate becomes useful by staging the requested endpoint and model,
+        # not by running an arbitrary synthetic inference before it can advertise the
+        # placement. Endpoint code is dynamic and untrusted to be cheap: a handler blocked
+        # in its first CUDA read previously left an otherwise prepared pod ACTIVATING
+        # forever. Fixed remote pods therefore skip the optional boot warm pass. This does
+        # not change hand-started/local `serve`, whose explicit flag still defaults off.
+        "--no-warm",
         "--socket",
         f"0.0.0.0:{config.worker_internal_port}",
         "--out",
@@ -187,14 +216,6 @@ def _start_worker(
         "--tls-key",
         str(config.tls_key_path),
     ]
-    return subprocess.Popen(
-        command,
-        cwd="/",
-        env=child_env,
-        stdin=subprocess.DEVNULL,
-        stdout=None,
-        stderr=None,
-    )
 
 
 def _supervise(process: subprocess.Popen[bytes]) -> int:
