@@ -868,6 +868,7 @@ DOCUMENT_KINDS = {
     "cozy.pod-readiness/1": "internal/readiness.py",
     "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
     "cozy.runtime.ConstructedGeneration/2": "internal/executor.py",
+    "cozy.runtime.EndpointOverlayReceipt/1": "internal/overlay.py",
     "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
     "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
     "cozy.runtime.Ledger/0": "internal/worker/ledger.py",

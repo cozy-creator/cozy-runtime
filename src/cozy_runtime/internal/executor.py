@@ -1525,7 +1525,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--overlay", default="")
     args = parser.parse_args(argv)
+
+    if args.overlay:
+        overlay = Path(args.overlay)
+        if not overlay.is_absolute() or not overlay.is_dir():
+            print(f"[executor] invalid endpoint overlay {args.overlay!r}", file=sys.stderr)
+            return int(Exit.structural)
+        # Base packages and this executor were resolved from the immutable image before
+        # the endpoint path existed. Append, never prepend: endpoint code is importable but
+        # cannot win path order over torch, TensorFS, or cozy-runtime.
+        sys.path.append(str(overlay))
 
     _capture_seal()
     channel = connect(args.socket)

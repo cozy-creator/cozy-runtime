@@ -34,7 +34,8 @@ torch_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'torch-*.whl' -print)
 test -n "$runtime_wheel" && test -n "$endpoint_wheel" && test -n "$torch_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
-UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" "$runtime_wheel"
+UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
+    "$runtime_wheel" "$torch_wheel"
 driver_python="$proof_root/driver/bin/python"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
@@ -48,7 +49,7 @@ driver_python="$proof_root/driver/bin/python"
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     "$driver_python" "$support" prepare "$proof_root" \
     "$fixture_source/endpoint.descriptor.json" "$runtime_wheel" "$endpoint_wheel" \
-    "$torch_wheel" "$uv_bin" "$driver_python")
+    "$torch_wheel" "$driver_python")
 
 for name in cold rebuild; do
     (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
@@ -58,22 +59,18 @@ for name in cold rebuild; do
         >"$proof_root/environment-$name.stdout")
     (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
         "$driver_python" "$support" model-request "$proof_root" "$name")
-    generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
-        "$proof_root/environment-$name.stdout")
     (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
         HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-        "$generation/venv/bin/cozy-model-contract-proof" \
+        "$proof_root/driver/bin/cozy-model-contract-proof" \
         "$proof_root/model-$name.json" "$proof_root/model-output-$name" \
         >"$proof_root/model-$name.stdout")
 done
 
 (cd / && env -u PYTHONPATH "$driver_python" "$support" red-request "$proof_root")
-cold_generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
-    "$proof_root/environment-cold.stdout")
 set +e
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-    "$cold_generation/venv/bin/cozy-model-contract-proof" \
+    "$proof_root/driver/bin/cozy-model-contract-proof" \
     "$proof_root/model-red.json" "$proof_root/model-output-red" \
     >"$proof_root/model-red.stdout" 2>"$proof_root/model-red.stderr")
 red_status=$?

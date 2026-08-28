@@ -52,7 +52,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("runtime_wheel", type=Path)
     prepare.add_argument("endpoint_wheel", type=Path)
     prepare.add_argument("torch_wheel", type=Path)
-    prepare.add_argument("uv", type=Path)
     prepare.add_argument("python", type=Path)
 
     model = sub.add_parser("model-request")
@@ -101,13 +100,17 @@ def _prepare(args: argparse.Namespace) -> None:
         for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
     ]
     project = _inventory(endpoint_path)
-    resolved_pairs = sorted(
+    base_pairs = sorted(
         [(_inventory(path), path) for path in (runtime_path, torch_path, *dependency_paths)],
         key=lambda pair: pair[0].distribution,
     )
     target = _target()
     wheelhouse = _canonical(
-        {"format": "WheelhouseManifest/1", "platform_target": target, "wheels": []}
+        {
+            "format": "WheelhouseManifest/1",
+            "platform_target": target,
+            "wheels": [_wheel(entry) for entry, _ in base_pairs],
+        }
     )
     resolved = _canonical(
         {
@@ -115,7 +118,7 @@ def _prepare(args: argparse.Namespace) -> None:
             "lock_digest": _digest(b"proof-lock"),
             "platform_target": target,
             "wheelhouse_manifest_digest": _digest(wheelhouse),
-            "wheels": [_wheel(entry) for entry, _ in resolved_pairs],
+            "wheels": [],
         }
     )
     config = _canonical({"width": 4})
@@ -168,12 +171,10 @@ def _prepare(args: argparse.Namespace) -> None:
     }
     config_path = _write(inputs / "model-config.json", config)
     wheel_files = {project.digest: str(endpoint_path)}
-    wheel_files.update({entry.digest: str(path.resolve()) for entry, path in resolved_pairs})
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
         "format": ENVIRONMENT_REQUEST_FORMAT,
         "python": str(args.python.resolve()),
-        "uv": str(args.uv.resolve()),
         "wheel_files": wheel_files,
     }
     for name in ("cold", "rebuild"):
@@ -193,6 +194,7 @@ def _prepare(args: argparse.Namespace) -> None:
             "environment_spec_digest": _digest(spec),
             "format": STATE_FORMAT,
             "project_wheel_digest": project.digest,
+            "wheelhouse_manifest": str(paths["wheelhouse_manifest"]),
         },
     )
 
@@ -200,6 +202,7 @@ def _prepare(args: argparse.Namespace) -> None:
 def _write_model_request(root: Path, name: str) -> None:
     state = _state(root)
     receipt = (root / f"receipt-{name}.json").read_bytes()
+    environment = _observation(root / f"environment-{name}.stdout")
     _json(
         root / f"model-{name}.json",
         {
@@ -221,6 +224,7 @@ def _write_model_request(root: Path, name: str) -> None:
                 "path": state["descriptor"],
             },
             "endpoint_release_id": "proof-release",
+            "environment_generation": environment["generation"],
             "environment_spec_digest": state["environment_spec_digest"],
             "format": MODEL_REQUEST_FORMAT,
             "installed_environment_receipt": {
@@ -228,6 +232,7 @@ def _write_model_request(root: Path, name: str) -> None:
                 "length": len(receipt),
             },
             "project_wheel_digest": state["project_wheel_digest"],
+            "wheelhouse_manifest": state["wheelhouse_manifest"],
         },
     )
 

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, environment, fill, provisioned, pull
+from cozy_runtime.internal import canonical, environment, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
@@ -473,6 +473,7 @@ def environment_input(
     resolved_wheel_set_bytes: bytes,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
+    include_base_wheel_grants: bool = True,
 ) -> environment.EnvironmentInput:
     """Join exact th-046 documents and fetched wheel paths without resolving anything."""
 
@@ -561,13 +562,19 @@ def environment_input(
         raise LaunchRefusal("wheel_digest_duplicate", "one digest has multiple owners")
     if len(distributions) != len(set(distributions)):
         raise LaunchRefusal("wheel_distribution_duplicate", "one distribution has multiple owners")
-    if set(wheel_paths) != set(digests):
-        missing = sorted(set(digests) - set(wheel_paths))
-        extra = sorted(set(wheel_paths) - set(digests))
+    granted_wheels = (
+        wheels
+        if include_base_wheel_grants
+        else [wheel for wheel in wheels if wheel.owner != "wheelhouse"]
+    )
+    granted_digests = {wheel.digest for wheel in granted_wheels}
+    if set(wheel_paths) != granted_digests:
+        missing = sorted(granted_digests - set(wheel_paths))
+        extra = sorted(set(wheel_paths) - granted_digests)
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
     grants = tuple(
         environment.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
-        for wheel in wheels
+        for wheel in granted_wheels
     )
     return environment.EnvironmentInput(
         environment_spec_bytes=environment_spec_bytes,
@@ -576,6 +583,54 @@ def environment_input(
         wheelhouse_manifest_bytes=wheelhouse_manifest_bytes,
         wheels=tuple(wheels),
         grants=grants,
+    )
+
+
+def endpoint_overlay_input(
+    *,
+    environment_spec_bytes: bytes,
+    endpoint_bundle_bytes: bytes,
+    resolved_wheel_set_bytes: bytes,
+    wheelhouse_manifest_bytes: bytes,
+    wheel_paths: Mapping[str, Path],
+) -> overlay.Input:
+    """Join publication documents to the endpoint-only overlay install.
+
+    The base wheelhouse document remains identity, but its wheel blobs do not travel to the
+    pod: those packages are already installed in the official PyTorch substrate. ``wheel_paths``
+    therefore names exactly the project wheel and optional custom wheels.
+    """
+
+    joined = environment_input(
+        environment_spec_bytes=environment_spec_bytes,
+        endpoint_bundle_bytes=endpoint_bundle_bytes,
+        resolved_wheel_set_bytes=resolved_wheel_set_bytes,
+        wheelhouse_manifest_bytes=wheelhouse_manifest_bytes,
+        wheel_paths=wheel_paths,
+        include_base_wheel_grants=False,
+    )
+    endpoint_wheels = tuple(wheel for wheel in joined.wheels if wheel.owner != "wheelhouse")
+    return overlay.Input(
+        environment_spec_digest=joined.environment_spec_digest,
+        base_family_digest=_digest(wheelhouse_manifest_bytes),
+        project_wheel_digest=next(
+            wheel.digest for wheel in endpoint_wheels if wheel.owner == "project"
+        ),
+        wheels=tuple(
+            overlay.Wheel(
+                distribution=wheel.distribution,
+                version=wheel.version,
+                filename=wheel.filename,
+                digest=wheel.digest,
+                length=wheel.length,
+                tags=wheel.tags,
+                owner="project" if wheel.owner == "project" else "custom",
+            )
+            for wheel in endpoint_wheels
+        ),
+        grants=tuple(
+            overlay.BlobGrant(grant.digest, grant.length, grant.path) for grant in joined.grants
+        ),
     )
 
 

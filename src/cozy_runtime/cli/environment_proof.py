@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, environment
+from cozy_runtime.internal import canonical, overlay
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.materialize_launch import LaunchRefusal, environment_input
+from cozy_runtime.internal.materialize_launch import LaunchRefusal, endpoint_overlay_input
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 REQUEST_FIELDS = {
@@ -24,7 +24,6 @@ REQUEST_FIELDS = {
     "format",
     "python",
     "resolved_wheel_set",
-    "uv",
     "wheel_files",
     "wheelhouse_manifest",
 }
@@ -37,7 +36,6 @@ class ProofRequest:
     resolved_wheel_set: Path
     wheelhouse_manifest: Path
     wheel_files: Mapping[str, Path]
-    uv: Path
     python: Path
     environment_root: Path
 
@@ -72,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "choose a separate absolute receipt path owned by the build seat",
                 Exit.validation,
             )
-        source = environment_input(
+        source = endpoint_overlay_input(
             environment_spec_bytes=_document_bytes(
                 request.environment_spec, "endpoint_environment_spec"
             ),
@@ -85,11 +83,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             wheel_paths=request.wheel_files,
         )
-        installed = environment.materialize(
+        installed = overlay.materialize(
             source,
             request.environment_root,
-            uv=request.uv,
             python=request.python,
+            base_manifest=request.wheelhouse_manifest,
             expected_receipt_digest="",
         )
         _publish_receipt(receipt_path, installed.receipt_bytes)
@@ -109,7 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CliError as err:
         emit_error(err, opts)
         return int(err.code)
-    except (LaunchRefusal, environment.EnvironmentRefusal) as err:
+    except (LaunchRefusal, overlay.OverlayRefusal) as err:
         emit_error(
             CliError(
                 err.code,
@@ -176,7 +174,6 @@ def _read_request(path: Path) -> ProofRequest:
         resolved_wheel_set=_existing_file(value["resolved_wheel_set"], "resolved_wheel_set"),
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,
-        uv=_existing_file(value["uv"], "uv"),
         python=_existing_file(value["python"], "python"),
         environment_root=environment_root,
     )

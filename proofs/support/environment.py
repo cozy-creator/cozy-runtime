@@ -34,7 +34,7 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
-RECEIPT_FORMAT = "cozy.worker.v1.InstalledEnvironmentReceipt/1"
+RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,7 +47,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("resolved", type=Path)
     prepare.add_argument("wheelhouse", type=Path)
     prepare.add_argument("torch", type=Path)
-    prepare.add_argument("uv", type=Path)
     prepare.add_argument("python", type=Path)
 
     sub.add_parser("verify").add_argument("root", type=Path)
@@ -96,7 +95,6 @@ def _prepare(args: argparse.Namespace) -> None:
     normal_paths = {
         project.digest: project_path,
         resolved.digest: resolved_path,
-        wheelhouse.digest: wheelhouse_path,
     }
     normal = _release(
         inputs / "normal",
@@ -107,8 +105,8 @@ def _prepare(args: argparse.Namespace) -> None:
         normal_paths,
     )
     for name in ("cold", "rebuild", "race-first", "race-second", "inside"):
-        _request(root, name, normal, root / f"environment-{name}", args.uv, args.python)
-    _request(root, "reuse", normal, root / "environment-cold", args.uv, args.python)
+        _request(root, name, normal, root / f"environment-{name}", args.python)
+    _request(root, "reuse", normal, root / "environment-cold", args.python)
 
     missing = dict(normal)
     missing["wheel_files"] = {
@@ -116,11 +114,11 @@ def _prepare(args: argparse.Namespace) -> None:
         for digest, path in _paths(normal["wheel_files"]).items()
         if digest != resolved.digest
     }
-    _request(root, "missing", missing, root / "environment-missing", args.uv, args.python)
+    _request(root, "missing", missing, root / "environment-missing", args.python)
 
     extra = dict(normal)
     extra["wheel_files"] = {**_paths(normal["wheel_files"]), torch.digest: torch_path}
-    _request(root, "extra", extra, root / "environment-extra", args.uv, args.python)
+    _request(root, "extra", extra, root / "environment-extra", args.python)
 
     corrupt_path = variants / "corrupt" / resolved.filename
     corrupt_path.parent.mkdir()
@@ -132,7 +130,7 @@ def _prepare(args: argparse.Namespace) -> None:
         **_paths(normal["wheel_files"]),
         resolved.digest: corrupt_path,
     }
-    _request(root, "corrupt", corrupt_request, root / "environment-corrupt", args.uv, args.python)
+    _request(root, "corrupt", corrupt_request, root / "environment-corrupt", args.python)
 
     renamed = _release(
         inputs / "renamed",
@@ -142,7 +140,7 @@ def _prepare(args: argparse.Namespace) -> None:
         (wheelhouse,),
         normal_paths,
     )
-    _request(root, "renamed", renamed, root / "environment-renamed", args.uv, args.python)
+    _request(root, "renamed", renamed, root / "environment-renamed", args.python)
 
     duplicate_path = variants / "duplicate" / resolved.filename
     duplicate_path.parent.mkdir()
@@ -161,7 +159,6 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             project.digest: project_path,
             duplicate.digest: duplicate_path,
-            wheelhouse.digest: wheelhouse_path,
         },
     )
     _request(
@@ -169,7 +166,6 @@ def _prepare(args: argparse.Namespace) -> None:
         "duplicate",
         duplicate_request,
         root / "environment-duplicate",
-        args.uv,
         args.python,
     )
 
@@ -188,7 +184,6 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             project.digest: project_path,
             expanded.digest: expanded_path,
-            wheelhouse.digest: wheelhouse_path,
         },
     )
     _request(
@@ -196,7 +191,6 @@ def _prepare(args: argparse.Namespace) -> None:
         "expanded",
         expanded_request,
         root / "environment-expanded",
-        args.uv,
         args.python,
     )
 
@@ -207,7 +201,6 @@ def _prepare(args: argparse.Namespace) -> None:
         "forbidden",
         forbidden,
         root / "environment-forbidden",
-        args.uv,
         args.python,
     )
 
@@ -218,9 +211,9 @@ def _prepare(args: argparse.Namespace) -> None:
         project,
         (resolved,),
         (wheelhouse, torch),
-        {**normal_paths, torch.digest: torch_path},
+        normal_paths,
     )
-    _request(root, "cuda", cuda, root / "environment-cuda", args.uv, args.python)
+    _request(root, "cuda", cuda, root / "environment-cuda", args.python)
 
 
 def _release(
@@ -283,7 +276,6 @@ def _request(
     name: str,
     release: Mapping[str, object],
     environment_root: Path,
-    uv: Path,
     python: Path,
 ) -> None:
     value = {
@@ -291,7 +283,6 @@ def _request(
         "environment_root": environment_root.resolve(),
         "format": REQUEST_FORMAT,
         "python": python.resolve(),
-        "uv": uv.resolve(),
     }
     _json(root / f"request-{name}.json", value)
 

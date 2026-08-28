@@ -61,9 +61,9 @@ from cozy_runtime.internal import (
     accel,
     child_env,
     egress,
-    environment,
     fill,
     hostfacts,
+    overlay,
     proctree,
     provisioned,
 )
@@ -174,7 +174,7 @@ class WorkerOptions:
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
     environment_root: Path | None = None
-    """The cr-027 materializer root whose receipt-keyed ``generations`` are selectable.
+    """The cr-027 overlay root whose receipt-keyed ``generations`` are selectable.
 
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
@@ -1625,10 +1625,10 @@ class Worker:
         Some missing => ABSENT with a typed fault, and the previous spec keeps serving
         (fallback-retention, #474).
 
-        `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured InstalledEnvironmentReceipt
-        equals the expected digest.  A receipt-keyed immutable generation is therefore
-        re-measured here before its Python can become the executor Python.  Missing canonical
-        materializer inputs remain MATERIALIZING; a corrupt/wrong receipt fails typed.
+        `MATERIALIZATION_STATE_STAGED` ASSERTS that the endpoint overlay receipt equals the
+        expected digest and names this image's base family. The image Python stays the
+        executor Python; only the endpoint import root changes. Missing canonical inputs
+        remain MATERIALIZING; a corrupt or wrong receipt fails typed.
         """
         assert self.placement is not None
         placement = self.placement
@@ -1650,14 +1650,14 @@ class Worker:
                 self.options.environment_root / "generations" / expected.removeprefix("sha256:")
             )
             try:
-                installed = environment.verify_generation(
+                installed = overlay.open_generation(
                     generation,
                     receipt_digest=expected,
                     environment_spec_digest=documents.spell(placement.environment_spec_digest),
                 )
-            except (environment.EnvironmentRefusal, OSError) as exc:
-                reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
-                unavailable = reason in {"environment_receipt_absent", "io_error"}
+            except (overlay.OverlayRefusal, OSError) as exc:
+                reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
+                unavailable = reason in {"overlay_receipt_absent", "io_error"}
                 if not unavailable:
                     placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
                 self.latch(
@@ -1673,15 +1673,15 @@ class Worker:
                     )
                 )
                 return
-            changed = self.supervision.use_generation(
-                str(installed.python), str(installed.bytecode_cache)
+            changed = self.supervision.use_overlay(
+                str(installed.python), str(installed.import_root)
             )
             if changed and self.supervision.current is not None:
                 self.supervision.current.poisoned = "installed environment generation changed"
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             self.note(
                 "materialization",
-                f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
+                f"opened overlay receipt {expected[:23]}… at {installed.generation}",
             )
         missing: list[str] = []
         plan_documents: dict[str, provisioned.ExactDocument] = {}
@@ -3131,7 +3131,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-root",
         default="",
-        help="cr-027 materializer root containing receipt-keyed immutable generations",
+        help="cr-027 endpoint-overlay root containing receipt-keyed immutable generations",
     )
     parser.add_argument(
         "--artifact-store",

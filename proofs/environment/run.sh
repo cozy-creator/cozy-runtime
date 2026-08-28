@@ -5,7 +5,6 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 support="$repo/proofs/support/environment.py"
 import_probe="$repo/proofs/support/environment_imports.py"
 shared_support="$repo/proofs/support/proof_data.py"
-private_proof="$repo/proofs/internal/environment_materializer.py"
 red_fixture="$repo/proofs/fixtures/environment-private-import-red.txt"
 uv_bin=$(command -v uv)
 proof_root=$(mktemp -d /tmp/cozy-environment-proof.XXXXXX)
@@ -49,7 +48,7 @@ test -n "$wheelhouse_wheel" && test -n "$torch_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
 UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
-    "$runtime_wheel"
+    "$runtime_wheel" "$wheelhouse_wheel" "$torch_wheel"
 driver_python="$proof_root/driver/bin/python"
 proof="$proof_root/driver/bin/cozy-environment-proof"
 
@@ -57,7 +56,7 @@ proof="$proof_root/driver/bin/cozy-environment-proof"
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
     ALL_PROXY=http://127.0.0.1:9 \
     "$driver_python" "$support" prepare "$proof_root" "$project_wheel" \
-    "$resolved_wheel" "$wheelhouse_wheel" "$torch_wheel" "$uv_bin" "$driver_python")
+    "$resolved_wheel" "$wheelhouse_wheel" "$torch_wheel" "$driver_python")
 
 run_proof() {
     name=$1
@@ -76,13 +75,14 @@ done
 for name in cold rebuild; do
     generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
         "$proof_root" "$name")
-    imported=$(cd / && env -u PYTHONPATH "$generation/venv/bin/python" -I "$import_probe" cpu)
+    imported=$(cd / && env -u PYTHONPATH "$driver_python" -I "$import_probe" \
+        "$generation/site-packages" cpu)
     test "$imported" = installed
 done
 cuda_generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
     "$proof_root" cuda)
-cuda_fact=$(cd / && env -u PYTHONPATH "$cuda_generation/venv/bin/python" -I \
-    "$import_probe" cuda)
+cuda_fact=$(cd / && env -u PYTHONPATH "$driver_python" -I "$import_probe" \
+    "$cuda_generation/site-packages" cuda)
 test "$cuda_fact" = "12.9 False"
 
 run_refusal() {
@@ -106,10 +106,10 @@ run_refusal() {
 
 run_refusal missing 6 wheel_grant_set_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
-run_refusal corrupt 6 wheel_digest_mismatch no
+run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
-run_refusal duplicate 6 wheel_member_duplicate no
-run_refusal expanded 6 wheel_expansion_cap no
+run_refusal duplicate 6 overlay_wheel_member_invalid no
+run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
@@ -134,9 +134,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-(cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
-    HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-    ALL_PROXY=http://127.0.0.1:9 \
-    "$driver_python" "$private_proof" "$proof_root")
-
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild receipts; exact digest/length, isolated imports, CUDA ABI without a device, atomic receipt race, no-partial-output refusals, and private generation reuse/tamper evidence passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; exact endpoint bytes, isolated imports over the installed base, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
