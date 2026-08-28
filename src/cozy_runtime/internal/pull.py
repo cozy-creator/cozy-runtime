@@ -21,8 +21,15 @@ the next invocation re-plans against the store and asks only for what is still m
 is no byte-range resume inside a single object — the artifact is already cut on the object
 grid, so the recovery unit is an object.
 
-**No magic timeouts.** A deadline arrives from the caller or there is none; the socket
-timeout is whatever is LEFT of that deadline. Nothing here invents a number of seconds.
+**No magic timeouts, and no unbounded silence either.** A deadline arrives from the caller
+or there is none, and nothing here invents a number of seconds to fail on. But the socket
+timeout used to be whatever was LEFT of that deadline, which made ONE black-holed TCP stream
+cost the whole budget: the read blocked, the pool waited on it, and a 96 GiB closure that
+moves at 470 MB/s died `readiness.deadline_exceeded` with 15 streams idle. The kill rule is
+cl-025's and it is RELATIVE: a stream that moved no bytes while its peers moved theirs is
+stalled, its socket is closed, and its object is re-fetched. When NO stream advances the link
+itself is down and nothing is singled out — the caller's deadline is the only authority then.
+The sampling interval is resolution, not a bound.
 
 **The wanted list is walked by N streams, not one.** An artifact is already cut on the
 object grid, so the objects are independent and the serial loop was leaving the whole link
@@ -35,7 +42,9 @@ enters at `fetch_admit`, and the proof is still `fetch_complete`.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -56,6 +65,30 @@ from cozy_runtime.internal import egress
 #: the right number is a property of the LINK, and this file has no way to measure the
 #: caller's.
 STREAMS = 16
+
+#: How often the stream watchdog SAMPLES the per-stream byte counters. Resolution, not a
+#: verdict: nothing is killed because this many seconds passed.
+STALL_SAMPLE_SECONDS = 5.0
+
+#: The NOISE FLOOR, in samples, below which silence is not evidence of anything. A pull whose
+#: chunks came back in milliseconds must not condemn a stream that is merely a second slow.
+STALL_SAMPLES = 6
+
+#: How many times the pull's OWN worst measured chunk gap a stream may be silent for before it
+#: is stalled. This is the term that carries the verdict, and it is measured: a link that has
+#: shown 30 s between chunks earns 30 s of patience, and one that has never paused earns the
+#: floor. Both conditions must hold, so neither a slow link nor a fast one is judged by the
+#: other's clock.
+STALL_FACTOR = 8.0
+
+#: How many times one object may be re-fetched. A grant is finite and the plan is per-object
+#: resumable, so a retry costs one object, not the pull. A stall or a transient object-store
+#: answer that survives this many attempts is the link, not a blip, and is reported as one.
+FETCH_ATTEMPTS = 4
+
+#: The object-store answers a re-fetch is worth attempting for. Everything else — an expired
+#: presign, an absent key — is a fact about authorization, and retrying it is a lie about time.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 #: The closed refusal registry for this leg. Every code here has a producer below, and the
 #: import-time check at the bottom of this module is the #503/#504 invariant: a code with no
@@ -471,19 +504,22 @@ class PullResult:
 class _Reader:
     """The HTTP body, handed to the border as a plain `.read(n)`.
 
-    It exists for one reason: to make the response's own read raise a PullRefusal rather than
+    It exists for two reasons: to make the response's own read raise a PullRefusal rather than
     a socket error, so a connection that dies mid-object is reported as `transfer_failed`
     naming the object — with nothing committed, because the border removes its partial temp
-    file before it returns.
+    file before it returns — and to be the one place every arriving byte is COUNTED, which is
+    what makes "this stream is not moving" a measurement instead of an opinion.
     """
 
-    def __init__(self, resp: Any, object_id: str) -> None:
+    def __init__(self, resp: Any, object_id: str, streams: _Streams | None = None) -> None:
         self._resp = resp
         self._id = object_id
+        self._streams = streams
+        self._key = threading.get_ident()
 
     def read(self, n: int) -> bytes:
         try:
-            return bytes(self._resp.read(n))
+            chunk = bytes(self._resp.read(n))
         except (OSError, urllib.error.URLError) as exc:
             raise PullRefusal(
                 "transfer_failed",
@@ -491,6 +527,119 @@ class _Reader:
                 "re-run the pull: it resumes per object and re-fetches only what is missing",
                 cause=str(exc),
             ) from exc
+        if chunk and self._streams is not None:
+            self._streams.moved(self._key, len(chunk))
+        return chunk
+
+
+class _Streams:
+    """The pull's own liveness ledger, and the one thing allowed to end a stream early.
+
+    A presigned GET that black-holes is indistinguishable from a slow one to the socket that
+    is waiting on it, and the socket's timeout is what is left of the caller's deadline — so
+    before this existed, one dead TCP stream held a pool slot for the entire budget and the
+    pull died on a deadline with the link mostly idle.
+
+    The rule is cl-025's, and it is MEASURED rather than invented: this ledger watches the gap
+    between one stream's chunks and remembers the longest gap the pull has actually shown. A
+    stream silent for longer than `STALL_FACTOR` times that measured worst case — and longer
+    than the sampling noise floor, so a millisecond link cannot condemn a one-second pause —
+    is stalled. Its socket is shut down so the blocked read raises, and `_fetch` asks for that
+    one object again. A genuinely slow link teaches this ledger its own pace and is left alone;
+    only a stream that has stopped, against the evidence of the same pull, is ended.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._advanced: dict[int, float] = {}
+        self._socket: dict[int, Any] = {}
+        self._stalled: set[int] = set()
+        self._worst_gap = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ---- the streams' side
+    def open(self, key: int) -> None:
+        with self._lock:
+            self._advanced[key] = time.monotonic()
+            self._socket.pop(key, None)
+            self._stalled.discard(key)
+
+    def bind(self, key: int, sock: Any) -> None:
+        with self._lock:
+            if sock is not None:
+                self._socket[key] = sock
+
+    def moved(self, key: int, count: int) -> None:
+        """One chunk arrived. Its GAP is the measurement the stall rule is judged against.
+
+        A stream this ledger has ALREADY named teaches it nothing. Its next `read` returns the
+        moment the socket is shut down, and counting that silence as the link's honest pace
+        would let every stall raise the patience that the next stall is judged by — the ledger
+        would talk itself out of its own rule, one object at a time.
+        """
+        now = time.monotonic()
+        with self._lock:
+            previous = self._advanced.get(key)
+            if previous is None:
+                return
+            self._advanced[key] = now
+            if key not in self._stalled:
+                self._worst_gap = max(self._worst_gap, now - previous)
+
+    def stalled(self, key: int) -> bool:
+        with self._lock:
+            return key in self._stalled
+
+    def done(self, key: int) -> None:
+        with self._lock:
+            self._advanced.pop(key, None)
+            self._socket.pop(key, None)
+            self._stalled.discard(key)
+
+    # ---- the watchdog's side
+    def __enter__(self) -> _Streams:
+        self._thread = threading.Thread(target=self._watch, name="pull-liveness", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _watch(self) -> None:
+        while not self._stop.wait(STALL_SAMPLE_SECONDS):
+            for sock in self._sample():
+                # SHUT_RDWR rather than close(): the blocked read is woken without the file
+                # descriptor being freed under a thread that is still inside a syscall on it.
+                with contextlib.suppress(OSError, ValueError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+    def _sample(self) -> list[Any]:
+        woken: list[Any] = []
+        now = time.monotonic()
+        with self._lock:
+            patience = max(STALL_FACTOR * self._worst_gap, STALL_SAMPLES * STALL_SAMPLE_SECONDS)
+            for key, advanced in self._advanced.items():
+                if now - advanced <= patience or key in self._stalled:
+                    continue
+                self._stalled.add(key)
+                sock = self._socket.get(key)
+                if sock is not None:
+                    woken.append(sock)
+        return woken
+
+
+def _socket_of(resp: Any) -> Any:
+    """The live socket under one urllib response, or None when the transport hides it.
+
+    Reaching for it is deliberate and best-effort: without it a stalled stream can only be
+    counted, not woken, and the leg degrades to exactly the behaviour it had before.
+    """
+    with contextlib.suppress(AttributeError):
+        return resp.fp.raw._sock
+    return None
 
 
 def pull(
@@ -695,6 +844,7 @@ def _execute_plan(
     """Run one TensorFS-authored plan and require its own completion proof."""
 
     ledger = threading.Lock()
+    liveness = _Streams()
 
     def degraded(code: str) -> None:
         with ledger:
@@ -728,6 +878,7 @@ def _execute_plan(
                 deadline,
                 allow_local,
                 no_proxy=no_proxy,
+                streams=liveness,
             )
             _backfill(tensorfs, store, cache_store, object_id, length, degraded)
             source = "cloud"
@@ -740,7 +891,7 @@ def _execute_plan(
                 on_object(object_id, length, True)
 
     wanted = [(str(o), int(n)) for o, n in plan["wanted"]]
-    with ThreadPoolExecutor(max_workers=streams, thread_name_prefix="pull") as pool:
+    with liveness, ThreadPoolExecutor(max_workers=streams, thread_name_prefix="pull") as pool:
         futures = [pool.submit(one, item) for item in wanted]
         done, pending = wait(futures, return_when=FIRST_EXCEPTION)
         failed = next((f for f in done if f.exception() is not None), None)
@@ -818,25 +969,66 @@ def _fetch(
     allow_local: bool,
     *,
     no_proxy: bool,
+    streams: _Streams | None = None,
 ) -> None:
-    try:
-        resp = open_guarded(url, deadline, allow_local=allow_local, no_proxy=no_proxy)
-    except urllib.error.HTTPError as exc:
-        raise PullRefusal(
-            "transfer_failed",
-            f"{object_id}: the object store answered {exc.code}",
-            "a presigned read expires; re-run the pull to be re-authorized",
-            cause=str(exc.reason),
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise PullRefusal(
-            "transfer_failed",
-            f"{object_id}: the object store did not answer",
-            "re-run the pull: it resumes per object",
-            cause=str(exc),
-        ) from exc
-    with resp:
-        _admit(tensorfs, store, plan_doc, object_id, _Reader(resp, object_id))
+    """Move ONE object across the door, re-asking for it while re-asking is honest.
+
+    The plan already made a retry cost one object rather than the pull, so the only question
+    is which failures deserve one. A stall the ledger NAMED, a connection that died, and the
+    object store's own retryable answers do; an expired presign and an absent key do not —
+    those are facts about authorization, and asking again is a lie about time.
+    """
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        last = attempt == FETCH_ATTEMPTS
+        key = threading.get_ident()
+        if streams is not None:
+            streams.open(key)
+        try:
+            try:
+                resp = open_guarded(url, deadline, allow_local=allow_local, no_proxy=no_proxy)
+            except urllib.error.HTTPError as exc:
+                if exc.code in RETRYABLE_STATUS and not last:
+                    continue
+                raise PullRefusal(
+                    "transfer_failed",
+                    f"{object_id}: the object store answered {exc.code}",
+                    "a presigned read expires; re-run the pull to be re-authorized",
+                    cause=str(exc.reason),
+                ) from exc
+            except urllib.error.URLError as exc:
+                if not last:
+                    continue
+                raise PullRefusal(
+                    "transfer_failed",
+                    f"{object_id}: the object store did not answer",
+                    "re-run the pull: it resumes per object",
+                    cause=str(exc),
+                ) from exc
+            try:
+                if streams is not None:
+                    streams.bind(key, _socket_of(resp))
+                with resp:
+                    _admit(tensorfs, store, plan_doc, object_id, _Reader(resp, object_id, streams))
+                return
+            except PullRefusal as exc:
+                stalled = streams is not None and streams.stalled(key)
+                if not last and (stalled or exc.code == "transfer_failed"):
+                    continue
+                if stalled:
+                    raise PullRefusal(
+                        "transfer_failed",
+                        f"{object_id}: the stream moved no bytes while its peers moved theirs, "
+                        f"{FETCH_ATTEMPTS} times",
+                        "this link drops streams rather than slowing them; re-run the pull, "
+                        "and if it repeats the route between this worker and the object store "
+                        "is the subject, not the artifact",
+                        cause=exc.code,
+                    ) from exc
+                raise
+        finally:
+            if streams is not None:
+                streams.done(key)
+    raise AssertionError("unreachable: the retry loop returns or raises on its last attempt")
 
 
 def _admit(tensorfs: Any, store: Any, plan_doc: bytes, object_id: str, source: Any) -> None:

@@ -226,8 +226,10 @@ Descriptor/1 behavior, canonical/local/strict key classification through a real 
 mixed-media grants and canonical invocation identity, and `--offline` execution while every
 AF_INET/6 connect is refused. Its private companion
 `proofs/internal/local_input_acceptance.py` owns transfer and RecordOwner fault plants; those
-private hooks are not presented as CLI evidence. The full scenario census and retired claims
-are recorded in `PROOF-SCENARIOS.md`.
+private hooks are not presented as CLI evidence. `proofs/internal/pull_stream_liveness.py`
+owns the transport's stream-liveness rule: a presigned GET that goes silent is named against
+the pull's own measured pace, re-asked, and refused by name — never held to the deadline. The
+full scenario census and retired claims are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
