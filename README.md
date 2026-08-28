@@ -162,34 +162,25 @@ weightless control plane only; this proof makes no claim about real Torch, GPU e
 loading, or output quality.
 
 The environment proof likewise builds and installs the exact Runtime wheel before invoking its
-public command from `/` with `PYTHONPATH` unset and offline process settings. Normal fixture
-packages replace generated source strings. The public path proves independent builds, exact
-receipt identity, isolated imports, atomic publication, and bounded refusals. The proof seat
-requires a fresh root by contract, so receipt-keyed reuse, wheel-store sharing, and installed-tree
-tamper refusals live in the explicitly private `proofs/internal/environment_materializer.py`
-check rather than masquerading as CLI behavior.
+public command from `/` with `PYTHONPATH` unset. Its base packages are installed once in the
+driver, exactly like an official PyTorch substrate. The command hashes and inspects only the
+project/custom wheels, extracts them into private staging, precompiles that small overlay, and
+atomically publishes it. Cold and independent rebuilds produce the same compact receipt.
 
-### Shared wheel store
+### Installed base plus endpoint overlay
 
-`internal/wheelstore.py` is a first-party, immutable, digest-keyed store of unpacked wheel trees
-at `/var/lib/cozy/wheel-store`, hardlinked into every venv. Without it each generation unpacked
-the whole Torch family again and shared zero inodes: two generations of one real 57-wheel CUDA
-endpoint cost 15 GB of disk and ~48 s each. With it the second generation costs 39 KB and ~26 s,
-at a byte-identical receipt.
+`internal/overlay.py` is the serving materializer. The image already contains Python,
+Torch/CUDA, cozy-runtime, TensorFS, and the registered base-family dependencies. A placement
+therefore installs only its deterministic project wheel and optional exact custom wheels. It
+never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
+archives after extraction.
 
-The hermetic seal is unchanged — still `--no-config --no-index --offline --no-deps --no-build
---no-cache` under `_sealed_env`. uv's own cache stays off: it is mutable, ambient, undigested
-state, and under endpoint stacking it would be a cross-tenant poisoning surface. The store is an
-input, not a resolver. It never downloads, never resolves, and never adds a distribution the
-exact inventory did not name, and it cannot poison a generation: every linked byte is re-hashed
-against its distribution's `RECORD` and every `record_digest` is re-measured into the receipt.
-
-Wheels the store already holds are hardlinked in; wheels it does not are unpacked by the same
-sealed `uv pip install` and then harvested into it, so the store fills itself and a substrate
-image can pre-populate it by materializing once. Entries are built in a private staging
-directory and renamed into place, so concurrent placements see an entry complete or absent.
-A store that cannot hardlink into the environments root fails closed with
-`wheel_store_cross_device` before anything is unpacked.
+The image's OCI digest owns image-resident integrity. Runtime checks the small baked
+`WheelhouseManifest` identity, rejects distribution/import-root shadowing, hashes each arriving
+endpoint wheel once, and publishes one read-only overlay by atomic rename. Reuse reads the small
+receipt and base-family manifest; it does not walk or re-hash every installed file. Base bytecode
+is baked in the image and endpoint bytecode is compiled once during overlay publication. The
+executor starts with image Python and APPENDS the overlay import root after image-owned paths.
 
 The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
@@ -203,9 +194,9 @@ are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the four exact release documents, every wheel file by digest,
-the pinned uv and Python executables, a fresh environment root, and a fresh receipt output. It
-installs offline through the same environment materializer the pod later replays, atomically
-publishes the materializer's exact measured receipt bytes, and prints their compact
+the installed-base Python, a fresh overlay root, and a fresh receipt output. `wheel_files`
+contains only the project and optional custom wheels; base wheel bytes do not travel. It
+atomically publishes the overlay receipt bytes and prints their compact
 digest/length/generation reference. It
 does not accept an expected receipt, author release documents, fetch, resolve, or import endpoint
 code.
@@ -221,15 +212,14 @@ set is closed; every path value is a normalized absolute local path:
   "resolved_wheel_set": "/proof/resolved-wheel-set.json",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
-  "uv": "/opt/cozy/bin/uv",
-  "python": "/opt/python/3.12/bin/python3.12",
+  "python": "/opt/conda/bin/python",
   "environment_root": "/proof/fresh-environment"
 }
 ```
 
-The receipt-keyed generation then exposes
+The receipt-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
-it re-verifies its own installed environment, compares the exact descriptor with the
+it verifies the overlay/base-family join, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
 offline construction sandbox. The fresh output directory appears atomically and contains
 `model-construction-proof.json` plus exact digest-named files under `contracts/`. Tensorhub
@@ -243,9 +233,11 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 ```json
 {
   "format": "cozy.runtime.ModelConstructionProofRequest/1",
+  "environment_generation": "/proof/environment/generations/<receipt>",
   "environment_spec_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
   "project_wheel_digest": "sha256:<64 lowercase hex>",
+  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "endpoint_release_id": "endpoint-release-id",
   "endpoint_descriptor": {
     "path": "/proof/endpoint.descriptor.json",

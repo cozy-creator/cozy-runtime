@@ -1,20 +1,20 @@
-"""Canonical release-document adapter for the offline environment materializer.
+"""Exact artifact intake and endpoint-overlay document join.
 
 Tensorhub owns the document schemas and delivery grants.  This module owns the one Runtime
-join from their already-fetched exact bytes to :class:`environment.EnvironmentInput`.  Local
-paths are deliberately function arguments: they never enter a canonical release document.
+join from their already-fetched exact bytes to :class:`overlay.Input`. Local paths are
+deliberately function arguments: they never enter a canonical release document.
 
 cr-048 RETIRED THE BOOT CLOSURE. ``tensorhub.rental_provision_spec/1`` and
 ``tensorhub.rental_provision_bundle/1`` named one endpoint's whole closure at boot — eight
 document roles, one artifact grant per wheel and weight, the whole materialization root
 keyed by the bundle digest — which is the pre-#459 one-pod-one-endpoint shape that rev-2's
 ``DesiredPlacementSet`` + ``ArtifactGrantUpdate`` replaced. The pod now boots to
-ready-but-EMPTY: control runtime verified, GPU inventory measured, listeners proven, receipt
+ready-but-EMPTY: GPU inventory measured, listeners proven, receipt
 published, zero placements. What survives here is the DISCIPLINE, not the vehicle:
 ``fetch_exact`` (one bounded exact-digest HTTPS grant) and ``materialize_objects`` (exact CAS
 admission) are the primitives the dynamic grant lane fetches through, and
-``materialize_exact``/``environment_input`` are the receipt-keyed join a placement converges
-to. Only the boot-only bundling retired.
+``endpoint_overlay_input`` is the small source/custom-wheel join a placement converges to.
+Only the boot-only bundling retired.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, environment, fill, overlay, provisioned, pull
+from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
@@ -43,9 +43,8 @@ WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
 BOOT_ROOT = LOCAL_DATA_ROOT / "boot"
 ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
-# Same filesystem as ENVIRONMENT_ROOT by construction: the store hardlinks into every venv.
-WHEEL_STORE_ROOT = LOCAL_DATA_ROOT / "wheel-store"
 LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
+ARTIFACT_CACHE_ROOT = LOCAL_DATA_ROOT / "artifacts"
 PLANS_ROOT = Path("/run/cozy/binding-plans")
 BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
 #: The canonical EMPTY ArtifactObjectSet. A pod that boots with no placement holds no
@@ -71,6 +70,7 @@ class PreparedBoot:
 
     artifact_store: Path
     artifact_object_set: Path
+    artifact_cache: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +99,7 @@ def prepare_boot(
     *,
     boot_root: Path = BOOT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
+    artifact_cache_root: Path = ARTIFACT_CACHE_ROOT,
 ) -> PreparedBoot:
     """Bring the pod to READY-BUT-EMPTY: check the deadline, lay two roots, publish one
     empty document. Nothing is read, nothing is fetched, nothing is hashed.
@@ -125,14 +126,21 @@ def prepare_boot(
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
     _directory(artifact_store_root)
+    _directory(artifact_cache_root)
     _directory(boot_root)
     object_set = boot_root / "artifact-object-set.json"
     _publish_exact(object_set, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
-    return PreparedBoot(artifact_store=artifact_store_root, artifact_object_set=object_set)
+    return PreparedBoot(
+        artifact_store=artifact_store_root,
+        artifact_object_set=object_set,
+        artifact_cache=artifact_cache_root,
+    )
 
 
-def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
-    """Fetch one bounded HTTPS grant without proxy, redirect, content transform, or alias."""
+def fetch_exact(
+    grant: Mapping[str, Any], root: Path, *, deadline: int, allow_local: bool = False
+) -> Path:
+    """Fetch one bounded exact grant without proxy, redirect, transform, or alias."""
 
     digest = grant.get("digest")
     length = grant.get("length")
@@ -176,6 +184,7 @@ def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
                     "Accept-Encoding": "identity",
                     "User-Agent": "cozy-materialize-launch/1",
                 },
+                allow_local=allow_local,
                 no_proxy=True,
             )
         except (OSError, urllib.error.URLError, pull.PullRefusal) as exc:
@@ -466,16 +475,15 @@ def _fsync(path: Path) -> None:
         os.close(descriptor)
 
 
-def environment_input(
+def endpoint_overlay_input(
     *,
     environment_spec_bytes: bytes,
     endpoint_bundle_bytes: bytes,
     resolved_wheel_set_bytes: bytes,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
-    include_base_wheel_grants: bool = True,
-) -> environment.EnvironmentInput:
-    """Join exact th-046 documents and fetched wheel paths without resolving anything."""
+) -> overlay.Input:
+    """Join exact publication documents and endpoint-only wheel grants."""
 
     spec = _document(environment_spec_bytes, "environment_spec")
     bundle = _document(endpoint_bundle_bytes, "endpoint_bundle")
@@ -562,111 +570,22 @@ def environment_input(
         raise LaunchRefusal("wheel_digest_duplicate", "one digest has multiple owners")
     if len(distributions) != len(set(distributions)):
         raise LaunchRefusal("wheel_distribution_duplicate", "one distribution has multiple owners")
-    granted_wheels = (
-        wheels
-        if include_base_wheel_grants
-        else [wheel for wheel in wheels if wheel.owner != "wheelhouse"]
-    )
+    granted_wheels = [wheel for wheel in wheels if wheel.owner != "base"]
     granted_digests = {wheel.digest for wheel in granted_wheels}
     if set(wheel_paths) != granted_digests:
         missing = sorted(granted_digests - set(wheel_paths))
         extra = sorted(set(wheel_paths) - granted_digests)
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
-    grants = tuple(
-        environment.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
-        for wheel in granted_wheels
-    )
-    return environment.EnvironmentInput(
-        environment_spec_bytes=environment_spec_bytes,
-        environment_spec_digest=_digest(environment_spec_bytes),
-        endpoint_bundle_bytes=endpoint_bundle_bytes,
-        wheelhouse_manifest_bytes=wheelhouse_manifest_bytes,
-        wheels=tuple(wheels),
-        grants=grants,
-    )
-
-
-def endpoint_overlay_input(
-    *,
-    environment_spec_bytes: bytes,
-    endpoint_bundle_bytes: bytes,
-    resolved_wheel_set_bytes: bytes,
-    wheelhouse_manifest_bytes: bytes,
-    wheel_paths: Mapping[str, Path],
-) -> overlay.Input:
-    """Join publication documents to the endpoint-only overlay install.
-
-    The base wheelhouse document remains identity, but its wheel blobs do not travel to the
-    pod: those packages are already installed in the official PyTorch substrate. ``wheel_paths``
-    therefore names exactly the project wheel and optional custom wheels.
-    """
-
-    joined = environment_input(
-        environment_spec_bytes=environment_spec_bytes,
-        endpoint_bundle_bytes=endpoint_bundle_bytes,
-        resolved_wheel_set_bytes=resolved_wheel_set_bytes,
-        wheelhouse_manifest_bytes=wheelhouse_manifest_bytes,
-        wheel_paths=wheel_paths,
-        include_base_wheel_grants=False,
-    )
-    endpoint_wheels = tuple(wheel for wheel in joined.wheels if wheel.owner != "wheelhouse")
     return overlay.Input(
-        environment_spec_digest=joined.environment_spec_digest,
+        environment_spec_digest=_digest(environment_spec_bytes),
         base_family_digest=_digest(wheelhouse_manifest_bytes),
-        project_wheel_digest=next(
-            wheel.digest for wheel in endpoint_wheels if wheel.owner == "project"
-        ),
-        wheels=tuple(
-            overlay.Wheel(
-                distribution=wheel.distribution,
-                version=wheel.version,
-                filename=wheel.filename,
-                digest=wheel.digest,
-                length=wheel.length,
-                tags=wheel.tags,
-                owner="project" if wheel.owner == "project" else "custom",
-            )
-            for wheel in endpoint_wheels
-        ),
+        project_wheel_digest=project.digest,
+        wheels=tuple(granted_wheels),
         grants=tuple(
-            overlay.BlobGrant(grant.digest, grant.length, grant.path) for grant in joined.grants
+            overlay.BlobGrant(wheel.digest, wheel.length, wheel_paths[wheel.digest])
+            for wheel in granted_wheels
         ),
     )
-
-
-def materialize_exact(
-    source: environment.EnvironmentInput,
-    root: Path,
-    *,
-    uv: Path,
-    expected_receipt_bytes: bytes,
-    store: Path | None = None,
-) -> environment.InstalledEnvironment:
-    """Materialize and require byte identity with th-046's proof-seat receipt."""
-
-    try:
-        expected = _document(expected_receipt_bytes, "expected_environment_receipt")
-    except LaunchRefusal:
-        raise
-    if expected.get("format") != environment.RECEIPT_FORMAT:
-        raise LaunchRefusal("expected_environment_receipt_format", str(expected.get("format")))
-    expected_digest = _digest(expected_receipt_bytes)
-    try:
-        installed = environment.materialize(
-            source,
-            root,
-            uv=uv,
-            expected_receipt_digest=expected_digest,
-            store=store,
-        )
-    except environment.EnvironmentRefusal as exc:
-        raise LaunchRefusal(exc.code, exc.detail) from exc
-    if installed.receipt_bytes != expected_receipt_bytes:
-        raise LaunchRefusal(
-            "expected_environment_receipt_bytes_mismatch",
-            f"measured {installed.receipt_digest}, exact expected bytes differ",
-        )
-    return installed
 
 
 def _document(raw: bytes, name: str) -> dict[str, Any]:
@@ -709,7 +628,7 @@ def _matches(raw: bytes, digest: str, name: str) -> None:
         )
 
 
-def _wheels(value: object, owner: str) -> list[environment.WheelInventoryEntry]:
+def _wheels(value: object, owner: str) -> list[overlay.Wheel]:
     if not isinstance(value, list):
         raise LaunchRefusal(f"{owner}_wheel_inventory_invalid", "wheels is not a list")
     wheels = [_wheel(row, owner) for row in value]
@@ -721,7 +640,7 @@ def _wheels(value: object, owner: str) -> list[environment.WheelInventoryEntry]:
     return wheels
 
 
-def _wheel(value: object, owner: str) -> environment.WheelInventoryEntry:
+def _wheel(value: object, owner: str) -> overlay.Wheel:
     keys = {"digest", "distribution", "filename", "length", "tags", "version"}
     if not isinstance(value, dict) or set(value) != keys:
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel row has the wrong fields")
@@ -741,14 +660,14 @@ def _wheel(value: object, owner: str) -> environment.WheelInventoryEntry:
         or tags != sorted(set(tags))
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "tags are not non-empty sorted unique")
-    return environment.WheelInventoryEntry(
+    return overlay.Wheel(
         distribution=value["distribution"],
         version=value["version"],
         filename=value["filename"],
         digest=str(digest),
         length=length,
         tags=tuple(tags),
-        owner=owner,
+        owner={"project": "project", "bundle": "custom", "wheelhouse": "base"}[owner],
     )
 
 

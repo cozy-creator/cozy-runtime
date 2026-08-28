@@ -171,6 +171,8 @@ def _start_worker(
         grant_roots,
         "--environment-root",
         str(ENVIRONMENT_ROOT),
+        "--artifact-cache",
+        str(prepared.artifact_cache),
         "--artifact-store",
         str(prepared.artifact_store),
         "--artifact-object-set",
