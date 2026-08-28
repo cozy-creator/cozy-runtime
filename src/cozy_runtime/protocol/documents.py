@@ -61,10 +61,13 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 #: two versions of one document exactly as the name domain-separates two documents. Read
 #: independently per language (#510g) — this map is the reader on this side of the wire.
 #:
-#: Everything is /1 except `AttemptOutcomeBody`, whose /3 adds exact committed artifact
-#: receipts to /2's structural `execution_started` bit (th-049). Without this map the worker
-#: would digest an outcome under a tag no rev-5 peer computes.
-DOC_VERSION = {"cozy.worker.v1.AttemptOutcomeBody": 3}
+#: `PlacementSet` and nested `PlacementSpec` move together: /2 adds the exact model-object
+#: set to desired-state identity. AttemptOutcomeBody/3 carries committed artifact receipts.
+DOC_VERSION = {
+    "cozy.worker.v1.AttemptOutcomeBody": 3,
+    "cozy.worker.v1.PlacementSet": 2,
+    "cozy.worker.v1.PlacementSpec": 2,
+}
 
 
 def doc_format(full_name: str) -> str:

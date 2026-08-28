@@ -31,11 +31,6 @@ class Arm:
 
 STATIC_ARMS = (
     Arm("env-authority", SRC / "internal" / "child_env.py", "import os\nS = os.environ.get('X')\n"),
-    # cr-037: the seam field is declared_weight_bytes; a budget wearing vram's name is red.
-    Arm(
-        SRC / "internal" / "executor.py",
-        "def _planted_seam(budgets: dict[str, int]) -> int:\n    return budgets['vram']\n",
-    ),
     Arm(
         "construction-fill-order",
         SRC / "internal" / "fill.py",

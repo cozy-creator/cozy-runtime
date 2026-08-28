@@ -12,7 +12,10 @@ class ProbeFailure(RuntimeError):
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(argv or ())
-    if args == ["cpu"]:
+    if len(args) != 2:
+        raise ProbeFailure("usage: environment_imports.py OVERLAY cpu|cuda")
+    sys.path.append(args[0])
+    if args[1] == "cpu":
         import proof_environment_project
         import proof_environment_resolved
         import proof_environment_wheelhouse
@@ -26,7 +29,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProbeFailure(f"unexpected installed fixture values: {values!r}")
         print("installed")
         return 0
-    if args == ["cuda"]:
+    if args[1] == "cuda":
         import torch
 
         fact = (torch.version.cuda, torch.cuda.is_available())
@@ -34,7 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProbeFailure(f"unexpected installed CUDA fact: {fact!r}")
         print("12.9 False")
         return 0
-    raise ProbeFailure("usage: environment_imports.py cpu|cuda")
+    raise ProbeFailure("usage: environment_imports.py OVERLAY cpu|cuda")
 
 
 if __name__ == "__main__":

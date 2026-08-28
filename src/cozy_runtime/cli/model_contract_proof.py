@@ -1,7 +1,7 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
-The command runs only from a receipt-keyed environment generation created by the one
-offline materializer. It re-verifies that generation, then delegates endpoint import and
+The command runs from the installed substrate Python plus a receipt-keyed endpoint overlay.
+It verifies that small overlay receipt and base-family join, then delegates endpoint import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
 digest-addressed result directory by atomic rename.
@@ -26,7 +26,7 @@ from typing import Any
 
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, contract, environment, sandbox
+from cozy_runtime.internal import canonical, contract, overlay, sandbox
 from cozy_runtime.internal import descriptor as endpoint_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StaleDescriptor
@@ -47,10 +47,12 @@ REQUEST_FIELDS = {
     "bindings",
     "endpoint_descriptor",
     "endpoint_release_id",
+    "environment_generation",
     "environment_spec_digest",
     "format",
     "installed_environment_receipt",
     "project_wheel_digest",
+    "wheelhouse_manifest",
 }
 REF_FIELDS = {"digest", "length"}
 LOCAL_REF_FIELDS = {"digest", "length", "path"}
@@ -90,12 +92,14 @@ class BindingRequest:
 
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
+    environment_generation: Path
     environment_spec_digest: str
     installed_environment_receipt: DocumentRef
     project_wheel_digest: str
     endpoint_release_id: str
     endpoint_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
+    wheelhouse_manifest: Path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -117,15 +121,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         request_path = _cli_input_path(args[0])
         output = _cli_output_path(args[1])
         request = _read_request(request_path)
-        generation, python = _installed_paths()
-        if output.is_relative_to(generation):
+        installed = _verify_installed_generation(request)
+        if output.is_relative_to(installed.generation):
             raise CliError(
                 "model_contract_output_invalid",
                 "the proof output must be outside the immutable environment generation",
                 "choose a separate fresh output directory owned by the build seat",
                 Exit.validation,
             )
-        response = _run_child(python, request_path)
+        response = _run_child(installed.python, request_path)
         index, documents = _decode_child(response, request)
         index_bytes = canonical.write(index)
         _publish(output, index_bytes, documents)
@@ -156,7 +160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             opts,
         )
         return int(Exit.structural)
-    except environment.EnvironmentRefusal as err:
+    except overlay.OverlayRefusal as err:
         emit_error(
             CliError(
                 err.code,
@@ -217,6 +221,9 @@ def _read_request(path: Path) -> ProofRequest:
     ):
         raise _request_error("endpoint_release_id is not one bounded non-empty string")
     return ProofRequest(
+        environment_generation=_existing_directory(
+            value["environment_generation"], "environment_generation"
+        ),
         environment_spec_digest=_digest(
             value["environment_spec_digest"], "environment_spec_digest"
         ),
@@ -227,6 +234,7 @@ def _read_request(path: Path) -> ProofRequest:
         endpoint_release_id=release,
         endpoint_descriptor=_local_ref(value["endpoint_descriptor"], "endpoint_descriptor"),
         bindings=bindings,
+        wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
     )
 
 
@@ -300,6 +308,18 @@ def _existing_file(value: object, name: str) -> Path:
     return path
 
 
+def _existing_directory(value: object, name: str) -> Path:
+    path = _absolute_path(value, name)
+    try:
+        path = path.resolve(strict=True)
+        info = path.lstat()
+    except OSError as err:
+        raise _request_error(f"{name} is unreadable: {type(err).__name__}") from err
+    if not stat.S_ISDIR(info.st_mode):
+        raise _request_error(f"{name} is not a directory")
+    return path
+
+
 def _absolute_path(value: object, name: str) -> Path:
     if not isinstance(value, str) or not value:
         raise _request_error(f"{name} is not a non-empty path string")
@@ -343,12 +363,12 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _verify_installed_generation(request: ProofRequest) -> environment.InstalledEnvironment:
-    generation, _ = _installed_paths()
-    installed = environment.verify_generation(
-        generation,
+def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOverlay:
+    installed = overlay.open_generation(
+        request.environment_generation,
         receipt_digest=request.installed_environment_receipt.digest,
         environment_spec_digest=request.environment_spec_digest,
+        base_manifest=request.wheelhouse_manifest,
         reused=True,
     )
     if len(installed.receipt_bytes) != request.installed_environment_receipt.length:
@@ -366,18 +386,6 @@ def _verify_installed_generation(request: ProofRequest) -> environment.Installed
             "verified environment receipt names a different project wheel",
         )
     return installed
-
-
-def _installed_paths() -> tuple[Path, Path]:
-    prefix = Path(sys.prefix).resolve()
-    if prefix.name != "venv":
-        raise ProofRefusal(
-            "model_contract_environment_unbound",
-            f"sys.prefix {prefix} is not a materializer generation's venv",
-        )
-    generation = prefix.parent
-    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    return generation, python
 
 
 def _run_child(python: Path, request: Path) -> dict[str, Any]:
@@ -443,7 +451,8 @@ def _child_entry(args: Sequence[str]) -> int:
     try:
         request_path = _existing_file(args[0], "request")
         request = _read_request(request_path)
-        _verify_installed_generation(request)
+        installed = _verify_installed_generation(request)
+        sys.path.append(str(installed.import_root))
         descriptor_doc = _read_descriptor(request.endpoint_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:
@@ -465,7 +474,7 @@ def _child_entry(args: Sequence[str]) -> int:
     except ProofRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
-    except environment.EnvironmentRefusal as err:
+    except overlay.OverlayRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
     except (ConformanceError, StaleDescriptor, contract.ContractError) as err:

@@ -28,7 +28,6 @@ from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
-    MATERIALIZER_UV,
     LaunchRefusal,
     PreparedBoot,
     prepare_boot,
@@ -177,17 +176,12 @@ def _start_worker(
         grant_roots,
         "--environment-root",
         str(ENVIRONMENT_ROOT),
+        "--artifact-cache",
+        str(prepared.artifact_cache),
         "--artifact-store",
         str(prepared.artifact_store),
         "--artifact-object-set",
         str(prepared.artifact_object_set),
-        # THE DYNAMIC LANE'S TWO GRANTS (cr-049). The pod boots empty; the first placement
-        # arrives afterwards and has to be FETCHED and BUILT, so the worker is told where to
-        # put exact bytes and where the substrate baked the one materializer's `uv`.
-        "--artifact-cache",
-        str(prepared.artifact_cache),
-        "--materializer-uv",
-        str(MATERIALIZER_UV),
         "--tls-cert",
         str(config.tls_cert_path),
         "--tls-key",
@@ -204,7 +198,7 @@ def _start_worker(
 
 
 def _supervise(process: subprocess.Popen[bytes]) -> int:
-    """Keep the adapter coupled to its worker; XS owns media and whole-pod supervision."""
+    """Keep the adapter coupled to its worker; cozy-pod owns media and whole-pod supervision."""
 
     stopped = False
     terminate_at = 0.0

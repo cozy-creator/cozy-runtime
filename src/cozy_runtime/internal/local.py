@@ -265,6 +265,7 @@ class LocalRecordOwner:
         workspace: Path,
         *,
         release_id: str,
+        model_object_set: bytes = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}',
         auto_ack: bool = True,
         on_progress: Any = None,
         ready_timeout: float = 1800.0,
@@ -276,6 +277,7 @@ class LocalRecordOwner:
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
         self.release_id = release_id
+        self.model_object_set = model_object_set
         self.auto_ack = auto_ack
         self.ready_timeout = ready_timeout
         self.ended = "unstarted"
@@ -595,9 +597,11 @@ class LocalRecordOwner:
             return directive
         # THE SET IS CONTENT-ADDRESSED, NOT ECHO-ADDRESSED (§4). The one-digester rule
         # (#454) is retired with the duplicate structured representation it needed: the
-        # RecordOwner authors the canonical `PlacementSet/1` document ONCE and sends its
+        # RecordOwner authors the canonical `PlacementSet/2` document ONCE and sends its
         # exact bytes, and the worker RECOMPUTES the digest before parsing a field. There is
         # no second place for the set to disagree with itself.
+        object_set_ref = _exact_ref(self.model_object_set)
+        object_set_digest = str(object_set_ref["digest"])
         placement_set = pb.PlacementSet(
             placements=[
                 pb.Placement(
@@ -618,6 +622,12 @@ class LocalRecordOwner:
                             )
                             for plan_id in sorted(set(self.bindings.values()))
                         ],
+                        model_object_set=pb.ArtifactSubject(
+                            subject_id=object_set_digest,
+                            kind="model_object_set",
+                            digest=documents.raw(object_set_digest),
+                            length=len(self.model_object_set),
+                        ),
                     ),
                 )
             ]
@@ -1074,7 +1084,17 @@ def run_slice(
         plan_refs.update(staged.plan_refs)
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
-        request, plans, plan_refs, workspace, release_id=release_id, auto_ack=auto_ack
+        request,
+        plans,
+        plan_refs,
+        workspace,
+        release_id=release_id,
+        model_object_set=(
+            staged.artifact_object_set.read_bytes()
+            if staged is not None
+            else b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
+        ),
+        auto_ack=auto_ack,
     )
     options = options or WorkerOptions(root=workspace / "worker")
     if staged is not None:

@@ -1,8 +1,7 @@
 #!/bin/sh
-# cr-048 + cr-049 boot proof: build this tree's wheel and the endpoint fixture's, bake them
-# into a substrate stand-in image beside the pinned `uv`, and BOOT it with no provision
-# document. The pod then receives its FIRST placement set over the wire and must fetch,
-# materialize and serve it. See proofs/boot/pod.py for what is measured.
+# cr-048 + cr-049 boot proof: build this tree's wheel and the endpoint fixture, install only
+# the Runtime/base family into the substrate stand-in, and BOOT with no provision document.
+# The pod then receives its FIRST placement and must fetch, overlay, and serve it.
 set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -24,9 +23,6 @@ mkdir -p "$proof_root/context/wheels"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/context/wheels" "$repo"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/context/wheels" \
     "$repo/proofs/fixtures/cli-project"
-# The materializer's `uv` is BAKED, exactly as the substrate bakes it: internal/environment.py
-# pins its digest, length and version, so any other binary refuses before a venv is created.
-cp "$(readlink -f "$uv_bin")" "$proof_root/context/uv"
 cp "$here/Dockerfile" "$here/pod.py" "$here/hub.py" "$here/nvidia-smi" \
     "$repo/proofs/support/proof_data.py" "$proof_root/context/"
 

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """cr-048's boot proof: a pod that boots with NO provision document, ready and empty.
 
-This process stands in for `cozy-bootstrap` + `cozy-media` — the two things the adapter is
-launched by and beside, and neither of which this repo owns. It makes exactly the grants
-the substrate makes (TLS keypair, boot id, renter-token hashes, the media listener, the
-closed COZY_ADAPTER_* environment), execs the real `cozy-materialize-launch`, and then
+This process is the Runtime-side contract stand-in for cozy-creator's single `cozy-pod`
+binary. It makes the same grants (TLS keypair, boot id, renter-token hashes, its in-process
+media listener, and the closed COZY_ADAPTER_* environment), execs the real adapter, and then
 observes what a rented pod's two consumers observe: tensorhub's receipt, and a
 RecordOwner's Claim.
 
 What it proves, and every line of it is measured rather than asserted by construction:
 
   * the adapter boots on nine environment names and reads no document at all;
-  * the receipt says NOTHING about the pod's own image — the eight retired fields, the
-    control-Runtime wheel measurement among them, are absent, and the worker reports an
-    empty `worker_artifact_digest` rather than a hash of bytes the hub itself pinned;
+  * the attempt id is spent as worker identity, not echoed through the receipt;
+  * the pod does not re-measure image-resident Runtime/base bytes;
+  * the old closure and identity-echo fields are GONE from the receipt;
   * both listeners bound and both refused a foreign credential;
   * the worker admits the renter's real token and reports ZERO placements, an empty
     accepted set, and no endpoint release — ready, and empty.
@@ -24,8 +23,8 @@ placement that took a private door would prove nothing about the tenth:
   * a standing `ArtifactGrantUpdate` lands and is echoed back, changing no revision;
   * one `DesiredPlacementSet` names an environment, a receipt and a binding plan by digest —
     and NOTHING else crosses;
-  * the worker FETCHES the whole closure it reaches, BUILDS the environment, and measures
-    the same receipt the hub measured independently;
+  * the worker fetches source/custom wheels, publishes a small installed-base overlay, and
+    derives the same receipt the hub derived independently;
   * it reports `STAGED` x `DISPATCHABLE` with `converged_revision` = the accepted revision;
   * it SERVES a real attempt against the endpoint installed in that generation;
   * and a following revision naming an unauthorized digest is refused typed while the
@@ -56,10 +55,8 @@ from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR, 
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
-STATE = Path("/run/cozy/bootstrap")
+STATE = Path("/run/cozy/pod")
 MEDIA_ROOT = Path("/run/cozy/media")
-CONTROL_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
-MATERIALIZER_UV = Path("/opt/cozy/control-runtime/uv")
 WHEELS = Path("/wheels")
 ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
 ARTIFACT_CACHE = Path("/var/lib/cozy/artifacts")
@@ -70,17 +67,9 @@ ARTIFACT_PORT = 43102
 DEADLINE = int(time.time()) + 1800
 
 RETIRED_RECEIPT_FIELDS = (
-    # The hub verifies this payload under a key minted for ONE attempt and recovered from
-    # that attempt's own create bytes, so a receipt that authenticates has already said
-    # which attempt it belongs to. Echoing the ids let the binder re-derive that from guest
-    # bytes; `pod_boot_id` is the identity this pod actually measured.
     "acquisition_attempt_id",
     "acquisition_attempt_ordinal",
     "artifact_sources",
-    # The pod does not measure its own image. Tensorhub registers an execution substrate
-    # as `name@sha256:…` and refuses a tag, so the control-Runtime wheel baked inside it
-    # is a fact the hub CHOSE; hashing it on the pod to report it back proves nothing the
-    # OCI digest had not already proven before this process started.
     "measured_control_runtime_wheel_digest",
     "measured_control_runtime_wheel_length",
     "measured_installed_environment_receipt_digest",
@@ -167,7 +156,7 @@ def mint_tls() -> tuple[Path, Path]:
 
 
 class MediaStandIn(http.server.BaseHTTPRequestHandler):
-    """cozy-media's authenticated health route, and nothing else.
+    """cozy-pod's in-process authenticated health route, and nothing else.
 
     The adapter proves the media listener refuses a FOREIGN bearer before it will publish a
     receipt; that refusal is the property, so the stand-in implements exactly it.
@@ -460,12 +449,10 @@ def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict
 
 
 def author_release() -> hub.Release:
-    """Author one endpoint release from the wheels the substrate stand-in baked.
+    """Author one endpoint release against the stand-in's installed base family.
 
-    The wheelhouse is the control Runtime and its three ordinary dependencies: the executor
-    runs `cozy_runtime.internal.executor` under the MATERIALIZED generation's python, so an
-    environment that could not import it could not serve at all. That is the point — the
-    generation this proof builds is the one the attempt actually executes in.
+    The wheelhouse is the control Runtime and its three ordinary dependencies, already
+    installed in image Python. The project wheel is absent until the grant lands.
     """
 
     project = next(WHEELS.glob("proof_cli_endpoint-*.whl"))
@@ -478,8 +465,8 @@ def author_release() -> hub.Release:
         wheelhouse_wheels=wheelhouse,
         target=hub.platform_target(version, libc),
         build_root=Path("/run/cozy/hub-build"),
-        uv=MATERIALIZER_UV,
         python=Path(sys.executable),
+        base_manifest=Path("/opt/cozy/base-runtime/WheelhouseManifest.json"),
     )
 
 
@@ -547,10 +534,7 @@ def main() -> int:
         for field in RETIRED_RECEIPT_FIELDS:
             assert field not in receipt, f"{field} survived the closure retirement"
 
-        # THE POD NEVER OPENED ITS OWN IMAGE. The wheel is right there at its fixed path
-        # and the receipt says nothing about it: what the hub pinned, the hub knows.
-        assert CONTROL_WHEEL.is_file(), "the substrate stand-in did not bake the wheel"
-        note(f"{len(RETIRED_RECEIPT_FIELDS)} image/closure fields absent from the receipt")
+        note(f"{len(RETIRED_RECEIPT_FIELDS)} closure/image echo fields are absent")
 
         # READY, AND EMPTY: nothing was materialized, because nothing named anything.
         object_set = Path("/var/lib/cozy/boot/artifact-object-set.json").read_bytes()
@@ -576,10 +560,6 @@ def main() -> int:
             assert owner.snapshot.get("held_attempts", []) == []
             assert ack.worker_id == "ra-cr048bootproof", ack
             assert ack.worker_release_id == "", ack
-            # `worker_artifact_digest` is where SUBSTRATE identity rides and nowhere else
-            # (#487/#489), and the only substrate identity a pod could measure from inside
-            # is its own image — which the hub pinned by digest. So it is ABSENT here, the
-            # way `worker_release_id` is: #481's "absent stays absent".
             assert ack.worker_artifact_digest == "", ack
             note(
                 f"renter Claim ACCEPTED: phase={pb.WorkerPhase.Name(empty.worker_phase)} "
@@ -628,23 +608,25 @@ def main() -> int:
             assert staged.placements[0].placement_id == hub.PLACEMENT_ID, describe(staged)
             assert staged.placements[0].dispatchable_plan_ids, describe(staged)
             assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+            assert hub.overlap_proven(), "endpoint wheel and model object-set fetches serialized"
             note(f"CONVERGED: {describe(staged)}")
+            note("endpoint-source and model-object-set GETs overlapped at the origin barrier")
 
-            # THE POD BUILT THE ENVIRONMENT ITSELF, and measured the hub's exact receipt.
+            # THE POD BUILT ONLY THE ENDPOINT OVERLAY and derived the hub's exact receipt.
             expected = "sha256:" + hashlib.sha256(release.receipt).hexdigest()
             generation = ENVIRONMENT_ROOT / "generations" / expected.removeprefix("sha256:")
             assert generation.is_dir(), f"no generation at {generation}"
-            assert (
-                generation / "installed-environment-receipt.json"
-            ).read_bytes() == release.receipt, "the pod's receipt bytes differ from the hub's"
-            assert (generation / "venv" / "bin" / "python").exists()
+            assert (generation / "endpoint-overlay-receipt.json").read_bytes() == release.receipt, (
+                "the pod's receipt bytes differ from the hub's"
+            )
+            assert (generation / "site-packages" / "proof_cli_endpoint").is_dir()
             # THE WORKER FETCHED THE REACHABLE CLOSURE AND NOTHING ELSE. The grant
             # authorizes the evaluated config too, and no document in the walk names it, so
             # it stays INERT and unfetched — rev-2 §3's rule that a grant may authorize more
             # than a spec reaches, observed rather than asserted.
             fetched = {"sha256:" + p.name for p in ARTIFACT_CACHE.iterdir()}
-            reached = {d for d, kind in release.kinds.items() if kind != "config"}
-            inert = {d for d, kind in release.kinds.items() if kind == "config"}
+            reached = {d for d, kind in release.kinds.items() if kind not in {"config", "receipt"}}
+            inert = {d for d, kind in release.kinds.items() if kind in {"config", "receipt"}}
             assert fetched == reached, sorted(fetched ^ reached)
             assert inert and not (fetched & inert), sorted(inert)
             note(
@@ -674,7 +656,7 @@ def main() -> int:
             refused = owner.await_state(
                 lambda state: (
                     state.accepted_desired_state_revision == 2
-                    and any(f.reason == "artifact_unauthorized" for f in state.faults)
+                    and any(f.reason == "overlay_receipt_mismatch" for f in state.faults)
                 ),
                 "a typed refusal of the unauthorized revision",
                 seconds=180,
@@ -693,7 +675,7 @@ def main() -> int:
                 refused.placements[0].placement_spec_digest
                 == staged.placements[0].placement_spec_digest
             ), describe(refused)
-            note(f"unauthorized revision 2 REFUSED, outgoing keeps serving: {describe(refused)}")
+            note(f"mismatched revision 2 REFUSED, outgoing keeps serving: {describe(refused)}")
         finally:
             owner.close()
     finally:
@@ -705,7 +687,7 @@ def main() -> int:
             adapter.wait(timeout=20)
     print(
         "boot proof: PASS — ready and empty with no provision document, then a first "
-        "DesiredPlacementSet fetched, materialized, served, and a following unauthorized "
+        "DesiredPlacementSet fetched, overlaid, served, and a following mismatched "
         "revision refused with the converged placement still serving",
         flush=True,
     )

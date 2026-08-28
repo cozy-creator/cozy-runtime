@@ -60,9 +60,9 @@ from typing import Any
 from cozy_runtime.internal import (
     accel,
     child_env,
-    environment,
     fill,
     hostfacts,
+    overlay,
     proctree,
     provisioned,
 )
@@ -189,11 +189,6 @@ class WorkerOptions:
     makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
-    materializer_uv: Path | None = None
-    """The substrate-baked `uv` the one offline materializer runs (#478/#483).
-
-    A PATH, never a switch: `environment.materialize` pins the exact binary identity and
-    refuses any other, so this names where the substrate put it and decides nothing."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -207,7 +202,7 @@ class Placement:
     """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
     RecordOwner-minted routing + journal key; it is never invocation identity.
 
-    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/1` document
+    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/2` document
     nested in the accepted set bytes. A single-placement replace is this SAME `placement_id`
     carrying a NEW spec digest, which is why routing survives an in-place release rollout.
     """
@@ -218,9 +213,11 @@ class Placement:
     environment_spec_digest: bytes
     installed_environment_receipt_digest: bytes
     descriptor_digest: bytes
+    model_object_set: tuple[str, int]
     plan_ids: tuple[str, ...]
     plan_refs: dict[str, tuple[str, int]]
     """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
+    model_object_set_path: Path | None = None
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
     #: offline" — the exact state an outgoing spec holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
@@ -631,6 +628,10 @@ class Worker:
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
         self.watches = WatchFanout(PROGRESS_QUEUE)
         self.work: queue.Queue[AttemptRecord | None] = queue.Queue()
+        # Slow source/custom-wheel and model-document acquisition never runs on a control
+        # stream thread. One lane serializes revisions; the revision check after every slow
+        # leg discards a superseded result before it can move serving state.
+        self.convergences: queue.Queue[int | None] = queue.Queue()
         self.stop = threading.Event()
         self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
@@ -1421,7 +1422,7 @@ class Worker:
             # SAME accepted set bytes. No revision, set digest, or placement identity moves.
             self.note("grant", f"re-driving convergence for revision {revision} on the refresh")
             self.latched = ""
-            self.converge_placement(revision)
+            self.schedule_convergence(revision)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
@@ -1642,6 +1643,7 @@ class Worker:
         plan_refs = {
             str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
         }
+        model_object_set = dict(spec.get("model_object_set", {}))
         candidate = Placement(
             placement_id=placement_id,
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
@@ -1653,6 +1655,10 @@ class Worker:
                 spec.get("installed_environment_receipt_digest")
             ),
             descriptor_digest=_digest_field(spec.get("descriptor_digest")),
+            model_object_set=(
+                str(model_object_set.get("digest", "")),
+                int(model_object_set.get("length", 0)),
+            ),
             plan_ids=plan_ids,
             plan_refs=plan_refs,
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
@@ -1707,7 +1713,18 @@ class Worker:
                 else " from a standing start"
             ),
         )
-        self.converge_placement(desired.revision)
+        self.schedule_convergence(desired.revision)
+
+    def schedule_convergence(self, revision: int) -> None:
+        self.convergences.put(revision)
+
+    def convergence_lane(self) -> None:
+        """One non-control lane for slow, generation-fenced placement convergence."""
+
+        while (revision := self.convergences.get()) is not None:
+            if revision != self.accepted.accepted_desired_state_revision:
+                continue
+            self.converge_placement(revision)
 
     def converge_placement(self, revision: int) -> None:
         """ACQUIRE, materialize, verify, then hand off the device — or refuse to lie.
@@ -1741,18 +1758,30 @@ class Worker:
                 f"{documents.spell(candidate.spec_digest)[:23]}… is materializing"
             )
 
-        installed = self._acquire(candidate, revision)
-        if installed is None:
+        installed = (
+            self._acquire(candidate, revision)
+            if candidate.installed_environment_receipt_digest
+            else None
+        )
+        if candidate.installed_environment_receipt_digest and installed is None:
             return
-        # cr-047: the interpreter and its receipt-keyed bytecode tree move together, and a
-        # generation change poisons the CURRENT executor so the next spawn picks both up.
-        if self.supervision.use_generation(
-            str(installed.python), str(installed.bytecode_cache)
-        ) and (self.supervision.current is not None):
-            self.supervision.current.poisoned = "installed environment generation changed"
+        if installed is None and not self._bind_preinstalled_object_set(candidate):
+            return
+        if revision != self.accepted.accepted_desired_state_revision:
+            self.note("materialization", f"revision {revision} was superseded after acquisition")
+            return
+        if installed is not None:
+            changed = self.supervision.use_overlay(
+                str(installed.python), str(installed.import_root)
+            )
+            if changed and self.supervision.current is not None:
+                self.supervision.current.poisoned = "endpoint overlay generation changed"
 
         bindings = self._resolve_bindings(candidate)
         if bindings is None:
+            return
+        if revision != self.accepted.accepted_desired_state_revision:
+            self.note("materialization", f"revision {revision} was superseded before hand-off")
             return
 
         # ---- THE DEVICE HAND-OFF. Everything above was concurrent with serving. ----------
@@ -1784,6 +1813,32 @@ class Worker:
         )
         self.prepare_executor()
 
+    def _bind_preinstalled_object_set(self, placement: Placement) -> bool:
+        """Bind the local/native lane's already-staged exact model-object set."""
+
+        path = self.options.artifact_object_set
+        expected_digest, expected_length = placement.model_object_set
+        try:
+            raw = path.read_bytes() if path is not None else b""
+        except OSError:
+            raw = b""
+        measured = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
+        if len(raw) != expected_length or measured != expected_digest:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                    subject=placement.placement_id,
+                    reason="model_object_set_identity_mismatch",
+                    detail=f"staged {measured}/{len(raw)}, expected "
+                    f"{expected_digest}/{expected_length}",
+                ),
+                terminal=True,
+            )
+            return False
+        placement.model_object_set_path = path
+        return True
+
     def await_drained(self) -> None:
         """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
 
@@ -1797,9 +1852,7 @@ class Worker:
             if attempt.state in self.engine.HELD:
                 self.await_settled(attempt)
 
-    def _acquire(
-        self, placement: Placement, revision: int
-    ) -> environment.InstalledEnvironment | None:
+    def _acquire(self, placement: Placement, revision: int) -> overlay.InstalledOverlay | None:
         """Fetch what the spec REACHES and publish the receipt-keyed generation it names.
 
         Returns the installed generation, or None having already typed the fault and left the
@@ -1819,7 +1872,7 @@ class Worker:
                 terminal=True,
             )
             return None
-        if self.options.environment_root is None or self.options.materializer_uv is None:
+        if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
                 pb.Fault(
@@ -1827,8 +1880,8 @@ class Worker:
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
                     detail=f"receipt {expected} is required, but this worker was launched "
-                    "without --environment-root and --materializer-uv; the worker will not "
-                    "guess where a substrate put its materializer",
+                    "without --environment-root and --artifact-store; the worker will not "
+                    "guess where a substrate put endpoint overlays or TensorFS objects",
                 ),
                 terminal=False,
             )
@@ -1873,7 +1926,8 @@ class Worker:
                     environment_root=self.options.environment_root,
                     plans_root=self.config.cozy_home / "binding-plans",
                     documents_root=self.config.cozy_home / "binding-documents",
-                    uv=self.options.materializer_uv,
+                    object_sets_root=self.options.environment_root.parent / "model-object-sets",
+                    artifact_store=self.options.artifact_store,
                     python=Path(sys.executable),
                 ).acquire(placement)
             except acquire.AcquisitionRefusal as exc:
@@ -1892,39 +1946,41 @@ class Worker:
                     ),
                 )
                 return None
-            except (OSError, environment.EnvironmentRefusal) as exc:
-                reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
+            except (OSError, overlay.OverlayRefusal) as exc:
+                reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
                 self._materialization_failed(
                     placement,
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                        if isinstance(exc, environment.EnvironmentRefusal)
+                        if isinstance(exc, overlay.OverlayRefusal)
                         else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                         subject=placement.placement_id,
                         reason=reason,
                         detail=safe(str(exc)),
                     ),
-                    terminal=isinstance(exc, environment.EnvironmentRefusal),
+                    terminal=isinstance(exc, overlay.OverlayRefusal),
                 )
                 return None
+            placement.model_object_set_path = acquired.object_set
             self.note(
                 "materialization",
                 f"revision {revision} acquired {acquired.wheels} wheel(s), "
                 f"{len(acquired.plans)} plan(s) and {len(acquired.documents)} reached "
-                f"document(s) — {acquired.fetched_bytes} new byte(s) — and published "
+                f"document(s), hydrated {acquired.model_objects} model object(s) — "
+                f"{acquired.fetched_bytes} new byte(s) — and published "
                 f"generation {acquired.installed.generation}",
             )
-        # RE-MEASURED, ALWAYS. A generation this worker just built and one an installer left
-        # behind are read through the same door, because "I built it" is not evidence.
+        # Open the small receipt and base-family document. Wheel bytes were hashed before
+        # atomic publication; image-resident bytes are already fixed by the OCI digest.
         try:
-            installed = environment.verify_generation(
+            installed = overlay.open_generation(
                 generation,
                 receipt_digest=expected,
                 environment_spec_digest=documents.spell(placement.environment_spec_digest),
             )
-        except (environment.EnvironmentRefusal, OSError) as exc:
-            reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
-            unavailable = reason in {"environment_receipt_absent", "io_error"}
+        except (overlay.OverlayRefusal, OSError) as exc:
+            reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
+            unavailable = reason in {"overlay_receipt_absent", "io_error"}
             self._materialization_failed(
                 placement,
                 pb.Fault(
@@ -1942,7 +1998,7 @@ class Worker:
             return None
         self.note(
             "materialization",
-            f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
+            f"opened overlay receipt {expected[:23]}… at {installed.generation}",
         )
         return installed
 
@@ -2008,9 +2064,13 @@ class Worker:
                         "canonical provisioned bindings require the verified TensorFS store "
                         "and exact model-root document",
                     )
-                object_set = provisioned.read_artifact_object_set(
-                    self.options.artifact_object_set.read_bytes()
-                )
+                object_set_path = placement.model_object_set_path
+                if object_set_path is None:
+                    raise PlanRefusal(
+                        "model_object_set_required",
+                        "the placement has no staged exact model object-set document",
+                    )
+                object_set = provisioned.read_artifact_object_set(object_set_path.read_bytes())
                 selected = provisioned.read_provisioned_release(
                     plan_documents,
                     read_document=provisioned.staged_document_reader(
@@ -3308,6 +3368,9 @@ class Worker:
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
             threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
+            threading.Thread(
+                target=self.convergence_lane, daemon=True, name="convergence-lane"
+            ).start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
         self.host.serve(self)
@@ -3322,6 +3385,7 @@ class Worker:
         )
         self.stop.set()
         self.work.put(None)
+        self.convergences.put(None)
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
@@ -3419,19 +3483,13 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-root",
         default="",
-        help="cr-027 materializer root containing receipt-keyed immutable generations",
+        help="cr-027 endpoint-overlay root containing receipt-keyed immutable generations",
     )
     parser.add_argument(
         "--artifact-cache",
         default="",
         help="where the dynamic acquisition lane writes the exact bytes a placement reaches "
         "(cr-049); content-addressed, so a replay re-fetches only what is missing",
-    )
-    parser.add_argument(
-        "--materializer-uv",
-        default="",
-        help="the substrate-baked `uv` the one offline materializer runs; its exact identity "
-        "is pinned by internal/environment.py and any other binary refuses",
     )
     parser.add_argument(
         "--artifact-store",
@@ -3475,7 +3533,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         artifact_store=Path(args.artifact_store).resolve(),
         artifact_object_set=Path(args.artifact_object_set).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
-        materializer_uv=Path(args.materializer_uv).resolve() if args.materializer_uv else None,
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

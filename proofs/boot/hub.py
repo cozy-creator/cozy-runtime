@@ -7,17 +7,16 @@ from. It is deliberately a repository proof driver and not a shipped component â
 proves is the WORKER's half: that a pod which boots empty converges to a live placement from
 a `DesiredPlacementSet` plus an `ArtifactGrantUpdate` and nothing else.
 
-The receipt is MEASURED, never asserted. A release's `installed_environment_receipt_digest`
-is an OUTPUT of a materialization, so this module materializes the environment ONCE into its
-own root to learn it, and the worker then materializes it INDEPENDENTLY into the pod's root
-and must measure the same bytes. Two independent builds agreeing on one receipt digest is a
-stronger arm than either build alone.
+The receipt is derived from exact base-family and endpoint-wheel identities. This module
+materializes the overlay once to learn it; the worker independently materializes the same
+overlay and must produce byte-identical receipt bytes without copying the base environment.
 """
 
 from __future__ import annotations
 
 import http.server
 import ssl
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +26,7 @@ from proof_data import Wheel, canonical, digest, inventory, ref, wheel
 
 from cozy_runtime.internal import canonical as canon
 from cozy_runtime.internal import descriptor as desc
-from cozy_runtime.internal import environment, local
+from cozy_runtime.internal import local, overlay
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -103,17 +102,14 @@ def author(
     wheelhouse_wheels: list[Path],
     target: dict[str, str],
     build_root: Path,
-    uv: Path,
     python: Path,
+    base_manifest: Path,
 ) -> Release:
     """Author the whole closure a `PlacementSpec` reaches, and measure its receipt."""
 
     release = Release()
     project = release.add_wheel(project_wheel)
-    house = sorted(
-        (release.add_wheel(path) for path in wheelhouse_wheels),
-        key=lambda entry: entry.distribution,
-    )
+    house = sorted((inventory(path) for path in wheelhouse_wheels), key=lambda e: e.distribution)
 
     wheelhouse = release.add(
         canonical(
@@ -138,9 +134,13 @@ def author(
         "wheelset",
     )
 
-    # The descriptor is BUILT from the installed endpoint, never hand-written: the executor
-    # re-derives it inside the materialized venv and refuses a published one that differs.
-    document = desc.build(discover_installed(application))
+    # The descriptor is BUILT from the project wheel, never hand-written: the executor
+    # re-derives it from the installed overlay and refuses a published one that differs.
+    sys.path.append(str(project_wheel))
+    try:
+        document = desc.build(discover_installed(application))
+    finally:
+        sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
     evaluated = release.add(canonical({"format": "proof.EvaluatedConfig/1"}), "config")
     bundle = release.add(
@@ -174,18 +174,28 @@ def author(
     release.wheelhouse_manifest = wheelhouse
     release.descriptor = descriptor_bytes
 
-    # MEASURE the receipt by building the environment once, on this side. The digest is an
-    # output of a materialization; a release that asserted one would be asserting a number.
-    from cozy_runtime.internal.materialize_launch import environment_input
+    # The image builder would bake this exact small family manifest beside the installed
+    # official PyTorch environment. This proof writes the stand-in before either independent
+    # overlay materialization and then treats it as read-only.
+    base_manifest.parent.mkdir(parents=True, exist_ok=True)
+    base_manifest.write_bytes(wheelhouse)
+    base_manifest.chmod(0o444)
 
-    source = environment_input(
+    from cozy_runtime.internal.materialize_launch import endpoint_overlay_input
+
+    source = endpoint_overlay_input(
         environment_spec_bytes=spec,
         endpoint_bundle_bytes=bundle,
         resolved_wheel_set_bytes=resolved,
         wheelhouse_manifest_bytes=wheelhouse,
-        wheel_paths=dict(release.wheel_paths),
+        wheel_paths={project.digest: project_wheel},
     )
-    installed = environment.materialize(source, build_root, uv=uv, python=python)
+    installed = overlay.materialize(
+        source,
+        build_root,
+        python=python,
+        base_manifest=base_manifest,
+    )
     release.receipt = release.add(installed.receipt_bytes, "receipt")
 
     # The binding-plan closure. A weightless endpoint's plans, model-root document and
@@ -195,6 +205,7 @@ def author(
         raise RuntimeError("the weightless closure and the bundle name different descriptors")
     plans = [release.add(raw, "plan") for _, raw in sorted(weightless.plans.items())]
     release.plan_refs = sorted((digest(raw), len(raw)) for raw in plans)
+    model_object_set = release.add(weightless.artifact_object_set, "model_object_set")
 
     placements = [
         {
@@ -213,6 +224,12 @@ def author(
                 "endpoint_release_id": ENDPOINT_RELEASE,
                 "environment_spec_digest": digest(spec),
                 "installed_environment_receipt_digest": digest(installed.receipt_bytes),
+                "model_object_set": {
+                    "digest": digest(model_object_set),
+                    "kind": "model_object_set",
+                    "length": len(model_object_set),
+                    "subject_id": digest(model_object_set),
+                },
             },
         }
     ]
@@ -226,6 +243,9 @@ class _Origin(http.server.BaseHTTPRequestHandler):
     """Exact bytes at their own content address. No redirect, no transform, no listing."""
 
     objects: ClassVar[dict[str, bytes]] = {}
+    overlap_subjects: ClassVar[frozenset[str]] = frozenset()
+    overlap_barrier: ClassVar[threading.Barrier | None] = None
+    overlapped: ClassVar[set[str]] = set()
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
@@ -236,6 +256,11 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if spelled in _Origin.overlap_subjects:
+            barrier = _Origin.overlap_barrier
+            assert barrier is not None
+            barrier.wait(timeout=10)
+            _Origin.overlapped.add(spelled)
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Type", "application/octet-stream")
@@ -248,8 +273,17 @@ class _Origin(http.server.BaseHTTPRequestHandler):
 
 def serve_artifacts(release: Release, certificate: Path, key: Path, port: int) -> None:
     _Origin.objects = dict(release.objects)
+    source = next(digest for digest, kind in release.kinds.items() if kind == "wheel")
+    models = next(digest for digest, kind in release.kinds.items() if kind == "model_object_set")
+    _Origin.overlap_subjects = frozenset({source, models})
+    _Origin.overlap_barrier = threading.Barrier(2)
+    _Origin.overlapped = set()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Origin)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(certificate), str(key))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def overlap_proven() -> bool:
+    return _Origin.overlapped == set(_Origin.overlap_subjects)

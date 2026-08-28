@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, TypeAlias
 
-from cozy_runtime.internal import canonical, environment, materialize_launch, pull
+from cozy_runtime.internal import canonical, materialize_launch, overlay, provisioned, pull
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -113,7 +115,9 @@ class StandingGrant:
 class AcquiredPlacement:
     """What one converged acquisition produced, all of it re-measurable on disk."""
 
-    installed: environment.InstalledEnvironment
+    installed: overlay.InstalledOverlay
+    object_set: Path
+    model_objects: int
     plans: tuple[str, ...]
     documents: tuple[str, ...]
     wheels: int
@@ -135,7 +139,8 @@ class Acquirer:
         environment_root: Path,
         plans_root: Path,
         documents_root: Path,
-        uv: Path,
+        object_sets_root: Path,
+        artifact_store: Path,
         python: Path,
     ) -> None:
         self.grant = grant
@@ -143,10 +148,13 @@ class Acquirer:
         self.environment_root = environment_root
         self.plans_root = plans_root
         self.documents_root = documents_root
-        self.uv = uv
+        self.object_sets_root = object_sets_root
+        self.artifact_store = artifact_store
         self.python = python
         self.fetched_bytes = 0
         self.wheels = 0
+        self._fetch_lock = Lock()
+        self._new_digests: set[str] = set()
 
     # ---- the one door bytes enter through -------------------------------------------
 
@@ -208,11 +216,13 @@ class Acquirer:
                 exc.code,
                 exc.detail,
             ) from exc
-        if not already:
+        with self._fetch_lock:
             # Content-addressed resume: a complete object is never re-fetched, so the
             # measured cost of a replay is the objects that were still missing (§1
             # Recovery). Only new bytes are counted.
-            self.fetched_bytes += length
+            if not already and digest not in self._new_digests and target == path:
+                self._new_digests.add(digest)
+                self.fetched_bytes += length
         return path
 
     # ---- the walk ---------------------------------------------------------------------
@@ -220,18 +230,84 @@ class Acquirer:
     def acquire(self, placement: Any) -> AcquiredPlacement:
         """Fetch, build, and stage everything one PlacementSpec reaches. Fail closed."""
 
-        installed = self._environment(placement)
-        plans, staged = self._bindings(placement)
+        # Endpoint code/custom wheels and the model/binding closure are independent legs.
+        # Start them together; model bytes dominate a cold pod, so the small overlay must
+        # never serialize in front of that transfer.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="cozy-acquire") as pool:
+            environment_future = pool.submit(self._environment, placement)
+            bindings_future = pool.submit(self._bindings, placement)
+            models_future = pool.submit(self._models, placement)
+            installed = environment_future.result()
+            plans, staged = bindings_future.result()
+            object_set, model_objects = models_future.result()
         return AcquiredPlacement(
             installed=installed,
+            object_set=object_set,
+            model_objects=model_objects,
             plans=plans,
             documents=staged,
             wheels=self.wheels,
             fetched_bytes=self.fetched_bytes,
         )
 
-    def _environment(self, placement: Any) -> environment.InstalledEnvironment:
-        """environment_spec -> bundle -> wheel sets -> wheels -> one immutable generation."""
+    def _models(self, placement: Any) -> tuple[Path, int]:
+        """Fetch the exact object-set document, then hydrate every model root into TensorFS."""
+
+        digest, length = placement.model_object_set
+        if not digest or length <= 0:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "model_object_set_absent",
+                "PlacementSpec/2 names one exact model_object_set subject",
+            )
+        raw = self.fetch(digest, length).read_bytes()
+        self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            object_set = provisioned.read_artifact_object_set(raw)
+        except Exception as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "model_object_set_invalid",
+                str(exc),
+            ) from exc
+        locations: dict[str, str] = {}
+        for object_digest, object_length in object_set.refs.items():
+            authorized = self.grant.subjects.get(object_digest)
+            if authorized != object_length:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
+                    "model_object_unauthorized",
+                    f"{object_digest} is required at {object_length} B and authorized at "
+                    f"{authorized!r}",
+                )
+            location = self.grant.locations.get(object_digest)
+            if not location:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                    "model_object_location_absent",
+                    object_digest,
+                )
+            locations[object_digest] = location
+        try:
+            materialize_launch.materialize_objects(
+                locations,
+                object_set,
+                cache=None,
+                deadline=self._deadline(),
+                store_root=self.artifact_store,
+                allow_local=self.grant.local(),
+            )
+        except materialize_launch.LaunchRefusal as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                exc.code,
+                exc.detail,
+            ) from exc
+        self._stage(self.object_sets_root, digest, raw)
+        return self.object_sets_root / _name(digest), len(object_set.refs)
+
+    def _environment(self, placement: Any) -> overlay.InstalledOverlay:
+        """Environment spec -> source/custom wheels -> one small installed-base overlay."""
 
         spec_digest = documents.spell(placement.environment_spec_digest)
         receipt_digest = documents.spell(placement.installed_environment_receipt_digest)
@@ -262,36 +338,32 @@ class Acquirer:
         resolved_bytes = self.fetch(*resolved_ref).read_bytes()
         wheelhouse_bytes = self.fetch(*wheelhouse_bundle_ref).read_bytes()
         resolved = self._parse(resolved_bytes, "resolved_wheel_set")
-        wheelhouse = self._parse(wheelhouse_bytes, "wheelhouse_manifest")
+        self._parse(wheelhouse_bytes, "wheelhouse_manifest")
 
         wheel_paths: dict[str, Path] = {}
         for row in (
             bundle.get("project_wheel"),
             *self._rows(resolved.get("wheels"), "resolved_wheel_set"),
-            *self._rows(wheelhouse.get("wheels"), "wheelhouse_manifest"),
         ):
             digest, length = self._wheel_ref(row)
             wheel_paths[digest] = self.fetch(digest, length)
         self.wheels = len(wheel_paths)
 
-        expected_receipt = self.fetch(
-            receipt_digest, self._authorized_length(receipt_digest, "environment_receipt")
-        ).read_bytes()
         try:
-            source = materialize_launch.environment_input(
+            source = materialize_launch.endpoint_overlay_input(
                 environment_spec_bytes=spec_bytes,
                 endpoint_bundle_bytes=bundle_bytes,
                 resolved_wheel_set_bytes=resolved_bytes,
                 wheelhouse_manifest_bytes=wheelhouse_bytes,
                 wheel_paths=wheel_paths,
             )
-            return materialize_launch.materialize_exact(
+            return overlay.materialize(
                 source,
                 self.environment_root,
-                uv=self.uv,
-                expected_receipt_bytes=expected_receipt,
+                python=self.python,
+                expected_receipt_digest=receipt_digest,
             )
-        except materialize_launch.LaunchRefusal as exc:
+        except (materialize_launch.LaunchRefusal, overlay.OverlayRefusal) as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
                 if "receipt" in exc.code
