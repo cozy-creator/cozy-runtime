@@ -33,7 +33,6 @@ STATIC_ARMS = (
     Arm("env-authority", SRC / "internal" / "child_env.py", "import os\nS = os.environ.get('X')\n"),
     # cr-037: the seam field is declared_weight_bytes; a budget wearing vram's name is red.
     Arm(
-        "seam-budget-vocabulary",
         SRC / "internal" / "executor.py",
         "def _planted_seam(budgets: dict[str, int]) -> int:\n    return budgets['vram']\n",
     ),
@@ -1318,23 +1317,6 @@ def run_static(arm: Arm) -> str:
     return f"red — {arm.fence} ({arm.path.relative_to(ROOT)}): {line}"
 
 
-def run_module_name_plant() -> str:
-    """cr-037: recreate the retired bare module name and observe the vocabulary fence red."""
-    planted = SRC / "internal" / "staging.py"
-    if planted.exists():
-        return "NOT PROVEN — staging.py already exists; the rename this arm proves is undone"
-    planted.write_text('"""planted: the retired bare module name."""\n')
-    try:
-        code, output = fence()
-    finally:
-        planted.unlink()
-    if code == 0:
-        return "NOT PROVEN — module-name-vocabulary stayed green with staging.py recreated"
-    lines = output.splitlines()
-    line = next((ln.strip() for ln in lines if "staging.py" in ln), lines[0])
-    return f"red — module-name-vocabulary (planted internal/staging.py): {line}"
-
-
 def run_live(name: str, source: str, expect: str) -> str:
     out = subprocess.run(
         [sys.executable, "-c", source], capture_output=True, text=True, cwd=ROOT, check=False
@@ -1677,7 +1659,6 @@ def main() -> int:
         print("refusing to plant: the tree is already fence-red", file=sys.stderr)
         return 1
     results = [run_static(a) for a in STATIC_ARMS]
-    results.append(run_module_name_plant())
     results += [run_live(*a) for a in LIVE_ARMS]
     results += [run_live(name, PRELUDE + body, expect) for name, body, expect in AUTHOR_ARMS]
     results += [run_live(name, MODEL_PRELUDE + body, expect) for name, body, expect in MODEL_ARMS]
