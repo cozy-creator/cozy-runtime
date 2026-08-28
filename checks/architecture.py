@@ -1013,7 +1013,7 @@ def fence_delivery_plan_observation() -> list[str]:
 
 
 def fence_pod_media_grant_root() -> list[str]:
-    """The fixed adapter declares cozy-pod/podmedia's one exact shared filesystem root."""
+    """The fixed adapter declares pod-supervisor/podmedia's one exact shared filesystem root."""
 
     path = SRC / "cli" / "materialize_launch.py"
     tree = ast.parse(path.read_text())
@@ -1028,7 +1028,7 @@ def fence_pod_media_grant_root() -> list[str]:
     if len(assignments) != 1:
         return [
             f"{path.relative_to(ROOT)}: MEDIA_ROOT has {len(assignments)} authorities; "
-            "cozy-pod and Runtime share one fixed root"
+            "pod-supervisor and Runtime share one fixed root"
         ]
     value = assignments[0].value
     if not (
@@ -1040,7 +1040,7 @@ def fence_pod_media_grant_root() -> list[str]:
         and value.args[0].value == "/var/lib/cozy/media"
     ):
         return [
-            f"{path.relative_to(ROOT)}: MEDIA_ROOT must equal cozy-pod's exact "
+            f"{path.relative_to(ROOT)}: MEDIA_ROOT must equal pod-supervisor's exact "
             "`/var/lib/cozy/media` root"
         ]
     source = (

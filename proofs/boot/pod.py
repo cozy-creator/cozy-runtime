@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cr-048's boot proof: a pod that boots with NO provision document, ready and empty.
 
-This process is the Runtime-side contract stand-in for cozy-creator's single `cozy-pod`
+This process is the Runtime-side contract stand-in for cozy-creator's single `pod-supervisor`
 binary. It makes the same grants (TLS keypair, boot id, renter-token hashes, its in-process
 media listener, and the closed COZY_ADAPTER_* environment), execs the real adapter, and then
 observes what a rented pod's two consumers observe: tensorhub's receipt, and a
@@ -156,7 +156,7 @@ def mint_tls() -> tuple[Path, Path]:
 
 
 class MediaStandIn(http.server.BaseHTTPRequestHandler):
-    """cozy-pod's in-process authenticated health route, and nothing else.
+    """pod-supervisor's in-process authenticated health route, and nothing else.
 
     The adapter proves the media listener refuses a FOREIGN bearer before it will publish a
     receipt; that refusal is the property, so the stand-in implements exactly it.

@@ -34,7 +34,7 @@ from cozy_runtime.internal.materialize_launch import (
 )
 
 WORKER_ROOT = Path("/run/cozy/worker")
-# Shared with cozy-pod's podmedia server. This is persistent pod data, unlike /run's
+# Shared with pod-supervisor's podmedia server. This is persistent pod data, unlike /run's
 # restart-local control state: PutInput returns file:// paths beneath this exact root and
 # the worker's grant authorizer must recognize the same tree without widening it.
 MEDIA_ROOT = Path("/var/lib/cozy/media")
@@ -222,7 +222,10 @@ def _worker_command(
 
 
 def _supervise(process: subprocess.Popen[bytes]) -> int:
-    """Keep the adapter coupled to its worker; cozy-pod owns media and whole-pod supervision."""
+    """Keep the adapter coupled to its worker.
+
+    pod-supervisor owns media and whole-pod supervision.
+    """
 
     stopped = False
     terminate_at = 0.0
