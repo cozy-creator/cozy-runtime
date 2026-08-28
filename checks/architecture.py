@@ -620,8 +620,8 @@ def fence_base_ownership_vectors() -> list[str]:
     cross = ROOT / "vectors" / "tensorhub-base-worker-image-wheelhouse-v2.json"
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    if len(raw) != 23_687 or digest != (
-        "sha256:d27017b3b0173a373ce70df3dabaea285f4b85646a730daec3b3c0765b7430c8"
+    if len(raw) != 23_742 or digest != (
+        "sha256:cdb6d7753c57049e8801673da26fa67c3c39daf39ab18a4aae1afff0ab99bf1f"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -690,15 +690,15 @@ def fence_base_ownership_vectors() -> list[str]:
     exact_contract = {
         "endpoint-bundle.json": (
             bundle_bytes,
-            "e343ba95b5a078ef1703cf20fc452d1524f04310174d9e076834775a15f3e5cd",
+            "e1ecebdd65b794cfe8eeec9906b6531a4d172dfb88f6a6184854bec1c811477f",
         ),
         "endpoint-environment-spec.json": (
             environment_bytes,
-            "4508f6a4505a592517beefefaf38b174abfa8f54c16070b8a2bd4b77903d7135",
+            "1ade3c64be8da9a20d3723377386d270fc10807499f92fc25ea1d24880d96eee",
         ),
         "fixture-index.json": (
             index_bytes,
-            "2ae701c00bd988f8c7e052cd16cd4b287b5ef58efdbb1c7487d98465b78cf666",
+            "b3fd2ea9e6973c5e028dc67ff1ed973fa681c515ef35a8a0047074b983898cdf",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -706,7 +706,7 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "789a7c76d304423f658effa0dd46ff1a83109b1ae2fab6b8b870302720665881",
+            "82307cc2d4d3580e0a9b617e93c18102e5a9d45e404e8d03543e3092f3068bd7",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
