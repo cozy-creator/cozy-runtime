@@ -69,7 +69,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import child, grants, observe, triage
+from cozy_runtime.internal.worker import acquire, child, grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -182,6 +182,18 @@ class WorkerOptions:
     """The verified TensorFS store populated from the canonical model-root closure."""
     artifact_object_set: Path | None = None
     """The exact model-root document used by the shared provisioned-release reader."""
+    artifact_cache: Path | None = None
+    """Where the dynamic acquisition lane writes the exact bytes it fetches (cr-049).
+
+    Content-addressed and re-readable: a complete object is never re-fetched, which is what
+    makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
+    was provisioned and a placement naming artifacts this worker does not already hold
+    reports a typed fault rather than guessing a directory."""
+    materializer_uv: Path | None = None
+    """The substrate-baked `uv` the one offline materializer runs (#478/#483).
+
+    A PATH, never a switch: `environment.materialize` pins the exact binary identity and
+    refuses any other, so this names where the substrate put it and decides nothing."""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -575,6 +587,10 @@ class Worker:
         self.prepared_models: dict[str, PreparedModel] = {}
         self.jobs: dict[str, JobBinding] = {}
         self.placement: Placement | None = None
+        #: The INCOMING placement being staged while `placement` keeps serving (#474). It is
+        #: a separate field precisely because one field cannot hold both, which is the same
+        #: reason the observed state has two axes.
+        self.pending: Placement | None = None
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
         self.job_ready = False
         #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
@@ -639,6 +655,10 @@ class Worker:
         #: every ObservedWorkerState so grant landing is observable with no ack lane.
         self.grant_id = ""
         self.grant_revision = 0
+        #: The STANDING acquisition authority (rev-2 §3). Empty until a grant lands; a
+        #: placement that reaches artifacts this worker does not hold then reports a typed
+        #: fault instead of fetching from nowhere.
+        self.grant = acquire.StandingGrant()
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
@@ -1354,25 +1374,54 @@ class Worker:
         A grant MAY PRECEDE its set. Subjects not named by any desired spec are INERT, never
         a refusal — pre-authorizing an incoming release is the normal rollout order.
 
-        WHAT THIS WORKER DOES WITH IT TODAY, said out loud rather than implied: it RECORDS
-        the standing authority and reports it back on `applied_artifact_grant_id` /
-        `applied_grant_revision`, so grant landing is observable without an ack lane. It does
-        not reinterpret opaque subjects as a wheel closure: th-044/th-046's canonical
-        manifest-to-CAS join must exist before this handler may invoke cr-027's executable.
-        An externally materialized receipt-keyed generation is still re-measured and used.
+        WHAT THIS WORKER DOES WITH IT (cr-049): it records the standing authority, reports
+        it back on `applied_artifact_grant_id` / `applied_grant_revision` so grant landing is
+        observable without an ack lane, and then RE-DRIVES CONVERGENCE if the accepted set is
+        not yet converged. Convergence is a LEVEL, not a transaction (§1): a placement parked
+        at `MATERIALIZING` with `FAULT_KIND_GRANT_EXPIRED` is exactly the case a refresh
+        exists to clear, and it must clear without a new desired revision.
+
+        It still does not reinterpret opaque subjects as an inventory, and it never has to:
+        `worker/acquire.py` starts at the digests the desired spec NAMES and reaches every
+        other digest from a document it has already fetched and verified. The grant answers
+        only "may I, and from where".
         """
         if update.grant_revision < self.grant_revision:
             self.note("grant", f"grant revision {update.grant_revision} ignored (older)")
+            return
+        idempotent = update.grant_revision == self.grant_revision and self.grant_revision > 0
+        try:
+            self.grant = acquire.StandingGrant.read(update)
+        except acquire.AcquisitionRefusal as exc:
+            self.note("grant", f"grant revision {update.grant_revision} REFUSED: {exc.code}")
+            self.engine.fault(
+                pb.Fault(
+                    kind=exc.kind,
+                    subject=update.grant.grant_id or "(unnamed grant)",
+                    reason=exc.code,
+                    detail=safe(exc.detail),
+                )
+            )
             return
         self.grant_revision = update.grant_revision
         self.grant_id = update.grant.grant_id
         self.note(
             "grant",
             f"acquisition authority {update.grant.grant_id or '(unnamed)'} at revision "
-            f"{update.grant_revision}: {len(update.grant.subjects)} authorized subject(s), "
-            f"{len(update.grant.locations)} location(s) — recorded; opaque subjects are not "
-            "treated as an environment inventory without th-044/th-046's canonical join",
+            f"{update.grant_revision}: {len(self.grant.subjects)} authorized subject(s), "
+            f"{len(self.grant.locations)} location(s), expiring {self.grant.expires_at_unix}",
         )
+        revision = self.accepted.accepted_desired_state_revision
+        if (
+            not idempotent
+            and self.placement is not None
+            and self.accepted.converged_revision < revision
+        ):
+            # REFRESHING ACCESS NEVER CHANGES IDENTITY: this re-runs convergence against the
+            # SAME accepted set bytes. No revision, set digest, or placement identity moves.
+            self.note("grant", f"re-driving convergence for revision {revision} on the refresh")
+            self.latched = ""
+            self.converge_placement(revision)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
@@ -1528,6 +1577,7 @@ class Worker:
                     self.latched = f"executor_reclaim_failed: {exc}"[:200]
                     self.note("recovery", self.latched)
             self.placement = None
+            self.pending = None
             self.bindings = {}
             self.prepared_models = {}
             self.engine.bindings = {}
@@ -1555,11 +1605,11 @@ class Worker:
         self.accepted.placement_set_canonical_bytes = desired_set.placement_set_canonical_bytes
 
         previous = self.placement
-        self.bindings = {}
-        self.prepared_models = {}
         self.jobs = {}
         self.engine.jobs = {}
         if not placements:
+            self.bindings = {}
+            self.prepared_models = {}
             executor = self.supervision.current
             if executor is not None:
                 try:
@@ -1571,12 +1621,17 @@ class Worker:
                     self._settle()
                     return
             self.placement = None
+            self.pending = None
             self.engine.bindings = {}
             self.engine.prepared_models = {}
             self.accepted.converged_revision = desired.revision
             self.bump_admission("the accepted set is EMPTY; nothing is dispatchable")
             self.note("desired_state", f"revision {desired.revision} accepted: an EMPTY set")
             return
+        # THE OUTGOING PLACEMENT KEEPS SERVING FROM HERE (fallback-retention, #474 clause 1).
+        # Nothing below touches `self.bindings`, the prepared models, or the executor until
+        # the incoming placement is materially STAGED — which is what makes the incoming's
+        # every materialization failure free.
         entry = placements[0]
         placement_id = str(entry.get("placement_id", ""))
         spec = dict(entry.get("spec", {}))
@@ -1587,7 +1642,7 @@ class Worker:
         plan_refs = {
             str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
         }
-        self.placement = Placement(
+        candidate = Placement(
             placement_id=placement_id,
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
             # reconstructed with its own format tag (#510g) from the bytes already held.
@@ -1610,78 +1665,290 @@ class Worker:
                 else b""
             ),
         )
-        self.bump_admission(
-            f"placement {self.placement.placement_id or '(unnamed)'} moved to spec "
-            f"{documents.spell(self.placement.spec_digest)[:23]}…"
+        replacement = (
+            previous is not None
+            and previous.placement_id == candidate.placement_id
+            and previous.spec_digest != candidate.spec_digest
+        )
+        if replacement:
+            assert previous is not None
+            # #485c: FALLBACK CAPABILITY IS A PRECONDITION OF REPLACEMENT, not a nicety. A
+            # placement whose rollback pin is gone — evicted under a bytes/age cap, or never
+            # materialized — cannot accept a new spec until it re-materializes one, so the
+            # replacement PAUSES here and is recorded as such. Proceeding without a pin is an
+            # explicit administrative act and there is no default that performs one.
+            if previous.materialization != pb.MaterializationState.MATERIALIZATION_STATE_STAGED:
+                self.note(
+                    "desired_state",
+                    f"revision {desired.revision} PAUSES the replacement of "
+                    f"{previous.placement_id or '(unnamed)'}: no live rollback pin",
+                )
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_FALLBACK_PIN_MISSING,
+                        subject=previous.placement_id,
+                        reason="rollback_pin_absent",
+                        detail="the outgoing spec is "
+                        f"{pb.MaterializationState.Name(previous.materialization)}, so it "
+                        "cannot restore this placement if the incoming activation fails; "
+                        "replacement is PAUSED until the pin re-materializes (#485c)",
+                    )
+                )
+                return
+        self.pending = candidate
+        self.note(
+            "desired_state",
+            f"revision {desired.revision} accepted: staging placement "
+            f"{candidate.placement_id or '(unnamed)'} at spec "
+            f"{documents.spell(candidate.spec_digest)[:23]}…"
+            + (
+                f" while {previous.placement_id or '(unnamed)'} keeps serving"
+                if replacement and previous is not None
+                else " from a standing start"
+            ),
         )
         self.converge_placement(desired.revision)
 
     def converge_placement(self, revision: int) -> None:
-        """Materialize what this worker CAN materialize, then activate — or refuse to lie.
+        """ACQUIRE, materialize, verify, then hand off the device — or refuse to lie.
 
-        THE MATERIALIZATION AXIS HAS ONE HONEST SUBJECT HERE: the placement's binding-plan
-        records, which are the only artifacts this worker stages today. All resolve => STAGED.
-        Some missing => ABSENT with a typed fault, and the previous spec keeps serving
-        (fallback-retention, #474).
+        The order is §1's, and none of it is negotiable:
+
+            acquire (fetch by digest, build the environment, stage the plan closure)
+                -> re-measure the published generation
+                -> resolve the provisioned bindings
+                -> HAND OFF the device (this is the only step that serializes)
+
+        Everything before the hand-off runs while the OUTGOING placement keeps serving
+        (fallback-retention #474 clauses 1-2), so an incoming failure costs zero intake
+        interruption and LATCHES for this desired revision rather than looping (clause 5).
 
         `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured InstalledEnvironmentReceipt
-        equals the expected digest.  A receipt-keyed immutable generation is therefore
-        re-measured here before its Python can become the executor Python.  Missing canonical
-        materializer inputs remain MATERIALIZING; a corrupt/wrong receipt fails typed.
+        equals `installed_environment_receipt_digest`; it is unspeakable otherwise (§8).
         """
-        assert self.placement is not None
-        placement = self.placement
-        if placement.installed_environment_receipt_digest:
-            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
-            expected = documents.spell(placement.installed_environment_receipt_digest)
-            if self.options.environment_root is None:
-                self.latch(
+        candidate = self.pending or self.placement
+        assert candidate is not None
+        outgoing = self.placement if self.pending is not None else None
+        candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
+        if outgoing is None:
+            # There is nothing to fall back to, so the incoming placement IS the reported
+            # one from the first instant. An empty pod's honest report is the incoming
+            # placement MATERIALIZING, never a plausible OFFLINE against no spec at all.
+            self.placement = candidate
+            self.pending = None
+            self.bump_admission(
+                f"placement {candidate.placement_id or '(unnamed)'} at spec "
+                f"{documents.spell(candidate.spec_digest)[:23]}… is materializing"
+            )
+
+        installed = self._acquire(candidate, revision)
+        if installed is None:
+            return
+        # cr-047: the interpreter and its receipt-keyed bytecode tree move together, and a
+        # generation change poisons the CURRENT executor so the next spawn picks both up.
+        if self.supervision.use_generation(
+            str(installed.python), str(installed.bytecode_cache)
+        ) and (self.supervision.current is not None):
+            self.supervision.current.poisoned = "installed environment generation changed"
+
+        bindings = self._resolve_bindings(candidate)
+        if bindings is None:
+            return
+
+        # ---- THE DEVICE HAND-OFF. Everything above was concurrent with serving. ----------
+        candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+        if outgoing is not None:
+            self.note(
+                "materialization",
+                f"incoming spec {documents.spell(candidate.spec_digest)[:23]}… is STAGED; "
+                f"draining {outgoing.placement_id or '(unnamed)'} and handing off the device",
+            )
+            self.await_drained()
+        self.placement = candidate
+        self.pending = None
+        self.bindings = bindings
+        self.prepared_models = {}
+        self.engine.bindings = self.bindings
+        self.engine.prepared_models = {}
+        self.bump_admission(
+            f"placement {candidate.placement_id or '(unnamed)'} moved to spec "
+            f"{documents.spell(candidate.spec_digest)[:23]}…"
+        )
+        self.note(
+            "desired_state",
+            f"revision {revision} STAGED: placement "
+            f"{candidate.placement_id or '(unnamed)'} at spec "
+            f"{documents.spell(candidate.spec_digest)[:23]}… with {len(self.bindings)} of "
+            f"{len(candidate.plan_ids)} binding plan(s) resolved, "
+            f"posture={pb.Posture.Name(self.accepted.posture)}",
+        )
+        self.prepare_executor()
+
+    def await_drained(self) -> None:
+        """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
+
+        NO DRAIN CONSTANT EXISTS (#434/#479). This waits on the attempts the RecordOwner
+        already accepted and on THEIR own deadlines — nothing else. Cutting the tail short is
+        `force`, an administrative act with a recorded actor, and there is no default number
+        in any config file that performs one.
+        """
+        self.set_serving(pb.ServingState.SERVING_STATE_DRAINING, "handing off the device")
+        for attempt in list(self.engine.history.values()):
+            if attempt.state in self.engine.HELD:
+                self.await_settled(attempt)
+
+    def _acquire(
+        self, placement: Placement, revision: int
+    ) -> environment.InstalledEnvironment | None:
+        """Fetch what the spec REACHES and publish the receipt-keyed generation it names.
+
+        Returns the installed generation, or None having already typed the fault and left the
+        outgoing placement serving.
+        """
+        expected = documents.spell(placement.installed_environment_receipt_digest)
+        if not expected:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=placement.placement_id,
+                    reason="environment_receipt_absent_from_spec",
+                    detail="a PlacementSpec names the receipt a completed materialization "
+                    "must measure to; a spec without one is unmaterializable",
+                ),
+                terminal=True,
+            )
+            return None
+        if self.options.environment_root is None or self.options.materializer_uv is None:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=placement.placement_id,
+                    reason="environment_materialization_input_missing",
+                    detail=f"receipt {expected} is required, but this worker was launched "
+                    "without --environment-root and --materializer-uv; the worker will not "
+                    "guess where a substrate put its materializer",
+                ),
+                terminal=False,
+            )
+            return None
+        generation = (
+            self.options.environment_root / "generations" / expected.removeprefix("sha256:")
+        )
+        if not generation.exists():
+            if self.options.artifact_cache is None:
+                self._materialization_failed(
+                    placement,
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=placement.placement_id,
-                        reason="environment_materialization_input_missing",
-                        detail=f"receipt {expected} is required, but no --environment-root was "
-                        "provisioned; the worker will not guess a manifest/CAS join",
-                    )
+                        reason="artifact_cache_absent",
+                        detail="no --artifact-cache was provisioned, so there is nowhere to "
+                        "put the exact bytes this placement reaches",
+                    ),
+                    terminal=False,
                 )
-                return
-            generation = (
-                self.options.environment_root / "generations" / expected.removeprefix("sha256:")
-            )
-            try:
-                installed = environment.verify_generation(
-                    generation,
-                    receipt_digest=expected,
-                    environment_spec_digest=documents.spell(placement.environment_spec_digest),
-                )
-            except (environment.EnvironmentRefusal, OSError) as exc:
-                reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
-                unavailable = reason in {"environment_receipt_absent", "io_error"}
-                if not unavailable:
-                    placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
-                self.latch(
+                return None
+            if not self.grant.authorized():
+                # A DESIRED SUBJECT WITH NO GRANT DOES NOT REFUSE THE DESIRED STATE (§3):
+                # the placement reports MATERIALIZING with a typed fault and the outgoing
+                # spec keeps serving. A later ArtifactGrantUpdate re-drives this level.
+                self._materialization_failed(
+                    placement,
                     pb.Fault(
-                        kind=(
-                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE
-                            if unavailable
-                            else pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                        ),
+                        kind=pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
+                        subject=placement.placement_id,
+                        reason="artifact_grant_absent",
+                        detail="the accepted set names artifacts this worker does not hold "
+                        "and no standing ArtifactGrant authorizes acquiring them",
+                    ),
+                    terminal=False,
+                )
+                return None
+            try:
+                acquired = acquire.Acquirer(
+                    self.grant,
+                    cache_root=self.options.artifact_cache,
+                    environment_root=self.options.environment_root,
+                    plans_root=self.config.cozy_home / "binding-plans",
+                    documents_root=self.config.cozy_home / "binding-documents",
+                    uv=self.options.materializer_uv,
+                    python=Path(sys.executable),
+                ).acquire(placement)
+            except acquire.AcquisitionRefusal as exc:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=exc.kind,
+                        subject=placement.placement_id,
+                        reason=exc.code,
+                        detail=safe(exc.detail),
+                    ),
+                    terminal=exc.kind
+                    in (
+                        pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                        pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
+                    ),
+                )
+                return None
+            except (OSError, environment.EnvironmentRefusal) as exc:
+                reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
+                        if isinstance(exc, environment.EnvironmentRefusal)
+                        else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                         subject=placement.placement_id,
                         reason=reason,
                         detail=safe(str(exc)),
-                    )
+                    ),
+                    terminal=isinstance(exc, environment.EnvironmentRefusal),
                 )
-                return
-            changed = self.supervision.use_generation(
-                str(installed.python), str(installed.bytecode_cache)
-            )
-            if changed and self.supervision.current is not None:
-                self.supervision.current.poisoned = "installed environment generation changed"
-            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+                return None
             self.note(
                 "materialization",
-                f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
+                f"revision {revision} acquired {acquired.wheels} wheel(s), "
+                f"{len(acquired.plans)} plan(s) and {len(acquired.documents)} reached "
+                f"document(s) — {acquired.fetched_bytes} new byte(s) — and published "
+                f"generation {acquired.installed.generation}",
             )
+        # RE-MEASURED, ALWAYS. A generation this worker just built and one an installer left
+        # behind are read through the same door, because "I built it" is not evidence.
+        try:
+            installed = environment.verify_generation(
+                generation,
+                receipt_digest=expected,
+                environment_spec_digest=documents.spell(placement.environment_spec_digest),
+            )
+        except (environment.EnvironmentRefusal, OSError) as exc:
+            reason = exc.code if isinstance(exc, environment.EnvironmentRefusal) else "io_error"
+            unavailable = reason in {"environment_receipt_absent", "io_error"}
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=(
+                        pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE
+                        if unavailable
+                        else pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
+                    ),
+                    subject=placement.placement_id,
+                    reason=reason,
+                    detail=safe(str(exc)),
+                ),
+                terminal=not unavailable,
+            )
+            return None
+        self.note(
+            "materialization",
+            f"verified receipt {expected[:23]}… at immutable generation {installed.generation}",
+        )
+        return installed
+
+    def _resolve_bindings(self, placement: Placement) -> dict[str, DeclaredBinding] | None:
+        """Re-measure every staged plan record, then read the ONE provisioned release."""
+
         missing: list[str] = []
         plan_documents: dict[str, provisioned.ExactDocument] = {}
         for plan_id in placement.plan_ids:
@@ -1731,6 +1998,8 @@ class Worker:
             plan_documents[plan_id] = provisioned.ExactDocument(
                 provisioned.ArtifactRef(plan_digest, plan_length), record, record_bytes
             )
+        code = ""
+        detail = ""
         if not missing:
             try:
                 if self.options.artifact_store is None or self.options.artifact_object_set is None:
@@ -1756,7 +2025,7 @@ class Worker:
                         fill.tensorfs_module()
                     ),
                 )
-                self.bindings = dict(selected.bindings)
+                return dict(selected.bindings)
             except (OSError, PlanRefusal, fill.FillRefusal) as refusal:
                 code = (
                     refusal.code
@@ -1764,31 +2033,50 @@ class Worker:
                     else "artifact_object_set_unreadable"
                 )
                 detail = refusal.detail if isinstance(refusal, PlanRefusal) else str(refusal)
-                missing.extend(placement.plan_ids)
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=placement.placement_id,
-                        reason=code,
-                        detail=safe(detail),
-                    )
-                )
+        self._materialization_failed(
+            placement,
+            pb.Fault(
+                kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                subject=placement.placement_id,
+                reason=code or "unresolved_binding_plans",
+                detail=safe(detail or f"{len(missing)} binding plan(s) did not resolve"),
+            ),
+            terminal=False,
+        )
+        return None
+
+    def _materialization_failed(
+        self, placement: Placement, fault: pb.Fault, *, terminal: bool
+    ) -> None:
+        """One exit for every materialization refusal, and it never serves-nothing silently.
+
+        `terminal` is the ABSENT/FAILED distinction (§8): a fault about the ARTIFACTS —
+        a wrong digest, a receipt that did not match — is a `FAILED(cause)` verdict about
+        this spec; a fault about ACCESS or about a missing local input is `ABSENT`, because
+        a grant refresh or a provisioner repair can still clear it.
+        """
         placement.materialization = (
-            pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
-            if missing
-            else pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            if terminal
+            else pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
         )
-        self.engine.bindings = self.bindings
+        if self.placement is placement:
+            # No outgoing spec exists to keep serving: latch on this placement, which moves
+            # its serving axis OFFLINE and leaves `converged_revision` behind, typed.
+            self.latch(fault)
+            return
+        # FALLBACK-RETENTION (#474 clauses 1, 4 and 5): the outgoing placement never stopped
+        # serving, the failure is typed against the incoming spec, and it LATCHES for this
+        # desired revision. Retry is a RecordOwner act — a NEW revision, or a grant refresh.
+        self.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
+        self.engine.fault(fault)
         self.note(
-            "desired_state",
-            f"revision {revision} accepted: placement "
-            f"{placement.placement_id or '(unnamed)'} at spec "
-            f"{documents.spell(placement.spec_digest)[:23]}… with {len(self.bindings)} of "
-            f"{len(placement.plan_ids)} binding plan(s) resolved, materialization="
-            f"{pb.MaterializationState.Name(placement.materialization)}, "
-            f"posture={pb.Posture.Name(self.accepted.posture)}",
+            "materialization",
+            f"incoming spec REFUSED ({fault.reason}); "
+            f"{self.placement.placement_id if self.placement else '(none)'} keeps serving and "
+            "the failure LATCHES for this desired revision",
         )
-        self.prepare_executor()
+        self._settle()
 
     def apply_job_directive(self, job: pb.JobDirective) -> None:
         """The JOB lane: resolve the descriptor, spawn a fresh executor, become dispatchable.
@@ -1803,6 +2091,7 @@ class Worker:
         self.engine.prepared_models = {}
         self.jobs = {}
         self.placement = None
+        self.pending = None
         self.set_job_ready(False)
         previous = self.supervision.current
         if previous is not None:
@@ -1939,8 +2228,13 @@ class Worker:
                 f"construction ({len(executor.ready_plans)} binding plan(s))",
             )
             if executor.ready_plans:
-                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
+                # The high-water mark moves BEFORE the edge is published. `set_serving`
+                # reports immediately — dispatchability is an edge — and `converged_revision`
+                # CLAMPS itself back until serving actually says DISPATCHABLE, so writing it
+                # first cannot publish an early claim, while writing it second published one
+                # frame that said DISPATCHABLE and not-converged in the same breath.
                 self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
             else:
                 self.latched = "logical model digest mismatch"
                 self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
@@ -2201,9 +2495,11 @@ class Worker:
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
             self._settle()
             return
-        self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
         if not self.latched:
+            # Before the edge, for the reason above: the clamp in `converged_revision` is
+            # what keeps this honest, and the ORDER is what keeps it consistent.
             self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+        self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
 
     def run_warm_pass(self) -> bool:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
@@ -3126,6 +3422,18 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="cr-027 materializer root containing receipt-keyed immutable generations",
     )
     parser.add_argument(
+        "--artifact-cache",
+        default="",
+        help="where the dynamic acquisition lane writes the exact bytes a placement reaches "
+        "(cr-049); content-addressed, so a replay re-fetches only what is missing",
+    )
+    parser.add_argument(
+        "--materializer-uv",
+        default="",
+        help="the substrate-baked `uv` the one offline materializer runs; its exact identity "
+        "is pinned by internal/environment.py and any other binary refuses",
+    )
+    parser.add_argument(
         "--artifact-store",
         required=True,
         help="verified TensorFS store populated from the provisioned model-root object set",
@@ -3166,6 +3474,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
         artifact_store=Path(args.artifact_store).resolve(),
         artifact_object_set=Path(args.artifact_object_set).resolve(),
+        artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
+        materializer_uv=Path(args.materializer_uv).resolve() if args.materializer_uv else None,
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

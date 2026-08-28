@@ -10,14 +10,26 @@ RecordOwner's Claim.
 
 What it proves, and every line of it is measured rather than asserted by construction:
 
-  * the adapter boots on eleven environment names and reads no document at all;
-  * the receipt carries the attempt identity that used to ride the provision spec;
+  * the adapter boots on nine environment names and reads no document at all;
   * the receipt says NOTHING about the pod's own image — the eight retired fields, the
     control-Runtime wheel measurement among them, are absent, and the worker reports an
     empty `worker_artifact_digest` rather than a hash of bytes the hub itself pinned;
   * both listeners bound and both refused a foreign credential;
   * the worker admits the renter's real token and reports ZERO placements, an empty
     accepted set, and no endpoint release — ready, and empty.
+
+Then cr-049's half, on the SAME pod and through the SAME connection, because a first
+placement that took a private door would prove nothing about the tenth:
+
+  * a standing `ArtifactGrantUpdate` lands and is echoed back, changing no revision;
+  * one `DesiredPlacementSet` names an environment, a receipt and a binding plan by digest —
+    and NOTHING else crosses;
+  * the worker FETCHES the whole closure it reaches, BUILDS the environment, and measures
+    the same receipt the hub measured independently;
+  * it reports `STAGED` x `DISPATCHABLE` with `converged_revision` = the accepted revision;
+  * it SERVES a real attempt against the endpoint installed in that generation;
+  * and a following revision naming an unauthorized digest is refused typed while the
+    converged placement KEEPS SERVING (fallback-retention, #474).
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import base64
 import hashlib
 import http.server
 import json
+import platform
 import queue
 import secrets
 import ssl
@@ -37,16 +50,24 @@ from pathlib import Path
 from typing import Any
 
 import grpc
+import hub
 
 from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 STATE = Path("/run/cozy/bootstrap")
+MEDIA_ROOT = Path("/run/cozy/media")
 CONTROL_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
+MATERIALIZER_UV = Path("/opt/cozy/control-runtime/uv")
+WHEELS = Path("/wheels")
+ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
+ARTIFACT_CACHE = Path("/var/lib/cozy/artifacts")
+APPLICATION = "proof_cli_endpoint:app"
 WORKER_PORT = 43100
 MEDIA_PORT = 43101
-DEADLINE = int(time.time()) + 300
+ARTIFACT_PORT = 43102
+DEADLINE = int(time.time()) + 1800
 
 RETIRED_RECEIPT_FIELDS = (
     # The hub verifies this payload under a key minted for ONE attempt and recovered from
@@ -81,6 +102,41 @@ RETIRED_ADAPTER_ENV = (
 
 def note(line: str) -> None:
     print(f"[boot-proof] {line}", flush=True)
+
+
+def mint_origin_tls() -> tuple[Path, Path]:
+    """The ARTIFACT ORIGIN's own keypair, which is the hub's and not the pod's.
+
+    It is separate on purpose: the pod's certificate is bound to `DNS:cozy-worker` and
+    `readiness.certificate` refuses any other SAN on it, because that certificate is the one
+    a renter pins. The origin is a different peer with a different name, so it gets a
+    different key — which is also what a real deployment looks like.
+    """
+
+    certificate, key = STATE / "origin.crt", STATE / "origin.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=cozy-artifact-origin",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return certificate, key
 
 
 def mint_tls() -> tuple[Path, Path]:
@@ -142,89 +198,295 @@ def serve_media(certificate: Path, key: Path, token: str) -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-def claim_worker(certificate: Path, token: str) -> dict[str, Any]:
-    """Claim the freshly booted worker as its renter and read what it says it is."""
+class RecordOwner:
+    """One long-lived RecordOwner over one control stream, driven by this proof.
 
-    credentials = grpc.ssl_channel_credentials(certificate.read_bytes())
-    channel = grpc.secure_channel(
-        f"127.0.0.1:{WORKER_PORT}",
-        credentials,
-        options=(
-            ("grpc.ssl_target_name_override", "cozy-worker"),
-            ("grpc.default_authority", "cozy-worker"),
-        ),
-    )
-    outbound: queue.Queue[pb.RecordOwnerFrame | None] = queue.Queue()
+    It exists because the cr-048 arm and the cr-049 arm must run on the SAME connection: a
+    first placement delivered over a second, private door would prove nothing about the
+    tenth, and "placement 1 is treated identically to placements 2..N" is the property.
+    """
 
-    def frames() -> Any:
-        while (frame := outbound.get()) is not None:
-            yield frame
+    def __init__(self, certificate: Path, token: str) -> None:
+        credentials = grpc.ssl_channel_credentials(certificate.read_bytes())
+        self.channel = grpc.secure_channel(
+            f"127.0.0.1:{WORKER_PORT}",
+            credentials,
+            options=(
+                ("grpc.ssl_target_name_override", "cozy-worker"),
+                ("grpc.default_authority", "cozy-worker"),
+            ),
+        )
+        self.outbound: queue.Queue[pb.RecordOwnerFrame | None] = queue.Queue()
+        self.inbound: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        self.epoch = 1
+        self.generation = 0
+        self.worker_boot_id = ""
+        self.admission_generation = 0
+        self.claim_ack: pb.ClaimAck | None = None
+        self.snapshot: dict[str, Any] = {}
 
-    call = pb_grpc.WorkerControlStub(channel).Control(frames())
-    outbound.put(
-        pb.RecordOwnerFrame(
-            claim=pb.Claim(
-                record_owner_epoch=1,
-                record_owner_id="cr-048-boot-proof",
-                wire_minor=WIRE_MINOR,
-                proof=token.encode(),
-                wire_schema_digest=SCHEMA_DIGEST_RAW,
+        def frames() -> Any:
+            while (frame := self.outbound.get()) is not None:
+                yield frame
+
+        self.call = pb_grpc.WorkerControlStub(self.channel).Control(frames())
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.send(
+            pb.RecordOwnerFrame(
+                claim=pb.Claim(
+                    record_owner_epoch=self.epoch,
+                    record_owner_id="cr-049-boot-proof",
+                    wire_minor=WIRE_MINOR,
+                    proof=token.encode(),
+                    wire_schema_digest=SCHEMA_DIGEST_RAW,
+                )
             )
         )
-    )
-    observed: dict[str, Any] = {}
-    generation, worker_boot = 0, ""
-    try:
-        for frame in call:
-            kind = frame.WhichOneof("msg")
-            if kind == "claim_ack":
-                ack = frame.claim_ack
-                assert ack.accepted, f"Claim REFUSED: {pb.ClaimRejection.Name(ack.rejection)}"
-                assert ack.wire_schema_digest == SCHEMA_DIGEST_RAW
-                generation, worker_boot = ack.control_stream_generation, ack.worker_boot_id
-                observed["worker_boot_id"] = ack.worker_boot_id
-                # `worker_artifact_digest` is where SUBSTRATE identity rides and nowhere
-                # else (#487/#489), and the only substrate identity a pod could measure
-                # from inside is its own image — which the hub pinned by digest. So it is
-                # ABSENT here, the way `worker_release_id` is: #481's "absent stays absent".
-                observed["worker_id"] = ack.worker_id
-                observed["release_id"] = ack.worker_release_id
-                observed["artifact_digest"] = ack.worker_artifact_digest
-            elif kind == "snapshot":
-                # RECOMPUTE before parsing, then ack by id AND digest: the worker's
-                # dispatch barrier stays closed until the RecordOwner has reconciled, so
-                # an unacked snapshot is why no observed state would ever arrive.
-                body = frame.snapshot.snapshot_canonical_bytes
-                assert documents.digest_of(body) == frame.snapshot.snapshot_digest
-                observed["snapshot"] = documents.read(body, pb.WorkerSnapshotBody)
-                outbound.put(
-                    pb.RecordOwnerFrame(
-                        snapshot_ack=pb.SnapshotAck(
-                            record_owner_epoch=1,
-                            control_stream_generation=generation,
-                            worker_boot_id=worker_boot,
+        self.reader.start()
+
+    def _read(self) -> None:
+        try:
+            for frame in self.call:
+                self.inbound.put(frame)
+        except grpc.RpcError:
+            return
+
+    def send(self, frame: pb.RecordOwnerFrame) -> None:
+        self.outbound.put(frame)
+
+    def envelope(self, message: Any) -> Any:
+        message.record_owner_epoch = self.epoch
+        message.control_stream_generation = self.generation
+        message.worker_boot_id = self.worker_boot_id
+        return message
+
+    def close(self) -> None:
+        self.outbound.put(None)
+        self.channel.close()
+
+    def pump(self, deadline: float) -> pb.WorkerFrame | None:
+        """One inbound frame, with the barrier and the ack lane already handled."""
+
+        try:
+            frame = self.inbound.get(timeout=max(0.05, deadline - time.monotonic()))
+        except queue.Empty:
+            return None
+        kind = frame.WhichOneof("msg")
+        if kind == "claim_ack":
+            ack = frame.claim_ack
+            assert ack.accepted, f"Claim REFUSED: {pb.ClaimRejection.Name(ack.rejection)}"
+            assert ack.wire_schema_digest == SCHEMA_DIGEST_RAW
+            self.generation = ack.control_stream_generation
+            self.worker_boot_id = ack.worker_boot_id
+            self.claim_ack = ack
+        elif kind == "snapshot":
+            # RECOMPUTE before parsing, then ack by id AND digest: the worker's dispatch
+            # barrier stays closed until the RecordOwner has reconciled.
+            body = frame.snapshot.snapshot_canonical_bytes
+            assert documents.digest_of(body) == frame.snapshot.snapshot_digest
+            self.snapshot = documents.read(body, pb.WorkerSnapshotBody)
+            self.send(
+                pb.RecordOwnerFrame(
+                    snapshot_ack=self.envelope(
+                        pb.SnapshotAck(
                             snapshot_id=frame.snapshot.snapshot_id,
                             snapshot_digest=frame.snapshot.snapshot_digest,
                         )
                     )
                 )
-            elif kind == "observed_state":
-                state = frame.observed_state
-                observed["phase"] = pb.WorkerPhase.Name(state.worker_phase)
-                observed["placements"] = len(state.placements)
-                observed["accepted_revision"] = state.accepted_desired_state_revision
-                observed["converged_revision"] = state.converged_revision
-                observed["faults"] = [fault.reason for fault in state.faults]
-                break
-    finally:
-        outbound.put(None)
-        channel.close()
-    return observed
+            )
+        elif kind == "observed_state":
+            self.admission_generation = frame.observed_state.admission_generation
+        return frame
+
+    def await_state(self, predicate: Any, why: str, *, seconds: float) -> pb.ObservedWorkerState:
+        """Watch the OBSERVED state until it satisfies `predicate`, or say what it was."""
+
+        deadline = time.monotonic() + seconds
+        last: pb.ObservedWorkerState | None = None
+        while time.monotonic() < deadline:
+            frame = self.pump(deadline)
+            if frame is None or frame.WhichOneof("msg") != "observed_state":
+                continue
+            last = frame.observed_state
+            if predicate(last):
+                return last
+        raise SystemExit(f"never observed {why}; last state was {describe(last)}")
+
+    def await_frame(self, kind: str, *, seconds: float) -> pb.WorkerFrame:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            frame = self.pump(deadline)
+            if frame is not None and frame.WhichOneof("msg") == kind:
+                return frame
+        raise SystemExit(f"the worker never sent a {kind}")
+
+
+def describe(state: pb.ObservedWorkerState | None) -> str:
+    if state is None:
+        return "(no ObservedWorkerState arrived)"
+    rows = [
+        f"phase={pb.WorkerPhase.Name(state.worker_phase)}",
+        f"accepted={state.accepted_desired_state_revision}",
+        f"converged={state.converged_revision}",
+        f"grant={state.applied_artifact_grant_id!r}@{state.applied_grant_revision}",
+    ]
+    for placement in state.placements:
+        rows.append(
+            f"{placement.placement_id}:"
+            f"{pb.MaterializationState.Name(placement.materialization)}x"
+            f"{pb.ServingState.Name(placement.serving)}"
+        )
+    rows.extend(f"fault[{f.reason}]" for f in state.faults)
+    return " ".join(rows)
+
+
+def placement_is(state: pb.ObservedWorkerState, materialization: Any, serving: Any) -> bool:
+    return len(state.placements) == 1 and (
+        state.placements[0].materialization == materialization
+        and state.placements[0].serving == serving
+    )
+
+
+def grant_update(release: hub.Release, revision: int) -> pb.ArtifactGrantUpdate:
+    """The standing acquisition authority: WHICH digests, WHERE, and until when."""
+
+    base = f"https://127.0.0.1:{ARTIFACT_PORT}"
+    return pb.ArtifactGrantUpdate(
+        grant_revision=revision,
+        grant=pb.ArtifactGrant(
+            grant_id=f"cr049-grant-{revision}",
+            subjects=release.subjects(),
+            credential=pb.DeliveryAccessCredential(
+                issuer="cr-049-boot-proof",
+                key_id="artifacts",
+                epoch=1,
+                expires_at_unix=DEADLINE,
+                token=b"proof-artifact-token",
+            ),
+            base_url=base,
+            expires_at_unix=DEADLINE,
+            locations=release.locations(base),
+        ),
+    )
+
+
+def desired_state(placement_set: bytes, revision: int) -> pb.DesiredWorkerState:
+    return pb.DesiredWorkerState(
+        revision=revision,
+        posture=pb.Posture.POSTURE_ACCEPTING,
+        wire_minor=WIRE_MINOR,
+        placement_set=pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(placement_set),
+            placement_set_canonical_bytes=placement_set,
+        ),
+    )
+
+
+def serve_one_attempt(owner: RecordOwner, plan_id: str, release_id: str) -> dict[str, Any]:
+    """One real attempt against the endpoint installed in the materialized generation."""
+
+    MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"text": "cr-049", "count": 2}).encode()
+    payload_path = MEDIA_ROOT / "payload.json"
+    payload_path.write_bytes(payload)
+    payload_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    spec = pb.InvocationSpec(
+        endpoint_release_id=release_id,
+        environment_spec_digest="sha256:" + "11" * 32,
+        config_digest="sha256:" + "22" * 32,
+        payload_digest=payload_digest,
+        inputs=[
+            pb.InputBinding(
+                input_id="payload",
+                digest=payload_digest,
+                length=len(payload),
+                kind_mime="application/json",
+                order=0,
+            )
+        ],
+        # `echo` returns a typed struct, not an artifact: it names no outputs, so the
+        # grant names none either. Exact set equality between produced and granted outputs
+        # is enforced by the tail, so an invented destination would refuse the attempt.
+    )
+    spec.serving.entrypoint_binding_plan_id = plan_id
+    spec.serving.attempt_binding_id = plan_id
+    canonical_bytes, spec_digest = documents.identity(spec)
+    owner.send(
+        pb.RecordOwnerFrame(
+            attempt_offer=owner.envelope(
+                pb.AttemptOffer(
+                    request_id="cr049-req-1",
+                    attempt_ordinal=1,
+                    invocation_spec_digest=spec_digest,
+                    invocation_spec_canonical_bytes=canonical_bytes,
+                    placement_id=hub.PLACEMENT_ID,
+                    admission_generation=owner.admission_generation,
+                    grant=pb.DeliveryGrant(
+                        invocation_spec_digest=spec_digest,
+                        credential=pb.DeliveryAccessCredential(
+                            issuer="cr-049-boot-proof",
+                            key_id="delivery",
+                            epoch=1,
+                            expires_at_unix=DEADLINE,
+                            token=b"proof-delivery-token",
+                        ),
+                        file_base_url=f"file://{MEDIA_ROOT}",
+                        expires_at_unix=DEADLINE,
+                        inputs=[pb.InputAccess(input_id="payload", url=f"file://{payload_path}")],
+                    ),
+                )
+            )
+        )
+    )
+    frame = owner.await_frame("attempt_outcome", seconds=300)
+    outcome = frame.attempt_outcome
+    body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+    owner.send(
+        pb.RecordOwnerFrame(
+            outcome_ack=owner.envelope(
+                pb.AttemptOutcomeAck(
+                    request_id=outcome.request_id,
+                    attempt_ordinal=outcome.attempt_ordinal,
+                    outcome_id=outcome.outcome_id,
+                    outcome_digest=outcome.outcome_digest,
+                )
+            )
+        )
+    )
+    envelope = body.get("result", {})
+    inline = base64.b64decode(str(envelope.get("inline_result", "")))
+    return {"body": body, "result": json.loads(inline) if inline else None}
+
+
+def author_release() -> hub.Release:
+    """Author one endpoint release from the wheels the substrate stand-in baked.
+
+    The wheelhouse is the control Runtime and its three ordinary dependencies: the executor
+    runs `cozy_runtime.internal.executor` under the MATERIALIZED generation's python, so an
+    environment that could not import it could not serve at all. That is the point — the
+    generation this proof builds is the one the attempt actually executes in.
+    """
+
+    project = next(WHEELS.glob("proof_cli_endpoint-*.whl"))
+    wheelhouse = sorted([next(WHEELS.glob("cozy_runtime-*.whl")), *(WHEELS / "deps").glob("*.whl")])
+    version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    libc = "glibc{}.{}".format(*platform.libc_ver()[1].split(".")[:2])
+    return hub.author(
+        application=APPLICATION,
+        project_wheel=project,
+        wheelhouse_wheels=wheelhouse,
+        target=hub.platform_target(version, libc),
+        build_root=Path("/run/cozy/hub-build"),
+        uv=MATERIALIZER_UV,
+        python=Path(sys.executable),
+    )
 
 
 def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     certificate, key = mint_tls()
+    origin_certificate, origin_key = mint_origin_tls()
     boot_id = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     (STATE / "pod-boot-id").write_text(boot_id + "\n")
     # The renter mints the token and tells NOBODY; the hub holds only the hash. The proof
@@ -235,6 +497,11 @@ def main() -> int:
 
     environment = {
         "LANG": "C.UTF-8",
+        # The artifact origin is this proof's own HTTPS listener, so the pod trusts its
+        # certificate the way a pod trusts any private CA: through the ONE platform name the
+        # substrate already passes through (`config.ADAPTER_CHILD_PLATFORM_ENV`). No new
+        # adapter variable, and no verification is skipped anywhere.
+        "SSL_CERT_FILE": str(origin_certificate),
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",
         "COZY_ADAPTER_POD_BOOT_ID_PATH": str(STATE / "pod-boot-id"),
         "COZY_ADAPTER_TLS_CERT_PATH": str(certificate),
@@ -247,7 +514,7 @@ def main() -> int:
     }
     for retired in RETIRED_ADAPTER_ENV:
         assert retired not in environment
-    note(f"handing the adapter {len(environment) - 1} COZY_ADAPTER_* names and no document")
+    note(f"handing the adapter {len(environment) - 2} COZY_ADAPTER_* names and no document")
 
     adapter = subprocess.Popen(
         [str(Path(sys.executable).parent / "cozy-materialize-launch")],
@@ -293,19 +560,142 @@ def main() -> int:
         assert not Path("/var/lib/cozy/provision").exists()
         note("artifact store empty, object set empty, no environment generation")
 
-        observed = claim_worker(certificate, token)
-        assert observed["placements"] == 0, observed
-        assert observed["accepted_revision"] == 0, observed
-        assert observed["converged_revision"] == 0, observed
-        assert observed["faults"] == [], observed
-        assert observed["snapshot"].get("held_attempts", []) == []
-        assert observed["worker_id"] == "ra-cr048bootproof", observed
-        assert observed["release_id"] == "", observed
-        assert observed["artifact_digest"] == "", observed
-        note(
-            f"renter Claim ACCEPTED: phase={observed['phase']} "
-            f"placements={observed['placements']} release_id={observed['release_id']!r}"
-        )
+        owner = RecordOwner(certificate, token)
+        try:
+            empty = owner.await_state(
+                lambda state: state.worker_phase != pb.WorkerPhase.WORKER_PHASE_UNSPECIFIED,
+                "the empty pod's first ObservedWorkerState",
+                seconds=60,
+            )
+            ack = owner.claim_ack
+            assert ack is not None
+            assert len(empty.placements) == 0, describe(empty)
+            assert empty.accepted_desired_state_revision == 0, describe(empty)
+            assert empty.converged_revision == 0, describe(empty)
+            assert list(empty.faults) == [], describe(empty)
+            assert owner.snapshot.get("held_attempts", []) == []
+            assert ack.worker_id == "ra-cr048bootproof", ack
+            assert ack.worker_release_id == "", ack
+            # `worker_artifact_digest` is where SUBSTRATE identity rides and nowhere else
+            # (#487/#489), and the only substrate identity a pod could measure from inside
+            # is its own image — which the hub pinned by digest. So it is ABSENT here, the
+            # way `worker_release_id` is: #481's "absent stays absent".
+            assert ack.worker_artifact_digest == "", ack
+            note(
+                f"renter Claim ACCEPTED: phase={pb.WorkerPhase.Name(empty.worker_phase)} "
+                f"placements=0 release_id={ack.worker_release_id!r}"
+            )
+
+            # ---- cr-049: the pod is empty; make it serve, over this same stream ----------
+            release = author_release()
+            hub.serve_artifacts(release, origin_certificate, origin_key, ARTIFACT_PORT)
+            note(
+                f"artifact origin serving {len(release.objects)} exact object(s) on "
+                f"127.0.0.1:{ARTIFACT_PORT}; the hub measured receipt "
+                f"{hashlib.sha256(release.receipt).hexdigest()[:16]}…"
+            )
+
+            owner.send(
+                pb.RecordOwnerFrame(artifact_grant_update=owner.envelope(grant_update(release, 1)))
+            )
+            granted = owner.await_state(
+                lambda state: state.applied_grant_revision == 1,
+                "the standing grant echoed back",
+                seconds=60,
+            )
+            # REFRESHING ACCESS NEVER CHANGES IDENTITY (§3): no revision moved.
+            assert granted.accepted_desired_state_revision == 0, describe(granted)
+            assert granted.converged_revision == 0, describe(granted)
+            assert granted.applied_artifact_grant_id == "cr049-grant-1", describe(granted)
+            note(f"grant landed: {describe(granted)}")
+
+            owner.send(
+                pb.RecordOwnerFrame(
+                    desired_state=owner.envelope(desired_state(release.placement_set, 1))
+                )
+            )
+            staged = owner.await_state(
+                lambda state: placement_is(
+                    state,
+                    pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
+                    pb.ServingState.SERVING_STATE_DISPATCHABLE,
+                ),
+                "STAGED x DISPATCHABLE for the first placement",
+                seconds=900,
+            )
+            assert staged.accepted_desired_state_revision == 1, describe(staged)
+            assert staged.converged_revision == 1, describe(staged)
+            assert staged.placements[0].placement_id == hub.PLACEMENT_ID, describe(staged)
+            assert staged.placements[0].dispatchable_plan_ids, describe(staged)
+            assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+            note(f"CONVERGED: {describe(staged)}")
+
+            # THE POD BUILT THE ENVIRONMENT ITSELF, and measured the hub's exact receipt.
+            expected = "sha256:" + hashlib.sha256(release.receipt).hexdigest()
+            generation = ENVIRONMENT_ROOT / "generations" / expected.removeprefix("sha256:")
+            assert generation.is_dir(), f"no generation at {generation}"
+            assert (
+                generation / "installed-environment-receipt.json"
+            ).read_bytes() == release.receipt, "the pod's receipt bytes differ from the hub's"
+            assert (generation / "venv" / "bin" / "python").exists()
+            # THE WORKER FETCHED THE REACHABLE CLOSURE AND NOTHING ELSE. The grant
+            # authorizes the evaluated config too, and no document in the walk names it, so
+            # it stays INERT and unfetched — rev-2 §3's rule that a grant may authorize more
+            # than a spec reaches, observed rather than asserted.
+            fetched = {"sha256:" + p.name for p in ARTIFACT_CACHE.iterdir()}
+            reached = {d for d, kind in release.kinds.items() if kind != "config"}
+            inert = {d for d, kind in release.kinds.items() if kind == "config"}
+            assert fetched == reached, sorted(fetched ^ reached)
+            assert inert and not (fetched & inert), sorted(inert)
+            note(
+                f"the pod fetched the {len(fetched)} object(s) the spec REACHES, left "
+                f"{len(inert)} authorized-but-unreached subject(s) inert, and published "
+                f"generation {generation.name[:16]}… whose receipt is byte-identical to "
+                "the hub's"
+            )
+
+            served = serve_one_attempt(
+                owner, staged.placements[0].dispatchable_plan_ids[0], hub.ENDPOINT_RELEASE
+            )
+            assert served["body"]["status"] == pb.OutcomeStatus.OUTCOME_STATUS_SUCCEEDED, served[
+                "body"
+            ]
+            assert served["body"]["execution_started"] is True, served["body"]
+            assert served["result"] == {"text": "cr-049cr-049"}, served
+            note(f"SERVED one attempt: {served['result']} from the materialized environment")
+
+            # ---- the red arm: an incoming spec the grant does not authorize --------------
+            broken = release.placement_set.replace(
+                expected.encode(),
+                (b"sha256:" + b"ee" * 32),
+            )
+            assert broken != release.placement_set
+            owner.send(pb.RecordOwnerFrame(desired_state=owner.envelope(desired_state(broken, 2))))
+            refused = owner.await_state(
+                lambda state: (
+                    state.accepted_desired_state_revision == 2
+                    and any(f.reason == "artifact_unauthorized" for f in state.faults)
+                ),
+                "a typed refusal of the unauthorized revision",
+                seconds=180,
+            )
+            # FALLBACK-RETENTION: the converged placement never stopped serving, and the
+            # convergence fact stayed behind the accepted one rather than lying.
+            assert refused.converged_revision == 1, describe(refused)
+            # The status reports what the placement ACTUALLY HOLDS: the outgoing spec, on
+            # disk and serving. The incoming failure is the typed fault beside it.
+            assert placement_is(
+                refused,
+                pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
+                pb.ServingState.SERVING_STATE_DISPATCHABLE,
+            ), describe(refused)
+            assert (
+                refused.placements[0].placement_spec_digest
+                == staged.placements[0].placement_spec_digest
+            ), describe(refused)
+            note(f"unauthorized revision 2 REFUSED, outgoing keeps serving: {describe(refused)}")
+        finally:
+            owner.close()
     finally:
         adapter.terminate()
         try:
@@ -313,7 +703,12 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             adapter.kill()
             adapter.wait(timeout=20)
-    print("boot proof: PASS — ready and empty, no provision document read", flush=True)
+    print(
+        "boot proof: PASS — ready and empty with no provision document, then a first "
+        "DesiredPlacementSet fetched, materialized, served, and a following unauthorized "
+        "revision refused with the converged placement still serving",
+        flush=True,
+    )
     return 0
 
 

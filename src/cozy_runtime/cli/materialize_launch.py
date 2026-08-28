@@ -4,7 +4,8 @@ The pod boots to READY-BUT-EMPTY. No provision document is read and nothing is f
 GPU inventory measured, worker started with zero placements, both listeners proven to
 refuse a foreign credential, receipt published. The first placement arrives afterwards
 over rev-2's `DesiredPlacementSet` from the connected RecordOwner, and is treated
-identically to placements 2..N.
+identically to placements 2..N — it is FETCHED through the standing `ArtifactGrant` and
+MATERIALIZED by the same acquisition walk every later revision runs (cr-049).
 
 Nothing here re-measures the pod's own image. The hub pinned the substrate by OCI digest
 before this process existed, so every byte baked into it is already attested; the pod
@@ -27,6 +28,7 @@ from cozy_runtime.internal.config import ConfigError, read_adapter_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
+    MATERIALIZER_UV,
     LaunchRefusal,
     PreparedBoot,
     prepare_boot,
@@ -179,6 +181,13 @@ def _start_worker(
         str(prepared.artifact_store),
         "--artifact-object-set",
         str(prepared.artifact_object_set),
+        # THE DYNAMIC LANE'S TWO GRANTS (cr-049). The pod boots empty; the first placement
+        # arrives afterwards and has to be FETCHED and BUILT, so the worker is told where to
+        # put exact bytes and where the substrate baked the one materializer's `uv`.
+        "--artifact-cache",
+        str(prepared.artifact_cache),
+        "--materializer-uv",
+        str(MATERIALIZER_UV),
         "--tls-cert",
         str(config.tls_cert_path),
         "--tls-key",

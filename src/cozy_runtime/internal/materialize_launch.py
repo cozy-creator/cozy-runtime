@@ -38,6 +38,9 @@ ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/1"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/1"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
+#: The one offline materializer's `uv`, baked by the substrate beside the control Runtime.
+#: A PATH, never a switch: `environment.materialize` pins the exact binary identity.
+MATERIALIZER_UV = Path("/opt/cozy/control-runtime/uv")
 # execution-substrates creates and grants the runtime exactly this container-local data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -46,6 +49,10 @@ ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
 # Same filesystem as ENVIRONMENT_ROOT by construction: the store hardlinks into every venv.
 WHEEL_STORE_ROOT = LOCAL_DATA_ROOT / "wheel-store"
 LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
+#: Where the dynamic acquisition lane writes the exact bytes a placement reaches (cr-049).
+#: Under the durable-for-this-pod data root, not /run: a wheel set is large and a replay
+#: after a crash must find the complete objects it already fetched.
+ARTIFACT_CACHE_ROOT = LOCAL_DATA_ROOT / "artifacts"
 PLANS_ROOT = Path("/run/cozy/binding-plans")
 BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
 #: The canonical EMPTY ArtifactObjectSet. A pod that boots with no placement holds no
@@ -71,6 +78,7 @@ class PreparedBoot:
 
     artifact_store: Path
     artifact_object_set: Path
+    artifact_cache: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +107,9 @@ def prepare_boot(
     *,
     boot_root: Path = BOOT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
+    artifact_cache_root: Path = ARTIFACT_CACHE_ROOT,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: check the deadline, lay two roots, publish one
+    """Bring the pod to READY-BUT-EMPTY: check the deadline, lay three roots, publish one
     empty document. Nothing is read, nothing is fetched, nothing is hashed.
 
     The deadline check converts a boot that is already too late into a NAMED refusal.
@@ -125,14 +134,28 @@ def prepare_boot(
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
     _directory(artifact_store_root)
+    _directory(artifact_cache_root)
     _directory(boot_root)
     object_set = boot_root / "artifact-object-set.json"
     _publish_exact(object_set, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
-    return PreparedBoot(artifact_store=artifact_store_root, artifact_object_set=object_set)
+    return PreparedBoot(
+        artifact_store=artifact_store_root,
+        artifact_object_set=object_set,
+        artifact_cache=artifact_cache_root,
+    )
 
 
-def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
-    """Fetch one bounded HTTPS grant without proxy, redirect, content transform, or alias."""
+def fetch_exact(
+    grant: Mapping[str, Any], root: Path, *, deadline: int, allow_local: bool = False
+) -> Path:
+    """Fetch one bounded HTTPS grant without proxy, redirect, content transform, or alias.
+
+    `allow_local` is `pull.guard`'s existing DEV CARVE-OUT and nothing new: a worker does not
+    fetch artifact bytes from its own network, because a presigned URL that resolved to a
+    link-local address would make it a proxy into its own metadata service. It is true only
+    when the GRANT'S OWN `base_url` is loopback — a production grant can never hand a worker
+    one — which is the same rule `pull.local_hub` already states for the hub base.
+    """
 
     digest = grant.get("digest")
     length = grant.get("length")
@@ -176,6 +199,7 @@ def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
                     "Accept-Encoding": "identity",
                     "User-Agent": "cozy-materialize-launch/1",
                 },
+                allow_local=allow_local,
                 no_proxy=True,
             )
         except (OSError, urllib.error.URLError, pull.PullRefusal) as exc:

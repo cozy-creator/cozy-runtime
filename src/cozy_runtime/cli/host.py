@@ -156,6 +156,8 @@ _SERVE_FLAGS: dict[str, str] = {
     "--environment-root": "--environment-root",
     "--artifact-store": "--artifact-store",
     "--artifact-object-set": "--artifact-object-set",
+    "--artifact-cache": "--artifact-cache",
+    "--materializer-uv": "--materializer-uv",
     "--artifact-digest": "--artifact-digest",
     "--threads": "--threads",
     "--grace": "--grace",
