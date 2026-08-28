@@ -72,9 +72,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline=config.readiness_deadline_unix,
         )
         payload = readiness.receipt_payload(
-            acquisition_attempt_id=config.acquisition_attempt_id,
-            acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
-            rental_id=config.rental_id,
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
@@ -194,7 +191,7 @@ def _start_worker(
 
 
 def _supervise(process: subprocess.Popen[bytes]) -> int:
-    """Keep the adapter coupled to its worker; XS owns media and whole-pod supervision."""
+    """Keep the adapter coupled to its worker; cozy-pod owns media and whole-pod supervision."""
 
     stopped = False
     terminate_at = 0.0

@@ -1,6 +1,6 @@
-# The BOOT proof's substrate stand-in. Not the shipped substrate image (that recipe lives
-# in tensorhub `build/substrate/` and is pinned to a cozy-creator bootstrap commit); this
-# is the same three grants the substrate makes to the adapter — the control-Runtime wheel
+# The BOOT proof's substrate stand-in. Not the shipped substrate image (its root-level
+# recipe lives in tensorhub and pins cozy-creator's single cozy-pod commit); this is the
+# same grants cozy-pod makes to the adapter — the control-Runtime wheel
 # at its fixed path, /run/cozy, /var/lib/cozy — with nothing else in the image, so a boot
 # that reaches ready-but-empty here reached it on the adapter's own code.
 ARG PYTHON_IMAGE=python:3.12-slim

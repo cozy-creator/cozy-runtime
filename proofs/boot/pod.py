@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """cr-048's boot proof: a pod that boots with NO provision document, ready and empty.
 
-This process stands in for `cozy-bootstrap` + `cozy-media` — the two things the adapter is
-launched by and beside, and neither of which this repo owns. It makes exactly the grants
-the substrate makes (TLS keypair, boot id, renter-token hashes, the media listener, the
-closed COZY_ADAPTER_* environment), execs the real `cozy-materialize-launch`, and then
+This process is the Runtime-side contract stand-in for cozy-creator's single `cozy-pod`
+binary, which this repo does not own. It makes exactly the grants that one binary makes
+(TLS keypair, boot id, renter-token hashes, its in-process media listener, and the closed
+COZY_ADAPTER_* environment), execs the real `cozy-materialize-launch`, and then
 observes what a rented pod's two consumers observe: tensorhub's receipt, and a
 RecordOwner's Claim.
 
 What it proves, and every line of it is measured rather than asserted by construction:
 
-  * the adapter boots on eleven environment names and reads no document at all;
-  * the receipt carries the attempt identity that used to ride the provision spec;
+  * the adapter boots on nine environment names and reads no document at all;
+  * the attempt id is spent as worker identity, not echoed in the receipt;
   * the receipt says NOTHING about the pod's own image — the eight retired fields, the
     control-Runtime wheel measurement among them, are absent, and the worker reports an
     empty `worker_artifact_digest` rather than a hash of bytes the hub itself pinned;
@@ -42,13 +42,15 @@ from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR, 
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
-STATE = Path("/run/cozy/bootstrap")
+STATE = Path("/run/cozy/pod")
 CONTROL_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
 WORKER_PORT = 43100
 MEDIA_PORT = 43101
 DEADLINE = int(time.time()) + 300
 
 RETIRED_RECEIPT_FIELDS = (
+    "acquisition_attempt_id",
+    "acquisition_attempt_ordinal",
     "artifact_sources",
     # The pod does not measure its own image. Tensorhub registers an execution substrate
     # as `name@sha256:…` and refuses a tag, so the control-Runtime wheel baked inside it
@@ -60,13 +62,16 @@ RETIRED_RECEIPT_FIELDS = (
     "network_cache_degradations",
     "provision_bundle_digest",
     "provision_spec_digest",
+    "rental_id",
     "staged_placement_set_digest",
 )
 RETIRED_ADAPTER_ENV = (
+    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
     "COZY_ADAPTER_PROVISION_SPEC_PATH",
     "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
     "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
     "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+    "COZY_ADAPTER_RENTAL_ID",
 )
 
 
@@ -102,7 +107,7 @@ def mint_tls() -> tuple[Path, Path]:
 
 
 class MediaStandIn(http.server.BaseHTTPRequestHandler):
-    """cozy-media's authenticated health route, and nothing else.
+    """cozy-pod's in-process authenticated health route, and nothing else.
 
     The adapter proves the media listener refuses a FOREIGN bearer before it will publish a
     receipt; that refusal is the property, so the stand-in implements exactly it.
@@ -227,8 +232,6 @@ def main() -> int:
     environment = {
         "LANG": "C.UTF-8",
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",
-        "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "1",
-        "COZY_ADAPTER_RENTAL_ID": "rental-cr048bootproof",
         "COZY_ADAPTER_POD_BOOT_ID_PATH": str(STATE / "pod-boot-id"),
         "COZY_ADAPTER_TLS_CERT_PATH": str(certificate),
         "COZY_ADAPTER_TLS_KEY_PATH": str(key),
@@ -261,9 +264,6 @@ def main() -> int:
         note(f"receipt published: {len(payload)} B, {len(receipt)} fields")
 
         assert receipt["format"] == "cozy.pod-readiness/1"
-        assert receipt["acquisition_attempt_id"] == "ra-cr048bootproof"
-        assert receipt["acquisition_attempt_ordinal"] == 1
-        assert receipt["rental_id"] == "rental-cr048bootproof"
         assert receipt["pod_boot_id"] == boot_id
         assert receipt["observed_renter_token_sha256"] == [token_hash]
         assert receipt["worker_internal_port"] == WORKER_PORT

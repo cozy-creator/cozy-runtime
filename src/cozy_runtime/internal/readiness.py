@@ -214,9 +214,6 @@ def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int
 
 def receipt_payload(
     *,
-    acquisition_attempt_id: str,
-    acquisition_attempt_ordinal: int,
-    rental_id: str,
     renter_token_sha256: Sequence[str],
     pod_boot_id_value: str,
     certificate_der: bytes,
@@ -240,14 +237,17 @@ def receipt_payload(
     hub that had already pinned the image BY DIGEST. A value the reader chose is not a
     value the reader learns.
 
-    The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
-    spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
+    The attempt id/ordinal and rental id are absent too. ``cozy-pod`` authenticates these
+    bytes with a key Tensorhub minted for exactly one attempt, so echoing Tensorhub's own
+    ids back through the guest cannot establish another fact. ``pod_boot_id`` remains: it
+    is measured on this boot rather than supplied by the hub.
+
+    The format tag stays `cozy.pod-readiness/1`: cozy-pod's HMAC domain separator spells
+    it, cozy-pod treats these bytes as opaque, and nothing has ever booted.
     """
 
     return canonical.write(
         {
-            "acquisition_attempt_id": acquisition_attempt_id,
-            "acquisition_attempt_ordinal": acquisition_attempt_ordinal,
             "format": "cozy.pod-readiness/1",
             "media_foreign_credential_refused": True,
             "media_internal_port": media_internal_port,
@@ -255,7 +255,6 @@ def receipt_payload(
             "media_protocol": "https",
             "observed_renter_token_sha256": list(renter_token_sha256),
             "pod_boot_id": pod_boot_id_value,
-            "rental_id": rental_id,
             "runtime_gpus": gpus,
             "tls_certificate_der_base64": base64.b64encode(certificate_der).decode("ascii"),
             "worker_foreign_credential_refused": True,

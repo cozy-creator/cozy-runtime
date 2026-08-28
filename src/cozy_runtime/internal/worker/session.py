@@ -419,7 +419,7 @@ class AccessTokenSet:
         rotate: a hash added after launch admits nobody and a hash removed after launch
         revokes nothing. A provisioner that intends to rotate delivers the path.
 
-    Everything about the path form is FAIL-CLOSED, exactly as cozy-media's reader is: an
+    Everything about the path form is FAIL-CLOSED, exactly as cozy-pod's byte-plane reader is: an
     unreadable file, a file holding no usable entry, or an mtime that moved BACKWARD
     leaves the loaded set in place and admits nobody until it reads clean again.
     """
