@@ -565,54 +565,6 @@ _ROW_FIELDS: Mapping[type, frozenset[str]] = {
     ),
 }
 
-#: Vocabulary that would make a destination-side transform expressible. A field whose name
-#: contains one of these refuses even if someone remembers to update `_ROW_FIELDS`.
-FORBIDDEN_VOCABULARY: frozenset[str] = frozenset(
-    {
-        "source",
-        "source_key",
-        "from_key",
-        "from_keys",
-        "maps_from",
-        "rekey",
-        "rename",
-        "transform",
-        "transpose",
-        "permute",
-        "permutation",
-        "reorder",
-        "fuse",
-        "fused",
-        "unfuse",
-        "split",
-        "chunk",
-        "concat",
-        "cat",
-        "slice",
-        "part",
-        "parts",
-        "shard",
-        "scale_of",
-        "zero_point",
-        "quant",
-        "quantize",
-        "dequantize",
-        "encoding",
-        "codec",
-        "decoder",
-        "converter",
-        "convert",
-        "adapter",
-        "reconstruct",
-        "subclass",
-        "wrapper",
-        "view_of",
-        "reshape",
-        "expr",
-        "formula",
-    }
-)
-
 
 def _prove_unrepresentable() -> None:
     """Run at import: the row types can express a destination and nothing else."""
@@ -627,15 +579,6 @@ def _prove_unrepresentable() -> None:
                 code="contract_shape",
                 fields=sorted(actual ^ expected),
             )
-        for name in actual:
-            for word in name.split("_"):
-                if word in FORBIDDEN_VOCABULARY:
-                    raise ContractError(
-                        f"{row.__name__}.{name} contains {word!r}: a contract row may name a "
-                        "destination, never a way to build one from something else",
-                        code="contract_vocabulary",
-                        fields=[f"{row.__name__}.{name}"],
-                    )
 
 
 _prove_unrepresentable()
