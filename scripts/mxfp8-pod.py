@@ -28,6 +28,7 @@ It is not claimed to be H3's forward. It does not need to be: BOTH ARMS RUN THE 
 MODULE and differ only in which stored bytes filled it, so a wiring error moves both arms
 together and the delta between them stays attributable to the encoding alone.
 
+    # First place the exact current H3 block order at /root/mx8/construction-order.json.
     python3 mxfp8-pod.py all
 """
 
@@ -45,6 +46,7 @@ from typing import Any
 
 ROOT = Path("/root/mx8")
 STORE = ROOT / "store"
+ORDER = ROOT / "construction-order.json"
 TFS = "/root/tfs"
 REPO = "Comfy-Org/MiniMax-H3"
 REV = "4cc1d817b6184899b41293954329f576cb5ae86b"
@@ -178,6 +180,11 @@ def quantize(torch: Any, weight: Any) -> tuple[Any, Any, int]:
 
 def ingest() -> None:
     head("ingest — both arms through the REAL border into one store")
+    if not ORDER.is_file():
+        raise SystemExit(
+            f"missing {ORDER}: supply the exact block subset of the current H3 "
+            "ModelConstruction traversal; carrier or lexical order is not executable"
+        )
     if not (STORE / "objects").is_dir():
         STORE.mkdir(parents=True, exist_ok=True)
         tfs_cli("store", "init", str(STORE))
@@ -205,6 +212,8 @@ def ingest() -> None:
             f"block={encoding}",
             "--source",
             f"block={source}",
+            "--order",
+            str(ORDER),
             "--session",
             arm,
             "--tenant",

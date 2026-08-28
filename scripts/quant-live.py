@@ -150,6 +150,28 @@ def tfs_cli(*args: str, cwd: Path = TFS) -> subprocess.CompletedProcess[str]:
     )
 
 
+def construction_order() -> Path:
+    """Materialize the current real SDXL construction census as an ingest recipe input."""
+    from corpus.sdxl_real import SdxlUnetPipeline
+
+    from cozy_runtime.author._loader import Config
+    from cozy_runtime.author._loader import census as walk_census
+    from cozy_runtime.internal.derive import placing
+
+    with placing():
+        construction = SdxlUnetPipeline(Config(unet_config(), "unet.config"))
+    rows: list[list[str]] = []
+    for destination in walk_census(construction).destinations:
+        component, separator, local = destination.key.partition(".")
+        if not separator or component != destination.component:
+            raise RuntimeError(f"malformed construction destination {destination.key!r}")
+        rows.append([component, local])
+    WORK.mkdir(parents=True, exist_ok=True)
+    path = WORK / "construction-order.json"
+    path.write_text(json.dumps(rows, separators=(",", ":")))
+    return path
+
+
 # --------------------------------------------------------------------------- produce
 
 #: ComfyUI's `scaled_fp8` emits an `input_scale` beside the weight scale for the modules
@@ -288,6 +310,8 @@ def ingest() -> None:
         "unet=fp8-scaled-scalar/1",
         "--source",
         f"unet={CARRIER}",
+        "--order",
+        str(construction_order()),
         "--session",
         "cr006",
         "--tenant",
@@ -595,6 +619,8 @@ def install_into(root: Path) -> str:
         "unet=fp8-scaled-scalar/1",
         "--source",
         f"unet={CARRIER}",
+        "--order",
+        str(construction_order()),
         "--session",
         session,
         "--tenant",

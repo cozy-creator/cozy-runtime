@@ -31,6 +31,7 @@ and `scripts/leaf-pod.py` proves what it costs on real weights.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import subprocess
@@ -52,6 +53,17 @@ RELEASE = "cozy/leaf-live@cr-006"
 #: fc2. Kilobytes of real bytes through the real border, and the same MIXED shape the real
 #: artifact has — rank-2 weights encoded, everything else at source precision.
 SHAPES = {"attn.out_proj.weight": (64, 224), "mlp.fc2.weight": (32, 448)}
+
+
+def traversal_digest(keys: list[str]) -> str:
+    """Independent oracle for fill.py's length-delimited destination-sequence identity."""
+    digest = hashlib.sha256()
+    for key in keys:
+        raw = key.encode("utf-8")
+        digest.update(len(raw).to_bytes(4, "big"))
+        digest.update(raw)
+    return "sha256:" + digest.hexdigest()
+
 
 PASS = 0
 FAIL = 0
@@ -89,6 +101,22 @@ def tfs_cli(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         cwd=str(TFS),
     )
+
+
+def construction_order() -> Path:
+    """Write the exact synthetic endpoint census TensorFS requires for artifact authorship."""
+    from cozy_runtime.author._loader import census as walk_census
+
+    rows: list[list[str]] = []
+    for destination in walk_census(LeafBlock(None)).destinations:
+        component, separator, local = destination.key.partition(".")
+        if not separator or component != destination.component:
+            raise RuntimeError(f"malformed construction destination {destination.key!r}")
+        rows.append([component, local])
+    WORK.mkdir(parents=True, exist_ok=True)
+    path = WORK / "construction-order.json"
+    path.write_text(json.dumps(rows, separators=(",", ":")))
+    return path
 
 
 def _rel(got: Any, want: Any) -> float:
@@ -626,6 +654,8 @@ def carrier() -> None:
         "block=fp8-rowwise/1",
         "--source",
         f"block={CARRIER}",
+        "--order",
+        str(construction_order()),
         "--session",
         session,
         "--tenant",
@@ -635,9 +665,16 @@ def carrier() -> None:
     if run.returncode or install.returncode:
         check("ingest", False, (run.stderr + install.stderr)[:300])
         raise SystemExit(1)
-    import tensorfs
-
-    snapshot = str(tensorfs.ingest_installed(tensorfs.Store.open(str(STORE)))[-1])
+    snapshot = next(
+        (
+            word.removeprefix("sha256:")
+            for word in install.stdout.split()
+            if word.startswith("sha256:") and len(word) == 71
+        ),
+        "",
+    )
+    if not snapshot:
+        raise RuntimeError("ingest install returned no exact snapshot identity")
     (WORK / "snapshot.txt").write_text(snapshot)
     print(f"  snapshot   {snapshot[:30]}…  carrier {CARRIER.stat().st_size} B")
 
@@ -843,6 +880,7 @@ def fill() -> None:
     """The rung itself: a real artifact, the real fill plane, real leaves installed."""
     import torch
 
+    from cozy_runtime.author._loader import census as walk_census
     from cozy_runtime.internal.fill import FillRefusal, _tensors
 
     head("fill — the native rung end to end: consent, replacement, census, ledger")
@@ -880,6 +918,8 @@ def fill() -> None:
     backend, rows = _backend("footprint")
     before_alloc = torch.cuda.memory_allocated()
     model = _acquire(backend, rows, "accept")
+    expected = [row.key for row in walk_census(LeafBlock(None)).destinations]
+    traversal = backend.stats["traversals"][-1]
     block = backend.components["block"]
     print(f"  servable   {backend.servability.line()}")
     print(
@@ -888,6 +928,14 @@ def fill() -> None:
             f"{k.split('.', 1)[1]} -> {v.provider.route}"
             for k, v in sorted(backend.selected.items())
         )
+    )
+    check(
+        "the initial fill handed TensorFS the exact construction traversal",
+        traversal["order"] == "construction"
+        and traversal["digest"] == traversal_digest(expected)
+        and traversal["tensors"] == len(expected),
+        f"{traversal['order']}, {traversal['digest'][:26]}… over {len(expected)} tensors; "
+        f"first {traversal['first']}",
     )
     check(
         "every encoded tensor became a LEAF, and the plain one did not",
@@ -962,10 +1010,20 @@ def arms() -> None:
         RowwiseNativeLeaf,
         implementation_digest,
     )
-    from cozy_runtime.internal.fill import FillRefusal, PlanRow
+    from cozy_runtime.internal.fill import FillRefusal, PlanRow, _require_construction_order
     from cozy_runtime.internal.instruments import quantize_rowwise
 
     head("arms — the route's laws, each planted")
+
+    try:
+        _require_construction_order("header", "block")
+        check("ARM: a header-order TensorFS plan refuses", False, "it was admitted")
+    except FillRefusal as exc:
+        check(
+            "ARM: a header-order TensorFS plan REFUSES before copies",
+            exc.code == "plan_divergence" and "not executable" in str(exc),
+            f"[{exc.code}] {str(exc)[:190]}",
+        )
 
     backend = globals().get("_FILLED")
     if backend is None:
@@ -1121,6 +1179,36 @@ def arms() -> None:
             f"[{exc.code}] {exc.args[0][:200]}",
         )
     parking.poison([])
+
+    # GREEN — the same artifact through the decoded-float route can park and re-fill. This
+    # is cr-041's second production transaction: `stage()` walks the fresh component census,
+    # enqueues it in that order and hands that exact traversal to TensorFS, just like the
+    # initial fill above.
+    staged, rows = _backend("latency")
+    staged.resident_budget = 1
+    model = _acquire(staged, rows, "accept")
+    was_parked = tuple(staged.parked)
+    expected = [row.key for row in walk_census(LeafBlock(None)).destinations]
+    receipt = staged.stage("block")
+    traversal = staged.stats["traversals"][-1]
+    x = torch.randn(96, 224, dtype=torch.bfloat16, device="cuda") * 0.5
+    with torch.inference_mode():
+        out, _ = model.step(torch, x)
+    check(
+        "GREEN: a parked decoded component re-fills from its fresh census and computes",
+        was_parked == ("block",)
+        and receipt.get("action") == "stage"
+        and tuple(staged.components) == ("block",)
+        and traversal["order"] == "construction"
+        and traversal["digest"] == traversal_digest(expected)
+        and traversal["tensors"] == len(expected)
+        and out.shape == (96, 64)
+        and bool(torch.isfinite(out).all()),
+        f"parked {list(was_parked)} -> {receipt}; {traversal['order']}, "
+        f"{traversal['digest'][:26]}… over {len(expected)} tensors; "
+        f"output {tuple(out.shape)} finite",
+    )
+    staged.close()
 
     # ARM 8 — the OUTPUT DTYPE law. A leaf built for one contract dtype must not quietly
     # emit another; the probe checks it and so does this.

@@ -477,13 +477,14 @@ def _cache(value: object, index: int) -> DeclaredCache:
 
 
 def check_agreement(contract: ModelConstructionContract, destinations: Sequence[str]) -> None:
-    """EXACT one-to-one agreement, in both directions and at both plumbing levels.
+    """EXACT ordered one-to-one agreement, at both plumbing levels.
 
     `destinations` is the fill plane's own key list (cr-002b's `Loader` census, which
     cr-005 turns into real byte fills). The contract's `logical_tensors` come from the
-    harness's independent deep walk. Two independently derived sets that must be equal is
-    a far stronger claim than one set checked against itself.
+    harness's independent deep walk. Membership proves topology; sequence proves the MCC
+    records the same construction traversal the Loader will hand to TensorFS.
     """
+    actual = list(destinations)
     keys = [t.key for t in contract.logical_tensors]
     duplicates = sorted({k for k in keys if keys.count(k) > 1})
     if duplicates:
@@ -506,8 +507,8 @@ def check_agreement(contract: ModelConstructionContract, destinations: Sequence[
             code="incomplete_destination_set",
             fields=(only_set + only_log)[:6],
         )
-    missing = sorted(set(keys) - set(destinations))
-    surplus = sorted(set(destinations) - set(keys))
+    missing = sorted(set(keys) - set(actual))
+    surplus = sorted(set(actual) - set(keys))
     if missing or surplus:
         raise ContractError(
             "the harness census and the fill plane disagree: "
@@ -515,6 +516,24 @@ def check_agreement(contract: ModelConstructionContract, destinations: Sequence[
             f"{surplus[:4]} — the contract the serve path replays must be the derived one",
             code="census_disagreement",
             fields=(missing + surplus)[:6],
+        )
+    if covered != actual:
+        first = next(
+            (
+                index
+                for index, (declared, filled) in enumerate(zip(covered, actual, strict=False))
+                if declared != filled
+            ),
+            min(len(covered), len(actual)),
+        )
+        declared = covered[first] if first < len(covered) else "<end>"
+        filled = actual[first] if first < len(actual) else "<end>"
+        raise ContractError(
+            "the ModelConstructionContract and Loader census contain the same destinations "
+            f"in different order at index {first}: contract {declared!r}, Loader "
+            f"{filled!r} — header/load order is construction identity",
+            code="census_order_disagreement",
+            fields=[declared, filled],
         )
 
 

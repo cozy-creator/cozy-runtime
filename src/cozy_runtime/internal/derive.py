@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, cast
 
-from cozy_runtime.author._loader import Artifact, Loader, census, loading
+from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
 from cozy_runtime.internal.contract import (
     DEFAULT_DTYPE,
     Candidate,
@@ -530,6 +530,65 @@ class RichCensus:
     sets: tuple[DestinationSet, ...]
 
 
+def _ordered_destination_sets(
+    shallow: Sequence[Census], rich: RichCensus
+) -> tuple[DestinationSet, ...]:
+    """Attach deep metadata to the Loader's one authoritative destination traversal.
+
+    `census()` is the walk `Loader._fill` executes: component mapping order, then each
+    module's exact `state_dict()` order. The deep walk supplies kind/class/alias metadata,
+    but its `named_parameters()`-then-`named_buffers()` order is not another traversal.
+    """
+    templates: dict[str, DestinationSet] = {}
+    for row in rich.sets:
+        if row.component in templates:
+            raise ConstructionFault(
+                "duplicate component",
+                f"component {row.component!r} is constructed more than once; one component "
+                "has one ordered DestinationSet",
+            )
+        templates[row.component] = row
+
+    ordered: list[DestinationSet] = []
+    for view in shallow:
+        keys: dict[str, list[str]] = {name: [] for name in view.components}
+        for destination in view.destinations:
+            if destination.component not in keys:
+                raise ConstructionFault(
+                    "component census",
+                    f"destination {destination.key!r} belongs to a component absent from "
+                    "the Loader census",
+                )
+            keys[destination.component].append(destination.key)
+        for name in view.components:
+            template = templates.pop(name, None)
+            if template is None:
+                raise ConstructionFault(
+                    "component census",
+                    f"the Loader constructs component {name!r} and the deep census does not",
+                )
+            if set(keys[name]) != set(template.keys):
+                raise ConstructionFault(
+                    "component census",
+                    f"the Loader and deep census disagree on component {name!r}",
+                )
+            ordered.append(
+                DestinationSet(
+                    component=name,
+                    module_class=template.module_class,
+                    training=template.training,
+                    compiled=template.compiled,
+                    keys=tuple(keys[name]),
+                )
+            )
+    if templates:
+        raise ConstructionFault(
+            "component census",
+            f"the deep census found components the Loader did not: {sorted(templates)}",
+        )
+    return tuple(ordered)
+
+
 def _load_typed(model: Any, loader: Any) -> None:
     """Run the author's `load()`, turning torch's own untyped refusals into named ones.
 
@@ -841,7 +900,7 @@ def derive(
             hardware_variant=hardware_variant,
         ),
         logical_tensors=tuple(sorted(rich.logical, key=lambda t: t.key)),
-        destination_sets=tuple(sorted(rich.sets, key=lambda d: d.component)),
+        destination_sets=_ordered_destination_sets(shallow, rich),
         derived=tuple(sorted(rich.derived, key=lambda d: d.key)),
         caches=tuple(
             sorted(
