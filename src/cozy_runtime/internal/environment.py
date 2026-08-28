@@ -50,8 +50,6 @@ MAX_WHEEL_EXPANDED_BYTES = 32 << 30
 MAX_WHEEL_EXPANSION = 64
 MAX_METADATA_BYTES = 4 << 20
 PINNED_UV_VERSION = "uv 0.9.18"
-PINNED_UV_LENGTH = 55_339_456
-PINNED_UV_DIGEST = "sha256:7f73d66b9767a281c2cae604b7cd0b6eaa1f0dda5ae28b9067e6de745d9593eb"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
 _GLIBC = re.compile(r"^glibc([0-9]+)\.([0-9]+)$")
@@ -792,17 +790,14 @@ def _sealed_env(base: Mapping[str, str]) -> dict[str, str]:
 
 
 def _verify_uv(uv: Path, env: Mapping[str, str]) -> None:
-    try:
-        info = uv.lstat()
-    except OSError as exc:
-        raise EnvironmentRefusal("uv_unreadable", str(exc)) from exc
-    if (
-        not uv.is_absolute()
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_size != PINNED_UV_LENGTH
-        or _hash_file(uv) != PINNED_UV_DIGEST
-    ):
-        raise EnvironmentRefusal("uv_identity_mismatch", str(uv))
+    """Require the exact resolver build, by the one fact that changes the install.
+
+    The bytes are not re-hashed: `uv` ships inside the substrate image, so its OCI digest
+    already fixes them before anything here runs.  The version is still checked because a
+    different resolver lays a venv out differently, and that surfaces as an opaque receipt
+    mismatch instead of a named refusal.
+    """
+
     result = _run([str(uv), "--version"], env, "uv_version_unreadable")
     if result.stdout.strip() != PINNED_UV_VERSION:
         raise EnvironmentRefusal("uv_identity_mismatch", result.stdout.strip())

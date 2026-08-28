@@ -8,16 +8,12 @@ paths are deliberately function arguments: they never enter a canonical release 
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
-import importlib.util
-import json
 import os
 import stat
 import time
 import urllib.error
 import urllib.parse
 import uuid
-import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +29,6 @@ RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/1"
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 PROVISION_SPEC_FORMAT = "tensorhub.rental_provision_spec/1"
 PROVISION_BUNDLE_FORMAT = "tensorhub.rental_provision_bundle/1"
-CONTROL_RUNTIME_WHEEL = Path("/opt/cozy/control-runtime/cozy-runtime.whl")
 # execution-substrates creates and grants the runtime exactly this container-local data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -99,7 +94,6 @@ def prepare_launch(
     environment_root: Path = ENVIRONMENT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
     plans_root: Path = PLANS_ROOT,
-    control_runtime_wheel: Path = CONTROL_RUNTIME_WHEEL,
 ) -> PreparedLaunch:
     """Acquire one exact provision closure, materialize it offline, and stage its plans."""
 
@@ -110,9 +104,6 @@ def prepare_launch(
         config.provision_bundle_path, config.provision_bundle_digest
     )
     spec, bundle, cache = _provision_pair(spec_bytes, bundle_bytes, config)
-    control_ref = _ref(spec["execution_substrate"]["control_runtime"], "control_runtime")
-    _verify_local(control_runtime_wheel, control_ref["digest"], control_ref["length"])
-    verify_control_install(control_runtime_wheel)
 
     root = provision_root / config.provision_bundle_digest.removeprefix("sha256:")
     document_root = root / "documents"
@@ -182,65 +173,6 @@ def prepare_launch(
         artifact_sources=materialized_objects.sources,
         network_cache_degradations=materialized_objects.network_cache_degradations,
     )
-
-
-def verify_control_install(wheel: Path) -> None:
-    """Require this imported control Runtime to be the exact package in ``wheel``.
-
-    A Python console script's executable inode is CPython, not its distribution. The
-    substrate therefore binds the wheel bytes, and this comparison closes the other half:
-    every shipped control-Runtime package file imported by this interpreter must be the
-    byte-identical member of that wheel. Editable/source/PYTHONPATH execution cannot pass.
-    """
-
-    spec = importlib.util.find_spec("cozy_runtime")
-    locations = tuple(spec.submodule_search_locations or ()) if spec is not None else ()
-    if len(locations) != 1:
-        raise LaunchRefusal("control_runtime_install_invalid", "package root is ambiguous")
-    package = Path(locations[0])
-    try:
-        package = package.resolve(strict=True)
-        distribution = importlib.metadata.distribution("cozy-runtime")
-        distribution_package = Path(str(distribution.locate_file("cozy_runtime"))).resolve(
-            strict=True
-        )
-        direct_url = distribution.read_text("direct_url.json")
-        if package != distribution_package or (
-            direct_url is not None and json.loads(direct_url).get("dir_info", {}).get("editable")
-        ):
-            raise LaunchRefusal(
-                "control_runtime_install_invalid", "adapter package is not the installed wheel"
-            )
-        with zipfile.ZipFile(wheel) as archive:
-            members = sorted(
-                name
-                for name in archive.namelist()
-                if name.startswith("cozy_runtime/") and not name.endswith("/")
-            )
-            if not members:
-                raise LaunchRefusal(
-                    "control_runtime_install_invalid", "wheel has no cozy_runtime package"
-                )
-            for name in members:
-                relative = Path(name).relative_to("cozy_runtime")
-                installed = package / relative
-                info = installed.lstat()
-                if not stat.S_ISREG(info.st_mode) or installed.read_bytes() != archive.read(name):
-                    raise LaunchRefusal(
-                        "control_runtime_install_mismatch", f"package member {relative} differs"
-                    )
-    except LaunchRefusal:
-        raise
-    except (OSError, KeyError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
-        raise LaunchRefusal(
-            "control_runtime_install_invalid", f"package comparison failed: {type(exc).__name__}"
-        ) from exc
-
-    module = Path(__file__).resolve(strict=True)
-    if package not in module.parents:
-        raise LaunchRefusal(
-            "control_runtime_install_invalid", "adapter is not executing from the installed package"
-        )
 
 
 def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
