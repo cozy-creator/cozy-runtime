@@ -341,10 +341,6 @@ class DeclaredBinding:
     max_inputs_total_bytes: int = 256 << 20
     """The whole attempt's input budget. Input retention is its own bounded story: inputs
     take no CAS lease and end with the attempt spool."""
-    egress_allowed_hosts: tuple[str, ...] = ()
-    """Hosts this deployment may fetch a remote grant from. EMPTY MEANS NO EGRESS: a
-    `file://` grant needs none, and a deployment that has not declared a host cannot be
-    talked into one at request time."""
 
     @property
     def weightless(self) -> bool:

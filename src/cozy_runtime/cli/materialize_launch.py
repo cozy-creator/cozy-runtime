@@ -4,7 +4,8 @@ The pod boots to READY-BUT-EMPTY. No provision document is read and nothing is f
 GPU inventory measured, worker started with zero placements, both listeners proven to
 refuse a foreign credential, receipt published. The first placement arrives afterwards
 over rev-2's `DesiredPlacementSet` from the connected RecordOwner, and is treated
-identically to placements 2..N.
+identically to placements 2..N — it is FETCHED through the standing `ArtifactGrant` and
+MATERIALIZED by the same acquisition walk every later revision runs (cr-049).
 
 Nothing here re-measures the pod's own image. The hub pinned the substrate by OCI digest
 before this process existed, so every byte baked into it is already attested; the pod
@@ -156,6 +157,10 @@ def _start_worker(
         f"0.0.0.0:{config.worker_internal_port}",
         "--out",
         str(WORKER_ROOT),
+        # The attempt id IS the worker's name on the rev-2 wire: a Claim naming another
+        # worker is refused, and every Fault is attributed to it. This is the whole reason
+        # COZY_ACQUISITION_ATTEMPT_ID survived the environment diet the ordinal and the
+        # rental id did not — it is spent here, not echoed back to the hub.
         "--worker-id",
         config.acquisition_attempt_id,
         "--instance-id",

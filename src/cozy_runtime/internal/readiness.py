@@ -237,13 +237,16 @@ def receipt_payload(
     hub that had already pinned the image BY DIGEST. A value the reader chose is not a
     value the reader learns.
 
-    The attempt id/ordinal and rental id are absent too. ``cozy-pod`` authenticates these
-    bytes with a key Tensorhub minted for exactly one attempt, so echoing Tensorhub's own
-    ids back through the guest cannot establish another fact. ``pod_boot_id`` remains: it
-    is measured on this boot rather than supplied by the hub.
+    `acquisition_attempt_id`, `acquisition_attempt_ordinal` and `rental_id` went last, for
+    a third reason: the hub verifies this payload under a key it minted for ONE attempt and
+    recovered from that attempt's own persisted create bytes. A receipt that authenticates
+    has already said which attempt it belongs to; echoing the ids back let the binder
+    re-derive, from guest bytes, a fact the signature had established first. `pod_boot_id`
+    remains — it is measured here, not told to us, and it is what makes two boots of the
+    same pod distinguishable.
 
-    The format tag stays `cozy.pod-readiness/1`: cozy-pod's HMAC domain separator spells
-    it, cozy-pod treats these bytes as opaque, and nothing has ever booted.
+    The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
+    spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
     """
 
     return canonical.write(

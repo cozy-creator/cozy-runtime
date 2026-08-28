@@ -60,7 +60,6 @@ from typing import Any
 from cozy_runtime.internal import (
     accel,
     child_env,
-    egress,
     fill,
     hostfacts,
     overlay,
@@ -1784,13 +1783,6 @@ class Worker:
         self.prepared_models = {}
         self.engine.bindings = self.bindings
         self.engine.prepared_models = {}
-        hosts = sorted(
-            {host for binding in self.bindings.values() for host in binding.egress_allowed_hosts}
-        )
-        self.engine.egress = egress.EgressPolicy(
-            allowed_hosts=tuple(hosts),
-            allow_private=any(b.tenancy == "local" for b in self.bindings.values()),
-        )
         self.bump_admission(
             f"placement {candidate.placement_id or '(unnamed)'} moved to spec "
             f"{documents.spell(candidate.spec_digest)[:23]}…"

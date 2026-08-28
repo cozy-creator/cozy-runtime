@@ -14,12 +14,31 @@ is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and repor
 `Fault`, because a worker asking for something it was never granted is a fact an operator
 must see. Nothing widens the table at runtime; a new call site is a new reviewed row.
 
-Two transports, one reader (cr-012). `file://` is the local deployment's own spool or CAS;
-`https://` goes out through `internal/egress.py`, which holds a declared allowlist, resolves
-fail-closed and re-applies the whole check on EVERY redirect hop. Both land in one bounded
-reader. The EXECUTOR still has no outbound network at all — every fetch happens here, in the
-worker, before acceptance, and the executor is handed verified files in the attempt
-spool.
+**EVERY DESTINATION IS CONTROL-PLANE-MINTED, never named by request content.** The grant is
+minted for one invocation and spent here, so nothing the endpoint produced — and nothing a
+request body can influence — chooses where bytes land: a destination the table has no row
+for refuses typed, and `scripts/worker-live.py grants` plants
+`https://exfiltrate.example/upload` for the `hub_call_unauthorized` SECURITY EVENT. Every
+row is `file://` TODAY, resolved by `_local` inside the declared grant roots.
+`OutputAccess.url`'s "presigned upload URL" (`worker.proto`) is the PLANNED public route —
+tensorhub mints it, R2 sits behind it, the worker never holds the credential — so that row
+is a completion, and whoever lands it lands HOST VALIDATION of the minted URL with it. That
+is what keeps the property; a `file://`-only table never did — `scripts/lifecycle-live.py
+--only egress` watches a `ctypes` connect(2) LAND from inside the serving executor, so a
+hostile endpoint already holds a socket. The rung is the fence's own, below: a careless
+endpoint and a malicious GRANT, never a malicious endpoint.
+
+cr-012 shipped an `https://` INPUT row and an `EgressPolicy` allowlist for it. Both are gone
+(cr-042): `DeclaredBinding.egress_allowed_hosts` never had a writer, so the row refused every
+`https://` grant unconditionally, and its per-binding shape was also unioned across
+deployments, which decision #451 forbids. `internal/egress.py` survives — it owns the ONE
+bounded reader `copy_bounded`, the ONE address predicate both downloaders call, and the
+fetch boundary th-008's hub-minted input URLs and cr-012's author `Egress` capability will
+enter through. Whoever lands that row lands its allowlist writer with it.
+
+The executor is handed verified files in the attempt spool and never an address, and it
+installs `sandbox.refuse_network` so a dial of its own refuses (cr-042) — a Python-level
+bound on a buggy endpoint, not a kernel bound on a hostile one.
 """
 
 from __future__ import annotations
@@ -70,6 +89,12 @@ class HubCall:
 
 #: The COMPLETE set of calls this worker may make. Read it as the security boundary it
 #: is: anything not spelled here cannot be dialled, whoever asks.
+#:
+#: Every row is `file://` TODAY. The `https://` output row `OutputAccess.url` reserves
+#: ("presigned upload URL") is PLANNED, not forbidden — land it WITH host validation of the
+#: control-plane-minted URL, because what this table holds is that a destination is minted
+#: for the invocation and never named by request content, not that bytes stay off the
+#: network (cr-042). Armed by `scripts/worker-live.py grants`.
 HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_input_read",
@@ -77,15 +102,6 @@ HUB_CALLS: tuple[HubCall, ...] = (
         r"^file://(?P<path>/[\w./-]+)$",
         ("input_id",),
         "read one granted input asset (the payload rides the grant as an input)",
-    ),
-    HubCall(
-        "grant_input_fetch",
-        "GET",
-        r"^https://[\w.-]+(:\d+)?/[\w./?=&%~-]*$",
-        ("input_id",),
-        "fetch one granted input asset over the egress boundary (cr-012): the allowlist, "
-        "the per-hop SSRF check and the bounded reader all apply BELOW this row — this "
-        "table says the call may be made at all, not that the address is safe",
     ),
     HubCall(
         "grant_tree_read",
@@ -412,11 +428,14 @@ def _transfer_granted(
     auth: Authorizer,
     sink: Any,
     *,
-    policy: Any,
     cap: int,
     prefix_bytes: int,
 ) -> Any:
-    """Authorize, stream, measure and verify one exact bound input."""
+    """Authorize, stream, measure and verify one exact bound input.
+
+    `_local` refuses any scheme but `file://` before this reads a byte, which is the whole
+    transport decision: the worker's grant table has no network row (cr-042).
+    """
     from cozy_runtime.internal import egress
 
     if expired(grant):
@@ -425,50 +444,25 @@ def _transfer_granted(
             f"the delivery grant expired at {grant.expires_at_unix}; a resolver fallback is "
             "a NEW attempt, never a patch to this one",
         )
-    absolute = (
-        entry.url
-        if "://" in entry.url
-        else grant.file_base_url.rstrip("/") + "/" + entry.url.lstrip("/")
-    )
-    local = _parse_grant_url(absolute).scheme == "file"
-    local_path = _local(entry.url, grant.file_base_url) if local else None
-    if local_path is not None:
-        absolute = f"file://{local_path}"
+    local_path = _local(entry.url, grant.file_base_url)
+    absolute = f"file://{local_path}"
     try:
-        if local:
-            assert local_path is not None
-            try:
-                descriptor = _open_local_grant(local_path, auth, absolute, entry.input_id)
-            except OSError as exc:
+        try:
+            descriptor = _open_local_grant(local_path, auth, absolute, entry.input_id)
+        except OSError as exc:
+            raise GrantRefusal(
+                "input_not_a_file",
+                f"{entry.input_id}: the grant does not name an openable regular file",
+            ) from exc
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 raise GrantRefusal(
                     "input_not_a_file",
-                    f"{entry.input_id}: the grant does not name an openable regular file",
-                ) from exc
-            with os.fdopen(descriptor, "rb") as handle:
-                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                    raise GrantRefusal(
-                        "input_not_a_file",
-                        f"{entry.input_id}: the grant does not name a regular file",
-                    )
-                receipt = egress.copy_bounded(
-                    iter(lambda: handle.read(egress.CHUNK), b""),
-                    sink,
-                    expected_length=entry.length,
-                    cap=cap,
-                    prefix_bytes=prefix_bytes,
-                    what=f"input {entry.input_id!r}",
+                    f"{entry.input_id}: the grant does not name a regular file",
                 )
-        else:
-            auth.authorize("grant_input_fetch", "GET", absolute, {"input_id": entry.input_id})
-            if policy is None or not policy.allowed_hosts:
-                raise GrantRefusal(
-                    "grant_transport",
-                    f"input {entry.input_id!r}: this deployment declares no allowed egress hosts",
-                )
-            receipt = egress.fetch_into(
-                absolute,
-                policy,
-                cast(BinaryIO, sink),
+            receipt = egress.copy_bounded(
+                iter(lambda: handle.read(egress.CHUNK), b""),
+                sink,
                 expected_length=entry.length,
                 cap=cap,
                 prefix_bytes=prefix_bytes,
@@ -494,7 +488,6 @@ def read_input(
     grant: BoundGrant,
     input_id: str,
     auth: Authorizer,
-    policy: Any = None,
     *,
     cap: int,
 ) -> bytes:
@@ -508,7 +501,7 @@ def read_input(
             f"{', '.join(sorted(grant.inputs)) or 'none'})",
         )
     sink = io.BytesIO()
-    _transfer_granted(grant, entry, auth, sink, policy=policy, cap=cap, prefix_bytes=0)
+    _transfer_granted(grant, entry, auth, sink, cap=cap, prefix_bytes=0)
     return sink.getvalue()
 
 
@@ -522,7 +515,6 @@ def hydrate_inputs(
     auth: Authorizer,
     *,
     spool: Path,
-    policy: Any = None,
     max_bytes: int = 64 << 20,
     max_total_bytes: int = 256 << 20,
 ) -> dict[str, Any]:
@@ -582,7 +574,6 @@ def hydrate_inputs(
                         entry,
                         auth,
                         sink,
-                        policy=policy,
                         cap=max_bytes,
                         prefix_bytes=SNIFF_BYTES,
                     )

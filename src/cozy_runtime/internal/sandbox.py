@@ -18,6 +18,7 @@ False is the assertion the harness makes afterwards.
 
 from __future__ import annotations
 
+import socket
 import sys
 from collections.abc import Sequence
 
@@ -38,7 +39,8 @@ WEIGHT_SUFFIXES: tuple[str, ...] = (
     ".cozy",
 )
 
-#: Audit events that are network egress under any spelling.
+#: Audit events that are network egress under any spelling. ONE definition, shared by every
+#: process in this runtime that claims to have no outbound network (cr-042).
 NETWORK_EVENTS: tuple[str, ...] = (
     "socket.connect",
     "socket.getaddrinfo",
@@ -82,18 +84,44 @@ class FenceViolation(Exception):
         self.detail = detail
 
 
+def unix_seam(event: str, args: tuple[object, ...]) -> bool:
+    """True when a `NETWORK_EVENTS` hit is an AF_UNIX connect: a local seam, not egress."""
+    if event != "socket.connect" or not args:
+        return False
+    return getattr(args[0], "family", None) == socket.AF_UNIX
+
+
+def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
+    """Refuse every `NETWORK_EVENTS` spelling in THIS process. IRREVERSIBLE.
+
+    WHICH ADVERSARY (law 15). This is a bound on Python-level dialling: `socket`, `urllib`,
+    `http.client`, `requests`, and everything built on them. It stops a BUGGY or careless
+    endpoint — a dependency that phones home, a `from_pretrained` that falls through to the
+    hub — which is the same-tenant-code rung, the rung that exists today.
+
+    It is NOT a bound on hostile code. `ctypes` or a C extension reaches `connect(2)` below
+    CPython, and a subprocess inherits no audit hook at all. The third-party-code rung needs
+    a kernel bound (`CLONE_NEWNET`, seccomp) that a process cannot install for itself, and
+    the runtime does not have one. `scripts/lifecycle-live.py egress` observes BOTH halves
+    on the real serving executor, so this paragraph cannot quietly become a bigger claim.
+    """
+
+    def hook(event: str, args: tuple[object, ...]) -> None:
+        if event in NETWORK_EVENTS and not (allow_unix_seam and unix_seam(event, args)):
+            raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]} — {why}")
+
+    sys.addaudithook(hook)
+
+
 def install(*, allow_write_prefixes: Sequence[str] = ()) -> None:
     """Install the audit fences. IRREVERSIBLE — call it in the child, never in a caller."""
     writable = tuple(allow_write_prefixes)
+    refuse_network(
+        "a derivation reads configs and code, never the network. Kernel binaries are pinned "
+        "image inputs; a boot-time kernel fetch is exactly what this refuses (cr-004)"
+    )
 
     def hook(event: str, args: tuple[object, ...]) -> None:
-        if event in NETWORK_EVENTS:
-            raise FenceViolation(
-                "no_network",
-                f"{event}{args[1:2] or args[:1]} — a derivation reads configs and code, never "
-                "the network. Kernel binaries are pinned image inputs; a boot-time kernel "
-                "fetch is exactly what this refuses (cr-004)",
-            )
         if event in SPAWN_EVENTS:
             raise FenceViolation(
                 "no_subprocess",

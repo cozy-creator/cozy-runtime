@@ -7,7 +7,8 @@ hydration, the real executor and the real endpoint, and prints numbers.
   roundtrip  a real PNG in -> `retouch` -> a real PNG out, digest-verified both ways
   kill       the executor dies mid-attempt: the terminal converges, the spool is cleaned
   arms       the typed red arms, each planted for real
-  egress     a real HTTP server: allowlist, per-hop SSRF, and the bounded reader
+  egress     a real HTTP server: allowlist, per-hop SSRF, the bounded reader, the ONE
+             address predicate both downloaders call, and the closed grant table
   debts      cl-010's three cozy-runtime debts, exercised through the product surfaces
   all        every section above, in order
 """
@@ -579,7 +580,7 @@ def arms() -> None:
 
 
 def egress() -> None:
-    head("egress — a real HTTP server: allowlist, per-hop SSRF, bounded reader")
+    head("egress — a real HTTP server: allowlist, per-hop SSRF, bounded reader, one predicate")
     import http.server
     import threading
 
@@ -891,19 +892,41 @@ def egress() -> None:
                     }
                 )
                 try:
-                    grants.read_input(
-                        malformed,
-                        "asset",
-                        grants.Authorizer(),
-                        policy=local,
-                        cap=1,
-                    )
+                    grants.read_input(malformed, "asset", grants.Authorizer(), cap=1)
                 except grants.GrantRefusal as exc:
                     malformed_grant_refusals += exc.code == "grant_transport"
             check(
                 "malformed local and remote grant URLs refuse at the grant front door",
                 malformed_grant_refusals == 2,
                 f"{malformed_grant_refusals}/2 typed refusals",
+            )
+
+            # cr-042: the closed table decides the destination, at the unit it decides it
+            # in; worker-live's `grants` section proves the same refusal end to end. The
+            # `https://` output row `OutputAccess.url` reserves is PLANNED — whoever adds it
+            # lands host validation of the minted URL and rewrites this arm around it.
+            exfiltrating = grants.BoundGrant(
+                outputs={
+                    "image": grants.BoundOutput(
+                        "image", "https://exfiltrate.example/upload", 1 << 20, "image/png"
+                    )
+                }
+            )
+            source = grant_root / "produced.png"
+            source.write_bytes(png(8, 8, 9))
+            try:
+                grants.write_output(
+                    exfiltrating, "image", source, grants.Authorizer(roots=(str(grant_root),))
+                )
+                exfiltration_refused = ""
+            except grants.GrantRefusal as exc:
+                exfiltration_refused = exc.code
+            check(
+                "ARM: a destination the closed table has no row for is unwritable — there is "
+                "no `https://` output row yet",
+                exfiltration_refused in ("hub_call_unauthorized", "grant_transport"),
+                f"{exfiltration_refused or 'it wrote'} — every HUB_CALLS row is `file://` "
+                "today, so a destination the table never minted a row for does not resolve",
             )
 
             inside_parent = grant_root / "parent"
@@ -1006,6 +1029,57 @@ def egress() -> None:
                 and output_peak < 8 * MIB,
                 f"{output_entry.length // MIB} MiB, {output_peak / MIB:.2f} MiB peak Python heap",
             )
+
+        # ------------------------------------------------------------------ cr-042
+        # ONE address predicate, TWO downloaders. `pull.guard` and
+        # `EgressPolicy.check_addresses` were separate hand-written class chains in the
+        # module whose own header says the defect is "there were two downloaders and only
+        # one had the check". They now share `egress.blocked`, and this asks BOTH of them
+        # about the same address.
+        import urllib.error
+
+        from cozy_runtime.internal import egress as egress_module
+        from cozy_runtime.internal import pull
+
+        metadata = "169.254.169.254"
+        why = egress_module.blocked(metadata)
+        try:
+            EgressPolicy(allowed_hosts=(metadata,)).check_addresses(metadata, 80)
+            downloader_codes = ["it resolved"]
+        except EgressRefusal as exc:
+            downloader_codes = [exc.code]
+        try:
+            pull.guard(f"https://{metadata}/object", allow_local=False)
+            downloader_codes.append("it passed")
+        except pull.PullRefusal as exc:
+            downloader_codes.append(exc.code)
+        check(
+            "ONE PREDICATE: both downloaders refuse the metadata address for the same reason",
+            why == "private, link-local"
+            and downloader_codes == ["egress_blocked_address", "source_not_allowed"],
+            f"egress.blocked({metadata}) = {why!r}; {downloader_codes}",
+        )
+
+        deadline = pull.Deadline.after(10.0)
+        body_len = len(
+            pull.open_guarded(f"http://127.0.0.1:{port}/ok", deadline, allow_local=True).read()
+        )
+        check(
+            "GREEN: the pull leg's guarded opener fetches from a declared loopback dev hub",
+            body_len == len(body),
+            f"{body_len} B through pull.open_guarded",
+        )
+        try:
+            pull.open_guarded(f"http://127.0.0.1:{port}/loop", deadline, allow_local=True)
+            redirect = "it followed"
+        except urllib.error.HTTPError as exc:
+            redirect = f"HTTP {exc.code}"
+        check(
+            "ARM: the pull leg REFUSES a redirect outright — never re-opens a URL the guard "
+            "did not see",
+            redirect == "HTTP 302",
+            f"{redirect}; a presigned GET has no business redirecting (`_open`/NoRedirect)",
+        )
 
         off = EgressPolicy()
         try:

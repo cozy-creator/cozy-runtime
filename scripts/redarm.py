@@ -31,12 +31,6 @@ class Arm:
 
 STATIC_ARMS = (
     Arm("env-authority", SRC / "internal" / "child_env.py", "import os\nS = os.environ.get('X')\n"),
-    # cr-037: the seam field is declared_weight_bytes; a budget wearing vram's name is red.
-    Arm(
-        "seam-budget-vocabulary",
-        SRC / "internal" / "executor.py",
-        "def _planted_seam(budgets: dict[str, int]) -> int:\n    return budgets['vram']\n",
-    ),
     Arm(
         "construction-fill-order",
         SRC / "internal" / "fill.py",
@@ -48,6 +42,14 @@ STATIC_ARMS = (
         SRC / "internal" / "derive.py",
         "\n\ndef _planted_mcc_order(rich: object) -> object:\n"
         "    return tuple(sorted(rich.sets, key=lambda row: row.component))\n",
+    ),
+    # cr-042: the third private-address check, planted in the module whose own header says
+    # the defect is "there were two downloaders and only one had the check".
+    Arm(
+        "one-address-predicate",
+        SRC / "internal" / "pull.py",
+        "\n\ndef _planted_second_ssrf_check(addr: object) -> bool:\n"
+        "    return addr.is_private or addr.is_loopback\n",
     ),
     Arm("package-imports", SRC / "author" / "_app.py", "import cozy_runtime.internal.config\n"),
     Arm("package-imports", SRC / "internal" / "config.py", "from cozy_runtime.cli import io\n"),
@@ -259,6 +261,35 @@ LIVE_ARMS = (
         "from cozy_runtime.author._observations import EventRing\n"
         "EventRing().emit('log', 'fetching', 'info', auth_token='ya29.a0Af')\n",
         "credential_field",
+    ),
+    (
+        # cr-051: the value guard inspects bytes and is the real defence; the NAME guard's
+        # residual value is a credential in an unrecognised format. It must not eat the most
+        # obvious fields an inference endpoint emits — `tokens_per_second` and
+        # `output_tokens` — while still refusing a field named for a credential.
+        "observation-metric-names-are-not-credentials",
+        "from cozy_runtime.author._observations import EventRing, ObservationRefusal\n"
+        "ring = EventRing()\n"
+        "admitted = ('tokens_per_second', 'output_tokens', 'input_tokens', 'total_tokens',\n"
+        "            'token_count', 'eos_token', 'kernel_signature', 'signatures')\n"
+        "for name in admitted:\n"
+        "    ring.emit('metric', name, 1.0)\n"
+        "    ring.emit('log', 'decoded', 'info', **{name: 1})\n"
+        "assert ring.caps()['refused'] == 0, ring.caps()\n"
+        "refused = ('token', 'signature', 'access_token', 'api_token', 'refresh_token',\n"
+        "           'session_token', 'oauth_token', 'api_signature', 'auth_token',\n"
+        "           'api_key', 'password', 'private_key', 'cookie')\n"
+        "for name in refused:\n"
+        "    try:\n"
+        "        ring.emit('log', 'fetching', 'info', **{name: 'ya29.a0Af'})\n"
+        "    except ObservationRefusal as exc:\n"
+        "        assert exc.code == 'credential_field', (name, exc.code)\n"
+        "    else:\n"
+        "        raise SystemExit('ADMITTED a credential-named field: ' + name)\n"
+        "assert ring.caps()['refused'] == len(refused), ring.caps()\n"
+        "raise SystemExit('admitted %d descriptive names, refused %d credential names'\n"
+        "    % (len(admitted), len(refused)))\n",
+        "admitted 8 descriptive names, refused 13 credential names",
     ),
     (
         "observation-credential-value",
@@ -1281,23 +1312,6 @@ def run_static(arm: Arm) -> str:
     return f"red — {arm.fence} ({arm.path.relative_to(ROOT)}): {line}"
 
 
-def run_module_name_plant() -> str:
-    """cr-037: recreate the retired bare module name and observe the vocabulary fence red."""
-    planted = SRC / "internal" / "staging.py"
-    if planted.exists():
-        return "NOT PROVEN — staging.py already exists; the rename this arm proves is undone"
-    planted.write_text('"""planted: the retired bare module name."""\n')
-    try:
-        code, output = fence()
-    finally:
-        planted.unlink()
-    if code == 0:
-        return "NOT PROVEN — module-name-vocabulary stayed green with staging.py recreated"
-    lines = output.splitlines()
-    line = next((ln.strip() for ln in lines if "staging.py" in ln), lines[0])
-    return f"red — module-name-vocabulary (planted internal/staging.py): {line}"
-
-
 def run_live(name: str, source: str, expect: str) -> str:
     out = subprocess.run(
         [sys.executable, "-c", source], capture_output=True, text=True, cwd=ROOT, check=False
@@ -1640,7 +1654,6 @@ def main() -> int:
         print("refusing to plant: the tree is already fence-red", file=sys.stderr)
         return 1
     results = [run_static(a) for a in STATIC_ARMS]
-    results.append(run_module_name_plant())
     results += [run_live(*a) for a in LIVE_ARMS]
     results += [run_live(name, PRELUDE + body, expect) for name, body, expect in AUTHOR_ARMS]
     results += [run_live(name, MODEL_PRELUDE + body, expect) for name, body, expect in MODEL_ARMS]

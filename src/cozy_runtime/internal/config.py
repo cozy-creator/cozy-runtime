@@ -77,7 +77,7 @@ class RuntimeConfig:
     it. A RENTED pod is the other mode — see `access_token_hashes`."""
     access_token_hashes: str = ""
     """The RENTED-POD launch mode (#495e/#560g): the sha256 hash SET a Claim's `proof` is
-    verified against, or the path of the file that holds it, in the format cozy-pod's byte plane
+    verified against, or the path of the file that holds it, in the format cozy-media
     already reads (`sha256:<64 hex>`, one per line or comma-separated).
 
     NOT a secret and that is the whole point: whoever launched this worker holds only
@@ -113,9 +113,12 @@ class AdapterConfig:
     delivery lane for the closure that rev-2's ``DesiredPlacementSet`` + ``ArtifactGrantUpdate``
     already carry after the RecordOwner connects.
 
-    The current pod launcher is cozy-creator's ONE ``cozy-pod`` binary. The attempt ordinal
-    and rental id were transit-only receipt echoes, so neither crosses this handoff. The
-    attempt id remains because the adapter spends it as the worker's ``--worker-id``.
+    Of the three identity facts that document smuggled, ONE is left. The ordinal and the
+    rental id existed only to be echoed in the readiness receipt for tensorhub's binder,
+    and that echo proved nothing the receipt's per-attempt HMAC key had not already proven,
+    so both are gone from the handoff and from the payload. ``acquisition_attempt_id``
+    stays because it is not an echo: it is the worker's ``--worker-id``, the identity a
+    RecordOwner's ``Claim`` is addressed to and every ``Fault`` is attributed to.
     """
 
     acquisition_attempt_id: str
@@ -132,9 +135,10 @@ class AdapterConfig:
 
 # The CLOSED adapter handoff. It is an ALLOWLIST, not a passthrough: `read_adapter_config`
 # refuses any other `COZY_ADAPTER_*` name by name, so every addition here is deliberate.
-# cr-048 removed four provision-document fields. Of the three identity fields first added
-# in their place, only the attempt id remains: unlike the retired ordinal/rental echoes it
-# is consumed as the worker's protocol identity.
+# cr-048 removed four (the two provision-document path/digest pairs) and added three
+# identity facts; two of those three are gone again with the receipt echo that was their
+# only reader. What remains of that trio is the attempt id, which the worker wears as its
+# own name.
 ADAPTER_ENV = {
     "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
     "COZY_ADAPTER_POD_BOOT_ID_PATH",
