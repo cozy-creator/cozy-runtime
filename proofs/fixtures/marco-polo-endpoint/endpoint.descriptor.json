@@ -1,0 +1,37 @@
+{
+  "application": "marco_polo_endpoint:app",
+  "entrypoints": [
+    {
+      "hidden": false,
+      "name": "marco",
+      "request": {
+        "fields": [
+          {
+            "name": "message",
+            "type": {
+              "literal": [
+                "marco"
+              ]
+            },
+            "wire": "required"
+          }
+        ]
+      },
+      "result": {
+        "fields": [
+          {
+            "name": "message",
+            "type": {
+              "literal": [
+                "polo"
+              ]
+            },
+            "wire": "required"
+          }
+        ]
+      }
+    }
+  ],
+  "format": "cozy.endpoint.descriptor/1",
+  "jobs": []
+}

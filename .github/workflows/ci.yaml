@@ -25,6 +25,12 @@ jobs:
       # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
       # refuses a stale one (§1.0). A staleness check, not a test suite.
       - run: uv run cozy-runtime describe --check --dir examples
+      # The publication fixture is a standalone endpoint wheel, matching the worker's
+      # dynamic overlay rather than importing it from this source checkout.
+      - run: uv build --wheel --project proofs/fixtures/marco-polo-endpoint --out-dir .fixture-dist
+      - run: >-
+          uv run --with .fixture-dist/marco_polo_endpoint-1.0.0-py3-none-any.whl
+          cozy-runtime --dir proofs/fixtures/marco-polo-endpoint describe --check
       # THE WIRE FENCE (#530-A1), recomputed from the vendored descriptor: the schema
       # digest is DERIVED, so a copy that is not the schema it claims refuses here. It
       # fires on every push and needs nothing outside this repo. What it does NOT cover —
