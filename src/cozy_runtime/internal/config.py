@@ -111,14 +111,17 @@ class AdapterConfig:
     THE POD BOOTS ON ENVIRONMENT ALONE (cr-048). The retired
     ``tensorhub.rental_provision_spec/1`` + ``_bundle/1`` pair was a second, boot-only
     delivery lane for the closure that rev-2's ``DesiredPlacementSet`` + ``ArtifactGrantUpdate``
-    already carry after the RecordOwner connects. What the spec document actually smuggled
-    was three small identity facts the receipt has to echo for the hub's binder; they are
-    named here explicitly instead.
+    already carry after the RecordOwner connects.
+
+    Of the three identity facts that document smuggled, ONE is left. The ordinal and the
+    rental id existed only to be echoed in the readiness receipt for tensorhub's binder,
+    and that echo proved nothing the receipt's per-attempt HMAC key had not already proven,
+    so both are gone from the handoff and from the payload. ``acquisition_attempt_id``
+    stays because it is not an echo: it is the worker's ``--worker-id``, the identity a
+    RecordOwner's ``Claim`` is addressed to and every ``Fault`` is attributed to.
     """
 
     acquisition_attempt_id: str
-    acquisition_attempt_ordinal: int
-    rental_id: str
     pod_boot_id_path: Path
     tls_cert_path: Path
     tls_key_path: Path
@@ -132,13 +135,12 @@ class AdapterConfig:
 
 # The CLOSED adapter handoff. It is an ALLOWLIST, not a passthrough: `read_adapter_config`
 # refuses any other `COZY_ADAPTER_*` name by name, so every addition here is deliberate.
-# cr-048 removed four (the two provision-document path/digest pairs) and added three: the
-# attempt identity the readiness receipt must echo for tensorhub's binder, which until now
-# rode inside the provision spec document for exactly that reason and nothing else.
+# cr-048 removed four (the two provision-document path/digest pairs) and added three
+# identity facts; two of those three are gone again with the receipt echo that was their
+# only reader. What remains of that trio is the attempt id, which the worker wears as its
+# own name.
 ADAPTER_ENV = {
     "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
-    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
-    "COZY_ADAPTER_RENTAL_ID",
     "COZY_ADAPTER_POD_BOOT_ID_PATH",
     "COZY_ADAPTER_TLS_CERT_PATH",
     "COZY_ADAPTER_TLS_KEY_PATH",
@@ -335,8 +337,6 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         raise ConfigError("adapter_config", "worker and media ports are equal", "fix bootstrap")
     parsed = AdapterConfig(
         acquisition_attempt_id=bounded("COZY_ADAPTER_ACQUISITION_ATTEMPT_ID"),
-        acquisition_attempt_ordinal=decimal("COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL", 1 << 31),
-        rental_id=bounded("COZY_ADAPTER_RENTAL_ID"),
         pod_boot_id_path=path("COZY_ADAPTER_POD_BOOT_ID_PATH"),
         tls_cert_path=path("COZY_ADAPTER_TLS_CERT_PATH"),
         tls_key_path=path("COZY_ADAPTER_TLS_KEY_PATH"),

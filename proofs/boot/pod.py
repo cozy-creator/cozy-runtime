@@ -49,6 +49,12 @@ MEDIA_PORT = 43101
 DEADLINE = int(time.time()) + 300
 
 RETIRED_RECEIPT_FIELDS = (
+    # The hub verifies this payload under a key minted for ONE attempt and recovered from
+    # that attempt's own create bytes, so a receipt that authenticates has already said
+    # which attempt it belongs to. Echoing the ids let the binder re-derive that from guest
+    # bytes; `pod_boot_id` is the identity this pod actually measured.
+    "acquisition_attempt_id",
+    "acquisition_attempt_ordinal",
     "artifact_sources",
     # The pod does not measure its own image. Tensorhub registers an execution substrate
     # as `name@sha256:…` and refuses a tag, so the control-Runtime wheel baked inside it
@@ -60,13 +66,16 @@ RETIRED_RECEIPT_FIELDS = (
     "network_cache_degradations",
     "provision_bundle_digest",
     "provision_spec_digest",
+    "rental_id",
     "staged_placement_set_digest",
 )
 RETIRED_ADAPTER_ENV = (
+    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
     "COZY_ADAPTER_PROVISION_SPEC_PATH",
     "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
     "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
     "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+    "COZY_ADAPTER_RENTAL_ID",
 )
 
 
@@ -227,8 +236,6 @@ def main() -> int:
     environment = {
         "LANG": "C.UTF-8",
         "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",
-        "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "1",
-        "COZY_ADAPTER_RENTAL_ID": "rental-cr048bootproof",
         "COZY_ADAPTER_POD_BOOT_ID_PATH": str(STATE / "pod-boot-id"),
         "COZY_ADAPTER_TLS_CERT_PATH": str(certificate),
         "COZY_ADAPTER_TLS_KEY_PATH": str(key),
@@ -261,9 +268,6 @@ def main() -> int:
         note(f"receipt published: {len(payload)} B, {len(receipt)} fields")
 
         assert receipt["format"] == "cozy.pod-readiness/1"
-        assert receipt["acquisition_attempt_id"] == "ra-cr048bootproof"
-        assert receipt["acquisition_attempt_ordinal"] == 1
-        assert receipt["rental_id"] == "rental-cr048bootproof"
         assert receipt["pod_boot_id"] == boot_id
         assert receipt["observed_renter_token_sha256"] == [token_hash]
         assert receipt["worker_internal_port"] == WORKER_PORT

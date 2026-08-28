@@ -72,9 +72,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline=config.readiness_deadline_unix,
         )
         payload = readiness.receipt_payload(
-            acquisition_attempt_id=config.acquisition_attempt_id,
-            acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
-            rental_id=config.rental_id,
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
@@ -159,6 +156,10 @@ def _start_worker(
         f"0.0.0.0:{config.worker_internal_port}",
         "--out",
         str(WORKER_ROOT),
+        # The attempt id IS the worker's name on the rev-2 wire: a Claim naming another
+        # worker is refused, and every Fault is attributed to it. This is the whole reason
+        # COZY_ACQUISITION_ATTEMPT_ID survived the environment diet the ordinal and the
+        # rental id did not — it is spent here, not echoed back to the hub.
         "--worker-id",
         config.acquisition_attempt_id,
         "--instance-id",

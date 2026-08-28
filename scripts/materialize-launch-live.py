@@ -89,8 +89,6 @@ def main() -> int:
             "PATH": "/usr/bin",
             "RUNPOD_API_KEY": "must-not-cross",
             "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "attempt-live",
-            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "1",
-            "COZY_ADAPTER_RENTAL_ID": "rental-live",
             "COZY_ADAPTER_POD_BOOT_ID_PATH": str(root / "boot-id"),
             "COZY_ADAPTER_TLS_CERT_PATH": str(root / "tls.crt"),
             "COZY_ADAPTER_TLS_KEY_PATH": str(root / "tls.key"),
@@ -115,11 +113,15 @@ def main() -> int:
         # cr-048's RETIRED HALF, as a negative arm: the adapter handoff is an allowlist, so
         # a bootstrap that still delivers the provision-closure names fails by name here
         # rather than fetching two documents nothing reads.
+        # The two identity facts whose only reader was the receipt echo are retired the same
+        # way: a bootstrap that still hands them over fails by name here.
         for retired in (
             "COZY_ADAPTER_PROVISION_SPEC_PATH",
             "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
             "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
             "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
+            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
+            "COZY_ADAPTER_RENTAL_ID",
         ):
             try:
                 read_adapter_config({**env, retired: "sha256:" + "0" * 64})
@@ -127,11 +129,7 @@ def main() -> int:
                 assert exc.name == "adapter_config" and "unknown" in exc.message
             else:
                 raise AssertionError(f"retired boot-closure name {retired} was accepted")
-        for name in (
-            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
-            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
-            "COZY_ADAPTER_RENTAL_ID",
-        ):
+        for name in ("COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",):
             try:
                 read_adapter_config({k: v for k, v in env.items() if k != name})
             except ConfigError as exc:
@@ -139,16 +137,14 @@ def main() -> int:
             else:
                 raise AssertionError(f"{name} is not required by the adapter handoff")
         try:
-            read_adapter_config({**env, "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL": "0"})
+            read_adapter_config({**env, "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": " untrimmed"})
         except ConfigError as exc:
             assert exc.name == "adapter_config"
         else:
-            raise AssertionError("a non-positive attempt ordinal was accepted")
+            raise AssertionError("an untrimmed attempt id was accepted")
         config = read_adapter_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
         assert config.acquisition_attempt_id == "attempt-live"
-        assert config.acquisition_attempt_ordinal == 1
-        assert config.rental_id == "rental-live"
 
         assert empty_bytes == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
         assert empty_object_set.roots == () and empty_object_set.refs == {}
@@ -564,9 +560,6 @@ def main() -> int:
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
         payload = readiness.receipt_payload(
-            acquisition_attempt_id=config.acquisition_attempt_id,
-            acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
-            rental_id=config.rental_id,
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
@@ -587,9 +580,7 @@ def main() -> int:
         assert isinstance(receipt, dict)
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
-        assert receipt["acquisition_attempt_id"] == "attempt-live"
-        assert receipt["acquisition_attempt_ordinal"] == 1
-        assert receipt["rental_id"] == "rental-live"
+        assert receipt["pod_boot_id"] == boot_id
         assert receipt["observed_renter_token_sha256"] == [token]
         assert receipt["worker_wire_schema_digest"] == SCHEMA_DIGEST
         assert "provider_pod_id" not in receipt
@@ -597,7 +588,12 @@ def main() -> int:
         # per-placement observed state is the rev-2 wire's job, continuously. And the pod
         # measures nothing about its own image: the hub pinned that image by OCI digest,
         # so a control-Runtime digest echoed back is a value the reader already chose.
+        # The identity echo went with them, for a third reason: the hub verifies this
+        # payload under a per-attempt key it recovered from that attempt's own create
+        # bytes, so the signature binds the attempt before any id is read.
         for retired in (
+            "acquisition_attempt_id",
+            "acquisition_attempt_ordinal",
             "artifact_sources",
             "measured_control_runtime_wheel_digest",
             "measured_control_runtime_wheel_length",
@@ -605,6 +601,7 @@ def main() -> int:
             "network_cache_degradations",
             "provision_bundle_digest",
             "provision_spec_digest",
+            "rental_id",
             "staged_placement_set_digest",
         ):
             assert retired not in receipt
