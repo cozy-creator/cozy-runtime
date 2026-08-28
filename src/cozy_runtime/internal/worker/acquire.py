@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from cozy_runtime.internal import canonical, environment, materialize_launch
+from cozy_runtime.internal import canonical, environment, materialize_launch, pull
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -67,6 +67,7 @@ class StandingGrant:
     subjects: Mapping[str, int] = field(default_factory=dict)
     locations: Mapping[str, str] = field(default_factory=dict)
     expires_at_unix: int = 0
+    base_url: str = ""
 
     @classmethod
     def read(cls, update: pb.ArtifactGrantUpdate) -> StandingGrant:
@@ -94,10 +95,18 @@ class StandingGrant:
             subjects=subjects,
             locations=locations,
             expires_at_unix=grant.expires_at_unix,
+            base_url=grant.base_url,
         )
 
     def authorized(self) -> bool:
         return bool(self.subjects)
+
+    def local(self) -> bool:
+        """`pull.guard`'s dev carve-out, decided by the GRANT'S OWN stated base and nothing
+        else: a production grant names a public base, so the private-address door stays
+        shut no matter what a location claims."""
+
+        return bool(self.base_url) and pull.local_hub(self.base_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +198,7 @@ class Acquirer:
                 {"digest": digest, "length": length, "url": url},
                 self.cache_root,
                 deadline=deadline,
+                allow_local=self.grant.local(),
             )
         except materialize_launch.LaunchRefusal as exc:
             raise AcquisitionRefusal(

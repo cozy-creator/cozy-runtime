@@ -210,8 +210,17 @@ def verify_control_install(wheel: Path) -> None:
         )
 
 
-def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
-    """Fetch one bounded HTTPS grant without proxy, redirect, content transform, or alias."""
+def fetch_exact(
+    grant: Mapping[str, Any], root: Path, *, deadline: int, allow_local: bool = False
+) -> Path:
+    """Fetch one bounded HTTPS grant without proxy, redirect, content transform, or alias.
+
+    `allow_local` is `pull.guard`'s existing DEV CARVE-OUT and nothing new: a worker does not
+    fetch artifact bytes from its own network, because a presigned URL that resolved to a
+    link-local address would make it a proxy into its own metadata service. It is true only
+    when the GRANT'S OWN `base_url` is loopback — a production grant can never hand a worker
+    one — which is the same rule `pull.local_hub` already states for the hub base.
+    """
 
     digest = grant.get("digest")
     length = grant.get("length")
@@ -255,6 +264,7 @@ def fetch_exact(grant: Mapping[str, Any], root: Path, *, deadline: int) -> Path:
                     "Accept-Encoding": "identity",
                     "User-Agent": "cozy-materialize-launch/1",
                 },
+                allow_local=allow_local,
                 no_proxy=True,
             )
         except (OSError, urllib.error.URLError, pull.PullRefusal) as exc:
