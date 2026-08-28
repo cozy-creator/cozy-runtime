@@ -27,5 +27,8 @@ uv run --with dist/marco-polo/marco_polo_endpoint-1.0.0-py3-none-any.whl \
 ```
 
 `uv.lock`, `endpoint.descriptor.json`, and the deterministic wheel are the exact inputs a
-Tensorhub publication proof should upload. Publish the same fixture under more than one endpoint
-repository to prove that one CPU worker can retain several independent placements.
+Tensorhub publication proof should upload. The current remote contract admits one placement per
+worker, so publishing this fixture under two endpoint repositories can prove sequential same-pod
+replacement with `cozy rent revise`; it does not prove simultaneous stacking. The currently
+qualified RunPod base worker image is CUDA/GPU even though this endpoint itself performs no GPU
+work.
