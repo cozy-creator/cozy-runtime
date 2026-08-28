@@ -1,0 +1,5 @@
+#!/bin/sh
+# The substrate's accelerator, stood in for. `readiness.runtime_gpus` shells out to the
+# real binary and parses exactly this CSV; the proof's subject is the boot path, not the
+# driver, so the inventory is fixed and the parse is real.
+printf '0, NVIDIA H200, GPU-cr048-boot-proof, 00000000:01:00.0, 143771, 580.65.06\n'

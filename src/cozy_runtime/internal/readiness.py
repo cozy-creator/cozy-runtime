@@ -10,15 +10,15 @@ import ssl
 import subprocess
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import grpc
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.materialize_launch import LaunchRefusal
-from cozy_runtime.protocol import SCHEMA_DIGEST_RAW, WIRE_MINOR
+from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -214,70 +214,57 @@ def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int
 
 def receipt_payload(
     *,
-    spec: Mapping[str, Any],
-    provision_spec_digest: str,
-    provision_bundle_digest: str,
+    acquisition_attempt_id: str,
+    acquisition_attempt_ordinal: int,
+    rental_id: str,
+    renter_token_sha256: Sequence[str],
     pod_boot_id_value: str,
     certificate_der: bytes,
-    installed_receipt_digest: str,
-    placement_set_digest: str,
+    control_runtime_wheel_digest: str,
+    control_runtime_wheel_length: int,
+    worker_internal_port: int,
+    media_internal_port: int,
     gpus: list[RuntimeGPU],
-    artifact_sources: Mapping[str, Mapping[str, int]],
-    network_cache_degradations: Sequence[str],
 ) -> bytes:
-    expected_sources = {"cloud", "local", "network_cache"}
-    if set(artifact_sources) != expected_sources or any(
-        set(row) != {"bytes", "objects"}
-        or not all(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in row.values()
-        )
-        for row in artifact_sources.values()
-    ):
-        raise LaunchRefusal("artifact_source_evidence_invalid", "source rows are not closed counts")
-    degradations = list(network_cache_degradations)
-    if degradations != sorted(set(degradations)) or any(
-        value
-        not in {
-            "backfill_unavailable",
-            "corrupt",
-            "read_unavailable",
-            "unavailable",
-        }
-        for value in degradations
-    ):
-        raise LaunchRefusal(
-            "network_cache_evidence_invalid", "degradations are not a canonical closed set"
-        )
-    network = spec["network"]
+    """The PodReadinessReceipt/1 payload: everything the pod MEASURED about itself.
+
+    cr-048's field set. Six fields left with the boot closure — `provision_spec_digest`,
+    `provision_bundle_digest`, `measured_installed_environment_receipt_digest`,
+    `staged_placement_set_digest`, `artifact_sources`, `network_cache_degradations` — because
+    a pod that boots empty has staged nothing, and a boot-frozen "staged" claim is exactly
+    the acceptance-as-reality shape #473 retired. That state is per-placement observed state
+    on the rev-2 wire (`converged_revision`, MaterializationState x ServingState), reported
+    continuously instead of asserted once.
+
+    `measured_control_runtime_wheel_digest` arrived in their place: the substrate-baked
+    control Runtime wheel, measured on the pod, for the hub to join against the
+    ExecutionSubstrate row it provisioned.
+
+    The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
+    spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
+    """
+
     return canonical.write(
         {
-            "acquisition_attempt_id": spec["acquisition_attempt_id"],
-            "acquisition_attempt_ordinal": spec["acquisition_attempt_ordinal"],
-            "artifact_sources": {
-                source: {"bytes": row["bytes"], "objects": row["objects"]}
-                for source, row in artifact_sources.items()
-            },
+            "acquisition_attempt_id": acquisition_attempt_id,
+            "acquisition_attempt_ordinal": acquisition_attempt_ordinal,
             "format": "cozy.pod-readiness/1",
+            "measured_control_runtime_wheel_digest": control_runtime_wheel_digest,
+            "measured_control_runtime_wheel_length": control_runtime_wheel_length,
             "media_foreign_credential_refused": True,
-            "media_internal_port": network["media_port"],
+            "media_internal_port": media_internal_port,
             "media_listener_bound": True,
-            "media_protocol": network["media_protocol"],
-            "measured_installed_environment_receipt_digest": installed_receipt_digest,
-            "network_cache_degradations": degradations,
-            "observed_renter_token_sha256": spec["renter_token_sha256"],
+            "media_protocol": "https",
+            "observed_renter_token_sha256": list(renter_token_sha256),
             "pod_boot_id": pod_boot_id_value,
-            "provision_bundle_digest": provision_bundle_digest,
-            "provision_spec_digest": provision_spec_digest,
-            "rental_id": spec["rental_id"],
+            "rental_id": rental_id,
             "runtime_gpus": gpus,
-            "staged_placement_set_digest": placement_set_digest,
             "tls_certificate_der_base64": base64.b64encode(certificate_der).decode("ascii"),
             "worker_foreign_credential_refused": True,
-            "worker_internal_port": network["worker_port"],
+            "worker_internal_port": worker_internal_port,
             "worker_listener_bound": True,
-            "worker_protocol": network["worker_protocol"],
-            "worker_wire_schema_digest": network["worker_wire_schema_digest"],
+            "worker_protocol": "cozy.worker.v1",
+            "worker_wire_schema_digest": SCHEMA_DIGEST,
         }
     )
 

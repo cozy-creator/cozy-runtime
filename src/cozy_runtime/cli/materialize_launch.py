@@ -1,4 +1,11 @@
-"""Fixed generic-substrate materialize/launch adapter entrypoint."""
+"""Fixed generic-substrate boot adapter entrypoint.
+
+cr-048: the pod boots to READY-BUT-EMPTY. No provision document is read and nothing is
+fetched — control runtime verified, GPU inventory measured, worker started with zero
+placements, both listeners proven to refuse a foreign credential, receipt published. The
+first placement arrives afterwards over rev-2's `DesiredPlacementSet` from the connected
+RecordOwner, and is treated identically to placements 2..N.
+"""
 
 from __future__ import annotations
 
@@ -17,16 +24,16 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
     LaunchRefusal,
-    prepare_launch,
+    PreparedBoot,
+    prepare_boot,
 )
 
 WORKER_ROOT = Path("/run/cozy/worker")
 MEDIA_ROOT = Path("/run/cozy/media")
-UV_PATH = Path("/opt/cozy/bin/uv")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Materialize one frozen provision closure, prove listeners, then supervise worker."""
+    """Boot empty, prove both listeners, publish the receipt, then supervise the worker."""
 
     opts = Options()
     process: subprocess.Popen[bytes] | None = None
@@ -41,14 +48,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpus = readiness.runtime_gpus(
             config.child_base_env, deadline=config.readiness_deadline_unix
         )
-        prepared = prepare_launch(config, uv=UV_PATH)
-        capacity = prepared.spec["capacity"]
-        if len(gpus) != capacity["accelerator_count"] or any(
-            row["device_name"] != capacity["accelerator_model"] for row in gpus
-        ):
-            raise LaunchRefusal(
-                "runtime_gpu_mismatch", "measured GPU inventory differs from provision capacity"
-            )
+        prepared = prepare_boot(config)
+        # The measured inventory is REPORTED, never compared here: the pod has no
+        # independent authority on what the provider was told to deliver. Tensorhub's
+        # binder joins `runtime_gpus` against the frozen attempt before it trusts the peer.
         process = _start_worker(config, prepared, boot_id, gpus)
         readiness.wait_worker_listener(
             WORKER_ROOT, process, deadline=config.readiness_deadline_unix
@@ -65,16 +68,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline=config.readiness_deadline_unix,
         )
         payload = readiness.receipt_payload(
-            spec=prepared.spec,
-            provision_spec_digest=config.provision_spec_digest,
-            provision_bundle_digest=config.provision_bundle_digest,
+            acquisition_attempt_id=config.acquisition_attempt_id,
+            acquisition_attempt_ordinal=config.acquisition_attempt_ordinal,
+            rental_id=config.rental_id,
+            renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
-            installed_receipt_digest=prepared.installed.receipt_digest,
-            placement_set_digest=prepared.placement_set_digest,
+            control_runtime_wheel_digest=prepared.control_runtime_wheel_digest,
+            control_runtime_wheel_length=prepared.control_runtime_wheel_length,
+            worker_internal_port=config.worker_internal_port,
+            media_internal_port=config.media_internal_port,
             gpus=gpus,
-            artifact_sources=prepared.artifact_sources,
-            network_cache_degradations=prepared.network_cache_degradations,
         )
         readiness.publish(config.receipt_payload_path, payload)
         return _supervise(process)
@@ -86,7 +90,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             CliError(
                 err.code,
                 err.detail,
-                "repair the immutable provision closure or substrate and launch a new attempt",
+                "repair the substrate image or the create-time environment and launch a "
+                "new attempt",
                 Exit.structural,
             ),
             opts,
@@ -116,24 +121,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _start_worker(
     config: object,
-    prepared: object,
+    prepared: PreparedBoot,
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
 ) -> subprocess.Popen[bytes]:
-    # Local imports keep the public entrypoint small while preserving precise static types.
+    # Local import keeps the public entrypoint small while preserving precise static types.
     from cozy_runtime.internal.config import AdapterConfig
-    from cozy_runtime.internal.materialize_launch import PreparedLaunch
 
     assert isinstance(config, AdapterConfig)
-    assert isinstance(prepared, PreparedLaunch)
     WORKER_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     (WORKER_ROOT / "control.addr").unlink(missing_ok=True)
-    control_ref = prepared.spec["execution_substrate"]["control_runtime"]
     devices = ",".join(str(row["device_index"]) for row in gpus)
     child_env = dict(config.child_base_env)
     child_env.update(
         {
-            "COZY_ACCESS_TOKEN_SHA256": ",".join(config.renter_token_sha256),
+            # `sha256:`-PREFIXED, and the prefix is the whole grammar (#560g): a bare hex
+            # entry is parsed as a PATH to a hash file, so the joined bare hashes this
+            # passed before made every renter Claim refuse on a rented pod. The adapter
+            # holds a literal hash SET, so it must spell one.
+            "COZY_ACCESS_TOKEN_SHA256": ",".join(
+                "sha256:" + item for item in config.renter_token_sha256
+            ),
             "COZY_HOME": "/run/cozy",
             "PYTHONNOUSERSITE": "1",
         }
@@ -150,13 +158,13 @@ def _start_worker(
         "--out",
         str(WORKER_ROOT),
         "--worker-id",
-        str(prepared.spec["acquisition_attempt_id"]),
+        config.acquisition_attempt_id,
         "--instance-id",
         boot_id,
-        "--release-id",
-        prepared.endpoint_release,
+        # No `--release-id`: a pod that hosts no placement HAS no endpoint release, and the
+        # worker's empty `release_id` is the honest answer an owner reads back.
         "--artifact-digest",
-        str(control_ref["digest"]),
+        prepared.control_runtime_wheel_digest,
         "--devices",
         devices,
         "--grant-root",

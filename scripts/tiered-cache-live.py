@@ -20,10 +20,10 @@ import tensorfs
 from cozy_runtime.internal import provisioned, pull
 from cozy_runtime.internal.materialize_launch import (
     LOCAL_ARTIFACT_STORE_ROOT,
+    CacheMount,
     LaunchRefusal,
-    ProvisionCache,
-    _materialize_objects,
     _open_cache_store,
+    materialize_objects,
 )
 
 
@@ -148,18 +148,15 @@ def main() -> int:
                     )
                 )
             )
-            grants = [
-                {"digest": ref.digest, "length": ref.length, "url": "https://blocked.invalid"}
-                for ref in sorted(
-                    (manifest_ref, second_manifest_ref, segment_ref),
-                    key=lambda item: item.digest,
-                )
-            ]
+            grants = {
+                ref.digest: "https://blocked.invalid"
+                for ref in (manifest_ref, second_manifest_ref, segment_ref)
+            }
             warm_local = root / "warm-local"
-            warm = _materialize_objects(
-                {"artifact_grants": grants},
+            warm = materialize_objects(
+                grants,
                 object_set,
-                cache=ProvisionCache(cache_mount, "cache-live", "provider-volume-live"),
+                cache=CacheMount(cache_mount, "cache-live", "provider-volume-live"),
                 deadline=None,
                 store_root=warm_local,
             )
@@ -194,17 +191,10 @@ def main() -> int:
             cloud_only_set = provisioned.ArtifactObjectSet(
                 (provisioned.ModelRoot(manifest_ref, (segment_ref,)),)
             )
-            cloud_only_grants = [
-                {
-                    "digest": ref.digest,
-                    "length": ref.length,
-                    "url": f"https://delivery.invalid/{ref.digest[7:]}",
-                }
-                for ref in sorted(
-                    (manifest_ref, segment_ref),
-                    key=lambda item: item.digest,
-                )
-            ]
+            cloud_only_grants = {
+                ref.digest: f"https://delivery.invalid/{ref.digest[7:]}"
+                for ref in (manifest_ref, segment_ref)
+            }
             server.objects = {
                 manifest_ref.digest: manifest,
                 segment_ref.digest: segment,
@@ -249,8 +239,8 @@ def main() -> int:
 
             cloud_only_local = root / "cloud-only-local"
             with mock.patch.object(pull, "pull_granted_snapshot", side_effect=local_cloud_pull):
-                cloud_only = _materialize_objects(
-                    {"artifact_grants": cloud_only_grants},
+                cloud_only = materialize_objects(
+                    cloud_only_grants,
                     cloud_only_set,
                     cache=None,
                     deadline=None,
@@ -406,10 +396,10 @@ def main() -> int:
             alias_mount.mkdir()
             alias_store = alias_mount / "tensorfs"
             try:
-                _materialize_objects(
-                    {"artifact_grants": []},
+                materialize_objects(
+                    {},
                     provisioned.ArtifactObjectSet(()),
-                    cache=ProvisionCache(alias_mount, "cache-alias", "provider-volume-alias"),
+                    cache=CacheMount(alias_mount, "cache-alias", "provider-volume-alias"),
                     deadline=None,
                     store_root=alias_store,
                 )
