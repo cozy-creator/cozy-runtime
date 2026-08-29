@@ -158,10 +158,16 @@ def _wheel_import_roots(names: list[str]) -> tuple[str, ...]:
             if len(path.parts) < 3 or path.parts[1] not in {"purelib", "platlib"}:
                 continue
             path = PurePosixPath(*path.parts[2:])
+        if len(path.parts) == 1:
+            filename = path.name
+            if not filename.endswith((".py", ".pyi", ".so", ".pyd", ".dylib", ".dll")):
+                continue
+        elif not path.name.endswith((".py", ".pyi", ".so", ".pyd", ".dylib", ".dll")):
+            continue
         first = path.parts[0]
         if first.endswith((".dist-info", ".egg-info", ".libs")) or first == "__pycache__":
             continue
-        root = first.partition(".")[0]
+        root = first.removesuffix(".py").removesuffix(".pyi").partition(".")[0]
         if _IMPORT_ROOT_RE.fullmatch(root) is not None:
             roots.add(root)
     return tuple(sorted(roots))

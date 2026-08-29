@@ -793,7 +793,14 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                     raise OverlayRefusal("overlay_wheel_install_scheme_forbidden", name)
                 basename = posix.name.lower()
                 suffix = posix.suffix.lower()
-                if basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES:
+                project_metadata = (
+                    wheel.owner == "project"
+                    and len(posix.parts) == 1
+                    and basename in {"pyproject.toml", "uv.lock"}
+                )
+                if (
+                    basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES
+                ) and not project_metadata:
                     raise OverlayRefusal("overlay_native_build_input_forbidden", name)
                 magic = archive.open(member).read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
@@ -912,15 +919,30 @@ def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) 
 
 
 def _import_roots(names: set[str]) -> frozenset[str]:
+    """Measure Python import roots without mistaking wheel data for modules.
+
+    A wheel may deliberately install repository metadata beside its packages (the endpoint
+    project carries ``endpoint.toml``).  A top-level filename is importable only when it is a
+    Python or native module; a directory is a package root only when the wheel installs an
+    importable member below it.  The files are still extracted -- this function classifies
+    ownership only.
+    """
+
     roots: set[str] = set()
     for name in names:
         installed = _install_path(name)
         if installed is None:
             continue
+        if len(installed.parts) == 1:
+            filename = installed.name
+            if not filename.endswith((".py", ".pyi", *_NATIVE_SUFFIXES)):
+                continue
+        elif not installed.name.endswith((".py", ".pyi", *_NATIVE_SUFFIXES)):
+            continue
         first = installed.parts[0]
         if first.endswith((".dist-info", ".egg-info", ".libs")) or first == "__pycache__":
             continue
-        root = first.partition(".")[0]
+        root = first.removesuffix(".py").removesuffix(".pyi").partition(".")[0]
         if valid_import_root(root):
             roots.add(root)
     return frozenset(roots)
