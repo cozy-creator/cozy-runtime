@@ -113,14 +113,14 @@ def base_manifest(path: Path) -> str:
                 {"providers": ["torch"], "root": "torch"},
             ],
             "compatibility_profile": {
-                "accelerator_build": "none",
+                "accelerator_build": "cpu",
                 "os_cpu": "linux-x86",
                 "python_abi": "cp312",
                 "torch_release": "2.13.0",
             },
             "format": "WheelhouseManifest/3",
-            "minimum_cuda_version": "12.6",
-            "minimum_driver_version": "560.28.03",
+            "minimum_cuda_version": "none",
+            "minimum_driver_version": "none",
             "platform_target": {
                 "accelerator_abi": "none",
                 "accelerator_backend": "none",
@@ -441,6 +441,33 @@ def main() -> int:
         native_host = native_wheel.qualify_host(native_inspection, gpu_sm=None)
         assert native_host["qualification"] == "static-host-compatible"
         base = overlay._read_base_manifest(manifest, family)
+        cpu_document = canonical.parse_canonical(manifest.read_bytes())
+        assert isinstance(cpu_document, dict)
+        for field, value in (
+            ("minimum_cuda_version", "12.6"),
+            ("minimum_driver_version", "560.28.03"),
+        ):
+            bad_cpu = {**cpu_document, field: value}
+            bad_raw = canonical.write(bad_cpu)
+            try:
+                overlay.parse_base_manifest(bad_raw, digest(bad_raw))
+            except overlay.OverlayRefusal as exc:
+                assert exc.code == "base_family_manifest_invalid", exc.code
+            else:
+                raise AssertionError(f"CPU profile with CUDA field {field} was admitted")
+        wrong_cpu_target = dict(cpu_document)
+        wrong_cpu_target["platform_target"] = {
+            **cpu_document["platform_target"],
+            "accelerator_abi": "cu126",
+            "accelerator_backend": "cuda",
+        }
+        wrong_raw = canonical.write(wrong_cpu_target)
+        try:
+            overlay.parse_base_manifest(wrong_raw, digest(wrong_raw))
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "base_family_manifest_invalid", exc.code
+        else:
+            raise AssertionError("CPU build over a CUDA platform target was admitted")
         measured_seat: dict[str, Any] = {
             "cuda_available": False,
             "distributions": [
@@ -468,6 +495,10 @@ def main() -> int:
             "overlay_native_torch_mismatch": {
                 **measured_seat,
                 "torch_version": "2.12.0+cpu",
+            },
+            "overlay_native_accelerator_mismatch": {
+                **measured_seat,
+                "cuda_available": True,
             },
         }
         for code, bad_seat in seat_reds.items():
@@ -506,6 +537,8 @@ def main() -> int:
                 )
             ),
             base_distributions=cuda_distributions,
+            minimum_cuda_version="12.6",
+            minimum_driver_version="560.28.03",
         )
         cuda_seat = {
             **measured_seat,

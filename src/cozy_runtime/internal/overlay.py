@@ -465,11 +465,22 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
     profile = value["compatibility_profile"]
+    accelerator_build = profile.get("accelerator_build") if isinstance(profile, dict) else None
+    cpu_profile = (
+        accelerator_build == "cpu"
+        and platform.get("accelerator_backend") == "none"
+        and platform.get("accelerator_abi") == "none"
+    )
+    accelerator_profile = (
+        isinstance(profile, dict)
+        and accelerator_build == platform.get("accelerator_abi")
+        and platform.get("accelerator_backend") == "cuda"
+    )
     if (
         not isinstance(profile, dict)
         or set(profile) != _COMPATIBILITY_PROFILE_FIELDS
         or not all(isinstance(item, str) and item for item in profile.values())
-        or profile["accelerator_build"] != platform["accelerator_abi"]
+        or not (cpu_profile or accelerator_profile)
         or profile["python_abi"] != platform["python_abi"]
         or profile["os_cpu"] != "linux-x86"
         or platform["os_arch"] != "linux/amd64"
@@ -478,12 +489,14 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
     minimum_cuda = value["minimum_cuda_version"]
     minimum_driver = value["minimum_driver_version"]
-    if (
-        not isinstance(minimum_cuda, str)
-        or re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is None
-        or not isinstance(minimum_driver, str)
-        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is None
-    ):
+    cuda_floors = (
+        isinstance(minimum_cuda, str)
+        and re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is not None
+        and isinstance(minimum_driver, str)
+        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is not None
+    )
+    cpu_floors = minimum_cuda == "none" and minimum_driver == "none"
+    if not ((cpu_profile and cpu_floors) or (accelerator_profile and cuda_floors)):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid CUDA or driver floor")
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))

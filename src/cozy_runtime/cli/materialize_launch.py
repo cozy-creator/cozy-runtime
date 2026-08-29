@@ -33,6 +33,7 @@ from cozy_runtime.internal.materialize_launch import (
     ENVIRONMENT_ROOT,
     LaunchRefusal,
     PreparedBoot,
+    baked_base_manifest,
     control_runtime_digest,
     prepare_boot,
 )
@@ -63,14 +64,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         _arm_supervisor_lifetime()
         boot_id = readiness.pod_boot_id(config.pod_boot_id_path)
         certificate_der = readiness.certificate(config.tls_cert_path)
+        base = baked_base_manifest()
+        platform = dict(base.platform_target)
+        accelerator_backend = platform["accelerator_backend"]
         gpus = readiness.runtime_gpus(
-            config.child_base_env, deadline=config.readiness_deadline_unix
+            config.child_base_env,
+            deadline=config.readiness_deadline_unix,
+            accelerator_backend=accelerator_backend,
         )
         prepared = prepare_boot(config)
         # The measured inventory is REPORTED, never compared here: the pod has no
         # independent authority on what the provider was told to deliver. Tensorhub's
         # binder joins `runtime_gpus` against the frozen attempt before it trusts the peer.
-        process = _start_worker(config, prepared, boot_id, gpus)
+        process = _start_worker(
+            config,
+            prepared,
+            boot_id,
+            gpus,
+            accelerator_backend=accelerator_backend,
+            control_runtime_digest_value=control_runtime_digest(manifest=base),
+        )
         readiness.wait_worker_listener(
             WORKER_ROOT, process, deadline=config.readiness_deadline_unix
         )
@@ -144,6 +157,9 @@ def _start_worker(
     prepared: PreparedBoot,
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
+    *,
+    accelerator_backend: str,
+    control_runtime_digest_value: str,
 ) -> subprocess.Popen[bytes]:
     # Local import keeps the public entrypoint small while preserving precise static types.
     from cozy_runtime.internal.config import AdapterConfig
@@ -169,7 +185,8 @@ def _start_worker(
         prepared,
         boot_id,
         gpus,
-        control_runtime_digest_value=control_runtime_digest(),
+        accelerator_backend=accelerator_backend,
+        control_runtime_digest_value=control_runtime_digest_value,
     )
     return subprocess.Popen(
         command,
@@ -207,6 +224,7 @@ def _worker_command(
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
     *,
+    accelerator_backend: str,
     control_runtime_digest_value: str,
 ) -> list[str]:
     """The fixed dynamic-pod worker argv, kept pure so the launch contract is executable."""
@@ -214,6 +232,12 @@ def _worker_command(
     from cozy_runtime.internal.config import AdapterConfig
 
     assert isinstance(config, AdapterConfig)
+    if accelerator_backend == "cuda" and not gpus:
+        raise LaunchRefusal("runtime_gpus_invalid", "CUDA base measured no GPUs")
+    if accelerator_backend == "none" and gpus:
+        raise LaunchRefusal("runtime_gpus_invalid", "CPU base measured a GPU inventory")
+    if accelerator_backend not in {"cuda", "none"}:
+        raise LaunchRefusal("runtime_accelerator_backend_invalid", accelerator_backend)
     devices = ",".join(str(row["device_index"]) for row in gpus)
     grant_roots = str(MEDIA_ROOT)
     return [
@@ -246,6 +270,8 @@ def _worker_command(
         # from the baked complete WheelhouseManifest, never an OCI self-reference.
         "--control-runtime-digest",
         control_runtime_digest_value,
+        "--accelerator-backend",
+        accelerator_backend,
         # The trusted worker stays root. Every endpoint executor crosses the trampoline
         # into this fixed unprivileged identity after no_new_privs; inability to make that
         # transition is a pre-bind structural refusal.

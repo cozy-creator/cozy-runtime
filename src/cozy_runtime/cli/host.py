@@ -158,6 +158,7 @@ _SERVE_FLAGS: dict[str, str] = {
     "--artifact-object-set": "--artifact-object-set",
     "--artifact-cache": "--artifact-cache",
     "--control-runtime-digest": "--control-runtime-digest",
+    "--accelerator-backend": "--accelerator-backend",
     "--executor-uid": "--executor-uid",
     "--executor-gid": "--executor-gid",
     "--threads": "--threads",
