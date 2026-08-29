@@ -249,7 +249,7 @@ _FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
 
 def package_modules() -> list[pathlib.Path]:
     modules = []
-    for path in sorted((ROOT / "examples").glob("*.py")):
+    for path in sorted((ROOT / "proofs" / "fixtures" / "tiny-models").glob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "App":
@@ -997,8 +997,8 @@ def fence_descriptor_minimality() -> list[str]:
     from cozy_runtime.internal.discovery import discover
 
     try:
-        first = descriptor.build(discover(ROOT / "examples"))
-        second = descriptor.build(discover(ROOT / "examples"))
+        first = descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
+        second = descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
         first_bytes = descriptor.canonical_bytes(first)
         second_bytes = descriptor.canonical_bytes(second)
         document = descriptor.read_bytes(first_bytes, "fresh example derivation")
@@ -1372,7 +1372,7 @@ def fence_typed_model_binding() -> list[str]:
 
     bad: list[str] = []
     paths = [
-        ROOT / "examples" / "package.toml",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml",
         ROOT / "corpus" / "package" / "package.toml",
         ROOT / "corpus" / "pipeline" / "package.toml",
     ]

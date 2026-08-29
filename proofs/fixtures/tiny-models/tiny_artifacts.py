@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from cozy_runtime.author import Artifact, Config, TensorSpec
-from cozy_runtime.author._loader import topology_of
 from tiny_diffusers import Task, TinySdxlPipeline
 from tiny_diffusers import build_h3_pipeline as _build_h3
+
+from cozy_runtime.author import Artifact, Config, TensorSpec
+from cozy_runtime.author._loader import topology_of
 
 H3_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": False}
 BAKED_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": True}

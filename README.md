@@ -457,12 +457,13 @@ Two real packages on the author surface (weightless, no GPU), both driven end to
 
 | example | what it exercises |
 |---|---|
-| `examples/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
-| `examples/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, a declared `DerivedCache`, and the `@app.job` that exercises JobDescriptor |
+| `proofs/fixtures/tiny-models/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
+| `proofs/fixtures/tiny-models/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, a declared `DerivedCache`, and the `@app.job` that exercises JobDescriptor |
 
-`examples/tiny_diffusers.py` stands in for the model library a package brings as an
-ordinary dependency (and registers its own construction adapter); `examples/tiny_artifacts.py`
-and `examples/package.toml` are the RUNTIME's side — resolved artifacts and default
+`proofs/fixtures/tiny-models/tiny_diffusers.py` stands in for the model library a package brings as
+an ordinary dependency (and registers its own construction adapter);
+`proofs/fixtures/tiny-models/tiny_artifacts.py` and
+`proofs/fixtures/tiny-models/package.toml` are the RUNTIME's side — resolved artifacts and default
 bindings. Author code never names an artifact identifier; a fence proves it.
 
 `run` · `serve` · `job` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit` land in

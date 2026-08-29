@@ -84,7 +84,11 @@ STATIC_ARMS = (
     ),
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
     Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
-    Arm("typed-model-binding", ROOT / "examples" / "package.toml", '\nrepo = "legacy/model"\n'),
+    Arm(
+        "typed-model-binding",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml",
+        '\nrepo = "legacy/model"\n',
+    ),
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
@@ -116,7 +120,7 @@ STATIC_ARMS = (
     ),
     Arm(
         "no-identifiers-in-package-code",
-        ROOT / "examples" / "tiny_h3.py",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "tiny_h3.py",
         '_PINNED = "minimaxai/h3@v1"\n',
     ),
     # §8's one-kernel rule, planted as the exact thing it forbids: a SECOND direct-call
@@ -145,23 +149,23 @@ STATIC_ARMS = (
     ),
     Arm(
         "package-owns-no-media-decode",
-        ROOT / "examples" / "tiny_h3.py",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "tiny_h3.py",
         "def _second_decoder() -> None:\n    import av\n\n    av.open('request.mp4')\n",
     ),
     Arm(
         "package-owns-no-media-decode",
-        ROOT / "examples" / "tiny_h3.py",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "tiny_h3.py",
         "def _steal_asset_path(asset: object) -> object:\n    return asset._local\n",
     ),
     Arm(
         "package-owns-no-media-decode",
-        ROOT / "examples" / "tiny_h3.py",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "tiny_h3.py",
         "def _library_path_decode(reference: object) -> object:\n"
         "    return reference.from_file('request.mp4')\n",
     ),
     Arm(
         "package-owns-no-media-decode",
-        ROOT / "examples" / "tiny_h3.py",
+        ROOT / "proofs" / "fixtures" / "tiny-models" / "tiny_h3.py",
         "def _packet_decode(container: object) -> object:\n    return container.demux()\n",
     ),
     Arm(
@@ -549,7 +553,7 @@ LIVE_ARMS = (
 # runs it; the arm passes only when the runtime refuses with the expected typed code.
 PRELUDE = """
 import sys
-sys.path.insert(0, 'examples')
+sys.path.insert(0, 'proofs/fixtures/tiny-models')
 from enum import Enum
 from typing import Annotated
 import msgspec
@@ -798,7 +802,7 @@ def second(payload: In) -> Meta:
 # fixtures, so every violation below is constructed and executed, never simulated.
 MODEL_PRELUDE = """
 import sys
-sys.path.insert(0, 'examples')
+sys.path.insert(0, 'proofs/fixtures/tiny-models')
 from typing import Annotated, Any
 import msgspec
 import tiny_artifacts as art
@@ -1286,7 +1290,7 @@ def handler(ctx: Context, payload: Out, model: Leaky, loader: Loader) -> Out:
 
 def run_separation() -> str:
     """Type-level Loader/Context separation, proven red in BOTH directions."""
-    planted = ROOT / "examples" / "_planted_separation.py"
+    planted = ROOT / "proofs" / "fixtures" / "tiny-models" / "_planted_separation.py"
     planted.write_text(SEPARATION)
     try:
         checked = subprocess.run(
@@ -1300,7 +1304,7 @@ def run_separation() -> str:
             [
                 sys.executable,
                 "-c",
-                "import sys; sys.path.insert(0, 'examples')\n"
+                "import sys; sys.path.insert(0, 'proofs/fixtures/tiny-models')\n"
                 "import _planted_separation as m\n"
                 "from cozy_runtime.author import describe\n"
                 "describe(m.app)\n",
@@ -1402,7 +1406,7 @@ def run_live(name: str, source: str, expect: str) -> str:
 
 def run_mistyped() -> str:
     """One planted signature, two readers: mypy --strict and describe must BOTH refuse."""
-    planted = ROOT / "examples" / "_planted_mistyped.py"
+    planted = ROOT / "proofs" / "fixtures" / "tiny-models" / "_planted_mistyped.py"
     planted.write_text(MISTYPED)
     try:
         checked = subprocess.run(
@@ -1416,7 +1420,7 @@ def run_mistyped() -> str:
             [
                 sys.executable,
                 "-c",
-                "import sys; sys.path.insert(0, 'examples')\n"
+                "import sys; sys.path.insert(0, 'proofs/fixtures/tiny-models')\n"
                 "import _planted_mistyped as m\n"
                 "from cozy_runtime.author import describe\n"
                 "describe(m.app)\n",
@@ -1613,7 +1617,7 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
 
 def run_retired_descriptor_shapes() -> list[str]:
     """The descriptor/1 hardcut has no reader for its four redundant old spellings."""
-    base = descriptor_document.build(discover(ROOT / "examples"))
+    base = descriptor_document.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
     def clone() -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(json.dumps(base)))
@@ -1695,7 +1699,7 @@ def run_fixed_point() -> list[str]:
         "sys.path.insert(0, 'src')\n"
         "from cozy_runtime.internal import descriptor\n"
         "from cozy_runtime.internal.discovery import discover\n"
-        "found = discover(__import__('pathlib').Path('examples'))\n"
+        "found = discover(__import__('pathlib').Path('proofs/fixtures/tiny-models'))\n"
         "body = descriptor.build(found)\n"
         "body{where} = {value}\n"
         "descriptor._fixed_point(body, descriptor._binding_values(found.bindings))\n"

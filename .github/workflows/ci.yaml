@@ -26,8 +26,8 @@ jobs:
       # The architecture fence validates the closed grammar; these exact replays prove the two
       # source fixtures derive byte-identically without dirtying either repository.
       - run: |
-          test "$(uv run cozy-runtime --json --dir examples describe)" = \
-            "$(uv run cozy-runtime --json --dir examples describe)"
+          test "$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)" = \
+            "$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)"
           test "$(uv run --locked --project examples/marco-polo \
             cozy-runtime --json --dir examples/marco-polo describe)" = \
             "$(uv run --locked --project examples/marco-polo \

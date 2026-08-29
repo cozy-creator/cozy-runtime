@@ -30,6 +30,7 @@ from enum import Enum
 from typing import Annotated, Literal, TypeAlias
 
 import msgspec
+from tiny_diffusers import MiniMaxH3ModularPipeline, build_h3_pipeline
 
 from cozy_runtime.author import (
     App,
@@ -59,7 +60,6 @@ from cozy_runtime.author import (
     VideoAsset,
     uses_components,
 )
-from tiny_diffusers import MiniMaxH3ModularPipeline, build_h3_pipeline
 
 app = App()
 

@@ -1,6 +1,7 @@
 """A real-torch H3 fixture: three AdaLN structures, two task partitions, one schedule.
 
-`examples/tiny_h3.py` exercises the AUTHOR SURFACE and is deliberately torch-free so the
+`proofs/fixtures/tiny-models/tiny_h3.py` exercises the AUTHOR SURFACE and is deliberately
+torch-free so the
 descriptor stays derivable without a 3 GB wheel. This is its construction twin: the same
 shape in real `nn.Module`s, so the cr-004 harness has something with genuine structural
 variance to derive.

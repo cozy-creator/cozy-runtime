@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live verification of the author surface. Not a test suite: a real run.
 
-Every section below EXECUTES the real packages in `examples/` through the real invocation
+Every section below executes the tiny-model proof package through the real invocation
 kernel and the real construction plane, and prints what actually happened. Refusals live in
 `scripts/redarm.py`, which plants each violation for real and observes the typed refusal.
 
@@ -28,11 +28,13 @@ import msgspec
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
-sys.path.insert(0, str(ROOT / "examples"))
+sys.path.insert(0, str(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
 import tiny_artifacts as art  # noqa: E402
 import tiny_h3 as h3  # noqa: E402
 import tiny_sdxl as ep  # noqa: E402
+from tiny_diffusers import MiniMaxH3ModularPipeline, TinyScheduler  # noqa: E402
+
 from cozy_runtime.author import (  # noqa: E402
     App,
     Backend,
@@ -68,7 +70,6 @@ from cozy_runtime.author.fakes import (  # noqa: E402  # noqa: E402
 from cozy_runtime.internal import canonical, descriptor  # noqa: E402
 from cozy_runtime.internal.bindings import read_table, resolve  # noqa: E402
 from cozy_runtime.internal.discovery import discover  # noqa: E402
-from tiny_diffusers import MiniMaxH3ModularPipeline, TinyScheduler  # noqa: E402
 
 RELEASE = "release:digest(source,lock,manifest)"
 
@@ -121,7 +122,7 @@ def main() -> int:
     head("bindings — code states capability, package.toml states selection")
     slots = [b for s in describe(h3.app) for b in s.model_bindings]
     slots += [b for s in describe(ep.app) for b in s.model_bindings]
-    table = read_table(ROOT / "examples" / "package.toml")
+    table = read_table(ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml")
     for resolved in resolve(slots, table).values():
         print(f"  {resolved}")
     override = resolve(slots, table, overrides={"generate.models.model": "cozy/h3-fl2va@v2"})
@@ -601,9 +602,13 @@ async def spelling_async(payload: SpellingPayload) -> SpellingReply:
 
 def temp_project(module: str) -> Path:
     """A project root whose package.toml names a DIFFERENT app export of these fixtures.
-    `examples/` is one package project; describe is exercised over every fixture."""
+    The tiny-model fixture is one package project; describe is exercised over every fixture."""
     root = Path(tempfile.mkdtemp(prefix=f"cozy-{module}-"))
-    bindings = (ROOT / "examples" / "package.toml").read_text().partition("[bindings")
+    bindings = (
+        (ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml")
+        .read_text()
+        .partition("[bindings")
+    )
     (root / "package.toml").write_text(
         f'[application]\nobject = "{module}:app"\n\n[bindings{bindings[2]}'
     )
@@ -612,7 +617,9 @@ def temp_project(module: str) -> Path:
 
 def descriptor_sections() -> None:
     head("describe — the isolation boundary over every fixture")
-    projects = [("tiny_h3", ROOT / "examples")] + [(m, temp_project(m)) for m in ("tiny_sdxl",)]
+    projects = [("tiny_h3", ROOT / "proofs" / "fixtures" / "tiny-models")] + [
+        (m, temp_project(m)) for m in ("tiny_sdxl",)
+    ]
     bodies = {}
     for module, project in projects:
         start = time.perf_counter()
@@ -647,7 +654,7 @@ def descriptor_sections() -> None:
 
     installed = Refusing()
     before = len(registered_adapters())
-    body = descriptor.build(discover(ROOT / "examples"))
+    body = descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
     print(
         f"  0 fills through {type(installed).__name__}; construction adapters unchanged: "
         f"{before} -> {len(registered_adapters())}"
@@ -730,7 +737,9 @@ def descriptor_sections() -> None:
             f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
             + (f", {len(record.destinations)} destinations" if record else "")
         )
-    rederived = descriptor.canonical_bytes(descriptor.build(discover(ROOT / "examples")))
+    rederived = descriptor.canonical_bytes(
+        descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
+    )
     print(f"  descriptor after both bindings: byte-unchanged = {rederived == before_bindings}")
     print(
         f"  generations now live in the registry: {len(registry.generations())} — "
@@ -819,7 +828,7 @@ def reproduce() -> None:
             ("venv B (fresh)", [str(binary)]),
         ):
             out = subprocess.run(
-                [*argv, "describe", "--dir", "examples", "--json"],
+                [*argv, "describe", "--dir", "proofs/fixtures/tiny-models", "--json"],
                 cwd=ROOT,
                 capture_output=True,
                 env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),

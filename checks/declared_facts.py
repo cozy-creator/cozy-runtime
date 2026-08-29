@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Annotated
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "examples"))
+sys.path.insert(0, str(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
 import msgspec  # noqa: E402
 

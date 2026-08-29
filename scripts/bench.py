@@ -43,14 +43,15 @@ def report(label: str, samples: list[float], rss_kib: int) -> None:
 ITERATIONS = 3000
 
 # The per-call cost of the author surface, measured in one process against the real
-# package in examples/. "kernel" is everything invoke() does around the handler: decode,
+# package in proofs/fixtures/tiny-models/. "kernel" is everything invoke() does around the
+# handler: decode,
 # ModelDefault overlay + digest, RequestFeatures normalization, preflight, injection,
 # return validation and the output transaction. "handler" is the same handler called
 # directly with the same arguments, so the DIFFERENCE is the surface's overhead.
 KERNEL = f"""
 import random, resource, sys, tempfile, time
 from pathlib import Path
-sys.path.insert(0, 'examples')
+sys.path.insert(0, 'proofs/fixtures/tiny-models')
 import tiny_artifacts as art
 import tiny_h3 as h3
 import tiny_sdxl as ep
@@ -151,11 +152,11 @@ print(f"  {{'peak RSS after these runs':<46}} "
 
 DESCRIPTOR = """
 import statistics, time, sys, pathlib
-sys.path.insert(0, 'examples')
+sys.path.insert(0, 'proofs/fixtures/tiny-models')
 from cozy_runtime.internal import canonical, descriptor
 from cozy_runtime.internal.discovery import discover
 
-project = pathlib.Path('examples')
+project = pathlib.Path('proofs/fixtures/tiny-models')
 
 
 def bench(label, fn, n):
@@ -189,7 +190,7 @@ print(f"  {'callables / model slots described':<46} "
 """
 
 
-DESCRIBE = ("cozy-runtime", "describe", "--dir", "examples")
+DESCRIBE = ("cozy-runtime", "describe", "--dir", "proofs/fixtures/tiny-models")
 
 
 def main() -> int:
@@ -209,7 +210,7 @@ def main() -> int:
     print(f"{RUNS} runs each; peak RSS measured per case in a fresh helper process")
     for label, argv in cases:
         report(label, *timed(argv))
-    print("\nauthor surface, in-process against examples/tiny_sdxl.py + tiny_h3.py", flush=True)
+    print("\nauthor surface, in-process against tiny-model proof fixtures", flush=True)
     subprocess.run([py, "-c", KERNEL], check=True)
     print("\ndescriptor plane, in-process (the boundary, the writer, the digest)", flush=True)
     subprocess.run([py, "-c", DESCRIPTOR], check=True)

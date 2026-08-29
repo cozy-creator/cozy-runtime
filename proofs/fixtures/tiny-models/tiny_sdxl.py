@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Annotated
 
 import msgspec
+from tiny_diffusers import ImageFrameData, TinySdxlPipeline
 
 from cozy_runtime.author import (
     Adjustments,
@@ -43,7 +44,6 @@ from cozy_runtime.author import (
     UnsupportedInput,
     uses_components,
 )
-from tiny_diffusers import ImageFrameData, TinySdxlPipeline
 
 app = App()
 
