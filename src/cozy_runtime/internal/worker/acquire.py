@@ -16,11 +16,11 @@ further digest is REACHED from a document already fetched and verified:
     binding_plan     -> descriptor
 
 That reachability is th-044/th-046's canonical join, and it already exists as documents;
-`materialize_launch.environment_input` is its reader. What never existed was a caller. This
+`placement_materialization.environment_input` is its reader. What never existed was a caller. This
 module is that caller, and it is why `apply_artifact_grant` no longer has to say it cannot
 "reinterpret opaque subjects as a wheel closure" — it never needs to interpret one.
 
-Every byte enters through `materialize_launch.fetch_exact`: one bounded exact-digest HTTPS
+Every byte enters through `placement_materialization.fetch_exact`: one bounded exact-digest HTTPS
 GET, no proxy, no redirect, no content transform, sha256-and-length before trust. There is
 no second fetcher.
 """
@@ -35,7 +35,8 @@ from pathlib import Path
 from threading import Lock, local
 from typing import Any, Literal, TypeAlias
 
-from cozy_runtime.internal import canonical, materialize_launch, overlay, provisioned, pull
+from cozy_runtime.internal import canonical, overlay, placement_materialization, provisioned, pull
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -157,7 +158,7 @@ class VerifiedArtifactCache:
 
 
 def observe_model_sources(
-    observation: AcquisitionObservation, outcome: materialize_launch.MaterializedObjects
+    observation: AcquisitionObservation, outcome: placement_materialization.MaterializedObjects
 ) -> None:
     """Project TensorFS source evidence into the model leg's counters."""
 
@@ -331,14 +332,14 @@ class Acquirer:
             if trusted is not None:
                 path = target
             else:
-                path = materialize_launch.fetch_exact(
+                path = placement_materialization.fetch_exact(
                     {"digest": digest, "length": length, "url": url},
                     self.cache_root,
                     deadline=deadline,
                     allow_local=self.grant.local(),
                 )
                 trusted = self.verified_cache.record(digest, length, path)
-        except materialize_launch.LaunchRefusal as exc:
+        except LaunchRefusal as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH
                 if exc.code
@@ -470,7 +471,7 @@ class Acquirer:
                 )
             locations[object_digest] = location
         try:
-            outcome = materialize_launch.materialize_objects(
+            outcome = placement_materialization.materialize_objects(
                 locations,
                 object_set,
                 cache=None,
@@ -478,7 +479,7 @@ class Acquirer:
                 store_root=self.artifact_store,
                 allow_local=self.grant.local(),
             )
-        except materialize_launch.LaunchRefusal as exc:
+        except LaunchRefusal as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                 exc.code,
@@ -544,7 +545,7 @@ class Acquirer:
         self.wheels = len(wheel_paths)
 
         try:
-            source = materialize_launch.package_overlay_input(
+            source = placement_materialization.package_overlay_input(
                 environment_spec_bytes=spec_bytes,
                 package_bundle_bytes=bundle_bytes,
                 resolved_wheel_set_bytes=resolved_bytes,
@@ -558,7 +559,7 @@ class Acquirer:
                 python=self.python,
                 expected_receipt_digest=receipt_digest,
             )
-        except (materialize_launch.LaunchRefusal, overlay.OverlayRefusal) as exc:
+        except (LaunchRefusal, overlay.OverlayRefusal) as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
                 if "receipt" in exc.code

@@ -60,11 +60,6 @@ STATIC_ARMS = (
         "    return delivery['cost_class']\n",
     ),
     Arm(
-        "pod-media-grant-root",
-        SRC / "cli" / "materialize_launch.py",
-        "\nMEDIA_ROOT = Path('/run/cozy/media')\n",
-    ),
-    Arm(
         "measured-backend-version",
         SRC / "internal" / "hostfacts.py",
         "\n\ndef _cuda_version() -> str:\n"
@@ -191,8 +186,13 @@ STATIC_ARMS = (
 OMISSION_ARMS = (
     OmissionArm(
         "dynamic-pods-skip-boot-warm",
-        SRC / "cli" / "materialize_launch.py",
-        '        "--no-warm",\n',
+        SRC / "cli" / "runtime_worker.py",
+        "        no_warm=True,\n",
+    ),
+    OmissionArm(
+        "pod-media-grant-root",
+        SRC / "cli" / "runtime_worker.py",
+        "        grant_roots=(str(host_paths.MEDIA_ROOT),),\n",
     ),
     OmissionArm(
         "measured-backend-version",

@@ -105,58 +105,38 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class AdapterConfig:
-    """The fixed base-worker-image handoff to ``cozy-materialize-launch``.
+class WorkerHostConfig:
+    """The fixed five-value host handoff to ``cozy-runtime-worker``.
 
-    THE POD BOOTS ON ENVIRONMENT ALONE (cr-048). The retired
-    ``tensorhub.rental_provision_spec/1`` + ``_bundle/1`` pair was a second, boot-only
-    delivery lane for the closure that rev-2's ``DesiredPlacementSet`` + ``ArtifactGrantUpdate``
-    already carry after the RecordOwner connects.
-
-    Of the three identity facts that document smuggled, ONE is left. The ordinal and the
-    rental id existed only to be echoed in the readiness receipt for tensorhub's binder,
-    and that echo proved nothing the receipt's per-attempt HMAC key had not already proven,
-    so both are gone from the handoff and from the payload. ``acquisition_attempt_id``
-    stays because it is not an echo: it is the worker's ``--worker-id``, the identity a
-    RecordOwner's ``Claim`` is addressed to and every ``Fault`` is attributed to.
+    Paths are image-contract constants from ``runtime-worker-host-paths.json`` rather than
+    environment configuration. The readiness HMAC remains supervisor-only. Desired placements,
+    grants and attempts arrive after Claim over WorkerControl.
     """
 
-    acquisition_attempt_id: str
-    pod_boot_id_path: Path
-    tls_cert_path: Path
-    tls_key_path: Path
-    receipt_payload_path: Path
+    worker_id: str
     worker_internal_port: int
     media_internal_port: int
-    renter_token_sha256: tuple[str, ...]
-    readiness_deadline_unix: int
+    record_owner_token_sha256: tuple[str, ...]
+    lease_expiry_unix: int
     child_base_env: tuple[tuple[str, str], ...]
 
 
-# The CLOSED adapter handoff. It is an ALLOWLIST, not a passthrough: `read_adapter_config`
-# refuses any other `COZY_ADAPTER_*` name by name, so every addition here is deliberate.
-# cr-048 removed four (the two provision-document path/digest pairs) and added three
-# identity facts; two of those three are gone again with the receipt echo that was their
-# only reader. What remains of that trio is the attempt id, which the worker wears as its
-# own name.
-ADAPTER_ENV = {
-    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",
-    "COZY_ADAPTER_POD_BOOT_ID_PATH",
-    "COZY_ADAPTER_TLS_CERT_PATH",
-    "COZY_ADAPTER_TLS_KEY_PATH",
-    "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH",
-    "COZY_ADAPTER_WORKER_INTERNAL_PORT",
-    "COZY_ADAPTER_MEDIA_INTERNAL_PORT",
-    "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON",
-    "COZY_ADAPTER_READINESS_DEADLINE_UNIX",
+# The CLOSED non-HMAC child projection of PodEnvironmentContract/1. Unknown COZY_* names refuse;
+# provider/image inheritance is not a configuration channel.
+WORKER_HOST_ENV = {
+    "COZY_WORKER_ID",
+    "COZY_MEDIA_INTERNAL_PORT",
+    "COZY_WORKER_LEASE_EXPIRY_UNIX",
+    "COZY_RECORD_OWNER_TOKEN_SHA256_JSON",
+    "COZY_WORKER_INTERNAL_PORT",
 }
 
-# The adapter starts one current control worker. Provider/image inheritance is not a config
-# channel: only these non-secret platform values survive, then the adapter imposes the two
-# worker-owned COZY paths explicitly. In particular RUNPOD/AWS/HF variables never cross.
+# The host starts one current control worker. Provider/image inheritance is not a config
+# channel: only these non-secret platform values survive. In particular RUNPOD/AWS/HF
+# variables never cross.
 # Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d); keep equal to that
 # row. PATH is deliberately absent: every pod exec is by absolute path.
-ADAPTER_CHILD_PLATFORM_ENV = {
+WORKER_CHILD_PLATFORM_ENV = {
     "LANG",
     "LC_ALL",
     "SSL_CERT_DIR",
@@ -180,7 +160,7 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 _read: bool = False
-_adapter_read: bool = False
+_worker_host_read: bool = False
 
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 
@@ -246,61 +226,48 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     )
 
 
-def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConfig:
-    """Read the base-worker-image adapter seam once.
+def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerHostConfig:
+    """Read the fixed product-host handoff once; admit no extra ``COZY_*`` name."""
 
-    No loose ``COZY_ADAPTER_*`` extension is admitted.
-    """
-
-    global _adapter_read
-    if _adapter_read:
+    global _worker_host_read
+    if _worker_host_read:
         raise ConfigError(
             "config_authority",
-            "read_adapter_config() called twice — a process has exactly one adapter handoff",
-            "read the adapter handoff once at its fixed executable entrypoint",
+            "read_worker_host_config() called twice — a process has one host handoff",
+            "read the host handoff once at cozy-runtime-worker",
             Exit.internal,
         )
     env = os.environ if environ is None else environ
     if any(env.get(name) for name in ("PYTHONHOME", "PYTHONPATH")):
         raise ConfigError(
-            "adapter_config",
-            "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed adapter",
-            "install and execute the control Runtime wheel owned by the base worker image "
-            "without source paths",
+            "worker_host_config",
+            "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed worker",
+            "execute the image-owned cozy-runtime-worker without source paths",
         )
     if unknown := sorted(
-        name for name in env if name.startswith("COZY_ADAPTER_") and name not in ADAPTER_ENV
+        name for name in env if name.startswith("COZY_") and name not in WORKER_HOST_ENV
     ):
         raise ConfigError(
-            "adapter_config",
-            f"unknown adapter environment variable {unknown[0]}",
-            "use the closed base-worker-image adapter handoff",
+            "worker_host_config",
+            f"unknown worker environment variable {unknown[0]}",
+            "use the closed five-value worker handoff",
         )
 
     def required(name: str) -> str:
         value = env.get(name, "")
         if not value:
             raise ConfigError(
-                "adapter_config",
-                f"required adapter environment variable {name} is absent",
-                "launch only through the generic base-worker-image bootstrap",
-            )
-        return value
-
-    def path(name: str) -> Path:
-        raw = required(name)
-        value = Path(raw)
-        if not value.is_absolute() or str(value) != raw:
-            raise ConfigError(
-                "adapter_config", f"{name} is not one absolute normalized path", "fix bootstrap"
+                "worker_host_config",
+                f"required worker environment variable {name} is absent",
+                "launch through cozy-daemon or pod-supervisor",
             )
         return value
 
     def bounded(name: str) -> str:
         value = required(name)
-        if value.strip() != value or len(value) > 256:
+        if value.strip() != value or len(value.encode()) > 256:
             raise ConfigError(
-                "adapter_config", f"{name} is not one bounded untrimmed identifier", "fix bootstrap"
+                "worker_host_config", f"{name} is not one bounded identifier", "fix host launch"
             )
         return value
 
@@ -310,19 +277,19 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
             value = int(raw)
         except ValueError as exc:
             raise ConfigError(
-                "adapter_config", f"{name} is not canonical decimal", "fix bootstrap"
+                "worker_host_config", f"{name} is not canonical decimal", "fix host launch"
             ) from exc
         if value <= 0 or value > maximum or str(value) != raw:
             raise ConfigError(
-                "adapter_config", f"{name} is not canonical decimal in range", "fix bootstrap"
+                "worker_host_config", f"{name} is not canonical decimal in range", "fix host launch"
             )
         return value
 
     try:
-        token_hashes = json.loads(required("COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON"))
+        token_hashes = json.loads(required("COZY_RECORD_OWNER_TOKEN_SHA256_JSON"))
     except json.JSONDecodeError as exc:
         raise ConfigError(
-            "adapter_config", "renter token hashes are not JSON", "fix bootstrap"
+            "worker_host_config", "RecordOwner token hashes are not JSON", "fix host launch"
         ) from exc
     if (
         not isinstance(token_hashes, list)
@@ -331,29 +298,38 @@ def read_adapter_config(environ: Mapping[str, str] | None = None) -> AdapterConf
         or token_hashes != sorted(set(token_hashes))
     ):
         raise ConfigError(
-            "adapter_config",
-            "renter token hashes are not a non-empty bounded sorted unique set",
-            "fix bootstrap",
+            "worker_host_config",
+            "RecordOwner token hashes are not a non-empty bounded sorted unique set",
+            "fix host launch",
         )
-    worker_port = decimal("COZY_ADAPTER_WORKER_INTERNAL_PORT", 65535)
-    media_port = decimal("COZY_ADAPTER_MEDIA_INTERNAL_PORT", 65535)
+    worker_port = decimal("COZY_WORKER_INTERNAL_PORT", 65535)
+    media_port = decimal("COZY_MEDIA_INTERNAL_PORT", 65535)
     if worker_port == media_port:
-        raise ConfigError("adapter_config", "worker and media ports are equal", "fix bootstrap")
-    parsed = AdapterConfig(
-        acquisition_attempt_id=bounded("COZY_ADAPTER_ACQUISITION_ATTEMPT_ID"),
-        pod_boot_id_path=path("COZY_ADAPTER_POD_BOOT_ID_PATH"),
-        tls_cert_path=path("COZY_ADAPTER_TLS_CERT_PATH"),
-        tls_key_path=path("COZY_ADAPTER_TLS_KEY_PATH"),
-        receipt_payload_path=path("COZY_ADAPTER_RECEIPT_PAYLOAD_PATH"),
+        raise ConfigError(
+            "worker_host_config", "worker and media ports are equal", "fix host launch"
+        )
+    parsed = WorkerHostConfig(
+        worker_id=bounded("COZY_WORKER_ID"),
         worker_internal_port=worker_port,
         media_internal_port=media_port,
-        renter_token_sha256=tuple(str(item) for item in token_hashes),
-        readiness_deadline_unix=decimal("COZY_ADAPTER_READINESS_DEADLINE_UNIX", (1 << 53) - 1),
+        record_owner_token_sha256=tuple(str(item) for item in token_hashes),
+        lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
         child_base_env=tuple(
             sorted(
-                (name, value) for name, value in env.items() if name in ADAPTER_CHILD_PLATFORM_ENV
+                (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV
             )
         ),
     )
-    _adapter_read = True
+    _worker_host_read = True
     return parsed
+
+
+def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
+    """Project one parsed host handoff into the existing worker core config."""
+
+    return RuntimeConfig(
+        cozy_home=Path("/run/cozy"),
+        credentials=Credentials(),
+        access_token_hashes=",".join("sha256:" + value for value in host.record_owner_token_sha256),
+        child_base_env=host.child_base_env,
+    )

@@ -119,11 +119,13 @@ class GrpcControlHost:
         *,
         tls_cert: Path | None = None,
         tls_key: Path | None = None,
+        on_bound: Callable[[str], None] | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
         self.tls_cert = tls_cert
         self.tls_key = tls_key
+        self.on_bound = on_bound
         self.server: Any = None
         self.stopped = threading.Event()
 
@@ -155,6 +157,13 @@ class GrpcControlHost:
             address = f"{host}:{port}"
         self.server.start()
         write_addr(self.addr_file, address)
+        if self.on_bound is not None:
+            try:
+                self.on_bound(address)
+            except Exception:
+                self.server.stop(grace=0)
+                self.stopped.set()
+                raise
         self.stopped.wait()
 
     def stop(self) -> None:

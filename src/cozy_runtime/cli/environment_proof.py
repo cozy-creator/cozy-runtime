@@ -14,7 +14,8 @@ from pathlib import Path
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import canonical, overlay
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.materialize_launch import LaunchRefusal, package_overlay_input
+from cozy_runtime.internal.placement_materialization import package_overlay_input
+from cozy_runtime.internal.refusal import LaunchRefusal
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 REQUEST_FIELDS = {

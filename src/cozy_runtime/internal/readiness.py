@@ -1,4 +1,4 @@
-"""Measured PodReadinessReceipt/1 facts for the fixed materialize/launch adapter."""
+"""Measured PodReadinessReceipt/1 facts for the fixed Runtime worker."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import TypedDict
 import grpc
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.materialize_launch import LaunchRefusal
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
@@ -127,21 +127,27 @@ def runtime_gpus(
     return rows
 
 
-def wait_worker_listener(root: Path, process: subprocess.Popen[bytes], *, deadline: int) -> str:
-    address_file = root / "control.addr"
-    while time.time() < deadline:
-        if process.poll() is not None:
-            raise LaunchRefusal(
-                "worker_exited_before_readiness", f"worker exited {process.returncode}"
-            )
-        try:
-            address = address_file.read_text(encoding="ascii").strip()
-        except OSError:
-            address = ""
-        if address:
-            return address
-        time.sleep(0.02)
-    raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
+def prove_tls_leaf(port: int, expected_der: bytes, *, deadline: int, owner: str) -> None:
+    """Compare one listener's exact TLS leaf DER, never only its trust chain or SAN."""
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=_remaining(deadline)) as raw,
+            context.wrap_socket(raw, server_hostname=WORKER_TLS_SERVER_NAME) as connection,
+        ):
+            if connection.getpeercert(binary_form=True) != expected_der:
+                raise LaunchRefusal(
+                    f"{owner}_tls_peer_mismatch",
+                    f"{owner} listener did not present the exact bootstrap certificate",
+                )
+    except LaunchRefusal:
+        raise
+    except (OSError, ssl.SSLError) as exc:
+        raise LaunchRefusal(f"{owner}_listener_unproven", type(exc).__name__) from exc
 
 
 def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline: int) -> None:
@@ -222,7 +228,7 @@ def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int
 
 def receipt_payload(
     *,
-    renter_token_sha256: Sequence[str],
+    record_owner_token_sha256: Sequence[str],
     pod_boot_id_value: str,
     certificate_der: bytes,
     worker_internal_port: int,
@@ -267,7 +273,7 @@ def receipt_payload(
             "media_internal_port": media_internal_port,
             "media_listener_bound": True,
             "media_protocol": "https",
-            "observed_renter_token_sha256": list(renter_token_sha256),
+            "observed_record_owner_token_sha256": list(record_owner_token_sha256),
             "pod_boot_id": pod_boot_id_value,
             "runtime_gpus": gpus,
             "tls_certificate_der_base64": base64.b64encode(certificate_der).decode("ascii"),

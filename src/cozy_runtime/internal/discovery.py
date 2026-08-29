@@ -94,7 +94,7 @@ def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> 
 
     A materialized rental has an immutable venv, not a copied source tree or package.toml.
     The exact PackageDescriptor supplies the application identity; importing anything else
-    or adding a host path would recreate the source/PYTHONPATH authority the adapter rejects.
+    or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
 
     return _discover(application, Path("/"), {}, seconds=seconds, add=None)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Narrow local contract proof for the fixed materialize/launch adapter."""
+"""Narrow live contract proof for the fixed environment-neutral Runtime worker."""
 
 from __future__ import annotations
 
@@ -14,11 +14,12 @@ from types import SimpleNamespace
 from typing import Any, TypedDict, cast
 from unittest.mock import patch
 
-from cozy_runtime.cli.materialize_launch import MEDIA_ROOT, _worker_command
+from cozy_runtime.cli.runtime_worker import _worker_options
 from cozy_runtime.internal import (
     canonical,
     contract,
     fill,
+    host_paths,
     hostfacts,
     local,
     provisioned,
@@ -29,15 +30,15 @@ from cozy_runtime.internal.config import (
     ConfigError,
     Credentials,
     RuntimeConfig,
-    read_adapter_config,
+    read_worker_host_config,
 )
-from cozy_runtime.internal.materialize_launch import (
+from cozy_runtime.internal.placement_materialization import (
     EMPTY_ARTIFACT_OBJECT_SET,
-    LaunchRefusal,
     PreparedBoot,
     _publish_exact,
     materialize_objects,
 )
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.grants import Authorizer, GrantRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
@@ -174,6 +175,44 @@ def prove_worker_warm_policy(root: Path) -> None:
     )
     assert explicit_skip.run_warm_pass() is True
     assert explicit_executor.calls == []
+
+
+def prove_pre_ready_claim(root: Path) -> None:
+    """Authentication precedes the state-inert UNDURABLE readiness gate."""
+
+    worker = Worker(
+        RuntimeConfig(
+            cozy_home=root / "home",
+            credentials=Credentials(),
+            bootstrap_credential="owner-proof",
+        ),
+        WorkerOptions(root=root / "worker", worker_id="worker-live", claim_ready=False),
+        InMemoryControlHost(),
+    )
+    frames: list[pb.WorkerFrame] = []
+    bad = pb.Claim(
+        record_owner_epoch=1,
+        record_owner_id="owner-live",
+        worker_id="worker-live",
+        wire_minor=WIRE_MINOR,
+        proof=b"wrong",
+    )
+    generation, _ = worker.accept_claim(bad, frames.append)
+    assert generation == 0
+    assert frames[-1].claim_ack.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED
+
+    good = pb.Claim()
+    good.CopyFrom(bad)
+    good.proof = b"owner-proof"
+    generation, _ = worker.accept_claim(good, frames.append)
+    assert generation == 0
+    assert frames[-1].claim_ack.rejection == pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE
+    assert worker.fence.control_stream_generation == 0
+
+    worker.mark_claim_ready()
+    generation, _ = worker.accept_claim(good, frames.append)
+    assert generation == 1 and worker.fence.control_stream_generation == 1
+    worker.shutdown()
 
 
 def prepared_binding() -> DeclaredBinding:
@@ -454,7 +493,7 @@ def mint_certificate(root: Path, name: str, san: str) -> Path:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="cozy-materialize-launch-") as raw_root:
+    with tempfile.TemporaryDirectory(prefix="cozy-runtime-worker-") as raw_root:
         root = Path(raw_root)
         vectors: dict[str, tuple[bytes, provisioned.ArtifactObjectSet]] = {}
         for line in (ROOT / "vectors" / "artifact-object-sets.jsonl").read_text().splitlines():
@@ -472,64 +511,47 @@ def main() -> int:
             "LANG": "C.UTF-8",
             "PATH": "/usr/bin",
             "RUNPOD_API_KEY": "must-not-cross",
-            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "attempt-live",
-            "COZY_ADAPTER_POD_BOOT_ID_PATH": str(root / "boot-id"),
-            "COZY_ADAPTER_TLS_CERT_PATH": str(root / "tls.crt"),
-            "COZY_ADAPTER_TLS_KEY_PATH": str(root / "tls.key"),
-            "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH": str(root / "receipt.json"),
-            "COZY_ADAPTER_WORKER_INTERNAL_PORT": "43100",
-            "COZY_ADAPTER_MEDIA_INTERNAL_PORT": "43101",
-            "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON": f'["{token}"]',
-            "COZY_ADAPTER_READINESS_DEADLINE_UNIX": str(int(time.time()) + 60),
+            "COZY_WORKER_ID": "worker-live",
+            "COZY_WORKER_INTERNAL_PORT": "43100",
+            "COZY_MEDIA_INTERNAL_PORT": "43101",
+            "COZY_RECORD_OWNER_TOKEN_SHA256_JSON": f'["{token}"]',
+            "COZY_WORKER_LEASE_EXPIRY_UNIX": str(int(time.time()) + 60),
         }
         try:
-            read_adapter_config({**env, "PYTHONPATH": "/injected/source"})
+            read_worker_host_config({**env, "PYTHONPATH": "/injected/source"})
         except ConfigError as exc:
-            assert exc.name == "adapter_config"
+            assert exc.name == "worker_host_config"
         else:
             raise AssertionError("PYTHONPATH source injection was accepted")
         try:
-            read_adapter_config({**env, "COZY_ADAPTER_PROVIDER_POD_ID": "retired-provider-id"})
+            read_worker_host_config({**env, "COZY_UNKNOWN": "retired"})
         except ConfigError as exc:
-            assert exc.name == "adapter_config" and "unknown" in exc.message
+            assert exc.name == "worker_host_config" and "unknown" in exc.message
         else:
-            raise AssertionError("retired provider identity entered the adapter handoff")
-        # cr-048's RETIRED HALF, as a negative arm: the adapter handoff is an allowlist, so
-        # a bootstrap that still delivers the provision-closure names fails by name here
-        # rather than fetching two documents nothing reads.
-        # The two identity facts whose only reader was the receipt echo are retired the same
-        # way: a bootstrap that still hands them over fails by name here.
-        for retired in (
-            "COZY_ADAPTER_PROVISION_SPEC_PATH",
-            "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
-            "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
-            "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
-            "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
-            "COZY_ADAPTER_RENTAL_ID",
+            raise AssertionError("an unknown COZY name entered the fixed worker handoff")
+        for name in (
+            "COZY_WORKER_ID",
+            "COZY_WORKER_INTERNAL_PORT",
+            "COZY_MEDIA_INTERNAL_PORT",
+            "COZY_RECORD_OWNER_TOKEN_SHA256_JSON",
+            "COZY_WORKER_LEASE_EXPIRY_UNIX",
         ):
             try:
-                read_adapter_config({**env, retired: "sha256:" + "0" * 64})
+                read_worker_host_config({k: v for k, v in env.items() if k != name})
             except ConfigError as exc:
-                assert exc.name == "adapter_config" and "unknown" in exc.message
+                assert exc.name == "worker_host_config" and "absent" in exc.message
             else:
-                raise AssertionError(f"retired boot-closure name {retired} was accepted")
-        for name in ("COZY_ADAPTER_ACQUISITION_ATTEMPT_ID",):
-            try:
-                read_adapter_config({k: v for k, v in env.items() if k != name})
-            except ConfigError as exc:
-                assert exc.name == "adapter_config" and "absent" in exc.message
-            else:
-                raise AssertionError(f"{name} is not required by the adapter handoff")
+                raise AssertionError(f"{name} is not required by the worker handoff")
         try:
-            read_adapter_config({**env, "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": " untrimmed"})
+            read_worker_host_config({**env, "COZY_WORKER_ID": " untrimmed"})
         except ConfigError as exc:
-            assert exc.name == "adapter_config"
+            assert exc.name == "worker_host_config"
         else:
-            raise AssertionError("an untrimmed attempt id was accepted")
-        config = read_adapter_config(env)
+            raise AssertionError("an untrimmed worker id was accepted")
+        config = read_worker_host_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
-        assert config.acquisition_attempt_id == "attempt-live"
-        command = _worker_command(
+        assert config.worker_id == "worker-live"
+        worker_options = _worker_options(
             config,
             PreparedBoot(root / "store", root / "object-set.json", root / "cache"),
             "boot-live",
@@ -546,13 +568,13 @@ def main() -> int:
             accelerator_backend="cuda",
             control_runtime_digest_value="sha256:" + "3" * 64,
         )
-        assert command.count("--no-warm") == 1
-        assert command[command.index("--control-runtime-digest") + 1] == "sha256:" + "3" * 64
-        assert command[command.index("--accelerator-backend") + 1] == "cuda"
-        assert command[command.index("--executor-uid") + 1] == "65533"
-        assert command.index("serve") < command.index("--no-warm") < command.index("--socket")
-        grant_root = command[command.index("--grant-root") + 1]
-        assert grant_root == str(MEDIA_ROOT) == "/var/lib/cozy/media"
+        assert worker_options.no_warm is True
+        assert worker_options.control_runtime_digest == "sha256:" + "3" * 64
+        assert worker_options.accelerator_backend == "cuda"
+        assert worker_options.executor_uid == 65533
+        assert worker_options.claim_ready is False
+        grant_root = worker_options.grant_roots[0]
+        assert grant_root == str(host_paths.MEDIA_ROOT) == "/var/lib/cozy/media"
         authorizer = Authorizer(roots=(grant_root,))
         # podmedia PutInput returns a payload path below its fixed mediaRoot. Exercise the
         # worker's real closed call table and root selector against that returned shape.
@@ -573,11 +595,11 @@ def main() -> int:
         with patch("subprocess.run", side_effect=AssertionError("CPU boot probed nvidia-smi")):
             cpu_gpus = readiness.runtime_gpus(
                 config.child_base_env,
-                deadline=config.readiness_deadline_unix,
+                deadline=config.lease_expiry_unix,
                 accelerator_backend="none",
             )
         assert cpu_gpus == []
-        cpu_command = _worker_command(
+        cpu_options = _worker_options(
             config,
             PreparedBoot(root / "cpu-store", root / "cpu-object-set.json", root / "cpu-cache"),
             "cpu-boot-live",
@@ -585,10 +607,10 @@ def main() -> int:
             accelerator_backend="none",
             control_runtime_digest_value="sha256:" + "3" * 64,
         )
-        assert cpu_command[cpu_command.index("--accelerator-backend") + 1] == "none"
-        assert cpu_command[cpu_command.index("--devices") + 1] == ""
+        assert cpu_options.accelerator_backend == "none"
+        assert cpu_options.devices == ""
         try:
-            _worker_command(
+            _worker_options(
                 config,
                 PreparedBoot(root / "bad-store", root / "bad-set.json", root / "bad-cache"),
                 "bad-cuda-boot",
@@ -604,6 +626,7 @@ def main() -> int:
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
         prove_worker_warm_policy(root / "worker-policy")
+        prove_pre_ready_claim(root / "pre-ready-claim")
         prove_wire_minor_compatibility(root / "wire-minor")
         prove_delivery_activation(root / "delivery-activation")
         prove_backend_version(root / "backend-version")
@@ -809,10 +832,14 @@ def main() -> int:
                             }
                         ],
                         "name": "generate",
+                        "request": {"fields": []},
+                        "result": {"fields": []},
                     },
                     {
                         "models": [],
                         "name": "health",
+                        "request": {"fields": []},
+                        "result": {"fields": []},
                     },
                 ],
                 "format": "cozy.package.descriptor/1",
@@ -1004,8 +1031,9 @@ def main() -> int:
 
         boot_raw = bytes(range(32))
         boot_id = base64.urlsafe_b64encode(boot_raw).rstrip(b"=").decode()
-        config.pod_boot_id_path.write_text(boot_id + "\n")
-        assert readiness.pod_boot_id(config.pod_boot_id_path) == boot_id
+        boot_path = root / "pod-boot-id"
+        boot_path.write_text(boot_id + "\n")
+        assert readiness.pod_boot_id(boot_path) == boot_id
         fixed_certificate = mint_certificate(root, "fixed-worker", "DNS:cozy-worker")
         assert readiness.certificate(fixed_certificate)
         ip_certificate = mint_certificate(root, "provider-ip", "IP:127.0.0.1")
@@ -1016,7 +1044,7 @@ def main() -> int:
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
         cpu_payload = readiness.receipt_payload(
-            renter_token_sha256=config.renter_token_sha256,
+            record_owner_token_sha256=config.record_owner_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
             worker_internal_port=config.worker_internal_port,
@@ -1026,7 +1054,7 @@ def main() -> int:
         cpu_receipt = canonical.parse_canonical(cpu_payload)
         assert isinstance(cpu_receipt, dict) and cpu_receipt["runtime_gpus"] == []
         payload = readiness.receipt_payload(
-            renter_token_sha256=config.renter_token_sha256,
+            record_owner_token_sha256=config.record_owner_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
             worker_internal_port=config.worker_internal_port,
@@ -1047,7 +1075,7 @@ def main() -> int:
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
         assert receipt["pod_boot_id"] == boot_id
-        assert receipt["observed_renter_token_sha256"] == [token]
+        assert receipt["observed_record_owner_token_sha256"] == [token]
         assert "provider_pod_id" not in receipt
         # An EMPTY boot has staged nothing, so the receipt asserts nothing about a closure;
         # per-placement observed state is the rev-2 wire's job, continuously. And the pod
@@ -1070,17 +1098,18 @@ def main() -> int:
             "staged_placement_set_digest",
         ):
             assert retired not in receipt
-        readiness.publish(config.receipt_payload_path, payload)
-        assert config.receipt_payload_path.read_bytes() == payload
-        readiness.publish(config.receipt_payload_path, payload)
-        assert config.receipt_payload_path.read_bytes() == payload
+        receipt_path = root / "readiness-payload"
+        readiness.publish(receipt_path, payload)
+        assert receipt_path.read_bytes() == payload
+        readiness.publish(receipt_path, payload)
+        assert receipt_path.read_bytes() == payload
         try:
-            readiness.publish(config.receipt_payload_path, payload + b"\n")
+            readiness.publish(receipt_path, payload + b"\n")
         except LaunchRefusal as exc:
             assert exc.code == "readiness_receipt_conflict"
         else:
             raise AssertionError("different readiness receipt overwrote the published bytes")
-    print("materialize-launch contract: PASS")
+    print("runtime-worker contract: PASS")
     return 0
 
 

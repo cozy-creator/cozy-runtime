@@ -202,7 +202,7 @@ def author(
     base_manifest.write_bytes(wheelhouse)
     base_manifest.chmod(0o444)
 
-    from cozy_runtime.internal.materialize_launch import package_overlay_input
+    from cozy_runtime.internal.placement_materialization import package_overlay_input
 
     source = package_overlay_input(
         environment_spec_bytes=spec,

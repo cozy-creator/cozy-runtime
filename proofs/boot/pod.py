@@ -3,14 +3,14 @@
 
 This process is the Runtime-side contract stand-in for cozy-creator's single `pod-supervisor`
 binary. It makes the same grants (TLS keypair, boot id, renter-token hashes, its in-process
-media listener, and the closed COZY_ADAPTER_* environment), execs the real adapter, and then
+media listener, and the closed COZY_WORKER_* environment), execs the real worker, and then
 observes what a rented pod's two consumers observe: tensorhub's receipt, and a
 RecordOwner's Claim.
 
 What it proves, and every line of it is measured rather than asserted by construction:
 
-  * the adapter boots on nine environment names and reads no document at all;
-  * the attempt id is spent as worker identity, not echoed through the receipt;
+  * the worker boots on five owner-neutral environment names and reads no document at all;
+  * the worker id is spent on the wire, not echoed through the receipt;
   * the pod does not re-measure image-resident Runtime/base bytes;
   * the old closure and identity-echo fields are GONE from the receipt;
   * both listeners bound and both refused a foreign credential;
@@ -53,17 +53,18 @@ from typing import Any
 import grpc
 import hub
 
+from cozy_runtime.internal import host_paths
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
-STATE = Path("/run/cozy/pod")
-# The adapter gives the worker this exact co-resident media root. Keeping a second proof-only
+STATE = host_paths.BOOTSTRAP_STATE
+# The worker gives the worker this exact co-resident media root. Keeping a second proof-only
 # spelling made the real attempt fail at the grant-root fence before the convergence arms ran.
-MEDIA_ROOT = Path("/var/lib/cozy/media")
+MEDIA_ROOT = host_paths.MEDIA_ROOT
 WHEELS = Path("/wheels")
-ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
-ARTIFACT_CACHE = Path("/var/lib/cozy/artifacts")
+ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
+ARTIFACT_CACHE = host_paths.ARTIFACT_CACHE
 APPLICATION = "proof_cli_package:app"
 WORKER_PORT = 43100
 MEDIA_PORT = 43101
@@ -89,13 +90,13 @@ def access_as(path: Path, uid: int, gid: int, flags: int) -> bool:
     return os.waitstatus_to_exitcode(status) == 0
 
 
-def prove_adapter_parent_death() -> None:
-    """The exact adapter arming code kills its process when its direct parent exits."""
+def prove_worker_parent_death() -> None:
+    """The exact worker arming code kills its process when its direct parent exits."""
 
     source = """
 import os
 import time
-from cozy_runtime.cli.materialize_launch import _arm_supervisor_lifetime
+from cozy_runtime.cli.runtime_worker import _arm_supervisor_lifetime
 
 read_fd, write_fd = os.pipe()
 if read_fd != 3:
@@ -134,7 +135,7 @@ os._exit(0)
         if state == "Z":
             break
         time.sleep(0.05)
-    assert state in {"gone", "Z"}, f"adapter child survived parent exit in state {state!r}"
+    assert state in {"gone", "Z"}, f"worker child survived parent exit in state {state!r}"
     with contextlib.suppress(ChildProcessError):
         os.waitpid(child_pid, os.WNOHANG)
 
@@ -151,14 +152,6 @@ RETIRED_RECEIPT_FIELDS = (
     "provision_spec_digest",
     "rental_id",
     "staged_placement_set_digest",
-)
-RETIRED_ADAPTER_ENV = (
-    "COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL",
-    "COZY_ADAPTER_PROVISION_SPEC_PATH",
-    "COZY_ADAPTER_PROVISION_SPEC_DIGEST",
-    "COZY_ADAPTER_PROVISION_BUNDLE_PATH",
-    "COZY_ADAPTER_PROVISION_BUNDLE_DIGEST",
-    "COZY_ADAPTER_RENTAL_ID",
 )
 
 
@@ -231,7 +224,7 @@ def mint_tls() -> tuple[Path, Path]:
 class MediaStandIn(http.server.BaseHTTPRequestHandler):
     """pod-supervisor's in-process authenticated health route, and nothing else.
 
-    The adapter proves the media listener refuses a FOREIGN bearer before it will publish a
+    The worker proves the media listener refuses a FOREIGN bearer before it will publish a
     receipt; that refusal is the property, so the stand-in implements exactly it.
     """
 
@@ -555,7 +548,7 @@ def author_release() -> hub.Release:
 
 
 def main() -> int:
-    prove_adapter_parent_death()
+    prove_worker_parent_death()
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chown(STATE, 65532, 65532)
     STATE.chmod(0o700)
@@ -574,7 +567,7 @@ def main() -> int:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     serve_media(certificate, key, token)
-    # Authoring also installs the stand-in's exact complete base manifest. The adapter now
+    # Authoring also installs the stand-in's exact complete base manifest. The worker now
     # measures its cozy-runtime wheel fact before it starts the control worker.
     release = author_release()
 
@@ -583,38 +576,32 @@ def main() -> int:
         # The artifact origin is this proof's own HTTPS listener, so the pod trusts its
         # certificate the way a pod trusts any private CA: through the ONE platform name the
         # base-worker-image bootstrap already passes through
-        # (`config.ADAPTER_CHILD_PLATFORM_ENV`). No new
-        # adapter variable, and no verification is skipped anywhere.
+        # (`config.WORKER_CHILD_PLATFORM_ENV`). No new worker variable, and no
+        # verification is skipped anywhere.
         "SSL_CERT_FILE": str(origin_certificate),
-        "COZY_ADAPTER_ACQUISITION_ATTEMPT_ID": "ra-cr048bootproof",
-        "COZY_ADAPTER_POD_BOOT_ID_PATH": str(STATE / "pod-boot-id"),
-        "COZY_ADAPTER_TLS_CERT_PATH": str(certificate),
-        "COZY_ADAPTER_TLS_KEY_PATH": str(key),
-        "COZY_ADAPTER_RECEIPT_PAYLOAD_PATH": str(STATE / "readiness-payload"),
-        "COZY_ADAPTER_WORKER_INTERNAL_PORT": str(WORKER_PORT),
-        "COZY_ADAPTER_MEDIA_INTERNAL_PORT": str(MEDIA_PORT),
-        "COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON": json.dumps([token_hash]),
-        "COZY_ADAPTER_READINESS_DEADLINE_UNIX": str(DEADLINE),
+        "COZY_WORKER_ID": "ra-cr048bootproof",
+        "COZY_WORKER_INTERNAL_PORT": str(WORKER_PORT),
+        "COZY_MEDIA_INTERNAL_PORT": str(MEDIA_PORT),
+        "COZY_RECORD_OWNER_TOKEN_SHA256_JSON": json.dumps([token_hash]),
+        "COZY_WORKER_LEASE_EXPIRY_UNIX": str(DEADLINE),
     }
-    for retired in RETIRED_ADAPTER_ENV:
-        assert retired not in environment
-    note(f"handing the adapter {len(environment) - 2} COZY_ADAPTER_* names and no document")
+    note("handing the worker five owner-neutral COZY_* names and no document")
 
-    adapter = subprocess.Popen(
-        [str(Path(sys.executable).parent / "cozy-materialize-launch")],
+    worker = subprocess.Popen(
+        [str(Path(sys.executable).parent / "cozy-runtime-worker")],
         cwd="/",
         env=environment,
         stdin=subprocess.DEVNULL,
         pass_fds=(stop_read,),
     )
     os.close(stop_read)
-    receipt_path = Path(environment["COZY_ADAPTER_RECEIPT_PAYLOAD_PATH"])
+    receipt_path = STATE / "readiness-payload"
     try:
         while not receipt_path.exists():
-            if adapter.poll() is not None:
-                raise SystemExit(f"the adapter exited {adapter.returncode} before readiness")
+            if worker.poll() is not None:
+                raise SystemExit(f"the worker exited {worker.returncode} before readiness")
             if time.time() >= DEADLINE:
-                raise SystemExit("the adapter never published a readiness receipt")
+                raise SystemExit("the worker never published a readiness receipt")
             time.sleep(0.1)
         payload = receipt_path.read_bytes()
         receipt_info = receipt_path.stat()
@@ -627,7 +614,7 @@ def main() -> int:
 
         assert receipt["format"] == "cozy.pod-readiness/1"
         assert receipt["pod_boot_id"] == boot_id
-        assert receipt["observed_renter_token_sha256"] == [token_hash]
+        assert receipt["observed_record_owner_token_sha256"] == [token_hash]
         assert receipt["worker_internal_port"] == WORKER_PORT
         assert receipt["media_internal_port"] == MEDIA_PORT
         assert receipt["worker_listener_bound"] and receipt["media_listener_bound"]
@@ -640,10 +627,10 @@ def main() -> int:
         note(f"{len(RETIRED_RECEIPT_FIELDS)} closure/image echo fields are absent")
 
         # READY, AND EMPTY: nothing was materialized, because nothing named anything.
-        object_set = Path("/var/lib/cozy/boot/artifact-object-set.json").read_bytes()
+        object_set = host_paths.EMPTY_OBJECT_SET.read_bytes()
         assert object_set == b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
-        assert sorted(p.name for p in Path("/var/lib/cozy/store").iterdir()) == []
-        assert not Path("/var/lib/cozy/environments").exists()
+        assert sorted(p.name for p in host_paths.ARTIFACT_STORE.iterdir()) == []
+        assert not host_paths.ENVIRONMENT_ROOT.exists()
         assert not Path("/var/lib/cozy/provision").exists()
         note("artifact store empty, object set empty, no environment generation")
 
@@ -964,11 +951,11 @@ def main() -> int:
         # PID1's capability-free cooperative stop: EOF, not a signal to the root child.
         os.close(stop_write)
         try:
-            code = adapter.wait(timeout=20)
+            code = worker.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            adapter.kill()
-            code = adapter.wait(timeout=20)
-        assert code == 0, f"adapter stop-pipe shutdown exited {code}"
+            worker.kill()
+            code = worker.wait(timeout=20)
+        assert code == 0, f"worker stop-pipe shutdown exited {code}"
     print(
         "boot proof: PASS — ready and empty with no provision document, then a first "
         "DesiredPlacementSet fetched with observed overlapping legs and early executor spawn; "
