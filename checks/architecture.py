@@ -689,6 +689,7 @@ def fence_base_ownership_vectors() -> list[str]:
         "project-wheel.json",
         "resolved-wheel-set.json",
         "resolution-lock.json",
+        "source-tree.json",
     )
     missing_contract = [name for name in required_contract if not (contract_root / name).is_file()]
     if missing_contract:
@@ -703,6 +704,7 @@ def fence_base_ownership_vectors() -> list[str]:
     project_bytes = (contract_root / "project-wheel.json").read_bytes()
     resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
     resolution_lock_bytes = (contract_root / "resolution-lock.json").read_bytes()
+    source_tree_bytes = (contract_root / "source-tree.json").read_bytes()
     exact_contract = {
         "base-worker-image-wheelhouse.json": (
             wheelhouse_bytes,
@@ -710,15 +712,15 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "package-bundle.json": (
             bundle_bytes,
-            "9a02bb4f507224140f1aa2c5281dfc13d4b2c0e200af2617c1593388fcd63105",
+            "110538d9a02da2b09843ee2c1b58713f69f77708cdbbf467c015d04790b368bb",
         ),
         "package-environment-spec.json": (
             environment_bytes,
-            "d17897b9c7048f359660e368c668be33a9c913ab9406eb0262e467f891f22819",
+            "12a81bdb7549dbcb706644468ce13407c158e6f66c212017449b7f80f4296c03",
         ),
         "fixture-index.json": (
             index_bytes,
-            "735da16e57ecaf62d3169b9d2c23483d6f2046cff516883d41fb289070a422b6",
+            "f7beb3d9d4c4c7f865fd4af8078d6223a64f18ac1e75dedb092157ef4d8caaf7",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -732,6 +734,10 @@ def fence_base_ownership_vectors() -> list[str]:
             resolved_bytes,
             "f0dc0011192e18b55352ca91748cb268db0d3d5d992bfa6f2b6612fb1c9ca112",
         ),
+        "source-tree.json": (
+            source_tree_bytes,
+            "6d4a297f2e1faae52a71f9260ff1507ca67823322ac075bbbf37c7c122f99c05",
+        ),
     }
     for name, (payload, want_digest) in exact_contract.items():
         got_digest = hashlib.sha256(payload).hexdigest()
@@ -744,6 +750,7 @@ def fence_base_ownership_vectors() -> list[str]:
         fixture = canonical.parse(index_bytes)
         project = canonical.parse_canonical(project_bytes)
         resolved = canonical.parse_canonical(resolved_bytes)
+        source_tree = canonical.parse_canonical(source_tree_bytes)
     except canonical.CanonicalError as exc:
         bad.append(f"{contract_root}: Tensorhub wheel contract is noncanonical: {exc}")
         return bad
@@ -752,9 +759,20 @@ def fence_base_ownership_vectors() -> list[str]:
         or not isinstance(fixture, dict)
         or not isinstance(project, dict)
         or not isinstance(resolved, dict)
+        or not isinstance(source_tree, dict)
         or bundle.get("project_wheel") != project
     ):
         bad.append(f"{contract_root}: project WheelFact differs from PackageBundle bytes")
+        return bad
+    source_tree_ref = {
+        "digest": "sha256:" + hashlib.sha256(source_tree_bytes).hexdigest(),
+        "length": len(source_tree_bytes),
+    }
+    if (
+        bundle.get("source_tree") != source_tree_ref
+        or fixture.get("source_tree") != source_tree_ref
+    ):
+        bad.append(f"{contract_root}: source tree bytes differ from bundle/index references")
         return bad
     wheel_files = fixture.get("wheel_files")
     if not isinstance(wheel_files, dict) or not all(
