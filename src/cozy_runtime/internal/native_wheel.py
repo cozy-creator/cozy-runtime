@@ -614,11 +614,12 @@ def verify_seat(
         )
     build = profile["accelerator_build"]
     torch_cuda = str(observation.get("torch_cuda", ""))
-    if build == "none":
-        if torch_cuda or gpu is not None:
+    if build == "cpu":
+        if torch_cuda or bool(observation.get("cuda_available")) or gpu is not None:
             raise NativeWheelRefusal(
                 "overlay_native_accelerator_mismatch",
-                f"CPU profile measured torch_cuda={torch_cuda!r} gpu={gpu is not None}",
+                f"CPU profile measured torch_cuda={torch_cuda!r} available="
+                f"{observation.get('cuda_available')} gpu={gpu is not None}",
             )
     else:
         required_cuda = {"cu126": "12.6", "cu130": "13.0"}.get(build)

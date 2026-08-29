@@ -176,6 +176,8 @@ class WorkerOptions:
     control_runtime_digest: str = ""
     git_commit: str = ""
     python: str = ""
+    accelerator_backend: str = ""
+    """Baked pod profile backend (`cuda`/`none`), or empty for local auto-detection."""
     devices: str = "0"
     grant_roots: tuple[str, ...] = ()
     """Every directory tree a `file://` DeliveryGrant may address on this machine (#506b).
@@ -3419,12 +3421,14 @@ class Worker:
         """Torch-free statics measured ONCE at claim time (#446): the worker NEVER
         fabricates capability facts — a discovered accelerator is present-but-unqualified
         until a deployment executor qualifies it."""
-        facts = hostfacts.measure()
+        facts = hostfacts.measure(self.options.accelerator_backend)
         memory_model = ""
         if facts.backend == "cuda":
             memory_model = "discrete"
         elif facts.backend == "mps":
             memory_model = "unified"
+        elif facts.backend == "none":
+            memory_model = "host"
         return pb.WorkerResources(
             platform=facts.platform,
             backend=facts.backend,
@@ -3629,6 +3633,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
+    parser.add_argument("--accelerator-backend", choices=("", "cuda", "none"), default="")
     parser.add_argument("--devices", default="0")
     parser.add_argument(
         "--grant-root",
@@ -3700,6 +3705,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         control_runtime_digest=args.control_runtime_digest,
         git_commit=args.git_commit,
         python=args.python,
+        accelerator_backend=args.accelerator_backend,
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,

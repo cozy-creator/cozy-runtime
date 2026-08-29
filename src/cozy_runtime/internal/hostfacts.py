@@ -52,10 +52,16 @@ class HostFacts:
         return "present" if getattr(self, name, "") else "absent"
 
 
-def measure() -> HostFacts:
+def measure(expected_backend: str = "") -> HostFacts:
+    """Measure host facts, using a baked CPU profile to distinguish absence from driver failure."""
+
+    if expected_backend not in {"", "cuda", "none"}:
+        raise ValueError(f"unsupported expected backend {expected_backend!r}")
     unreadable: list[str] = []
     gpu_name, gpu_sm, vram, driver, backend = "", 0, 0, "", ""
-    if sys.platform == "darwin" and platform.machine() == "arm64":
+    if expected_backend == "none":
+        backend = "none"
+    elif sys.platform == "darwin" and platform.machine() == "arm64":
         # Apple silicon: the FAMILY is present and that is all a torch-free process can
         # honestly say — present-but-unqualified (#446). The CUDA facts are ABSENT here,
         # not unreadable, and the device facts are the executor's to measure (#430).

@@ -111,7 +111,7 @@ class PolicySupervision:
 
 
 def policy_worker(
-    root: Path, *, environment_root: Path | None, no_warm: bool
+    root: Path, *, environment_root: Path | None, no_warm: bool, accelerator_backend: str = ""
 ) -> tuple[Worker, PolicyExecutor]:
     """A real Worker carrying controlled executor ownership and one ready binding."""
 
@@ -120,6 +120,7 @@ def policy_worker(
         environment_root=environment_root,
         artifact_store=root / "store",
         artifact_object_set=root / "object-set.json",
+        accelerator_backend=accelerator_backend,
         no_warm=no_warm,
     )
     worker = Worker(
@@ -332,6 +333,35 @@ def prove_backend_version(root: Path) -> None:
     assert absent.backend_version == ""
     assert "cuda_version" in absent.unreadable
 
+    cpu_worker, _ = policy_worker(
+        root / "cpu-worker",
+        environment_root=root / "cpu-env",
+        no_warm=False,
+        accelerator_backend="none",
+    )
+    cpu = hostfacts.HostFacts(
+        backend="none",
+        platform="proof-linux",
+        host_ram_total_bytes=32 << 30,
+        vcpu_count=8,
+    )
+    with patch.object(hostfacts, "measure", return_value=cpu) as measured_cpu:
+        resources = cpu_worker.resources()
+    measured_cpu.assert_called_once_with("none")
+    assert resources.backend == "none"
+    assert resources.memory_model == "host"
+    assert resources.device_count == 0
+    assert resources.host_ram_total_bytes > 0 and resources.vcpu_count > 0
+
+    with (
+        patch.object(hostfacts, "_installed_cuda_version", return_value=("", False)),
+        patch("cozy_runtime.internal.hostfacts.platform.platform", return_value="proof-linux"),
+        patch("subprocess.run", side_effect=AssertionError("CPU profile probed nvidia-smi")),
+    ):
+        measured_host = hostfacts.measure("none")
+    assert measured_host.backend == "none" and measured_host.gpu_count == 0
+    assert not ({"gpu_name", "driver_version"} & set(measured_host.unreadable))
+
 
 def prove_installed_backend_authority(root: Path) -> None:
     """Image metadata beats the driver's maximum; bad metadata invents no version."""
@@ -513,10 +543,12 @@ def main() -> int:
                     "pci_bus_id": "00000000:01:00.0",
                 }
             ],
+            accelerator_backend="cuda",
             control_runtime_digest_value="sha256:" + "3" * 64,
         )
         assert command.count("--no-warm") == 1
         assert command[command.index("--control-runtime-digest") + 1] == "sha256:" + "3" * 64
+        assert command[command.index("--accelerator-backend") + 1] == "cuda"
         assert command[command.index("--executor-uid") + 1] == "65533"
         assert command.index("serve") < command.index("--no-warm") < command.index("--socket")
         grant_root = command[command.index("--grant-root") + 1]
@@ -537,6 +569,37 @@ def main() -> int:
                 assert exc.code == "grant_path_outside_roots"
             else:
                 raise AssertionError(f"outside podmedia path {outside!r} was authorized")
+
+        with patch("subprocess.run", side_effect=AssertionError("CPU boot probed nvidia-smi")):
+            cpu_gpus = readiness.runtime_gpus(
+                config.child_base_env,
+                deadline=config.readiness_deadline_unix,
+                accelerator_backend="none",
+            )
+        assert cpu_gpus == []
+        cpu_command = _worker_command(
+            config,
+            PreparedBoot(root / "cpu-store", root / "cpu-object-set.json", root / "cpu-cache"),
+            "cpu-boot-live",
+            cpu_gpus,
+            accelerator_backend="none",
+            control_runtime_digest_value="sha256:" + "3" * 64,
+        )
+        assert cpu_command[cpu_command.index("--accelerator-backend") + 1] == "none"
+        assert cpu_command[cpu_command.index("--devices") + 1] == ""
+        try:
+            _worker_command(
+                config,
+                PreparedBoot(root / "bad-store", root / "bad-set.json", root / "bad-cache"),
+                "bad-cuda-boot",
+                [],
+                accelerator_backend="cuda",
+                control_runtime_digest_value="sha256:" + "3" * 64,
+            )
+        except LaunchRefusal as exc:
+            assert exc.code == "runtime_gpus_invalid"
+        else:
+            raise AssertionError("CUDA base with no GPU was admitted")
         # The hardcut is specific to fixed base worker images. A hand-started/local worker
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
@@ -959,6 +1022,16 @@ def main() -> int:
             assert exc.code == "tls_certificate_invalid"
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
+        cpu_payload = readiness.receipt_payload(
+            renter_token_sha256=config.renter_token_sha256,
+            pod_boot_id_value=boot_id,
+            certificate_der=b"certificate-der",
+            worker_internal_port=config.worker_internal_port,
+            media_internal_port=config.media_internal_port,
+            gpus=[],
+        )
+        cpu_receipt = canonical.parse_canonical(cpu_payload)
+        assert isinstance(cpu_receipt, dict) and cpu_receipt["runtime_gpus"] == []
         payload = readiness.receipt_payload(
             renter_token_sha256=config.renter_token_sha256,
             pod_boot_id_value=boot_id,

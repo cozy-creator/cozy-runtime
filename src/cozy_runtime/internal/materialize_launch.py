@@ -476,8 +476,26 @@ def _fsync(path: Path) -> None:
         os.close(descriptor)
 
 
+def baked_base_manifest(
+    manifest_path: Path = overlay.DEFAULT_BASE_MANIFEST,
+) -> overlay.BaseManifest:
+    """Read the trusted image-owned base profile before any hardware probe."""
+
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as exc:
+        raise LaunchRefusal("control_runtime_manifest_unreadable", str(exc)) from exc
+    manifest_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    try:
+        return overlay.parse_base_manifest(raw, manifest_digest)
+    except overlay.OverlayRefusal as exc:
+        raise LaunchRefusal(exc.code, exc.detail) from exc
+
+
 def control_runtime_digest(
     manifest_path: Path = overlay.DEFAULT_BASE_MANIFEST,
+    *,
+    manifest: overlay.BaseManifest | None = None,
 ) -> str:
     """Read the exact image-owned control Runtime wheel identity.
 
@@ -487,15 +505,8 @@ def control_runtime_digest(
     so the hub can compare it with the selected image record.
     """
 
-    try:
-        raw = manifest_path.read_bytes()
-    except OSError as exc:
-        raise LaunchRefusal("control_runtime_manifest_unreadable", str(exc)) from exc
-    manifest_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    try:
-        manifest = overlay.parse_base_manifest(raw, manifest_digest)
-    except overlay.OverlayRefusal as exc:
-        raise LaunchRefusal(exc.code, exc.detail) from exc
+    if manifest is None:
+        manifest = baked_base_manifest(manifest_path)
     matches = [wheel.digest for wheel in manifest.wheels if wheel.distribution == "cozy-runtime"]
     if len(matches) != 1:
         raise LaunchRefusal(

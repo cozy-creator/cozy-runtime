@@ -68,8 +68,18 @@ def certificate(path: Path) -> bytes:
     return der
 
 
-def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, deadline: int) -> list[RuntimeGPU]:
-    """Measure the exact executor-visible NVIDIA inventory, sorted by device index."""
+def runtime_gpus(
+    child_env: tuple[tuple[str, str], ...], *, deadline: int, accelerator_backend: str
+) -> list[RuntimeGPU]:
+    """Measure the exact executor-visible inventory required by the baked base profile."""
+
+    if accelerator_backend == "none":
+        return []
+    if accelerator_backend != "cuda":
+        raise LaunchRefusal(
+            "runtime_accelerator_backend_invalid",
+            f"pod base requires unsupported accelerator backend {accelerator_backend!r}",
+        )
 
     command = [
         "nvidia-smi",
