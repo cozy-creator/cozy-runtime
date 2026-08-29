@@ -699,11 +699,11 @@ def fence_base_ownership_vectors() -> list[str]:
     wanted = {"legacy-v1-refused", "minimal-complete-v2", "unknown-provider-refused"}
     if names != wanted:
         bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
-    cross = ROOT / "vectors" / "tensorhub-base-worker-image-wheelhouse-v2.json"
+    cross = ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse.json"
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if len(raw) != 23_930 or digest != (
-        "sha256:7e30e22a6c951c40909e911cfa042d1b649a47dc8eef2a305cfdd390f60c7de5"
+        "sha256:33e0e0f17ee0e1a9d41e8acca0fcf14362280597a50dbe0229c76f65fbfdaafc"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
