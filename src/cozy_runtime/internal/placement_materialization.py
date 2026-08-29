@@ -8,7 +8,7 @@ cr-048 RETIRED THE BOOT CLOSURE. ``tensorhub.rental_provision_spec/1`` and
 ``tensorhub.rental_provision_bundle/1`` named one package's whole closure at boot — eight
 document roles, one artifact grant per wheel and weight, the whole materialization root
 keyed by the bundle digest — which is the pre-#459 one-pod-one-package shape that rev-2's
-``DesiredPlacementSet`` + ``ArtifactGrantUpdate`` replaced. The pod now boots to
+``DesiredPlacementSet`` + direct Tensorhub artifact redemption replaced. The pod now boots to
 ready-but-EMPTY: GPU inventory measured, listeners proven, receipt
 published, zero placements. What survives here is the DISCIPLINE, not the vehicle:
 ``fetch_exact`` (one bounded exact-digest HTTPS grant) and ``materialize_objects`` (exact CAS
@@ -232,9 +232,8 @@ def materialize_objects(
 ) -> MaterializedObjects:
     """Admit each exact model closure into the required worker-local TensorFS CAS.
 
-    `grants` is a per-object-id location map — the shape rev-2's `ArtifactGrantUpdate`
-    carries. It used to be spelled as `bundle["artifact_grants"]`; the closure vehicle
-    retired, the exact-digest admission it drove did not.
+    `grants` is Tensorhub's per-object-id download plan. The old Creator-relayed grant vehicle
+    retired; exact-digest TensorFS admission did not.
     """
 
     refs = object_set.refs

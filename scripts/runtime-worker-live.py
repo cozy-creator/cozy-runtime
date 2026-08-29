@@ -505,6 +505,7 @@ def main() -> int:
         empty_bytes, empty_object_set = vectors["empty"]
 
         token = "1" * 64
+        control_key = base64.urlsafe_b64encode(b"c" * 32).rstrip(b"=").decode()
         env = {
             "AWS_SECRET_ACCESS_KEY": "must-not-cross",
             "HF_TOKEN": "must-not-cross",
@@ -514,7 +515,14 @@ def main() -> int:
             "COZY_WORKER_ID": "worker-live",
             "COZY_WORKER_INTERNAL_PORT": "43100",
             "COZY_MEDIA_INTERNAL_PORT": "43101",
-            "COZY_RECORD_OWNER_TOKEN_SHA256_JSON": f'["{token}"]',
+            "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
+                {
+                    "control_public_key_ed25519_b64url": control_key,
+                    "media_token_sha256": [token],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "COZY_WORKER_LEASE_EXPIRY_UNIX": str(int(time.time()) + 60),
         }
         try:
@@ -529,11 +537,28 @@ def main() -> int:
             assert exc.name == "worker_host_config" and "unknown" in exc.message
         else:
             raise AssertionError("an unknown COZY name entered the fixed worker handoff")
+        auth = json.loads(env["COZY_RECORD_OWNER_AUTH_JSON"])
+        for planted in (
+            {**auth, "extra": "ambiguous"},
+            {**auth, "control_public_key_ed25519_b64url": control_key + "="},
+            {**auth, "media_token_sha256": ["2" * 64, "1" * 64]},
+        ):
+            try:
+                read_worker_host_config(
+                    {
+                        **env,
+                        "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(planted),
+                    }
+                )
+            except ConfigError as exc:
+                assert exc.name == "worker_host_config"
+            else:
+                raise AssertionError("malformed RecordOwner auth was accepted")
         for name in (
             "COZY_WORKER_ID",
             "COZY_WORKER_INTERNAL_PORT",
             "COZY_MEDIA_INTERNAL_PORT",
-            "COZY_RECORD_OWNER_TOKEN_SHA256_JSON",
+            "COZY_RECORD_OWNER_AUTH_JSON",
             "COZY_WORKER_LEASE_EXPIRY_UNIX",
         ):
             try:
@@ -565,6 +590,7 @@ def main() -> int:
                     "pci_bus_id": "00000000:01:00.0",
                 }
             ],
+            certificate_der=b"certificate-der",
             accelerator_backend="cuda",
             control_runtime_digest_value="sha256:" + "3" * 64,
         )
@@ -604,6 +630,7 @@ def main() -> int:
             PreparedBoot(root / "cpu-store", root / "cpu-object-set.json", root / "cpu-cache"),
             "cpu-boot-live",
             cpu_gpus,
+            certificate_der=b"certificate-der",
             accelerator_backend="none",
             control_runtime_digest_value="sha256:" + "3" * 64,
         )
@@ -615,6 +642,7 @@ def main() -> int:
                 PreparedBoot(root / "bad-store", root / "bad-set.json", root / "bad-cache"),
                 "bad-cuda-boot",
                 [],
+                certificate_der=b"certificate-der",
                 accelerator_backend="cuda",
                 control_runtime_digest_value="sha256:" + "3" * 64,
             )
@@ -1044,7 +1072,8 @@ def main() -> int:
         else:
             raise AssertionError("provider IP SAN was accepted as worker identity")
         cpu_payload = readiness.receipt_payload(
-            record_owner_token_sha256=config.record_owner_token_sha256,
+            control_public_key_ed25519_b64url=config.control_public_key_ed25519_b64url,
+            media_token_sha256=config.media_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
             worker_internal_port=config.worker_internal_port,
@@ -1054,7 +1083,8 @@ def main() -> int:
         cpu_receipt = canonical.parse_canonical(cpu_payload)
         assert isinstance(cpu_receipt, dict) and cpu_receipt["runtime_gpus"] == []
         payload = readiness.receipt_payload(
-            record_owner_token_sha256=config.record_owner_token_sha256,
+            control_public_key_ed25519_b64url=config.control_public_key_ed25519_b64url,
+            media_token_sha256=config.media_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=b"certificate-der",
             worker_internal_port=config.worker_internal_port,
@@ -1075,7 +1105,10 @@ def main() -> int:
         assert receipt["worker_listener_bound"] is True
         assert receipt["media_foreign_credential_refused"] is True
         assert receipt["pod_boot_id"] == boot_id
-        assert receipt["observed_record_owner_token_sha256"] == [token]
+        assert receipt["observed_record_owner_auth"] == {
+            "control_public_key_ed25519_b64url": control_key,
+            "media_token_sha256": [token],
+        }
         assert "provider_pod_id" not in receipt
         # An EMPTY boot has staged nothing, so the receipt asserts nothing about a closure;
         # per-placement observed state is the rev-2 wire's job, continuously. And the pod

@@ -1,12 +1,12 @@
-"""cr-049: the ACQUISITION walk — a desired spec plus a standing grant become local bytes.
+"""The acquisition walk: desired bytes plus one direct Tensorhub plan become local state.
 
 `converge_placement` used to only VERIFY: it read a receipt-selected generation that something
 else had already built and binding-plan records something else had already staged. Nothing
 built or staged them, because cr-048 retired the boot closure that did. This module is the
 missing door.
 
-**The set is the authority on WHAT; the grant is the authority on ACCESS** (rev-2 §3). The
-walk therefore never reads the grant's subject `kind` to decide what a digest MEANS — it
+**The set is the authority on WHAT; the plan is access only.** The walk never reads the plan's
+artifact `kind` to decide what a digest means — it
 starts at the two digests the `PlacementSpec` names (`environment_spec_digest`,
 `installed_environment_receipt_digest`) plus the spec's binding-plan subjects, and every
 further digest is REACHED from a document already fetched and verified:
@@ -17,8 +17,7 @@ further digest is REACHED from a document already fetched and verified:
 
 That reachability is th-044/th-046's canonical join, and it already exists as documents;
 `placement_materialization.environment_input` is its reader. What never existed was a caller. This
-module is that caller, and it is why `apply_artifact_grant` no longer has to say it cannot
-"reinterpret opaque subjects as a wheel closure" — it never needs to interpret one.
+module is that caller. The plan is never interpreted as a wheel or model closure.
 
 Every byte enters through `placement_materialization.fetch_exact`: one bounded exact-digest HTTPS
 GET, no proxy, no redirect, no content transform, sha256-and-length before trust. There is
@@ -30,13 +29,14 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
 from typing import Any, Literal, TypeAlias
 
-from cozy_runtime.internal import canonical, overlay, placement_materialization, provisioned, pull
+from cozy_runtime.internal import canonical, overlay, placement_materialization, provisioned
 from cozy_runtime.internal.refusal import LaunchRefusal
+from cozy_runtime.internal.worker.artifact_access import ArtifactPlan
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -170,62 +170,6 @@ def observe_model_sources(
 
 
 @dataclass(frozen=True, slots=True)
-class StandingGrant:
-    """The recorded acquisition authority — WHICH digests, WHERE, and UNTIL WHEN.
-
-    A COMPLETE replacement of the previous authority (rev-2 §3): a refresh bumps only
-    `revision` and touches no placement identity, because the identities live in the set
-    document and a grant cannot reach it.
-    """
-
-    grant_id: str = ""
-    revision: int = 0
-    subjects: Mapping[str, int] = field(default_factory=dict)
-    locations: Mapping[str, str] = field(default_factory=dict)
-    expires_at_unix: int = 0
-    base_url: str = ""
-
-    @classmethod
-    def read(cls, update: pb.ArtifactGrantUpdate) -> StandingGrant:
-        grant = update.grant
-        subjects: dict[str, int] = {}
-        for subject in grant.subjects:
-            spelled = documents.spell(subject.digest)
-            if subject.length <= 0:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "artifact_subject_invalid",
-                    f"{spelled} is authorized with length {subject.length}",
-                )
-            previous = subjects.setdefault(spelled, subject.length)
-            if previous != subject.length:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "artifact_subject_conflict",
-                    f"{spelled} is authorized at two lengths",
-                )
-        locations = {documents.spell(location.digest): location.url for location in grant.locations}
-        return cls(
-            grant_id=grant.grant_id,
-            revision=update.grant_revision,
-            subjects=subjects,
-            locations=locations,
-            expires_at_unix=grant.expires_at_unix,
-            base_url=grant.base_url,
-        )
-
-    def authorized(self) -> bool:
-        return bool(self.subjects)
-
-    def local(self) -> bool:
-        """`pull.guard`'s dev carve-out, decided by the GRANT'S OWN stated base and nothing
-        else: a production grant names a public base, so the private-address door stays
-        shut no matter what a location claims."""
-
-        return bool(self.base_url) and pull.local_hub(self.base_url)
-
-
-@dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
     """What one converged acquisition produced, all of it re-measurable on disk."""
 
@@ -241,7 +185,7 @@ class AcquiredPlacement:
 
 
 class Acquirer:
-    """One placement's acquisition, against one standing grant.
+    """One placement's acquisition against one direct-Tensorhub plan.
 
     Storage is a constructor argument and never a document field: local paths are the
     provisioner's choice and no canonical document may name one.
@@ -249,7 +193,7 @@ class Acquirer:
 
     def __init__(
         self,
-        grant: StandingGrant,
+        plan: ArtifactPlan,
         *,
         cache_root: Path,
         environment_root: Path,
@@ -261,7 +205,7 @@ class Acquirer:
         verified_cache: VerifiedArtifactCache | None = None,
         on_observation: Any = None,
     ) -> None:
-        self.grant = grant
+        self.plan = plan
         self.cache_root = cache_root
         self.environment_root = environment_root
         self.plans_root = plans_root
@@ -283,32 +227,33 @@ class Acquirer:
 
     # ---- the one door bytes enter through -------------------------------------------
 
-    def _deadline(self) -> int:
-        """The grant's own expiry IS the deadline. No timeout is invented here."""
+    def _deadline(self, digest: str) -> int:
+        """The Tensorhub plan's expiry is the download deadline."""
 
-        if self.grant.expires_at_unix <= 0:
+        deadline = self.plan.deadline(digest)
+        if deadline <= 0:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
-                "grant_expiry_absent",
-                "an acquisition grant states when it expires or it authorizes nothing",
+                pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
+                "artifact_authorization_absent",
+                "a direct artifact plan states when it expires or authorizes nothing",
             )
-        if time.time() >= self.grant.expires_at_unix:
+        if time.time() >= deadline:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
-                "grant_expired",
-                f"the standing grant expired at {self.grant.expires_at_unix}",
+                pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
+                "artifact_authorization_expired",
+                f"the direct artifact plan for {digest} expired at {deadline}",
             )
-        return self.grant.expires_at_unix
+        return deadline
 
     def fetch(self, digest: str, length: int, *, observe: bool = True) -> Path:
         """Fetch one AUTHORIZED digest. Authority is checked before a socket is opened."""
 
-        authorized = self.grant.subjects.get(digest)
+        authorized = self.plan.subjects.get(digest)
         if authorized is None:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
-                "artifact_unauthorized",
-                f"{digest} is reached by the desired spec but no standing grant names it",
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                "artifact_plan_missing",
+                f"{digest} is reached by the desired spec but absent from Tensorhub's plan",
             )
         if authorized != length:
             raise AcquisitionRefusal(
@@ -316,14 +261,6 @@ class Acquirer:
                 "artifact_length_conflict",
                 f"{digest} is named at {length} B and authorized at {authorized} B",
             )
-        url = self.grant.locations.get(digest)
-        if not url:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "artifact_location_absent",
-                f"{digest} is authorized but the grant carries no location for it",
-            )
-        deadline = self._deadline()
         target = self.cache_root / digest.removeprefix("sha256:")
         already = target.exists()
         trusted = self.verified_cache.trusted(digest, length, target)
@@ -332,11 +269,18 @@ class Acquirer:
             if trusted is not None:
                 path = target
             else:
+                url = self.plan.locations.get(digest)
+                if not url:
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                        "artifact_location_absent",
+                        f"{digest} is authorized but the plan carries no location for it",
+                    )
                 path = placement_materialization.fetch_exact(
                     {"digest": digest, "length": length, "url": url},
                     self.cache_root,
-                    deadline=deadline,
-                    allow_local=self.grant.local(),
+                    deadline=self._deadline(digest),
+                    allow_local=self.plan.allow_local,
                 )
                 trusted = self.verified_cache.record(digest, length, path)
         except LaunchRefusal as exc:
@@ -454,15 +398,15 @@ class Acquirer:
             ) from exc
         locations: dict[str, str] = {}
         for object_digest, object_length in object_set.refs.items():
-            authorized = self.grant.subjects.get(object_digest)
+            authorized = self.plan.subjects.get(object_digest)
             if authorized != object_length:
                 raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
-                    "model_object_unauthorized",
-                    f"{object_digest} is required at {object_length} B and authorized at "
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                    "model_object_plan_missing",
+                    f"{object_digest} is required at {object_length} B and planned at "
                     f"{authorized!r}",
                 )
-            location = self.grant.locations.get(object_digest)
+            location = self.plan.locations.get(object_digest)
             if not location:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
@@ -471,13 +415,21 @@ class Acquirer:
                 )
             locations[object_digest] = location
         try:
+            deadlines = [self.plan.deadline(digest) for digest in object_set.refs]
+            deadline = min(deadlines) if deadlines else self.plan.expires_at_unix
+            if deadline <= 0 or time.time() >= deadline:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
+                    "artifact_authorization_expired",
+                    f"model artifact plan expired at {deadline}",
+                )
             outcome = placement_materialization.materialize_objects(
                 locations,
                 object_set,
                 cache=None,
-                deadline=self._deadline(),
+                deadline=deadline,
                 store_root=self.artifact_store,
-                allow_local=self.grant.local(),
+                allow_local=self.plan.allow_local,
             )
         except LaunchRefusal as exc:
             raise AcquisitionRefusal(
@@ -643,12 +595,12 @@ class Acquirer:
         temporary.replace(target)
 
     def _authorized_length(self, digest: str, name: str) -> int:
-        length = self.grant.subjects.get(digest)
+        length = self.plan.subjects.get(digest)
         if length is None:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
-                "artifact_unauthorized",
-                f"{name} {digest} is named by the desired spec and by no standing grant",
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                "artifact_plan_missing",
+                f"{name} {digest} is named by the desired spec and absent from the plan",
             )
         return length
 

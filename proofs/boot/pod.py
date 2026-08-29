@@ -2,7 +2,7 @@
 """cr-048's boot proof: a pod that boots with NO provision document, ready and empty.
 
 This process is the Runtime-side contract stand-in for cozy-creator's single `pod-supervisor`
-binary. It makes the same grants (TLS keypair, boot id, renter-token hashes, its in-process
+binary. It makes the same handoff (TLS keypair, boot id, owner auth, its in-process
 media listener, and the closed COZY_WORKER_* environment), execs the real worker, and then
 observes what a rented pod's two consumers observe: tensorhub's receipt, and a
 RecordOwner's Claim.
@@ -20,7 +20,7 @@ What it proves, and every line of it is measured rather than asserted by constru
 Then cr-049's half, on the SAME pod and through the SAME connection, because a first
 placement that took a private door would prove nothing about the tenth:
 
-  * a standing `ArtifactGrantUpdate` lands and is echoed back, changing no revision;
+  * signed `EnsureArtifacts` lands and is redeemed directly over worker mTLS;
   * one `DesiredPlacementSet` names an environment, a receipt and a binding plan by digest —
     and NOTHING else crosses;
   * the worker fetches source/custom wheels, publishes a small installed-base overlay, and
@@ -47,11 +47,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import grpc
 import hub
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from cozy_runtime.internal import host_paths
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -68,7 +72,6 @@ ARTIFACT_CACHE = host_paths.ARTIFACT_CACHE
 APPLICATION = "proof_cli_package:app"
 WORKER_PORT = 43100
 MEDIA_PORT = 43101
-ARTIFACT_PORT = 43102
 DEADLINE = int(time.time()) + 1800
 
 
@@ -184,9 +187,9 @@ def mint_origin_tls() -> tuple[Path, Path]:
             "-days",
             "1",
             "-subj",
-            "/CN=cozy-artifact-origin",
+            "/CN=worker.tensorhub.com",
             "-addext",
-            "subjectAltName=IP:127.0.0.1",
+            "subjectAltName=DNS:worker.tensorhub.com",
         ],
         check=True,
         capture_output=True,
@@ -214,6 +217,8 @@ def mint_tls() -> tuple[Path, Path]:
             "/CN=cozy-worker",
             "-addext",
             "subjectAltName=DNS:cozy-worker",
+            "-addext",
+            "extendedKeyUsage=serverAuth,clientAuth",
         ],
         check=True,
         capture_output=True,
@@ -261,7 +266,13 @@ class RecordOwner:
     tenth, and "placement 1 is treated identically to placements 2..N" is the property.
     """
 
-    def __init__(self, certificate: Path, token: bytes) -> None:
+    def __init__(
+        self,
+        certificate: Path,
+        private_key: Ed25519PrivateKey,
+        worker_boot_id: str,
+        worker_tls_certificate_digest: str,
+    ) -> None:
         credentials = grpc.ssl_channel_credentials(certificate.read_bytes())
         self.channel = grpc.secure_channel(
             f"127.0.0.1:{WORKER_PORT}",
@@ -275,7 +286,7 @@ class RecordOwner:
         self.inbound: queue.Queue[pb.WorkerFrame] = queue.Queue()
         self.epoch = 1
         self.generation = 0
-        self.worker_boot_id = ""
+        self.worker_boot_id = worker_boot_id
         self.admission_generation = 0
         self.claim_ack: pb.ClaimAck | None = None
         self.snapshot: dict[str, Any] = {}
@@ -287,13 +298,23 @@ class RecordOwner:
 
         self.call = pb_grpc.WorkerControlStub(self.channel).Control(frames())
         self.reader = threading.Thread(target=self._read, daemon=True)
+        proof = documents.canonical_bytes(
+            pb.ClaimProof(
+                record_owner_epoch=self.epoch,
+                worker_boot_id=worker_boot_id,
+                worker_id="ra-cr048bootproof",
+                worker_tls_certificate_digest=documents.raw(worker_tls_certificate_digest),
+            )
+        )
         self.send(
             pb.RecordOwnerFrame(
                 claim=pb.Claim(
                     record_owner_epoch=self.epoch,
                     record_owner_id="cr-049-boot-proof",
+                    worker_boot_id=worker_boot_id,
+                    worker_id="ra-cr048bootproof",
                     wire_minor=WIRE_MINOR,
-                    proof=token,
+                    proof=private_key.sign(proof),
                 )
             )
         )
@@ -386,7 +407,11 @@ def describe(state: pb.ObservedWorkerState | None) -> str:
         f"phase={pb.WorkerPhase.Name(state.worker_phase)}",
         f"accepted={state.accepted_desired_state_revision}",
         f"converged={state.converged_revision}",
-        f"grant={state.applied_artifact_grant_id!r}@{state.applied_grant_revision}",
+        (
+            f"artifacts={state.artifact_intent.delegation_id!r}@{state.artifact_intent.revision}"
+            if state.HasField("artifact_intent")
+            else "artifacts=(none)"
+        ),
     ]
     for placement in state.placements:
         rows.append(
@@ -405,26 +430,28 @@ def placement_is(state: pb.ObservedWorkerState, materialization: Any, serving: A
     )
 
 
-def grant_update(release: hub.Release, revision: int) -> pb.ArtifactGrantUpdate:
-    """The standing acquisition authority: WHICH digests, WHERE, and until when."""
-
-    base = f"https://127.0.0.1:{ARTIFACT_PORT}"
-    return pb.ArtifactGrantUpdate(
-        grant_revision=revision,
-        grant=pb.ArtifactGrant(
-            grant_id=f"cr049-grant-{revision}",
-            subjects=release.subjects(),
-            credential=pb.DeliveryAccessCredential(
-                issuer="cr-049-boot-proof",
-                key_id="artifacts",
-                epoch=1,
-                expires_at_unix=DEADLINE,
-                token=b"proof-artifact-token",
-            ),
-            base_url=base,
-            expires_at_unix=DEADLINE,
-            locations=release.locations(base),
-        ),
+def ensure_artifacts(
+    private_key: Ed25519PrivateKey,
+    worker_boot_id: str,
+    worker_tls_certificate_digest: str,
+    *,
+    delegation_id: str,
+) -> pb.EnsureArtifacts:
+    delegation = pb.ArtifactDelegation(
+        rental_id="rental-cr049-proof",
+        worker_id="ra-cr048bootproof",
+        worker_boot_id=worker_boot_id,
+        worker_tls_certificate_digest=documents.raw(worker_tls_certificate_digest),
+        revision=1,
+        package_release_ids=[hub.PACKAGE_RELEASE],
+        model_checkpoint_ids=["sha256:" + hashlib.sha256(b"proof-checkpoint").hexdigest()],
+        delegation_id=delegation_id,
+        expires_at_unix=DEADLINE,
+    )
+    raw = documents.canonical_bytes(delegation)
+    return pb.EnsureArtifacts(
+        delegation_canonical_bytes=raw,
+        creator_signature=private_key.sign(raw),
     )
 
 
@@ -562,10 +589,18 @@ def main() -> int:
     origin_certificate, origin_key = mint_origin_tls()
     boot_id = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     (STATE / "pod-boot-id").write_text(boot_id + "\n")
-    # Creator is the private pod's sole RecordOwner. It mints the renter token and hands
-    # the pod only its hash; the proof holds the preimage because it plays Creator.
+    # Cozy is the private pod's sole RecordOwner. One rental key signs Claim and artifact intent;
+    # media bearer hashes remain a disjoint door.
+    control_private_key = Ed25519PrivateKey.generate()
+    control_public_key = control_private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    control_public_key_text = base64.urlsafe_b64encode(control_public_key).rstrip(b"=").decode()
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
+    certificate_der = ssl.PEM_cert_to_DER_cert(certificate.read_text())
+    worker_tls_digest = "sha256:" + hashlib.sha256(certificate_der).hexdigest()
     serve_media(certificate, key, token)
     # Authoring also installs the stand-in's exact complete base manifest. The worker now
     # measures its cozy-runtime wheel fact before it starts the control worker.
@@ -582,7 +617,14 @@ def main() -> int:
         "COZY_WORKER_ID": "ra-cr048bootproof",
         "COZY_WORKER_INTERNAL_PORT": str(WORKER_PORT),
         "COZY_MEDIA_INTERNAL_PORT": str(MEDIA_PORT),
-        "COZY_RECORD_OWNER_TOKEN_SHA256_JSON": json.dumps([token_hash]),
+        "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
+            {
+                "control_public_key_ed25519_b64url": control_public_key_text,
+                "media_token_sha256": [token_hash],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
         "COZY_WORKER_LEASE_EXPIRY_UNIX": str(DEADLINE),
     }
     note("handing the worker five owner-neutral COZY_* names and no document")
@@ -614,7 +656,10 @@ def main() -> int:
 
         assert receipt["format"] == "cozy.pod-readiness/1"
         assert receipt["pod_boot_id"] == boot_id
-        assert receipt["observed_record_owner_token_sha256"] == [token_hash]
+        assert receipt["observed_record_owner_auth"] == {
+            "control_public_key_ed25519_b64url": control_public_key_text,
+            "media_token_sha256": [token_hash],
+        }
         assert receipt["worker_internal_port"] == WORKER_PORT
         assert receipt["media_internal_port"] == MEDIA_PORT
         assert receipt["worker_listener_bound"] and receipt["media_listener_bound"]
@@ -634,7 +679,12 @@ def main() -> int:
         assert not Path("/var/lib/cozy/provision").exists()
         note("artifact store empty, object set empty, no environment generation")
 
-        owner = RecordOwner(certificate, token.encode())
+        owner = RecordOwner(
+            certificate,
+            control_private_key,
+            boot_id,
+            worker_tls_digest,
+        )
         try:
             empty = owner.await_state(
                 lambda state: state.worker_phase != pb.WorkerPhase.WORKER_PHASE_UNSPECIFIED,
@@ -665,26 +715,55 @@ def main() -> int:
             )
 
             # ---- cr-049: the pod is empty; make it serve, over this same stream ----------
-            hub.serve_artifacts(release, origin_certificate, origin_key, ARTIFACT_PORT)
+            hub.serve_artifacts(
+                release,
+                origin_certificate,
+                origin_key,
+                certificate,
+                control_public_key,
+            )
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        "https://worker.tensorhub.com/v1/worker/artifacts/resolve",
+                        data=b"{}",
+                        method="POST",
+                    ),
+                    context=ssl.create_default_context(cafile=str(origin_certificate)),
+                    timeout=5,
+                )
+            except (urllib.error.URLError, ssl.SSLError):
+                pass
+            else:
+                raise AssertionError("direct resolve admitted a caller without the worker leaf")
             note(
-                f"artifact origin serving {len(release.objects)} exact object(s) on "
-                f"127.0.0.1:{ARTIFACT_PORT}; the hub measured receipt "
+                f"worker.tensorhub.com serving {len(release.objects)} exact object(s); "
+                f"the hub measured receipt "
                 f"{hashlib.sha256(release.receipt).hexdigest()[:16]}…"
             )
 
             owner.send(
-                pb.RecordOwnerFrame(artifact_grant_update=owner.envelope(grant_update(release, 1)))
+                pb.RecordOwnerFrame(
+                    ensure_artifacts=owner.envelope(
+                        ensure_artifacts(
+                            control_private_key,
+                            boot_id,
+                            worker_tls_digest,
+                            delegation_id="cr049-delegation-1",
+                        )
+                    )
+                )
             )
-            granted = owner.await_state(
-                lambda state: state.applied_grant_revision == 1,
-                "the standing grant echoed back",
+            ensured = owner.await_state(
+                lambda state: (
+                    state.HasField("artifact_intent") and state.artifact_intent.revision == 1
+                ),
+                "the signed artifact intent echoed back",
                 seconds=60,
             )
-            # REFRESHING ACCESS NEVER CHANGES IDENTITY (§3): no revision moved.
-            assert granted.accepted_desired_state_revision == 0, describe(granted)
-            assert granted.converged_revision == 0, describe(granted)
-            assert granted.applied_artifact_grant_id == "cr049-grant-1", describe(granted)
-            note(f"grant landed: {describe(granted)}")
+            assert ensured.accepted_desired_state_revision == 0, describe(ensured)
+            assert ensured.converged_revision == 0, describe(ensured)
+            note(f"artifact intent landed: {describe(ensured)}")
 
             owner.send(
                 pb.RecordOwnerFrame(
@@ -705,6 +784,9 @@ def main() -> int:
             assert staged.placements[0].placement_id == hub.PLACEMENT_ID, describe(staged)
             assert staged.placements[0].dispatchable_plan_ids, describe(staged)
             assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
+            assert hub.resolve_mtls_proven(), (
+                "direct resolve did not present the pinned worker leaf"
+            )
             assert hub.overlap_proven(), "package wheel and model object-set fetches serialized"
             cold_acquisition = staged.placements[0].acquisition
             assert cold_acquisition.package.started_monotonic_ns > 0
@@ -880,7 +962,7 @@ def main() -> int:
                 f"{warm_acquisition.package.reused_bytes} package B"
             )
 
-            # ---- the red arm: an incoming spec the grant does not authorize --------------
+            # ---- the red arm: an incoming spec conflicts with the committed receipt -------
             broken = release.placement_set.replace(
                 expected.encode(),
                 (b"sha256:" + b"ee" * 32),
@@ -911,19 +993,28 @@ def main() -> int:
             ), describe(refused)
             note(f"mismatched revision 4 REFUSED, outgoing keeps serving: {describe(refused)}")
 
-            # A GRANT refresh repairs access; it cannot repair a terminal verdict about the
-            # desired spec's exact receipt bytes. Before this arm existed, every newer grant
-            # cleared the latch, repeated the full acquisition walk, and appended the same
-            # `overlay_receipt_mismatch` fault again while claiming failures were latched.
+            # Same-revision delegation renewal changes access, not the terminal content verdict.
             mismatch_faults = sum(
                 fault.reason == "overlay_receipt_mismatch" for fault in refused.faults
             )
             owner.send(
-                pb.RecordOwnerFrame(artifact_grant_update=owner.envelope(grant_update(release, 2)))
+                pb.RecordOwnerFrame(
+                    ensure_artifacts=owner.envelope(
+                        ensure_artifacts(
+                            control_private_key,
+                            boot_id,
+                            worker_tls_digest,
+                            delegation_id="cr049-delegation-2",
+                        )
+                    )
+                )
             )
             refreshed = owner.await_state(
-                lambda state: state.applied_grant_revision == 2,
-                "the refreshed grant beside a terminal materialization failure",
+                lambda state: (
+                    state.HasField("artifact_intent")
+                    and state.artifact_intent.delegation_id == "cr049-delegation-2"
+                ),
+                "renewed delegation beside a terminal materialization failure",
                 seconds=60,
             )
             deadline = time.monotonic() + 5
@@ -940,9 +1031,9 @@ def main() -> int:
             assert (
                 sum(fault.reason == "overlay_receipt_mismatch" for fault in after_refresh.faults)
                 == mismatch_faults
-            ), "a grant refresh repeated a terminal materialization fault"
+            ), "delegation renewal repeated a terminal materialization fault"
             note(
-                "grant revision 2 landed without re-driving terminal revision 4: "
+                "same-revision delegation renewal landed without re-driving terminal revision 4: "
                 f"{describe(refreshed)}"
             )
         finally:

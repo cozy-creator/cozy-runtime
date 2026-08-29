@@ -5,7 +5,7 @@ canonical documents (tensorhub's `releaseassembly` + `wheelset` + `placementset`
 authors produce these same shapes), and the ARTIFACT ORIGIN those documents are fetched
 from. It is deliberately a repository proof driver and not a shipped component — what it
 proves is the WORKER's half: that a pod which boots empty converges to a live placement from
-a `DesiredPlacementSet` plus an `ArtifactGrantUpdate` and nothing else.
+a signed `EnsureArtifacts` plus one `DesiredPlacementSet` and nothing else.
 
 The receipt is derived from exact base-family and package-wheel identities. This module
 materializes the overlay once to learn it; the worker independently materializes the same
@@ -14,7 +14,9 @@ overlay and must produce byte-identical receipt bytes without copying the base e
 
 from __future__ import annotations
 
+import base64
 import http.server
+import json
 import ssl
 import sys
 import threading
@@ -23,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from proof_data import Wheel, canonical, digest, installed_base_ownership, inventory, ref, wheel
 
 from cozy_runtime.internal import canonical as canon
@@ -34,6 +37,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 PACKAGE_RELEASE = "proof-boot-release-1"
 PLACEMENT_ID = "cr049-first-placement"
+ARTIFACT_PORT = 43102
 
 
 @dataclass
@@ -64,27 +68,6 @@ class Release:
         self.wheel_paths[entry.digest] = path
         return entry
 
-    def subjects(self) -> list[pb.ArtifactSubject]:
-        """Sorted by digest, exactly the bytes this release authorizes and no others."""
-
-        return [
-            pb.ArtifactSubject(
-                digest=documents.raw(spelled),
-                subject_id=spelled,
-                kind=self.kinds[spelled],
-                length=len(raw),
-            )
-            for spelled, raw in sorted(self.objects.items())
-        ]
-
-    def locations(self, base: str) -> list[pb.ArtifactLocation]:
-        return [
-            pb.ArtifactLocation(
-                digest=documents.raw(spelled), url=f"{base}/artifacts/{spelled[7:]}"
-            )
-            for spelled in sorted(self.objects)
-        ]
-
 
 def platform_target(python_abi: str, libc: str) -> dict[str, str]:
     return {
@@ -111,8 +94,8 @@ def author(
     release = Release()
     project = release.add_wheel(project_wheel)
     house = sorted((inventory(path) for path in wheelhouse_wheels), key=lambda e: e.distribution)
-    if len(house) != 5:
-        raise AssertionError(f"boot proof base carries {len(house)} control wheels, want 5")
+    if len(house) != 8:
+        raise AssertionError(f"boot proof base carries {len(house)} control wheels, want 8")
 
     base_distributions, base_import_roots = installed_base_ownership()
     profile = {
@@ -264,10 +247,14 @@ class _Origin(http.server.BaseHTTPRequestHandler):
     """Exact bytes at their own content address. No redirect, no transform, no listing."""
 
     objects: ClassVar[dict[str, bytes]] = {}
+    kinds: ClassVar[dict[str, str]] = {}
     overlap_subjects: ClassVar[frozenset[str]] = frozenset()
     overlap_barrier: ClassVar[threading.Barrier | None] = None
     overlapped: ClassVar[set[str]] = set()
     delayed_model_subject: ClassVar[str] = ""
+    creator_public_key: ClassVar[bytes] = b""
+    worker_certificate_der: ClassVar[bytes] = b""
+    resolved_mtls: ClassVar[bool] = False
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
@@ -293,24 +280,129 @@ class _Origin(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        if self.path != "/v1/worker/artifacts/resolve":
+            self._json(
+                404,
+                {
+                    "error": {"code": "not_found", "message": "not found"},
+                    "server_time_unix": int(time.time()),
+                },
+            )
+            return
+        if self.connection.getpeercert(binary_form=True) != _Origin.worker_certificate_der:
+            self._json(
+                403,
+                {
+                    "error": {"code": "worker_identity", "message": "wrong leaf"},
+                    "server_time_unix": int(time.time()),
+                },
+            )
+            return
+        _Origin.resolved_mtls = True
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            assert 0 < length <= 1 << 20
+            request = json.loads(self.rfile.read(length))
+            assert set(request) == {
+                "creator_signature",
+                "delegation_canonical_bytes",
+                "model_checkpoint_ids",
+                "package_release_ids",
+            }
+            delegation_bytes = base64.b64decode(
+                request["delegation_canonical_bytes"], validate=True
+            )
+            signature_text = request["creator_signature"]
+            signature = base64.urlsafe_b64decode(signature_text + "=" * (-len(signature_text) % 4))
+            Ed25519PublicKey.from_public_bytes(_Origin.creator_public_key).verify(
+                signature, delegation_bytes
+            )
+            delegation = documents.read(delegation_bytes, pb.ArtifactDelegation)
+            packages = request["package_release_ids"]
+            models = request["model_checkpoint_ids"]
+            assert packages == sorted(set(packages))
+            assert models == sorted(set(models))
+            assert set(packages).issubset(delegation.get("package_release_ids", []))
+            assert set(models).issubset(delegation.get("model_checkpoint_ids", []))
+            now = int(time.time())
+            expires = min(int(delegation["expires_at_unix"]), now + 600)
+            assert expires > now
+        except Exception as exc:
+            self._json(
+                400,
+                {
+                    "error": {"code": "invalid", "message": type(exc).__name__},
+                    "server_time_unix": int(time.time()),
+                },
+            )
+            return
+        self._json(
+            200,
+            {
+                "artifacts": [
+                    {
+                        "digest": spelled,
+                        "kind": _Origin.kinds[spelled],
+                        "length": len(raw),
+                        "url": (
+                            f"https://worker.tensorhub.com:{ARTIFACT_PORT}/artifacts/{spelled[7:]}"
+                        ),
+                    }
+                    for spelled, raw in sorted(_Origin.objects.items())
+                ],
+                "expires_at_unix": expires,
+                "server_time_unix": now,
+            },
+        )
+
+    def _json(self, status: int, value: object) -> None:
+        body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
 
-def serve_artifacts(release: Release, certificate: Path, key: Path, port: int) -> None:
+def serve_artifacts(
+    release: Release,
+    certificate: Path,
+    key: Path,
+    worker_certificate: Path,
+    creator_public_key: bytes,
+) -> None:
     _Origin.objects = dict(release.objects)
+    _Origin.kinds = dict(release.kinds)
     source = next(digest for digest, kind in release.kinds.items() if kind == "wheel")
     models = next(digest for digest, kind in release.kinds.items() if kind == "model_object_set")
     _Origin.overlap_subjects = frozenset({source, models})
     _Origin.overlap_barrier = threading.Barrier(2)
     _Origin.overlapped = set()
     _Origin.delayed_model_subject = models
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Origin)
+    _Origin.creator_public_key = creator_public_key
+    _Origin.worker_certificate_der = ssl.PEM_cert_to_DER_cert(worker_certificate.read_text())
+    _Origin.resolved_mtls = False
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 443), _Origin)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(certificate), str(key))
+    context.load_verify_locations(cafile=str(worker_certificate))
+    context.verify_mode = ssl.CERT_REQUIRED
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    artifact_server = http.server.ThreadingHTTPServer(("127.0.0.1", ARTIFACT_PORT), _Origin)
+    artifact_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    artifact_context.load_cert_chain(str(certificate), str(key))
+    artifact_server.socket = artifact_context.wrap_socket(artifact_server.socket, server_side=True)
+    threading.Thread(target=artifact_server.serve_forever, daemon=True).start()
 
 
 def overlap_proven() -> bool:
     return _Origin.overlapped == set(_Origin.overlap_subjects)
+
+
+def resolve_mtls_proven() -> bool:
+    return _Origin.resolved_mtls

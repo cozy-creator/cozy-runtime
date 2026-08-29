@@ -1,4 +1,4 @@
-"""Fixed environment-neutral Runtime worker for Creator and base worker image hosts."""
+"""Fixed environment-neutral Runtime worker for Cozy and base worker image hosts."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from cozy_runtime.internal.placement_materialization import (
     prepare_boot,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
+from cozy_runtime.internal.worker.artifact_access import ArtifactClient, tls_certificate_digest
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
@@ -97,6 +98,7 @@ def _run(config: WorkerHostConfig) -> int:
         prepared,
         boot_id,
         gpus,
+        certificate_der=certificate_der,
         accelerator_backend=accelerator_backend,
         control_runtime_digest_value=control_runtime_digest(manifest=base),
     )
@@ -132,7 +134,8 @@ def _run(config: WorkerHostConfig) -> int:
             deadline=config.lease_expiry_unix,
         )
         payload = readiness.receipt_payload(
-            record_owner_token_sha256=config.record_owner_token_sha256,
+            control_public_key_ed25519_b64url=config.control_public_key_ed25519_b64url,
+            media_token_sha256=config.media_token_sha256,
             pod_boot_id_value=boot_id,
             certificate_der=certificate_der,
             worker_internal_port=config.worker_internal_port,
@@ -174,6 +177,7 @@ def _worker_options(
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
     *,
+    certificate_der: bytes,
     accelerator_backend: str,
     control_runtime_digest_value: str,
 ) -> WorkerOptions:
@@ -189,6 +193,7 @@ def _worker_options(
         root=host_paths.WORKER_STATE,
         worker_id=config.worker_id,
         instance_id=boot_id,
+        worker_boot_id=boot_id,
         control_runtime_digest=control_runtime_digest_value,
         accelerator_backend=accelerator_backend,
         devices=",".join(str(row["device_index"]) for row in gpus),
@@ -197,6 +202,11 @@ def _worker_options(
         artifact_cache=prepared.artifact_cache,
         artifact_store=prepared.artifact_store,
         artifact_object_set=prepared.artifact_object_set,
+        artifact_client=ArtifactClient(
+            host_paths.TLS_CERTIFICATE,
+            host_paths.TLS_PRIVATE_KEY,
+        ),
+        worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         no_warm=True,
         claim_ready=False,
         executor_uid=POD_EXECUTOR_UID,

@@ -20,7 +20,7 @@ from typing import Any
 from unittest.mock import patch
 
 from cozy_runtime.internal import canonical, child_env, jit_cache, native_wheel, overlay
-from cozy_runtime.internal.worker import acquire, child
+from cozy_runtime.internal.worker import acquire, artifact_access, child
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -174,11 +174,11 @@ def source(
 
 def acquirer(
     root: Path,
-    grant: acquire.StandingGrant,
+    plan: artifact_access.ArtifactPlan,
     verified: acquire.VerifiedArtifactCache,
 ) -> acquire.Acquirer:
     return acquire.Acquirer(
-        grant,
+        plan,
         cache_root=root / "cache",
         environment_root=root / "environment",
         plans_root=root / "plans",
@@ -939,29 +939,35 @@ def main() -> int:
         cached = cache / project[0].digest.removeprefix("sha256:")
         cached.write_bytes(project[1].read_bytes())
         cached.chmod(0o400)
-        grant = acquire.StandingGrant(
-            grant_id="proof",
-            revision=1,
-            subjects={project[0].digest: project[0].length},
-            locations={project[0].digest: "https://artifacts.invalid/project.whl"},
+        expires = int(time.time()) + 60
+        plan = artifact_access.ArtifactPlan(
+            server_time_unix=int(time.time()),
             expires_at_unix=int(time.time()) + 60,
-            base_url="https://artifacts.invalid",
+            artifacts={
+                project[0].digest: artifact_access.PlanArtifact(
+                    project[0].digest,
+                    project[0].length,
+                    "wheel",
+                    "https://artifacts.invalid/project.whl",
+                    expires,
+                )
+            },
         )
         verified = acquire.VerifiedArtifactCache()
-        first = acquirer(cache_root, grant, verified)
+        first = acquirer(cache_root, plan, verified)
         first.fetch(project[0].digest, project[0].length)
         assert (first.verified_bytes, first.trusted_reuse_bytes) == (project[0].length, 0)
-        second = acquirer(cache_root, grant, verified)
+        second = acquirer(cache_root, plan, verified)
         second.fetch(project[0].digest, project[0].length)
         assert (second.verified_bytes, second.trusted_reuse_bytes) == (0, project[0].length)
 
         stat_before = cached.stat()
         os.utime(cached, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 1))
-        changed_stat = acquirer(cache_root, grant, verified)
+        changed_stat = acquirer(cache_root, plan, verified)
         changed_stat.fetch(project[0].digest, project[0].length)
         assert changed_stat.verified_bytes == project[0].length
 
-        restarted = acquirer(cache_root, grant, acquire.VerifiedArtifactCache())
+        restarted = acquirer(cache_root, plan, acquire.VerifiedArtifactCache())
         restarted.fetch(project[0].digest, project[0].length)
         assert restarted.verified_bytes == project[0].length
 
@@ -971,7 +977,7 @@ def main() -> int:
         cached.write_bytes(damaged)
         cached.chmod(0o400)
         try:
-            acquirer(cache_root, grant, verified).fetch(project[0].digest, project[0].length)
+            acquirer(cache_root, plan, verified).fetch(project[0].digest, project[0].length)
         except acquire.AcquisitionRefusal as exc:
             assert exc.code == "local_artifact_digest_mismatch"
             assert exc.kind == pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH

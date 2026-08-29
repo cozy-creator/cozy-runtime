@@ -228,7 +228,8 @@ def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int
 
 def receipt_payload(
     *,
-    record_owner_token_sha256: Sequence[str],
+    control_public_key_ed25519_b64url: str,
+    media_token_sha256: Sequence[str],
     pod_boot_id_value: str,
     certificate_der: bytes,
     worker_internal_port: int,
@@ -273,7 +274,10 @@ def receipt_payload(
             "media_internal_port": media_internal_port,
             "media_listener_bound": True,
             "media_protocol": "https",
-            "observed_record_owner_token_sha256": list(record_owner_token_sha256),
+            "observed_record_owner_auth": {
+                "control_public_key_ed25519_b64url": control_public_key_ed25519_b64url,
+                "media_token_sha256": list(media_token_sha256),
+            },
             "pod_boot_id": pod_boot_id_value,
             "runtime_gpus": gpus,
             "tls_certificate_der_base64": base64.b64encode(certificate_der).decode("ascii"),
