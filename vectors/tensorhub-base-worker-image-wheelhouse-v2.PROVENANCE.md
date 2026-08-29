@@ -5,10 +5,10 @@ Go-authored `vectors/base-worker-image-wheelhouse-cu126.json`. It is the
 canonical no-newline payload the image embeds, not the repository-text spelling reparsed or
 reserialized by Runtime.
 
-- Producing Tensorhub commit: `b5216c4109cd4b28d4eb9ecb7a7742182b410d8b`
+- Producing Tensorhub commit: `390938935dde0f62e446c28f5fcfac0ef95bf385`
 
 - Length: 23,930 bytes
-- SHA-256: `b37eb3300a08f2edf29bb0bd963c898e1ece9fdb08b2998cf9193be65d4dc74d`
+- SHA-256: `7e30e22a6c951c40909e911cfa042d1b649a47dc8eef2a305cfdd390f60c7de5`
 - Census: 82 normalized distributions, 359 import roots, 5 control wheels
 
 TensorFS is the source-reproducible manylinux2014 wheel built from pinned commit `4f3d16d` in
@@ -17,8 +17,8 @@ Tensorhub's digest-pinned maturin container: `sha256:7aa6d6388b1b2bcc0556d71ccfe
 import-root ownership are unchanged.
 
 The control Runtime wheel is the exact source-first base input recorded by Tensorhub:
-`sha256:a1b4815666f6cffe0a0ce45701c770d4bc62608d94d4e5ad225f1af4880c6f4c`
-/ 681,258 bytes. This vector copy does not reinterpret those packaged bytes.
+`sha256:4ed12c4af9fa2d1ac6a704e2f335c030f98a9bade2c724b8e62868822beb3e24`
+/ 697,437 bytes. This vector copy does not reinterpret those packaged bytes.
 
 `checks/architecture.py --only base-ownership-vectors` runs Runtime's real strict parser over
 these exact foreign-authored bytes and refuses any byte, schema, or census drift.

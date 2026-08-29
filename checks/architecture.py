@@ -622,7 +622,7 @@ def fence_base_ownership_vectors() -> list[str]:
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if len(raw) != 23_930 or digest != (
-        "sha256:b37eb3300a08f2edf29bb0bd963c898e1ece9fdb08b2998cf9193be65d4dc74d"
+        "sha256:7e30e22a6c951c40909e911cfa042d1b649a47dc8eef2a305cfdd390f60c7de5"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -692,15 +692,15 @@ def fence_base_ownership_vectors() -> list[str]:
     exact_contract = {
         "endpoint-bundle.json": (
             bundle_bytes,
-            "1790343eb9007e3aa79c0ed7ec602ac48a395cd7d7d04db927c80b7b81095b17",
+            "f95aa077347a5f3fc84c7f9d80b801fe38d121605b8d03fe3c61945afa7e4b8d",
         ),
         "endpoint-environment-spec.json": (
             environment_bytes,
-            "c79110115207896b599ee44649cbfc3141edfc6227de5ab88a0e5310402495b0",
+            "154d4d77d513596237bde209077bc5761c278f61251d985b3a7470f3eb5c1afa",
         ),
         "fixture-index.json": (
             index_bytes,
-            "4bd060fae82d18da98ba5a97c9ad6c103f71bd74c432df0cbbc58d112ae84179",
+            "8809d5843a57b99e4bdd1abc4e4accf631c16ba73c694c4b1c53b518eaffc013",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -708,11 +708,11 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolution-lock.json": (
             resolution_lock_bytes,
-            "07092a4d5a2896a9a084398477b728b4a094733522e61180d331197e4a422cd1",
+            "436a122eb921d2e9b3196c95390df7e633f198816a36ed33cbd962fdff0a7d63",
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "072b784337e59f9e551c467ebf1ea8da5a737addd276470aca6aea577769d03c",
+            "203b86882159262c94f6d72daf38623c11bef576ed6d824118da786403e6aeac",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
@@ -1033,11 +1033,14 @@ DOCUMENT_KINDS = {
     "cozy.mxfp8.native-leaf/1": "internal/encoding/leaves.py",
     "cozy.pod-readiness/1": "internal/readiness.py",
     "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
+    "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
     "cozy.runtime.ConstructedGeneration/2": "internal/executor.py",
     "cozy.runtime.EndpointOverlayContent/1": "internal/overlay.py",
     "cozy.runtime.EndpointOverlayReceipt/1": "internal/overlay.py",
     "cozy.runtime.EndpointWheelExtraction/1": "internal/overlay.py",
     "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
+    "cozy.runtime.ExecutionObservation/1": "internal/acceptance.py",
+    "cozy.runtime.ExecutionObservationRequest/1": "internal/acceptance.py",
     "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
     "cozy.runtime.Ledger/0": "internal/worker/ledger.py",
     "cozy.runtime.LocalArtifact/1": "internal/artifacts.py",

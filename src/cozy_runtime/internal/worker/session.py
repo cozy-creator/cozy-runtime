@@ -188,6 +188,8 @@ class WorkerOptions:
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
     """
+    base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST
+    """Exact base-worker-image WheelhouseManifest path; fixed default in production."""
     artifact_store: Path | None = None
     """The verified TensorFS store populated from the canonical model-root closure."""
     artifact_object_set: Path | None = None
@@ -1797,7 +1799,14 @@ class Worker:
         )
         if candidate.installed_environment_receipt_digest and installed is None:
             return
-        if installed is None and not self._bind_preinstalled_object_set(candidate):
+        # A preinstalled overlay receipt says nothing about TensorFS/model-root custody.
+        # Dynamic acquisition sets the exact object-set path itself; warm/local reuse must
+        # bind the independently staged document before resolving plans. Requiring this
+        # only when `installed is None` left every preinstalled endpoint with an overlay but
+        # no model closure, including the truthful empty closure of a weightless endpoint.
+        if candidate.model_object_set_path is None and not self._bind_preinstalled_object_set(
+            candidate
+        ):
             return
         if revision != self.accepted.accepted_desired_state_revision:
             self.note("materialization", f"revision {revision} was superseded after acquisition")
@@ -2051,6 +2060,7 @@ class Worker:
                 self.options.environment_root,
                 receipt_digest=expected,
                 environment_spec_digest=documents.spell(placement.environment_spec_digest),
+                base_manifest=self.options.base_manifest,
             )
         except (overlay.OverlayRefusal, OSError) as exc:
             reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
