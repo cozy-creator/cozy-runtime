@@ -100,7 +100,7 @@ def _prepare(args: argparse.Namespace) -> None:
     _require(len(base_pairs) == 5, "proof base does not carry five control wheels")
     target = _target()
     profile = {
-        "accelerator_build": target["accelerator_abi"],
+        "accelerator_build": "cpu",
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
         "torch_release": "2.13.0",
@@ -112,8 +112,8 @@ def _prepare(args: argparse.Namespace) -> None:
             "base_import_roots": base_import_roots,
             "compatibility_profile": profile,
             "format": "WheelhouseManifest/3",
-            "minimum_cuda_version": "12.6",
-            "minimum_driver_version": "560.28.03",
+            "minimum_cuda_version": "none",
+            "minimum_driver_version": "none",
             "platform_target": target,
             "wheels": [_wheel(entry, import_roots=True) for entry, _ in base_pairs],
         }

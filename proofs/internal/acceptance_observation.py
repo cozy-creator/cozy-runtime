@@ -85,7 +85,7 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     roots = filtered_roots
     target = _target()
     profile = {
-        "accelerator_build": target["accelerator_abi"],
+        "accelerator_build": "cpu",
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
         "torch_release": "2.13.0",
@@ -96,8 +96,8 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
             "base_import_roots": roots,
             "compatibility_profile": profile,
             "format": "WheelhouseManifest/3",
-            "minimum_cuda_version": "12.6",
-            "minimum_driver_version": "560.28.03",
+            "minimum_cuda_version": "none",
+            "minimum_driver_version": "none",
             "platform_target": target,
             "wheels": [wheel(base, import_roots=True)],
         }
