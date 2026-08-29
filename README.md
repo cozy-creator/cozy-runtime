@@ -4,6 +4,19 @@ The worker runtime: author surface (`cozy_runtime.author`), worker, disposable d
 executor, and the single-package CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
 `cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.
 
+## Compatibility status
+
+Cozy Runtime is pre-launch `0.x`: its Python author API may still change incompatibly. Package
+code has one supported production import root, `cozy_runtime.author`; package tests may also use
+`cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
+package APIs.
+
+Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
+baseline recorded. From v1 onward the distribution major is the Python compatibility major:
+minor releases are additive, breaking author changes require a new major, and candidate base
+worker images must replay the supported-major package corpus before activation. The protobuf
+package major and additive wire minor remain their own worker-control compatibility contract.
+
 **No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
 deterministic contract/arithmetic/staleness checks; everything else is verified by running
 the real thing and recording what it did, plus time/memory benchmarks.
@@ -462,7 +475,7 @@ Two real packages on the author surface (weightless, no GPU), both driven end to
 
 `proofs/fixtures/tiny-models/tiny_diffusers.py` stands in for the model library a package brings as
 an ordinary dependency (and registers its own construction adapter);
-`proofs/fixtures/tiny-models/tiny_artifacts.py` and
+`proofs/internal/tiny_artifacts.py` and
 `proofs/fixtures/tiny-models/package.toml` are the RUNTIME's side — resolved artifacts and default
 bindings. Author code never names an artifact identifier; a fence proves it.
 

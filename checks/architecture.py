@@ -3,7 +3,7 @@
 
 Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
-  package-imports
+  package-imports · author-import-boundary · prelaunch-version
   env-authority · single-config · no-interactive · excluded-keywords
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
@@ -27,8 +27,60 @@ import re
 import sys
 import tomllib
 
+from packaging.version import InvalidVersion, Version
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
+
+
+def _literal_assignments(path: pathlib.Path, names: frozenset[str]) -> dict[str, list[object]]:
+    found: dict[str, list[object]] = {name: [] for name in names}
+    for node in ast.parse(path.read_text()).body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in found:
+                found[target.id].append(ast.literal_eval(node.value))
+    return found
+
+
+def fence_prelaunch_version() -> list[str]:
+    """The v1 compatibility promise begins only when proto-014 cuts it deliberately."""
+
+    bad: list[str] = []
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    distribution = project.get("version")
+    source = _literal_assignments(
+        SRC / "__init__.py", frozenset({"__version__", "PYTHON_CONTRACT_VERSION"})
+    )
+    for name, values in source.items():
+        if len(values) != 1 or not isinstance(values[0], str):
+            bad.append(f"src/cozy_runtime/__init__.py: {name} must have one literal string value")
+    if bad or not isinstance(distribution, str):
+        if not isinstance(distribution, str):
+            bad.append("pyproject.toml: project.version must be a string")
+        return bad
+    runtime = source["__version__"][0]
+    contract = source["PYTHON_CONTRACT_VERSION"][0]
+    assert isinstance(runtime, str) and isinstance(contract, str)
+    if runtime != distribution:
+        bad.append(
+            "src/cozy_runtime/__init__.py: __version__ does not match pyproject.toml "
+            f"({runtime!r} != {distribution!r})"
+        )
+    for where, value in (
+        ("pyproject.toml: project.version", distribution),
+        ("src/cozy_runtime/__init__.py: PYTHON_CONTRACT_VERSION", contract),
+    ):
+        try:
+            major = Version(value).major
+        except InvalidVersion:
+            bad.append(f"{where} is not a valid version: {value!r}")
+        else:
+            if major != 0:
+                bad.append(f"{where} must remain 0.x until proto-014 cuts the v1 contract")
+    return bad
+
 
 # boundaries.md: forbidden Cozy dependencies for cozy-runtime core + the author subpackage.
 DENY_TOKENS = (
@@ -159,6 +211,35 @@ def fence_package_imports() -> list[str]:
                 )
             ):
                 bad.append(f"{rel}: author surface may not import third-party {name}")
+    return bad
+
+
+def fence_author_import_boundary() -> list[str]:
+    """Package-shaped code uses the public author roots, never their implementation files."""
+
+    bad: list[str] = []
+    paths = (
+        *(ROOT / "examples").rglob("*.py"),
+        *(ROOT / "corpus").rglob("*.py"),
+        *(ROOT / "proofs" / "fixtures").rglob("*.py"),
+    )
+    for path in sorted(paths):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                private = [a.name for a in node.names if a.name.startswith("cozy_runtime.author._")]
+            elif isinstance(node, ast.ImportFrom):
+                private = []
+                if (node.module or "").startswith("cozy_runtime.author._"):
+                    private.append(node.module or "")
+                elif node.module == "cozy_runtime.author":
+                    private.extend(a.name for a in node.names if a.name.startswith("_"))
+            else:
+                continue
+            for name in private:
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: package-shaped code imports "
+                    f"private author module/name {name!r}"
+                )
     return bad
 
 
@@ -1393,6 +1474,7 @@ def fence_typed_model_binding() -> list[str]:
 
 
 FENCES = {
+    "prelaunch-version": fence_prelaunch_version,
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
     "descriptor-minimality": fence_descriptor_minimality,
@@ -1402,6 +1484,7 @@ FENCES = {
     "base-ownership-vectors": fence_base_ownership_vectors,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
+    "author-import-boundary": fence_author_import_boundary,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,
     "no-interactive": fence_no_interactive,

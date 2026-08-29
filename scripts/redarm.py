@@ -40,6 +40,16 @@ class OmissionArm:
 
 
 STATIC_ARMS = (
+    Arm(
+        "prelaunch-version",
+        SRC / "__init__.py",
+        '__version__ = "1.0.0"\n',
+    ),
+    Arm(
+        "author-import-boundary",
+        ROOT / "examples" / "marco-polo" / "marco_polo_package" / "__init__.py",
+        "from cozy_runtime.author._app import App\n",
+    ),
     Arm("env-authority", SRC / "internal" / "child_env.py", "import os\nS = os.environ.get('X')\n"),
     Arm(
         "construction-fill-order",
@@ -803,6 +813,7 @@ def second(payload: In) -> Meta:
 MODEL_PRELUDE = """
 import sys
 sys.path.insert(0, 'proofs/fixtures/tiny-models')
+sys.path.insert(0, 'proofs/internal')
 from typing import Annotated, Any
 import msgspec
 import tiny_artifacts as art

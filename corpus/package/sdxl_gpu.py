@@ -30,6 +30,7 @@ import msgspec
 from corpus.sdxl_real import SdxlUnetModel
 
 from cozy_runtime.author import (
+    App,
     AssetBound,
     Context,
     ImageAsset,
@@ -38,7 +39,6 @@ from cozy_runtime.author import (
     Telemetry,
     VideoAsset,
 )
-from cozy_runtime.author._app import App
 
 # IMPORT TRIPWIRE (cr-007 red arm, deliberate module-scope side effect). Every process
 # that imports this package records its own pid here. The worker must never appear:
