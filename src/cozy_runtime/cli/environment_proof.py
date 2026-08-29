@@ -174,7 +174,7 @@ def _read_request(path: Path) -> ProofRequest:
         resolved_wheel_set=_existing_file(value["resolved_wheel_set"], "resolved_wheel_set"),
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,
-        python=_existing_file(value["python"], "python"),
+        python=_existing_executable(value["python"]),
         environment_root=environment_root,
     )
 
@@ -197,6 +197,17 @@ def _existing_file(value: object, name: str) -> Path:
         raise _request_error(f"{name} is unreadable: {type(err).__name__}") from err
     if not stat.S_ISREG(info.st_mode):
         raise _request_error(f"{name} is not a regular file")
+    return path
+
+
+def _existing_executable(value: object) -> Path:
+    path = _absolute_path(value, "python")
+    try:
+        target = path.resolve(strict=True)
+    except OSError as err:
+        raise _request_error(f"python is unreadable: {type(err).__name__}") from err
+    if not target.is_file() or not os.access(target, os.X_OK):
+        raise _request_error("python is not an executable file")
     return path
 
 

@@ -141,8 +141,10 @@ def author(
             {
                 "compatibility_profile": profile,
                 "format": "ResolvedWheelSet/3",
-                "lock_digest": digest(b"cr-049-boot-proof-lock"),
+                "overlay_bytes": 0,
                 "platform_target": dict(target),
+                "resolution_lock_digest": digest(b"cr-049-resolution-lock"),
+                "resolution_lock_length": len(b"cr-049-resolution-lock"),
                 "wheelhouse_manifest_digest": digest(wheelhouse),
                 "wheels": [],
             }

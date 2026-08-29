@@ -119,10 +119,12 @@ run_refusal missing 6 wheel_grant_set_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
 run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
+run_refusal overlay-bytes-mismatch 6 resolved_wheel_set_overlay_bytes_mismatch no
 run_refusal oversized-fact 6 bundle_wheel_invalid no
 run_refusal duplicate 6 overlay_wheel_member_invalid no
 run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
+run_refusal build-request 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
 run_refusal resolved-v1 6 resolved_wheel_set_format no

@@ -229,6 +229,39 @@ An overlay contains exactly one project wheel and at most 127 custom wheels. The
 128 total endpoint-owned wheels, counting the project; 128 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
+The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
+`WHEEL` tags, `Root-Is-Purelib`, members, and native magic. A project `.so` or a platform-specific
+project tag refuses. Every dependency wheel remains a separate exact prebuilt subject selected by
+Tensorhub. Runtime accepts no build request and rejects C/C++/CUDA/Rust sources, build manifests,
+headers/objects/static archives, and wheel install schemes that would inject scripts or data. It
+never invokes pip, a resolver, PEP 517, or a compiler.
+
+Ordinary native dependency and custom-extension wheels keep the semantic Python/ABI/platform,
+`abi3`, marker, manylinux-floor, digest, ZIP, RECORD, and ownership checks. Before native bytes are
+published, `internal/native_wheel.py` parses bounded ELF64 metadata and refuses a wrong machine,
+hostile or escaping RPATH/RUNPATH, invalid `DT_NEEDED`, and any bundled library that shadows the
+selected base's Torch, Triton, CUDA, cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSolver, NCCL, or other NVIDIA
+families. CUDA-bearing ELF requires bounded `cuobjdump` cubin/PTX inventory; unavailable tooling is
+a refusal, not an omitted proof. The hardware qualification seat then joins that evidence to the
+actual loader inventory and SM and runs the registered no-argument operator fixture in a separate
+process. Missing libraries/symbols, wrong SM/PTX, `no kernel image`, timeout, oversized output, and
+result-digest mismatch are named refusals. Tensorhub's networkless VM/cgroup remains the isolation
+authority; Runtime additionally applies CPU/address-space/file/descriptor bounds and kills the
+whole fixture process group.
+
+PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation, but those
+keys are never treated as a same-UID security boundary. Runtime scopes cache reuse by unpredictable
+worker boot plus exact overlay content, then imposes `TORCHINDUCTOR_CACHE_DIR`,
+`TRITON_CACHE_DIR`, `TORCH_EXTENSIONS_DIR`, and `CUDA_CACHE_PATH` before executor import. A respawn
+within that pod can retain its warm compiler cache; the whole pod scope is deleted after worker
+shutdown has proven the executor tree gone. Tensorhub's public placement law supplies one public
+trust domain per pod. Private renter cross-org stacking retains its explicitly documented same-UID
+risk—Runtime does not relabel worker boot identity as tenant isolation. Cache bytes stay node-local,
+never enter an overlay receipt/content identity, and are never published as release artifacts. OCI and
+managed-local realizations consume this same overlay path; their distinct realization provenance
+belongs to Tensorhub/Creator qualification evidence, while the portable receipt remains the exact
+WheelhouseManifest/project/custom-wheel join.
+
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control
 convergence lane starts endpoint and model acquisition together. As soon as endpoint overlay and
@@ -280,6 +313,34 @@ set is closed; every path value is a normalized absolute local path:
   "environment_root": "/proof/fresh-environment"
 }
 ```
+
+An overlay containing native custom-wheel bytes must additionally pass
+`cozy-native-wheel-proof REQUEST.json EVIDENCE.json` on every claimed hardware class. The request
+does not carry a caller-asserted OCI or managed-local realization identity: Runtime cannot measure
+an OCI manifest, and echoing one is not proof. Tensorhub joins Runtime's measured evidence to
+provider OCI readback; Creator independently validates and hash-binds its ManagedBaseReceipt.
+
+```json
+{
+  "format": "cozy.runtime.NativeWheelProofRequest/1",
+  "device_index": 0,
+  "endpoint_environment_spec_digest": "sha256:<64 lowercase hex>",
+  "environment_root": "/proof/installed-environment",
+  "installed_environment_receipt_digest": "sha256:<64 lowercase hex>",
+  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
+  "python": "/opt/conda/bin/python",
+  "fixture": "qualified_fixture:run",
+  "expected_result_digest": "sha256:<64 lowercase hex>"
+}
+```
+
+Runtime asks both its running proof interpreter and the selected `python` to report the actual
+CPython ABI, OS/CPU, glibc, complete installed distribution/version set, Torch release and CUDA
+build. It requires both reports to be identical and to satisfy the exact WheelhouseManifest using
+minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM are measured through
+`nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
+immutable `NativeWheelQualification/1` output binds these measurements to the WHM, environment
+spec, installed receipt and overlay content digests, but carries no unmeasured realization claim.
 
 The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:

@@ -21,6 +21,7 @@ cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-materialize-launch = "cozy_runtime.cli.materialize_launch:main"
 cozy-environment-proof = "cozy_runtime.cli.environment_proof:main"
 cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
+cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 
 [build-system]
 requires = ["hatchling"]

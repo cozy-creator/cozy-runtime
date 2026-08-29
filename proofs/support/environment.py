@@ -183,6 +183,23 @@ def _prepare(args: argparse.Namespace) -> None:
     )
     _request(root, "renamed", renamed, root / "environment-renamed", args.python)
 
+    overlay_bytes_mismatch = _release(
+        inputs / "overlay-bytes-mismatch",
+        _target(),
+        project,
+        (resolved,),
+        base_wheels,
+        normal_paths,
+        overlay_bytes_override=resolved.length + 1,
+    )
+    _request(
+        root,
+        "overlay-bytes-mismatch",
+        overlay_bytes_mismatch,
+        root / "environment-overlay-bytes-mismatch",
+        args.python,
+    )
+
     oversized_fact = _release(
         inputs / "oversized-fact",
         _target(),
@@ -258,6 +275,15 @@ def _prepare(args: argparse.Namespace) -> None:
         "forbidden",
         forbidden,
         root / "environment-forbidden",
+        args.python,
+    )
+    build_request = dict(normal)
+    build_request["source_path"] = str(root / "untrusted-source")
+    _request(
+        root,
+        "build-request",
+        build_request,
+        root / "environment-build-request",
         args.python,
     )
 
@@ -352,6 +378,7 @@ def _release(
     *,
     import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
     resolved_format: str = "ResolvedWheelSet/3",
+    overlay_bytes_override: int | None = None,
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
@@ -383,8 +410,14 @@ def _release(
         {
             "compatibility_profile": profile,
             "format": resolved_format,
-            "lock_digest": _digest(b"proof-lock"),
+            "overlay_bytes": (
+                sum(wheel.length for wheel in resolved_wheels)
+                if overlay_bytes_override is None
+                else overlay_bytes_override
+            ),
             "platform_target": dict(target),
+            "resolution_lock_digest": _digest(b"proof-resolution-lock"),
+            "resolution_lock_length": len(b"proof-resolution-lock"),
             "wheelhouse_manifest_digest": _digest(wheelhouse),
             "wheels": resolved_rows,
         }
