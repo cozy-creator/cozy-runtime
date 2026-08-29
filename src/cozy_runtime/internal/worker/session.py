@@ -1589,7 +1589,10 @@ class Worker:
                 else pb.WorkerPhase.WORKER_PHASE_ONLINE,
                 f"posture {pb.Posture.Name(desired.posture)}",
             )
-        self.fence.wire_minor = desired.wire_minor
+        # Minor skew is additive compatibility, not an equality gate. Never report a
+        # RecordOwner's future minor as if this worker had applied capabilities it does not
+        # implement; an older owner's lower minor remains visible as the effective level.
+        self.fence.wire_minor = min(WIRE_MINOR, desired.wire_minor)
         self.accepted.drain_grace_ms = desired.drain_grace_ms
         self.accepted.mode = "serving" if mode == "placement_set" else mode
         self.latched = ""  # a NEW revision un-latches: the latch is per desired revision

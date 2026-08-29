@@ -42,6 +42,7 @@ from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.grants import Authorizer, GrantRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -267,6 +268,36 @@ def prove_delivery_activation(root: Path) -> None:
     assert broken.placement.serving == pb.ServingState.SERVING_STATE_OFFLINE
     assert broken.latched == "activation_exception"
     assert broken.engine.faults[-1].reason == "activation_exception"
+
+
+def prove_wire_minor_compatibility(root: Path) -> None:
+    """Both additive-skew directions converge on the lower implemented minor."""
+
+    for name, advertised, effective in (
+        ("older-owner", WIRE_MINOR - 1, WIRE_MINOR - 1),
+        ("newer-owner", WIRE_MINOR + 1, WIRE_MINOR),
+    ):
+        worker, _ = policy_worker(root / name, environment_root=None, no_warm=True)
+        worker.supervision.current = None
+        generation, _ = worker.accept_claim(
+            pb.Claim(
+                record_owner_epoch=1,
+                record_owner_id=name,
+                wire_minor=advertised,
+            ),
+            lambda _frame: None,
+        )
+        assert generation != 0
+        assert worker.fence.wire_minor == effective
+        worker._apply_desired_state(
+            pb.DesiredWorkerState(
+                revision=8,
+                posture=pb.Posture.POSTURE_ACCEPTING,
+                wire_minor=advertised,
+            )
+        )
+        assert worker.fence.wire_minor == effective
+        assert worker.observed_state().applied_wire_minor == effective
 
 
 def prove_backend_version(root: Path) -> None:
@@ -510,6 +541,7 @@ def main() -> int:
         # keeps the existing opt-in behavior and may still choose to run its warm pass.
         assert WorkerOptions(root / "local-worker").no_warm is False
         prove_worker_warm_policy(root / "worker-policy")
+        prove_wire_minor_compatibility(root / "wire-minor")
         prove_delivery_activation(root / "delivery-activation")
         prove_backend_version(root / "backend-version")
         prove_installed_backend_authority(root / "installed-backend")

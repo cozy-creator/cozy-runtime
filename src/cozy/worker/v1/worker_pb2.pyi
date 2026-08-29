@@ -117,7 +117,6 @@ class ClaimRejection(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLAIM_REJECTION_EPOCH_HELD: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_WORKER_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_RELEASE_ID_MISMATCH: _ClassVar[ClaimRejection]
-    CLAIM_REJECTION_UNSUPPORTED_MINOR: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_UNDURABLE: _ClassVar[ClaimRejection]
 
 class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
@@ -253,7 +252,6 @@ CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH: ClaimRejection
 CLAIM_REJECTION_EPOCH_HELD: ClaimRejection
 CLAIM_REJECTION_WORKER_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_RELEASE_ID_MISMATCH: ClaimRejection
-CLAIM_REJECTION_UNSUPPORTED_MINOR: ClaimRejection
 CLAIM_REJECTION_UNDURABLE: ClaimRejection
 FAULT_KIND_UNSPECIFIED: FaultKind
 FAULT_KIND_BINDING_UNAVAILABLE: FaultKind
