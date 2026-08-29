@@ -27,11 +27,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TypedDict
+from typing import Protocol, TypedDict
+
+from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical
 
 EVIDENCE_FORMAT = "cozy.runtime.NativeWheelInspection/1"
+HOST_EVIDENCE_FORMAT = "cozy.runtime.NativeHostQualification/1"
 OPERATOR_EVIDENCE_FORMAT = "cozy.runtime.NativeOperatorObservation/1"
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
@@ -39,6 +42,18 @@ MAX_STRING_TABLE_BYTES = 64 << 20
 MAX_SYMBOLS = 2_000_000
 MAX_HOST_LIBRARIES = 200_000
 MAX_TOOL_OUTPUT = 4 << 20
+_SEAT_FIELDS = {
+    "cuda_available",
+    "distributions",
+    "implementation",
+    "libc_name",
+    "libc_version",
+    "machine",
+    "python_abi",
+    "system",
+    "torch_cuda",
+    "torch_version",
+}
 
 _ELF_MAGIC = b"\x7fELF"
 _ELF64_HEADER = struct.Struct("<16sHHIQQQIHHHHHH")
@@ -72,6 +87,23 @@ class GPUObservation(TypedDict):
     driver_version: str
     name: str
     sm: int
+
+
+class BaseSeat(Protocol):
+    @property
+    def compatibility_profile(self) -> tuple[tuple[str, str], ...]: ...
+
+    @property
+    def platform_target(self) -> tuple[tuple[str, str], ...]: ...
+
+    @property
+    def base_distributions(self) -> tuple[tuple[str, str], ...]: ...
+
+    @property
+    def minimum_cuda_version(self) -> str: ...
+
+    @property
+    def minimum_driver_version(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,15 +499,153 @@ def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, obj
                 "overlay_native_gpu_unsupported",
                 f"sm_{gpu_sm}: no matching cubin or forward PTX in {','.join(unsupported)}",
             )
-    evidence = inspection.document()
-    evidence.update(
-        {
-            "gpu_sm": gpu_sm,
-            "host_library_count": len(visited),
-            "qualification": "static-host-compatible",
-        }
-    )
-    return evidence
+    return {
+        "format": HOST_EVIDENCE_FORMAT,
+        "gpu_sm": gpu_sm,
+        "host_library_count": len(visited),
+        "inspection_digest": canonical.digest(inspection.document()),
+        "qualification": "static-host-compatible",
+    }
+
+
+def observe_seat(python: Path, environment: Mapping[str, str]) -> dict[str, object]:
+    """Ask the selected base interpreter to report its actual installed/runtime facts."""
+
+    try:
+        result = subprocess.run(
+            [str(python), "-I", "-m", "cozy_runtime.internal.native_seat_probe"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=dict(environment),
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeWheelRefusal("overlay_native_seat_probe_failed", type(exc).__name__) from exc
+    if (
+        result.returncode != 0
+        or len(result.stdout) > MAX_TOOL_OUTPUT
+        or len(result.stderr) > MAX_TOOL_OUTPUT
+    ):
+        detail = result.stderr.decode("utf-8", "replace").strip()[:1000]
+        raise NativeWheelRefusal(
+            "overlay_native_seat_probe_failed", detail or f"exit {result.returncode}"
+        )
+    try:
+        value = canonical.parse_canonical(result.stdout)
+    except canonical.CanonicalError as exc:
+        raise NativeWheelRefusal("overlay_native_seat_probe_invalid", str(exc)) from exc
+    if not isinstance(value, dict) or set(value) != _SEAT_FIELDS:
+        raise NativeWheelRefusal("overlay_native_seat_probe_invalid", "wrong fields")
+    return value
+
+
+def verify_seat(
+    base: BaseSeat,
+    observation: Mapping[str, object],
+    *,
+    gpu: GPUObservation | None,
+) -> dict[str, object]:
+    """Verify measured interpreter/OS/libc/Torch/CUDA/driver facts against one WHM."""
+
+    profile = dict(base.compatibility_profile)
+    target = dict(base.platform_target)
+    if observation.get("implementation") != "cpython" or observation.get(
+        "python_abi"
+    ) != target.get("python_abi"):
+        raise NativeWheelRefusal(
+            "overlay_native_python_abi_mismatch",
+            f"measured={observation.get('implementation')}:{observation.get('python_abi')} "
+            f"required=cpython:{target.get('python_abi')}",
+        )
+    machine = observation.get("machine")
+    measured_arch = "linux/amd64" if machine in {"amd64", "x86_64"} else ""
+    if observation.get("system") != "linux" or measured_arch != target.get("os_arch"):
+        raise NativeWheelRefusal(
+            "overlay_native_os_cpu_mismatch",
+            f"measured={observation.get('system')}/{machine} required={target.get('os_arch')}",
+        )
+    libc_match = re.fullmatch(r"glibc([0-9]+\.[0-9]+)", str(target.get("libc", "")))
+    if observation.get("libc_name") != "glibc" or libc_match is None:
+        raise NativeWheelRefusal(
+            "overlay_native_libc_mismatch",
+            f"measured={observation.get('libc_name')}{observation.get('libc_version')} "
+            f"required={target.get('libc')}",
+        )
+    try:
+        libc_ok = Version(str(observation.get("libc_version", ""))) >= Version(libc_match.group(1))
+    except InvalidVersion as exc:
+        raise NativeWheelRefusal("overlay_native_libc_mismatch", str(exc)) from exc
+    if not libc_ok:
+        raise NativeWheelRefusal(
+            "overlay_native_libc_mismatch",
+            f"measured=glibc{observation.get('libc_version')} minimum={target.get('libc')}",
+        )
+    rows = observation.get("distributions")
+    measured_distributions: list[tuple[str, str]] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"distribution", "version"}:
+                raise NativeWheelRefusal(
+                    "overlay_native_base_inventory_mismatch", "invalid measured distribution row"
+                )
+            name, version = row["distribution"], row["version"]
+            if not isinstance(name, str) or not isinstance(version, str):
+                raise NativeWheelRefusal(
+                    "overlay_native_base_inventory_mismatch", "invalid measured distribution"
+                )
+            measured_distributions.append((name, version))
+    if tuple(measured_distributions) != base.base_distributions:
+        raise NativeWheelRefusal(
+            "overlay_native_base_inventory_mismatch",
+            f"measured={len(measured_distributions)} required={len(base.base_distributions)}",
+        )
+    torch_version = str(observation.get("torch_version", ""))
+    try:
+        torch_release_ok = (
+            Version(torch_version).release[:3] == Version(profile["torch_release"]).release[:3]
+        )
+    except InvalidVersion as exc:
+        raise NativeWheelRefusal("overlay_native_torch_mismatch", torch_version) from exc
+    if not torch_release_ok:
+        raise NativeWheelRefusal(
+            "overlay_native_torch_mismatch",
+            f"measured={torch_version} required={profile['torch_release']}",
+        )
+    build = profile["accelerator_build"]
+    torch_cuda = str(observation.get("torch_cuda", ""))
+    if build == "none":
+        if torch_cuda or gpu is not None:
+            raise NativeWheelRefusal(
+                "overlay_native_accelerator_mismatch",
+                f"CPU profile measured torch_cuda={torch_cuda!r} gpu={gpu is not None}",
+            )
+    else:
+        required_cuda = {"cu126": "12.6", "cu130": "13.0"}.get(build)
+        if required_cuda is None:
+            raise NativeWheelRefusal("overlay_native_accelerator_mismatch", build)
+        if (
+            torch_cuda != required_cuda
+            or not bool(observation.get("cuda_available"))
+            or gpu is None
+        ):
+            raise NativeWheelRefusal(
+                "overlay_native_accelerator_mismatch",
+                f"measured torch_cuda={torch_cuda!r} available="
+                f"{observation.get('cuda_available')} gpu={gpu is not None}; "
+                f"required={required_cuda}",
+            )
+        if Version(torch_cuda) < Version(base.minimum_cuda_version):
+            raise NativeWheelRefusal(
+                "overlay_native_cuda_minimum_mismatch",
+                f"measured={torch_cuda} minimum={base.minimum_cuda_version}",
+            )
+        if Version(gpu["driver_version"]) < Version(base.minimum_driver_version):
+            raise NativeWheelRefusal(
+                "overlay_native_driver_minimum_mismatch",
+                f"measured={gpu['driver_version']} minimum={base.minimum_driver_version}",
+            )
+    return dict(observation)
 
 
 def qualify_operator(

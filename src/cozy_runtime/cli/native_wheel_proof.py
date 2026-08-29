@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import platform
 import re
 import stat
 import sys
@@ -15,15 +14,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, config, jit_cache, native_wheel, overlay, spawn
+from cozy_runtime.internal import (
+    canonical,
+    config,
+    jit_cache,
+    native_wheel,
+    overlay,
+    spawn,
+)
 from cozy_runtime.internal.exits import Exit
 
 REQUEST_FORMAT = "cozy.runtime.NativeWheelProofRequest/1"
 EVIDENCE_FORMAT = "cozy.runtime.NativeWheelQualification/1"
 REQUEST_FIELDS = {
-    "base_realization_digest",
-    "base_realization_kind",
-    "base_worker_profile",
     "device_index",
     "endpoint_environment_spec_digest",
     "environment_root",
@@ -34,14 +37,10 @@ REQUEST_FIELDS = {
     "python",
     "wheelhouse_manifest",
 }
-_PROFILE = re.compile(r"^torch[0-9]+\.[0-9]+\.[0-9]+-[a-z0-9]+-cp[0-9]+-linux-x86$")
 
 
 @dataclass(frozen=True, slots=True)
 class Request:
-    base_realization_digest: str
-    base_realization_kind: str
-    base_worker_profile: str
     device_index: int | None
     environment_spec_digest: str
     environment_root: Path
@@ -64,12 +63,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_raw = _bounded_bytes(request.wheelhouse_manifest, "wheelhouse_manifest")
         base_digest = _digest(base_raw)
         base = overlay.parse_base_manifest(base_raw, base_digest)
-        expected_profile = _profile_id(base)
-        if request.base_worker_profile != expected_profile:
-            raise native_wheel.NativeWheelRefusal(
-                "overlay_native_base_profile_mismatch",
-                f"request={request.base_worker_profile} manifest={expected_profile}",
-            )
         installed = overlay.open_generation(
             request.environment_root,
             receipt_digest=request.installed_receipt_digest,
@@ -78,46 +71,64 @@ def main(argv: Sequence[str] | None = None) -> int:
             python=request.python,
         )
         inspection = native_wheel.inspect_installed(installed.import_root)
+        runtime_config = config.read_config()
+        base_environment = spawn.seal(runtime_config.child_base_env, {})
+        selected_seat = native_wheel.observe_seat(request.python, base_environment)
+        running_seat = native_wheel.observe_seat(Path(sys.executable), base_environment)
         gpu = (
             native_wheel.observe_gpu(request.device_index)
             if request.device_index is not None
             else None
         )
         gpu_sm = gpu["sm"] if gpu is not None else None
+        native_wheel.verify_seat(base, running_seat, gpu=gpu)
+        native_wheel.verify_seat(base, selected_seat, gpu=gpu)
+        if canonical.digest(running_seat) != canonical.digest(selected_seat):
+            raise native_wheel.NativeWheelRefusal(
+                "overlay_native_python_seat_mismatch",
+                "proof executable and requested base Python report different seats",
+            )
         host = native_wheel.qualify_host(inspection, gpu_sm=gpu_sm)
-        runtime_config = config.read_config()
+        proof_pod_scope = f"native-proof-{uuid.uuid4().hex}"
         try:
-            jit_environment = jit_cache.scope(runtime_config.cozy_home, installed.content_digest)
+            cache_scope = jit_cache.scope(
+                runtime_config.cozy_home,
+                installed.content_digest,
+                pod_scope=proof_pod_scope,
+            )
         except jit_cache.JITCacheRefusal as exc:
             raise native_wheel.NativeWheelRefusal(
                 "overlay_native_jit_cache_invalid", str(exc)
             ) from exc
         imposed = {
-            **jit_environment,
+            **cache_scope.environment,
             "OMP_NUM_THREADS": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "",
         }
         if request.device_index is not None:
             imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
-        operator = native_wheel.qualify_operator(
-            python=request.python,
-            overlay=installed.import_root,
-            fixture=request.fixture,
-            expected_result_digest=request.expected_result_digest,
-            environment=spawn.seal(runtime_config.child_base_env, imposed),
-        )
+        try:
+            operator = native_wheel.qualify_operator(
+                python=request.python,
+                overlay=installed.import_root,
+                fixture=request.fixture,
+                expected_result_digest=request.expected_result_digest,
+                environment=spawn.seal(runtime_config.child_base_env, imposed),
+            )
+        finally:
+            try:
+                jit_cache.remove_pod(runtime_config.cozy_home, proof_pod_scope)
+            except jit_cache.JITCacheRefusal as exc:
+                raise native_wheel.NativeWheelRefusal(
+                    "overlay_native_jit_cache_invalid", str(exc)
+                ) from exc
         evidence = {
-            "base_realization_digest": request.base_realization_digest,
-            "base_realization_kind": request.base_realization_kind,
-            "base_worker_profile": request.base_worker_profile,
+            "base_worker_profile": _profile_id(base),
             "endpoint_environment_spec_digest": request.environment_spec_digest,
             "format": EVIDENCE_FORMAT,
             "host_capability": {
                 "gpu": gpu,
-                "libc": _libc(),
-                "machine": platform.machine().lower(),
-                "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-                "system": platform.system().lower(),
+                "seat": running_seat,
             },
             "host_qualification": host,
             "installed_environment_receipt_digest": request.installed_receipt_digest,
@@ -171,7 +182,6 @@ def _request(path: Path) -> Request:
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise _error("request fields are not closed")
     digests = (
-        "base_realization_digest",
         "endpoint_environment_spec_digest",
         "expected_result_digest",
         "installed_environment_receipt_digest",
@@ -181,23 +191,15 @@ def _request(path: Path) -> Request:
         for name in digests
     ):
         raise _error("request format or digest")
-    if value["base_realization_kind"] not in {"oci", "managed-local"}:
-        raise _error("base_realization_kind")
-    profile = value["base_worker_profile"]
     fixture = value["fixture"]
     device = value["device_index"]
     if (
-        not isinstance(profile, str)
-        or _PROFILE.fullmatch(profile) is None
-        or not isinstance(fixture, str)
+        not isinstance(fixture, str)
         or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*", fixture) is None
         or not (device is None or (isinstance(device, int) and not isinstance(device, bool)))
     ):
-        raise _error("profile, fixture, or device")
+        raise _error("fixture or device")
     return Request(
-        str(value["base_realization_digest"]),
-        str(value["base_realization_kind"]),
-        profile,
         device,
         str(value["endpoint_environment_spec_digest"]),
         _existing_directory(_absolute(value["environment_root"], "environment_root")),
@@ -218,11 +220,6 @@ def _profile_id(base: overlay.BaseManifest) -> str:
         f"torch{profile['torch_release']}-{profile['accelerator_build']}-"
         f"{profile['python_abi']}-{profile['os_cpu']}"
     )
-
-
-def _libc() -> str:
-    name, version = platform.libc_ver()
-    return f"{name}{version}" if name and version else "unknown"
 
 
 def _absolute(value: object, name: str) -> Path:

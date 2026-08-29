@@ -1045,6 +1045,7 @@ DOCUMENT_KINDS = {
     "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
     "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
     "cozy.runtime.NativeOperatorObservation/1": "internal/native_wheel.py",
+    "cozy.runtime.NativeHostQualification/1": "internal/native_wheel.py",
     "cozy.runtime.NativeWheelProofRequest/1": "cli/native_wheel_proof.py",
     "cozy.runtime.NativeWheelQualification/1": "cli/native_wheel_proof.py",
     "cozy.runtime.NativeWheelInspection/1": "internal/native_wheel.py",

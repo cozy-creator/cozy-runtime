@@ -835,6 +835,15 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                     "overlay_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
+            if native_members and any(
+                tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
+                for tag in declared_tags
+            ):
+                raise OverlayRefusal(
+                    "overlay_native_wheel_tag_not_concrete",
+                    f"{wheel.filename}: native custom wheels require concrete CPython ABI and "
+                    "platform tags",
+                )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:
                 raise OverlayRefusal("overlay_wheel_record_missing", wheel.filename)

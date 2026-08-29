@@ -25,6 +25,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -236,6 +237,7 @@ class ExecutorSupervision:
         cozy_home: Path,
         executor_uid: int = -1,
         executor_gid: int = -1,
+        jit_pod_scope: str = "",
         scratch_root: Path | None = None,
         device_process: Callable[[int], accel.ProcessMemory] | None = None,
     ) -> None:
@@ -243,12 +245,14 @@ class ExecutorSupervision:
         self.python = python
         self.overlay = ""
         """The endpoint-only import root appended after image-owned packages."""
+        self.overlay_content_digest = ""
         self.jit_cache = ""
-        """Node-local mutable upstream compiler cache, scoped by exact overlay content."""
+        """One worker-boot/content cache path, deleted after worker shutdown."""
         self.base_env = base_env
         self.cozy_home = cozy_home
         self.executor_uid = executor_uid
         self.executor_gid = executor_gid
+        self.jit_pod_scope = jit_pod_scope or f"local-{secrets.token_hex(16)}"
         self.scratch_root = scratch_root
         self.root.mkdir(parents=True, exist_ok=True)
         if self.isolated:
@@ -620,26 +624,39 @@ class ExecutorSupervision:
 
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
             raise ExecutorGone(f"invalid endpoint content digest for JIT cache: {content_digest!r}")
-        jit_cache = str(self.cozy_home / "jit-cache" / content_digest.removeprefix("sha256:"))
-        if (self.python, self.overlay, self.jit_cache) == (python, overlay, jit_cache):
+        if (self.python, self.overlay, self.overlay_content_digest) == (
+            python,
+            overlay,
+            content_digest,
+        ):
             return False
         self.python = python
         self.overlay = overlay
-        self.jit_cache = jit_cache
+        self.overlay_content_digest = content_digest
         return True
 
     def _prepare_jit_cache(self) -> dict[str, str]:
-        """Create one endpoint/base-scoped mutable cache without publishing its bytes."""
+        """Create/reuse one worker-boot/content cache without publishing its bytes."""
 
-        if not self.jit_cache:
+        if not self.overlay_content_digest:
             return {}
         try:
-            return jit_cache.scope(
+            prepared = jit_cache.scope(
                 self.cozy_home,
-                "sha256:" + Path(self.jit_cache).name,
+                self.overlay_content_digest,
+                pod_scope=self.jit_pod_scope,
                 uid=self.executor_uid,
                 gid=self.executor_gid,
             )
+            self.jit_cache = str(prepared.root)
+            return prepared.environment
+        except jit_cache.JITCacheRefusal as exc:
+            raise ExecutorGone(str(exc)) from exc
+
+    def _clear_jit_pod(self) -> None:
+        try:
+            jit_cache.remove_pod(self.cozy_home, self.jit_pod_scope)
+            self.jit_cache = ""
         except jit_cache.JITCacheRefusal as exc:
             raise ExecutorGone(str(exc)) from exc
 
@@ -669,16 +686,6 @@ class ExecutorSupervision:
             self.incarnation += 1
         self._prepare_generation_scratch()
         self.spawns += 1
-        imposed = {
-            **imposed,
-            **self._prepare_jit_cache(),
-            # Backend-mandated laws come from the accelerator boundary (#450): on MPS this
-            # forces PYTORCH_ENABLE_MPS_FALLBACK=0; on CUDA it is empty. The FAMILY is a
-            # cheap platform fact (present-but-unqualified, #446).
-            **accel.child_env_law(accel.host_backend_family()),
-            "COZY_EXECUTOR_SOCKET": self.socket_path,
-            "COZY_HOME": str(self.cozy_home),
-        }
         started = time.perf_counter()
         spawned: spawn.Spawned | None = None
         process: proctree.ProcessIdentity | None = None
@@ -686,6 +693,16 @@ class ExecutorSupervision:
         conn: socket.socket | None = None
         exit_published: threading.Event | None = None
         try:
+            imposed = {
+                **imposed,
+                **self._prepare_jit_cache(),
+                # Backend-mandated laws come from the accelerator boundary (#450): on MPS this
+                # forces PYTORCH_ENABLE_MPS_FALLBACK=0; on CUDA it is empty. The FAMILY is a
+                # cheap platform fact (present-but-unqualified, #446).
+                **accel.child_env_law(accel.host_backend_family()),
+                "COZY_EXECUTOR_SOCKET": self.socket_path,
+                "COZY_HOME": str(self.cozy_home),
+            }
             try:
                 owner = OwnerRecord(
                     proctree.create_executor_scope(
@@ -1110,6 +1127,7 @@ class ExecutorSupervision:
                 self._retire_locked(executor, "worker shutdown")
             else:
                 self._sweep_orphans_locked("worker shutdown")
+            self._clear_jit_pod()
             if self._listener is not None:
                 self._listener.close()
                 Path(self.socket_path).unlink(missing_ok=True)

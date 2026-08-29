@@ -16,9 +16,10 @@ import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
-from cozy_runtime.internal import canonical, child_env, native_wheel, overlay
+from cozy_runtime.internal import canonical, child_env, jit_cache, native_wheel, overlay
 from cozy_runtime.internal.worker import acquire, child
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -104,10 +105,12 @@ def base_manifest(path: Path) -> str:
             "base_distributions": [
                 {"distribution": "base-control", "version": "1.0.0"},
                 {"distribution": "numpy", "version": "2.0.0"},
+                {"distribution": "torch", "version": "2.13.0+cpu"},
             ],
             "base_import_roots": [
                 {"providers": ["base-control"], "root": "base_control"},
                 {"providers": ["numpy"], "root": "numpy"},
+                {"providers": ["torch"], "root": "torch"},
             ],
             "compatibility_profile": {
                 "accelerator_build": "none",
@@ -406,6 +409,26 @@ def main() -> int:
                 ),
             },
         )
+        native_nonconcrete = build_wheel(
+            wheels,
+            "proof-native-nonconcrete",
+            "proof_native_nonconcrete",
+            "native-nonconcrete",
+            owner="custom",
+            root_is_pure=False,
+            extra_entries={"proof_native_nonconcrete/_native.so": native_bytes},
+        )
+        try:
+            overlay.materialize(
+                source("native-nonconcrete", family, project, native_nonconcrete),
+                root / "native-nonconcrete-installed",
+                python=Path(sys.executable),
+                base_manifest=manifest,
+            )
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "overlay_native_wheel_tag_not_concrete", exc.code
+        else:
+            raise AssertionError("py3-none-any native custom wheel was admitted")
         native_installed = overlay.materialize(
             source("native-custom", family, project, native_custom),
             root / "native-custom-installed",
@@ -417,6 +440,163 @@ def main() -> int:
         )
         native_host = native_wheel.qualify_host(native_inspection, gpu_sm=None)
         assert native_host["qualification"] == "static-host-compatible"
+        base = overlay._read_base_manifest(manifest, family)
+        measured_seat: dict[str, Any] = {
+            "cuda_available": False,
+            "distributions": [
+                {"distribution": name, "version": version}
+                for name, version in base.base_distributions
+            ],
+            "implementation": "cpython",
+            "libc_name": "glibc",
+            "libc_version": "2.39",
+            "machine": "x86_64",
+            "python_abi": "cp312",
+            "system": "linux",
+            "torch_cuda": "",
+            "torch_version": "2.13.0+cpu",
+        }
+        native_wheel.verify_seat(base, measured_seat, gpu=None)
+        seat_reds = {
+            "overlay_native_python_abi_mismatch": {**measured_seat, "python_abi": "cp313"},
+            "overlay_native_os_cpu_mismatch": {**measured_seat, "machine": "aarch64"},
+            "overlay_native_libc_mismatch": {**measured_seat, "libc_version": "2.38"},
+            "overlay_native_base_inventory_mismatch": {
+                **measured_seat,
+                "distributions": measured_seat["distributions"][:-1],
+            },
+            "overlay_native_torch_mismatch": {
+                **measured_seat,
+                "torch_version": "2.12.0+cpu",
+            },
+        }
+        for code, bad_seat in seat_reds.items():
+            try:
+                native_wheel.verify_seat(base, bad_seat, gpu=None)
+            except native_wheel.NativeWheelRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"seat mismatch {code} was admitted")
+
+        cuda_distributions = tuple(
+            (name, "2.13.0+cu126" if name == "torch" else version)
+            for name, version in base.base_distributions
+        )
+        cuda_base = replace(
+            base,
+            compatibility_profile=tuple(
+                sorted(
+                    {
+                        "accelerator_build": "cu126",
+                        "os_cpu": "linux-x86",
+                        "python_abi": "cp312",
+                        "torch_release": "2.13.0",
+                    }.items()
+                )
+            ),
+            platform_target=tuple(
+                sorted(
+                    {
+                        "accelerator_abi": "cu126",
+                        "accelerator_backend": "cuda",
+                        "libc": "glibc2.39",
+                        "os_arch": "linux/amd64",
+                        "python_abi": "cp312",
+                    }.items()
+                )
+            ),
+            base_distributions=cuda_distributions,
+        )
+        cuda_seat = {
+            **measured_seat,
+            "cuda_available": True,
+            "distributions": [
+                {"distribution": name, "version": version} for name, version in cuda_distributions
+            ],
+            "torch_cuda": "12.6",
+            "torch_version": "2.13.0+cu126",
+        }
+        cuda_gpu = native_wheel.GPUObservation(
+            device_index=0,
+            driver_version="570.124.06",
+            name="proof GPU",
+            sm=80,
+        )
+        native_wheel.verify_seat(cuda_base, cuda_seat, gpu=cuda_gpu)
+        cuda130_distributions = tuple(
+            (name, "2.13.0+cu130" if name == "torch" else version)
+            for name, version in base.base_distributions
+        )
+        cuda130_base = replace(
+            cuda_base,
+            compatibility_profile=tuple(
+                sorted(
+                    {
+                        "accelerator_build": "cu130",
+                        "os_cpu": "linux-x86",
+                        "python_abi": "cp312",
+                        "torch_release": "2.13.0",
+                    }.items()
+                )
+            ),
+            platform_target=tuple(
+                sorted(
+                    {
+                        "accelerator_abi": "cu130",
+                        "accelerator_backend": "cuda",
+                        "libc": "glibc2.39",
+                        "os_arch": "linux/amd64",
+                        "python_abi": "cp312",
+                    }.items()
+                )
+            ),
+            base_distributions=cuda130_distributions,
+            minimum_cuda_version="13.0",
+            minimum_driver_version="580.126.20",
+        )
+        cuda130_seat = {
+            **cuda_seat,
+            "distributions": [
+                {"distribution": name, "version": version}
+                for name, version in cuda130_distributions
+            ],
+            "torch_cuda": "13.0",
+            "torch_version": "2.13.0+cu130",
+        }
+        cuda130_gpu = native_wheel.GPUObservation(
+            device_index=0,
+            driver_version="580.126.20",
+            name="proof GPU",
+            sm=90,
+        )
+        native_wheel.verify_seat(cuda130_base, cuda130_seat, gpu=cuda130_gpu)
+        cuda_reds = (
+            (
+                "overlay_native_accelerator_mismatch",
+                cuda_base,
+                {**cuda_seat, "torch_cuda": "13.0"},
+                cuda_gpu,
+            ),
+            (
+                "overlay_native_cuda_minimum_mismatch",
+                replace(cuda_base, minimum_cuda_version="12.7"),
+                cuda_seat,
+                cuda_gpu,
+            ),
+            (
+                "overlay_native_driver_minimum_mismatch",
+                replace(cuda_base, minimum_driver_version="580.126.20"),
+                cuda_seat,
+                cuda_gpu,
+            ),
+        )
+        for code, bad_base, bad_seat, bad_gpu in cuda_reds:
+            try:
+                native_wheel.verify_seat(bad_base, bad_seat, gpu=bad_gpu)
+            except native_wheel.NativeWheelRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"CUDA seat mismatch {code} was admitted")
         operator_evidence = native_wheel.qualify_operator(
             python=Path(sys.executable),
             overlay=native_installed.import_root,
@@ -450,62 +630,45 @@ def main() -> int:
         else:
             raise AssertionError("no-kernel-image operator failure was admitted")
 
-        realization_evidence: list[bytes] = []
         proof_python = Path(sys.prefix) / "bin" / "python"
         assert proof_python.is_file()
-        for realization_kind, realization_digit in (("oci", "a"), ("managed-local", "b")):
-            request_path = root / f"native-request-{realization_kind}.json"
-            evidence_path = root / f"native-evidence-{realization_kind}.json"
-            request_path.write_bytes(
-                canonical.write(
-                    {
-                        "base_realization_digest": "sha256:" + realization_digit * 64,
-                        "base_realization_kind": realization_kind,
-                        "base_worker_profile": "torch2.13.0-none-cp312-linux-x86",
-                        "device_index": None,
-                        "endpoint_environment_spec_digest": digest(b"native-custom"),
-                        "environment_root": str(root / "native-custom-installed"),
-                        "expected_result_digest": canonical.digest({"value": 3}),
-                        "fixture": "proof_native_custom.fixture:run",
-                        "format": "cozy.runtime.NativeWheelProofRequest/1",
-                        "installed_environment_receipt_digest": native_installed.receipt_digest,
-                        "python": str(proof_python),
-                        "wheelhouse_manifest": str(manifest),
-                    }
-                )
+        request_path = root / "native-request-wrong-python.json"
+        evidence_path = root / "native-evidence-wrong-python.json"
+        request_path.write_bytes(
+            canonical.write(
+                {
+                    "device_index": None,
+                    "endpoint_environment_spec_digest": digest(b"native-custom"),
+                    "environment_root": str(root / "native-custom-installed"),
+                    "expected_result_digest": canonical.digest({"value": 3}),
+                    "fixture": "proof_native_custom.fixture:run",
+                    "format": "cozy.runtime.NativeWheelProofRequest/1",
+                    "installed_environment_receipt_digest": native_installed.receipt_digest,
+                    "python": str(proof_python),
+                    "wheelhouse_manifest": str(manifest),
+                }
             )
-            cli_result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "from cozy_runtime.cli.native_wheel_proof import main; "
-                    "raise SystemExit(main())",
-                    str(request_path),
-                    str(evidence_path),
-                ],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                check=False,
-                timeout=60,
-                env={
-                    "COZY_HOME": str(root / f"node-{realization_kind}"),
-                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                },
-            )
-            assert cli_result.returncode == 0, cli_result.stderr.decode()
-            realization_evidence.append(evidence_path.read_bytes())
-        assert realization_evidence[0] != realization_evidence[1]
-        oci_evidence = canonical.parse_canonical(realization_evidence[0])
-        local_evidence = canonical.parse_canonical(realization_evidence[1])
-        assert isinstance(oci_evidence, dict) and isinstance(local_evidence, dict)
-        assert (
-            oci_evidence["installed_environment_receipt_digest"] == native_installed.receipt_digest
         )
-        assert (
-            local_evidence["installed_environment_receipt_digest"]
-            == native_installed.receipt_digest
+        cli_result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from cozy_runtime.cli.native_wheel_proof import main; raise SystemExit(main())",
+                str(request_path),
+                str(evidence_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=60,
+            env={
+                "COZY_HOME": str(root / "node-wrong-python"),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            },
         )
-        assert oci_evidence["overlay_content_digest"] == local_evidence["overlay_content_digest"]
+        assert cli_result.returncode != 0
+        assert b"overlay_native_python_abi_mismatch" in cli_result.stderr
+        assert not evidence_path.exists()
 
         mutable_manifest = root / "mutable-base.json"
         mutable_manifest.write_bytes(manifest.read_bytes() + b" ")
@@ -693,14 +856,49 @@ def main() -> int:
             )
             jit_env = supervision._prepare_jit_cache()
             assert set(jit_env) == {name for name, _directory in child_env.JIT_CACHE_ENV}
-            scope = Path(next(iter(jit_env.values()))).parent
-            assert scope.parent == root / "node-local" / "jit-cache"
-            assert scope.name == cold.content_digest.removeprefix("sha256:")
-            assert all(Path(value).parent == scope for value in jit_env.values())
+            executor_scope = Path(next(iter(jit_env.values()))).parent
+            relative = executor_scope.relative_to(root / "node-local" / "jit-cache")
+            assert len(relative.parts) == 2
+            assert relative.parts[1] == cold.content_digest.removeprefix("sha256:")
+            assert all(Path(value).parent == executor_scope for value in jit_env.values())
             assert all(child_env.erased(name) for name in jit_env)
-            assert not any(path.is_file() for path in scope.rglob("*"))
+            assert not any(path.is_file() for path in executor_scope.rglob("*"))
+            (executor_scope / "poison").write_text("owned only by this lifecycle")
         finally:
             supervision.close()
+        assert not executor_scope.exists()
+
+        tenant_a = jit_cache.scope(
+            root / "tenant-cache",
+            cold.content_digest,
+            pod_scope="pod-a",
+        )
+        tenant_a_warm = jit_cache.scope(
+            root / "tenant-cache",
+            cold.content_digest,
+            pod_scope="pod-a",
+        )
+        tenant_b = jit_cache.scope(
+            root / "tenant-cache",
+            cold.content_digest,
+            pod_scope="pod-b",
+        )
+        try:
+            assert tenant_a.root != tenant_b.root
+            assert tenant_a.root == tenant_a_warm.root
+            assert all(
+                Path(value).is_relative_to(tenant_a.root) for value in tenant_a.environment.values()
+            )
+            assert all(
+                Path(value).is_relative_to(tenant_b.root) for value in tenant_b.environment.values()
+            )
+            (tenant_a.root / "poison").write_text("tenant-a")
+            assert (tenant_a_warm.root / "poison").read_text() == "tenant-a"
+            assert not (tenant_b.root / "poison").exists()
+            assert all(name in tenant_a.environment for name, _directory in child_env.JIT_CACHE_ENV)
+        finally:
+            jit_cache.remove_pod(root / "tenant-cache", "pod-a")
+            jit_cache.remove_pod(root / "tenant-cache", "pod-b")
 
         cache_root = root / "acquisition"
         cache = cache_root / "cache"
@@ -769,7 +967,12 @@ def main() -> int:
                     "platform_specific_project_wheel_refused": True,
                     "node_local_jit_cache_scoped": True,
                     "jit_cache_bytes_unpublished": True,
+                    "jit_cache_worker_shutdown_removed": True,
+                    "jit_cache_pod_scopes_separated": True,
+                    "jit_cache_warm_reuse_within_pod": True,
+                    "jit_cache_defaults_never_used": True,
                     "prebuilt_native_custom_wheel_admitted": True,
+                    "native_custom_without_concrete_tags_refused": True,
                     "hostile_rpath_refused": True,
                     "base_library_shadow_refused": True,
                     "nvidia_base_library_shadows_refused": True,
@@ -779,8 +982,11 @@ def main() -> int:
                     "native_operator_executed": True,
                     "native_operator_numerical_mismatch_refused": True,
                     "native_operator_no_kernel_image_refused": True,
-                    "oci_local_same_overlay_path": True,
-                    "realization_fingerprints_separate": True,
+                    "synthetic_exact_seat_admitted": True,
+                    "actual_cp313_for_cp312_refused": True,
+                    "seat_os_cpu_libc_inventory_torch_reds": True,
+                    "seat_cuda_driver_minimum_reds": True,
+                    "cu126_and_cu130_spelling_verified": True,
                     "mutable_local_base_refused": True,
                     "source_path_injection_erased": True,
                     "killed_materialization_retry_atomic": True,

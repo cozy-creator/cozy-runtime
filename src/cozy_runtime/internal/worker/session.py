@@ -599,6 +599,7 @@ class Worker:
             cozy_home=config.cozy_home,
             executor_uid=options.executor_uid,
             executor_gid=options.executor_gid,
+            jit_pod_scope=self.fence.worker_boot_id,
             scratch_root=self.root.parent / "scratch",
         )
         self.supervision.on_change = self.executor_changed

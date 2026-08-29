@@ -100,9 +100,10 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     *(
         ProjectedVar(
             name,
-            "worker.endpoint_content_digest",
-            "upstream PyTorch/Triton/CUDA owns cache keys and validation; Cozy only scopes "
-            "the mutable cache to one node-local exact base-plus-overlay content identity",
+            "worker.pod_jit_cache_scope",
+            "upstream PyTorch/Triton/CUDA owns cache keys and validation; Cozy scopes mutable "
+            "reuse by worker boot plus exact content and deletes it on worker shutdown. This is "
+            "warm-cache ownership inside the pod's admitted trust domain, not same-UID isolation",
         )
         for name, _directory in JIT_CACHE_ENV
     ),
