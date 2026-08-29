@@ -149,6 +149,23 @@ def _prepare(args: argparse.Namespace) -> None:
         args.python,
     )
 
+    legacy_bundle = _release(
+        inputs / "package-bundle-v2",
+        _target(),
+        project,
+        (resolved,),
+        base_wheels,
+        normal_paths,
+        legacy_bundle=True,
+    )
+    _request(
+        root,
+        "package-bundle-v2",
+        legacy_bundle,
+        root / "environment-package-bundle-v2",
+        args.python,
+    )
+
     missing = dict(normal)
     missing["wheel_files"] = {
         digest: path
@@ -379,6 +396,7 @@ def _release(
     import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
     resolved_format: str = "ResolvedWheelSet/3",
     overlay_bytes_override: int | None = None,
+    legacy_bundle: bool = False,
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
@@ -424,18 +442,22 @@ def _release(
         }
     )
     descriptor = _canonical({"format": "proof.PackageDescriptor/1"})
-    bundle = _canonical(
-        {
-            "package_descriptor": _ref(descriptor),
-            "package_release_id": "proof-release",
-            "format": "tensorhub.package_bundle/2",
-            "project_wheel": _wheel(project, import_roots=True),
-            "resolved_wheel_set": _ref(resolved),
-            "source_archive": _ref(b"proof-source"),
-            "source_lock": _ref(b"proof-lock"),
-            "wheelhouse_manifest": _ref(wheelhouse),
-        }
-    )
+    bundle_fields = {
+        "package_descriptor": _ref(descriptor),
+        "package_release_id": "proof-release",
+        "format": "tensorhub.package_bundle/2" if legacy_bundle else "tensorhub.package_bundle/3",
+        "project_wheel": _wheel(project, import_roots=True),
+        "resolved_wheel_set": _ref(resolved),
+        "wheelhouse_manifest": _ref(wheelhouse),
+    }
+    if legacy_bundle:
+        bundle_fields.update(
+            source_archive=_ref(b"proof-source"),
+            source_lock=_ref(b"proof-lock"),
+        )
+    else:
+        bundle_fields["source_tree"] = _ref(b"proof-source-tree")
+    bundle = _canonical(bundle_fields)
     spec = documents.canonical_bytes(
         pb.PackageEnvironmentSpec(
             compatibility_profile=pb.CompatibilityProfile(**profile),

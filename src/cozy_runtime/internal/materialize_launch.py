@@ -34,7 +34,7 @@ from typing import Any
 from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
-PACKAGE_BUNDLE_FORMAT = "tensorhub.package_bundle/2"
+PACKAGE_BUNDLE_FORMAT = "tensorhub.package_bundle/3"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.PackageEnvironmentSpec/2"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
 MAX_RESOLUTION_LOCK_BYTES = 16 << 20
@@ -552,16 +552,14 @@ def package_overlay_input(
             "format",
             "project_wheel",
             "resolved_wheel_set",
-            "source_archive",
-            "source_lock",
+            "source_tree",
             "wheelhouse_manifest",
         },
         "package_bundle",
     )
     if bundle["format"] != PACKAGE_BUNDLE_FORMAT:
         raise LaunchRefusal("package_bundle_format", str(bundle["format"]))
-    _ref(bundle["source_archive"], "source_archive")
-    _ref(bundle["source_lock"], "source_lock")
+    _ref(bundle["source_tree"], "source_tree")
     _closed(
         resolved,
         {

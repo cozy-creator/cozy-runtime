@@ -3,7 +3,7 @@
 This complete fixture is copied byte-for-byte from Tensorhub PR #102's Go-authored
 `vectors/wheel-contract/` output. Runtime neither recreates its JSON shape nor reserializes it:
 the `base-ownership-vectors` architecture fence verifies the fixed SHA-256 identities, sends the
-exact PackageEnvironmentSpec/2, PackageBundle/2, and ResolvedWheelSet/3 bytes through
+exact PackageEnvironmentSpec/2, PackageBundle/3, and ResolvedWheelSet/3 bytes through
 `package_overlay_input` with the exact foreign wheel files, then materializes those wheel grants
 against Tensorhub's exact 23,930-byte WheelhouseManifest/3 payload.
 
