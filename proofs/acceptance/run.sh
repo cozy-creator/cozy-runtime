@@ -22,8 +22,14 @@ UV_OFFLINE=1 uv pip install --offline --python "$proof_root/driver/bin/python" \
     "$runtime_wheel" "$project_wheel"
 python="$proof_root/driver/bin/python"
 proof="$proof_root/driver/bin/cozy-acceptance-proof"
+runtime="$proof_root/driver/bin/cozy-runtime"
 driver="$repo/proofs/internal/acceptance_observation.py"
-descriptor="$repo/proofs/fixtures/marco-polo-endpoint/endpoint.descriptor.json"
+descriptor="$proof_root/endpoint-descriptor.json"
+(cd / && env -u PYTHONPATH "$runtime" --json \
+    --dir "$repo/proofs/fixtures/marco-polo-endpoint" describe) >"$descriptor"
+(cd / && env -u PYTHONPATH "$runtime" --json \
+    --dir "$repo/proofs/fixtures/marco-polo-endpoint" describe) >"$proof_root/descriptor-replay.json"
+cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH PATH="$PATH" HOME="$proof_root/home" \
     "$python" "$driver" setup "$proof_root" "$project_wheel" "$descriptor")

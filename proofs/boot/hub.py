@@ -160,7 +160,6 @@ def author(
     finally:
         sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
-    evaluated = release.add(canonical({"format": "proof.EvaluatedConfig/1"}), "config")
     # These exact refs prove publication provenance but are deliberately not
     # runtime grant subjects. The executable source payload is project_wheel.
     source_archive = b"cr-049-boot-proof-source"
@@ -170,7 +169,6 @@ def author(
             {
                 "descriptor": ref(descriptor_bytes),
                 "endpoint_release_id": ENDPOINT_RELEASE,
-                "evaluated_config": ref(evaluated),
                 "format": "tensorhub.endpoint_bundle/2",
                 "project_wheel": wheel(project, import_roots=True),
                 "resolved_wheel_set": ref(resolved),

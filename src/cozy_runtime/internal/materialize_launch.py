@@ -549,7 +549,6 @@ def endpoint_overlay_input(
         {
             "descriptor",
             "endpoint_release_id",
-            "evaluated_config",
             "format",
             "project_wheel",
             "resolved_wheel_set",

@@ -114,12 +114,10 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
             "wheels": [],
         }
     )
-    evaluated_raw = canonical.write({"format": "proof.EvaluatedConfig/1"})
     bundle_raw = canonical.write(
         {
             "descriptor": _ref(descriptor_raw),
             "endpoint_release_id": "local/marco@acceptance-1",
-            "evaluated_config": _ref(evaluated_raw),
             "format": "tensorhub.endpoint_bundle/2",
             "project_wheel": wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved_raw),
@@ -203,7 +201,6 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     state = {
         "artifact_store": str(artifact_store),
         "binding_documents": plan_rows,
-        "config_digest": _digest(evaluated_raw),
         "control_runtime_digest": base.digest,
         "descriptor_digest": _digest(descriptor_raw),
         "endpoint_release_id": "local/marco@acceptance-1",
@@ -236,7 +233,6 @@ def _run(root: Path) -> None:
         environment_spec_digest=str(state["environment_spec_digest"]),
         installed_environment_receipt_digest=str(state["installed_environment_receipt_digest"]),
         descriptor_digest=str(state["descriptor_digest"]),
-        config_digest=str(state["config_digest"]),
         environment_root=Path(str(state["environment_root"])),
         wheelhouse_manifest=inputs / "wheelhouse-manifest.json",
     )

@@ -81,10 +81,6 @@ pull flags:
   --timeout <dur>       a deadline for the whole pull; absent means none
   --dry-run             the plan — what would move — without moving it
 
-describe flags:
-  --write-descriptor  commit endpoint.descriptor.json (bare describe is read-only)
-  --check             refuse a stale committed descriptor (exit 13)
-
 serve modes (exactly one):
   --weightless-endpoint <dir>                 stage a local model-free endpoint
   --artifact-store <dir> --artifact-object-set <file>
@@ -99,7 +95,6 @@ global flags:
 """
 
 _VALUE_FLAGS = ("--fields", "--dir")
-_VERB_FLAGS = describe_verb.FLAGS
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = ("run", "job", "fit", "serve", "rm", "pull", "ingest")
@@ -112,7 +107,6 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     directory = "."
     verb: str | None = None
     args: list[str] = []
-    verb_flags: list[str] = []
     unknown: list[str] = []
     rest = list(argv)
     while rest:
@@ -140,8 +134,6 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
                 fields = tuple(f.strip() for f in inline.split(",") if f.strip())
             else:
                 directory = inline
-        elif item in _VERB_FLAGS:
-            verb_flags.append(item)
         elif item.startswith("-") and item != "-":
             unknown.append(item)
         elif verb is None:
@@ -156,26 +148,19 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             Exit.usage,
             next=("cozy-runtime --help",),
         )
-    return verb, args + verb_flags, Options(as_json, full, fields, directory), want_help
+    return verb, args, Options(as_json, full, fields, directory), want_help
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     if verb == "describe":
-        flags = [a for a in args if a in describe_verb.FLAGS]
-        names = [a for a in args if a not in describe_verb.FLAGS]
-        if len(names) > 1:
+        if len(args) > 1:
             raise CliError(
                 "usage",
-                f"describe takes at most one function name, got {len(names)}",
-                "cozy-runtime describe [<function>] [--json|--write-descriptor|--check]",
+                f"describe takes at most one function name, got {len(args)}",
+                "cozy-runtime [--json] [--dir <path>] describe [<function>]",
                 Exit.usage,
             )
-        return describe_verb.run(
-            names[0] if names else None,
-            opts,
-            write="--write-descriptor" in flags,
-            check="--check" in flags,
-        )
+        return describe_verb.run(args[0] if args else None, opts)
     if verb == "version":
         return version_verb.run(config, opts.full)
     if verb == "new":

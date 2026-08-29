@@ -28,6 +28,8 @@ class Result:
     """Free-form compact lines (a schema view), printed after the rows."""
     document: object | None = None
     """A full typed document `--json` emits verbatim instead of the row projection."""
+    canonical_json: bytes | None = None
+    """Exact canonical JSON for a command whose output is itself an identity."""
 
 
 class CliError(Exception):
@@ -61,6 +63,9 @@ def emit(result: Result, opts: Options) -> None:
     if opts.fields:
         rows = tuple(r for r in rows if r[0] in opts.fields)
     nxt = result.next[:2]
+    if opts.json and result.canonical_json is not None:
+        sys.stdout.buffer.write(result.canonical_json + b"\n")
+        return
     if opts.json and result.document is not None:
         # The full typed document IS the result — never a row projection of it, because the
         # byte-identical reproduction contract is over these exact bytes.

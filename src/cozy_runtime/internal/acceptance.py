@@ -699,13 +699,6 @@ def _invocation(
         raise AcceptanceRefusal("acceptance_invocation_invalid", "environment_spec_digest")
     if value.get("payload_digest") != fixture.digest:
         raise AcceptanceRefusal("acceptance_invocation_invalid", "payload_digest")
-    if (
-        value.get("config_digest")
-        != _embedded_ref(
-            environment.bundle.get("evaluated_config"), "bundle.evaluated_config"
-        ).digest
-    ):
-        raise AcceptanceRefusal("acceptance_invocation_invalid", "config_digest")
     serving = value.get("serving")
     if (
         not isinstance(serving, dict)

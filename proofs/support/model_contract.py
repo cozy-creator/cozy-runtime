@@ -157,7 +157,6 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             "descriptor": _ref(descriptor_bytes),
             "endpoint_release_id": "proof-release",
-            "evaluated_config": _ref(config),
             "format": "tensorhub.endpoint_bundle/2",
             "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),

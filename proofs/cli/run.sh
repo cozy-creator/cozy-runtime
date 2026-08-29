@@ -85,20 +85,9 @@ cli describe >"$proof_root/describe.stdout"
 after=$(cd / && env -u PYTHONPATH "$driver_python" "$support" tree "$project")
 test "$before" = "$after"
 
-cli describe --write-descriptor >"$proof_root/write-descriptor.stdout"
-cli describe --check >"$proof_root/check-descriptor.stdout"
-descriptor="$project/endpoint.descriptor.json"
-cp "$descriptor" "$proof_root/descriptor.exact.json"
-
-(cd / && env -u PYTHONPATH "$driver_python" "$support" descriptor-red \
-    "$descriptor" whitespace)
-expect_exit 13 "not the deterministic descriptor encoding" cli describe --check
-cp "$proof_root/descriptor.exact.json" "$descriptor"
-(cd / && env -u PYTHONPATH "$driver_python" "$support" descriptor-red \
-    "$descriptor" key-order)
-expect_exit 13 "not the deterministic descriptor encoding" cli describe --check
-cp "$proof_root/descriptor.exact.json" "$descriptor"
-cli describe --check >/dev/null
+cli --json describe >"$proof_root/descriptor.json"
+cli --json describe >"$proof_root/descriptor-replay.json"
+cmp "$proof_root/descriptor.json" "$proof_root/descriptor-replay.json"
 
 expect_exit 2 "unknown verb 'frobnicate'" cli frobnicate
 expect_exit 2 "unknown flag '--nope'" cli --nope

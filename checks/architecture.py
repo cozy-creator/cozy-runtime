@@ -682,23 +682,28 @@ def fence_base_ownership_vectors() -> list[str]:
             bad.append("cr-027 admitted 128 custom wheels plus the project wheel")
     contract_root = ROOT / "vectors" / "tensorhub-wheel-contract"
     bundle_bytes = (contract_root / "endpoint-bundle.json").read_bytes()
+    wheelhouse_bytes = (contract_root / "base-worker-image-wheelhouse.json").read_bytes()
     environment_bytes = (contract_root / "endpoint-environment-spec.json").read_bytes()
     index_bytes = (contract_root / "fixture-index.json").read_bytes()
     project_bytes = (contract_root / "project-wheel.json").read_bytes()
     resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
     resolution_lock_bytes = (contract_root / "resolution-lock.json").read_bytes()
     exact_contract = {
+        "base-worker-image-wheelhouse.json": (
+            wheelhouse_bytes,
+            "cb6c46c667ba43897c7d3cc5ea26e44484b83d54a47344dfffdd5e2ddb24ffe1",
+        ),
         "endpoint-bundle.json": (
             bundle_bytes,
-            "f95aa077347a5f3fc84c7f9d80b801fe38d121605b8d03fe3c61945afa7e4b8d",
+            "76ddb2ed3c7de4357f5d7c1898fcd328820da67bf6f2dc7ae8758fce64230800",
         ),
         "endpoint-environment-spec.json": (
             environment_bytes,
-            "154d4d77d513596237bde209077bc5761c278f61251d985b3a7470f3eb5c1afa",
+            "1c51b6f924bddee706c196e4b419a8c256bca6dba1b0df19e689a228e4e8b695",
         ),
         "fixture-index.json": (
             index_bytes,
-            "8809d5843a57b99e4bdd1abc4e4accf631c16ba73c694c4b1c53b518eaffc013",
+            "097a2dddb8e4f6908a2c8f65eef67637dccefb1885cf547d18e87571f6efa6e8",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -710,7 +715,7 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "203b86882159262c94f6d72daf38623c11bef576ed6d824118da786403e6aeac",
+            "c402ba85dbf8e943455d2415f6d59e491b07f1ab3b3d885ef073c06eabdbbcb7",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
@@ -747,7 +752,7 @@ def fence_base_ownership_vectors() -> list[str]:
             environment_spec_bytes=environment_bytes,
             endpoint_bundle_bytes=bundle_bytes,
             resolved_wheel_set_bytes=resolved_bytes,
-            wheelhouse_manifest_bytes=raw,
+            wheelhouse_manifest_bytes=wheelhouse_bytes,
             wheel_paths={digest: contract_root / name for digest, name in wheel_files.items()},
         )
     except Exception as exc:
@@ -765,7 +770,7 @@ def fence_base_ownership_vectors() -> list[str]:
                     installed = overlay.materialize(
                         joined,
                         pathlib.Path(temporary),
-                        base_manifest=cross,
+                        base_manifest=contract_root / "base-worker-image-wheelhouse.json",
                         python=pathlib.Path(sys.executable),
                     )
                     if not installed.generation.is_dir():
@@ -951,20 +956,27 @@ def fence_reviewed_specs_exist() -> list[str]:
 
 
 def fence_descriptor_minimality() -> list[str]:
-    """The committed example carries only the descriptor/1 facts with real readers."""
-    path = ROOT / "examples" / "endpoint.descriptor.json"
+    """Two fresh derivations produce one closed, compact descriptor/1 document."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import descriptor
+    from cozy_runtime.internal.discovery import discover
+
     try:
-        document = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as exc:
-        return [f"{path.relative_to(ROOT)} is not a readable descriptor: {exc}"]
+        first = descriptor.build(discover(ROOT / "examples"))
+        second = descriptor.build(discover(ROOT / "examples"))
+        first_bytes = descriptor.canonical_bytes(first)
+        second_bytes = descriptor.canonical_bytes(second)
+        document = descriptor.read_bytes(first_bytes, "fresh example derivation")
+    except Exception as exc:
+        return [f"the fresh example descriptor is not readable: {exc}"]
     bad: list[str] = []
+    if first_bytes != second_bytes:
+        bad.append("two fresh example derivations produced different canonical bytes")
     expected = {"format", "application", "entrypoints", "jobs"}
     if set(document) != expected:
-        bad.append(
-            f"{path.relative_to(ROOT)} fields are {sorted(document)}, want {sorted(expected)}"
-        )
+        bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
     if document.get("format") != "cozy.endpoint.descriptor/1":
-        bad.append(f"{path.relative_to(ROOT)} has the wrong format")
+        bad.append("descriptor has the wrong format")
     forbidden = {
         "attribute",
         "capabilities",

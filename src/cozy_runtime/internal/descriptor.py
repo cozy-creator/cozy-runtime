@@ -1,16 +1,14 @@
-"""The reviewed endpoint descriptor generated from one frozen application.
+"""The endpoint descriptor generated from one frozen application.
 
-The committed ``endpoint.descriptor.json`` is a readable projection. Its one identity is
-SHA-256 over the canonical JSON encoding of its content, so indentation, whitespace and key
-order can never change ``descriptor_digest``. The digest is derived and is not embedded in
-the document it identifies.
+Its one identity is SHA-256 over canonical JSON. Creator obtains those exact bytes from
+`cozy-runtime --json describe`; nothing is written into the endpoint repository.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from typing import cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
 from cozy_runtime.internal import canonical, schema
@@ -18,7 +16,6 @@ from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
 
 SCHEMA = "cozy.endpoint.descriptor/1"
-FILE = "endpoint.descriptor.json"
 DIGEST_KEY = "descriptor_digest"
 
 #: The complete top-level field set. A reader admits EXACTLY these — never a superset.
@@ -33,7 +30,7 @@ TOP_LEVEL_KEYS = frozenset(
 
 
 class StaleDescriptor(ConformanceError):
-    """The committed descriptor is not what this release derives. Exit 13."""
+    """Supplied descriptor bytes are malformed or differ from the installed release."""
 
     default_code = "stale_descriptor"
 
@@ -186,11 +183,6 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
 # ------------------------------------------------------------------------ identity + file
 
 
-def render(doc: Mapping[str, Json]) -> bytes:
-    """The deterministic, readable repository projection."""
-    return canonical.pretty(dict(doc)).encode("utf-8")
-
-
 def canonical_bytes(doc: Mapping[str, Json]) -> bytes:
     """The semantic descriptor bytes used for identity and control-plane transport."""
     return canonical.write(dict(doc))
@@ -222,16 +214,6 @@ def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
         f"{', '.join(str(j['name']) for j in jobs if isinstance(j, dict)) or 'no jobs'}",
         code="unknown_job",
     )
-
-
-def path_of(project: Path) -> Path:
-    return project / FILE
-
-
-def write(project: Path, doc: Mapping[str, Json]) -> Path:
-    target = path_of(project)
-    target.write_bytes(render(doc))
-    return target
 
 
 def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
@@ -278,7 +260,7 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
     return []
 
 
-def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
+def read_bytes(raw: bytes, source: str = "endpoint descriptor") -> dict[str, Json]:
     """Read one descriptor projection without making its formatting part of identity."""
     try:
         parsed = canonical.parse(raw)
@@ -305,19 +287,211 @@ def read_bytes(raw: bytes, source: str = FILE) -> dict[str, Json]:
             f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
             code="unknown_format",
         )
+    _validate(parsed, source)
     return parsed
 
 
-def read(project: Path) -> dict[str, Json]:
-    """The committed descriptor, parsed. A missing one is a refusal, not an empty default."""
-    target = path_of(project)
-    if not target.is_file():
-        raise StaleDescriptor(
-            f"{FILE} is not committed in {project} — the endpoint is valid only once its "
-            "descriptor is derived and committed (§1.0)",
-            code="missing_descriptor",
+def _validate(body: Mapping[str, Json], source: str) -> None:
+    """Read the one current nested grammar. This is a hardcut, not a legacy decoder."""
+    application = body["application"]
+    if not isinstance(application, str) or not application:
+        _invalid(source, "application", "must be a non-empty string")
+    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
+        rows = body[collection]
+        if not isinstance(rows, list):
+            _invalid(source, collection, "must be an array")
+        names: set[str] = set()
+        for index, row in enumerate(rows):
+            path = f"{collection}[{index}]"
+            required = {"name", "request", "result"}
+            optional = {"models"}
+            if kind == "job":
+                required.add("publishes")
+                optional.add("resources")
+            item = _closed(row, required, optional, source, path)
+            name = item["name"]
+            if not isinstance(name, str) or not name or name in names:
+                _invalid(source, f"{path}.name", "must be non-empty and unique")
+            names.add(name)
+            _schema(item["request"], source, f"{path}.request")
+            _schema(item["result"], source, f"{path}.result")
+            models = item.get("models", [])
+            if not isinstance(models, list):
+                _invalid(source, f"{path}.models", "must be an array")
+            for model_index, model in enumerate(models):
+                model_path = f"{path}.models[{model_index}]"
+                slot = _closed(
+                    model,
+                    {"class", "component_use", "path", "stamps"},
+                    set(),
+                    source,
+                    model_path,
+                )
+                prefix = f"{name}.models."
+                if (
+                    not isinstance(slot["path"], str)
+                    or not slot["path"].startswith(prefix)
+                    or not slot["path"][len(prefix) :]
+                ):
+                    _invalid(source, f"{model_path}.path", f"must start with {prefix!r}")
+                if not isinstance(slot["class"], str) or not slot["class"]:
+                    _invalid(source, f"{model_path}.class", "must be a non-empty string")
+                _string_map(slot["stamps"], source, f"{model_path}.stamps")
+                uses = slot["component_use"]
+                if not isinstance(uses, dict):
+                    _invalid(source, f"{model_path}.component_use", "must be an object")
+                for method, components in uses.items():
+                    if (
+                        not isinstance(method, str)
+                        or not isinstance(components, list)
+                        or not all(isinstance(component, str) for component in components)
+                    ):
+                        _invalid(
+                            source,
+                            f"{model_path}.component_use",
+                            "must map method names to component-name arrays",
+                        )
+            if kind == "job":
+                if not isinstance(item["publishes"], bool):
+                    _invalid(source, f"{path}.publishes", "must be a boolean")
+                if "resources" in item:
+                    resources = _closed(
+                        item["resources"], {"gpu_count"}, set(), source, f"{path}.resources"
+                    )
+                    count = resources["gpu_count"]
+                    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                        _invalid(source, f"{path}.resources.gpu_count", "must be positive")
+
+
+def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
+    if isinstance(value, str):
+        if value not in _SCALARS:
+            _invalid(source, path, f"unknown scalar {value!r}")
+        return
+    if not isinstance(value, dict):
+        _invalid(source, path, "must be a scalar or schema object")
+    forms = set(value) & _SCHEMA_FORMS
+    if len(forms) != 1:
+        _invalid(source, path, "must carry exactly one schema form")
+    form = next(iter(forms))
+    if form == "fields":
+        optional = {"tag", "tag_field"}
+        struct = _closed(value, {"fields"}, optional, source, path)
+        tag = struct.get("tag")
+        tag_field = struct.get("tag_field")
+        active_tag_field: Json
+        if union_tag_field is not None:
+            if tag is None or tag_field is not None:
+                _invalid(source, path, "a tagged-union member carries only its tag")
+            active_tag_field = union_tag_field
+        elif (tag is None) != (tag_field is None):
+            _invalid(source, path, "a standalone tag and tag_field must appear together")
+        else:
+            active_tag_field = tag_field
+        if active_tag_field is not None and (
+            not isinstance(active_tag_field, str) or not active_tag_field
+        ):
+            _invalid(source, f"{path}.tag_field", "must be a non-empty string")
+        fields = struct["fields"]
+        if not isinstance(fields, list):
+            _invalid(source, f"{path}.fields", "must be an array")
+        names: set[str] = set()
+        for index, value_field in enumerate(fields):
+            field_path = f"{path}.fields[{index}]"
+            field = _closed(
+                value_field,
+                {"name", "type"},
+                {"asset_bound", "constraints", "wire"},
+                source,
+                field_path,
+            )
+            name = field["name"]
+            if not isinstance(name, str) or not name or name in names or name == active_tag_field:
+                _invalid(
+                    source,
+                    f"{field_path}.name",
+                    "must be non-empty, unique, and not repeat the tag field",
+                )
+            names.add(name)
+            wire = field.get("wire")
+            if wire is not None and wire not in {"optional", "omissible"}:
+                _invalid(
+                    source,
+                    f"{field_path}.wire",
+                    "may only be optional or omissible; required is the default",
+                )
+            _schema(field["type"], source, f"{field_path}.type")
+            if "constraints" in field:
+                _subset_object(
+                    field["constraints"], _CONSTRAINT_KEYS, source, f"{field_path}.constraints"
+                )
+            if "asset_bound" in field:
+                _subset_object(
+                    field["asset_bound"], _ASSET_BOUND_KEYS, source, f"{field_path}.asset_bound"
+                )
+        return
+    if form == "union":
+        union = _closed(value, {"union"}, {"tag_field"}, source, path)
+        branches = union["union"]
+        if not isinstance(branches, list) or not branches:
+            _invalid(source, f"{path}.union", "must be a non-empty array")
+        tag_field = union.get("tag_field")
+        if tag_field is not None and (not isinstance(tag_field, str) or not tag_field):
+            _invalid(source, f"{path}.tag_field", "must be a non-empty string")
+        for index, branch in enumerate(branches):
+            _schema(branch, source, f"{path}.union[{index}]", tag_field)
+        return
+    exact = _closed(value, {form}, set(), source, path)
+    child = exact[form]
+    if form == "list":
+        _schema(child, source, f"{path}.list")
+    elif form == "literal":
+        if not isinstance(child, list):
+            _invalid(source, f"{path}.literal", "must be an array")
+    elif not isinstance(child, str) or not child:
+        _invalid(source, f"{path}.{form}", "must be a non-empty string")
+
+
+def _closed(
+    value: Json,
+    required: set[str],
+    optional: set[str],
+    source: str,
+    path: str,
+) -> dict[str, Json]:
+    if not isinstance(value, dict):
+        _invalid(source, path, "must be an object")
+    fields = set(value)
+    if fields != required | (fields & optional):
+        missing = sorted(required - fields)
+        unknown = sorted(fields - required - optional)
+        detail = ", ".join(
+            [*(f"missing {name}" for name in missing), *(f"unknown {name}" for name in unknown)]
         )
-    return read_bytes(target.read_bytes(), str(target))
+        _invalid(source, path, detail)
+    return cast(dict[str, Json], value)
+
+
+def _string_map(value: Json, source: str, path: str) -> None:
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        _invalid(source, path, "must map strings to strings")
+
+
+def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> None:
+    if not isinstance(value, dict) or not value or not set(value) <= allowed:
+        _invalid(source, path, f"must be a non-empty object using {sorted(allowed)}")
+
+
+def _invalid(source: str, path: str, detail: str) -> None:
+    raise StaleDescriptor(f"{source}: {path} {detail}", code="malformed_descriptor")
+
+
+_SCALARS = frozenset({"bool", "float", "int", "null", "str"})
+_SCHEMA_FORMS = frozenset({"asset", "fields", "input", "list", "literal", "union"})
+_CONSTRAINT_KEYS = {"ge", "gt", "le", "max_length", "min_length"}
+_ASSET_BOUND_KEYS = {"max_bytes", "media_types"}
 
 
 def counts(body: Mapping[str, Json]) -> dict[str, int]:

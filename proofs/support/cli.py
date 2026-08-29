@@ -88,20 +88,6 @@ def check_wheel(path: Path) -> None:
     )
 
 
-def descriptor_red(path: Path, mode: str) -> None:
-    if mode == "whitespace":
-        path.write_bytes(path.read_bytes() + b"\n")
-        return
-    if mode == "key-order":
-        value = read_json(path)
-        require(isinstance(value, dict), "descriptor is not an object")
-        document = cast("dict[str, object]", value)
-        reordered = {key: document[key] for key in reversed(tuple(document))}
-        path.write_text(json.dumps(reordered, indent=2, ensure_ascii=False) + "\n")
-        return
-    raise ProofFailure(f"unknown descriptor red mode {mode!r}")
-
-
 def _document(path: Path) -> dict[str, Any]:
     value = read_json(path)
     require(isinstance(value, dict), f"{path.name} is not an object")
@@ -169,7 +155,7 @@ def verify(root: Path) -> None:
 
 def main() -> int:
     if len(sys.argv) < 3:
-        raise ProofFailure("usage: cli.py <prepare|tree|wheel|descriptor-red|verify> <path> [mode]")
+        raise ProofFailure("usage: cli.py <prepare|tree|wheel|verify> <path>")
     command, path = sys.argv[1], Path(sys.argv[2])
     if command == "prepare":
         prepare(path)
@@ -177,10 +163,6 @@ def main() -> int:
         print(tree_digest(path))
     elif command == "wheel":
         check_wheel(path)
-    elif command == "descriptor-red":
-        if len(sys.argv) != 4:
-            raise ProofFailure("descriptor-red needs whitespace or key-order")
-        descriptor_red(path, sys.argv[3])
     elif command == "verify":
         verify(path)
     else:
