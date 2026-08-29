@@ -791,19 +791,19 @@ def fence_base_ownership_vectors() -> list[str]:
     exact_contract = {
         "base-worker-image-wheelhouse.json": (
             wheelhouse_bytes,
-            "650f9e4010062d0895582a3e2d3e3c2ea21130d1b9ca30ed0de0f43eb1d2d655",
+            "33e0e0f17ee0e1a9d41e8acca0fcf14362280597a50dbe0229c76f65fbfdaafc",
         ),
         "package-bundle.json": (
             bundle_bytes,
-            "110538d9a02da2b09843ee2c1b58713f69f77708cdbbf467c015d04790b368bb",
+            "0ec72a58775c618bf4d5980856e2458692f8582f60dfe5a4477f7bf6a5c3c6ae",
         ),
         "package-environment-spec.json": (
             environment_bytes,
-            "12a81bdb7549dbcb706644468ce13407c158e6f66c212017449b7f80f4296c03",
+            "df17c9c92134b0bb7bb226bcee01ad5f6f6f6d244baeb61418af61295144277f",
         ),
         "fixture-index.json": (
             index_bytes,
-            "f7beb3d9d4c4c7f865fd4af8078d6223a64f18ac1e75dedb092157ef4d8caaf7",
+            "75324dfae56425bbd26fb6d54ec2fc726a01c81dcb9ff02f4d9d51e7cd028ece",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -811,11 +811,11 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolution-lock.json": (
             resolution_lock_bytes,
-            "1a1f34b8ada8cfd08d311208c24932a80fb52a147e5af374289257367e784b55",
+            "57d1ec1c637d6ebbff889bc3f59631452d45cbffd5616807f1f9627c8da4f3ca",
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "f0dc0011192e18b55352ca91748cb268db0d3d5d992bfa6f2b6612fb1c9ca112",
+            "93e668e46ae4d89bf8dfbe85b3f79d68e94ae1ddae3e8938f8bddea82fc27b36",
         ),
         "source-tree.json": (
             source_tree_bytes,
