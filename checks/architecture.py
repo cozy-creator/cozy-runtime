@@ -702,8 +702,8 @@ def fence_base_ownership_vectors() -> list[str]:
     cross = ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse.json"
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    if len(raw) != 23_930 or digest != (
-        "sha256:33e0e0f17ee0e1a9d41e8acca0fcf14362280597a50dbe0229c76f65fbfdaafc"
+    if len(raw) != 24_246 or digest != (
+        "sha256:330ea6ec84c2012a3e73772ffaa0b69ad7f0381e244a709dd70a91a21fef795a"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -718,8 +718,8 @@ def fence_base_ownership_vectors() -> list[str]:
             len(manifest.base_import_roots),
             len(manifest.wheels),
         )
-        if census != (82, 359, 5):
-            bad.append(f"{cross}: ownership census is {census}, want (82, 359, 5)")
+        if census != (82, 359, 6):
+            bad.append(f"{cross}: ownership census is {census}, want (82, 359, 6)")
 
         def counted_wheel(index: int, owner: str) -> overlay.Wheel:
             label = "project" if owner == "project" else f"custom-{index:03d}"
@@ -791,19 +791,19 @@ def fence_base_ownership_vectors() -> list[str]:
     exact_contract = {
         "base-worker-image-wheelhouse.json": (
             wheelhouse_bytes,
-            "33e0e0f17ee0e1a9d41e8acca0fcf14362280597a50dbe0229c76f65fbfdaafc",
+            "330ea6ec84c2012a3e73772ffaa0b69ad7f0381e244a709dd70a91a21fef795a",
         ),
         "package-bundle.json": (
             bundle_bytes,
-            "0ec72a58775c618bf4d5980856e2458692f8582f60dfe5a4477f7bf6a5c3c6ae",
+            "b150c4f2642c5b3f78663a371779bc4ee6950ab29b24c1b20e1252aa1ae5cf4d",
         ),
         "package-environment-spec.json": (
             environment_bytes,
-            "df17c9c92134b0bb7bb226bcee01ad5f6f6f6d244baeb61418af61295144277f",
+            "35ae314fa0333930bb59b13fe82cb3830fa9d723baba432334aa7e24762a787c",
         ),
         "fixture-index.json": (
             index_bytes,
-            "75324dfae56425bbd26fb6d54ec2fc726a01c81dcb9ff02f4d9d51e7cd028ece",
+            "179f3f1569bdc369e9b119bcb7de94c0a9fabb24a2d29d14e87f954d72d4632e",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -815,7 +815,7 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "93e668e46ae4d89bf8dfbe85b3f79d68e94ae1ddae3e8938f8bddea82fc27b36",
+            "e83ad3b049134707bdb093167c83f6fb74f196be723b77931a55cdb0b70859f7",
         ),
         "source-tree.json": (
             source_tree_bytes,
