@@ -88,8 +88,8 @@ class Surface:
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     hidden: bool = False
-    """DECLARED but NOT SERVED (#572d). Kept in the descriptor — it is real code with a real
-    signature — and excluded from the serving set, so no binding is staged for it."""
+    """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
+    are absent from the descriptor, so no binding is staged and no request reaches them."""
 
     @property
     def model_params(self) -> tuple[str, ...]:

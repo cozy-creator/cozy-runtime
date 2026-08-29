@@ -620,11 +620,11 @@ def descriptor_sections() -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
         bodies[module] = body
         counts = descriptor.counts(body)
-        raw = descriptor.render(body)
+        raw = descriptor.canonical_bytes(body)
         size = len(raw)
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
-            f"{counts['model_bindings']} slots · {size:>6,} B pretty · {elapsed_ms:6.1f} ms · "
+            f"{counts['model_bindings']} slots · {size:>6,} B canonical · {elapsed_ms:6.1f} ms · "
             f"{descriptor.descriptor_digest(body)[:26]}…"
         )
 
@@ -670,11 +670,11 @@ def descriptor_sections() -> None:
     print(f"  identical:  {pair[0] == pair[1]} ({len(pair[0])} bytes each)")
 
     head("semantic digest — formatting is irrelevant and meaning is not")
-    base_raw = descriptor.render(bodies["tiny_h3"])
+    base_raw = descriptor.canonical_bytes(bodies["tiny_h3"])
     base = descriptor.descriptor_digest(bodies["tiny_h3"])
     mutations: dict[str, Callable[[Any], object]] = {
         "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
-            {"name": "extra", "type": "int", "wire": "required"}
+            {"name": "extra", "type": "int"}
         ),
         "stamp (task=fl2va -> task=other)": lambda d: d["entrypoints"][0]["models"][0][
             "stamps"
@@ -682,7 +682,7 @@ def descriptor_sections() -> None:
         "component-use (one method's set)": lambda d: d["entrypoints"][0]["models"][0][
             "component_use"
         ].update(denoise=["fl2va_transformer", "smuggled"]),
-        "visibility (hidden toggled)": lambda d: d["entrypoints"][0].update(hidden=True),
+        "published surface removed": lambda d: d["entrypoints"].pop(),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
@@ -691,7 +691,7 @@ def descriptor_sections() -> None:
         if not moved:
             raise AssertionError(f"descriptor meaning change did not move identity: {what}")
         print(f"  {what:34} digest moved: {moved}")
-    whitespace_edit = base_raw.replace(b"{\n", b"{\n ", 1)
+    whitespace_edit = base_raw.replace(b"{", b"{ ", 1)
     reordered = json.dumps(
         dict(reversed(list(bodies["tiny_h3"].items()))), separators=(", ", ": ")
     ).encode()
@@ -720,7 +720,7 @@ def descriptor_sections() -> None:
         print(f"  {name:34} refused: {code}")
 
     head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
-    committed = descriptor.render(bodies["tiny_h3"])
+    before_bindings = descriptor.canonical_bytes(bodies["tiny_h3"])
     registry = ModelRegistry(release=RELEASE, backend=StagedBackend())
     configs = (("full", art.h3(task="fl2va")), ("baked", art.h3(task="fl2va", baked=True)))
     for label, artifact in configs:
@@ -730,8 +730,8 @@ def descriptor_sections() -> None:
             f"  bound {label:6} artifact -> construction {model.checkpoint_ref}"
             + (f", {len(record.destinations)} destinations" if record else "")
         )
-    rederived = descriptor.render(descriptor.build(discover(ROOT / "examples")))
-    print(f"  descriptor after both bindings: byte-unchanged = {rederived == committed}")
+    rederived = descriptor.canonical_bytes(descriptor.build(discover(ROOT / "examples")))
+    print(f"  descriptor after both bindings: byte-unchanged = {rederived == before_bindings}")
     print(
         f"  generations now live in the registry: {len(registry.generations())} — "
         "candidate facts, on a different clock"

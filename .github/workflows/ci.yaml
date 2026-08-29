@@ -22,12 +22,16 @@ jobs:
       # Self-contained architecture fences + frozen ES6 vectors + torch-free import. The
       # one cross-repo TensorFS registry comparison has its own pinned job below.
       - run: uv run python checks/architecture.py --exclude reviewed-specs-exist
-      # The committed descriptor is a CHECKED CACHE, never authority: CI re-derives and
-      # refuses a stale one (§1.0). A staleness check, not a test suite.
-      - run: uv run cozy-runtime describe --check --dir examples
-      # Creator owns the one fixed project-wheel packer. Runtime checks the same committed
-      # endpoint source directly here; the cross-repo publication acceptance installs the wheel.
-      - run: uv run cozy-runtime --dir proofs/fixtures/marco-polo-endpoint describe --check
+      # The descriptor is a read-only publication output, never a committed repository file.
+      # The architecture fence validates the closed grammar; these exact replays prove the two
+      # source fixtures derive byte-identically without dirtying either repository.
+      - run: |
+          test "$(uv run cozy-runtime --json --dir examples describe)" = \
+            "$(uv run cozy-runtime --json --dir examples describe)"
+          test "$(uv run --locked --project proofs/fixtures/marco-polo-endpoint \
+            cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)" = \
+            "$(uv run --locked --project proofs/fixtures/marco-polo-endpoint \
+            cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)"
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python checks/declared_facts.py

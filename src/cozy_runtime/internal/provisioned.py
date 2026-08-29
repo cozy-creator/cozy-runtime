@@ -238,7 +238,7 @@ def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
         raise PlanRefusal("binding_descriptor_invalid", "entrypoints is not an array")
     visible: dict[str, dict[str, Any]] = {}
     for row in entries:
-        if not isinstance(row, dict) or row.get("hidden") is not False:
+        if not isinstance(row, dict):
             continue
         name = _identifier(row.get("name"), "descriptor.entrypoint.name")
         if name in visible:
@@ -294,7 +294,8 @@ def _read_binding(
     slot_row = selected[0]
     _closed_keys(slot_row, {"binding", "slot"}, "plan.bindings[0]")
     slot = _identifier(slot_row["slot"], "plan.bindings[0].slot")
-    if model.get("param") != slot:
+    expected_path = f"{entrypoint}.models.{slot}"
+    if model.get("path") != expected_path:
         raise PlanRefusal("binding_descriptor_invalid", f"slot {slot!r}")
     binding_ref = _document_ref(slot_row["binding"], "plan.bindings[0].binding")
     binding_doc = read_document(binding_ref, "resolved_model_binding")

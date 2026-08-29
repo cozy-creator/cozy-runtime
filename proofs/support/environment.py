@@ -382,8 +382,9 @@ def _release(
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
+    cpu = target["accelerator_backend"] == "none"
     profile = {
-        "accelerator_build": target["accelerator_abi"],
+        "accelerator_build": "cpu" if cpu else target["accelerator_abi"],
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
         "torch_release": "2.13.0",
@@ -394,8 +395,8 @@ def _release(
             "base_import_roots": base_import_roots,
             "compatibility_profile": profile,
             "format": "WheelhouseManifest/3",
-            "minimum_cuda_version": "12.6",
-            "minimum_driver_version": "560.28.03",
+            "minimum_cuda_version": "none" if cpu else "12.6",
+            "minimum_driver_version": "none" if cpu else "560.28.03",
             "platform_target": dict(target),
             "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
         }
@@ -423,12 +424,10 @@ def _release(
         }
     )
     descriptor = _canonical({"format": "proof.EndpointDescriptor/1"})
-    evaluated = _canonical({"format": "proof.EvaluatedConfig/1"})
     bundle = _canonical(
         {
             "descriptor": _ref(descriptor),
             "endpoint_release_id": "proof-release",
-            "evaluated_config": _ref(evaluated),
             "format": "tensorhub.endpoint_bundle/2",
             "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),

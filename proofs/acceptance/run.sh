@@ -3,6 +3,8 @@ set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 proof_root=$(mktemp -d /tmp/cozy-acceptance-proof.XXXXXX)
+fixture="$repo/proofs/fixtures/marco-polo-endpoint"
+fixture_source="$proof_root/endpoint-source"
 
 cleanup() {
     chmod -R u+w "$proof_root" 2>/dev/null || true
@@ -11,9 +13,12 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir "$proof_root/build"
+mkdir "$fixture_source"
+cp "$fixture/pyproject.toml" "$fixture/endpoint.toml" "$fixture/uv.lock" "$fixture_source/"
+cp -R "$fixture/marco_polo_endpoint" "$fixture_source/"
 UV_OFFLINE=1 uv build --offline --wheel --out-dir "$proof_root/build" "$repo"
 UV_OFFLINE=1 uv build --offline --wheel --out-dir "$proof_root/build" \
-    "$repo/proofs/fixtures/marco-polo-endpoint"
+    "$fixture_source"
 runtime_wheel=$(find "$proof_root/build" -name 'cozy_runtime-*.whl' -print)
 project_wheel=$(find "$proof_root/build" -name 'marco_polo_endpoint-*.whl' -print)
 
@@ -22,8 +27,14 @@ UV_OFFLINE=1 uv pip install --offline --python "$proof_root/driver/bin/python" \
     "$runtime_wheel" "$project_wheel"
 python="$proof_root/driver/bin/python"
 proof="$proof_root/driver/bin/cozy-acceptance-proof"
+runtime="$proof_root/driver/bin/cozy-runtime"
 driver="$repo/proofs/internal/acceptance_observation.py"
-descriptor="$repo/proofs/fixtures/marco-polo-endpoint/endpoint.descriptor.json"
+descriptor="$proof_root/endpoint-descriptor.json"
+(cd / && env -u PYTHONPATH "$runtime" --json \
+    --dir "$repo/proofs/fixtures/marco-polo-endpoint" describe) >"$descriptor"
+(cd / && env -u PYTHONPATH "$runtime" --json \
+    --dir "$repo/proofs/fixtures/marco-polo-endpoint" describe) >"$proof_root/descriptor-replay.json"
+cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH PATH="$PATH" HOME="$proof_root/home" \
     "$python" "$driver" setup "$proof_root" "$project_wheel" "$descriptor")

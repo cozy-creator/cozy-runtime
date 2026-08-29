@@ -135,14 +135,9 @@ def _tagged_union_conformance() -> str:
     assert isinstance(members, list) and len(members) == 2, members
     tags = {member["tag"]: member for member in members}
     assert set(tags) == {"image", "video"}, tags
-    for tag, member in tags.items():
-        assert member["tag_field"] == "type", member
-        discriminator = member["fields"][0]
-        assert discriminator == {
-            "name": "type",
-            "type": {"literal": [tag]},
-            "wire": "required",
-        }, discriminator
+    for member in tags.values():
+        assert set(member) == {"fields", "tag"}, member
+        assert all(field["name"] != "type" for field in member["fields"]), member
 
     decoder = msgspec.json.Decoder(list[TaggedReference])
     decoded = decoder.decode(b'[{"type":"image","image":"ref"}]')
@@ -162,15 +157,17 @@ def _tagged_union_conformance() -> str:
         "union": [
             "null",
             {
-                "fields": [{"name": "file", "type": "str", "wire": "required"}],
+                "fields": [{"name": "file", "type": "str"}],
             },
         ]
     }
     single = schema.render(TaggedImage)
-    assert single["fields"][0]["wire"] == "optional", single
+    assert single["tag_field"] == "type" and single["tag"] == "image", single
+    assert all(field["name"] != "type" for field in single["fields"]), single
     scalar_union = schema.render(TaggedImage | str)
     tagged_member = next(member for member in scalar_union["union"] if isinstance(member, dict))
-    assert tagged_member["fields"][0]["wire"] == "optional", tagged_member
+    assert tagged_member["tag_field"] == "type" and tagged_member["tag"] == "image", tagged_member
+    assert all(field["name"] != "type" for field in tagged_member["fields"]), tagged_member
     try:
         schema.render(TaggedImage | UntaggedReference)
     except Exception as exc:

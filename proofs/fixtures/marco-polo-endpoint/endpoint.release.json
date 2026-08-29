@@ -1,7 +1,0 @@
-{
-  "compatible_accelerator_models": [
-    "NVIDIA GeForce RTX 4090"
-  ],
-  "model_bindings": [],
-  "model_roots": []
-}

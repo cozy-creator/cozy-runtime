@@ -85,7 +85,7 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     roots = filtered_roots
     target = _target()
     profile = {
-        "accelerator_build": target["accelerator_abi"],
+        "accelerator_build": "cpu",
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
         "torch_release": "2.13.0",
@@ -96,8 +96,8 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
             "base_import_roots": roots,
             "compatibility_profile": profile,
             "format": "WheelhouseManifest/3",
-            "minimum_cuda_version": "12.6",
-            "minimum_driver_version": "560.28.03",
+            "minimum_cuda_version": "none",
+            "minimum_driver_version": "none",
             "platform_target": target,
             "wheels": [wheel(base, import_roots=True)],
         }
@@ -114,12 +114,10 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
             "wheels": [],
         }
     )
-    evaluated_raw = canonical.write({"format": "proof.EvaluatedConfig/1"})
     bundle_raw = canonical.write(
         {
             "descriptor": _ref(descriptor_raw),
             "endpoint_release_id": "local/marco@acceptance-1",
-            "evaluated_config": _ref(evaluated_raw),
             "format": "tensorhub.endpoint_bundle/2",
             "project_wheel": wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved_raw),
@@ -203,7 +201,6 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     state = {
         "artifact_store": str(artifact_store),
         "binding_documents": plan_rows,
-        "config_digest": _digest(evaluated_raw),
         "control_runtime_digest": base.digest,
         "descriptor_digest": _digest(descriptor_raw),
         "endpoint_release_id": "local/marco@acceptance-1",
@@ -236,7 +233,6 @@ def _run(root: Path) -> None:
         environment_spec_digest=str(state["environment_spec_digest"]),
         installed_environment_receipt_digest=str(state["installed_environment_receipt_digest"]),
         descriptor_digest=str(state["descriptor_digest"]),
-        config_digest=str(state["config_digest"]),
         environment_root=Path(str(state["environment_root"])),
         wheelhouse_manifest=inputs / "wheelhouse-manifest.json",
     )

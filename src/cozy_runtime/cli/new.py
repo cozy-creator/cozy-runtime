@@ -152,13 +152,11 @@ def _readme(name: str, pkg: str) -> str:
 
     uv sync
     uv run python -m {pkg}
-    uv run cozy-runtime describe --check
+    uv run cozy-runtime --json describe
 
-`endpoint.descriptor.json` was derived by the scaffold and is already `--check`-clean;
-re-derive it with `describe --write-descriptor` whenever a signature or schema changes, and
-commit the diff — it is how a surface-contract change gets reviewed. `uv.lock` and the
-descriptor are the two generated, committed files; the release is
-digest(source, lock, manifest), so both re-key it.
+`cozy endpoint publish` invokes Runtime's read-only describe command and sends the canonical
+descriptor bytes with the source release. Tensorhub independently derives and compares the
+same descriptor from the installed project wheel. Nothing generated is committed here.
 """
 
 
@@ -193,31 +191,26 @@ def run(name: str, target_dir: str) -> Result:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
 
-    # The skeleton is only MINIMAL VALID once its surface contract is derived and committed
-    # (§1.0), so the scaffold runs the same describe the build runs: a fresh endpoint is
-    # `describe --check`-clean out of the box, and its first commit already carries the
-    # surface a reviewer diffs against.
-    written = describe_verb.run(None, Options(dir=str(target)), write=True, check=False)
-    assert isinstance(written.document, dict)
+    # Run the same derivation publication runs. It validates the scaffold without creating
+    # another generated repository file.
+    described = describe_verb.run(None, Options(dir=str(target)))
+    assert isinstance(described.document, dict)
 
     return Result(
         rows=(
             ("created", str(target)),
             ("package", pkg),
             ("entry", f"{pkg}:app"),
-            ("files", str(len(files) + 1)),
+            ("files", str(len(files))),
             (
                 descriptor.DIGEST_KEY,
-                descriptor.descriptor_digest(written.document),
+                descriptor.descriptor_digest(described.document),
             ),
         ),
         commands=(
             f"cd {target} && uv sync",
             f"uv run python -m {pkg}",
-            "uv run cozy-runtime describe --check",
+            "uv run cozy-runtime --json describe",
         ),
-        next=(
-            f"cd {target} && uv sync",
-            f"git add {descriptor.FILE} — it is generated, committed, and CI-checked",
-        ),
+        next=(f"cd {target} && uv sync",),
     )

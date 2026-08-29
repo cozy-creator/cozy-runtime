@@ -16,19 +16,19 @@ returns:
 {"message":"polo"}
 ```
 
-Publish it through the real Creator product path:
+Publish it through Creator's endpoint-publish command, pointing `--dir` at this directory.
+Creator's fixed pure-Python packer produces the deterministic `py3-none-any` project wheel; this
+fixture intentionally declares no PEP 517 backend. `pyproject.toml`, `uv.lock`,
+the Runtime-derived canonical descriptor, and that wheel are the exact publication inputs. The
+descriptor is sent directly to Tensorhub and is not committed here. There is no release manifest
+and no author-selected worker profile: Tensorhub derives compatible base worker images from the
+locked Python/package requirements. The current remote contract admits one placement per worker,
+so publishing this fixture under two endpoint repositories can prove sequential same-pod
+replacement with `cozy rent revise`; it does not prove simultaneous stacking.
+
+Creator derives the publication descriptor through this locked, read-only project command:
 
 ```sh
-cozy endpoint publish cozy/marco-polo --create --release acceptance-1 \
-  --dir proofs/fixtures/marco-polo-endpoint \
-  --profile torch2.13.0-cu130-cp312-linux-x86 \
-  --reason "Marco/Polo acceptance"
+uv run --locked --project proofs/fixtures/marco-polo-endpoint \
+  cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe
 ```
-
-Creator's fixed pure-Python packer produces the deterministic `py3-none-any` project wheel; this
-fixture intentionally declares no PEP 517 backend. `uv.lock`, `endpoint.descriptor.json`, and that
-wheel are the exact publication inputs. The current remote contract admits one placement per
-worker, so publishing this fixture under two endpoint repositories can prove sequential same-pod
-replacement with `cozy rent revise`; it does not prove simultaneous stacking. The approved RunPod
-profiles use an RTX 4090 even though this endpoint itself performs no GPU work;
-`endpoint.release.json` records that placement compatibility and declares no model closure.

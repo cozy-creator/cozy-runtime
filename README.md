@@ -149,20 +149,18 @@ no release digest, build timestamp, machine path or mutable binding reached it.
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.
 
-`endpoint.descriptor.json` is generated, committed and reviewed. The committed file is a
-deterministic pretty projection; `descriptor_digest` is SHA-256 over canonical JSON content,
-so whitespace and key order never affect identity. `describe --check` compares meaning and
-refuses a stale surface while admitting a harmless reformat. `describe` itself is read-only;
-`--write-descriptor` is the normal projection writer, and
-`cozy-runtime new` runs it so a fresh endpoint is `--check`-clean out of the box.
+The descriptor is derived, not committed. `cozy-runtime --json --dir PROJECT describe` writes
+the canonical descriptor bytes to stdout without modifying the project. Creator sends those
+bytes with the source release; Tensorhub independently derives the descriptor from the installed
+project wheel and compares it. `descriptor_digest` is SHA-256 over those canonical bytes.
 
 ## Commands
 
     uv sync
     uv run cozy-runtime version          # tag, commit, wire + python semvers
     uv run cozy-runtime new <name>       # scaffold a minimal valid endpoint
-    uv run cozy-runtime describe         # the surface, without loading weights
-    uv run cozy-runtime describe --check # refuse a stale endpoint.descriptor.json (CI)
+    uv run cozy-runtime describe              # human-readable surface summary
+    uv run cozy-runtime --json describe       # canonical publication bytes on stdout
     uv run python checks/architecture.py # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
     uv run python checks/declared_facts.py # every public Context/service fact has a live writer

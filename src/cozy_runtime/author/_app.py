@@ -48,10 +48,9 @@ class Registration:
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
     hidden: bool = False
-    """This surface is DECLARED but NOT SERVED (#572d). A hidden entrypoint stays in the
-    descriptor — it is real code with a real signature, and pretending otherwise would make
-    the descriptor lie about the release — but no deployment stages a binding for it and no
-    request reaches it.
+    """This surface is DECLARED but NOT PUBLISHED (#572d). A hidden entrypoint stays in the
+    local registry but is absent from the descriptor, so no deployment stages a binding and
+    no request reaches it.
 
     It is an AUTHOR fact, not a deployment one: what makes H3's `reference_to_video` hidden
     is that its vision-conditioning seam is unbuilt, which only the author knows. A
@@ -115,8 +114,8 @@ class App:
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
-        `hidden=True` declares a surface that is real but NOT READY: it keeps its place in
-        the descriptor and gets no binding staged and no traffic (§1.2, #572d)."""
+        `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
+        published descriptor and gets no binding staged and no traffic (§1.2, #572d)."""
         return self._register(
             "entrypoint",
             fn,

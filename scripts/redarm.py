@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from typing import Any, cast
+
+from cozy_runtime.internal import descriptor as descriptor_document
+from cozy_runtime.internal.discovery import discover
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
@@ -1012,9 +1015,9 @@ registry().acquire('g.models.m', h3.Fl2VAModel, Artifact(
         "topology_extra_keys",
     ),
     (
-        # #572d: a HIDDEN entrypoint is declared and not served. It keeps its descriptor
-        # place — it is real code — and the serving set excludes it.
-        "hidden-entrypoint-is-declared-and-not-served",
+        # #572d: a HIDDEN entrypoint remains a local registry fact but is not published or
+        # served. Descriptor construction owns the omission; this arm proves the author flag.
+        "hidden-entrypoint-is-local-and-not-served",
         """
 from cozy_runtime.author._signature import analyze
 
@@ -1026,7 +1029,7 @@ b = analyze(concealed, name='concealed', kind='entrypoint', hidden=True)
 assert a.hidden is False and b.hidden is True, (a.hidden, b.hidden)
 serving = [s.name for s in (a, b) if not s.hidden]
 assert serving == ['visible'], serving
-raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surface kept its surface')
+raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surface stayed local')
 """,
         "the serving set is ['visible']",
     ),
@@ -1608,78 +1611,81 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
         return f"red — {name} (exit {got}): {line.strip()[:150]}"
 
 
-def run_stale_descriptor() -> list[str]:
-    """Meaning changes and invalid JSON refuse; harmless formatting does not."""
-    results = []
-    with tempfile.TemporaryDirectory(prefix="cozy-arm-stale-") as tmp:
-        project = _project(pathlib.Path(tmp), '[application]\nobject = "ep:app"\n', _VALID_MODULE)
-        code, _ = _describe(project, "--write-descriptor")
-        assert code == 0, "the fixture must describe cleanly before it can be made stale"
-        target = project / "endpoint.descriptor.json"
-        good = target.read_text()
+def run_retired_descriptor_shapes() -> list[str]:
+    """The descriptor/1 hardcut has no reader for its four redundant old spellings."""
+    base = descriptor_document.build(discover(ROOT / "examples"))
 
-        document = json.loads(good)
-        document["entrypoints"][0]["request"]["fields"][0]["name"] += "_edited"
-        target.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        code, output = _describe(project, "--check")
-        results.append(
-            f"red — stale_descriptor (exit {code}): {_first(output, 'different documents')}"
-            if code == 13
-            else f"NOT PROVEN — a hand-edited descriptor passed --check (exit {code})"
-        )
+    def clone() -> dict[str, Any]:
+        return cast(dict[str, Any], json.loads(json.dumps(base)))
 
-        target.write_text(good.replace("{\n", "{\n ", 1))
-        code, output = _describe(project, "--check")
-        results.append(
-            "green — descriptor formatting is not semantic identity"
-            if code == 0
-            else f"NOT PROVEN — whitespace-only descriptor edit refused "
-            f"(exit {code}): {output[:120]}"
-        )
+    def refused(name: str, document: dict[str, Any]) -> str:
+        try:
+            descriptor_document.read_bytes(json.dumps(document).encode(), name)
+        except descriptor_document.StaleDescriptor as exc:
+            if exc.code == "malformed_descriptor":
+                return f"red — retired_descriptor/{name}: {str(exc)[:120]}"
+            return f"NOT PROVEN — {name} refused with {exc.code}, not malformed_descriptor"
+        return f"NOT PROVEN — retired descriptor shape {name} was accepted"
 
-        target.write_text(good.replace('"format":', '"smuggled": 1,\n  "format":'))
-        code, output = _describe(project, "--check")
-        results.append(
-            f"red — unknown_top_level_field (exit {code}): {_first(output, 'unknown smuggled')}"
-            if code == 13
-            else f"NOT PROVEN — an unknown top-level field passed --check (exit {code})"
-        )
+    hidden = clone()
+    hidden["entrypoints"][0]["hidden"] = False
 
-        target.write_text(good.replace("cozy.endpoint.descriptor/1", "cozy.endpoint.descriptor/9"))
-        code, output = _describe(project, "--check")
-        results.append(
-            f"red — unknown_descriptor_format (exit {code}): {_first(output, 'is not')}"
-            if code == 13
-            else f"NOT PROVEN — an unknown descriptor format passed --check (exit {code})"
-        )
+    param = clone()
+    modeled = next(row for row in param["entrypoints"] if row.get("models"))
+    slot = modeled["models"][0]
+    slot["param"] = slot["path"].rsplit(".", 1)[-1]
 
-        target.unlink()
-        code, output = _describe(project, "--check")
-        results.append(
-            f"red — missing_descriptor (exit {code}): {_first(output, 'not committed')}"
-            if code == 13
-            else f"NOT PROVEN — a missing descriptor passed --check (exit {code})"
-        )
-    return results
+    required_wire = clone()
+    field = next(
+        field
+        for row in required_wire["entrypoints"]
+        for field in row["request"]["fields"]
+        if "wire" not in field
+    )
+    field["wire"] = "required"
 
+    old_tag = clone()
 
-def run_environment_drift() -> str:
-    """Two environments claiming to be one release must derive one document (§1.0). Plant a
-    DIFFERENT cozy_runtime ahead of the installed one and prove --check refuses."""
-    with tempfile.TemporaryDirectory(prefix="cozy-arm-drift-") as tmp:
-        drift = pathlib.Path(tmp) / "src"
-        shutil.copytree(ROOT / "src", drift)
-        target = drift / "cozy_runtime" / "internal" / "schema.py"
-        target.write_text(
-            target.read_text().replace(
-                'doc["wire"] = "required"',
-                'doc["wire"] = "drifted"',
-            )
-        )
-        code, output = _describe(ROOT / "examples", "--check", env={"PYTHONPATH": str(drift)})
-    if code != 13:
-        return f"NOT PROVEN — a drifted environment passed --check (exit {code})"
-    return f"red — environment_drift (exit {code}): {_first(output, 'different documents')}"
+    def tagged(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        if isinstance(value, dict):
+            union = value.get("union")
+            tag_field = value.get("tag_field")
+            if isinstance(union, list) and isinstance(tag_field, str):
+                member = next(
+                    (item for item in union if isinstance(item, dict) and "tag" in item), None
+                )
+                if isinstance(member, dict):
+                    return cast(dict[str, Any], value), cast(dict[str, Any], member)
+            for child in value.values():
+                try:
+                    return tagged(child)
+                except LookupError:
+                    pass
+        elif isinstance(value, list):
+            for child in value:
+                try:
+                    return tagged(child)
+                except LookupError:
+                    pass
+        raise LookupError("the real example has no tagged union")
+
+    union, member = tagged(old_tag)
+    member["tag_field"] = union["tag_field"]
+    member["fields"].insert(
+        0,
+        {
+            "name": union["tag_field"],
+            "type": {"literal": [member["tag"]]},
+            "wire": "required",
+        },
+    )
+
+    return [
+        refused("hidden", hidden),
+        refused("param", param),
+        refused("required-wire", required_wire),
+        refused("repeated-tag-field", old_tag),
+    ]
 
 
 def run_fixed_point() -> list[str]:
@@ -1736,9 +1742,8 @@ def main() -> int:
     results.append(run_mistyped())
     results.append(run_separation())
     results += [run_boundary(*a) for a in BOUNDARY_ARMS]
-    results += run_stale_descriptor()
+    results += run_retired_descriptor_shapes()
     results += run_fixed_point()
-    results.append(run_environment_drift())
     for r in results:
         print(r)
     unproven = [r for r in results if r.startswith("NOT PROVEN")]

@@ -116,7 +116,7 @@ def author(
 
     base_distributions, base_import_roots = installed_base_ownership()
     profile = {
-        "accelerator_build": target["accelerator_abi"],
+        "accelerator_build": "cpu",
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
         "torch_release": "2.13.0",
@@ -128,8 +128,8 @@ def author(
                 "base_import_roots": base_import_roots,
                 "compatibility_profile": profile,
                 "format": "WheelhouseManifest/3",
-                "minimum_cuda_version": "12.6",
-                "minimum_driver_version": "560.28.03",
+                "minimum_cuda_version": "none",
+                "minimum_driver_version": "none",
                 "platform_target": dict(target),
                 "wheels": [wheel(entry, import_roots=True) for entry in house],
             }
@@ -160,7 +160,6 @@ def author(
     finally:
         sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
-    evaluated = release.add(canonical({"format": "proof.EvaluatedConfig/1"}), "config")
     # These exact refs prove publication provenance but are deliberately not
     # runtime grant subjects. The executable source payload is project_wheel.
     source_archive = b"cr-049-boot-proof-source"
@@ -170,7 +169,6 @@ def author(
             {
                 "descriptor": ref(descriptor_bytes),
                 "endpoint_release_id": ENDPOINT_RELEASE,
-                "evaluated_config": ref(evaluated),
                 "format": "tensorhub.endpoint_bundle/2",
                 "project_wheel": wheel(project, import_roots=True),
                 "resolved_wheel_set": ref(resolved),

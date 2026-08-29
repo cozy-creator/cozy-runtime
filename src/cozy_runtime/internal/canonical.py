@@ -143,7 +143,7 @@ _ESCAPES = {
 #: Almost every string in a descriptor is an identifier, a type name or a sentence — none
 #: of them need escaping. Checking once beats branching per character: this fast path plus
 #: the ASCII key sort took `canonical.write` over the real H3 descriptor from 931 us to
-#: 525 us (measured, this box). The digest is unchanged by both — proven by `--check`.
+#: 525 us (measured, this box). Both paths produce the same canonical digest.
 _NEEDS_ESCAPE = re.compile(r'["\\\x00-\x1f]')
 
 
@@ -257,15 +257,3 @@ def _parse_float(token: str) -> float:
     if not math.isfinite(value) or abs(value) > INT_MAX:
         raise CanonicalError("number_range", f"{token} is outside the interoperable numeric range")
     return value
-
-
-# --------------------------------------------------------------------------- projection
-
-
-def pretty(value: Json) -> str:
-    """Deterministic sorted, indented, newline-terminated review bytes.
-
-    Projections are never identity. Semantic document digests use :func:`write`; exact-byte
-    artifact digests are explicitly owned by the artifact or blob boundary.
-    """
-    return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"

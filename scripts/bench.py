@@ -172,16 +172,17 @@ def bench(label, fn, n):
 
 found = discover(project)
 body = descriptor.build(found)
-raw = descriptor.render(body)
+raw = descriptor.canonical_bytes(body)
 
 bench('descriptor.build (frozen app -> document)', lambda: descriptor.build(found), 200)
-bench('descriptor.render (the committed bytes)', lambda: descriptor.render(body), 500)
+bench('descriptor.canonical_bytes (publication output)',
+      lambda: descriptor.canonical_bytes(body), 500)
 bench('descriptor_digest (canonical semantic hash)',
       lambda: descriptor.descriptor_digest(body), 500)
-bench('canonical.parse (read the committed file)', lambda: canonical.parse(raw), 500)
-bench('compare (the --check comparison)',
+bench('canonical.parse (read publication bytes)', lambda: canonical.parse(raw), 500)
+bench('compare (the server proof comparison)',
       lambda: descriptor.compare(body, body, ('a', 'b')), 500)
-print(f"  {'committed exact bytes':<46} {len(raw):9,} B")
+print(f"  {'canonical publication bytes':<46} {len(raw):9,} B")
 print(f"  {'callables / model slots described':<46} "
       f"{descriptor.counts(body)['entrypoints'] + descriptor.counts(body)['jobs']:5} / "
       f"{descriptor.counts(body)['model_bindings']}")
@@ -204,7 +205,6 @@ def main() -> int:
         # cr-003: what the build and CI actually pay per endpoint.
         ("cozy-runtime describe (h3)", [*DESCRIBE]),
         ("cozy-runtime describe --json", [*DESCRIBE, "--json"]),
-        ("cozy-runtime describe --check", [*DESCRIBE, "--check"]),
     ]
     print(f"{RUNS} runs each; peak RSS measured per case in a fresh helper process")
     for label, argv in cases:

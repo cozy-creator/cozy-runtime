@@ -38,17 +38,19 @@ UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/py
     "$runtime_wheel" "$torch_wheel"
 driver_python="$proof_root/driver/bin/python"
 
+descriptor="$proof_root/endpoint-descriptor.json"
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-    "$proof_root/driver/bin/cozy-runtime" --dir "$fixture_source" \
-    describe --write-descriptor >/dev/null)
+    "$proof_root/driver/bin/cozy-runtime" --json --dir "$fixture_source" describe >"$descriptor")
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-    "$proof_root/driver/bin/cozy-runtime" --dir "$fixture_source" describe --check >/dev/null)
+    "$proof_root/driver/bin/cozy-runtime" --json --dir "$fixture_source" describe \
+    >"$proof_root/descriptor-replay.json")
+cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     "$driver_python" "$support" prepare "$proof_root" \
-    "$fixture_source/endpoint.descriptor.json" "$runtime_wheel" "$endpoint_wheel" \
+    "$descriptor" "$runtime_wheel" "$endpoint_wheel" \
     "$torch_wheel" "$driver_python")
 
 for name in cold rebuild; do

@@ -699,13 +699,6 @@ def _invocation(
         raise AcceptanceRefusal("acceptance_invocation_invalid", "environment_spec_digest")
     if value.get("payload_digest") != fixture.digest:
         raise AcceptanceRefusal("acceptance_invocation_invalid", "payload_digest")
-    if (
-        value.get("config_digest")
-        != _embedded_ref(
-            environment.bundle.get("evaluated_config"), "bundle.evaluated_config"
-        ).digest
-    ):
-        raise AcceptanceRefusal("acceptance_invocation_invalid", "config_digest")
     serving = value.get("serving")
     if (
         not isinstance(serving, dict)
@@ -795,13 +788,7 @@ def _descriptor_entrypoint(descriptor_doc: LocalDocument, entrypoint: str) -> di
     if not isinstance(entries, list):
         raise AcceptanceRefusal("acceptance_descriptor_invalid", "entrypoints is not an array")
     row = next(
-        (
-            item
-            for item in entries
-            if isinstance(item, dict)
-            and item.get("hidden") is False
-            and item.get("name") == entrypoint
-        ),
+        (item for item in entries if isinstance(item, dict) and item.get("name") == entrypoint),
         None,
     )
     if not isinstance(row, dict):

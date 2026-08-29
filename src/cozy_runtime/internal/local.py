@@ -98,7 +98,6 @@ class LocalPlacementFacts:
     environment_spec_digest: str
     installed_environment_receipt_digest: str
     descriptor_digest: str
-    config_digest: str
     environment_root: Path
     wheelhouse_manifest: Path
 
@@ -756,9 +755,7 @@ class LocalRecordOwner:
                 if self.placement_facts is not None
                 else ""
             ),
-            config_digest=(
-                self.placement_facts.config_digest if self.placement_facts is not None else ""
-            ),
+            config_digest="",
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -768,10 +765,7 @@ class LocalRecordOwner:
                 int(time.time() * 1000) + self.request.timeout_ms if self.request.timeout_ms else 0
             ),
         )
-        # `environment_spec_digest` and `config_digest` stay EMPTY on the local door and
-        # that is a statement: a bare-venv run has no measured environment document, and
-        # minting a plausible digest for one would be the fabrication class this runtime
-        # exists to prevent.
+        # `config_digest` stays EMPTY. Model configuration is bound and verified separately.
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
@@ -1000,9 +994,7 @@ def weightless_release_documents(
     entries = endpoint_descriptor.get("entrypoints")
     if not isinstance(entries, list):
         raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
-    visible: list[Mapping[str, Any]] = [
-        entry for entry in entries if isinstance(entry, Mapping) and entry.get("hidden") is False
-    ]
+    visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
     modeled = sorted(str(entry.get("name", "")) for entry in visible if entry.get("models"))

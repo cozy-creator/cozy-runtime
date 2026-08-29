@@ -4,7 +4,7 @@ The EndpointDescriptor (cr-003) is the SOURCE-STABLE surface; this is the other 
 One contract per EXACT candidate — (endpoint release, model factory, artifact snapshot,
 artifact configs, hardware variant) — derived by EXECUTING the author's `load()` under the
 cr-004 harness, never by trusting a declaration. It is stored apart from
-`endpoint.descriptor.json` and never merges into it.
+the EndpointDescriptor and never merges into it.
 
 Two properties are structural rather than checked:
 

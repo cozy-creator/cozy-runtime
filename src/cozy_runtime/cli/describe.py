@@ -1,8 +1,7 @@
 """`cozy-runtime describe` — emit the EndpointDescriptor without loading weights.
 
-READ-ONLY by default: an inspection command never silently dirties a repository
-(cozy-runtime-cli.md). `--write-descriptor` commits the pretty descriptor, `--check` is the
-CI/build staleness verb and exits 13 naming which pair diverged.
+Always read-only. Full `--json` output is the canonical publication input; there is no
+committed descriptor projection and therefore no writer or staleness-check mode.
 
 Weights are structurally unreachable here, not merely unrequested: discovery imports the app
 and freezes it, and a model parameter is a TYPE. Nothing on this path constructs a `Loader`,
@@ -21,17 +20,8 @@ from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 
-FLAGS = ("--write-descriptor", "--check")
 
-
-def run(function: str | None, opts: Options, *, write: bool, check: bool) -> Result:
-    if write and check:
-        raise CliError(
-            "usage",
-            "--write-descriptor and --check are opposites",
-            "--check verifies the committed descriptor; --write-descriptor replaces it",
-            Exit.usage,
-        )
+def run(function: str | None, opts: Options) -> Result:
     project = Path(opts.dir).expanduser()
     try:
         found = discover(project)
@@ -43,46 +33,9 @@ def run(function: str | None, opts: Options, *, write: bool, check: bool) -> Res
             "an endpoint's surface must be valid before it can be described (§1.0)",
             Exit.validation,
         ) from exc
-    digest = desc.descriptor_digest(body)
-
-    if check:
-        return _check(project, body)
-    if write:
-        target = desc.write(project, body)
-        return Result(
-            rows=(
-                ("wrote", str(target.relative_to(project) if project != Path() else target)),
-                ("application", str(body["application"])),
-                (desc.DIGEST_KEY, digest),
-                ("bytes", str(target.stat().st_size)),
-            ),
-            document=body,
-            next=(f"git add {desc.FILE} — the surface contract is reviewed in the diff",),
-        )
     if function is not None:
         return _one(body, function)
     return _list(body)
-
-
-def _check(project: Path, derived: Mapping[str, Json]) -> Result:
-    try:
-        committed = desc.read(project)
-        desc.compare(committed, derived, ("the committed descriptor", "this release"))
-    except desc.StaleDescriptor as exc:
-        raise CliError(
-            "conflict",
-            str(exc),
-            "run `cozy-runtime describe --write-descriptor` and commit the result; if the "
-            "source did not change, the two environments derive different surfaces and one "
-            "of them is broken",
-            Exit.conflict,
-        ) from exc
-    return Result(
-        rows=(
-            ("descriptor", "current"),
-            (desc.DIGEST_KEY, desc.descriptor_digest(derived)),
-        )
-    )
 
 
 def _list(body: Mapping[str, Json]) -> Result:
@@ -112,10 +65,8 @@ def _list(body: Mapping[str, Json]) -> Result:
     return Result(
         rows=tuple(rows),
         document=body,
-        next=(
-            "cozy-runtime describe <function> — that function's schemas",
-            "cozy-runtime describe --write-descriptor — commit the surface contract",
-        ),
+        canonical_json=desc.canonical_bytes(body),
+        next=("cozy-runtime describe <function> — that function's schemas",),
     )
 
 
@@ -164,7 +115,7 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
     rows: list[tuple[str, str]] = [("function", f"{doc['name']} ({kind})")]
     view: dict[str, Json] = dict(doc)
     if kind == "job":
-        # DERIVED here, and only here. It may not enter the committed descriptor — a
+        # DERIVED here, and only here. It may not enter the published descriptor — a
         # `sha256:` inside a source-stable surface leaves a reader no way to know which
         # clock it came from — but a RecordOwner dispatches by it, so a verb that would not
         # say it forces every consumer to re-derive the canonical form (cl-004 measured one
@@ -198,7 +149,10 @@ def _fields(struct: Json) -> list[str]:
     out = []
     for field in _as_list(struct["fields"]):
         assert isinstance(field, dict)
-        bits = [f"    {field['name']}: {_type(field['type'])}", str(field["wire"])]
+        bits = [
+            f"    {field['name']}: {_type(field['type'])}",
+            str(field.get("wire", "required")),
+        ]
         if (constraints := field.get("constraints")) is not None:
             assert isinstance(constraints, dict)
             bits.append("(" + ", ".join(f"{k}={v}" for k, v in sorted(constraints.items())) + ")")
