@@ -633,7 +633,7 @@ def main() -> int:
         assert receipt["worker_listener_bound"] and receipt["media_listener_bound"]
         assert receipt["worker_foreign_credential_refused"]
         assert receipt["media_foreign_credential_refused"]
-        assert [row["device_name"] for row in receipt["runtime_gpus"]] == ["NVIDIA H200"]
+        assert receipt["runtime_gpus"] == []
         for field in RETIRED_RECEIPT_FIELDS:
             assert field not in receipt, f"{field} survived the closure retirement"
 

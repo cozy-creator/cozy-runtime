@@ -23,7 +23,7 @@ mkdir -p "$proof_root/context/wheels"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/context/wheels" "$repo"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/context/wheels" \
     "$repo/proofs/fixtures/cli-project"
-cp "$here/Dockerfile" "$here/pod.py" "$here/hub.py" "$here/nvidia-smi" \
+cp "$here/Dockerfile" "$here/pod.py" "$here/hub.py" \
     "$repo/proofs/support/proof_data.py" "$proof_root/context/"
 
 nice -n 19 docker build --quiet -t "$image" "$proof_root/context" >/dev/null
