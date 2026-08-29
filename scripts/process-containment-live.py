@@ -96,8 +96,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmp", default="/tmp/cozy-process-containment")
     parser.add_argument("--observe", type=float, default=10.0)
+    parser.add_argument("--executor-uid", type=int, default=-1)
     parser.add_argument("--expect-nonzero-capability-refusal", action="store_true")
     args = parser.parse_args()
+    target_uid = os.geteuid() if args.executor_uid < 0 else args.executor_uid
+    if target_uid != os.geteuid() and os.geteuid() != 0:
+        raise RuntimeError("a uid-split containment proof must start as root")
     if args.expect_nonzero_capability_refusal:
         try:
             proctree._prove_zero_cgroup_capabilities()
@@ -110,14 +114,17 @@ def main() -> int:
     root = Path(args.tmp)
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
-    prove_unwritable_refusals(root)
+    if target_uid != os.geteuid():
+        os.chown(root, target_uid, target_uid)
+    if target_uid == os.geteuid():
+        prove_unwritable_refusals(root)
     home = root / "home"
     home.mkdir()
     helper_file = root / "detached.pid"
     release_file = root / "release-leader"
 
     proctree.arm_subreaper()
-    scope = proctree.ProcessTreeScope(secrets.token_hex(32))
+    scope = proctree.ProcessTreeScope(secrets.token_hex(32), target_uid)
     atexit.register(cleanup_scope, scope)
     base_env = dict(os.environ)
     base_env[EXECUTOR_SCOPE_ENV] = scope.token
@@ -139,6 +146,8 @@ def main() -> int:
         base_env=(),
         cozy_home=home,
         device_process=lambda _pid: accel.ProcessMemory("absent", 0),
+        executor_uid=target_uid if target_uid != os.geteuid() else -1,
+        executor_gid=target_uid if target_uid != os.geteuid() else -1,
     )
     provisional = OwnerRecord(scope)
     supervision._write_owner(provisional)
@@ -149,6 +158,8 @@ def main() -> int:
         imposed={EXECUTOR_SCOPE_ENV: scope.token},
         cwd=str(root),
         scope=scope,
+        uid=target_uid if target_uid != os.geteuid() else -1,
+        gid=target_uid if target_uid != os.geteuid() else -1,
     )
     leader_pid = spawned.pid
     leader = proctree.process_identity(spawned.pid)
@@ -159,17 +170,21 @@ def main() -> int:
     proctree.signal_process(leader, signal.SIGCONT)
     detached = proctree.process_identity(wait_file(helper_file, args.observe))
 
-    wrong_scope = proctree.ProcessTreeScope(secrets.token_hex(32))
-    atexit.register(cleanup_scope, wrong_scope)
-    wrong_env = dict(os.environ)
-    wrong_env[EXECUTOR_SCOPE_ENV] = wrong_scope.token
-    wrong_pid = os.posix_spawn(
-        sys.executable,
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        wrong_env,
-        setpgroup=0,
-    )
-    wrong = proctree.process_identity(wrong_pid)
+    wrong: proctree.ProcessIdentity | None = None
+    if target_uid == os.geteuid():
+        wrong_scope = proctree.ProcessTreeScope(secrets.token_hex(32), target_uid)
+        atexit.register(cleanup_scope, wrong_scope)
+        wrong_spawned = spawn.spawn_executor(
+            python=sys.executable,
+            module_argv=["-c", "import time; time.sleep(60)"],
+            base_env=tuple(sorted(os.environ.items())),
+            imposed={EXECUTOR_SCOPE_ENV: wrong_scope.token},
+            cwd=str(root),
+            scope=wrong_scope,
+        )
+        wrong = proctree.process_identity(wrong_spawned.pid)
+        proctree.wait_process_stopped(wrong, seconds=args.observe)
+        proctree.signal_process(wrong, signal.SIGCONT)
 
     release_file.touch()
     os.waitpid(leader_pid, 0)
@@ -187,6 +202,8 @@ def main() -> int:
         base_env=(),
         cozy_home=home,
         device_process=lambda _pid: accel.ProcessMemory("absent", 0),
+        executor_uid=target_uid if target_uid != os.geteuid() else -1,
+        executor_gid=target_uid if target_uid != os.geteuid() else -1,
     )
     try:
         recorded = successor._read_owner()
@@ -199,20 +216,26 @@ def main() -> int:
         wait_absent(detached, args.observe)
         if successor._read_owner() is not None:
             raise RuntimeError("leaderless owner did not clear after exact reclaim")
-        if not proctree.same_process(wrong):
+        if wrong is not None and not proctree.same_process(wrong):
             raise RuntimeError("a wrong-token sibling was killed as collateral")
     finally:
         successor.close()
-        if proctree.same_process(wrong):
+        if wrong is not None and proctree.same_process(wrong):
             proctree.signal_process(wrong, signal.SIGKILL)
-        wait_absent(wrong, args.observe)
+        if wrong is not None:
+            wait_absent(wrong, args.observe)
 
     print("process_backend=process_tree")
-    print("writable_cgroup_lineage_refused=true")
-    print("writable_cgroup_migration_refused=true")
+    print(
+        "writable_cgroup_lineage_refused=true"
+        if target_uid == os.geteuid()
+        else "cgroup_lineage_read_only_checked_as_trusted_root=true"
+    )
+    if target_uid == os.geteuid():
+        print("writable_cgroup_migration_refused=true")
     print("spawn_bound_before_continue=true")
     print(f"leader_gone=true detached_reclaimed={detached.pid}")
-    print("wrong_token_survived=true")
+    print("wrong_token_survived=true" if wrong is not None else "dedicated_uid_domain=true")
     print("durable_owner_cleared=true")
     return 0
 

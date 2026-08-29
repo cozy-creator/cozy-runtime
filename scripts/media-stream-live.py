@@ -208,7 +208,7 @@ def killed_midmux() -> None:
     with tempfile.TemporaryDirectory(prefix="cozy-media-kill-") as directory:
         root = Path(directory)
         proctree.arm_subreaper()
-        scope = proctree.ProcessTreeScope(secrets.token_hex(32))
+        scope = proctree.ProcessTreeScope(secrets.token_hex(32), os.geteuid())
         environment = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
         process = spawn.spawn_executor(
             python=sys.executable,
