@@ -98,7 +98,7 @@ def run(case: Case) -> dict[str, Any]:
 
 
 def _bare(case: Case) -> Any:
-    from cozy_runtime.author._loader import Artifact, Config
+    from cozy_runtime.author import Artifact, Config
 
     return Artifact(f"corpus/{case.name}@1", {}, Config(dict(case.config)))
 

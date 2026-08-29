@@ -24,8 +24,7 @@ from typing import Any, Literal
 
 import torch
 
-from cozy_runtime.author import Model
-from cozy_runtime.author._loader import Artifact, Config, TensorSpec
+from cozy_runtime.author import Artifact, Config, Model, TensorSpec
 from cozy_runtime.internal.derive import RichCensus, component_members, walk
 
 Verdict = Literal["derived-correct", "typed-refusal", "typed-harness-gap", "silent-wrong"]

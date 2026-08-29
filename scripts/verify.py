@@ -28,6 +28,7 @@ import msgspec
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
+sys.path.insert(0, str(ROOT / "proofs" / "internal"))
 sys.path.insert(0, str(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
 import tiny_artifacts as art  # noqa: E402

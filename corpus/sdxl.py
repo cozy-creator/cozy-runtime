@@ -18,8 +18,7 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-from cozy_runtime.author import Model, uses_components
-from cozy_runtime.author._loader import Config, Loader
+from cozy_runtime.author import Config, Loader, Model, uses_components
 
 
 def _clip(width: int, layers: int) -> nn.Module:

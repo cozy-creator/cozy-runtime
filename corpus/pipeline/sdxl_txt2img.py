@@ -20,8 +20,7 @@ from typing import Annotated, Any
 import msgspec
 from corpus.sdxl_pipeline import SdxlPipelineModel
 
-from cozy_runtime.author import Context, ImageAsset, ImageFrame, Outputs, Telemetry
-from cozy_runtime.author._app import App
+from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs, Telemetry
 
 app = App()
 

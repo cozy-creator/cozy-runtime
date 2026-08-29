@@ -52,6 +52,7 @@ KERNEL = f"""
 import random, resource, sys, tempfile, time
 from pathlib import Path
 sys.path.insert(0, 'proofs/fixtures/tiny-models')
+sys.path.insert(0, 'proofs/internal')
 import tiny_artifacts as art
 import tiny_h3 as h3
 import tiny_sdxl as ep

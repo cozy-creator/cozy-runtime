@@ -16,8 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cozy_runtime.author import Model, uses_components
-from cozy_runtime.author._loader import Config, Loader
+from cozy_runtime.author import Config, Loader, Model, uses_components
 
 
 class SdxlUnetPipeline:

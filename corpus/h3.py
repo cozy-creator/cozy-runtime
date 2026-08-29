@@ -30,8 +30,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
-from cozy_runtime.author import Model, uses_components
-from cozy_runtime.author._loader import Config, Loader
+from cozy_runtime.author import Config, Loader, Model, uses_components
 from cozy_runtime.internal import canonical
 
 Task = Literal["fl2va", "ref2va"]
