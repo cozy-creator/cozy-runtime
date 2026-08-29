@@ -61,7 +61,7 @@ def _value(node: Any, path: str, spool: Path) -> Any:
         return _primitive(node, path)
     if not isinstance(node, dict):
         raise _Stop(f"{path or 'payload'}: unrecognized schema node")
-    if "struct" in node:
+    if "fields" in node:
         return _struct(node, path, spool)
     if "asset" in node:
         return _asset(str(node["asset"]), path, spool)

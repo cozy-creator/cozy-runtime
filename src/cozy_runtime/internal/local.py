@@ -88,6 +88,22 @@ class StagedWeightlessRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalPlacementFacts:
+    """Exact qualified release facts for a production-shaped local protocol run.
+
+    This changes only what the local RecordOwner puts in the ordinary PlacementSpec and
+    InvocationSpec.  The same worker convergence, executor and attempt path consume it.
+    """
+
+    environment_spec_digest: str
+    installed_environment_receipt_digest: str
+    descriptor_digest: str
+    config_digest: str
+    environment_root: Path
+    wheelhouse_manifest: Path
+
+
+@dataclass(frozen=True, slots=True)
 class WeightlessReleaseDocuments:
     """Exact bytes behind both local staging and pre-spawn subject resolution."""
 
@@ -172,12 +188,20 @@ class SliceOutcome:
     result: dict[str, Any] | None = None
     result_schema_digest: str = ""
     invocation: dict[str, Any] = field(default_factory=dict)
+    invocation_canonical_bytes: bytes = b""
     accepted: dict[str, Any] = field(default_factory=dict)
     manifest: list[dict[str, Any]] = field(default_factory=list)
     #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
     #: journaled before the terminal named it. `manifest_id` on the terminal IS its digest.
     publication: dict[str, Any] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
+    terminal_digest: str = ""
+    terminal_canonical_bytes: bytes = b""
+    placement_set_digest: str = ""
+    placement_set_canonical_bytes: bytes = b""
+    placement_spec_digest: str = ""
+    worker_resources: dict[str, Any] = field(default_factory=dict)
+    accelerator_qualification: dict[str, Any] = field(default_factory=dict)
     ledger: dict[str, Any] = field(default_factory=dict)
     reconciliation: dict[str, Any] = field(default_factory=dict)
     journal: list[dict[str, Any]] = field(default_factory=list)
@@ -265,6 +289,7 @@ class LocalRecordOwner:
         workspace: Path,
         *,
         release_id: str,
+        placement_facts: LocalPlacementFacts | None = None,
         model_object_set: bytes = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}',
         auto_ack: bool = True,
         on_progress: Any = None,
@@ -277,6 +302,7 @@ class LocalRecordOwner:
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
         self.release_id = release_id
+        self.placement_facts = placement_facts
         self.model_object_set = model_object_set
         self.auto_ack = auto_ack
         self.ready_timeout = ready_timeout
@@ -299,6 +325,10 @@ class LocalRecordOwner:
         self.reports: list[pb.ObservedWorkerState] = []
         self.spec_digest = b""
         self.spec_document: dict[str, Any] = {}
+        self.spec_canonical_bytes = b""
+        self.worker_resources = pb.WorkerResources()
+        self.placement_set_digest = b""
+        self.placement_set_canonical_bytes = b""
         self.done = threading.Event()
         self.marks: dict[str, float] = {"start": time.perf_counter()}
         self.grant_dir = workspace / "grants"
@@ -440,6 +470,7 @@ class LocalRecordOwner:
             return
         self.generation = ack.control_stream_generation
         self.boot_id = ack.worker_boot_id
+        self.worker_resources.CopyFrom(ack.resources)
         self.marks["registered"] = time.perf_counter()
 
     def _on_snapshot(self, snapshot: pb.WorkerSnapshot) -> None:
@@ -604,10 +635,21 @@ class LocalRecordOwner:
                     spec=pb.PlacementSpec(
                         # PROVENANCE only — the worker never resolves it (§1).
                         endpoint_release_id=self.release_id,
-                        # The local door names NO environment receipt, and that is a
-                        # statement: a bare-venv run has no measured installed environment,
-                        # and a spec that named one would make STAGED unspeakable for a
-                        # placement this door can actually serve.
+                        environment_spec_digest=(
+                            documents.raw(self.placement_facts.environment_spec_digest)
+                            if self.placement_facts is not None
+                            else b""
+                        ),
+                        installed_environment_receipt_digest=(
+                            documents.raw(self.placement_facts.installed_environment_receipt_digest)
+                            if self.placement_facts is not None
+                            else b""
+                        ),
+                        descriptor_digest=(
+                            documents.raw(self.placement_facts.descriptor_digest)
+                            if self.placement_facts is not None
+                            else b""
+                        ),
                         binding_plans=[
                             pb.ArtifactSubject(
                                 subject_id=plan_id,
@@ -628,6 +670,8 @@ class LocalRecordOwner:
             ]
         )
         canonical_bytes, set_digest = documents.identity(placement_set)
+        self.placement_set_digest = set_digest
+        self.placement_set_canonical_bytes = canonical_bytes
         directive.placement_set.CopyFrom(
             pb.DesiredPlacementSet(
                 placement_set_digest=set_digest,
@@ -702,9 +746,19 @@ class LocalRecordOwner:
         plan_id = "" if self.request.kind == "job" else self._plan_id()
         self.grant_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        body = json.dumps(self.request.payload).encode()
+        # Invocation payload identity is the exact canonical typed-argument document. A
+        # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
+        body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
             endpoint_release_id=self.release_id,
+            environment_spec_digest=(
+                self.placement_facts.environment_spec_digest
+                if self.placement_facts is not None
+                else ""
+            ),
+            config_digest=(
+                self.placement_facts.config_digest if self.placement_facts is not None else ""
+            ),
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -731,6 +785,7 @@ class LocalRecordOwner:
             spec.serving.attempt_binding_id = plan_id
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
+        self.spec_canonical_bytes = canonical_bytes
         self.spec_document = documents.read(canonical_bytes, pb.InvocationSpec)
         self.marks["dispatched"] = time.perf_counter()
         self._send(
@@ -1051,6 +1106,7 @@ def run_slice(
     workspace: Path,
     release_id: str,
     endpoint_descriptor: Mapping[str, Any] | None = None,
+    placement_facts: LocalPlacementFacts | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
@@ -1077,6 +1133,8 @@ def run_slice(
         staged = stage_weightless_release(config.cozy_home, endpoint_descriptor)
         plans.update(staged.plans)
         plan_refs.update(staged.plan_refs)
+    if placement_facts is not None and staged is None:
+        raise RuntimeError("qualified placement facts require a staged endpoint closure")
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
         request,
@@ -1084,6 +1142,7 @@ def run_slice(
         plan_refs,
         workspace,
         release_id=release_id,
+        placement_facts=placement_facts,
         model_object_set=(
             staged.artifact_object_set.read_bytes()
             if staged is not None
@@ -1101,6 +1160,16 @@ def run_slice(
             options,
             artifact_store=staged.artifact_store,
             artifact_object_set=staged.artifact_object_set,
+            environment_root=(
+                placement_facts.environment_root
+                if placement_facts is not None
+                else options.environment_root
+            ),
+            base_manifest=(
+                placement_facts.wheelhouse_manifest
+                if placement_facts is not None
+                else options.base_manifest
+            ),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
@@ -1149,6 +1218,7 @@ def _collect(
             "digest": _spell(record_owner.spec_digest),
             "document": record_owner.spec_document,
         }
+        outcome.invocation_canonical_bytes = record_owner.spec_canonical_bytes
 
     if record_owner.accepted is not None:
         accepted = record_owner.accepted
@@ -1172,6 +1242,8 @@ def _collect(
             "executor_generation": accepted.executor_generation,
         }
     if record_owner.terminal is not None:
+        outcome.terminal_digest = _spell(record_owner.terminal.outcome_digest)
+        outcome.terminal_canonical_bytes = bytes(record_owner.terminal.outcome_canonical_bytes)
         body = documents.read(record_owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         outcome.terminal = body
         # The triage read, exactly as cl-006 will do it: take the opaque subject off the
@@ -1208,6 +1280,22 @@ def _collect(
             path = record_owner.destination(str(row.get("output_id", "")))
             if path.is_file():
                 outcome.outputs[str(row["output_id"])] = str(path)
+
+    outcome.placement_set_digest = _spell(record_owner.placement_set_digest)
+    outcome.placement_set_canonical_bytes = record_owner.placement_set_canonical_bytes
+    outcome.worker_resources = documents.body(record_owner.worker_resources)
+    placement = next(
+        (
+            item
+            for report in reversed(record_owner.reports)
+            for item in report.placements
+            if item.placement_id == LOCAL_PLACEMENT
+        ),
+        None,
+    )
+    if placement is not None:
+        outcome.placement_spec_digest = _spell(placement.placement_spec_digest)
+        outcome.accelerator_qualification = documents.body(placement.accelerator)
 
     marks = record_owner.marks
     outcome.timings = {

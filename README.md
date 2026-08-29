@@ -342,6 +342,27 @@ minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM a
 immutable `NativeWheelQualification/1` output binds these measurements to the WHM, environment
 spec, installed receipt and overlay content digests, but carries no unmeasured realization claim.
 
+`cozy-acceptance-proof` closes the remaining per-release admission sample without introducing a
+second executor. `fixture REQUEST.json PAYLOAD.json` derives a deterministic neutral payload from
+the exact descriptor; `observe REQUEST.json OBSERVATION.json` runs only after Tensorhub has sent
+that payload as an ordinary Worker attempt with `boot_warmup=false`. The observer re-joins the
+exact endpoint execution, binding release, EES/EndpointBundle/RWS/WHM/overlay receipt, placement,
+InvocationSpec, AttemptAccepted and AttemptOutcome and emits bounded canonical
+`cozy.runtime.ExecutionObservation/1`. It derives the canonical base-worker profile label and
+requires the authenticated ClaimAck control-Runtime digest to equal the WHM's `cozy-runtime`
+WheelFact. All local documents must remain beneath one explicit `input_root`; environment and
+TensorFS stores are separately declared roots. A model-bound request must have the exact TensorFS
+closure available or refuses—it never substitutes a weightless proof.
+
+`worker_resources`, `accelerator_qualification`, and `attempt_accepted` are exact existing
+worker-protocol projections supplied by the authenticated RecordOwner session; the local CLI
+validates their shape and joins them but does not authenticate their transport origin. Tensorhub
+does that, separately aborts the qualification output transaction against the terminal manifest,
+and alone authors `ModelAdmissionDecision`. Consequently Runtime evidence contains no candidate,
+qualification, provider, cost, reclaim, or `outputs_aborted` claim. Failure observations are
+banked honestly; only Tensorhub policy may turn a successful, execution-started, schema-valid,
+fully-aborted sample into admission.
+
 The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
 it verifies the overlay/base-family join, compares the exact descriptor with the

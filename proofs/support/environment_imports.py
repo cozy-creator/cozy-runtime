@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from importlib.machinery import PathFinder
 
 
 class ProbeFailure(RuntimeError):
@@ -16,6 +17,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ProbeFailure("usage: environment_imports.py OVERLAY cpu|cuda")
     sys.path.append(args[0])
     if args[1] == "cpu":
+        for metadata in ("endpoint", "pyproject", "uv"):
+            if PathFinder.find_spec(metadata, [args[0]]) is not None:
+                raise ProbeFailure(f"project metadata {metadata!r} became an import root")
         import proof_environment_project
         import proof_environment_resolved
         import proof_environment_wheelhouse
