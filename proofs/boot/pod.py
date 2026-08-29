@@ -53,7 +53,7 @@ from typing import Any
 import grpc
 import hub
 
-from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR, documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -301,7 +301,6 @@ class RecordOwner:
                     record_owner_id="cr-049-boot-proof",
                     wire_minor=WIRE_MINOR,
                     proof=token,
-                    wire_schema_digest=SCHEMA_DIGEST_RAW,
                 )
             )
         )
@@ -338,7 +337,6 @@ class RecordOwner:
         if kind == "claim_ack":
             ack = frame.claim_ack
             assert ack.accepted, f"Claim REFUSED: {pb.ClaimRejection.Name(ack.rejection)}"
-            assert ack.wire_schema_digest == SCHEMA_DIGEST_RAW
             self.generation = ack.control_stream_generation
             self.worker_boot_id = ack.worker_boot_id
             self.claim_ack = ack
@@ -632,7 +630,6 @@ def main() -> int:
         assert receipt["observed_renter_token_sha256"] == [token_hash]
         assert receipt["worker_internal_port"] == WORKER_PORT
         assert receipt["media_internal_port"] == MEDIA_PORT
-        assert receipt["worker_wire_schema_digest"] == SCHEMA_DIGEST
         assert receipt["worker_listener_bound"] and receipt["media_listener_bound"]
         assert receipt["worker_foreign_credential_refused"]
         assert receipt["media_foreign_credential_refused"]

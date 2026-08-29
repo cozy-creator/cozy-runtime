@@ -42,7 +42,6 @@ from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.grants import Authorizer, GrantRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
-from cozy_runtime.protocol import SCHEMA_DIGEST
 from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -951,7 +950,6 @@ def main() -> int:
         assert receipt["media_foreign_credential_refused"] is True
         assert receipt["pod_boot_id"] == boot_id
         assert receipt["observed_renter_token_sha256"] == [token]
-        assert receipt["worker_wire_schema_digest"] == SCHEMA_DIGEST
         assert "provider_pod_id" not in receipt
         # An EMPTY boot has staged nothing, so the receipt asserts nothing about a closure;
         # per-placement observed state is the rev-2 wire's job, continuously. And the pod

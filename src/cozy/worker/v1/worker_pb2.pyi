@@ -119,7 +119,6 @@ class ClaimRejection(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLAIM_REJECTION_RELEASE_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_UNSUPPORTED_MINOR: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_UNDURABLE: _ClassVar[ClaimRejection]
-    CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH: _ClassVar[ClaimRejection]
 
 class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -256,7 +255,6 @@ CLAIM_REJECTION_WORKER_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_RELEASE_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_UNSUPPORTED_MINOR: ClaimRejection
 CLAIM_REJECTION_UNDURABLE: ClaimRejection
-CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH: ClaimRejection
 FAULT_KIND_UNSPECIFIED: FaultKind
 FAULT_KIND_BINDING_UNAVAILABLE: FaultKind
 FAULT_KIND_BINDING_DEGRADED: FaultKind
@@ -344,7 +342,7 @@ class WorkerFrame(_message.Message):
     def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResultFrame, _Mapping]] = ...) -> None: ...
 
 class Claim(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof", "wire_schema_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -352,7 +350,6 @@ class Claim(_message.Message):
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     PROOF_FIELD_NUMBER: _ClassVar[int]
-    WIRE_SCHEMA_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -360,11 +357,10 @@ class Claim(_message.Message):
     worker_id: str
     wire_minor: int
     proof: bytes
-    wire_schema_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., proof: _Optional[bytes] = ..., wire_schema_digest: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., proof: _Optional[bytes] = ...) -> None: ...
 
 class ClaimAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "accepted", "rejection", "wire_minor", "worker_id", "worker_instance_id", "worker_release_id", "control_runtime_digest", "git_commit", "resources", "wire_schema_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "accepted", "rejection", "wire_minor", "worker_id", "worker_instance_id", "worker_release_id", "control_runtime_digest", "git_commit", "resources")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -377,7 +373,6 @@ class ClaimAck(_message.Message):
     CONTROL_RUNTIME_DIGEST_FIELD_NUMBER: _ClassVar[int]
     GIT_COMMIT_FIELD_NUMBER: _ClassVar[int]
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
-    WIRE_SCHEMA_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -390,8 +385,7 @@ class ClaimAck(_message.Message):
     control_runtime_digest: str
     git_commit: str
     resources: WorkerResources
-    wire_schema_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., accepted: bool = ..., rejection: _Optional[_Union[ClaimRejection, str]] = ..., wire_minor: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., worker_release_id: _Optional[str] = ..., control_runtime_digest: _Optional[str] = ..., git_commit: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., wire_schema_digest: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., accepted: bool = ..., rejection: _Optional[_Union[ClaimRejection, str]] = ..., wire_minor: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., worker_release_id: _Optional[str] = ..., control_runtime_digest: _Optional[str] = ..., git_commit: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ...) -> None: ...
 
 class BootFailure(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "worker_id", "worker_instance_id", "reason", "detail", "resources", "control_runtime_digest", "worker_release_id")

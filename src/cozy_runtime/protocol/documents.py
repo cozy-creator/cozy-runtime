@@ -164,66 +164,6 @@ def document(message: Message) -> dict[str, Any]:
     return rendered
 
 
-#: The `format` tag of the schema's own document. It is not a message in `worker.proto` —
-#: it is a document ABOUT `worker.proto` — so it has no descriptor to read the name off.
-WIRE_SCHEMA_FORMAT = "cozy.worker.v1.WireSchema/1"
-
-
-def _normalize_descriptor(fdp: Any) -> None:
-    """Reduce a rebuilt `FileDescriptorProto` to the facts that are WIRE MEANING (#536c).
-
-    A descriptor handed back by a runtime is the schema PLUS whatever that runtime chose to
-    reconstruct, so two things come out before it is digested or the identity depends on WHO
-    rebuilt it — the one thing a fence may never do:
-
-    * `source_code_info` is comments. A fence that fired on every prose edit would be switched
-      off inside a week.
-    * `json_name` is the protobuf-JSON camelCase mapping, DERIVED mechanically from the field
-      name and carrying no wire meaning. Go's `protodesc.ToFileDescriptorProto` populates it on
-      every field and Python's `CopyToProto` leaves it unset — a 10 KB, 200-field disagreement
-      that would have refused every correct cross-language handshake.
-    """
-    fdp.ClearField("source_code_info")
-
-    def strip(messages: Any) -> None:
-        for message in messages:
-            for field in message.field:
-                field.ClearField("json_name")
-            strip(message.nested_type)
-
-    strip(fdp.message_type)
-
-
-def wire_schema_document() -> bytes:
-    """The canonical bytes of THIS file set's own `cozy.worker.v1.WireSchema/1` (#530-A1).
-
-    THE FENCE IS DERIVED, NOT DECLARED. `SCHEMA_DIGEST` in `wire_identity.py` is a constant
-    regen.sh wrote, and a constant can agree while the bytes disagree — which is the whole of
-    what `WIRE_MINOR` got wrong. This recomputes the identity from the descriptor the vendored
-    binding actually carries, so a stale copy cannot spell the digest without BEING the schema
-    it names.
-
-    The document-version map rides in the document because a document's version IS wire
-    meaning (an `AttemptOutcomeBody/3` is not an `AttemptOutcomeBody/2`) and it lives in the
-    writer rather than the descriptor — the one schema fact the descriptor cannot carry.
-    """
-    from google.protobuf import descriptor_pb2
-
-    from cozy.worker.v1 import worker_pb2
-
-    fdp = descriptor_pb2.FileDescriptorProto()
-    worker_pb2.DESCRIPTOR.CopyToProto(fdp)
-    _normalize_descriptor(fdp)
-    rendered = body(fdp)
-    if "format" in rendered or "document_versions" in rendered:
-        raise DocumentError("unknown_field", "reserved keys collided with descriptor fields")
-    rendered["document_versions"] = [
-        {"document": name, "version": version} for name, version in sorted(DOC_VERSION.items())
-    ]
-    rendered["format"] = WIRE_SCHEMA_FORMAT
-    return canonical.write(rendered)
-
-
 def embedded_document_digest(sub: dict[str, Any], full_name: str) -> bytes:
     """The raw digest of a document NESTED inside another (#510g).
 

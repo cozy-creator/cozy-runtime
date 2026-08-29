@@ -47,13 +47,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from cozy_runtime.internal.readiness import WORKER_TLS_SERVER_NAME  # noqa: E402
-from cozy_runtime.protocol import (  # noqa: E402
-    SCHEMA_DIGEST,
-    SCHEMA_DIGEST_RAW,
-    WIRE_MINOR,
-    WIRE_SCHEMA_REV,
-    documents,
-)
+from cozy_runtime.protocol import WIRE_MINOR, documents  # noqa: E402
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc  # noqa: E402
 
@@ -222,10 +216,6 @@ class Hub:
             record_owner_id=self.record_owner_id,
             wire_minor=WIRE_MINOR,
             proof=token.encode(),
-            # THE SCHEMA FENCE, sent by BOTH ends and checked before any other body field
-            # (#536b). A harness that omitted it would be indistinguishable from a stale
-            # pre-rev-2 RecordOwner, and the worker would refuse it — which is the arm.
-            wire_schema_digest=SCHEMA_DIGEST_RAW,
         )
         outbound.put(pb.RecordOwnerFrame(claim=claim))
         if claim_only:
@@ -325,17 +315,10 @@ class Hub:
         self.generation = ack.control_stream_generation
         self.boot_id = ack.worker_boot_id
         self.boots.append(ack.worker_boot_id)
-        # THE OTHER DIRECTION OF THE FENCE (#536b): the worker answers with its own digest,
-        # and a RecordOwner that does not check it has only fenced one side.
-        if ack.wire_schema_digest != SCHEMA_DIGEST_RAW:
-            raise RuntimeError(
-                f"the worker speaks schema sha256:{ack.wire_schema_digest.hex()} and this "
-                f"harness speaks {SCHEMA_DIGEST}"
-            )
         print(
             f"[hub] ClaimAck boot={ack.worker_boot_id} "
             f"generation={ack.control_stream_generation} minor={ack.wire_minor} "
-            f"schema_rev={WIRE_SCHEMA_REV} device={ack.resources.device_name!r} "
+            f"device={ack.resources.device_name!r} "
             f"backend={ack.resources.backend!r} unreadable={list(ack.resources.unreadable)}",
             flush=True,
         )
@@ -1058,25 +1041,8 @@ def terminal_body(terminal: pb.AttemptOutcome) -> dict[str, Any]:
 
 
 def section_fixtures(args: argparse.Namespace) -> None:
-    """The copied bindings and this writer against worker-protocol's schema-rev-4 corpus."""
-    head("the SCHEMA FENCE is DERIVED here, not declared (#530-A1/#536b)")
-    derived = documents.wire_schema_document()
-    derived_id = "sha256:" + documents.digest_of(derived).hex()
-    frozen_schema = (FIXTURES / "canonical" / "wire_schema.json").read_bytes()
-    check(
-        "this binding's own descriptor digests to the constant regen.sh wrote",
-        derived_id == SCHEMA_DIGEST,
-        f"derived {derived_id[:30]}… == wire_identity.SCHEMA_DIGEST, schema rev "
-        f"{WIRE_SCHEMA_REV} — a stale copy cannot spell it without BEING the schema",
-    )
-    check(
-        "and reproduces the protocol's frozen WireSchema/1 document byte-for-byte",
-        derived == frozen_schema,
-        f"{len(derived)} B, normalized (source_code_info cleared, json_name stripped) with "
-        f"the document-version map {documents.DOC_VERSION} inside it",
-    )
-
-    head("the vendored schema-rev-4 bindings decode the frozen fixture corpus")
+    """The copied bindings and this writer against worker-protocol's frozen corpus."""
+    head("the vendored bindings decode the frozen fixture corpus")
     manifest = json.loads((FIXTURES / "MANIFEST.json").read_text())
     bad = []
     for name, row in manifest["positive"].items():
@@ -1095,10 +1061,6 @@ def section_fixtures(args: argparse.Namespace) -> None:
     head("canonical DOCUMENT identity: this writer reproduces the frozen bytes")
     wrong = []
     for name, row in manifest["canonical"].items():
-        if row["type"] == "cozy.worker.v1.WireSchema":
-            # NOT a message in worker.proto — a document ABOUT worker.proto. It has no
-            # descriptor to parse a `.bin` into, and the arm above already proved it.
-            continue
         frozen = (FIXTURES / "canonical" / f"{name}.json").read_bytes()
         cls = getattr(pb, row["type"].split(".")[-1])
         message = cls()
@@ -1110,9 +1072,8 @@ def section_fixtures(args: argparse.Namespace) -> None:
     check(
         "byte-identical canonical documents and ids",
         not wrong,
-        f"{len(manifest['canonical']) - 1} message documents + the schema document, "
-        f"{len(wrong)} divergent — the worker authors the same bytes worker-protocol froze, "
-        "with no shared code",
+        f"{len(manifest['canonical'])} message documents, {len(wrong)} divergent — "
+        "the worker authors the same bytes worker-protocol froze, with no shared code",
     )
 
     head("the reading side refuses what the writer cannot have produced")

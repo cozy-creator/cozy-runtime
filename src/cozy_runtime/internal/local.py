@@ -52,7 +52,7 @@ from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import SCHEMA_DIGEST_RAW, WIRE_MINOR, documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The one local deployment's owner-minted routing key (#446). Routing, never identity:
@@ -250,8 +250,8 @@ def redispatchable(body: Mapping[str, Any]) -> bool:
 class LocalRecordOwner:
     """The in-memory RECORDOWNER — the record-plane half of th-024, in this process.
 
-    It is a real RecordOwner in every way the worker can observe: it claims first (carrying
-    its `wire_schema_digest`), speaks only `cozy.worker.v1` frames under the three-field
+    It is a real RecordOwner in every way the worker can observe: it claims first, speaks
+    only `cozy.worker.v1` frames under the three-field
     envelope, RECOMPUTES the snapshot digest before acknowledging it, dispatches against the
     admission generation it last saw, and learns dispatchability the way a hub does — from a
     durable ObservedWorkerState's per-placement axes, not from a Python attribute.
@@ -309,11 +309,6 @@ class LocalRecordOwner:
             record_owner_epoch=self.record_owner_epoch,
             record_owner_id="local-run",
             wire_minor=WIRE_MINOR,
-            # THE SCHEMA FENCE, from BOTH ends (#536b). The local door speaks the same
-            # vendored file set as the worker it drives, so this is trivially equal here —
-            # and it is sent anyway, because a lane that skips the fence when it happens to
-            # be safe is a lane that never proves the fence works.
-            wire_schema_digest=SCHEMA_DIGEST_RAW,
         )
         self.host.deliver(pb.RecordOwnerFrame(claim=claim))
         threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()

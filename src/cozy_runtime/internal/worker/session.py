@@ -16,13 +16,6 @@ before any body field is read. LAUNCH TIER (single-owner): the epoch is a provis
 constant — a claim with a strictly higher epoch supersedes, an equal epoch from the same
 RecordOwner is a reconnect, anything else refuses typed.
 
-BEFORE the ownership fence comes the SCHEMA fence (#530-A1/#536): `Claim.wire_schema_digest`
-is compared against this file set's own `SCHEMA_DIGEST` before ANY other body field of the
-Claim is read, and the answering `ClaimAck` carries the worker's digest so the RecordOwner
-can make the same check in the other direction. A mismatch — or an ABSENCE, which is what a
-pre-rev-2 peer has to send — refuses `CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH` and the stream
-closes, instead of a stale peer misparsing a renumbered field several frames later.
-
 Threads, and why each exists: each accepted STREAM runs its conversation on the host's
 thread and must never do slow work (a cancel has to arrive while an attempt runs); the
 DEVICE LANE holds the single device lease and serializes attempts in arrival order — the
@@ -99,13 +92,7 @@ from cozy_runtime.internal.worker.plan import (
     PlanRefusal,
     PreparedModel,
 )
-from cozy_runtime.protocol import (
-    SCHEMA_DIGEST,
-    SCHEMA_DIGEST_RAW,
-    WIRE_MINOR,
-    WIRE_SCHEMA_REV,
-    documents,
-)
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -1050,10 +1037,6 @@ class Worker:
                 accepted=False,
                 rejection=reason,
                 wire_minor=WIRE_MINOR,
-                # A REFUSAL CARRIES THE DIGEST TOO. The peer has to be able to tell
-                # "you are stale" from "I am stale", and it cannot do that from a
-                # rejection code alone.
-                wire_schema_digest=SCHEMA_DIGEST_RAW,
             )
             ack.record_owner_epoch = claim.record_owner_epoch
             ack.control_stream_generation = self.fence.control_stream_generation
@@ -1061,30 +1044,6 @@ class Worker:
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
 
-        # THE SCHEMA FENCE, BEFORE ANY OTHER BODY FIELD (#530-A1/#536b). Not after the
-        # credential and not after the worker id: those are checks whose MEANING depends on
-        # the two ends agreeing what the fields are. A peer whose schema is not this one may
-        # have written `proof` at a number this binding reads as something else, so reading
-        # it first would be reading a field that does not exist.
-        #
-        # ABSENCE IS THE STALE SIGNAL. A pre-rev-2 RecordOwner cannot populate this field at
-        # all, so an empty digest is not a peer that forgot — it is a peer that predates the
-        # fence, and it refuses here rather than misparsing a renumbered field mid-stream.
-        if claim.wire_schema_digest != SCHEMA_DIGEST_RAW:
-            carried = claim.wire_schema_digest
-            return reject(
-                pb.ClaimRejection.CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH,
-                (
-                    "the claim carries NO wire_schema_digest, which is what a pre-rev-2 "
-                    f"binding sends; this worker speaks schema rev {WIRE_SCHEMA_REV} "
-                    f"{SCHEMA_DIGEST}"
-                )
-                if not carried
-                else (
-                    f"the claim speaks schema sha256:{carried.hex()} and this worker speaks "
-                    f"rev {WIRE_SCHEMA_REV} {SCHEMA_DIGEST}; no later frame is worth parsing"
-                ),
-            )
         # THE CREDENTIAL CHECK, in whichever of the two launch modes this worker was
         # started in (#560g). A rented pod verifies BY HASH — it holds no copy of the
         # token, so neither does whoever provisioned it — and a self-spawned worker
@@ -1226,7 +1185,6 @@ class Worker:
         ack = pb.ClaimAck(
             accepted=True,
             wire_minor=WIRE_MINOR,
-            wire_schema_digest=SCHEMA_DIGEST_RAW,
             worker_id=self.options.worker_id,
             worker_instance_id=self.options.instance_id,
             worker_release_id=self.options.release_id,
@@ -1240,8 +1198,7 @@ class Worker:
             "session",
             f"claimed by {claim.record_owner_id or 'an unnamed RecordOwner'} at epoch "
             f"{claim.record_owner_epoch}, generation {generation} "
-            f"(wire schema rev {WIRE_SCHEMA_REV}, wire_minor effective "
-            f"{self.fence.wire_minor})",
+            f"(wire_minor effective {self.fence.wire_minor})",
         )
 
     def snapshot_body(self) -> pb.WorkerSnapshotBody:

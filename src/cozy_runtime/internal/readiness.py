@@ -18,7 +18,7 @@ import grpc
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.materialize_launch import LaunchRefusal
-from cozy_runtime.protocol import SCHEMA_DIGEST, SCHEMA_DIGEST_RAW, WIRE_MINOR
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -153,7 +153,6 @@ def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline:
             record_owner_id="readiness-negative-arm",
             wire_minor=WIRE_MINOR,
             proof=("foreign-" + uuid.uuid4().hex).encode(),
-            wire_schema_digest=SCHEMA_DIGEST_RAW,
         )
         call = pb_grpc.WorkerControlStub(channel).Control(
             iter((pb.RecordOwnerFrame(claim=claim),)), timeout=_remaining(deadline)
@@ -167,7 +166,6 @@ def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline:
         frame.WhichOneof("msg") != "claim_ack"
         or frame.claim_ack.accepted
         or frame.claim_ack.rejection != pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED
-        or frame.claim_ack.wire_schema_digest != SCHEMA_DIGEST_RAW
     ):
         raise LaunchRefusal("worker_foreign_credential_unproven", "negative Claim was not refused")
 
@@ -223,7 +221,7 @@ def receipt_payload(
 ) -> bytes:
     """The PodReadinessReceipt/1 payload: everything the pod MEASURED about itself.
 
-    Eight fields left with the boot closure. Six went with cr-048 —
+    Six fields went with cr-048 —
     `provision_spec_digest`, `provision_bundle_digest`,
     `measured_installed_environment_receipt_digest`, `staged_placement_set_digest`,
     `artifact_sources`, `network_cache_degradations` — because a pod that boots empty has
@@ -245,6 +243,9 @@ def receipt_payload(
     remains — it is measured here, not told to us, and it is what makes two boots of the
     same pod distinguishable.
 
+    Protocol identity is the package major plus the additive minor exchanged on the control
+    stream. Exact generated-binding provenance belongs to the build and CI, not a pod receipt.
+
     The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
     spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
     """
@@ -264,7 +265,6 @@ def receipt_payload(
             "worker_internal_port": worker_internal_port,
             "worker_listener_bound": True,
             "worker_protocol": "cozy.worker.v1",
-            "worker_wire_schema_digest": SCHEMA_DIGEST,
         }
     )
 

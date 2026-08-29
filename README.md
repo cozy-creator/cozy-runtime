@@ -14,7 +14,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` (schema rev 9) — worker-protocol's bindings, COPIED VERBATIM into `src/cozy/`, plus the document plane and the schema fence | protobuf, internal.canonical |
+| `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
@@ -166,7 +166,6 @@ refuses a stale surface while admitting a harmless reformat. `describe` itself i
     uv run python checks/architecture.py # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
     uv run python checks/declared_facts.py # every public Context/service fact has a live writer
-    uv run python checks/wire_schema.py  # vendored worker-schema identity
     uv run python scripts/verify.py      # live run of both example endpoints end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
@@ -239,7 +238,7 @@ exact model closure. READY remains the join of overlay, TensorFS closure, bindin
 device construction. An outgoing placement is never disturbed by this optimization, and a grant
 refresh re-drives the same accepted revision without changing its identity.
 
-Schema rev 7 exposes that work as observation only. `PlacementStatus.acquisition` retains
+`PlacementStatus.acquisition` exposes that work as observation only. It retains
 endpoint/model start and end values from one process-monotonic clock plus cumulative
 downloaded/reused bytes. Partial states are emitted while either leg runs; terminal values
 remain attached to that placement spec. These values are never read by admission,
