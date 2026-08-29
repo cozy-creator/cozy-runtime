@@ -23,10 +23,11 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 WORKER_TENSORHUB_HOST = "worker.tensorhub.com"
 WORKER_TENSORHUB_PATH = "/v1/worker/artifacts/resolve"
-MAX_REQUEST_BYTES = 1 << 20
-MAX_RESPONSE_BYTES = 16 << 20
+MAX_REQUEST_BYTES = 128 << 10
+MAX_RESPONSE_BYTES = 8 << 20
 MAX_ARTIFACTS = 4096
-MAX_LOGICAL_IDS = 128
+MAX_PACKAGE_IDS = 64
+MAX_MODEL_IDS = 256
 RESOLVE_TIMEOUT_SECONDS = 30
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -177,8 +178,10 @@ def read_intent(
             "artifact_delegation_incomplete",
             "delegation identity, revision, and expiry are required",
         )
-    packages = _logical_ids(value.get("package_release_ids"), "package_release_ids")
-    models = _logical_ids(value.get("model_checkpoint_ids"), "model_checkpoint_ids")
+    packages = _logical_ids(
+        value.get("package_release_ids"), "package_release_ids", MAX_PACKAGE_IDS
+    )
+    models = _logical_ids(value.get("model_checkpoint_ids"), "model_checkpoint_ids", MAX_MODEL_IDS)
     if not packages and not models:
         raise ArtifactAccessRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -219,10 +222,10 @@ def read_intent(
     )
 
 
-def _logical_ids(value: object, name: str) -> tuple[str, ...]:
+def _logical_ids(value: object, name: str, maximum: int) -> tuple[str, ...]:
     if (
         not isinstance(value, list)
-        or len(value) > MAX_LOGICAL_IDS
+        or len(value) > maximum
         or not all(isinstance(item, str) and 0 < len(item) <= 256 for item in value)
         or value != sorted(set(value))
     ):
