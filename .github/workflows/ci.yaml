@@ -32,6 +32,13 @@ jobs:
             cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)" = \
             "$(uv run --locked --project proofs/fixtures/marco-polo-endpoint \
             cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)"
+      - run: |
+          a=$(mktemp -d)
+          b=$(mktemp -d)
+          uv build --wheel --out-dir "$a" proofs/fixtures/marco-polo-endpoint
+          uv build --wheel --out-dir "$b" proofs/fixtures/marco-polo-endpoint
+          cmp "$a"/*.whl "$b"/*.whl
+          unzip -l "$a"/*.whl | grep -F 'marco_polo_endpoint/__init__.py'
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python checks/declared_facts.py
