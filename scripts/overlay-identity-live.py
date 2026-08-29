@@ -35,6 +35,8 @@ def build_wheel(
     tag: str = "py3-none-any",
     requires_python: str = "",
     requires_dist: tuple[str, ...] = (),
+    root_is_pure: bool = True,
+    extra_entries: dict[str, bytes] | None = None,
 ) -> tuple[overlay.Wheel, Path]:
     filename = f"{distribution.replace('-', '_')}-1.0.0-{tag}.whl"
     wheel_root = root / f"{distribution}-{value}-{tag.replace('.', '_')}"
@@ -48,8 +50,11 @@ def build_wheel(
             + (f"Requires-Python: {requires_python}\n" if requires_python else "")
             + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires_dist)
         ).encode(),
-        f"{info}/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
+        f"{info}/WHEEL": (
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: {str(root_is_pure).lower()}\nTag: {tag}\n"
+        ).encode(),
     }
+    entries.update(extra_entries or {})
     record = []
     for name, raw in sorted(entries.items()):
         encoded = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
@@ -237,17 +242,18 @@ def main() -> int:
         else:
             raise AssertionError("corrupt first arrival was admitted")
 
-        abi3_project = build_wheel(
+        abi3_custom = build_wheel(
             wheels,
             "proof-abi3",
             "proof_abi3",
             "abi3",
-            owner="project",
+            owner="custom",
             tag="cp310-abi3-manylinux_2_17_x86_64",
             requires_python=">=3.10",
+            root_is_pure=False,
         )
         abi3 = overlay.materialize(
-            source("abi3", family, abi3_project, custom_one),
+            source("abi3", family, project, abi3_custom),
             root / "abi3-installed",
             python=Path(sys.executable),
             base_manifest=manifest,
@@ -260,8 +266,9 @@ def main() -> int:
                 "proof-new-manylinux",
                 "proof_new_manylinux",
                 "new-manylinux",
-                owner="project",
+                owner="custom",
                 tag="cp312-cp312-manylinux_2_40_x86_64",
+                root_is_pure=False,
             ),
             "overlay_python_incompatible": build_wheel(
                 wheels,
@@ -288,10 +295,12 @@ def main() -> int:
                 requires_dist=("missing-package; python_version >= '3.12'",),
             ),
         }
-        for code, bad_project in incompatible_cases.items():
+        for code, bad_wheel in incompatible_cases.items():
+            bad_project = bad_wheel if bad_wheel[0].owner == "project" else project
+            bad_custom = bad_wheel if bad_wheel[0].owner == "custom" else custom_one
             try:
                 overlay.materialize(
-                    source(code, family, bad_project, custom_one),
+                    source(code, family, bad_project, bad_custom),
                     root / f"red-{code}",
                     python=Path(sys.executable),
                     base_manifest=manifest,
@@ -300,6 +309,57 @@ def main() -> int:
                 assert exc.code == code, (exc.code, code)
             else:
                 raise AssertionError(f"{code} was admitted")
+
+        native_project = build_wheel(
+            wheels,
+            "proof-native-project",
+            "proof_native_project",
+            "native-project",
+            owner="project",
+            extra_entries={"proof_native_project/_native.so": b"\x7fELFfake"},
+        )
+        build_input_custom = build_wheel(
+            wheels,
+            "proof-source-custom",
+            "proof_source_custom",
+            "source-custom",
+            owner="custom",
+            extra_entries={"proof_source_custom/kernels/op.cu": b"// source must not ship\n"},
+        )
+        native_reds = {
+            "overlay_project_wheel_native": (native_project, custom_one),
+            "overlay_native_build_input_forbidden": (project, build_input_custom),
+        }
+        for code, (bad_project, bad_custom) in native_reds.items():
+            try:
+                overlay.materialize(
+                    source(code, family, bad_project, bad_custom),
+                    root / f"red-{code}",
+                    python=Path(sys.executable),
+                    base_manifest=manifest,
+                )
+            except overlay.OverlayRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"{code} was admitted")
+
+        tagged_project = replace(
+            project[0],
+            filename="proof_project-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl",
+            tags=("cp312-cp312-manylinux_2_17_x86_64",),
+        )
+        try:
+            overlay._verify_inventory(
+                replace(
+                    source("tagged-project", family, project, custom_one),
+                    wheels=(tagged_project, custom_one[0]),
+                ),
+                overlay._read_base_manifest(manifest, family),
+            )
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "overlay_project_wheel_not_pure", exc.code
+        else:
+            raise AssertionError("platform-specific project wheel was admitted")
 
         false_marker = build_wheel(
             wheels,
@@ -378,6 +438,9 @@ def main() -> int:
                     "requires_python_refused": True,
                     "active_marker_missing_dependency_refused": True,
                     "inactive_marker_ignored": True,
+                    "native_project_wheel_refused": True,
+                    "custom_source_build_input_refused": True,
+                    "platform_specific_project_wheel_refused": True,
                     "base_version_conflict_refused": True,
                 },
                 sort_keys=True,

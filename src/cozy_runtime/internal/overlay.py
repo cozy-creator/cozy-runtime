@@ -36,6 +36,7 @@ from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag, parse_tag
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical
@@ -62,6 +63,37 @@ _FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}\.whl$")
 _IMPORT_ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WHEEL_TAG = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*$")
 _SAFE_MEMBER = re.compile(r"^[^/][^\x00]*$")
+_NATIVE_SUFFIXES = frozenset({".dll", ".dylib", ".pyd", ".so"})
+_BUILD_SOURCE_SUFFIXES = frozenset(
+    {
+        ".a",
+        ".asm",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cu",
+        ".cuh",
+        ".cxx",
+        ".h",
+        ".hip",
+        ".hpp",
+        ".o",
+        ".obj",
+        ".rs",
+    }
+)
+_BUILD_INPUT_NAMES = frozenset(
+    {
+        "build.ninja",
+        "cargo.toml",
+        "cmakelists.txt",
+        "makefile",
+        "meson.build",
+        "pyproject.toml",
+        "setup.cfg",
+        "setup.py",
+    }
+)
 _PLATFORM_TARGET_FIELDS = frozenset(
     {"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"}
 )
@@ -194,6 +226,7 @@ class _Inspected:
     import_roots: frozenset[str]
     requires_python: str | None
     requirements: tuple[Requirement, ...]
+    native_members: tuple[str, ...]
 
 
 def materialize(
@@ -620,6 +653,11 @@ def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
             or wheel.owner not in {"project", "custom"}
         ):
             raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
+        if wheel.owner == "project" and wheel.tags != ("py3-none-any",):
+            raise OverlayRefusal(
+                "overlay_project_wheel_not_pure",
+                f"{wheel.filename} tags={','.join(wheel.tags)}; project must be py3-none-any",
+            )
         base_version = base.distribution_versions.get(name)
         if base_version is not None:
             raise OverlayRefusal(
@@ -697,11 +735,19 @@ def _verify_grants(
 
 
 def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
-    filename = wheel.filename.removesuffix(".whl").split("-")
+    try:
+        filename_name, filename_version, _build, filename_tags = parse_wheel_filename(
+            wheel.filename
+        )
+    except InvalidWheelFilename as exc:
+        raise OverlayRefusal("wheel_filename_mismatch", wheel.filename) from exc
+    declared_tags: set[Tag] = set()
+    for tag in wheel.tags:
+        declared_tags.update(parse_tag(tag))
     if (
-        len(filename) < 5
-        or _name(filename[0]) != wheel.distribution
-        or filename[1].replace("_", "-") != wheel.version.replace("_", "-")
+        _name(filename_name) != wheel.distribution
+        or filename_version != Version(wheel.version)
+        or filename_tags != declared_tags
     ):
         raise OverlayRefusal("wheel_filename_mismatch", wheel.filename)
     try:
@@ -710,6 +756,7 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
             if not members or len(members) > MAX_WHEEL_MEMBERS:
                 raise OverlayRefusal("overlay_wheel_member_count", wheel.filename)
             names: set[str] = set()
+            native_members: list[str] = []
             expanded = 0
             for member in members:
                 name = member.filename
@@ -738,6 +785,21 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                     raise OverlayRefusal("overlay_wheel_symlink", name)
                 if not member.is_dir() and PurePosixPath(name).suffix == ".pth":
                     raise OverlayRefusal("overlay_pth_forbidden", name)
+                if member.is_dir():
+                    continue
+                installed = _install_path(name)
+                if installed is None and ".data/" in name:
+                    raise OverlayRefusal("overlay_wheel_install_scheme_forbidden", name)
+                basename = posix.name.lower()
+                suffix = posix.suffix.lower()
+                if basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES:
+                    raise OverlayRefusal("overlay_native_build_input_forbidden", name)
+                magic = archive.open(member).read(4)
+                native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
+                if wheel.owner == "project" and native:
+                    raise OverlayRefusal("overlay_project_wheel_native", name)
+                if native:
+                    native_members.append(name)
             dist_infos = sorted(
                 name
                 for name in names
@@ -761,6 +823,16 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                 or tuple(sorted(parsed_wheel.get_all("Tag", []))) != wheel.tags
             ):
                 raise OverlayRefusal("overlay_wheel_metadata_mismatch", wheel.filename)
+            root_is_pure = parsed_wheel.get("Root-Is-Purelib", "").strip().lower()
+            if wheel.owner == "project" and root_is_pure != "true":
+                raise OverlayRefusal(
+                    "overlay_project_wheel_not_pure", "Root-Is-Purelib is not true"
+                )
+            if native_members and root_is_pure != "false":
+                raise OverlayRefusal(
+                    "overlay_native_wheel_metadata_invalid",
+                    f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
+                )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:
                 raise OverlayRefusal("overlay_wheel_record_missing", wheel.filename)
@@ -793,6 +865,7 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                 roots,
                 requires_python,
                 tuple(requirements),
+                tuple(sorted(native_members)),
             )
     except OverlayRefusal:
         raise
