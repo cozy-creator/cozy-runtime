@@ -1,4 +1,4 @@
-"""Per-service fakes — an SDK FEATURE endpoint authors use, not test scaffolding (§1.6).
+"""Per-service fakes — an SDK FEATURE package authors use, not test scaffolding (§1.6).
 
 One fake per service the handler requests, never one fake world. Each is a CAPABILITY
 ADAPTER over the production kernel: `fake_outputs()` is the real `Outputs` writing to a
@@ -194,7 +194,7 @@ def invoke_with_fakes(
 
 # --------------------------------------------------------------------------- fill
 #
-# WEIGHTLESS FILL BACKENDS. The endpoint declares WHICH components a method may touch;
+# WEIGHTLESS FILL BACKENDS. The package declares WHICH components a method may touch;
 # it never learns HOW their bytes got there, and these two prove it: the same handler
 # runs on either and cannot observe which. They are DOUBLES and they lived under
 # `internal/` as if they were a runtime plane — production fills through cr-005's

@@ -7,7 +7,7 @@ result. It is CPU-class, it writes nothing into the store, and it holds no model
 
 Why THIS derivation: the projection below is `topology_digest`-shaped — component -> key ->
 logical shape, in canonical order — which is exactly the index `tfs-009` freezes and every
-adapter/endpoint admissibility check runs over. Deriving it from real headers over 6.9 GB of
+adapter/package admissibility check runs over. Deriving it from real headers over 6.9 GB of
 real objects is the honest smallest version of "a job produces facts about CozyTensors".
 
 Nothing here names an artifact: the store arrives as `payload.store` (a `Tree`, whose PATH
@@ -55,7 +55,7 @@ class CensusInput(msgspec.Struct, forbid_unknown_fields=True):
     budget is twice one control frame's."""
     refuse_after_narration: bool = False
     """Refuse typed AFTER the narration — job-001's host-fit shape. The attempt must
-    converge on the endpoint's own message, not on the death of an executor whose reply did
+    converge on the package's own message, not on the death of an executor whose reply did
     not fit."""
 
 

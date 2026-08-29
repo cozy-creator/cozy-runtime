@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """#549's conformance runner: ONE runner, scenario manifests, CPU-only, CI-executable.
 
-The #533 CI class (`serverless-endpoints/scripts/h3-conform.py` is the exemplar): a dict of
+The #533 CI class (`serverless-packages/scripts/h3-conform.py` is the exemplar): a dict of
 named scenarios, each a function, selected on argv, scoring through one `check`. It is the
 shape the ~11k lines of `*-live.py` drivers are meant to consolidate into, and this lane
 starts that consolidation with what it TOUCHED — plan resolution, cache identity, the
@@ -933,14 +933,14 @@ def envelope() -> None:
 
 
 def consent() -> None:
-    head("consent — the encoded route needs the endpoint's word, at RESOLUTION")
+    head("consent — the encoded route needs the package's word, at RESOLUTION")
 
     refusing = plan_over(MIXED, objective="footprint", consent="refuse")
     check(
-        "ARM: an endpoint that did not consent gets NO encoded-GEMM plan, on ANY axis",
+        "ARM: a package that did not consent gets NO encoded-GEMM plan, on ANY axis",
         refusing.route_census().get("encoded_gemm") is None,
         f"{refusing.label()} — footprint is the axis the encoded route WINS, and it is not "
-        "offered, because a plan the endpoint cannot consent to is not a candidate",
+        "offered, because a plan the package cannot consent to is not a candidate",
     )
     check(
         "the walk SAYS SO rather than silently omitting the plan",
@@ -954,7 +954,7 @@ def consent() -> None:
         "with consent the same artifact resolves the encoded plan",
         plan_over(MIXED, objective="footprint", consent="accept").route_census().get("encoded_gemm")
         == 1,
-        "it used to be discovered at `materialize`, with the plan chosen and the endpoint "
+        "it used to be discovered at `materialize`, with the plan chosen and the package "
         "already imported",
     )
 

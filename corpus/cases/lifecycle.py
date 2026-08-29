@@ -2,7 +2,7 @@
 gates, and the two capabilities a derivation must never have.
 
 The last three cases are the fences themselves. A fence that has never been attempted is a
-comment, so each one is attempted here by real endpoint code and observed refusing.
+comment, so each one is attempted here by real package code and observed refusing.
 """
 
 from __future__ import annotations

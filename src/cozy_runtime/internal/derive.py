@@ -65,7 +65,7 @@ class DeriveError(Exception):
 
 
 class ConstructionFault(DeriveError):
-    """The author's construction is not derivable, and the fix is in the endpoint."""
+    """The author's construction is not derivable, and the fix is in the package."""
 
 
 class HarnessGap(DeriveError):
@@ -137,12 +137,12 @@ def _refuse_compile() -> Iterator[None]:
     It wraps the module in an `OptimizedModule` whose every `state_dict` key gains an
     `_orig_mod.` prefix, so the derived code topology would demand `blk._orig_mod.weight`
     from checkpoints that carry `blk.weight` — a construction that no artifact on earth
-    satisfies. v1 could not refuse (its h3 endpoint compiled the VAE decoder for a real
+    satisfies. v1 could not refuse (its h3 package compiled the VAE decoder for a real
     1.68x serve win) so it neutered compile to eager for the drive (pgw#1659, after a
     compiled callable handed fake tensors read a fake data pointer, launched a real kernel,
     and killed the CUDA context process-wide while the drive finished green against the
     corpse). v2 has no graph-mint consumer that needs the call to survive, so the honest
-    answer is the refusal: the fix lane is the endpoint deleting the call.
+    answer is the refusal: the fix lane is the package deleting the call.
     """
     torch = torch_module()
     original = torch.compile
@@ -217,7 +217,7 @@ def _capability(cap: _Capability) -> Iterator[None]:
 
 
 def _author_site() -> str:
-    """The AUTHOR's frame, skipping the harness and torch — v1's `_endpoint_site`. A
+    """The AUTHOR's frame, skipping the harness and torch — v1's `_package_site`. A
     refusal that names its own file names the wrong line."""
     frame: Any = sys._getframe(1)
     while frame is not None:
@@ -593,10 +593,10 @@ def _load_typed(model: Any, loader: Any) -> None:
     """Run the author's `load()`, turning torch's own untyped refusals into named ones.
 
     A raw `NotImplementedError` from a missing meta kernel names a torch internal and a
-    line inside `_refs`; the endpoint author needs the OP and the reason. The two causes
+    line inside `_refs`; the package author needs the OP and the reason. The two causes
     are genuinely different lanes: a data-dependent op has no correct shape function and
-    the endpoint must stop asking, while a custom op merely LACKS one and the harness (or
-    the endpoint's own `torch.library` registration) can supply it.
+    the package must stop asking, while a custom op merely LACKS one and the harness (or
+    the package's own `torch.library` registration) can supply it.
     """
     from cozy_runtime.author._errors import ConformanceError
     from cozy_runtime.internal.sandbox import FenceViolation

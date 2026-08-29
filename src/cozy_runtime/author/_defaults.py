@@ -9,7 +9,7 @@ unvalidated steps/guidance/scheduler combination can emerge from independently r
 correlated fields. A partial or internally inconsistent recipe refuses AS A UNIT.
 
 There is no parallel family-defaults struct, no `model.tuned`, no name mapping, and no
-endpoint-side `resolve()` call: the resolved values are written into the payload before
+package-side `resolve()` call: the resolved values are written into the payload before
 invocation, so the handler sees concrete `T`.
 """
 

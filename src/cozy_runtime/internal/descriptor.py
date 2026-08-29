@@ -1,7 +1,7 @@
-"""The endpoint descriptor generated from one frozen application.
+"""The package descriptor generated from one frozen application.
 
 Its one identity is SHA-256 over canonical JSON. Creator obtains those exact bytes from
-`cozy-runtime --json describe`; nothing is written into the endpoint repository.
+`cozy-runtime --json describe`; nothing is written into the package repository.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
 
-SCHEMA = "cozy.endpoint.descriptor/1"
-DIGEST_KEY = "descriptor_digest"
+SCHEMA = "cozy.package.descriptor/1"
+DIGEST_KEY = "package_descriptor_digest"
 
 #: The complete top-level field set. A reader admits EXACTLY these — never a superset.
 TOP_LEVEL_KEYS = frozenset(
@@ -29,10 +29,10 @@ TOP_LEVEL_KEYS = frozenset(
 )
 
 
-class StaleDescriptor(ConformanceError):
+class StalePackageDescriptor(ConformanceError):
     """Supplied descriptor bytes are malformed or differ from the installed release."""
 
-    default_code = "stale_descriptor"
+    default_code = "stale_package_descriptor"
 
 
 # ------------------------------------------------------------------------ the document
@@ -129,7 +129,7 @@ _FORBIDDEN_KEYS = frozenset(
 
 
 def _binding_values(bindings: Mapping[str, Mapping[str, object]]) -> frozenset[str]:
-    """Every spelling of a binding an endpoint.toml states — the parts AND the composed ref,
+    """Every spelling of a binding a package.toml states — the parts AND the composed ref,
     because `model` and `release` are stored apart but named together everywhere else."""
     values: set[str] = set()
     for entry in bindings.values():
@@ -161,7 +161,7 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
     elif isinstance(value, str):
         if value in bindings:
             raise ConformanceError(
-                f"{path}: {value!r} is an endpoint.toml binding value — bindings are MUTABLE "
+                f"{path}: {value!r} is a package.toml binding value — bindings are MUTABLE "
                 "and post-deploy authority is the hub's, so no binding can key a release",
                 code="fixed_point",
                 fields=[path],
@@ -188,7 +188,7 @@ def canonical_bytes(doc: Mapping[str, Json]) -> bytes:
     return canonical.write(dict(doc))
 
 
-def descriptor_digest(doc: Mapping[str, Json]) -> str:
+def package_descriptor_digest(doc: Mapping[str, Json]) -> str:
     """The descriptor's formatting-invariant semantic identity."""
     return canonical.digest(dict(doc))
 
@@ -221,9 +221,9 @@ def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[st
     if canonical_bytes(left) == canonical_bytes(right):
         return
     detail = "; ".join(_differences(left, right)) or "the documents differ"
-    raise StaleDescriptor(
+    raise StalePackageDescriptor(
         f"{names[0]} and {names[1]} are different documents: {detail}",
-        code="stale_descriptor",
+        code="stale_package_descriptor",
     )
 
 
@@ -260,14 +260,18 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
     return []
 
 
-def read_bytes(raw: bytes, source: str = "endpoint descriptor") -> dict[str, Json]:
+def read_bytes(raw: bytes, source: str = "package descriptor") -> dict[str, Json]:
     """Read one descriptor projection without making its formatting part of identity."""
     try:
         parsed = canonical.parse(raw)
     except canonical.CanonicalError as exc:
-        raise StaleDescriptor(f"{source}: {exc}", code="malformed_descriptor") from exc
+        raise StalePackageDescriptor(
+            f"{source}: {exc}", code="malformed_package_descriptor"
+        ) from exc
     if not isinstance(parsed, dict):
-        raise StaleDescriptor(f"{source} is not a JSON object", code="malformed_descriptor")
+        raise StalePackageDescriptor(
+            f"{source} is not a JSON object", code="malformed_package_descriptor"
+        )
     fields = set(parsed)
     if fields != TOP_LEVEL_KEYS:
         missing = sorted(TOP_LEVEL_KEYS - fields)
@@ -277,13 +281,13 @@ def read_bytes(raw: bytes, source: str = "endpoint descriptor") -> dict[str, Jso
             problems.append(f"missing {', '.join(missing)}")
         if unknown:
             problems.append(f"unknown {', '.join(unknown)}")
-        raise StaleDescriptor(
+        raise StalePackageDescriptor(
             f"{source} has {'; '.join(problems)}: the descriptor fields are exactly "
             f"{', '.join(sorted(TOP_LEVEL_KEYS))}",
             code="unknown_field",
         )
     if parsed["format"] != SCHEMA:
-        raise StaleDescriptor(
+        raise StalePackageDescriptor(
             f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
             code="unknown_format",
         )
@@ -485,7 +489,7 @@ def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> No
 
 
 def _invalid(source: str, path: str, detail: str) -> None:
-    raise StaleDescriptor(f"{source}: {path} {detail}", code="malformed_descriptor")
+    raise StalePackageDescriptor(f"{source}: {path} {detail}", code="malformed_package_descriptor")
 
 
 _SCALARS = frozenset({"bool", "float", "int", "null", "str"})

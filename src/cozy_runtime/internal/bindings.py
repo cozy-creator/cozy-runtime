@@ -1,11 +1,11 @@
-"""Binding resolution: `endpoint.toml` defaults -> `--model` -> the deploy binding.
+"""Binding resolution: `package.toml` defaults -> `--model` -> the deploy binding.
 
 Code states CAPABILITY; selection is a BINDING (§1.0/§1.1). Author code never names a model,
 release, checkpoint or adapter — so this module lives outside the author fence, reads the
-endpoint repository's `endpoint.toml`, and speaks the same one binding vocabulary the deploy
+package repository's `package.toml`, and speaks the same one binding vocabulary the deploy
 side does.
 
-`endpoint.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
+`package.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
 speaks (a bare-venv `run` with no `--model`). Production authority is the hub-side binding
 alone. Two spellings, one schema: `[bindings."<ModelClass>"]` covers every parameter of that
 class, `[bindings."<callable>.models.<param>"]` names one parameter specifically, and the
@@ -37,13 +37,13 @@ class Binding:
         return f"{self.path} -> {self.ref}{lane}  [{self.source}]"
 
 
-def read_table(endpoint_toml: Path) -> Mapping[str, Mapping[str, object]]:
-    """The endpoint repository's unresolved `[bindings.*]` table."""
-    data = tomllib.loads(endpoint_toml.read_text())
+def read_table(package_toml: Path) -> Mapping[str, Mapping[str, object]]:
+    """The package repository's unresolved `[bindings.*]` table."""
+    data = tomllib.loads(package_toml.read_text())
     table = data.get("bindings", {})
     if not isinstance(table, dict):
         raise ConformanceError(
-            f"{endpoint_toml}: [bindings] must be a table of binding paths", code="bindings"
+            f"{package_toml}: [bindings] must be a table of binding paths", code="bindings"
         )
     return {str(k): dict(v) for k, v in table.items() if isinstance(v, dict)}
 
@@ -61,7 +61,7 @@ def resolve(
     unknown = sorted(set(table) - known)
     if unknown:
         raise ConformanceError(
-            f"endpoint.toml binds {', '.join(unknown)}, which this release declares no slot "
+            f"package.toml binds {', '.join(unknown)}, which this release declares no slot "
             f"for (slots: {', '.join(sorted(s.path for s in slots))})",
             code="unknown_binding",
             fields=unknown,
@@ -70,8 +70,8 @@ def resolve(
     for slot in slots:
         chosen: Binding | None = None
         for key, source in (
-            (slot.class_key, "endpoint.toml:class"),
-            (slot.path, "endpoint.toml:path"),
+            (slot.class_key, "package.toml:class"),
+            (slot.path, "package.toml:path"),
         ):
             entry = table.get(key)
             if entry is not None:
@@ -83,7 +83,7 @@ def resolve(
         if chosen is None:
             raise ConformanceError(
                 f"{slot.path} ({slot.class_key}) has no binding: code states capability, "
-                "bindings state selection — name it in endpoint.toml or pass --model",
+                "bindings state selection — name it in package.toml or pass --model",
                 code="unbound_slot",
                 fields=[slot.path],
             )

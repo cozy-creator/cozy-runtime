@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Run the adversarial derivation corpus and print the scoreboard.
 
-Not a test suite (#160): it spawns the real harness over real torch endpoint modules in a
+Not a test suite (#160): it spawns the real harness over real torch package modules in a
 real bounded sandbox, one child process per case, and prints what happened. The corpus is
 the ONE place cr-004 is deliberately exhaustive — every other surface stays minimal.
 

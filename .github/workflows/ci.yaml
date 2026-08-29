@@ -28,17 +28,17 @@ jobs:
       - run: |
           test "$(uv run cozy-runtime --json --dir examples describe)" = \
             "$(uv run cozy-runtime --json --dir examples describe)"
-          test "$(uv run --locked --project proofs/fixtures/marco-polo-endpoint \
-            cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)" = \
-            "$(uv run --locked --project proofs/fixtures/marco-polo-endpoint \
-            cozy-runtime --json --dir proofs/fixtures/marco-polo-endpoint describe)"
+          test "$(uv run --locked --project proofs/fixtures/marco-polo-package \
+            cozy-runtime --json --dir proofs/fixtures/marco-polo-package describe)" = \
+            "$(uv run --locked --project proofs/fixtures/marco-polo-package \
+            cozy-runtime --json --dir proofs/fixtures/marco-polo-package describe)"
       - run: |
           a=$(mktemp -d)
           b=$(mktemp -d)
-          uv build --wheel --out-dir "$a" proofs/fixtures/marco-polo-endpoint
-          uv build --wheel --out-dir "$b" proofs/fixtures/marco-polo-endpoint
+          uv build --wheel --out-dir "$a" proofs/fixtures/marco-polo-package
+          uv build --wheel --out-dir "$b" proofs/fixtures/marco-polo-package
           cmp "$a"/*.whl "$b"/*.whl
-          unzip -l "$a"/*.whl | grep -F 'marco_polo_endpoint/__init__.py'
+          unzip -l "$a"/*.whl | grep -F 'marco_polo_package/__init__.py'
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python checks/declared_facts.py
@@ -98,7 +98,7 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     env:
-      WORKER_PROTOCOL_SHA: 34f2993e91c65076850a828e37c3d9bd0215eefc
+      WORKER_PROTOCOL_SHA: ac3e4f46acac7278be71961161bbd97dc8ed3fd8
     steps:
       - uses: actions/checkout@v4
       # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and

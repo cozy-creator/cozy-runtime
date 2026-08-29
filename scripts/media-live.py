@@ -2,7 +2,7 @@
 """cr-017's codec plane, live: FLAC + muxed mp4 arms over the REAL author services.
 
 No worker, no GPU, no weights: these arms exercise `Outputs.save_audio`/`save_video`
-exactly as an endpoint calls them — through an `Attempt` and its spool — with synthetic
+exactly as a package calls them — through an `Attempt` and its spool — with synthetic
 deterministic fixtures. The tensor duck-typing means the same code path a torch tensor
 takes after `.cpu().numpy()` is the one the ndarray-like fixtures take here; the
 device-side D2H half of the source-independence law is se-002's pod arm.

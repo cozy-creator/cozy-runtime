@@ -8,11 +8,11 @@ Three rules:
 
 **The sniff is a REFUSAL, not a correction.** When the bytes disagree with the declaration
 the input refuses typed and pre-entrypoint. Rewriting the declared type to match the bytes
-would make a caller's mislabelled upload succeed under a type the endpoint never agreed to,
-and the endpoint's typed field is the whole contract.
+would make a caller's mislabelled upload succeed under a type the package never agreed to,
+and the package's typed field is the whole contract.
 
 **A kind is a set of media types, declared here and nowhere else.** `ImageAsset` means
-exactly `KIND_MEDIA["image"]`. An endpoint narrows that with `AssetBound(media_types=…)`;
+exactly `KIND_MEDIA["image"]`. A package narrows that with `AssetBound(media_types=…)`;
 it never widens it, because a decoder the runtime does not have is not a capability.
 
 **An unrecognised container is UNKNOWN, never "probably fine".** `sniff` returns `""` when

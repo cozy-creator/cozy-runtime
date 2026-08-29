@@ -2,7 +2,7 @@
 """cr-008c live verification: the DELIVERY axis, chosen over two real SDXL artifacts.
 
 Not a test (tracker README #160): every leg runs the real chooser, the real prepare, the
-real attempt path and the real endpoint, and prints numbers.
+real attempt path and the real package, and prints numbers.
 
 The two artifacts are cr-006's: the real fp16 SDXL UNet (`plain/1`) and the real
 `fp8-scaled-scalar/1` carrier made from it, both installed in ONE four-component store so
@@ -264,7 +264,7 @@ def spawn(label: str, spec: dict[str, Any], mode: str = "exec") -> dict[str, Any
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — worker, executor, endpoint."""
+    """ONE request through the WHOLE real path — worker, executor, package."""
     import dataclasses
     import os
 

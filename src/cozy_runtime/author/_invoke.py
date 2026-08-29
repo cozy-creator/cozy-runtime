@@ -319,7 +319,7 @@ def _reaches(annotation: object, kind: type, depth: int = 0) -> bool:
     `issubclass(list[ImageAsset], Asset)` is false. That made a list of assets declare no
     assets, so `_hydrate` was skipped and every element arrived unhydrated: `read_bytes()`
     then refused with `asset_bytes_unavailable`, which reads like a preflight violation and
-    is nothing of the kind. Found live by ev-003's judge endpoint (decisions #303), worked
+    is nothing of the kind. Found live by ev-003's judge package (decisions #303), worked
     around there by wrapping each asset in a one-asset struct.
 
     The SILENT half was the defect. It is fixed rather than refused, because a
@@ -502,7 +502,7 @@ def _check_input(
 
     MEDIA-TYPE HONESTY is the first check and it is about the BYTES: `granted.media_type`
     is what the worker sniffed, not what the caller declared, so a `.png` that is a
-    zip refuses here rather than inside a decoder the endpoint did not agree to run.
+    zip refuses here rather than inside a decoder the package did not agree to run.
     """
     if granted.order != expected_order:
         raise InvalidRequest(
@@ -518,7 +518,7 @@ def _check_input(
             f"and the field is a {type(asset).__name__}, which admits "
             f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. The type comes "
             "from the BYTES, not from the declaration: a mislabelled upload refuses at the "
-            "field rather than inside a decoder this endpoint never agreed to run",
+            "field rather than inside a decoder this package never agreed to run",
             code="asset_media_type",
             fields=[granted.input_id],
         )
@@ -611,7 +611,7 @@ def _model(param: Param, inv: Invocation) -> object:
     if model is None:
         raise InvalidRequest(
             f"no model bound for parameter {param.name!r}: bindings state selection "
-            "(endpoint.toml / the deployment binding), code states capability",
+            "(package.toml / the deployment binding), code states capability",
             code="unbound_model",
             fields=[param.name],
         )

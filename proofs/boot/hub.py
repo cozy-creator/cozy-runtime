@@ -1,4 +1,4 @@
-"""cr-049's hub stand-in: author one endpoint release, then serve its exact bytes.
+"""cr-049's hub stand-in: author one package release, then serve its exact bytes.
 
 This module plays the two roles the pod is not: the BUILD side that authors a release's
 canonical documents (tensorhub's `releaseassembly` + `wheelset` + `placementset`, whose Go
@@ -7,7 +7,7 @@ from. It is deliberately a repository proof driver and not a shipped component â
 proves is the WORKER's half: that a pod which boots empty converges to a live placement from
 a `DesiredPlacementSet` plus an `ArtifactGrantUpdate` and nothing else.
 
-The receipt is derived from exact base-family and endpoint-wheel identities. This module
+The receipt is derived from exact base-family and package-wheel identities. This module
 materializes the overlay once to learn it; the worker independently materializes the same
 overlay and must produce byte-identical receipt bytes without copying the base environment.
 """
@@ -32,7 +32,7 @@ from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-ENDPOINT_RELEASE = "proof-boot-release-1"
+PACKAGE_RELEASE = "proof-boot-release-1"
 PLACEMENT_ID = "cr049-first-placement"
 
 
@@ -44,7 +44,7 @@ class Release:
     kinds: dict[str, str] = field(default_factory=dict)
     wheel_paths: dict[str, Path] = field(default_factory=dict)
     environment_spec: bytes = b""
-    endpoint_bundle: bytes = b""
+    package_bundle: bytes = b""
     resolved_wheel_set: bytes = b""
     wheelhouse_manifest: bytes = b""
     descriptor: bytes = b""
@@ -159,7 +159,7 @@ def author(
         document = desc.build(discover_installed(application))
     finally:
         sys.path.remove(str(project_wheel))
-    descriptor_bytes = release.add(desc.canonical_bytes(document), "descriptor")
+    descriptor_bytes = release.add(desc.canonical_bytes(document), "package_descriptor")
     # These exact refs prove publication provenance but are deliberately not
     # runtime grant subjects. The executable source payload is project_wheel.
     source_archive = b"cr-049-boot-proof-source"
@@ -167,9 +167,9 @@ def author(
     bundle = release.add(
         canonical(
             {
-                "descriptor": ref(descriptor_bytes),
-                "endpoint_release_id": ENDPOINT_RELEASE,
-                "format": "tensorhub.endpoint_bundle/2",
+                "package_descriptor": ref(descriptor_bytes),
+                "package_release_id": PACKAGE_RELEASE,
+                "format": "tensorhub.package_bundle/2",
                 "project_wheel": wheel(project, import_roots=True),
                 "resolved_wheel_set": ref(resolved),
                 "source_archive": ref(source_archive),
@@ -181,10 +181,10 @@ def author(
     )
     spec = release.add(
         documents.canonical_bytes(
-            pb.EndpointEnvironmentSpec(
+            pb.PackageEnvironmentSpec(
                 compatibility_profile=pb.CompatibilityProfile(**profile),
                 platform_target=pb.PlatformTarget(**target),
-                endpoint_bundle_digest=documents.digest_of(bundle),
+                package_bundle_digest=documents.digest_of(bundle),
                 project_wheel_digest=documents.raw(project.digest),
                 wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
             )
@@ -192,7 +192,7 @@ def author(
         "environment",
     )
     release.environment_spec = spec
-    release.endpoint_bundle = bundle
+    release.package_bundle = bundle
     release.resolved_wheel_set = resolved
     release.wheelhouse_manifest = wheelhouse
     release.descriptor = descriptor_bytes
@@ -204,11 +204,11 @@ def author(
     base_manifest.write_bytes(wheelhouse)
     base_manifest.chmod(0o444)
 
-    from cozy_runtime.internal.materialize_launch import endpoint_overlay_input
+    from cozy_runtime.internal.materialize_launch import package_overlay_input
 
-    source = endpoint_overlay_input(
+    source = package_overlay_input(
         environment_spec_bytes=spec,
-        endpoint_bundle_bytes=bundle,
+        package_bundle_bytes=bundle,
         resolved_wheel_set_bytes=resolved,
         wheelhouse_manifest_bytes=wheelhouse,
         wheel_paths={project.digest: project_wheel},
@@ -221,7 +221,7 @@ def author(
     )
     release.receipt = release.add(installed.receipt_bytes, "receipt")
 
-    # The binding-plan closure. A weightless endpoint's plans, model-root document and
+    # The binding-plan closure. A weightless package's plans, model-root document and
     # descriptor are exactly what tensorhub authors for a model-free release.
     weightless = local.weightless_release_documents(document)
     if weightless.descriptor != descriptor_bytes:
@@ -243,8 +243,8 @@ def author(
                     }
                     for plan_digest, length in release.plan_refs
                 ],
-                "descriptor_digest": digest(descriptor_bytes),
-                "endpoint_release_id": ENDPOINT_RELEASE,
+                "package_descriptor_digest": digest(descriptor_bytes),
+                "package_release_id": PACKAGE_RELEASE,
                 "environment_spec_digest": digest(spec),
                 "installed_environment_receipt_digest": digest(installed.receipt_bytes),
                 "model_object_set": {
@@ -286,7 +286,7 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             barrier.wait(timeout=10)
             _Origin.overlapped.add(spelled)
             if spelled == _Origin.delayed_model_subject:
-                # Keep the model leg observably live after the endpoint wheel is admitted;
+                # Keep the model leg observably live after the package wheel is admitted;
                 # the Runtime proof must spawn its executor during this window.
                 time.sleep(2)
         self.send_response(200)

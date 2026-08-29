@@ -97,7 +97,7 @@ class Bound:
 
     Labeled `bound` forever and NEVER rendered as measured demand (§1.2). Measured rows
     live outside the release keyed by exact (profile, plan, runtime, device class); an
-    endpoint is not generally routable until its first measured row exists. `reason` is
+    package is not generally routable until its first measured row exists. `reason` is
     mandatory falsifier-first discipline: state the physical fact measurement cannot
     safely discover.
     """
@@ -129,7 +129,7 @@ class AssetBound:
     * `max_bytes` — the largest this field admits, enforced BEFORE the entrypoint sees the
       value and (as a deployment-wide cap) before acceptance. A field with no bound takes
       the deployment's cap, so "unbounded" is not spellable.
-    * `media_types` — a NARROWING of the kind's own set (`_media.KIND_MEDIA`). An endpoint
+    * `media_types` — a NARROWING of the kind's own set (`_media.KIND_MEDIA`). A package
       that decodes only PNG says so; one that lists a type its kind does not admit is a
       conformance error, because widening a kind would promise a decoder nothing has.
     * `max_decoded_bytes` — the largest immutable RGB8 + float32 PCM value this field may

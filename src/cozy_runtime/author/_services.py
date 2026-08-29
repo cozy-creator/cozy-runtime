@@ -86,7 +86,7 @@ class Attempt:
     max_output_bytes: int = MAX_OUTPUT_BYTES
     closed: bool = False
     entered: bool = False
-    """Whether the endpoint handler itself was entered. Pre-entry refusals never poison a
+    """Whether the package handler itself was entered. Pre-entry refusals never poison a
     healthy executor; one structural bit is safer than duplicating refusal-code lists."""
     pending: dict[str, Asset] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
@@ -575,7 +575,7 @@ class Outputs(_Bound):
         """A bounded attempt-spool target for encoders that need a filesystem path.
 
         Becomes an output only when a save converts it; otherwise it dies with the spool.
-        No general scratch directory exists for endpoints.
+        No general scratch directory exists for packages.
         """
         self._attempt.check_open("Outputs.temporary_file")
         tmp = self._attempt.spool / "tmp"
@@ -646,7 +646,7 @@ class Telemetry(_Bound):
         )
 
     def step_callback(self, total: int, *, stage: str | None = None) -> Any:
-        """One hook doing progress + cancellation — every v1 endpoint hand-rolled this.
+        """One hook doing progress + cancellation — every v1 package hand-rolled this.
 
         It is also the STEP-TIME instrument: the interval between consecutive calls is
         accumulated in place (five floats per stage), so inference step time is attributable

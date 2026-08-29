@@ -673,15 +673,15 @@ def resolve(
         for policy in POLICIES:
             if policy == "encoded_gemm" and encoded_leaves != "accept":
                 # THE CONSENT GATE, MOVED INTO RESOLUTION. It used to fire at `materialize`,
-                # with the plan already chosen and the endpoint already imported; a plan the
-                # endpoint cannot consent to is not a candidate, so it is never built.
+                # with the plan already chosen and the package already imported; a plan the
+                # package cannot consent to is not a candidate, so it is never built.
                 walk.append(
                     {
                         "variant": variant.name,
                         "policy": policy,
                         "verdict": "unconsented",
-                        "why": f"the endpoint declares encoded_leaves={encoded_leaves!r}; a "
-                        "route that REPLACES the module that computes needs the endpoint to "
+                        "why": f"the package declares encoded_leaves={encoded_leaves!r}; a "
+                        "route that REPLACES the module that computes needs the package to "
                         "say so, because code that reads `.weight` finds nothing there",
                     }
                 )

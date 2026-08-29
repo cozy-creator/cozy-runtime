@@ -1,5 +1,5 @@
 #!/bin/sh
-# cr-048 + cr-049 boot proof: build this tree's wheel and the endpoint fixture, install only
+# cr-048 + cr-049 boot proof: build this tree's wheel and the package fixture, install only
 # the Runtime/base family into the base-worker-image stand-in, and BOOT with no provision document.
 # The pod then receives its FIRST placement and must fetch, overlay, and serve it.
 set -eu

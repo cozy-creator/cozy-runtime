@@ -44,5 +44,5 @@ def run(config: RuntimeConfig, full: bool = False) -> Result:
         )
     return Result(
         rows=rows,
-        next=("cozy-runtime new <name> — scaffold an endpoint",),
+        next=("cozy-runtime new <name> — scaffold a package",),
     )

@@ -74,7 +74,7 @@ class TensorSpec:
 
 @dataclass(frozen=True, slots=True)
 class Destination:
-    """One logical destination the endpoint's construction demands."""
+    """One logical destination the package's construction demands."""
 
     key: str
     component: str
@@ -224,9 +224,9 @@ class Config:
         """The whole section as a plain, canonically ordered COPY.
 
         The typed accessors are the door for the author's own code; this one is the door
-        for the third-party constructor an endpoint brings as a dependency, every one of
+        for the third-party constructor a package brings as a dependency, every one of
         which takes `**config` (`from_config`, `from_dict`, a dataclass). Handing it back
-        field by field would mean restating a forty-field upstream schema in the endpoint,
+        field by field would mean restating a forty-field upstream schema in the package,
         which is the declaration surface §1.1 deletes. It carries no new authority: a
         source carrier was already refused at construction, and the result is a copy, so
         this is still read-only configuration and never a path.
@@ -301,7 +301,7 @@ class Artifact:
     """The RESOLVED binding a slot loads: one exact snapshot, its topology, its immutable
     config, and the uploader-minted stamps a class's keywords must match.
 
-    Selection produced this (endpoint.toml default -> `--model` -> deploy binding); author
+    Selection produced this (package.toml default -> `--model` -> deploy binding); author
     code never names any part of it.
     """
 
@@ -350,7 +350,7 @@ class Artifact:
 
 class Backend(Protocol):
     """The ONE fill path (§1.1). cr-005 supplies the TensorFS stream behind it; the
-    endpoint cannot observe which backend served it — that is the backend-blindness fence.
+    package cannot observe which backend served it — that is the backend-blindness fence.
 
     Three calls, one transaction: `materialize` reserves the destinations the census just
     agreed on, `fill` validates and claims each one, and `commit` moves the bytes and
@@ -360,7 +360,7 @@ class Backend(Protocol):
 
     `encoded_leaves` is the model class's own `ENCODED_LEAVES` declaration, carried in
     rather than reached for. It rides `materialize` because that is the first call of the
-    transaction and the last moment before a destination is reserved: an endpoint that did
+    transaction and the last moment before a destination is reserved: a package that did
     not consent must refuse with nothing to undo, not after its bytes are on the card.
     """
 

@@ -96,7 +96,7 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
 
     WHICH ADVERSARY (law 15). This is a bound on Python-level dialling: `socket`, `urllib`,
     `http.client`, `requests`, and everything built on them. It stops a BUGGY or careless
-    endpoint — a dependency that phones home, a `from_pretrained` that falls through to the
+    package — a dependency that phones home, a `from_pretrained` that falls through to the
     hub — which is the same-tenant-code rung, the rung that exists today.
 
     It is NOT a bound on hostile code. `ctypes` or a C extension reaches `connect(2)` below

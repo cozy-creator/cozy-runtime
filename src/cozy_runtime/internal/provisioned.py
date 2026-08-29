@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import canonical, contract
-from cozy_runtime.internal import descriptor as endpoint_descriptor
+from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanRefusal
 
@@ -48,7 +48,7 @@ class ModelRoot:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactObjectSet:
-    """The complete delivered model-root closure; empty for a weightless endpoint."""
+    """The complete delivered model-root closure; empty for a weightless package."""
 
     roots: tuple[ModelRoot, ...]
 
@@ -131,7 +131,7 @@ def read_provisioned_release(
     plans: Mapping[str, ExactDocument],
     *,
     read_document: DocumentReader,
-    endpoint_release: str,
+    package_release: str,
     store_root: Path,
     object_set: ArtifactObjectSet,
     dtype_widths: DTypeWidths,
@@ -156,21 +156,23 @@ def read_provisioned_release(
                 "binding_plan_subject_invalid", f"subject {plan_id} != digest {plan_doc.ref.digest}"
             )
         plan = _canonical_object(plan_doc.raw, "entrypoint_binding_plan")
-        _closed_keys(plan, {"bindings", "descriptor", "entrypoint", "format"}, "plan")
-        if plan["format"] != "cozy.endpoint.EntrypointBindingPlan/1":
+        _closed_keys(plan, {"bindings", "package_descriptor", "entrypoint", "format"}, "plan")
+        if plan["format"] != "cozy.package.EntrypointBindingPlan/1":
             raise PlanRefusal("binding_plan_format", str(plan["format"]))
         entrypoint = _identifier(plan["entrypoint"], "plan.entrypoint")
-        current_descriptor_ref = _document_ref(plan["descriptor"], "plan.descriptor")
+        current_descriptor_ref = _document_ref(
+            plan["package_descriptor"], "plan.package_descriptor"
+        )
         if descriptor_ref is None:
             descriptor_ref = current_descriptor_ref
-            descriptor_doc = read_document(descriptor_ref, "descriptor")
-            _verify_exact(descriptor_doc, "descriptor")
+            descriptor_doc = read_document(descriptor_ref, "package_descriptor")
+            _verify_exact(descriptor_doc, "package_descriptor")
             try:
-                descriptor = endpoint_descriptor.read_bytes(
+                descriptor = package_descriptor.read_bytes(
                     descriptor_doc.raw, str(descriptor_doc.path)
                 )
-            except endpoint_descriptor.StaleDescriptor as exc:
-                raise PlanRefusal("descriptor_invalid", str(exc)) from exc
+            except package_descriptor.StalePackageDescriptor as exc:
+                raise PlanRefusal("package_descriptor_invalid", str(exc)) from exc
             documents[descriptor_ref.digest] = descriptor_ref.length
             visible = _visible_entrypoints(descriptor)
         elif current_descriptor_ref != descriptor_ref:
@@ -179,7 +181,9 @@ def read_provisioned_release(
             raise PlanRefusal("binding_plan_set_invalid", f"duplicate entrypoint {entrypoint!r}")
         described = visible.get(entrypoint)
         if described is None:
-            raise PlanRefusal("binding_descriptor_invalid", f"visible entrypoint {entrypoint!r}")
+            raise PlanRefusal(
+                "binding_package_descriptor_invalid", f"visible entrypoint {entrypoint!r}"
+            )
         assert descriptor_doc is not None and descriptor is not None
         bindings[entrypoint] = _read_binding(
             plan_id,
@@ -188,7 +192,7 @@ def read_provisioned_release(
             descriptor,
             descriptor_doc.path,
             read_document,
-            endpoint_release,
+            package_release,
             store_root,
             object_set,
             dtype_widths,
@@ -232,20 +236,24 @@ def staged_document_reader(root: Path) -> DocumentReader:
 
 
 def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    _nonempty(descriptor.get("application"), "descriptor.application")
+    _nonempty(descriptor.get("application"), "package_descriptor.application")
     entries = descriptor.get("entrypoints")
     if not isinstance(entries, list):
-        raise PlanRefusal("binding_descriptor_invalid", "entrypoints is not an array")
+        raise PlanRefusal("binding_package_descriptor_invalid", "entrypoints is not an array")
     visible: dict[str, dict[str, Any]] = {}
     for row in entries:
         if not isinstance(row, dict):
             continue
-        name = _identifier(row.get("name"), "descriptor.entrypoint.name")
+        name = _identifier(row.get("name"), "package_descriptor.entrypoint.name")
         if name in visible:
-            raise PlanRefusal("binding_descriptor_invalid", f"duplicate entrypoint {name!r}")
+            raise PlanRefusal(
+                "binding_package_descriptor_invalid", f"duplicate entrypoint {name!r}"
+            )
         visible[name] = row
     if not visible:
-        raise PlanRefusal("binding_descriptor_invalid", "descriptor has no visible entrypoint")
+        raise PlanRefusal(
+            "binding_package_descriptor_invalid", "descriptor has no visible entrypoint"
+        )
     return visible
 
 
@@ -256,7 +264,7 @@ def _read_binding(
     descriptor: Mapping[str, Any],
     descriptor_path: Path,
     read_document: DocumentReader,
-    endpoint_release: str,
+    package_release: str,
     store_root: Path,
     object_set: ArtifactObjectSet,
     dtype_widths: DTypeWidths,
@@ -274,29 +282,29 @@ def _read_binding(
             "binding_plan_unsupported",
             "current Runtime requires zero or one selected model slot per entrypoint",
         )
-    application = _nonempty(descriptor.get("application"), "descriptor.application")
+    application = _nonempty(descriptor.get("application"), "package_descriptor.application")
     if not models:
         return DeclaredBinding(
             entrypoint_binding_plan_id=plan_id,
             entrypoint=entrypoint,
-            endpoint_release=endpoint_release,
+            package_release=package_release,
             model_class="",
             model_binding_path="",
             model_parameter_name="",
-            release=endpoint_release,
+            release=package_release,
             application=application,
             descriptor_path=str(descriptor_path),
         )
 
     model = models[0]
     if not isinstance(model, dict):
-        raise PlanRefusal("binding_descriptor_invalid", f"entrypoint {entrypoint!r} model")
+        raise PlanRefusal("binding_package_descriptor_invalid", f"entrypoint {entrypoint!r} model")
     slot_row = selected[0]
     _closed_keys(slot_row, {"binding", "slot"}, "plan.bindings[0]")
     slot = _identifier(slot_row["slot"], "plan.bindings[0].slot")
     expected_path = f"{entrypoint}.models.{slot}"
     if model.get("path") != expected_path:
-        raise PlanRefusal("binding_descriptor_invalid", f"slot {slot!r}")
+        raise PlanRefusal("binding_package_descriptor_invalid", f"slot {slot!r}")
     binding_ref = _document_ref(slot_row["binding"], "plan.bindings[0].binding")
     binding_doc = read_document(binding_ref, "resolved_model_binding")
     _verify_exact(binding_doc, "resolved_model_binding")
@@ -314,7 +322,7 @@ def _read_binding(
         },
         "resolved_model_binding",
     )
-    if binding["format"] != "cozy.endpoint.ResolvedModelBinding/1":
+    if binding["format"] != "cozy.package.ResolvedModelBinding/1":
         raise PlanRefusal("resolved_model_binding_format", str(binding["format"]))
 
     checkpoint = binding["checkpoint"]
@@ -359,10 +367,10 @@ def _read_binding(
     except contract.ContractError as exc:
         raise PlanRefusal("model_construction_contract_invalid", str(exc)) from exc
     candidate = construction.candidate
-    model_class = _identifier(model.get("class"), "descriptor.model.class")
-    model_path = _nonempty(model.get("path"), "descriptor.model.path")
+    model_class = _identifier(model.get("class"), "package_descriptor.model.class")
+    model_path = _nonempty(model.get("path"), "package_descriptor.model.path")
     if (
-        candidate.release != endpoint_release
+        candidate.release != package_release
         or candidate.application != application
         or not candidate.model_class.endswith(":" + model_class)
         or candidate.snapshot != snapshot.digest
@@ -393,13 +401,14 @@ def _read_binding(
         raise PlanRefusal("resolved_model_binding_mismatch", "MCC destination order")
     component_use = model.get("component_use")
     if not isinstance(component_use, dict):
-        raise PlanRefusal("binding_descriptor_invalid", f"slot {slot!r} component_use")
+        raise PlanRefusal("binding_package_descriptor_invalid", f"slot {slot!r} component_use")
     declared_components: set[str] = set()
     for method, values in component_use.items():
         if not isinstance(method, str) or not isinstance(values, list):
-            raise PlanRefusal("binding_descriptor_invalid", f"slot {slot!r} component_use")
+            raise PlanRefusal("binding_package_descriptor_invalid", f"slot {slot!r} component_use")
         declared_components.update(
-            _identifier(value, f"descriptor.model.component_use.{method}") for value in values
+            _identifier(value, f"package_descriptor.model.component_use.{method}")
+            for value in values
         )
     if declared_components != set(components):
         raise PlanRefusal("resolved_model_binding_mismatch", "descriptor component set")
@@ -410,7 +419,7 @@ def _read_binding(
         not isinstance(key, str) or not isinstance(value, str)
         for key, value in descriptor_stamps.items()
     ):
-        raise PlanRefusal("binding_descriptor_invalid", f"slot {slot!r} stamps")
+        raise PlanRefusal("binding_package_descriptor_invalid", f"slot {slot!r} stamps")
     for key, value in descriptor_stamps.items():
         if value not in stamps.get(key, set()):
             raise PlanRefusal("resolved_model_binding_mismatch", f"missing stamp {key}={value}")
@@ -423,11 +432,11 @@ def _read_binding(
     return DeclaredBinding(
         entrypoint_binding_plan_id=plan_id,
         entrypoint=entrypoint,
-        endpoint_release=endpoint_release,
+        package_release=package_release,
         model_class=model_class,
         model_binding_path=model_path,
         model_parameter_name=slot,
-        release=endpoint_release,
+        release=package_release,
         application=application,
         descriptor_path=str(descriptor_path),
         store=str(store_root),

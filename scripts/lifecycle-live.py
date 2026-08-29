@@ -6,7 +6,7 @@ executor crash -> worker kill + orphan check -> journal recovery, then the contr
 executor-liveness and egress arms (`--only <name>` runs one of those alone). This is the sequence
 a platform port must pass before it may call itself a port (cr-020 items 1-5, cr-021's
 process half): every section exercises the REAL worker control process, the REAL executor spawn path
-(trampoline seal included), and the REAL protocol bytes — only the endpoint is weightless.
+(trampoline seal included), and the REAL protocol bytes — only the package is weightless.
 
     nice -n 19 uv run python scripts/lifecycle-live.py
     nice -n 19 uv run python scripts/lifecycle-live.py --tmp /tmp/cozy-lifecycle
@@ -47,11 +47,11 @@ pb = wl.pb
 
 RELEASE = "cozy/lifecycle@live"
 
-#: The fixture endpoint, written into the run's tmp dir. `tick` returns immediately;
+#: The fixture package, written into the run's tmp dir. `tick` returns immediately;
 #: `hold` runs for payload.seconds checking the cooperative-cancel signal — the payload
 #: value is each section's PLANT (how long the attempt would run if nobody stopped it),
 #: not a timeout of the harness's. `dial`/`dial_native` are section 17's egress plants.
-ENDPOINT_SOURCE = '''\
+PACKAGE_SOURCE = '''\
 """Weightless lifecycle fixture: no model, no torch, no device."""
 
 import os
@@ -107,7 +107,7 @@ class DialOutput(msgspec.Struct):
 
 @app.entrypoint
 def dial(payload: DialInput) -> DialOutput:
-    """cr-042 section 17's PLANT: endpoint code dialling a reachable address, in Python."""
+    """cr-042 section 17's PLANT: package code dialling a reachable address, in Python."""
     import socket
 
     sock = socket.create_connection(("127.0.0.1", payload.port), timeout=5)
@@ -138,13 +138,13 @@ def dial_native(payload: DialInput) -> DialOutput:
     return DialOutput(rc=int(rc), how="ctypes -> libc connect(2)")
 '''
 
-ENDPOINT_TOML = '[application]\nobject = "lifecycle_endpoint:app"\n'
+PACKAGE_TOML = '[application]\nobject = "lifecycle_package:app"\n'
 
 
 def write_weightless_project(project: Path) -> None:
     project.mkdir(parents=True, exist_ok=True)
-    (project / "lifecycle_endpoint.py").write_text(ENDPOINT_SOURCE)
-    (project / "endpoint.toml").write_text(ENDPOINT_TOML)
+    (project / "lifecycle_package.py").write_text(PACKAGE_SOURCE)
+    (project / "package.toml").write_text(PACKAGE_TOML)
 
 
 def stage_weightless(home: Path, project: Path) -> Any:
@@ -235,7 +235,7 @@ def start_weightless(
         socket_path,
         "--out",
         str(root),
-        "--weightless-endpoint",
+        "--weightless-package",
         str(project),
         *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
@@ -937,13 +937,13 @@ def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None
             f"_Path({str(entered)!r}).write_text('entered')\n"
             f"while not _Path({str(release)!r}).exists(): _time.sleep(0.01)\n"
         )
-        (tmp / "project" / "lifecycle_endpoint.py").write_text(gate + ENDPOINT_SOURCE)
+        (tmp / "project" / "lifecycle_package.py").write_text(gate + PACKAGE_SOURCE)
         old.send(pb.RecordOwnerFrame(desired_state=old._env(successor.directive)))
         deadline = time.monotonic() + args.observe
         while not entered.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not entered.exists():
-            raise TimeoutError("the replacement executor never entered its endpoint import")
+            raise TimeoutError("the replacement executor never entered its package import")
 
         claimant = threading.Thread(target=claim, daemon=True, name="claim-during-convergence")
         claimant.start()
@@ -1208,9 +1208,9 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     root.mkdir(parents=True)
     staged = stage_weightless(home, project)
     detached_file = tmp / "detached.pid"
-    endpoint = project / "lifecycle_endpoint.py"
-    endpoint.write_text(
-        endpoint.read_text()
+    package = project / "lifecycle_package.py"
+    package.write_text(
+        package.read_text()
         + f"""\
 
 # Plant a real executor descendant which defeats process-group containment twice: it
@@ -1302,8 +1302,8 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         {
             "cmd": "prepare",
             "binding": {
-                "application": "lifecycle_endpoint:app",
-                "descriptor": str(staged.descriptor),
+                "application": "lifecycle_package:app",
+                "package_descriptor": str(staged.descriptor),
                 "model_class": "",
             },
             "budgets": {},
@@ -1411,8 +1411,8 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         {
             "cmd": "prepare",
             "binding": {
-                "application": "missing_endpoint:app",
-                "descriptor": str(staged.descriptor),
+                "application": "missing_package:app",
+                "package_descriptor": str(staged.descriptor),
                 "model_class": "",
             },
             "budgets": {},
@@ -1556,7 +1556,7 @@ def section_executor_egress(args: argparse.Namespace, base: str) -> None:
     Both halves are asserted because either alone is a lie. The refusal alone would read as
     "the executor cannot reach the network"; the connection alone would read as "the fence
     does nothing". Together they are the exact claim the comments in `internal/executor.py`
-    and `internal/worker/grants.py` make: a bound on a BUGGY endpoint at the Python layer,
+    and `internal/worker/grants.py` make: a bound on a BUGGY package at the Python layer,
     and no bound at all on a hostile one (law 15's third rung, unarmed and named).
     """
     import socket as _socket

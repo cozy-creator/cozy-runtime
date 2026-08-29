@@ -246,9 +246,9 @@ def _worker_command(
         "-m",
         "cozy_runtime.cli.main",
         "serve",
-        # A base worker image becomes useful by staging the requested endpoint and model,
+        # A base worker image becomes useful by staging the requested package and model,
         # not by running an arbitrary synthetic inference before it can advertise the
-        # placement. Endpoint code is dynamic and untrusted to be cheap: a handler blocked
+        # placement. Package code is dynamic and untrusted to be cheap: a handler blocked
         # in its first CUDA read previously left an otherwise prepared pod ACTIVATING
         # forever. Fixed remote pods therefore skip the optional boot warm pass. This does
         # not change hand-started/local `serve`, whose explicit flag still defaults off.
@@ -265,14 +265,14 @@ def _worker_command(
         config.acquisition_attempt_id,
         "--instance-id",
         boot_id,
-        # No `--release-id`: a pod that hosts no placement HAS no endpoint release. The
+        # No `--release-id`: a pod that hosts no placement HAS no package release. The
         # artifact field carries the image-owned CONTROL RUNTIME WHEEL identity measured
         # from the baked complete WheelhouseManifest, never an OCI self-reference.
         "--control-runtime-digest",
         control_runtime_digest_value,
         "--accelerator-backend",
         accelerator_backend,
-        # The trusted worker stays root. Every endpoint executor crosses the trampoline
+        # The trusted worker stays root. Every package executor crosses the trampoline
         # into this fixed unprivileged identity after no_new_privs; inability to make that
         # transition is a pre-bind structural refusal.
         "--executor-uid",

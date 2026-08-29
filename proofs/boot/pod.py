@@ -15,7 +15,7 @@ What it proves, and every line of it is measured rather than asserted by constru
   * the old closure and identity-echo fields are GONE from the receipt;
   * both listeners bound and both refused a foreign credential;
   * the worker admits the renter's real token and reports ZERO placements, an empty
-    accepted set, and no endpoint release — ready, and empty.
+    accepted set, and no package release — ready, and empty.
 
 Then cr-049's half, on the SAME pod and through the SAME connection, because a first
 placement that took a private door would prove nothing about the tenth:
@@ -26,7 +26,7 @@ placement that took a private door would prove nothing about the tenth:
   * the worker fetches source/custom wheels, publishes a small installed-base overlay, and
     derives the same receipt the hub derived independently;
   * it reports `STAGED` x `DISPATCHABLE` with `converged_revision` = the accepted revision;
-  * it SERVES a real attempt against the endpoint installed in that generation;
+  * it SERVES a real attempt against the package installed in that generation;
   * and a following revision naming an unauthorized digest is refused typed while the
     converged placement KEEPS SERVING (fallback-retention, #474).
 """
@@ -64,7 +64,7 @@ MEDIA_ROOT = Path("/var/lib/cozy/media")
 WHEELS = Path("/wheels")
 ENVIRONMENT_ROOT = Path("/var/lib/cozy/environments")
 ARTIFACT_CACHE = Path("/var/lib/cozy/artifacts")
-APPLICATION = "proof_cli_endpoint:app"
+APPLICATION = "proof_cli_package:app"
 WORKER_PORT = 43100
 MEDIA_PORT = 43101
 ARTIFACT_PORT = 43102
@@ -456,7 +456,7 @@ def serve_one_attempt(
     count: int = 2,
     request_id: str = "cr049-req-1",
 ) -> dict[str, Any]:
-    """One real attempt against the endpoint installed in the materialized generation."""
+    """One real attempt against the package installed in the materialized generation."""
 
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"text": text, "count": count}).encode()
@@ -464,7 +464,7 @@ def serve_one_attempt(
     payload_path.write_bytes(payload)
     payload_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     spec = pb.InvocationSpec(
-        endpoint_release_id=release_id,
+        package_release_id=release_id,
         environment_spec_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         payload_digest=payload_digest,
@@ -533,13 +533,13 @@ def serve_one_attempt(
 
 
 def author_release() -> hub.Release:
-    """Author one endpoint release against the stand-in's installed base family.
+    """Author one package release against the stand-in's installed base family.
 
     The wheelhouse is the control Runtime and its three ordinary dependencies, already
     installed in image Python. The project wheel is absent until the grant lands.
     """
 
-    project = next(WHEELS.glob("proof_cli_endpoint-*.whl"))
+    project = next(WHEELS.glob("proof_cli_package-*.whl"))
     wheelhouse = sorted([next(WHEELS.glob("cozy_runtime-*.whl")), *(WHEELS / "deps").glob("*.whl")])
     version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     libc = "glibc{}.{}".format(*platform.libc_ver()[1].split(".")[:2])
@@ -718,31 +718,31 @@ def main() -> int:
             assert staged.placements[0].placement_id == hub.PLACEMENT_ID, describe(staged)
             assert staged.placements[0].dispatchable_plan_ids, describe(staged)
             assert staged.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
-            assert hub.overlap_proven(), "endpoint wheel and model object-set fetches serialized"
+            assert hub.overlap_proven(), "package wheel and model object-set fetches serialized"
             cold_acquisition = staged.placements[0].acquisition
-            assert cold_acquisition.endpoint.started_monotonic_ns > 0
+            assert cold_acquisition.package.started_monotonic_ns > 0
             assert cold_acquisition.model.started_monotonic_ns > 0
-            assert cold_acquisition.endpoint.ended_monotonic_ns >= (
-                cold_acquisition.endpoint.started_monotonic_ns
+            assert cold_acquisition.package.ended_monotonic_ns >= (
+                cold_acquisition.package.started_monotonic_ns
             )
             assert cold_acquisition.model.ended_monotonic_ns >= (
                 cold_acquisition.model.started_monotonic_ns
             )
             assert max(
-                cold_acquisition.endpoint.started_monotonic_ns,
+                cold_acquisition.package.started_monotonic_ns,
                 cold_acquisition.model.started_monotonic_ns,
             ) <= min(
-                cold_acquisition.endpoint.ended_monotonic_ns,
+                cold_acquisition.package.ended_monotonic_ns,
                 cold_acquisition.model.ended_monotonic_ns,
             ), "terminal acquisition intervals do not overlap"
-            assert cold_acquisition.endpoint.downloaded_bytes > 0
-            assert cold_acquisition.endpoint.reused_bytes == 0
+            assert cold_acquisition.package.downloaded_bytes > 0
+            assert cold_acquisition.package.reused_bytes == 0
             assert any(
                 state.placements
                 and (
                     (
-                        state.placements[0].acquisition.endpoint.started_monotonic_ns > 0
-                        and state.placements[0].acquisition.endpoint.ended_monotonic_ns == 0
+                        state.placements[0].acquisition.package.started_monotonic_ns > 0
+                        and state.placements[0].acquisition.package.ended_monotonic_ns == 0
                     )
                     or (
                         state.placements[0].acquisition.model.started_monotonic_ns > 0
@@ -754,15 +754,15 @@ def main() -> int:
             assert any(
                 state.placements
                 and state.placements[0].executor_generation > 0
-                and state.placements[0].acquisition.endpoint.ended_monotonic_ns > 0
+                and state.placements[0].acquisition.package.ended_monotonic_ns > 0
                 and state.placements[0].acquisition.model.started_monotonic_ns > 0
                 and state.placements[0].acquisition.model.ended_monotonic_ns == 0
                 for state in owner.states
-            ), "executor did not spawn after endpoint admission while model hydration continued"
+            ), "executor did not spawn after package admission while model hydration continued"
             note(f"CONVERGED: {describe(staged)}")
-            note("endpoint-source and model-object-set GETs overlapped at the origin barrier")
+            note("package-source and model-object-set GETs overlapped at the origin barrier")
 
-            # THE POD BUILT ONLY THE ENDPOINT OVERLAY and derived the hub's exact receipt.
+            # THE POD BUILT ONLY THE PACKAGE OVERLAY and derived the hub's exact receipt.
             expected = "sha256:" + hashlib.sha256(release.receipt).hexdigest()
             receipt_path = (
                 ENVIRONMENT_ROOT / "receipts" / f"{expected.removeprefix('sha256:')}.json"
@@ -771,7 +771,7 @@ def main() -> int:
             content_identity = json.dumps(
                 {
                     "base_family_digest": receipt_value["base_family_digest"],
-                    "format": "cozy.runtime.EndpointOverlayContent/1",
+                    "format": "cozy.runtime.PackageOverlayContent/1",
                     "wheel_digests": sorted(
                         row["digest"] for row in receipt_value["overlay_wheels"]
                     ),
@@ -783,13 +783,13 @@ def main() -> int:
             generation = ENVIRONMENT_ROOT / "contents" / content_digest
             assert generation.is_dir(), f"no generation at {generation}"
             assert receipt_path.read_bytes() == release.receipt, "the pod receipt differs"
-            assert (
-                generation / "endpoint-overlay-content.json"
-            ).read_bytes() == content_identity, "the installed-content identity differs"
-            assert (generation / "site-packages" / "proof_cli_endpoint").is_dir()
-            endpoint_file = generation / "site-packages" / "proof_cli_endpoint" / "__init__.py"
-            assert access_as(endpoint_file, 65533, 65533, os.O_RDONLY)
-            assert not access_as(endpoint_file, 65533, 65533, os.O_WRONLY)
+            assert (generation / "package-overlay-content.json").read_bytes() == content_identity, (
+                "the installed-content identity differs"
+            )
+            assert (generation / "site-packages" / "proof_cli_package").is_dir()
+            package_file = generation / "site-packages" / "proof_cli_package" / "__init__.py"
+            assert access_as(package_file, 65533, 65533, os.O_RDONLY)
+            assert not access_as(package_file, 65533, 65533, os.O_WRONLY)
             assert not access_as(receipt_path, 65533, 65533, os.O_RDONLY)
             journal = STATE.parent / "worker" / "journal.log"
             assert journal.is_file() and not access_as(journal, 65533, 65533, os.O_RDONLY)
@@ -810,7 +810,7 @@ def main() -> int:
             )
 
             served = serve_one_attempt(
-                owner, staged.placements[0].dispatchable_plan_ids[0], hub.ENDPOINT_RELEASE
+                owner, staged.placements[0].dispatchable_plan_ids[0], hub.PACKAGE_RELEASE
             )
             assert served["body"]["status"] == pb.OutcomeStatus.OUTCOME_STATUS_SUCCEEDED, served[
                 "body"
@@ -822,7 +822,7 @@ def main() -> int:
             isolation = serve_one_attempt(
                 owner,
                 staged.placements[0].dispatchable_plan_ids[0],
-                hub.ENDPOINT_RELEASE,
+                hub.PACKAGE_RELEASE,
                 text="__cozy_isolation_probe__",
                 count=1,
                 request_id="cr045-isolation-probe",
@@ -834,7 +834,7 @@ def main() -> int:
                 "worker_secret_read_refused": True,
             }, isolation_facts
             note(
-                "actual endpoint executor ran as uid 65533 and refused worker journal plus "
+                "actual package executor ran as uid 65533 and refused worker journal plus "
                 "/proc/<worker>/mem"
             )
 
@@ -848,7 +848,7 @@ def main() -> int:
             assert access_as(scratch_sentinel, 65533, 65533, os.O_RDONLY)
 
             # Leave observed state, then request the exact same placement again. Every
-            # endpoint byte is already verified in the artifact cache and the empty model
+            # package byte is already verified in the artifact cache and the empty model
             # set reaches zero model bytes: both legs must download zero on the warm pass.
             empty_set, _ = documents.identity(pb.PlacementSet())
             owner.send(
@@ -878,9 +878,9 @@ def main() -> int:
                 seconds=300,
             )
             warm_acquisition = warm.placements[0].acquisition
-            assert warm_acquisition.endpoint.downloaded_bytes == 0
-            assert warm_acquisition.endpoint.reused_bytes == (
-                cold_acquisition.endpoint.downloaded_bytes
+            assert warm_acquisition.package.downloaded_bytes == 0
+            assert warm_acquisition.package.reused_bytes == (
+                cold_acquisition.package.downloaded_bytes
             )
             assert warm_acquisition.model.downloaded_bytes == 0
             assert warm_acquisition.model.reused_bytes == 0
@@ -890,7 +890,7 @@ def main() -> int:
             assert (STATE.parent / "scratch" / f"generation-{successor_generation}").is_dir()
             note(
                 "WARM acquisition downloaded 0 B and reused "
-                f"{warm_acquisition.endpoint.reused_bytes} endpoint B"
+                f"{warm_acquisition.package.reused_bytes} package B"
             )
 
             # ---- the red arm: an incoming spec the grant does not authorize --------------
@@ -972,7 +972,7 @@ def main() -> int:
     print(
         "boot proof: PASS — ready and empty with no provision document, then a first "
         "DesiredPlacementSet fetched with observed overlapping legs and early executor spawn; "
-        "the uid-65533 endpoint refused worker secret/proc access, scratch rotated, warm reuse "
+        "the uid-65533 package refused worker secret/proc access, scratch rotated, warm reuse "
         "downloaded zero bytes, a mismatched revision retained serving, and fd3 EOF stopped "
         "the root worker cooperatively",
         flush=True,

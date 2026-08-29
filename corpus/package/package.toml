@@ -1,4 +1,4 @@
-# The real-GPU endpoint cr-007 serves. Bindings state SELECTION; the code names nothing.
+# The real-GPU package cr-007 serves. Bindings state SELECTION; the code names nothing.
 #
 # The binding below is the in-repo DEFAULT and never authority: the worker serves whatever
 # its Directive's EntrypointBindingPlan resolves to, which for this verification is the

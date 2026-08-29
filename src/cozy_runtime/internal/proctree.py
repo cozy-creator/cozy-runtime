@@ -66,7 +66,7 @@ class ContainmentUnavailable(Exception):
 class CgroupScope:
     """One exact cgroup-v2 directory, protected against path reuse by its inode.
 
-    This is lifecycle containment for ordinary endpoint process trees: sessions, process
+    This is lifecycle containment for ordinary package process trees: sessions, process
     groups, double-forks, and nested cgroups stay below it and ``cgroup.kill`` reaches them.
     It is not a hostile-code sandbox. Same-UID code that can write a delegated ancestor's
     ``cgroup.procs`` may deliberately migrate out; privilege isolation owns that threat.
@@ -205,7 +205,7 @@ def arm_subreaper() -> None:
 
 
 def deny_process_inspection() -> None:
-    """Make the trusted worker non-dumpable before an endpoint child exists.
+    """Make the trusted worker non-dumpable before a package child exists.
 
     The pod executor runs as a different uid, which already closes ordinary same-uid
     ptrace.  Keeping the worker non-dumpable makes the intended boundary explicit and

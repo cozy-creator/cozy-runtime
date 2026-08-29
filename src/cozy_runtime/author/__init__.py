@@ -1,4 +1,4 @@
-"""The author-facing surface — the ONLY cozy-runtime package endpoint/job code imports.
+"""The author-facing surface — the ONLY cozy-runtime package/job code imports.
 
 Structural fence (cozy-runtime.md §7, boundaries.md): this package may import schema and
 typing libraries and the pure canonical-JSON facade only. It cannot import
@@ -8,7 +8,7 @@ it names no device, allocator, compile or ingest surface. `checks/architecture.p
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. The surface below is the
-complete set of things an endpoint author touches, minus the codec plane (cr-017). Per-service
+complete set of things a package author touches, minus the codec plane (cr-017). Per-service
 fakes live in `cozy_runtime.author.fakes`.
 """
 

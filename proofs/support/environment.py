@@ -36,8 +36,8 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
-RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
-CONTENT_FORMAT = "cozy.runtime.EndpointOverlayContent/1"
+RECEIPT_FORMAT = "cozy.runtime.PackageOverlayReceipt/1"
+CONTENT_FORMAT = "cozy.runtime.PackageOverlayContent/1"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -423,12 +423,12 @@ def _release(
             "wheels": resolved_rows,
         }
     )
-    descriptor = _canonical({"format": "proof.EndpointDescriptor/1"})
+    descriptor = _canonical({"format": "proof.PackageDescriptor/1"})
     bundle = _canonical(
         {
-            "descriptor": _ref(descriptor),
-            "endpoint_release_id": "proof-release",
-            "format": "tensorhub.endpoint_bundle/2",
+            "package_descriptor": _ref(descriptor),
+            "package_release_id": "proof-release",
+            "format": "tensorhub.package_bundle/2",
             "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),
             "source_archive": _ref(b"proof-source"),
@@ -437,17 +437,17 @@ def _release(
         }
     )
     spec = documents.canonical_bytes(
-        pb.EndpointEnvironmentSpec(
+        pb.PackageEnvironmentSpec(
             compatibility_profile=pb.CompatibilityProfile(**profile),
             platform_target=pb.PlatformTarget(**target),
-            endpoint_bundle_digest=documents.digest_of(bundle),
+            package_bundle_digest=documents.digest_of(bundle),
             project_wheel_digest=documents.raw(project.digest),
             wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
         )
     )
     return {
-        "endpoint_environment_spec": _write(root / "environment.json", spec),
-        "endpoint_bundle": _write(root / "bundle.json", bundle),
+        "package_environment_spec": _write(root / "environment.json", spec),
+        "package_bundle": _write(root / "bundle.json", bundle),
         "resolved_wheel_set": _write(root / "resolved.json", resolved),
         "wheelhouse_manifest": _write(root / "wheelhouse.json", wheelhouse),
         "wheel_files": dict(wheel_paths),
@@ -514,10 +514,10 @@ def _success(root: Path, name: str, receipt: bytes) -> dict[str, Any]:
     )
     _require(generation.is_dir(), f"{name} installed content is absent")
     site = generation / "site-packages"
-    for metadata in ("endpoint.toml", "pyproject.toml", "uv.lock"):
+    for metadata in ("package.toml", "pyproject.toml", "uv.lock"):
         _require((site / metadata).is_file(), f"{name} omitted project metadata {metadata}")
     _require(
-        (generation / "endpoint-overlay-content.json").read_bytes() == content,
+        (generation / "package-overlay-content.json").read_bytes() == content,
         f"{name} installed-content identity disagrees with its receipt",
     )
     _require(

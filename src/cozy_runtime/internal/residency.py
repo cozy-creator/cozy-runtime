@@ -1,6 +1,6 @@
 """Component-use ADMISSION and MATERIALIZATION — the runtime body of the §1.1 contract.
 
-The endpoint declares, per public model operation, the possible heavyweight component set it
+The package declares, per public model operation, the possible heavyweight component set it
 may touch. It declares nothing else: no device, no movement, no offload, no pinning, no
 eviction, no backend. This module is what makes that declaration mean something at runtime.
 

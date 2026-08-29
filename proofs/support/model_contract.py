@@ -42,9 +42,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     prepare = sub.add_parser("prepare")
     prepare.add_argument("root", type=Path)
-    prepare.add_argument("descriptor", type=Path)
+    prepare.add_argument("package_descriptor", type=Path)
     prepare.add_argument("runtime_wheel", type=Path)
-    prepare.add_argument("endpoint_wheel", type=Path)
+    prepare.add_argument("package_wheel", type=Path)
     prepare.add_argument("torch_wheel", type=Path)
     prepare.add_argument("python", type=Path)
 
@@ -87,12 +87,12 @@ def _prepare(args: argparse.Namespace) -> None:
     inputs.mkdir()
 
     runtime_path = args.runtime_wheel.resolve()
-    endpoint_path = args.endpoint_wheel.resolve()
+    package_path = args.package_wheel.resolve()
     dependency_paths = [
         _pack_installed(wheels, name)
         for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
     ]
-    project = _inventory(endpoint_path)
+    project = _inventory(package_path)
     base_pairs = sorted(
         [(_inventory(path), path) for path in (runtime_path, *dependency_paths)],
         key=lambda pair: pair[0].distribution,
@@ -131,7 +131,7 @@ def _prepare(args: argparse.Namespace) -> None:
         }
     )
     config = _canonical({"width": 4})
-    descriptor_path = args.descriptor.resolve()
+    descriptor_path = args.package_descriptor.resolve()
     descriptor_bytes = descriptor_path.read_bytes()
     descriptor_doc = _parse_json(descriptor_bytes)
     if not isinstance(descriptor_doc, dict) or set(descriptor_doc) != {
@@ -140,13 +140,13 @@ def _prepare(args: argparse.Namespace) -> None:
         "format",
         "jobs",
     }:
-        raise ProofFailure("fixture descriptor is not one closed EndpointDescriptor/1")
+        raise ProofFailure("fixture descriptor is not one closed PackageDescriptor/1")
     _require(
-        descriptor_doc.get("format") == "cozy.endpoint.descriptor/1",
+        descriptor_doc.get("format") == "cozy.package.descriptor/1",
         "fixture descriptor has the wrong format",
     )
     descriptor_bytes = _canonical(descriptor_doc)
-    descriptor_path = _write(inputs / "endpoint-descriptor.json", descriptor_bytes)
+    descriptor_path = _write(inputs / "package-descriptor.json", descriptor_bytes)
     names = [row.get("name") for row in descriptor_doc["entrypoints"] if isinstance(row, dict)]
     _require(names == ["metadata", "render"], f"unexpected published functions: {names!r}")
     _require(
@@ -155,9 +155,9 @@ def _prepare(args: argparse.Namespace) -> None:
     )
     bundle = _canonical(
         {
-            "descriptor": _ref(descriptor_bytes),
-            "endpoint_release_id": "proof-release",
-            "format": "tensorhub.endpoint_bundle/2",
+            "package_descriptor": _ref(descriptor_bytes),
+            "package_release_id": "proof-release",
+            "format": "tensorhub.package_bundle/2",
             "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),
             "source_archive": _ref(b"proof-source"),
@@ -166,22 +166,22 @@ def _prepare(args: argparse.Namespace) -> None:
         }
     )
     spec = documents.canonical_bytes(
-        pb.EndpointEnvironmentSpec(
+        pb.PackageEnvironmentSpec(
             compatibility_profile=pb.CompatibilityProfile(**profile),
             platform_target=pb.PlatformTarget(**target),
-            endpoint_bundle_digest=documents.digest_of(bundle),
+            package_bundle_digest=documents.digest_of(bundle),
             project_wheel_digest=documents.raw(project.digest),
             wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
         )
     )
     paths = {
-        "endpoint_environment_spec": _write(inputs / "environment.json", spec),
-        "endpoint_bundle": _write(inputs / "bundle.json", bundle),
+        "package_environment_spec": _write(inputs / "environment.json", spec),
+        "package_bundle": _write(inputs / "bundle.json", bundle),
         "resolved_wheel_set": _write(inputs / "resolved.json", resolved),
         "wheelhouse_manifest": _write(inputs / "wheelhouse.json", wheelhouse),
     }
     config_path = _write(inputs / "model-config.json", config)
-    wheel_files = {project.digest: str(endpoint_path)}
+    wheel_files = {project.digest: str(package_path)}
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
         "format": ENVIRONMENT_REQUEST_FORMAT,
@@ -199,8 +199,8 @@ def _prepare(args: argparse.Namespace) -> None:
             "config": str(config_path),
             "config_digest": _digest(config),
             "config_length": len(config),
-            "descriptor": str(descriptor_path),
-            "descriptor_digest": _digest(descriptor_bytes),
+            "package_descriptor": str(descriptor_path),
+            "package_descriptor_digest": _digest(descriptor_bytes),
             "descriptor_length": len(descriptor_bytes),
             "environment_spec_digest": _digest(spec),
             "format": STATE_FORMAT,
@@ -229,12 +229,12 @@ def _write_model_request(root: Path, name: str) -> None:
                     "snapshot": _digest(b"proof-snapshot"),
                 }
             ],
-            "endpoint_descriptor": {
-                "digest": state["descriptor_digest"],
+            "package_descriptor": {
+                "digest": state["package_descriptor_digest"],
                 "length": state["descriptor_length"],
-                "path": state["descriptor"],
+                "path": state["package_descriptor"],
             },
-            "endpoint_release_id": "proof-release",
+            "package_release_id": "proof-release",
             "environment_generation": environment["generation"],
             "environment_spec_digest": state["environment_spec_digest"],
             "format": MODEL_REQUEST_FORMAT,

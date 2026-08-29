@@ -4,7 +4,7 @@ tensor subclasses that answer for themselves.
 This is where v1 bled. `is_virtual` exists because pgw#1661 asked "does this tensor have
 storage?" with `isinstance(t, FakeTensor)` and 300 torchao `Float8Tensor` weights over fake
 data answered FALSE, pricing a config-only tree at 23 GB on an 8 GiB card. The wrapper
-cases below are that defect, reproduced as endpoint code.
+cases below are that defect, reproduced as package code.
 
 v1 had NOTHING for custom `torch.library` ops — no `register_fake`, no meta-kernel
 handling anywhere in its derivation path — and it FENCED OUT the artifact classes whose
@@ -161,7 +161,7 @@ def _torch_function_param(config: Config) -> Pipeline:
 
 def _c_extension(config: Config) -> Pipeline:
     """A third-party C extension consuming a parameter during construction. numpy is the
-    one every endpoint already has, and it reaches storage through the buffer protocol."""
+    one every package already has, and it reaches storage through the buffer protocol."""
     width = config.as_int("width", 16)
     import numpy as np
 
@@ -182,7 +182,7 @@ CASES = (
         _custom_op_no_meta,
         "typed-harness-gap",
         names="opaque_table",
-        note="the fix lane is a meta kernel in the endpoint's own op, or this refusal",
+        note="the fix lane is a meta kernel in the package's own op, or this refusal",
     ),
     Case(
         "custom_op_with_meta_kernel",

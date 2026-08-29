@@ -211,7 +211,7 @@ class WorkerOptions:
     no_warm: bool = False
     executor_uid: int = -1
     executor_gid: int = -1
-    """Fixed endpoint identity, or ``-1/-1`` for the native same-user development lane."""
+    """Fixed package identity, or ``-1/-1`` for the native same-user development lane."""
 
 
 @dataclass(slots=True)
@@ -226,10 +226,10 @@ class Placement:
 
     placement_id: str
     spec_digest: bytes
-    endpoint_release_id: str
+    package_release_id: str
     environment_spec_digest: bytes
     installed_environment_receipt_digest: bytes
-    descriptor_digest: bytes
+    package_descriptor_digest: bytes
     model_object_set: tuple[str, int]
     plan_ids: tuple[str, ...]
     plan_refs: dict[str, tuple[str, int]]
@@ -570,7 +570,7 @@ class Worker:
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
         if options.executor_uid >= 0:
-            # Set before any endpoint child exists and before the worker starts serving.
+            # Set before any package child exists and before the worker starts serving.
             # The uid split closes ordinary ptrace; non-dumpable is the explicit second belt.
             proctree.deny_process_inspection()
         self.fence = OwnershipFence(worker_boot_id=f"boot-{uuid.uuid4().hex[:20]}")
@@ -1685,12 +1685,12 @@ class Worker:
             # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
             # reconstructed with its own format tag (#510g) from the bytes already held.
             spec_digest=documents.embedded_document_digest(spec, "cozy.worker.v1.PlacementSpec"),
-            endpoint_release_id=str(spec.get("endpoint_release_id", "")),
+            package_release_id=str(spec.get("package_release_id", "")),
             environment_spec_digest=_digest_field(spec.get("environment_spec_digest")),
             installed_environment_receipt_digest=_digest_field(
                 spec.get("installed_environment_receipt_digest")
             ),
-            descriptor_digest=_digest_field(spec.get("descriptor_digest")),
+            package_descriptor_digest=_digest_field(spec.get("package_descriptor_digest")),
             model_object_set=(
                 str(model_object_set.get("digest", "")),
                 int(model_object_set.get("length", 0)),
@@ -1804,8 +1804,8 @@ class Worker:
         # A preinstalled overlay receipt says nothing about TensorFS/model-root custody.
         # Dynamic acquisition sets the exact object-set path itself; warm/local reuse must
         # bind the independently staged document before resolving plans. Requiring this
-        # only when `installed is None` left every preinstalled endpoint with an overlay but
-        # no model closure, including the truthful empty closure of a weightless endpoint.
+        # only when `installed is None` left every preinstalled package with an overlay but
+        # no model closure, including the truthful empty closure of a weightless package.
         if candidate.model_object_set_path is None and not self._bind_preinstalled_object_set(
             candidate
         ):
@@ -1818,7 +1818,7 @@ class Worker:
                 str(installed.python), str(installed.import_root), installed.content_digest
             )
             if changed and self.supervision.current is not None:
-                self.supervision.current.poisoned = "endpoint overlay generation changed"
+                self.supervision.current.poisoned = "package overlay generation changed"
 
         bindings = self._resolve_bindings(candidate)
         if bindings is None:
@@ -1924,7 +1924,7 @@ class Worker:
                     reason="environment_materialization_input_missing",
                     detail=f"receipt {expected} is required, but this worker was launched "
                     "without --environment-root and --artifact-store; the worker will not "
-                    "guess where the worker put endpoint overlays or TensorFS objects",
+                    "guess where the worker put package overlays or TensorFS objects",
                 ),
                 terminal=False,
             )
@@ -1933,7 +1933,7 @@ class Worker:
             self.options.environment_root / "receipts" / f"{expected.removeprefix('sha256:')}.json"
         )
         # A standing grant re-drives the full reachability walk even when the overlay is
-        # already present: that is how warm reuse is measured honestly for BOTH endpoint
+        # already present: that is how warm reuse is measured honestly for BOTH package
         # and model legs. A preinstalled generation with no grant may still open locally.
         if not receipt.exists() or self.grant.authorized():
             if self.options.artifact_cache is None:
@@ -1979,7 +1979,7 @@ class Worker:
                     on_observation=lambda value: self._observe_acquisition(placement, value),
                 )
 
-                def endpoint_ready(installed: overlay.InstalledOverlay) -> None:
+                def package_ready(installed: overlay.InstalledOverlay) -> None:
                     """Start cold interpreter/Torch import while model bytes still hydrate."""
 
                     if revision != self.accepted.accepted_desired_state_revision:
@@ -2005,14 +2005,14 @@ class Worker:
                     self.note(
                         "boot",
                         f"generation {executor.incarnation} pid {executor.pid} spawned "
-                        "after endpoint overlay admission while model hydration continued",
+                        "after package overlay admission while model hydration continued",
                     )
                     # Make the overlap externally observable immediately; otherwise the
                     # next state frame might be the model leg's terminal update and the
                     # optimization would exist without a proof surface.
                     self._observe_acquisition(placement, acquirer.observation.snapshot())
 
-                acquired = acquirer.acquire(placement, on_endpoint_ready=endpoint_ready)
+                acquired = acquirer.acquire(placement, on_package_ready=package_ready)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,
@@ -2171,7 +2171,7 @@ class Worker:
                     read_document=provisioned.staged_document_reader(
                         self.config.cozy_home / "binding-documents"
                     ),
-                    endpoint_release=placement.endpoint_release_id,
+                    package_release=placement.package_release_id,
                     store_root=self.options.artifact_store,
                     object_set=object_set,
                     # A weightless release never opens TensorFS. Defer the facade lookup
@@ -2472,7 +2472,7 @@ class Worker:
                         "cmd": "prepare",
                         "binding": {
                             "application": first.application,
-                            "descriptor": first.descriptor_path,
+                            "package_descriptor": first.descriptor_path,
                             "model_class": first.model_class,
                             "model_binding_path": first.model_binding_path,
                             "model_parameter_name": first.model_parameter_name,
@@ -2685,7 +2685,7 @@ class Worker:
 
     def run_warm_pass(self) -> bool:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
-        # Dynamic placement workers execute endpoint source only for a real invocation,
+        # Dynamic placement workers execute package source only for a real invocation,
         # after the placement is DISPATCHABLE. Their environment root is the structural
         # identity of that mode; the adapter's `--no-warm` remains a belt, but correctness
         # cannot depend on one argv translation surviving every launch layer. A real pod
@@ -2694,7 +2694,7 @@ class Worker:
         if self.options.environment_root is not None:
             self.note(
                 "warm",
-                "dynamic placement worker: boot warm pass disabled; endpoint execution "
+                "dynamic placement worker: boot warm pass disabled; package execution "
                 "begins only after DISPATCHABLE",
             )
             executor = self.supervision.current
@@ -3653,7 +3653,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-root",
         default="",
-        help="endpoint-overlay root containing exact receipts and content-keyed generations",
+        help="package-overlay root containing exact receipts and content-keyed generations",
     )
     parser.add_argument(
         "--artifact-cache",

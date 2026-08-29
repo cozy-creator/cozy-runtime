@@ -1,4 +1,4 @@
-"""Measure the Python/base half of a native qualification seat before endpoint import."""
+"""Measure the Python/base half of a native qualification seat before package import."""
 
 from __future__ import annotations
 

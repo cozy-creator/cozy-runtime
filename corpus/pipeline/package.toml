@@ -1,4 +1,4 @@
-# cr-008b's real-GPU endpoint: the whole four-component SDXL pipeline, one text-to-image
+# cr-008b's real-GPU package: the whole four-component SDXL pipeline, one text-to-image
 # call. Bindings state SELECTION; the code names nothing.
 
 [application]

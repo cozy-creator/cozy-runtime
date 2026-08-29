@@ -1,7 +1,7 @@
 # Installed CLI proof
 
 `run.sh` builds the current Runtime wheel, installs it and this directory's ordinary
-endpoint fixture into a fresh environment, changes to `/`, unsets `PYTHONPATH`, cuts
+package fixture into a fresh environment, changes to `/`, unsets `PYTHONPATH`, cuts
 network connects, and invokes only the installed `cozy-runtime` executable.
 
 It proves the process exit matrix, noninteractive/read-only AXI, exact Descriptor/1 bytes,

@@ -15,7 +15,7 @@ is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and repor
 must see. Nothing widens the table at runtime; a new call site is a new reviewed row.
 
 **EVERY DESTINATION IS CONTROL-PLANE-MINTED, never named by request content.** The grant is
-minted for one invocation and spent here, so nothing the endpoint produced — and nothing a
+minted for one invocation and spent here, so nothing the package produced — and nothing a
 request body can influence — chooses where bytes land: a destination the table has no row
 for refuses typed, and `scripts/worker-live.py grants` plants
 `https://exfiltrate.example/upload` for the `hub_call_unauthorized` SECURITY EVENT. Every
@@ -25,8 +25,8 @@ tensorhub mints it, R2 sits behind it, the worker never holds the credential —
 is a completion, and whoever lands it lands HOST VALIDATION of the minted URL with it. That
 is what keeps the property; a `file://`-only table never did — `scripts/lifecycle-live.py
 --only egress` watches a `ctypes` connect(2) LAND from inside the serving executor, so a
-hostile endpoint already holds a socket. The rung is the fence's own, below: a careless
-endpoint and a malicious GRANT, never a malicious endpoint.
+hostile package already holds a socket. The rung is the fence's own, below: a careless
+package and a malicious GRANT, never a malicious package.
 
 cr-012 shipped an `https://` INPUT row and an `EgressPolicy` allowlist for it. Both are gone
 (cr-042): `DeclaredBinding.egress_allowed_hosts` never had a writer, so the row refused every
@@ -38,7 +38,7 @@ enter through. Whoever lands that row lands its allowlist writer with it.
 
 The executor is handed verified files in the attempt spool and never an address, and it
 installs `sandbox.refuse_network` so a dial of its own refuses (cr-042) — a Python-level
-bound on a buggy endpoint, not a kernel bound on a hostile one.
+bound on a buggy package, not a kernel bound on a hostile one.
 """
 
 from __future__ import annotations

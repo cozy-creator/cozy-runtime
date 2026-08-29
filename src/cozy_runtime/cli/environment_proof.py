@@ -1,4 +1,4 @@
-"""Trusted th-046 proof seat for one exact offline endpoint environment."""
+"""Trusted th-046 proof seat for one exact offline package environment."""
 
 from __future__ import annotations
 
@@ -14,12 +14,12 @@ from pathlib import Path
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import canonical, overlay
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.materialize_launch import LaunchRefusal, endpoint_overlay_input
+from cozy_runtime.internal.materialize_launch import LaunchRefusal, package_overlay_input
 
 REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 REQUEST_FIELDS = {
-    "endpoint_bundle",
-    "endpoint_environment_spec",
+    "package_bundle",
+    "package_environment_spec",
     "environment_root",
     "format",
     "python",
@@ -32,7 +32,7 @@ REQUEST_FIELDS = {
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
     environment_spec: Path
-    endpoint_bundle: Path
+    package_bundle: Path
     resolved_wheel_set: Path
     wheelhouse_manifest: Path
     wheel_files: Mapping[str, Path]
@@ -70,11 +70,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "choose a separate absolute receipt path owned by the build seat",
                 Exit.validation,
             )
-        source = endpoint_overlay_input(
+        source = package_overlay_input(
             environment_spec_bytes=_document_bytes(
-                request.environment_spec, "endpoint_environment_spec"
+                request.environment_spec, "package_environment_spec"
             ),
-            endpoint_bundle_bytes=_document_bytes(request.endpoint_bundle, "endpoint_bundle"),
+            package_bundle_bytes=_document_bytes(request.package_bundle, "package_bundle"),
             resolved_wheel_set_bytes=_document_bytes(
                 request.resolved_wheel_set, "resolved_wheel_set"
             ),
@@ -168,9 +168,9 @@ def _read_request(path: Path) -> ProofRequest:
     environment_root = _fresh_root(value["environment_root"])
     return ProofRequest(
         environment_spec=_existing_file(
-            value["endpoint_environment_spec"], "endpoint_environment_spec"
+            value["package_environment_spec"], "package_environment_spec"
         ),
-        endpoint_bundle=_existing_file(value["endpoint_bundle"], "endpoint_bundle"),
+        package_bundle=_existing_file(value["package_bundle"], "package_bundle"),
         resolved_wheel_set=_existing_file(value["resolved_wheel_set"], "resolved_wheel_set"),
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,

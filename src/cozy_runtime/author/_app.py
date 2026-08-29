@@ -1,4 +1,4 @@
-"""The `App` registry — the one object an endpoint module exports as `app = App()`.
+"""The `App` registry — the one object a package module exports as `app = App()`.
 
 The decorators are sugar for explicit registration calls (`app.entrypoint(...)(fn)`):
 sibling modules export plain functions and the entry module registers them, so merely
@@ -81,7 +81,7 @@ class Registration:
 
 @dataclass(slots=True)
 class App:
-    """The one registry an endpoint module exports as `app = App()`."""
+    """The one registry a package module exports as `app = App()`."""
 
     _registry: dict[str, Registration] = field(default_factory=dict)
     _frozen: bool = False

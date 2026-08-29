@@ -1,11 +1,11 @@
 """The describe-time conformance layer — static analysis as a CONTRACT, not a suggestion.
 
-`describe` is the second reader of the one signature (mypy is the first). An endpoint whose
+`describe` is the second reader of the one signature (mypy is the first). A package whose
 surface is invalid refuses at BUILD with the same verdict class as a schema violation, so a
 mis-typed handler cannot reach a device (§1.7).
 
-This module also owns the ONE SDK-owned deleted-field list. An endpoint asserts what IT
-declares via `assert_declaration_shape` and inherits the deletion walk — contracts endpoints
+This module also owns the ONE SDK-owned deleted-field list. A package asserts what IT
+declares via `assert_declaration_shape` and inherits the deletion walk — contracts packages
 rely on are exercised by conformance, never by convention.
 """
 
@@ -28,13 +28,13 @@ from cozy_runtime.author._walker import walk
 if TYPE_CHECKING:
     from cozy_runtime.author._app import App
 
-#: Names deleted from the author surface, with WHY. One list, one owner: an endpoint that
+#: Names deleted from the author surface, with WHY. One list, one owner: a package that
 #: declares any of them refuses, and `checks/architecture.py` proves the SDK never grows one back.
 DELETED_SURFACES: Mapping[str, str] = {
     "generator": "the seeded generator is view.generator — there is no ctx.generator (§1.3)",
     "recommended": "'runs better on newer silicon' is a measured ranking fact (§1.2)",
     "vcpus": "vcpus are MEASURED per (lane, plan) fleet-side, never authored (§1.2)",
-    "vram": "no VRAM guess is authored in endpoint code (§1.2)",
+    "vram": "no VRAM guess is authored in package code (§1.2)",
     "batch_size": "one request produces one output; batch dimensions stay deleted (§1.2)",
     "tuned": "no parallel family-defaults struct or model.tuned exists (§1.2)",
     "callback_on_step_end": "mid-run tensor mutation is an unconfessed quality change (§1.3)",
@@ -71,7 +71,7 @@ def assert_declaration_shape(declaration: object) -> None:
         bound = node.marker(AssetBound)
         if isinstance(bound, AssetBound):
             # cr-012: a bound NARROWS a kind. Checking it at DESCRIBE rather than at
-            # hydration is the difference between an endpoint that cannot be built and one
+            # hydration is the difference between a package that cannot be built and one
             # that refuses every request that reaches it — a field declaring a media type
             # its kind does not admit promises a decoder this runtime does not have.
             kinds = asset_kinds(node.annotation)
@@ -200,8 +200,8 @@ def _media_decode_bounds(surface: Surface) -> None:
 
     Compressed bytes are already deployment- and field-bounded. Decode has a different
     amplification factor, so requesting the service without binding every decodable media
-    field would make the most dangerous input the one field an endpoint forgot to annotate.
-    Refuse that endpoint at describe instead of offering a request-time unbounded overload.
+    field would make the most dangerous input the one field a package forgot to annotate.
+    Refuse that package at describe instead of offering a request-time unbounded overload.
     """
     if "media_decode" not in surface.capabilities:
         return
@@ -238,7 +238,7 @@ def _media_decode_bounds(surface: Surface) -> None:
     except CapabilityError as exc:
         raise ConformanceError(
             f"{surface.name} declares MediaDecoder but its release cannot import PyAV; "
-            "install cozy-runtime[media] in the endpoint closure",
+            "install cozy-runtime[media] in the package closure",
             code="media_decoder_dependency",
         ) from exc
 

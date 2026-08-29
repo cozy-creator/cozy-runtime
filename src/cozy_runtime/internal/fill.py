@@ -1,6 +1,6 @@
 """cr-005 — the streaming fill plane: CAS bytes into the contract's exact destinations.
 
-This is the real body behind cr-002b's `Backend` seam. The endpoint declares WHICH
+This is the real body behind cr-002b's `Backend` seam. The package declares WHICH
 components a method touches; it never learns HOW their bytes got there (§1.1/§3.2), so
 everything in this module is runtime-owned and invisible to author code.
 
@@ -148,7 +148,7 @@ REFUSALS = frozenset(
         # whole plans, and the chooser that held them never ran. `resolution.py` makes the
         # joint decision now and CONFESSES uncalibrated instead of refusing.
         # The `encoded_gemm` route's own two. Distinct on purpose, because they print
-        # different remedies: `leaf_unconsented` says the ENDPOINT must declare that its
+        # different remedies: `leaf_unconsented` says the PACKAGE must declare that its
         # code survives a replaced linear op (an author edit), while `leaf_topology` says
         # the module tree cannot take a leaf where this destination is, or did not end up
         # holding what the substitution declared (a runtime/artifact disagreement).
@@ -1232,7 +1232,7 @@ class StreamingFillBackend:
 
         THE CONSENT GATE IS FIRST, before a byte of device memory is reserved. Every row's
         route is the resolved plan's — so an
-        endpoint that did not declare `encoded_leaves="accept"` and was handed a plan
+        package that did not declare `encoded_leaves="accept"` and was handed a plan
         that replaces modules refuses HERE, with nothing allocated
         and nothing to undo. Discovering it at the decode, with the component resident,
         would mean rolling back gigabytes to deliver an answer that was knowable from the
@@ -1248,11 +1248,11 @@ class StreamingFillBackend:
                 "leaf_unconsented",
                 f"{len(native)} of this artifact's tensors ({', '.join(native[:3])}…) serve "
                 f"through a NATIVE ENCODED LEAF on {device_line(self.device_facts)}, and this "
-                f"endpoint declares encoded_leaves={encoded_leaves!r}. That route does not "
+                f"package declares encoded_leaves={encoded_leaves!r}. That route does not "
                 "hand the module a float weight: the stored payload and its scales ARE the "
                 "weight and the linear op is REPLACED, so code that reads `.weight`, walks "
                 "submodule dtypes or rebuilds a Linear from one finds something that is not "
-                'there. The endpoint states `class …(Model[…], encoded_leaves="accept")` '
+                'there. The package states `class …(Model[…], encoded_leaves="accept")` '
                 "when its components are touched through their forward only — the runtime "
                 "cannot know that, and reading silence as consent is how a serving path "
                 "starts raising AttributeError in production",
@@ -1934,7 +1934,7 @@ class StreamingFillBackend:
         # of NaN elements rather than as a fault: measured on the real fp8 UNet at 2 of 6
         # stage-ins, 9 to 13 tensors of 1,680 with 9 to 16 NaN elements each, and never on
         # a whole-generation fill (a fresh allocator does not hand the block straight back).
-        # An endpoint without an output-integrity floor SERVES that (se-008).
+        # A package without an output-integrity floor SERVES that (se-008).
         self.torch.cuda.current_stream().synchronize()
         for parts in spent:
             freed += self._free_storages(parts.values())

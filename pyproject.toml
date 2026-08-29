@@ -49,8 +49,8 @@ files = [
     "proofs/fixtures/environment-resolved/src",
     "proofs/fixtures/environment-wheelhouse/src",
     "proofs/fixtures/cli-project/src",
-    "proofs/fixtures/model-contract-endpoint/src",
-    "proofs/fixtures/marco-polo-endpoint",
+    "proofs/fixtures/model-contract-package/src",
+    "proofs/fixtures/marco-polo-package",
     "examples",
 ]
 # The bindings live under the PROTO PACKAGE PATH (`src/cozy/worker/v1`) and are PEP 420
@@ -58,7 +58,7 @@ files = [
 # byte-identical. mypy needs the source roots stated for that, or it maps
 # `src/cozy/worker/v1/wire_version.py` to bare `wire_version`.
 explicit_package_bases = true
-mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/environment-wheelhouse/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-endpoint/src:proofs/fixtures/marco-polo-endpoint:examples"
+mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/environment-wheelhouse/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-package/src:proofs/fixtures/marco-polo-package:examples"
 # The two derive-* runners live with the corpus they drive: they are torch-shaped code for
 # the corpus venv, and checking them against a torch that is not installed produces
 # confident nonsense. They are exercised by RUNNING them.
@@ -104,7 +104,7 @@ ignore_missing_imports = true
 # fetch a tokenizer merges file the bench download skipped. Not a runtime dependency and
 # not present in the checking venv.
 # `PIL` joins them for cr-006: the fp8-vs-fp16 image comparison reads two PNGs the real
-# endpoint wrote and computes PSNR, in the corpus venv where Pillow already lives.
+# package wrote and computes PSNR, in the corpus venv where Pillow already lives.
 module = [
     "huggingface_hub",
     "diffusers",
@@ -128,7 +128,7 @@ warn_unused_ignores = false
 [project.optional-dependencies]
 # The derivation harness and the serving executor. Corpus venvs install this.
 derive = ["torch>=2.6"]
-# `corpus/sdxl_real.py` is a real ENDPOINT: the model architecture is its dependency, not
+# `corpus/sdxl_real.py` is a real PACKAGE: the model architecture is its dependency, not
 # the runtime's (§1.1 — cozy-runtime defines none). Pinned here only so cr-005's real fill
 # run reproduces; nothing under `src/` may import it.
 corpus = ["torch>=2.6", "diffusers>=0.36", "transformers>=4.40,<5"]

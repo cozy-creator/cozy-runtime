@@ -1,19 +1,19 @@
-"""Exact artifact intake and endpoint-overlay document join.
+"""Exact artifact intake and package-overlay document join.
 
 Tensorhub owns the document schemas and delivery grants.  This module owns the one Runtime
 join from their already-fetched exact bytes to :class:`overlay.Input`. Local paths are
 deliberately function arguments: they never enter a canonical release document.
 
 cr-048 RETIRED THE BOOT CLOSURE. ``tensorhub.rental_provision_spec/1`` and
-``tensorhub.rental_provision_bundle/1`` named one endpoint's whole closure at boot — eight
+``tensorhub.rental_provision_bundle/1`` named one package's whole closure at boot — eight
 document roles, one artifact grant per wheel and weight, the whole materialization root
-keyed by the bundle digest — which is the pre-#459 one-pod-one-endpoint shape that rev-2's
+keyed by the bundle digest — which is the pre-#459 one-pod-one-package shape that rev-2's
 ``DesiredPlacementSet`` + ``ArtifactGrantUpdate`` replaced. The pod now boots to
 ready-but-EMPTY: GPU inventory measured, listeners proven, receipt
 published, zero placements. What survives here is the DISCIPLINE, not the vehicle:
 ``fetch_exact`` (one bounded exact-digest HTTPS grant) and ``materialize_objects`` (exact CAS
 admission) are the primitives the dynamic grant lane fetches through, and
-``endpoint_overlay_input`` is the small source/custom-wheel join a placement converges to.
+``package_overlay_input`` is the small source/custom-wheel join a placement converges to.
 Only the boot-only bundling retired.
 """
 
@@ -34,8 +34,8 @@ from typing import Any
 from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
 from cozy_runtime.internal.config import AdapterConfig
 
-ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
-ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/2"
+PACKAGE_BUNDLE_FORMAT = "tensorhub.package_bundle/2"
+ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.PackageEnvironmentSpec/2"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
 MAX_RESOLUTION_LOCK_BYTES = 16 << 20
 MAX_OVERLAY_BYTES = 4 << 30
@@ -126,7 +126,7 @@ def prepare_boot(
 
     if time.time() >= config.readiness_deadline_unix:
         raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
-    # Endpoint executors read verified TensorFS objects but never publish them. Root owns
+    # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
     # or directory writable to it.
     _directory(artifact_store_root, mode=0o755)
@@ -516,25 +516,25 @@ def control_runtime_digest(
     return matches[0]
 
 
-def endpoint_overlay_input(
+def package_overlay_input(
     *,
     environment_spec_bytes: bytes,
-    endpoint_bundle_bytes: bytes,
+    package_bundle_bytes: bytes,
     resolved_wheel_set_bytes: bytes,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
     verified_wheels: Mapping[str, overlay.VerifiedFile] | None = None,
 ) -> overlay.Input:
-    """Join exact publication documents and endpoint-only wheel grants."""
+    """Join exact publication documents and package-only wheel grants."""
 
     spec = _document(environment_spec_bytes, "environment_spec")
-    bundle = _document(endpoint_bundle_bytes, "endpoint_bundle")
+    bundle = _document(package_bundle_bytes, "package_bundle")
     resolved = _document(resolved_wheel_set_bytes, "resolved_wheel_set")
     _closed(
         spec,
         {
             "compatibility_profile",
-            "endpoint_bundle_digest",
+            "package_bundle_digest",
             "format",
             "platform_target",
             "project_wheel_digest",
@@ -547,8 +547,8 @@ def endpoint_overlay_input(
     _closed(
         bundle,
         {
-            "descriptor",
-            "endpoint_release_id",
+            "package_descriptor",
+            "package_release_id",
             "format",
             "project_wheel",
             "resolved_wheel_set",
@@ -556,10 +556,10 @@ def endpoint_overlay_input(
             "source_lock",
             "wheelhouse_manifest",
         },
-        "endpoint_bundle",
+        "package_bundle",
     )
-    if bundle["format"] != ENDPOINT_BUNDLE_FORMAT:
-        raise LaunchRefusal("endpoint_bundle_format", str(bundle["format"]))
+    if bundle["format"] != PACKAGE_BUNDLE_FORMAT:
+        raise LaunchRefusal("package_bundle_format", str(bundle["format"]))
     _ref(bundle["source_archive"], "source_archive")
     _ref(bundle["source_lock"], "source_lock")
     _closed(
@@ -588,12 +588,12 @@ def endpoint_overlay_input(
         raise LaunchRefusal(
             "resolved_wheel_set_invalid", "resolution_lock_length is not positive and bounded"
         )
-    _require_digest(spec["endpoint_bundle_digest"], "environment_spec.endpoint_bundle_digest")
+    _require_digest(spec["package_bundle_digest"], "environment_spec.package_bundle_digest")
     _require_digest(spec["project_wheel_digest"], "environment_spec.project_wheel_digest")
     _require_digest(
         spec["wheelhouse_manifest_digest"], "environment_spec.wheelhouse_manifest_digest"
     )
-    _matches(endpoint_bundle_bytes, str(spec["endpoint_bundle_digest"]), "endpoint_bundle")
+    _matches(package_bundle_bytes, str(spec["package_bundle_digest"]), "package_bundle")
     _matches(
         wheelhouse_manifest_bytes,
         str(spec["wheelhouse_manifest_digest"]),

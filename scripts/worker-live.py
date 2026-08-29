@@ -552,7 +552,7 @@ def serving_directive(
             pb.Placement(
                 placement_id=PLACEMENT,
                 spec=pb.PlacementSpec(
-                    endpoint_release_id=release,
+                    package_release_id=release,
                     binding_plans=subjects,
                     model_object_set=pb.ArtifactSubject(
                         digest=documents.raw(object_set_digest),
@@ -590,7 +590,7 @@ def snapshot() -> str:
 def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     return {
         "entrypoint_binding_plan_id": plan_id,
-        "project": str(ROOT / "corpus" / "endpoint"),
+        "project": str(ROOT / "corpus" / "package"),
         "model_class": "SdxlUnetModel",
         "model_binding_path": f"{entrypoint}.models.model",
         "model_parameter_name": "model",
@@ -710,7 +710,7 @@ class Worker:
     def result_schema_digest(self, entrypoint: str) -> str:
         """The DECLARED result-surface digest, computed independently of the worker.
 
-        In a SUBPROCESS on purpose: the RecordOwner has no business importing endpoint code
+        In a SUBPROCESS on purpose: the RecordOwner has no business importing package code
         either, and the import tripwire must stay a fact about the worker's processes.
         """
         code = (
@@ -719,7 +719,7 @@ class Worker:
             "from pathlib import Path\n"
             "from cozy_runtime.internal import canonical, schema\n"
             "from cozy_runtime.internal.discovery import discover\n"
-            f"found = discover(Path({str(ROOT / 'corpus' / 'endpoint')!r}))\n"
+            f"found = discover(Path({str(ROOT / 'corpus' / 'package')!r}))\n"
             f"surface = next(s for s in found.surfaces if s.name == {entrypoint!r})\n"
             "print(canonical.digest(schema.render(surface.result_type)))\n"
         )
@@ -802,7 +802,7 @@ def start_worker(
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
-    project = Path(str((overrides or {}).get("project") or ROOT / "corpus" / "endpoint"))
+    project = Path(str((overrides or {}).get("project") or ROOT / "corpus" / "package"))
     hub = hub or Hub()
     hub.directive = serving_directive(
         release, sorted(ids.values()), posture, home / "binding-plans"
@@ -921,7 +921,7 @@ def make_spec(
     else:
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
     spec = pb.InvocationSpec(
-        endpoint_release_id=release,
+        package_release_id=release,
         environment_spec_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
@@ -2227,10 +2227,10 @@ def section_seal(args: argparse.Namespace) -> None:
 
 
 def section_tripwire(args: argparse.Namespace) -> None:
-    """STRUCTURAL: the worker never imports endpoint code, whatever the endpoint does.
+    """STRUCTURAL: the worker never imports package code, whatever the package does.
 
-    The endpoint module writes `<pid>.pid` into `corpus/endpoint/imports/` at MODULE SCOPE.
-    Any process that imports it leaves a mark it cannot avoid leaving — a friendly endpoint
+    The package module writes `<pid>.pid` into `corpus/package/imports/` at MODULE SCOPE.
+    Any process that imports it leaves a mark it cannot avoid leaving — a friendly package
     whose torch imports are inside functions would prove nothing, so the tripwire fires on
     the import itself.
     """
@@ -2238,22 +2238,22 @@ def section_tripwire(args: argparse.Namespace) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
-    marks = ROOT / "corpus" / "endpoint" / "imports"
+    marks = ROOT / "corpus" / "package" / "imports"
     shutil.rmtree(marks, ignore_errors=True)
     worker = start_worker(tmp, entrypoints=("denoise", "restyle"))
     hub = worker.hub
     try:
         hub.ready(plan_id_for("denoise"), 400)
-        head("who imported the endpoint module")
+        head("who imported the package module")
         worker_pid = worker.process.pid
         executor_pid = worker.executor_pid()
         seen = sorted(int(path.stem) for path in marks.glob("*.pid"))
         check(
-            "the endpoint was imported by the EXECUTOR and by nobody else",
+            "the package was imported by the EXECUTOR and by nobody else",
             seen == [executor_pid],
             f"import marks {seen}; executor {executor_pid}, worker {worker_pid} "
             "— the warm pass synthesizes and runs INSIDE the disposable process, so no "
-            "endpoint module scope can ever contaminate the no-CUDA parent",
+            "package module scope can ever contaminate the no-CUDA parent",
         )
         check(
             "and the warm pass still ran, through ordinary dispatch",
@@ -2543,7 +2543,7 @@ def section_results(args: argparse.Namespace) -> None:
         pair_payload = {"steps": 1, "latent": 48}
         body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
         spec = pb.InvocationSpec(
-            endpoint_release_id=RELEASE,
+            package_release_id=RELEASE,
             environment_spec_digest="sha256:" + "11" * 32,
             config_digest="sha256:" + "22" * 32,
             payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),
@@ -2743,7 +2743,7 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
     evicted, the ledger reported the drift as an unreconciled leak and then did nothing about
     it, and the NEXT request's chooser priced `all_resident` against a residency map holding
     one 167 MB VAE — so the 1024px decode ran out of memory inside the kernel and was
-    reported as the endpoint's own exception.
+    reported as the package's own exception.
     """
     tmp = Path(args.tmp)
     shutil.rmtree(tmp, ignore_errors=True)
@@ -2928,8 +2928,8 @@ def section_drift(args: argparse.Namespace) -> dict[str, Any]:
     """RED ARM: a PLANTED residency leak refuses at CHOOSE time, not inside a decode.
 
     The plant is harness-side and it is the real mechanism rather than a switch in the
-    runtime: a leak is planted by making the ENDPOINT hold a device allocation past its own
-    terminal (`corpus/endpoint/sdxl_gpu.py`'s `leak_mib` request field), which is exactly
+    runtime: a leak is planted by making the PACKAGE hold a device allocation past its own
+    terminal (`corpus/package/sdxl_gpu.py`'s `leak_mib` request field), which is exactly
     what an executor-poisoning defect looks like from the ledger's side.
     """
     tmp = Path(args.tmp)

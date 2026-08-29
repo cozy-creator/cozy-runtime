@@ -18,7 +18,7 @@ class Exit(IntEnum):
     internal = 1  # unexpected fault — a bug, never a user condition
     usage = 2  # bad invocation: unknown flag, malformed key=value, majorless target
     validation = 3  # typed payload/schema/bounds refusal; verifier refusal at ingest
-    not_found = 4  # unknown ref/function/endpoint/attempt; hub 404 rendered verbatim
+    not_found = 4  # unknown ref/function/package/attempt; hub 404 rendered verbatim
     credential = 5  # private/gated source without a credential
     structural = 6  # structural incompatibility — never a fit shortfall
     confirm = 7  # destructive op without --yes

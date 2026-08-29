@@ -2,13 +2,13 @@
 set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-fixture="$repo/proofs/fixtures/model-contract-endpoint"
+fixture="$repo/proofs/fixtures/model-contract-package"
 fake_torch="$repo/proofs/fixtures/fake-torch"
 support="$repo/proofs/support/model_contract.py"
 shared_support="$repo/proofs/support/proof_data.py"
 uv_bin=$(command -v uv)
 proof_root=$(mktemp -d /tmp/cozy-model-contract-proof.XXXXXX)
-fixture_source="$proof_root/endpoint-source"
+fixture_source="$proof_root/package-source"
 
 cleanup() {
     chmod -R u+w "$proof_root" 2>/dev/null || true
@@ -29,16 +29,16 @@ UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$f
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$fake_torch"
 
 runtime_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'cozy_runtime-*.whl' -print)
-endpoint_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'proof_endpoint-*.whl' -print)
+package_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'proof_package-*.whl' -print)
 torch_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'torch-*.whl' -print)
-test -n "$runtime_wheel" && test -n "$endpoint_wheel" && test -n "$torch_wheel"
+test -n "$runtime_wheel" && test -n "$package_wheel" && test -n "$torch_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
 UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
     "$runtime_wheel" "$torch_wheel"
 driver_python="$proof_root/driver/bin/python"
 
-descriptor="$proof_root/endpoint-descriptor.json"
+descriptor="$proof_root/package-descriptor.json"
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
     "$proof_root/driver/bin/cozy-runtime" --json --dir "$fixture_source" describe >"$descriptor")
@@ -50,7 +50,7 @@ cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     "$driver_python" "$support" prepare "$proof_root" \
-    "$descriptor" "$runtime_wheel" "$endpoint_wheel" \
+    "$descriptor" "$runtime_wheel" "$package_wheel" \
     "$torch_wheel" "$driver_python")
 
 for name in cold rebuild; do

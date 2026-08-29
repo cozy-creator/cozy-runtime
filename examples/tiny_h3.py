@@ -1,4 +1,4 @@
-"""The component-staged endpoint — MiniMax H3 shaped, weightless but real.
+"""The component-staged package — MiniMax H3 shaped, weightless but real.
 
 Modeled on `cozy-runtime-h3.md`: three typed request/result structs, an ordered
 discriminated reference union, plain orchestration functions (module code — they touch no

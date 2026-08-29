@@ -11,7 +11,7 @@ starts at the two digests the `PlacementSpec` names (`environment_spec_digest`,
 `installed_environment_receipt_digest`) plus the spec's binding-plan subjects, and every
 further digest is REACHED from a document already fetched and verified:
 
-    environment_spec -> endpoint_bundle -> resolved_wheel_set + wheelhouse_manifest -> wheels
+    environment_spec -> package_bundle -> resolved_wheel_set + wheelhouse_manifest -> wheels
     binding_plan     -> resolved_model_binding -> model_construction_contract + model config
     binding_plan     -> descriptor
 
@@ -40,7 +40,7 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 FaultKind: TypeAlias = pb.FaultKind
-LegName: TypeAlias = Literal["endpoint", "model"]
+LegName: TypeAlias = Literal["package", "model"]
 
 #: Documents in the walk are small and bounded; a wheel is capped by `fetch_exact` itself.
 MAX_DOCUMENT_BYTES = 64 << 20
@@ -73,7 +73,7 @@ class AcquisitionObservation:
 
     def __init__(self, callback: Any = None) -> None:
         self._lock = Lock()
-        self._legs = {"endpoint": _Leg(), "model": _Leg()}
+        self._legs = {"package": _Leg(), "model": _Leg()}
         self._callback = callback
 
     def start(self, leg: LegName) -> None:
@@ -276,7 +276,7 @@ class Acquirer:
         self._fetch_lock = Lock()
         self._new_digests: set[str] = set()
         self._metric_digests: set[str] = set()
-        self._observed_digests: dict[LegName, set[str]] = {"endpoint": set(), "model": set()}
+        self._observed_digests: dict[LegName, set[str]] = {"package": set(), "model": set()}
         self._thread = local()
         self.observation = AcquisitionObservation(on_observation)
 
@@ -383,20 +383,20 @@ class Acquirer:
         self,
         placement: Any,
         *,
-        on_endpoint_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
+        on_package_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
     ) -> AcquiredPlacement:
         """Fetch, build, and stage everything one PlacementSpec reaches. Fail closed."""
 
-        # The endpoint closure and model-object closure are the two observed legs. They
-        # start together. Binding/model documents are small endpoint control bytes and ride
-        # the endpoint leg; model-object-set document bytes are identity and excluded from
+        # The package closure and model-object closure are the two observed legs. They
+        # start together. Binding/model documents are small package control bytes and ride
+        # the package leg; model-object-set document bytes are identity and excluded from
         # the model byte counter by protocol definition.
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
-            endpoint_future = pool.submit(self._run_endpoint, placement)
+            package_future = pool.submit(self._run_package, placement)
             model_future = pool.submit(self._run_model, placement)
-            installed, plans, staged = endpoint_future.result()
-            if on_endpoint_ready is not None:
-                on_endpoint_ready(installed)
+            installed, plans, staged = package_future.result()
+            if on_package_ready is not None:
+                on_package_ready(installed)
             object_set, model_objects = model_future.result()
         return AcquiredPlacement(
             installed=installed,
@@ -410,17 +410,17 @@ class Acquirer:
             trusted_reuse_bytes=self.trusted_reuse_bytes,
         )
 
-    def _run_endpoint(
+    def _run_package(
         self, placement: Any
     ) -> tuple[overlay.InstalledOverlay, tuple[str, ...], tuple[str, ...]]:
-        self._thread.leg = "endpoint"
-        self.observation.start("endpoint")
+        self._thread.leg = "package"
+        self.observation.start("package")
         try:
             installed = self._environment(placement)
             plans, staged = self._bindings(placement)
             return installed, plans, staged
         finally:
-            self.observation.finish("endpoint")
+            self.observation.finish("package")
 
     def _run_model(self, placement: Any) -> tuple[Path, int]:
         self._thread.leg = "model"
@@ -503,12 +503,12 @@ class Acquirer:
         spec_length = self._authorized_length(spec_digest, "environment_spec")
         spec_bytes = self.fetch(spec_digest, spec_length).read_bytes()
         spec = self._parse(spec_bytes, "environment_spec")
-        bundle_ref = self._digest_ref(spec, "endpoint_bundle_digest", "environment_spec")
+        bundle_ref = self._digest_ref(spec, "package_bundle_digest", "environment_spec")
         wheelhouse_ref = self._digest_ref(spec, "wheelhouse_manifest_digest", "environment_spec")
         bundle_bytes = self.fetch(
-            bundle_ref, self._authorized_length(bundle_ref, "endpoint_bundle")
+            bundle_ref, self._authorized_length(bundle_ref, "package_bundle")
         ).read_bytes()
-        bundle = self._parse(bundle_bytes, "endpoint_bundle")
+        bundle = self._parse(bundle_bytes, "package_bundle")
         # Archive and lock prove how the project wheel was published; they are
         # not executable placement bytes. Validate their exact references but
         # fetch only the project/custom wheels the worker can actually run.
@@ -520,7 +520,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "wheelhouse_manifest_ref_mismatch",
-                "the endpoint bundle and the environment spec name different wheelhouses",
+                "the package bundle and the environment spec name different wheelhouses",
             )
         resolved_bytes = self.fetch(*resolved_ref).read_bytes()
         wheelhouse_bytes = self.fetch(*wheelhouse_bundle_ref).read_bytes()
@@ -546,9 +546,9 @@ class Acquirer:
         self.wheels = len(wheel_paths)
 
         try:
-            source = materialize_launch.endpoint_overlay_input(
+            source = materialize_launch.package_overlay_input(
                 environment_spec_bytes=spec_bytes,
-                endpoint_bundle_bytes=bundle_bytes,
+                package_bundle_bytes=bundle_bytes,
                 resolved_wheel_set_bytes=resolved_bytes,
                 wheelhouse_manifest_bytes=wheelhouse_bytes,
                 wheel_paths=wheel_paths,
@@ -577,21 +577,21 @@ class Acquirer:
         self.plans_root.chmod(0o755)
         self.documents_root.chmod(0o755)
         staged: list[str] = []
-        descriptor_digest = documents.spell(placement.descriptor_digest)
+        package_descriptor_digest = documents.spell(placement.package_descriptor_digest)
         for plan_id in placement.plan_ids:
             plan_digest, plan_length = placement.plan_refs[plan_id]
             plan_path = self.fetch(plan_digest, plan_length)
             self._stage(self.plans_root, plan_digest, plan_path.read_bytes())
             plan = self._parse(plan_path.read_bytes(), "entrypoint_binding_plan")
-            plan_descriptor = self._ref(plan.get("descriptor"), "plan.descriptor")
-            if plan_descriptor[0] != descriptor_digest:
+            plan_descriptor = self._ref(plan.get("package_descriptor"), "plan.package_descriptor")
+            if plan_descriptor[0] != package_descriptor_digest:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "plan_descriptor_mismatch",
+                    "plan_package_descriptor_mismatch",
                     f"{plan_id} names descriptor {plan_descriptor[0]}, the spec names "
-                    f"{descriptor_digest}",
+                    f"{package_descriptor_digest}",
                 )
-            staged.append(self._document(*plan_descriptor, "descriptor"))
+            staged.append(self._document(*plan_descriptor, "package_descriptor"))
             for binding in self._rows(plan.get("bindings"), "entrypoint_binding_plan"):
                 if not isinstance(binding, dict):
                     raise AcquisitionRefusal(

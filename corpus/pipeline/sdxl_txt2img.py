@@ -1,4 +1,4 @@
-"""cr-008b's endpoint: real SDXL text-to-image, four components, zero memory management.
+"""cr-008b's package: real SDXL text-to-image, four components, zero memory management.
 
 One entrypoint, `generate`, doing what a product does: tokenize, encode with both towers,
 run a real denoising loop with classifier-free guidance, decode through the VAE, and save a
@@ -43,7 +43,7 @@ class Txt2ImgOutput(msgspec.Struct):
     """sha256 of the decoded RGB pixel bytes — the determinism fence for the WHOLE loop."""
 
 
-#: The tokenizer vocabularies this endpoint BUNDLES. They are the endpoint's own asset,
+#: The tokenizer vocabularies this package BUNDLES. They are the package's own asset,
 #: like the model library it imports — not an artifact identifier, not a catalog ref, and
 #: not something the construction config may carry (a path in a config refuses, §1.1).
 _TOKENIZERS = Path(__file__).resolve().parent

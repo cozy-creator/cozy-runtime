@@ -2,7 +2,7 @@
 """cr-012 live verification: typed INPUT ASSETS, end to end on the real attempt path.
 
 Not a test (tracker README #160): every leg runs the real RecordOwner, the real worker
-hydration, the real executor and the real endpoint, and prints numbers.
+hydration, the real executor and the real package, and prints numbers.
 
   roundtrip  a real PNG in -> `retouch` -> a real PNG out, digest-verified both ways
   kill       the executor dies mid-attempt: the terminal converges, the spool is cleaned
@@ -1104,7 +1104,7 @@ def debts() -> None:
     env = dict(os.environ, PYTHONPATH=f"{ROOT}:{ROOT / 'src'}", COZY_HOME=str(HOME))
 
     done = subprocess.run(
-        [*runtime, "--json", "--dir", str(ROOT / "corpus" / "endpoint"), "fit"],
+        [*runtime, "--json", "--dir", str(ROOT / "corpus" / "package"), "fit"],
         capture_output=True,
         text=True,
         env=env,
@@ -1118,7 +1118,7 @@ def debts() -> None:
     )
 
     done = subprocess.run(
-        [*runtime, "--json", "--dir", str(ROOT / "corpus" / "endpoint"), "bindings"],
+        [*runtime, "--json", "--dir", str(ROOT / "corpus" / "package"), "bindings"],
         capture_output=True,
         text=True,
         env=env,

@@ -38,13 +38,13 @@ def main(argv: list[str] | None = None) -> int:
         print("invalid native fixture resource limits", file=sys.stderr)
         return 2
     # Tensorhub's networkless VM/cgroup remains the qualification-seat authority. These local
-    # limits bound the child even inside that seat and are imposed before endpoint import.
+    # limits bound the child even inside that seat and are imposed before package import.
     _cap(resource.RLIMIT_CORE, 0)
     _cap(resource.RLIMIT_CPU, cpu_seconds)
     _cap(resource.RLIMIT_AS, address_bytes)
     _cap(resource.RLIMIT_FSIZE, output_bytes)
     _cap(resource.RLIMIT_NOFILE, 256)
-    # Base paths stay first. The exact endpoint overlay is one appended root, identical to the
+    # Base paths stay first. The exact package overlay is one appended root, identical to the
     # serving executor's import order; a custom wheel cannot win a base import by path order.
     sys.path.append(overlay)
     try:

@@ -95,7 +95,7 @@ def derive_plan(
     video: Mapping[str, Any],
     audio: Mapping[str, Any],
 ) -> TimestepPlan:
-    """The endpoint's PURE schedule/modulation-plan builder — what conformance executes
+    """The package's PURE schedule/modulation-plan builder — what conformance executes
     per typed step preset and condition-presence cell (cr-004)."""
     steps = STEPS[preset]
     classes = ["denoise"]

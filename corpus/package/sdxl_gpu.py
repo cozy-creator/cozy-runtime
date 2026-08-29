@@ -1,7 +1,7 @@
-"""The real GPU endpoint cr-007 serves: one SDXL UNet, three entrypoints, real bytes.
+"""The real GPU package cr-007 serves: one SDXL UNet, three entrypoints, real bytes.
 
 `corpus/sdxl_real.py` is the MODEL (upstream diffusers, upstream config, 1,680 real
-destinations); this file is the ENDPOINT around it — the request schema, the handlers, and
+destinations); this file is the PACKAGE around it — the request schema, the handlers, and
 the output transaction the worker drives an attempt through. It is deliberately in
 `corpus/` and not in `examples/`: the examples are weightless and run anywhere, this one
 needs an 8 GiB card and a real CAS.
@@ -41,9 +41,9 @@ from cozy_runtime.author import (
 from cozy_runtime.author._app import App
 
 # IMPORT TRIPWIRE (cr-007 red arm, deliberate module-scope side effect). Every process
-# that imports this endpoint records its own pid here. The worker must never appear:
-# it is the long-lived no-CUDA process, and endpoint module scope is exactly where a real
-# endpoint would touch torch. `scripts/worker-live.py tripwire` reads these files.
+# that imports this package records its own pid here. The worker must never appear:
+# it is the long-lived no-CUDA process, and package module scope is exactly where a real
+# package would touch torch. `scripts/worker-live.py tripwire` reads these files.
 _IMPORTS = Path(__file__).resolve().parent / "imports"
 _IMPORTS.mkdir(exist_ok=True)
 (_IMPORTS / f"{os.getpid()}.pid").write_text(f"{os.getpid()}\n")
@@ -54,7 +54,7 @@ app = App()
 LATENT = (48, 64, 80)
 
 #: Where `leak_mib`'s planted allocation lives. A module global, because that is where a real
-#: endpoint leak lives too.
+#: package leak lives too.
 _RETAINED: list[Any] = []
 
 
@@ -68,7 +68,7 @@ class DenoiseInput(msgspec.Struct, forbid_unknown_fields=True):
 
     It lives in the CORPUS, never in the runtime — a fault switch inside the product is a
     production hook nobody asked for (decisions #249). What it stands in for is ordinary and
-    common: an endpoint that caches a tensor on a module global. From the ledger's side it is
+    common: a package that caches a tensor on a module global. From the ledger's side it is
     indistinguishable from any other persistent allocation, which is the point."""
 
 
@@ -166,7 +166,7 @@ def _inputs(torch: Any, device: Any, side: int, seed: int) -> tuple[Any, ...]:
 
 def _preview(torch: Any, latents: Any) -> ImageFrame:
     """The latent's first three channels as RGB. A real image out of real computation —
-    there is no VAE in this binding, and inventing one would be a different endpoint."""
+    there is no VAE in this binding, and inventing one would be a different package."""
     field = latents[0, :3].float()
     low = field.amin()
     span = (field.amax() - low).clamp(min=1e-6)
@@ -331,6 +331,6 @@ def _png_rgb(data: bytes, width: int, height: int) -> bytes:
     for y in range(height):
         start = y * (stride + 1)
         if raw[start] != 0:
-            raise ValueError("this endpoint decodes filter-0 PNG rows only")
+            raise ValueError("this package decodes filter-0 PNG rows only")
         out += raw[start + 1 : start + 1 + stride]
     return bytes(out)
