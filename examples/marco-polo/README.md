@@ -28,13 +28,18 @@ from the built wheel and never adds a `v` prefix.
 
 Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module
 root explicitly. The backend produces a deterministic `py3-none-any` wheel without writing build
-output into the source tree. `pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor,
-and that wheel are the exact publication inputs. The
+output into the source tree. The `[tool.uv.sources]` entry is only a local-development override:
+it is not embedded in the project wheel. The base worker image supplies one exact Cozy Runtime
+wheel, while the package declares the oldest compatible Runtime API it needs. Arbitrary local or
+editable dependencies are not bundled by publication.
+
+`pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor, and the project wheel are
+the exact publication inputs. The
 descriptor is sent directly to Tensorhub and is not committed here. There is no release manifest
 and no author-selected worker profile: Tensorhub derives compatible base worker images from the
-locked Python/package requirements. The current remote contract admits one placement per worker,
-so publishing this fixture under two package repositories can prove sequential same-pod
-replacement with `cozy rent revise`; it does not prove simultaneous stacking.
+wheel-declared Python/package requirements and its exact base inventory. The current remote contract
+admits one placement per worker, so publishing this fixture under two package repositories can prove
+sequential same-pod replacement with `cozy rent revise`; it does not prove simultaneous stacking.
 
 Cozy derives the publication descriptor through this locked, read-only project command:
 

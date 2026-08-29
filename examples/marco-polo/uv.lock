@@ -92,10 +92,14 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "cozy-runtime" },
+    { name = "msgspec" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "cozy-runtime", editable = "../../" }]
+requires-dist = [
+    { name = "cozy-runtime", editable = "../../" },
+    { name = "msgspec", specifier = ">=0.19" },
+]
 
 [[package]]
 name = "msgspec"
