@@ -634,7 +634,7 @@ class ExecutorSupervision:
         if not self.jit_cache:
             return {}
         try:
-            return jit_cache.prepare(
+            return jit_cache.scope(
                 self.cozy_home,
                 "sha256:" + Path(self.jit_cache).name,
                 uid=self.executor_uid,

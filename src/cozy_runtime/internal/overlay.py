@@ -278,6 +278,7 @@ def materialize(
     reused = final.exists()
     inspected = None if reused else _verify_grants(source, wheels, base)
     _require_owned_root(root)
+    _remove_dead_staging(root)
     contents.mkdir(parents=True, exist_ok=True, mode=0o700)
     wheel_pools.mkdir(parents=True, exist_ok=True, mode=0o700)
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -292,7 +293,7 @@ def materialize(
             item.wheel.digest: _publish_wheel_pool(wheel_pools, source.base_family_digest, item)
             for item in inspected
         }
-        staging = root / f".overlay-staging-{uuid.uuid4().hex}"
+        staging = root / f".overlay-staging-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             site = staging / OVERLAY_DIR
             site.mkdir(parents=True, mode=0o700)
@@ -1098,7 +1099,7 @@ def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspec
         if existing != identity_bytes or final.stat().st_uid != os.geteuid():
             raise OverlayRefusal("overlay_wheel_pool_invalid", str(final))
         return final / "tree"
-    staging = pools.parent / f".wheel-staging-{uuid.uuid4().hex}"
+    staging = pools.parent / f".wheel-staging-{os.getpid()}-{uuid.uuid4().hex}"
     try:
         tree = staging / "tree"
         tree.mkdir(parents=True, mode=0o700)
@@ -1227,6 +1228,32 @@ def _require_owned_root(root: Path) -> None:
     if not root.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
         raise OverlayRefusal("overlay_root_owner_mismatch", str(root))
     root.chmod(0o711)
+
+
+def _remove_dead_staging(root: Path) -> None:
+    """Remove only staging owned by a process identity that is observably gone."""
+
+    for prefix in (".overlay-staging-", ".wheel-staging-"):
+        for path in root.glob(prefix + "*"):
+            remainder = path.name.removeprefix(prefix)
+            pid_raw, separator, _nonce = remainder.partition("-")
+            if not separator or not pid_raw.isdigit():
+                continue
+            pid = int(pid_raw)
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                info = path.lstat()
+                if (
+                    stat.S_ISDIR(info.st_mode)
+                    and not stat.S_ISLNK(info.st_mode)
+                    and info.st_uid == os.geteuid()
+                ):
+                    _remove_tree(path)
+            except PermissionError:
+                continue
 
 
 def _publish_receipt(path: Path, payload: bytes, receipts: Path) -> None:

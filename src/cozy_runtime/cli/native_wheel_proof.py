@@ -87,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         host = native_wheel.qualify_host(inspection, gpu_sm=gpu_sm)
         runtime_config = config.read_config()
         try:
-            jit_environment = jit_cache.prepare(runtime_config.cozy_home, installed.content_digest)
+            jit_environment = jit_cache.scope(runtime_config.cozy_home, installed.content_digest)
         except jit_cache.JITCacheRefusal as exc:
             raise native_wheel.NativeWheelRefusal(
                 "overlay_native_jit_cache_invalid", str(exc)

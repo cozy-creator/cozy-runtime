@@ -14,7 +14,7 @@ class JITCacheRefusal(Exception):
     pass
 
 
-def prepare(
+def scope(
     cozy_home: Path,
     content_digest: str,
     *,

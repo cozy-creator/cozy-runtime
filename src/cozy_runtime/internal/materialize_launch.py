@@ -568,9 +568,7 @@ def endpoint_overlay_input(
     )
     if resolved["format"] != RESOLVED_WHEEL_SET_FORMAT:
         raise LaunchRefusal("resolved_wheel_set_format", str(resolved["format"]))
-    _require_digest(
-        resolved["resolution_lock_digest"], "resolved_wheel_set.resolution_lock_digest"
-    )
+    _require_digest(resolved["resolution_lock_digest"], "resolved_wheel_set.resolution_lock_digest")
     resolution_lock_length = resolved["resolution_lock_length"]
     if (
         not isinstance(resolution_lock_length, int)
@@ -625,9 +623,7 @@ def endpoint_overlay_input(
 
     project = _wheel(bundle["project_wheel"], "project", import_roots=True)
     if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
-        raise LaunchRefusal(
-            "project_wheel_not_pure", "project wheel must be exactly py3-none-any"
-        )
+        raise LaunchRefusal("project_wheel_not_pure", "project wheel must be exactly py3-none-any")
     if project.digest != spec["project_wheel_digest"]:
         raise LaunchRefusal("project_wheel_mismatch", project.digest)
     wheels = [project]

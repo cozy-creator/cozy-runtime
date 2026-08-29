@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -506,6 +507,62 @@ def main() -> int:
         )
         assert oci_evidence["overlay_content_digest"] == local_evidence["overlay_content_digest"]
 
+        mutable_manifest = root / "mutable-base.json"
+        mutable_manifest.write_bytes(manifest.read_bytes() + b" ")
+        try:
+            overlay.open_generation(
+                environment,
+                receipt_digest=cold.receipt_digest,
+                environment_spec_digest=digest(b"spec-one"),
+                base_manifest=mutable_manifest,
+                python=Path(sys.executable),
+            )
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "base_family_mismatch", exc.code
+        else:
+            raise AssertionError("byte-different local base borrowed the admitted receipt")
+        assert child_env.erased("PYTHONPATH") and child_env.erased("PYTHONHOME")
+
+        killed_custom = build_wheel(
+            wheels,
+            "proof-killed-custom",
+            "proof_killed_custom",
+            "killed-custom",
+            owner="custom",
+            extra_entries={
+                f"proof_killed_custom/module_{index:05d}.py": f"VALUE = {index}\n".encode()
+                for index in range(5_000)
+            },
+        )
+        killed_root = root / "killed-installed"
+        killed_source = source("killed", family, project, killed_custom)
+        process = multiprocessing.get_context("fork").Process(
+            target=overlay.materialize,
+            args=(killed_source, killed_root),
+            kwargs={"python": Path(sys.executable), "base_manifest": manifest},
+        )
+        process.start()
+        deadline = time.monotonic() + 10
+        abandoned: list[Path] = []
+        while time.monotonic() < deadline and process.is_alive():
+            abandoned = list(killed_root.glob(".*-staging-*"))
+            if abandoned:
+                break
+            time.sleep(0.001)
+        assert abandoned and process.is_alive(), "materialization finished before kill arm"
+        process.kill()
+        process.join(10)
+        assert process.exitcode is not None and process.exitcode < 0
+        assert not list((killed_root / "receipts").glob("*.json"))
+        retried = overlay.materialize(
+            killed_source,
+            killed_root,
+            python=Path(sys.executable),
+            base_manifest=manifest,
+        )
+        assert retried.generation.is_dir()
+        assert not list(killed_root.glob(".*-staging-*"))
+
         hostile_bytes = compile_shared(
             root / "native-rpath-build",
             "proof_rpath",
@@ -716,6 +773,9 @@ def main() -> int:
                     "native_operator_no_kernel_image_refused": True,
                     "oci_local_same_overlay_path": True,
                     "realization_fingerprints_separate": True,
+                    "mutable_local_base_refused": True,
+                    "source_path_injection_erased": True,
+                    "killed_materialization_retry_atomic": True,
                     "base_version_conflict_refused": True,
                 },
                 sort_keys=True,
