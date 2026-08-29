@@ -89,6 +89,7 @@ class ProcessTreeScope:
     """
 
     token: str
+    uid: int
 
 
 ExecutorScope = CgroupScope | ProcessTreeScope
@@ -301,21 +302,20 @@ def _root_owned_container_marker() -> bool:
     return False
 
 
-def _full_proc_visibility() -> bool:
-    """Require every same-UID process to expose stat and its complete environment."""
+def _full_proc_visibility(process_uid: int, *, require_environment: bool) -> bool:
+    """Require every target-UID process identity, plus environments when same-UID."""
     try:
         entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdigit()]
         if not entries or not Path("/proc/1/stat").is_file():
             return False
     except OSError:
         return False
-    euid = os.geteuid()
     for entry in entries:
         try:
             fields = _linux_stat(int(entry.name))
             status = (entry / "status").read_text().splitlines()
-            uid = next(line for line in status if line.startswith("Uid:"))
-            if int(uid.split()[1]) == euid and fields[0] != "Z":
+            uid_row = next(line for line in status if line.startswith("Uid:"))
+            if require_environment and int(uid_row.split()[1]) == process_uid and fields[0] != "Z":
                 (entry / "environ").read_bytes()
         except FileNotFoundError:
             continue  # one birth ended during the census
@@ -392,7 +392,7 @@ def _require_cgroup_lineage_unwritable(mount_target: Path, resolved: Path) -> No
                 )
 
 
-def _prove_unwritable_container_cgroup_v1() -> None:
+def _prove_unwritable_container_cgroup_v1(process_uid: int) -> None:
     """Require every fact behind the narrow first-party process-tree backend.
 
     A marker alone proves little and an inaccessible cgroup alone can be an ordinary host.
@@ -402,13 +402,20 @@ def _prove_unwritable_container_cgroup_v1() -> None:
     pidfds. Unified v2 is checked by the caller first and never reaches this path.
     """
 
-    if os.geteuid() == 0:
-        raise ContainmentUnavailable("process-tree backend requires a non-root effective uid")
+    euid = os.geteuid()
+    if process_uid < 0 or (euid != 0 and process_uid != euid):
+        raise ContainmentUnavailable(
+            f"process-tree backend cannot supervise uid {process_uid} from euid {euid}"
+        )
     if not _root_owned_container_marker():
         raise ContainmentUnavailable(
             "process-tree backend found no regular uid-0 non-writable container marker"
         )
-    _prove_zero_cgroup_capabilities()
+    # An ordinary same-UID worker must have no ambient authority. The pod worker is
+    # deliberately trusted root only long enough to launch a sealed uid-split child;
+    # setuid clears the child's capabilities after no_new_privs is armed.
+    if process_uid == euid:
+        _prove_zero_cgroup_capabilities()
     try:
         memberships: list[tuple[frozenset[str], Path]] = []
         for line in Path("/proc/self/cgroup").read_text().splitlines():
@@ -444,31 +451,32 @@ def _prove_unwritable_container_cgroup_v1() -> None:
             )
         mount, path = candidates[0]
         _require_cgroup_lineage_unwritable(mount.target, path)
-    if not _full_proc_visibility():
-        raise ContainmentUnavailable("full same-UID /proc visibility is unavailable")
+    if not _full_proc_visibility(process_uid, require_environment=process_uid == euid):
+        raise ContainmentUnavailable("full target-UID /proc visibility is unavailable")
     try:
         signal_process(process_identity(os.getpid()), 0)
     except (OSError, ProcessLookupError) as exc:
         raise ContainmentUnavailable("pidfd open/send proof failed") from exc
 
 
-def validate_process_tree_host() -> None:
+def validate_process_tree_host(process_uid: int | None = None) -> None:
     """Revalidate every point-in-time fact required by the process-tree backend."""
     _linux_only("validate_process_tree_host")
     if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
         raise ContainmentUnavailable("process-tree backend is forbidden on cgroup v2")
-    _prove_unwritable_container_cgroup_v1()
+    _prove_unwritable_container_cgroup_v1(os.geteuid() if process_uid is None else process_uid)
 
 
-def create_executor_scope(namespace: str) -> ExecutorScope:
+def create_executor_scope(namespace: str, process_uid: int | None = None) -> ExecutorScope:
     """Select and create the strongest proven executor scope on this Linux host."""
     _linux_only("create_executor_scope")
     if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
         # Unified v2 always keeps the kernel scope path. A read-only or undelegated v2
         # hierarchy refuses in create_executor_cgroup; it never silently falls back.
         return create_executor_cgroup(namespace)
-    validate_process_tree_host()
-    return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES))
+    uid = os.geteuid() if process_uid is None else process_uid
+    validate_process_tree_host(uid)
+    return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES), uid)
 
 
 def _cgroup_root() -> Path:
@@ -531,6 +539,8 @@ def validate_executor_scope(scope: ExecutorScope, namespace: str) -> None:
         or any(char not in "0123456789abcdef" for char in scope.token)
     ):
         raise ContainmentUnavailable("process-tree scope token is not 64 lowercase hex")
+    if scope.uid < 0:
+        raise ContainmentUnavailable("process-tree scope uid is negative")
 
 
 def create_executor_cgroup(namespace: str) -> CgroupScope:
@@ -736,7 +746,8 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
     """One full proc census, matching the scope as one complete environment entry."""
     _linux_only("process_tree_census")
     expected = f"{EXECUTOR_SCOPE_ENV}={scope.token}".encode()
-    euid = os.geteuid()
+    process_uid = scope.uid
+    uid_domain = process_uid != os.geteuid()
     snapshots: dict[int, _ProcessSnapshot] = {}
     try:
         entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdigit()]
@@ -749,7 +760,7 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
             fields = _linux_stat(pid)
             status = (entry / "status").read_text().splitlines()
             uid = next(line for line in status if line.startswith("Uid:"))
-            if int(uid.split()[1]) != euid:
+            if int(uid.split()[1]) != process_uid:
                 continue
             state = fields[0]
             # Linux exposes no useful environment for a zombie. It cannot fork or hold a
@@ -761,6 +772,16 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
                 try:
                     environment = (entry / "environ").read_bytes().split(b"\0")
                 except PermissionError:
+                    if uid_domain:
+                        environment = []
+                        snapshots[pid] = _ProcessSnapshot(
+                            identity=ProcessIdentity(pid, int(fields[19])),
+                            state=state,
+                            parent_pid=int(fields[1]),
+                            process_group=int(fields[2]),
+                            scope_token=False,
+                        )
+                        continue
                     # A SIGKILLed task can shed its mm (and therefore environ) before its
                     # proc state reaches Z/X. Empty cmdline proves that exit transition;
                     # a live non-dumpable task remains unreadable and fails closed.
@@ -774,7 +795,7 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
                 process_group=int(fields[2]),
                 scope_token=expected in environment,
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except (OSError, StopIteration, IndexError, ValueError) as exc:
             observed = (
@@ -796,7 +817,10 @@ def _process_tree_census(
     worker_pid: int,
 ) -> dict[ProcessIdentity, str]:
     snapshots = _same_uid_processes(scope)
-    owned: set[ProcessIdentity] = {row.identity for row in snapshots.values() if row.scope_token}
+    uid_domain = scope.uid != os.geteuid()
+    owned: set[ProcessIdentity] = {
+        row.identity for row in snapshots.values() if uid_domain or row.scope_token
+    }
     for process in known:
         row = snapshots.get(process.pid)
         if row is not None and row.identity == process:
@@ -840,7 +864,7 @@ def process_scope_contains(scope: ProcessTreeScope, process: ProcessIdentity) ->
     return (
         row is not None
         and row.identity == process
-        and row.scope_token
+        and (scope.uid != os.geteuid() or row.scope_token)
         and row.process_group == process.pid
     )
 
@@ -902,7 +926,12 @@ def kill_process_tree(processes: set[ProcessIdentity]) -> None:
 
 
 def process_scope_processes(scope: ProcessTreeScope) -> set[ProcessIdentity]:
-    return {row.identity for row in _same_uid_processes(scope).values() if row.scope_token}
+    uid_domain = scope.uid != os.geteuid()
+    return {
+        row.identity
+        for row in _same_uid_processes(scope).values()
+        if (uid_domain and row.state not in {"X", "x", "Z"}) or row.scope_token
+    }
 
 
 def executor_scope_exists(scope: ExecutorScope) -> bool:

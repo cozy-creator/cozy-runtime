@@ -361,7 +361,7 @@ class ExecutorSupervision:
                         "inode": scope.inode,
                     }
                     if isinstance(scope, proctree.CgroupScope)
-                    else {"backend": "process_tree", "token": scope.token}
+                    else {"backend": "process_tree", "token": scope.token, "uid": scope.uid}
                 ),
                 "process": (
                     {"pid": process.pid, "started_ticks": process.started_ticks}
@@ -445,8 +445,9 @@ class ExecutorSupervision:
             elif raw_scope.get("backend") == "process_tree" and set(raw_scope) == {
                 "backend",
                 "token",
+                "uid",
             }:
-                scope = proctree.ProcessTreeScope(str(raw_scope["token"]))
+                scope = proctree.ProcessTreeScope(str(raw_scope["token"]), int(raw_scope["uid"]))
             else:
                 raise TypeError("scope fields differ")
             raw_process = document["process"]
@@ -487,6 +488,11 @@ class ExecutorSupervision:
             raise ExecutorGone(
                 f"executor ownership record {self._owner_path} names an unsafe scope: {exc}"
             ) from exc
+        if isinstance(scope, proctree.ProcessTreeScope) and scope.uid != self.executor_uid:
+            raise ExecutorGone(
+                f"executor ownership record {self._owner_path} names uid {scope.uid}, "
+                f"want {self.executor_uid}"
+            )
         if process is not None and (process.pid <= 0 or process.started_ticks <= 0):
             raise ExecutorGone(
                 f"executor ownership record {self._owner_path} has invalid identity {process}"
@@ -658,7 +664,12 @@ class ExecutorSupervision:
         exit_published: threading.Event | None = None
         try:
             try:
-                owner = OwnerRecord(proctree.create_executor_scope(self._scope_namespace))
+                owner = OwnerRecord(
+                    proctree.create_executor_scope(
+                        self._scope_namespace,
+                        self.executor_uid if self.isolated else None,
+                    )
+                )
             except (proctree.ContainmentUnavailable, proctree.ProcessTreeUnsupported) as exc:
                 raise ExecutorGone(
                     f"executor containment unavailable before allocation: {exc}"
