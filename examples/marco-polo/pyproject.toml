@@ -9,6 +9,9 @@ description = "Weightless Marco/Polo example for Tensorhub publication and worke
 requires-python = ">=3.11"
 dependencies = ["cozy-runtime==0.0.3"]
 
+[tool.cozy]
+organization = "paul"
+
 [tool.uv.sources]
 cozy-runtime = { path = "../..", editable = true }
 
