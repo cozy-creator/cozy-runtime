@@ -691,19 +691,19 @@ def fence_base_ownership_vectors() -> list[str]:
     exact_contract = {
         "base-worker-image-wheelhouse.json": (
             wheelhouse_bytes,
-            "cb6c46c667ba43897c7d3cc5ea26e44484b83d54a47344dfffdd5e2ddb24ffe1",
+            "650f9e4010062d0895582a3e2d3e3c2ea21130d1b9ca30ed0de0f43eb1d2d655",
         ),
         "endpoint-bundle.json": (
             bundle_bytes,
-            "76ddb2ed3c7de4357f5d7c1898fcd328820da67bf6f2dc7ae8758fce64230800",
+            "ac3b9b3482fbc673ec62d4b2143b64254454c8e45f06987eedf4f39fb2701fb9",
         ),
         "endpoint-environment-spec.json": (
             environment_bytes,
-            "1c51b6f924bddee706c196e4b419a8c256bca6dba1b0df19e689a228e4e8b695",
+            "a34714c0610936206e1744a565da41301f58c8e1003b15ed55491e84077bca75",
         ),
         "fixture-index.json": (
             index_bytes,
-            "097a2dddb8e4f6908a2c8f65eef67637dccefb1885cf547d18e87571f6efa6e8",
+            "2b6c46e40b0408c449d1a3d68751dc27c916a87a033fc516edfd233b621a26c7",
         ),
         "project-wheel.json": (
             project_bytes,
@@ -715,7 +715,7 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "c402ba85dbf8e943455d2415f6d59e491b07f1ab3b3d885ef073c06eabdbbcb7",
+            "432c0052384b3c54ba0ca5d2336fd57b14633bbd6c8a7dcfce8ff5d4be7caa2d",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
