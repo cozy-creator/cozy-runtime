@@ -315,7 +315,8 @@ def _verify(root: Path) -> None:
         "boot_warmup": False,
         "entrypoint": "marco",
         "execution_started": True,
-        "model_construction_digests": [],
+        "logical_model_digest": "",
+        "model_construction_contract_digests": [],
         "result_digest": _digest(b'{"message":"polo"}'),
         "status": int(pb.OutcomeStatus.OUTCOME_STATUS_SUCCEEDED),
     }

@@ -39,6 +39,7 @@ MAX_OBSERVATION_BYTES = 1 << 20
 MAX_STRING = 256
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_MIME = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,127}$")
 _BINDING_KINDS = frozenset(
     {
         "entrypoint_binding_plan",
@@ -191,6 +192,12 @@ def execution_observation(raw: bytes) -> bytes:
         documents_by_name["invocation_spec"].digest,
         placement_id,
     )
+    logical_model_digest = str(selected.expected_logical_model_digest)
+    if accepted["model_construction_digest"] != logical_model_digest:
+        raise AcceptanceRefusal(
+            "acceptance_model_construction_mismatch",
+            "AttemptAccepted names a logical model other than the exact binding plan",
+        )
     outcome = _outcome(
         documents_by_name["attempt_outcome"],
         accepted,
@@ -249,7 +256,8 @@ def execution_observation(raw: bytes) -> bytes:
         "format": OBSERVATION_FORMAT,
         "installed_environment_receipt_digest": environment.installed.receipt_digest,
         "invocation_spec_digest": documents_by_name["invocation_spec"].digest,
-        "model_construction_digests": model_contracts,
+        "logical_model_digest": logical_model_digest,
+        "model_construction_contract_digests": model_contracts,
         "object_set_digest": documents_by_name["artifact_object_set"].digest,
         "output_manifest": output_manifest,
         "overlay_content_digest": environment.installed.content_digest,
@@ -726,6 +734,8 @@ def _attempt_accepted(value: object, invocation_digest: str, placement_id: str) 
         raise AcceptanceRefusal("attempt_accepted_invalid", "invocation or placement")
     _digest(value.get("plan_digest"), "attempt_accepted.plan_digest")
     construction = value.get("model_construction_digest")
+    if not isinstance(construction, str):
+        raise AcceptanceRefusal("attempt_accepted_invalid", "model_construction_digest")
     if construction:
         _digest(construction, "attempt_accepted.model_construction_digest")
     if (
@@ -830,31 +840,47 @@ def _result(value: object) -> tuple[str, str]:
         return "sha256:" + hashlib.sha256(raw).hexdigest(), schema_digest
     if not isinstance(blob, dict):
         raise AcceptanceRefusal("attempt_result_invalid", "result_blob")
-    return _digest(blob.get("digest"), "result_blob.digest"), schema_digest
+    _output_entry(blob, "result_blob")
+    return str(blob["digest"]), schema_digest
 
 
 def _output_manifest(value: object) -> dict[str, Any]:
     if value is None:
         return {"outputs": []}
-    if not isinstance(value, dict) or not set(value).issubset(
-        {"outputs", "publication_receipt_digest"}
+    if not isinstance(value, dict) or set(value) not in (
+        {"outputs"},
+        {"outputs", "publication_receipt_digest"},
     ):
         raise AcceptanceRefusal("attempt_output_manifest_invalid", "manifest fields")
+    publication = value.get("publication_receipt_digest")
+    if publication is not None:
+        _digest(publication, "output_manifest.publication_receipt_digest")
     rows = value.get("outputs", [])
     if not isinstance(rows, list):
         raise AcceptanceRefusal("attempt_output_manifest_invalid", "outputs is not an array")
     prior = ""
     for index, row in enumerate(rows):
-        if not isinstance(row, dict) or not set(row).issubset(
-            {"digest", "length", "mime_type", "output_id"}
-        ):
+        if not isinstance(row, dict):
             raise AcceptanceRefusal("attempt_output_manifest_invalid", f"outputs[{index}]")
+        _output_entry(row, f"outputs[{index}]")
         output_id = row.get("output_id")
-        if not isinstance(output_id, str) or not output_id or output_id <= prior:
+        if not isinstance(output_id, str) or output_id <= prior:
             raise AcceptanceRefusal("attempt_output_manifest_invalid", "outputs not sorted unique")
-        _digest(row.get("digest"), f"outputs[{index}].digest")
         prior = output_id
     return cast(dict[str, Any], value)
+
+
+def _output_entry(value: Mapping[str, Any], name: str) -> None:
+    if set(value) != {"digest", "length", "mime_type", "output_id"}:
+        raise AcceptanceRefusal("attempt_output_manifest_invalid", f"{name} fields")
+    _identifier(value.get("output_id"), f"{name}.output_id")
+    _digest(value.get("digest"), f"{name}.digest")
+    length = value.get("length")
+    if not isinstance(length, int) or isinstance(length, bool) or not 0 <= length <= 1 << 40:
+        raise AcceptanceRefusal("attempt_output_manifest_invalid", f"{name}.length")
+    mime = value.get("mime_type")
+    if not isinstance(mime, str) or _MIME.fullmatch(mime) is None:
+        raise AcceptanceRefusal("attempt_output_manifest_invalid", f"{name}.mime_type")
 
 
 def _protocol_projection(value: object, cls: Any, name: str) -> dict[str, Any]:
