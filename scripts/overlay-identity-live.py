@@ -581,7 +581,15 @@ def main() -> int:
         )
         structural_native_reds = [("overlay_native_rpath_forbidden", hostile_custom)]
         for index, library in enumerate(
-            ("libtorch_cuda.so", "libcublas.so.12", "libcusparse.so.12", "libcudnn.so.9")
+            (
+                "libtorch_cuda.so",
+                "libcublas.so.12",
+                "libcublasLt.so.12",
+                "libcudart.so.12",
+                "libcusparse.so.12",
+                "libcudnn.so.9",
+                "libnvidia-ml.so.1",
+            )
         ):
             package = f"proof_library_shadow_{index}"
             structural_native_reds.append(

@@ -49,8 +49,9 @@ _CUDA_SECTION = re.compile(r"(?:^|\.)(?:nv|cuda)(?:_|\.)", re.IGNORECASE)
 _SM = re.compile(r"(?:^|[^a-z0-9])sm[_-]?([0-9]{2,3})(?:[^0-9]|$)", re.IGNORECASE)
 _COMPUTE = re.compile(r"(?:^|[^a-z0-9])compute[_-]?([0-9]{2,3})(?:[^0-9]|$)", re.IGNORECASE)
 _PROTECTED_LIBRARY = re.compile(
-    r"^(?:lib)?(?:c10|cublas|cuda|cudnn|cufft|cufile|curand|cusolver|cusparse|"
-    r"cusparselt|nccl|nvjitlink|nvrtc|nvshmem|nvtx|torch|triton)"
+    r"^(?:lib)?(?:c10|cublas|cublaslt|cuda|cudart|cudnn|cufft|cufile|curand|"
+    r"cusolver|cusparse|cusparselt|nccl|nvidia|nvjitlink|nvrtc|nvshmem|"
+    r"nvtoolsext|nvtx|torch|triton)"
     r"(?:[_+.-].*)?\.so(?:\..*)?$",
     re.IGNORECASE,
 )
