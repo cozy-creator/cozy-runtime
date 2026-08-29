@@ -118,11 +118,10 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
         {
             "package_descriptor": _ref(descriptor_raw),
             "package_release_id": "local/marco@acceptance-1",
-            "format": "tensorhub.package_bundle/2",
+            "format": "tensorhub.package_bundle/3",
             "project_wheel": wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved_raw),
-            "source_archive": _ref(b"source"),
-            "source_lock": _ref(b"lock"),
+            "source_tree": _ref(b"source tree"),
             "wheelhouse_manifest": _ref(wheelhouse_raw),
         }
     )

@@ -13,7 +13,5 @@ RUN python -m pip download --only-binary=:all: -d /wheels/deps \
       msgspec protobuf grpcio
 RUN python -m pip install --no-cache-dir /wheels/cozy_runtime-*.whl \
  && mkdir -p /opt/cozy/base-runtime /run/cozy /var/lib/cozy
-COPY nvidia-smi /usr/bin/nvidia-smi
 COPY pod.py hub.py proof_data.py /
-RUN chmod 0755 /usr/bin/nvidia-smi
 ENTRYPOINT ["python", "/pod.py"]

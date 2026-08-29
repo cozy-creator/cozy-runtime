@@ -160,20 +160,18 @@ def author(
     finally:
         sys.path.remove(str(project_wheel))
     descriptor_bytes = release.add(desc.canonical_bytes(document), "package_descriptor")
-    # These exact refs prove publication provenance but are deliberately not
-    # runtime grant subjects. The executable source payload is project_wheel.
-    source_archive = b"cr-049-boot-proof-source"
-    source_lock = b"cr-049-boot-proof-lock"
+    # This exact ref proves publication provenance but is deliberately not a
+    # runtime grant subject. The executable source payload is project_wheel.
+    source_tree = b"cr-049-boot-proof-source-tree"
     bundle = release.add(
         canonical(
             {
                 "package_descriptor": ref(descriptor_bytes),
                 "package_release_id": PACKAGE_RELEASE,
-                "format": "tensorhub.package_bundle/2",
+                "format": "tensorhub.package_bundle/3",
                 "project_wheel": wheel(project, import_roots=True),
                 "resolved_wheel_set": ref(resolved),
-                "source_archive": ref(source_archive),
-                "source_lock": ref(source_lock),
+                "source_tree": ref(source_tree),
                 "wheelhouse_manifest": ref(wheelhouse),
             }
         ),

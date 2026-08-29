@@ -157,11 +157,10 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             "package_descriptor": _ref(descriptor_bytes),
             "package_release_id": "proof-release",
-            "format": "tensorhub.package_bundle/2",
+            "format": "tensorhub.package_bundle/3",
             "project_wheel": _wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved),
-            "source_archive": _ref(b"proof-source"),
-            "source_lock": _ref(b"proof-lock"),
+            "source_tree": _ref(b"proof-source-tree"),
             "wheelhouse_manifest": _ref(wheelhouse),
         }
     )

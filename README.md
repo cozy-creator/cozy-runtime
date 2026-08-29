@@ -198,7 +198,7 @@ canonical ownership document for that image: its existing platform target and ex
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
 sorted unique import roots: the five control rows in `WheelhouseManifest/3`, the project row in
-`PackageBundle/2`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
+`PackageBundle/3`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
