@@ -581,7 +581,9 @@ def fence_base_ownership_vectors() -> list[str]:
     sys.path.insert(0, str(ROOT / "src"))
     from cozy_runtime.internal import canonical, overlay
 
-    materialize_launch = importlib.import_module("cozy_runtime.internal.materialize_launch")
+    placement_materialization = importlib.import_module(
+        "cozy_runtime.internal.placement_materialization"
+    )
 
     bad: list[str] = []
     path = ROOT / "vectors" / "base-ownership.jsonl"
@@ -781,7 +783,7 @@ def fence_base_ownership_vectors() -> list[str]:
         bad.append(f"{contract_root}: fixture wheel file map is invalid")
         return bad
     try:
-        joined = materialize_launch.package_overlay_input(
+        joined = placement_materialization.package_overlay_input(
             environment_spec_bytes=environment_bytes,
             package_bundle_bytes=bundle_bytes,
             resolved_wheel_set_bytes=resolved_bytes,
@@ -1225,28 +1227,30 @@ def fence_construction_fill_order() -> list[str]:
 
 
 def fence_dynamic_pods_skip_boot_warm() -> list[str]:
-    """The fixed remote adapter must never run package inference before dispatchability."""
+    """The fixed product worker never runs package inference before dispatchability."""
 
-    path = SRC / "cli" / "materialize_launch.py"
+    path = SRC / "cli" / "runtime_worker.py"
     tree = ast.parse(path.read_text())
     command = next(
         (
             node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_worker_command"
+            if isinstance(node, ast.FunctionDef) and node.name == "_worker_options"
         ),
         None,
     )
     if command is None:
-        return [f"{path.relative_to(ROOT)}: fixed dynamic-pod worker command is gone"]
-    returned = [node.value for node in ast.walk(command) if isinstance(node, ast.Return)]
-    if not any(
-        isinstance(value, ast.List)
-        and any(isinstance(item, ast.Constant) and item.value == "--no-warm" for item in value.elts)
-        for value in returned
-    ):
+        return [f"{path.relative_to(ROOT)}: fixed product-worker options are gone"]
+    no_warm = [
+        keyword.value
+        for node in ast.walk(command)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "no_warm"
+    ]
+    if not any(isinstance(value, ast.Constant) and value.value is True for value in no_warm):
         return [
-            f"{path.relative_to(ROOT)}: fixed dynamic-pod child argv omits `--no-warm`; "
+            f"{path.relative_to(ROOT)}: fixed product worker omits `no_warm=True`; "
             "package inference can block activation before DISPATCHABLE"
         ]
     return []
@@ -1276,51 +1280,20 @@ def fence_delivery_plan_observation() -> list[str]:
 
 
 def fence_pod_media_grant_root() -> list[str]:
-    """The fixed adapter declares pod-supervisor/podmedia's one exact shared filesystem root."""
+    """The host-path vector is the one pod-supervisor/Runtime media-root authority."""
 
-    path = SRC / "cli" / "materialize_launch.py"
-    tree = ast.parse(path.read_text())
-    assignments = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "MEDIA_ROOT" for target in node.targets
-        )
-    ]
-    if len(assignments) != 1:
+    path = SRC / "cli" / "runtime_worker.py"
+    vector_path = SRC / "vectors" / "runtime-worker-host-paths.json"
+    vector = json.loads(vector_path.read_text())
+    if vector.get("media_root") != "/var/lib/cozy/media":
         return [
-            f"{path.relative_to(ROOT)}: MEDIA_ROOT has {len(assignments)} authorities; "
-            "pod-supervisor and Runtime share one fixed root"
-        ]
-    value = assignments[0].value
-    if not (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "Path"
-        and len(value.args) == 1
-        and isinstance(value.args[0], ast.Constant)
-        and value.args[0].value == "/var/lib/cozy/media"
-    ):
-        return [
-            f"{path.relative_to(ROOT)}: MEDIA_ROOT must equal pod-supervisor's exact "
+            f"{vector_path.relative_to(ROOT)}: media_root must equal pod-supervisor's exact "
             "`/var/lib/cozy/media` root"
         ]
-    source = (
-        ast.get_source_segment(
-            path.read_text(),
-            next(
-                node
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name == "_worker_command"
-            ),
-        )
-        or ""
-    )
-    if "grant_roots = str(MEDIA_ROOT)" not in source:
+    if "grant_roots=(str(host_paths.MEDIA_ROOT),)" not in path.read_text():
         return [
-            f"{path.relative_to(ROOT)}: fixed worker argv no longer derives --grant-root "
-            "from MEDIA_ROOT"
+            f"{path.relative_to(ROOT)}: fixed worker no longer derives grant_roots from "
+            "host_paths.MEDIA_ROOT"
         ]
     return []
 

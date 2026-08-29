@@ -977,6 +977,13 @@ class ExecutorSupervision:
         while True:
             states = {member.pid: proctree.process_state(member) for member in known}
             observations = self._observe_processes(known)
+            # A zombie has already completed exit: its mm and device contexts are gone, and
+            # only the direct-child wait slot remains. Driver APIs commonly answer unreadable
+            # for that state, which is not uncertainty about live memory. Preserve the birth
+            # until `_reap_and_prove_absent`, but treat the released device side as absent.
+            for member in known:
+                if states[member.pid] == "Z":
+                    observations[member.pid] = accel.ProcessMemory("absent", 0)
             try:
                 token_leftovers = (
                     proctree.process_scope_processes(owner.scope)

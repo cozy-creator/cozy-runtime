@@ -15,7 +15,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 | `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
 | `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
-| `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
+| `cozy_runtime.cli` | user CLI plus the fixed product-host worker entrypoint | author, internal |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
@@ -36,6 +36,13 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
     a real RecordOwner ──gRPC───┐
                                 ├──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
     an in-memory RecordOwner ───┘        cozy.worker.v1, either way
+
+Product hosts run `cozy-runtime-worker`, a private no-argument entrypoint that constructs
+the worker core directly. On a base worker image it starts as root, consumes the five-value
+owner-neutral host handoff, proves the worker and media TLS listeners, publishes readiness,
+then opens Claim admission. Package executors alone drop to UID/GID 65533. The removed
+wrapper executable has no compatibility alias; placement acquisition now lives in
+`internal/placement_materialization.py`.
 
 | module | role |
 |---|---|

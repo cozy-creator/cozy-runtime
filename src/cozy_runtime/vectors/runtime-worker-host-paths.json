@@ -1,0 +1,18 @@
+{
+  "artifact_cache": "/var/lib/cozy/artifacts",
+  "artifact_store": "/var/lib/cozy/store",
+  "binding_documents": "/run/cozy/binding-documents",
+  "binding_plans": "/run/cozy/binding-plans",
+  "boot_data": "/var/lib/cozy/boot",
+  "boot_id": "/run/cozy/bootstrap/pod-boot-id",
+  "bootstrap_state": "/run/cozy/bootstrap",
+  "empty_object_set": "/var/lib/cozy/boot/artifact-object-set.json",
+  "environment_root": "/var/lib/cozy/environments",
+  "media_root": "/var/lib/cozy/media",
+  "readiness_envelope": "/run/cozy/bootstrap/readiness-envelope.json",
+  "readiness_payload": "/run/cozy/bootstrap/readiness-payload",
+  "tls_certificate": "/run/cozy/bootstrap/tls.crt",
+  "tls_private_key": "/run/cozy/bootstrap/tls.key",
+  "worker_control_address": "/run/cozy/worker/control.addr",
+  "worker_state": "/run/cozy/worker"
+}

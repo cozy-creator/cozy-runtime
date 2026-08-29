@@ -209,6 +209,8 @@ class WorkerOptions:
     host_budget: int = 8 << 30
     pinned_budget: int = 512 << 20
     no_warm: bool = False
+    claim_ready: bool = True
+    """False only for fixed product-host boot until listener/readiness proof commits."""
     executor_uid: int = -1
     executor_gid: int = -1
     """Fixed package identity, or ``-1/-1`` for the native same-user development lane."""
@@ -611,6 +613,9 @@ class Worker:
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
         # from the superseded stream cannot finish under its successor's generation.
         self.control_lock = threading.RLock()
+        self.claim_ready = threading.Event()
+        if options.claim_ready:
+            self.claim_ready.set()
         self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
         #: plan id -> why THIS binding could not be prepared (#572d). A faulted binding
@@ -1066,6 +1071,11 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
+        if not self.claim_ready.is_set():
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                "the worker listener is bound but the readiness barrier is not committed",
+            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -1127,6 +1137,11 @@ class Worker:
                 f"under epoch {claim.record_owner_epoch}",
             )
         return generation, outbound
+
+    def mark_claim_ready(self) -> None:
+        """Open Claim only after fixed-host listener proof and readiness publication."""
+
+        self.claim_ready.set()
 
     def record_ownership(self, claim: pb.Claim) -> bool:
         """Journal the authority this claim carries, BEFORE any ClaimAck (#494e).
@@ -2687,7 +2702,7 @@ class Worker:
         """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
         # Dynamic placement workers execute package source only for a real invocation,
         # after the placement is DISPATCHABLE. Their environment root is the structural
-        # identity of that mode; the adapter's `--no-warm` remains a belt, but correctness
+        # identity of that mode; the fixed worker's `no_warm` remains a belt, but correctness
         # cannot depend on one argv translation surviving every launch layer. A real pod
         # proved why: its model prepared successfully, then a synthetic warm handler blocked
         # forever in its first CUDA scalar read and kept the placement ACTIVATING.
@@ -3543,8 +3558,10 @@ class Worker:
             ).start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
-        self.host.serve(self)
-        self.shutdown()
+        try:
+            self.host.serve(self)
+        finally:
+            self.shutdown()
         return self.exit_code
 
     def shutdown(self) -> None:

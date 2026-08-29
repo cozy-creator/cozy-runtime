@@ -22,7 +22,7 @@ from proof_data import installed_base_ownership, inventory, pack_installed, whee
 
 from cozy_runtime.internal import canonical, descriptor, local, overlay
 from cozy_runtime.internal.config import read_config
-from cozy_runtime.internal.materialize_launch import package_overlay_input
+from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb

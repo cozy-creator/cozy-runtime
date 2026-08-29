@@ -31,38 +31,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, fill, overlay, provisioned, pull
-from cozy_runtime.internal.config import AdapterConfig
+from cozy_runtime.internal import canonical, fill, host_paths, overlay, provisioned, pull
+from cozy_runtime.internal.config import WorkerHostConfig
+from cozy_runtime.internal.refusal import LaunchRefusal
 
 PACKAGE_BUNDLE_FORMAT = "tensorhub.package_bundle/3"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.PackageEnvironmentSpec/2"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
 MAX_RESOLUTION_LOCK_BYTES = 16 << 20
 MAX_OVERLAY_BYTES = 4 << 30
-# The base-worker-image bootstrap creates exactly this container-local Runtime data root.
-# Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
-LOCAL_DATA_ROOT = Path("/var/lib/cozy")
-BOOT_ROOT = LOCAL_DATA_ROOT / "boot"
-ENVIRONMENT_ROOT = LOCAL_DATA_ROOT / "environments"
-LOCAL_ARTIFACT_STORE_ROOT = LOCAL_DATA_ROOT / "store"
-ARTIFACT_CACHE_ROOT = LOCAL_DATA_ROOT / "artifacts"
-PLANS_ROOT = Path("/run/cozy/binding-plans")
-BINDING_DOCUMENTS_ROOT = Path("/run/cozy/binding-documents")
+BOOT_ROOT = host_paths.BOOT_DATA
+ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
+LOCAL_ARTIFACT_STORE_ROOT = host_paths.ARTIFACT_STORE
+ARTIFACT_CACHE_ROOT = host_paths.ARTIFACT_CACHE
+PLANS_ROOT = host_paths.BINDING_PLANS
+BINDING_DOCUMENTS_ROOT = host_paths.BINDING_DOCUMENTS
 #: The canonical EMPTY ArtifactObjectSet. A pod that boots with no placement holds no
 #: objects, and the worker's launch grammar requires the document to exist and be exact
 #: rather than letting "absent" mean "anything".
 EMPTY_ARTIFACT_OBJECT_SET = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20
-
-
-class LaunchRefusal(Exception):
-    """A fail-closed release/grant join verdict with a stable code."""
-
-    def __init__(self, code: str, detail: str) -> None:
-        super().__init__(f"{code}: {detail}")
-        self.code = code
-        self.detail = detail
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +85,7 @@ class CacheMount:
 
 
 def prepare_boot(
-    config: AdapterConfig,
+    config: WorkerHostConfig,
     *,
     boot_root: Path = BOOT_ROOT,
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
@@ -124,8 +113,8 @@ def prepare_boot(
     all; withholding it would turn that convergence into a BINDING_UNAVAILABLE fault.
     """
 
-    if time.time() >= config.readiness_deadline_unix:
-        raise LaunchRefusal("readiness_deadline_elapsed", str(config.readiness_deadline_unix))
+    if time.time() >= config.lease_expiry_unix:
+        raise LaunchRefusal("worker_lease_elapsed", str(config.lease_expiry_unix))
     # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
     # or directory writable to it.
@@ -186,7 +175,7 @@ def fetch_exact(
                 pull.Deadline.after(timeout),
                 headers={
                     "Accept-Encoding": "identity",
-                    "User-Agent": "cozy-materialize-launch/1",
+                    "User-Agent": "cozy-runtime-worker/1",
                 },
                 allow_local=allow_local,
                 no_proxy=True,

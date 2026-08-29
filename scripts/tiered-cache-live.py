@@ -18,13 +18,13 @@ from unittest import mock
 import tensorfs
 
 from cozy_runtime.internal import provisioned, pull
-from cozy_runtime.internal.materialize_launch import (
+from cozy_runtime.internal.placement_materialization import (
     LOCAL_ARTIFACT_STORE_ROOT,
     CacheMount,
-    LaunchRefusal,
     _open_cache_store,
     materialize_objects,
 )
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
 
 
