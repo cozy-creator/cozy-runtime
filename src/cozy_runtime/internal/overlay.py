@@ -39,7 +39,7 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, native_wheel
 
 RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
 CONTENT_FORMAT = "cozy.runtime.EndpointOverlayContent/1"
@@ -799,7 +799,8 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                 if wheel.owner == "project" and native:
                     raise OverlayRefusal("overlay_project_wheel_native", name)
                 if native:
-                    native_members.append(name)
+                    assert installed is not None
+                    native_members.append(installed.as_posix())
             dist_infos = sorted(
                 name
                 for name in names
@@ -1102,6 +1103,11 @@ def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspec
         tree = staging / "tree"
         tree.mkdir(parents=True, mode=0o700)
         _extract((inspected,), tree)
+        if inspected.native_members:
+            try:
+                native_wheel.inspect_tree(tree, inspected.native_members)
+            except native_wheel.NativeWheelRefusal as exc:
+                raise OverlayRefusal(exc.code, exc.detail) from exc
         _write_once(staging / WHEEL_EXTRACTION_IDENTITY_NAME, identity_bytes)
         _make_read_only(staging)
         _fsync_dir(staging)

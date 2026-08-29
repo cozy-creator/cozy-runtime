@@ -37,6 +37,8 @@ from cozy_runtime.internal.config import AdapterConfig
 ENDPOINT_BUNDLE_FORMAT = "tensorhub.endpoint_bundle/2"
 ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.EndpointEnvironmentSpec/2"
 RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
+MAX_RESOLUTION_LOCK_BYTES = 16 << 20
+MAX_OVERLAY_BYTES = 4 << 30
 # The base-worker-image bootstrap creates exactly this container-local Runtime data root.
 # Every durable-for-this-pod child stays beneath it; /run/cozy remains restart-local control state.
 LOCAL_DATA_ROOT = Path("/var/lib/cozy")
@@ -549,14 +551,16 @@ def endpoint_overlay_input(
     if bundle["format"] != ENDPOINT_BUNDLE_FORMAT:
         raise LaunchRefusal("endpoint_bundle_format", str(bundle["format"]))
     _ref(bundle["source_archive"], "source_archive")
-    source_lock = _ref(bundle["source_lock"], "source_lock")
+    _ref(bundle["source_lock"], "source_lock")
     _closed(
         resolved,
         {
             "compatibility_profile",
             "format",
-            "lock_digest",
+            "overlay_bytes",
             "platform_target",
+            "resolution_lock_digest",
+            "resolution_lock_length",
             "wheelhouse_manifest_digest",
             "wheels",
         },
@@ -564,10 +568,17 @@ def endpoint_overlay_input(
     )
     if resolved["format"] != RESOLVED_WHEEL_SET_FORMAT:
         raise LaunchRefusal("resolved_wheel_set_format", str(resolved["format"]))
-    _require_digest(resolved["lock_digest"], "resolved_wheel_set.lock_digest")
-    if source_lock["digest"] != resolved["lock_digest"]:
+    _require_digest(
+        resolved["resolution_lock_digest"], "resolved_wheel_set.resolution_lock_digest"
+    )
+    resolution_lock_length = resolved["resolution_lock_length"]
+    if (
+        not isinstance(resolution_lock_length, int)
+        or isinstance(resolution_lock_length, bool)
+        or not 0 < resolution_lock_length <= MAX_RESOLUTION_LOCK_BYTES
+    ):
         raise LaunchRefusal(
-            "source_lock_ref_mismatch", "bundle source lock and resolved set disagree"
+            "resolved_wheel_set_invalid", "resolution_lock_length is not positive and bounded"
         )
     _require_digest(spec["endpoint_bundle_digest"], "environment_spec.endpoint_bundle_digest")
     _require_digest(spec["project_wheel_digest"], "environment_spec.project_wheel_digest")
@@ -613,10 +624,33 @@ def endpoint_overlay_input(
         raise LaunchRefusal("compatibility_profile_mismatch", "release documents disagree")
 
     project = _wheel(bundle["project_wheel"], "project", import_roots=True)
+    if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
+        raise LaunchRefusal(
+            "project_wheel_not_pure", "project wheel must be exactly py3-none-any"
+        )
     if project.digest != spec["project_wheel_digest"]:
         raise LaunchRefusal("project_wheel_mismatch", project.digest)
     wheels = [project]
-    wheels.extend(_wheels(resolved["wheels"], "bundle", import_roots=True))
+    custom_wheels = _wheels(resolved["wheels"], "bundle", import_roots=True)
+    overlay_bytes = resolved["overlay_bytes"]
+    measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
+    if (
+        not isinstance(overlay_bytes, int)
+        or isinstance(overlay_bytes, bool)
+        or overlay_bytes != measured_custom_bytes
+        or overlay_bytes > MAX_OVERLAY_BYTES
+    ):
+        raise LaunchRefusal(
+            "resolved_wheel_set_overlay_bytes_mismatch",
+            f"declared={overlay_bytes!r} measured_custom={measured_custom_bytes}",
+        )
+    if project.length > MAX_OVERLAY_BYTES - measured_custom_bytes:
+        raise LaunchRefusal(
+            "overlay_byte_budget_exceeded",
+            f"project_plus_custom={project.length + measured_custom_bytes} "
+            f"budget={MAX_OVERLAY_BYTES}",
+        )
+    wheels.extend(custom_wheels)
     digests = [wheel.digest for wheel in wheels]
     distributions = [wheel.distribution for wheel in wheels]
     if len(digests) != len(set(digests)):

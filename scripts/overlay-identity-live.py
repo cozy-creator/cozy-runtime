@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,8 +17,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from cozy_runtime.internal import canonical, overlay
-from cozy_runtime.internal.worker import acquire
+from cozy_runtime.internal import canonical, child_env, native_wheel, overlay
+from cozy_runtime.internal.worker import acquire, child
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -78,6 +79,22 @@ def build_wheel(
         ),
         path,
     )
+
+
+def compile_shared(root: Path, name: str, source: str, *linker_flags: str) -> bytes:
+    """Test harness only: manufacture a prebuilt input before Runtime sees the wheel."""
+
+    root.mkdir()
+    source_path = root / f"{name}.c"
+    library_path = root / f"{name}.so"
+    source_path.write_text(source)
+    subprocess.run(
+        ["cc", "-shared", "-fPIC", str(source_path), "-o", str(library_path), *linker_flags],
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=30,
+    )
+    return library_path.read_bytes()
 
 
 def base_manifest(path: Path) -> str:
@@ -361,6 +378,229 @@ def main() -> int:
         else:
             raise AssertionError("platform-specific project wheel was admitted")
 
+        native_bytes = compile_shared(
+            root / "native-valid-build",
+            "proof_native",
+            "int proof_add(int a, int b) { return a + b; }\n",
+        )
+        native_custom = build_wheel(
+            wheels,
+            "proof-native-custom",
+            "proof_native_custom",
+            "native-custom",
+            owner="custom",
+            tag="cp312-cp312-manylinux_2_17_x86_64",
+            root_is_pure=False,
+            extra_entries={
+                "proof_native_custom/_native.so": native_bytes,
+                "proof_native_custom/fixture.py": (
+                    b"import ctypes\nfrom pathlib import Path\n"
+                    b"def run():\n"
+                    b"    lib = ctypes.CDLL(str(Path(__file__).with_name('_native.so')))\n"
+                    b"    return {'value': lib.proof_add(1, 2)}\n"
+                ),
+                "proof_native_custom/no_kernel.py": (
+                    b"def run():\n"
+                    b"    raise RuntimeError('no kernel image is available for execution')\n"
+                ),
+            },
+        )
+        native_installed = overlay.materialize(
+            source("native-custom", family, project, native_custom),
+            root / "native-custom-installed",
+            python=Path(sys.executable),
+            base_manifest=manifest,
+        )
+        native_inspection = native_wheel.inspect_tree(
+            native_installed.import_root, ("proof_native_custom/_native.so",)
+        )
+        native_host = native_wheel.qualify_host(native_inspection, gpu_sm=None)
+        assert native_host["qualification"] == "static-host-compatible"
+        operator_evidence = native_wheel.qualify_operator(
+            python=Path(sys.executable),
+            overlay=native_installed.import_root,
+            fixture="proof_native_custom.fixture:run",
+            expected_result_digest=canonical.digest({"value": 3}),
+            environment={},
+        )
+        assert operator_evidence["result_digest"] == canonical.digest({"value": 3})
+        try:
+            native_wheel.qualify_operator(
+                python=Path(sys.executable),
+                overlay=native_installed.import_root,
+                fixture="proof_native_custom.fixture:run",
+                expected_result_digest=canonical.digest({"value": 4}),
+                environment={},
+            )
+        except native_wheel.NativeWheelRefusal as exc:
+            assert exc.code == "overlay_native_operator_numerical_mismatch", exc.code
+        else:
+            raise AssertionError("native operator numerical mismatch was admitted")
+        try:
+            native_wheel.qualify_operator(
+                python=Path(sys.executable),
+                overlay=native_installed.import_root,
+                fixture="proof_native_custom.no_kernel:run",
+                expected_result_digest=canonical.digest({"value": 3}),
+                environment={},
+            )
+        except native_wheel.NativeWheelRefusal as exc:
+            assert exc.code == "overlay_native_no_kernel_image", exc.code
+        else:
+            raise AssertionError("no-kernel-image operator failure was admitted")
+
+        realization_evidence: list[bytes] = []
+        proof_python = Path(sys.prefix) / "bin" / "python"
+        assert proof_python.is_file()
+        for realization_kind, realization_digit in (("oci", "a"), ("managed-local", "b")):
+            request_path = root / f"native-request-{realization_kind}.json"
+            evidence_path = root / f"native-evidence-{realization_kind}.json"
+            request_path.write_bytes(
+                canonical.write(
+                    {
+                        "base_realization_digest": "sha256:" + realization_digit * 64,
+                        "base_realization_kind": realization_kind,
+                        "base_worker_profile": "torch2.13.0-none-cp312-linux-x86",
+                        "device_index": None,
+                        "endpoint_environment_spec_digest": digest(b"native-custom"),
+                        "environment_root": str(root / "native-custom-installed"),
+                        "expected_result_digest": canonical.digest({"value": 3}),
+                        "fixture": "proof_native_custom.fixture:run",
+                        "format": "cozy.runtime.NativeWheelProofRequest/1",
+                        "installed_environment_receipt_digest": native_installed.receipt_digest,
+                        "python": str(proof_python),
+                        "wheelhouse_manifest": str(manifest),
+                    }
+                )
+            )
+            cli_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from cozy_runtime.cli.native_wheel_proof import main; "
+                    "raise SystemExit(main())",
+                    str(request_path),
+                    str(evidence_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=60,
+                env={
+                    "COZY_HOME": str(root / f"node-{realization_kind}"),
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                },
+            )
+            assert cli_result.returncode == 0, cli_result.stderr.decode()
+            realization_evidence.append(evidence_path.read_bytes())
+        assert realization_evidence[0] != realization_evidence[1]
+        oci_evidence = canonical.parse_canonical(realization_evidence[0])
+        local_evidence = canonical.parse_canonical(realization_evidence[1])
+        assert isinstance(oci_evidence, dict) and isinstance(local_evidence, dict)
+        assert (
+            oci_evidence["installed_environment_receipt_digest"] == native_installed.receipt_digest
+        )
+        assert (
+            local_evidence["installed_environment_receipt_digest"]
+            == native_installed.receipt_digest
+        )
+        assert oci_evidence["overlay_content_digest"] == local_evidence["overlay_content_digest"]
+
+        hostile_bytes = compile_shared(
+            root / "native-rpath-build",
+            "proof_rpath",
+            "int proof(void) { return 1; }\n",
+            "-Wl,-rpath,/tmp/hostile",
+        )
+        hostile_custom = build_wheel(
+            wheels,
+            "proof-hostile-rpath",
+            "proof_hostile_rpath",
+            "hostile-rpath",
+            owner="custom",
+            tag="cp312-cp312-manylinux_2_17_x86_64",
+            root_is_pure=False,
+            extra_entries={"proof_hostile_rpath/_native.so": hostile_bytes},
+        )
+        structural_native_reds = [("overlay_native_rpath_forbidden", hostile_custom)]
+        for index, library in enumerate(
+            ("libtorch_cuda.so", "libcublas.so.12", "libcusparse.so.12", "libcudnn.so.9")
+        ):
+            package = f"proof_library_shadow_{index}"
+            structural_native_reds.append(
+                (
+                    "overlay_native_base_library_shadow",
+                    build_wheel(
+                        wheels,
+                        f"proof-library-shadow-{index}",
+                        package,
+                        f"library-shadow-{index}",
+                        owner="custom",
+                        tag="cp312-cp312-manylinux_2_17_x86_64",
+                        root_is_pure=False,
+                        extra_entries={f"{package}/{library}": native_bytes},
+                    ),
+                )
+            )
+        for index, (code, bad_custom) in enumerate(structural_native_reds):
+            try:
+                overlay.materialize(
+                    source(code, family, project, bad_custom),
+                    root / f"red-{code}-{index}",
+                    python=Path(sys.executable),
+                    base_manifest=manifest,
+                )
+            except overlay.OverlayRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"{code} was admitted")
+
+        missing_bytes = compile_shared(
+            root / "native-symbol-build",
+            "proof_symbol",
+            "extern int cozy_symbol_that_does_not_exist(void); "
+            "int proof(void) { return cozy_symbol_that_does_not_exist(); }\n",
+        )
+        missing_path = root / "missing-symbol.so"
+        missing_path.write_bytes(missing_bytes)
+        missing_inspection = native_wheel.inspect_tree(root, (missing_path.name,))
+        try:
+            native_wheel.qualify_host(missing_inspection, gpu_sm=None)
+        except native_wheel.NativeWheelRefusal as exc:
+            assert exc.code == "overlay_native_symbol_unavailable", exc.code
+        else:
+            raise AssertionError("unavailable native symbol was admitted")
+
+        gpu_inspection = native_wheel.Inspection(
+            (
+                native_wheel.ELFMember(
+                    "proof_gpu/_native.so",
+                    "",
+                    (),
+                    (),
+                    (),
+                    (),
+                    (".nv_fatbin",),
+                    (80,),
+                    (),
+                ),
+            )
+        )
+        try:
+            native_wheel.qualify_host(gpu_inspection, gpu_sm=90)
+        except native_wheel.NativeWheelRefusal as exc:
+            assert exc.code == "overlay_native_gpu_unsupported", exc.code
+        else:
+            raise AssertionError("wrong-SM native wheel was admitted")
+
+        with patch("cozy_runtime.internal.native_wheel.shutil.which", return_value=None):
+            try:
+                native_wheel._cuda_images(missing_path)
+            except native_wheel.NativeWheelRefusal as exc:
+                assert exc.code == "overlay_native_gpu_inspector_unavailable", exc.code
+            else:
+                raise AssertionError("CUDA image inspection passed without cuobjdump")
+
         false_marker = build_wheel(
             wheels,
             "proof-false-marker",
@@ -375,6 +615,27 @@ def main() -> int:
             python=Path(sys.executable),
             base_manifest=manifest,
         )
+
+        supervision = child.ExecutorSupervision(
+            root=root / "jit-supervision",
+            python=sys.executable,
+            base_env=(),
+            cozy_home=root / "node-local",
+        )
+        try:
+            assert supervision.use_overlay(
+                str(cold.python), str(cold.import_root), cold.content_digest
+            )
+            jit_env = supervision._prepare_jit_cache()
+            assert set(jit_env) == {name for name, _directory in child_env.JIT_CACHE_ENV}
+            scope = Path(next(iter(jit_env.values()))).parent
+            assert scope.parent == root / "node-local" / "jit-cache"
+            assert scope.name == cold.content_digest.removeprefix("sha256:")
+            assert all(Path(value).parent == scope for value in jit_env.values())
+            assert all(child_env.erased(name) for name in jit_env)
+            assert not any(path.is_file() for path in scope.rglob("*"))
+        finally:
+            supervision.close()
 
         cache_root = root / "acquisition"
         cache = cache_root / "cache"
@@ -441,6 +702,20 @@ def main() -> int:
                     "native_project_wheel_refused": True,
                     "custom_source_build_input_refused": True,
                     "platform_specific_project_wheel_refused": True,
+                    "node_local_jit_cache_scoped": True,
+                    "jit_cache_bytes_unpublished": True,
+                    "prebuilt_native_custom_wheel_admitted": True,
+                    "hostile_rpath_refused": True,
+                    "base_library_shadow_refused": True,
+                    "nvidia_base_library_shadows_refused": True,
+                    "unavailable_native_symbol_refused": True,
+                    "wrong_sm_refused": True,
+                    "missing_cuobjdump_refused": True,
+                    "native_operator_executed": True,
+                    "native_operator_numerical_mismatch_refused": True,
+                    "native_operator_no_kernel_image_refused": True,
+                    "oci_local_same_overlay_path": True,
+                    "realization_fingerprints_separate": True,
                     "base_version_conflict_refused": True,
                 },
                 sort_keys=True,

@@ -122,8 +122,10 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             "compatibility_profile": profile,
             "format": "ResolvedWheelSet/3",
-            "lock_digest": _digest(b"proof-lock"),
+            "overlay_bytes": 0,
             "platform_target": target,
+            "resolution_lock_digest": _digest(b"proof-resolution-lock"),
+            "resolution_lock_length": len(b"proof-resolution-lock"),
             "wheelhouse_manifest_digest": _digest(wheelhouse),
             "wheels": [],
         }

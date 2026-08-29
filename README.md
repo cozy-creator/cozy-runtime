@@ -229,6 +229,36 @@ An overlay contains exactly one project wheel and at most 127 custom wheels. The
 128 total endpoint-owned wheels, counting the project; 128 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
+The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
+`WHEEL` tags, `Root-Is-Purelib`, members, and native magic. A project `.so` or a platform-specific
+project tag refuses. Every dependency wheel remains a separate exact prebuilt subject selected by
+Tensorhub. Runtime accepts no build request and rejects C/C++/CUDA/Rust sources, build manifests,
+headers/objects/static archives, and wheel install schemes that would inject scripts or data. It
+never invokes pip, a resolver, PEP 517, or a compiler.
+
+Ordinary native dependency and custom-extension wheels keep the semantic Python/ABI/platform,
+`abi3`, marker, manylinux-floor, digest, ZIP, RECORD, and ownership checks. Before native bytes are
+published, `internal/native_wheel.py` parses bounded ELF64 metadata and refuses a wrong machine,
+hostile or escaping RPATH/RUNPATH, invalid `DT_NEEDED`, and any bundled library that shadows the
+selected base's Torch, Triton, CUDA, cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSolver, NCCL, or other NVIDIA
+families. CUDA-bearing ELF requires bounded `cuobjdump` cubin/PTX inventory; unavailable tooling is
+a refusal, not an omitted proof. The hardware qualification seat then joins that evidence to the
+actual loader inventory and SM and runs the registered no-argument operator fixture in a separate
+process. Missing libraries/symbols, wrong SM/PTX, `no kernel image`, timeout, oversized output, and
+result-digest mismatch are named refusals. Tensorhub's networkless VM/cgroup remains the isolation
+authority; Runtime additionally applies CPU/address-space/file/descriptor bounds and kills the
+whole fixture process group.
+
+PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation. Runtime
+only scopes their mutable directories under `COZY_HOME/jit-cache/<overlay-content-digest>/`, then
+imposes `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `TORCH_EXTENSIONS_DIR`, and
+`CUDA_CACHE_PATH` before executor import. The content digest already binds the exact
+WheelhouseManifest plus project/custom wheel bytes. Cache bytes stay node-local, never enter an
+overlay receipt/content identity, and are never published as release artifacts. OCI and
+managed-local realizations consume this same overlay path; their distinct realization provenance
+belongs to Tensorhub/Creator qualification evidence, while the portable receipt remains the exact
+WheelhouseManifest/project/custom-wheel join.
+
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control
 convergence lane starts endpoint and model acquisition together. As soon as endpoint overlay and

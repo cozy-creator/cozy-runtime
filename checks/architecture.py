@@ -622,7 +622,7 @@ def fence_base_ownership_vectors() -> list[str]:
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if len(raw) != 23_930 or digest != (
-        "sha256:c01451e80dd43a6b8dae8ecaf265003ffdb93e4dfee8b7da51381f356af34fd8"
+        "sha256:b37eb3300a08f2edf29bb0bd963c898e1ece9fdb08b2998cf9193be65d4dc74d"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -688,26 +688,31 @@ def fence_base_ownership_vectors() -> list[str]:
     index_bytes = (contract_root / "fixture-index.json").read_bytes()
     project_bytes = (contract_root / "project-wheel.json").read_bytes()
     resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
+    resolution_lock_bytes = (contract_root / "resolution-lock.json").read_bytes()
     exact_contract = {
         "endpoint-bundle.json": (
             bundle_bytes,
-            "7ebe5a7100bf3aaaab0c9245fe8684ce14b62875ed67a7e3023f854f747f7771",
+            "1790343eb9007e3aa79c0ed7ec602ac48a395cd7d7d04db927c80b7b81095b17",
         ),
         "endpoint-environment-spec.json": (
             environment_bytes,
-            "fadd98f988d65e667d4a70191460748f5412897cddc18d3516417953449345bc",
+            "c79110115207896b599ee44649cbfc3141edfc6227de5ab88a0e5310402495b0",
         ),
         "fixture-index.json": (
             index_bytes,
-            "54d3fd2b1986520616e1accd284e8056c1ebc616c3f7b7298793bb0eab0f8b98",
+            "4bd060fae82d18da98ba5a97c9ad6c103f71bd74c432df0cbbc58d112ae84179",
         ),
         "project-wheel.json": (
             project_bytes,
             "e374821cce113ced053fe870c067fb2252ad32b649b5539ebb4847bf639aed22",
         ),
+        "resolution-lock.json": (
+            resolution_lock_bytes,
+            "07092a4d5a2896a9a084398477b728b4a094733522e61180d331197e4a422cd1",
+        ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "0ffa18cd2514c0f0fffd753ce5bbb785cb5417f1b73b02df4b90088289c1d162",
+            "072b784337e59f9e551c467ebf1ea8da5a737addd276470aca6aea577769d03c",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
@@ -716,7 +721,9 @@ def fence_base_ownership_vectors() -> list[str]:
             bad.append(f"{contract_root / name}: exact Tensorhub bytes hash to {got_digest}")
     try:
         bundle = canonical.parse_canonical(bundle_bytes)
-        fixture = canonical.parse_canonical(index_bytes)
+        # fixture-index is an exact foreign test manifest, not an execution identity
+        # document. Tensorhub's Go struct order is retained byte-for-byte and is not JCS.
+        fixture = canonical.parse(index_bytes)
         project = canonical.parse_canonical(project_bytes)
         resolved = canonical.parse_canonical(resolved_bytes)
     except canonical.CanonicalError as exc:
@@ -1037,6 +1044,10 @@ DOCUMENT_KINDS = {
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
     "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
     "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
+    "cozy.runtime.NativeOperatorObservation/1": "internal/native_wheel.py",
+    "cozy.runtime.NativeWheelProofRequest/1": "cli/native_wheel_proof.py",
+    "cozy.runtime.NativeWheelQualification/1": "cli/native_wheel_proof.py",
+    "cozy.runtime.NativeWheelInspection/1": "internal/native_wheel.py",
     "cozy.runtime.plan-fact/1": "internal/planfacts.py",
     "cozy.runtime.probe/1": "internal/probe.py",
     "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",

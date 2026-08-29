@@ -383,8 +383,10 @@ def _release(
         {
             "compatibility_profile": profile,
             "format": resolved_format,
-            "lock_digest": _digest(b"proof-lock"),
+            "overlay_bytes": sum(wheel.length for wheel in resolved_wheels),
             "platform_target": dict(target),
+            "resolution_lock_digest": _digest(b"proof-resolution-lock"),
+            "resolution_lock_length": len(b"proof-resolution-lock"),
             "wheelhouse_manifest_digest": _digest(wheelhouse),
             "wheels": resolved_rows,
         }

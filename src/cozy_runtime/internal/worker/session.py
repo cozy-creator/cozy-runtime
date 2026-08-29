@@ -1803,7 +1803,7 @@ class Worker:
             return
         if installed is not None:
             changed = self.supervision.use_overlay(
-                str(installed.python), str(installed.import_root)
+                str(installed.python), str(installed.import_root), installed.content_digest
             )
             if changed and self.supervision.current is not None:
                 self.supervision.current.poisoned = "endpoint overlay generation changed"
@@ -1977,7 +1977,11 @@ class Worker:
                     # available only from a standing start.
                     if self.supervision.current is not None:
                         return
-                    self.supervision.use_overlay(str(installed.python), str(installed.import_root))
+                    self.supervision.use_overlay(
+                        str(installed.python),
+                        str(installed.import_root),
+                        installed.content_digest,
+                    )
                     try:
                         executor = self.supervision.spawn(imposed=self.imposed())
                     except ExecutorGone as exc:

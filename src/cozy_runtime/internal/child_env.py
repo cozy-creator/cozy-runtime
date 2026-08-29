@@ -46,7 +46,10 @@ ERASED_PREFIXES: tuple[str, ...] = (
     "COZY_",
     "CUDA_",
     "PYTORCH_",
+    "PYTHON",
     "TORCH_",
+    "TORCHINDUCTOR_",
+    "TRITON_",
     "NCCL_",
     "HF_",
     "HUGGINGFACE_",
@@ -61,6 +64,12 @@ ERASED_PREFIXES: tuple[str, ...] = (
 #: authority's reader must spell it identically and this is the table both read.
 FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
 EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
+JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
+    ("CUDA_CACHE_PATH", "cuda"),
+    ("TORCH_EXTENSIONS_DIR", "extensions"),
+    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+    ("TRITON_CACHE_DIR", "triton"),
+)
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here. Class-B impose vocabulary
@@ -87,6 +96,15 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "accel.MPS_CHILD_ENV_LAW",
         "FORCED to 0 on MPS executors (#450): the fallback silently runs unsupported "
         "operations on CPU, which violates the CPU-refusal law",
+    ),
+    *(
+        ProjectedVar(
+            name,
+            "worker.endpoint_content_digest",
+            "upstream PyTorch/Triton/CUDA owns cache keys and validation; Cozy only scopes "
+            "the mutable cache to one node-local exact base-plus-overlay content identity",
+        )
+        for name, _directory in JIT_CACHE_ENV
     ),
     ProjectedVar(
         "COZY_HOME",

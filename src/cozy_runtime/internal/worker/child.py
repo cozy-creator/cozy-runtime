@@ -24,6 +24,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -34,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel, proctree, spawn
+from cozy_runtime.internal import accel, jit_cache, proctree, spawn
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
@@ -242,6 +243,8 @@ class ExecutorSupervision:
         self.python = python
         self.overlay = ""
         """The endpoint-only import root appended after image-owned packages."""
+        self.jit_cache = ""
+        """Node-local mutable upstream compiler cache, scoped by exact overlay content."""
         self.base_env = base_env
         self.cozy_home = cozy_home
         self.executor_uid = executor_uid
@@ -612,14 +615,33 @@ class ExecutorSupervision:
                 )
             return self._spawn_locked(imposed=imposed)
 
-    def use_overlay(self, python: str, overlay: str) -> bool:
-        """Point the executor at the image interpreter plus one endpoint import root."""
+    def use_overlay(self, python: str, overlay: str, content_digest: str) -> bool:
+        """Point the executor at one base interpreter, overlay, and node-local JIT scope."""
 
-        if (self.python, self.overlay) == (python, overlay):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
+            raise ExecutorGone(f"invalid endpoint content digest for JIT cache: {content_digest!r}")
+        jit_cache = str(self.cozy_home / "jit-cache" / content_digest.removeprefix("sha256:"))
+        if (self.python, self.overlay, self.jit_cache) == (python, overlay, jit_cache):
             return False
         self.python = python
         self.overlay = overlay
+        self.jit_cache = jit_cache
         return True
+
+    def _prepare_jit_cache(self) -> dict[str, str]:
+        """Create one endpoint/base-scoped mutable cache without publishing its bytes."""
+
+        if not self.jit_cache:
+            return {}
+        try:
+            return jit_cache.prepare(
+                self.cozy_home,
+                "sha256:" + Path(self.jit_cache).name,
+                uid=self.executor_uid,
+                gid=self.executor_gid,
+            )
+        except jit_cache.JITCacheRefusal as exc:
+            raise ExecutorGone(str(exc)) from exc
 
     def _spawn_locked(self, *, imposed: dict[str, str]) -> Executor:
         """Spawn while `_lifecycle` is held; publish only after a verified hello."""
@@ -649,6 +671,7 @@ class ExecutorSupervision:
         self.spawns += 1
         imposed = {
             **imposed,
+            **self._prepare_jit_cache(),
             # Backend-mandated laws come from the accelerator boundary (#450): on MPS this
             # forces PYTORCH_ENABLE_MPS_FALLBACK=0; on CUDA it is empty. The FAMILY is a
             # cheap platform fact (present-but-unqualified, #446).
