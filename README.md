@@ -57,6 +57,13 @@ then opens Claim admission. Package executors alone drop to UID/GID 65533. The r
 wrapper executable has no compatibility alias; placement acquisition now lives in
 `internal/placement_materialization.py`.
 
+The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record containing the rental's
+Ed25519 control public key and the media bearer's sorted hashes. Claim and `EnsureArtifacts`
+signatures open only WorkerControl; media hashes open only media HTTP. Neither reaches an
+executor. Runtime redeems package/model intent at the code-owned
+`https://worker.tensorhub.com/v1/worker/artifacts/resolve` authority with its existing per-boot
+TLS leaf, then downloads the returned exact R2 plan directly.
+
 | module | role |
 |---|---|
 | `internal/worker/session.py` | the protocol client and the worker entrypoint |
@@ -64,6 +71,7 @@ wrapper executable has no compatibility alias; placement acquisition now lives i
 | `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
 | `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
+| `internal/worker/artifact_access.py` | canonical Claim/delegation verification and direct Tensorhub mTLS resolve |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
 | `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
@@ -281,13 +289,15 @@ belongs to Tensorhub/Creator qualification evidence, while the portable receipt 
 WheelhouseManifest/project/custom-wheel join.
 
 On a remote placement, `PlacementSpec/2` names one exact
-`model_object_set` subject. The standing grant supplies access only. The non-control
+`model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
+exact digest/length/HTTPS locations directly from Tensorhub over mTLS. The non-control
 convergence lane starts package and model acquisition together. As soon as package overlay and
 binding documents are admitted from a standing start, Runtime spawns the executor so interpreter
 and Torch import overlap continued TensorFS hydration; model preparation/fill still waits for the
 exact model closure. READY remains the join of overlay, TensorFS closure, binding resolution and
-device construction. An outgoing placement is never disturbed by this optimization, and a grant
-refresh re-drives the same accepted revision without changing its identity.
+device construction. An outgoing placement is never disturbed by this optimization. Same-revision
+delegation renewal changes only access; verified complete objects survive and only missing objects
+move after renewal.
 
 `PlacementStatus.acquisition` exposes that work as observation only. It retains
 package/model start and end values from one process-monotonic clock plus cumulative

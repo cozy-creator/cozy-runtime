@@ -16,6 +16,8 @@ a credential value or a path. Behaviour switches are flags, parsed by the CLI, n
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -73,20 +75,7 @@ class RuntimeConfig:
     the device child (it is stripped from `child_base_env` below: the executor has no
     business holding the control plane's credential).
 
-    This is the SELF-SPAWNED launch mode: the launcher minted the credential, so it knows
-    it. A RENTED pod is the other mode — see `access_token_hashes`."""
-    access_token_hashes: str = ""
-    """The RENTED-POD launch mode (#495e/#560g): the sha256 hash SET a Claim's `proof` is
-    verified against, or the path of the file that holds it, in the format cozy-media
-    already reads (`sha256:<64 hex>`, one per line or comma-separated).
-
-    NOT a secret and that is the whole point: whoever launched this worker holds only
-    hashes, so it can provision a pod it can never authenticate to. The renter minted the
-    token and nobody else was ever told it. A path is re-read per claim, so a rotation of
-    the set converges on the control plane the way it already converges on the byte plane.
-
-    Mutually exclusive with `bootstrap_credential`: two credential authorities over one
-    door is an ambiguity, not a fallback, and it refuses here."""
+    Fixed private-rental workers use `record_owner_public_key` instead."""
     child_base_env: tuple[tuple[str, str], ...] = ()
     """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal;
     class B of tracker-v2/spawn-allowlists.md #616.d).
@@ -103,6 +92,12 @@ class RuntimeConfig:
     with no directory configured executes the identical code path. Read ONCE here with the
     rest of the config and projected across the executor seal by the worker."""
 
+    record_owner_public_key: bytes = b""
+    """Raw Ed25519 key that verifies private-rental artifact delegations.
+
+    Empty on local/public workers. It never enters an executor environment.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
@@ -110,13 +105,15 @@ class WorkerHostConfig:
 
     Paths are image-contract constants from ``runtime-worker-host-paths.json`` rather than
     environment configuration. The readiness HMAC remains supervisor-only. Desired placements,
-    grants and attempts arrive after Claim over WorkerControl.
+    signed artifact intent, and attempts arrive after Claim over WorkerControl.
     """
 
     worker_id: str
     worker_internal_port: int
     media_internal_port: int
-    record_owner_token_sha256: tuple[str, ...]
+    control_public_key_ed25519: bytes
+    control_public_key_ed25519_b64url: str
+    media_token_sha256: tuple[str, ...]
     lease_expiry_unix: int
     child_base_env: tuple[tuple[str, str], ...]
 
@@ -127,7 +124,7 @@ WORKER_HOST_ENV = {
     "COZY_WORKER_ID",
     "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WORKER_LEASE_EXPIRY_UNIX",
-    "COZY_RECORD_OWNER_TOKEN_SHA256_JSON",
+    "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_WORKER_INTERNAL_PORT",
 }
 
@@ -163,6 +160,7 @@ _read: bool = False
 _worker_host_read: bool = False
 
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
+_ED25519_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -195,26 +193,11 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         )
     creds = Credentials(**{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV})
     bootstrap = env.get("COZY_BOOTSTRAP_CREDENTIAL", "").strip()
-    hashes = env.get("COZY_ACCESS_TOKEN_SHA256", "").strip()
-    if bootstrap and hashes:
-        # TWO AUTHORITIES OVER ONE DOOR (#560g). These are the two launch modes, not a
-        # value and its fallback: a self-spawned worker's launcher MINTED the credential
-        # and a rented pod's launcher only ever held hashes of one it will never see.
-        # A worker handed both cannot say which authority its owner is, and a worker that
-        # cannot say that must not open the door — so this refuses before anything binds.
-        raise ConfigError(
-            "config",
-            "COZY_BOOTSTRAP_CREDENTIAL and COZY_ACCESS_TOKEN_SHA256 are both set",
-            "set exactly one: COZY_BOOTSTRAP_CREDENTIAL for a worker whose launcher minted "
-            "its credential, or COZY_ACCESS_TOKEN_SHA256 for a rented pod whose renter did "
-            "(#495e — the two are launch modes, not a value and a fallback)",
-        )
     _read = True
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
         bootstrap_credential=bootstrap,
-        access_token_hashes=hashes,
         child_base_env=tuple(
             sorted(
                 (k, v)
@@ -286,20 +269,46 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         return value
 
     try:
-        token_hashes = json.loads(required("COZY_RECORD_OWNER_TOKEN_SHA256_JSON"))
+        record_owner_auth = json.loads(required("COZY_RECORD_OWNER_AUTH_JSON"))
     except json.JSONDecodeError as exc:
         raise ConfigError(
-            "worker_host_config", "RecordOwner token hashes are not JSON", "fix host launch"
+            "worker_host_config", "RecordOwner auth is not JSON", "fix host launch"
+        ) from exc
+    if not isinstance(record_owner_auth, dict) or set(record_owner_auth) != {
+        "control_public_key_ed25519_b64url",
+        "media_token_sha256",
+    }:
+        raise ConfigError(
+            "worker_host_config",
+            "RecordOwner auth is not the closed control-key/media-hash record",
+            "fix host launch",
+        )
+    public_key_text = record_owner_auth.get("control_public_key_ed25519_b64url")
+    token_hashes = record_owner_auth.get("media_token_sha256")
+    try:
+        public_key = base64.b64decode(
+            str(public_key_text) + "=" * ((-len(str(public_key_text))) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise ConfigError(
+            "worker_host_config",
+            "RecordOwner control public key is not unpadded base64url",
+            "fix host launch",
         ) from exc
     if (
-        not isinstance(token_hashes, list)
+        not isinstance(public_key_text, str)
+        or _ED25519_KEY.fullmatch(public_key_text) is None
+        or len(public_key) != 32
+        or not isinstance(token_hashes, list)
         or not 1 <= len(token_hashes) <= 16
         or not all(isinstance(item, str) and _TOKEN_HASH.fullmatch(item) for item in token_hashes)
         or token_hashes != sorted(set(token_hashes))
     ):
         raise ConfigError(
             "worker_host_config",
-            "RecordOwner token hashes are not a non-empty bounded sorted unique set",
+            "RecordOwner auth key or media hashes are invalid",
             "fix host launch",
         )
     worker_port = decimal("COZY_WORKER_INTERNAL_PORT", 65535)
@@ -312,7 +321,9 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         worker_id=bounded("COZY_WORKER_ID"),
         worker_internal_port=worker_port,
         media_internal_port=media_port,
-        record_owner_token_sha256=tuple(str(item) for item in token_hashes),
+        control_public_key_ed25519=public_key,
+        control_public_key_ed25519_b64url=public_key_text,
+        media_token_sha256=tuple(str(item) for item in token_hashes),
         lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
         child_base_env=tuple(
             sorted(
@@ -330,6 +341,6 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
     return RuntimeConfig(
         cozy_home=Path("/run/cozy"),
         credentials=Credentials(),
-        access_token_hashes=",".join("sha256:" + value for value in host.record_owner_token_sha256),
+        record_owner_public_key=host.control_public_key_ed25519,
         child_base_env=host.child_base_env,
     )

@@ -126,7 +126,6 @@ class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FAULT_KIND_BINDING_DEGRADED: _ClassVar[FaultKind]
     FAULT_KIND_HARDWARE_UNSUITABLE: _ClassVar[FaultKind]
     FAULT_KIND_ARTIFACT_FETCH_FAILED: _ClassVar[FaultKind]
-    FAULT_KIND_GRANT_EXPIRED: _ClassVar[FaultKind]
     FAULT_KIND_CREDENTIAL_UNAPPLIED: _ClassVar[FaultKind]
     FAULT_KIND_LOCAL_SAFETY_REFUSAL: _ClassVar[FaultKind]
     FAULT_KIND_EXECUTOR_POISONED: _ClassVar[FaultKind]
@@ -137,6 +136,7 @@ class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_FALLBACK_PIN_MISSING: _ClassVar[FaultKind]
+    FAULT_KIND_AUTHORIZATION_EXPIRED: _ClassVar[FaultKind]
 
 class BootFailureReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -258,7 +258,6 @@ FAULT_KIND_BINDING_UNAVAILABLE: FaultKind
 FAULT_KIND_BINDING_DEGRADED: FaultKind
 FAULT_KIND_HARDWARE_UNSUITABLE: FaultKind
 FAULT_KIND_ARTIFACT_FETCH_FAILED: FaultKind
-FAULT_KIND_GRANT_EXPIRED: FaultKind
 FAULT_KIND_CREDENTIAL_UNAPPLIED: FaultKind
 FAULT_KIND_LOCAL_SAFETY_REFUSAL: FaultKind
 FAULT_KIND_EXECUTOR_POISONED: FaultKind
@@ -269,6 +268,7 @@ FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH: FaultKind
 FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: FaultKind
 FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: FaultKind
 FAULT_KIND_FALLBACK_PIN_MISSING: FaultKind
+FAULT_KIND_AUTHORIZATION_EXPIRED: FaultKind
 BOOT_FAILURE_REASON_UNSPECIFIED: BootFailureReason
 BOOT_FAILURE_REASON_HARDWARE_VERDICT: BootFailureReason
 BOOT_FAILURE_REASON_ARTIFACT_FAULT: BootFailureReason
@@ -296,7 +296,7 @@ ARTIFACT_FINALIZE_OUTCOME_ADOPTED: ArtifactFinalizeOutcome
 ARTIFACT_FINALIZE_OUTCOME_ABANDONED: ArtifactFinalizeOutcome
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_grant_update", "artifact_finalize_request")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request", "ensure_artifacts")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -304,8 +304,8 @@ class RecordOwnerFrame(_message.Message):
     OUTCOME_ACK_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_ACK_FIELD_NUMBER: _ClassVar[int]
-    ARTIFACT_GRANT_UPDATE_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_FINALIZE_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    ENSURE_ARTIFACTS_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -313,9 +313,9 @@ class RecordOwnerFrame(_message.Message):
     outcome_ack: AttemptOutcomeAck
     checkpoint_receipt: JobCheckpointReceipt
     snapshot_ack: SnapshotAck
-    artifact_grant_update: ArtifactGrantUpdate
     artifact_finalize_request: ArtifactFinalizeRequest
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_grant_update: _Optional[_Union[ArtifactGrantUpdate, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ...) -> None: ...
+    ensure_artifacts: EnsureArtifacts
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ..., ensure_artifacts: _Optional[_Union[EnsureArtifacts, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
     __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result")
@@ -356,6 +356,18 @@ class Claim(_message.Message):
     wire_minor: int
     proof: bytes
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., proof: _Optional[bytes] = ...) -> None: ...
+
+class ClaimProof(_message.Message):
+    __slots__ = ("record_owner_epoch", "worker_boot_id", "worker_id", "worker_tls_certificate_digest")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    worker_boot_id: str
+    worker_id: str
+    worker_tls_certificate_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
 
 class ClaimAck(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "accepted", "rejection", "wire_minor", "worker_id", "worker_instance_id", "worker_release_id", "control_runtime_digest", "git_commit", "resources")
@@ -577,43 +589,41 @@ class PlatformTarget(_message.Message):
     accelerator_abi: str
     def __init__(self, os_arch: _Optional[str] = ..., libc: _Optional[str] = ..., python_abi: _Optional[str] = ..., accelerator_backend: _Optional[str] = ..., accelerator_abi: _Optional[str] = ...) -> None: ...
 
-class ArtifactGrantUpdate(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "grant_revision", "grant")
+class EnsureArtifacts(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "delegation_canonical_bytes", "creator_signature")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
-    GRANT_REVISION_FIELD_NUMBER: _ClassVar[int]
-    GRANT_FIELD_NUMBER: _ClassVar[int]
+    DELEGATION_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CREATOR_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
-    grant_revision: int
-    grant: ArtifactGrant
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., grant: _Optional[_Union[ArtifactGrant, _Mapping]] = ...) -> None: ...
+    delegation_canonical_bytes: bytes
+    creator_signature: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., delegation_canonical_bytes: _Optional[bytes] = ..., creator_signature: _Optional[bytes] = ...) -> None: ...
 
-class ArtifactGrant(_message.Message):
-    __slots__ = ("grant_id", "subjects", "credential", "base_url", "expires_at_unix", "locations")
-    GRANT_ID_FIELD_NUMBER: _ClassVar[int]
-    SUBJECTS_FIELD_NUMBER: _ClassVar[int]
-    CREDENTIAL_FIELD_NUMBER: _ClassVar[int]
-    BASE_URL_FIELD_NUMBER: _ClassVar[int]
+class ArtifactDelegation(_message.Message):
+    __slots__ = ("rental_id", "worker_id", "worker_boot_id", "worker_tls_certificate_digest", "revision", "package_release_ids", "model_checkpoint_ids", "delegation_id", "expires_at_unix")
+    RENTAL_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_RELEASE_IDS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_CHECKPOINT_IDS_FIELD_NUMBER: _ClassVar[int]
+    DELEGATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
-    LOCATIONS_FIELD_NUMBER: _ClassVar[int]
-    grant_id: str
-    subjects: _containers.RepeatedCompositeFieldContainer[ArtifactSubject]
-    credential: DeliveryAccessCredential
-    base_url: str
+    rental_id: str
+    worker_id: str
+    worker_boot_id: str
+    worker_tls_certificate_digest: bytes
+    revision: int
+    package_release_ids: _containers.RepeatedScalarFieldContainer[str]
+    model_checkpoint_ids: _containers.RepeatedScalarFieldContainer[str]
+    delegation_id: str
     expires_at_unix: int
-    locations: _containers.RepeatedCompositeFieldContainer[ArtifactLocation]
-    def __init__(self, grant_id: _Optional[str] = ..., subjects: _Optional[_Iterable[_Union[ArtifactSubject, _Mapping]]] = ..., credential: _Optional[_Union[DeliveryAccessCredential, _Mapping]] = ..., base_url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., locations: _Optional[_Iterable[_Union[ArtifactLocation, _Mapping]]] = ...) -> None: ...
-
-class ArtifactLocation(_message.Message):
-    __slots__ = ("digest", "url")
-    DIGEST_FIELD_NUMBER: _ClassVar[int]
-    URL_FIELD_NUMBER: _ClassVar[int]
-    digest: bytes
-    url: str
-    def __init__(self, digest: _Optional[bytes] = ..., url: _Optional[str] = ...) -> None: ...
+    def __init__(self, rental_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ..., revision: _Optional[int] = ..., package_release_ids: _Optional[_Iterable[str]] = ..., model_checkpoint_ids: _Optional[_Iterable[str]] = ..., delegation_id: _Optional[str] = ..., expires_at_unix: _Optional[int] = ...) -> None: ...
 
 class JobDirective(_message.Message):
     __slots__ = ("build_id", "job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count")
@@ -632,7 +642,7 @@ class JobDirective(_message.Message):
     def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ...) -> None: ...
 
 class ObservedWorkerState(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_generation", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase", "applied_artifact_grant_id", "applied_grant_revision")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_generation", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase", "artifact_intent")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -649,8 +659,7 @@ class ObservedWorkerState(_message.Message):
     ACCEPTED_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CONVERGED_REVISION_FIELD_NUMBER: _ClassVar[int]
     WORKER_PHASE_FIELD_NUMBER: _ClassVar[int]
-    APPLIED_ARTIFACT_GRANT_ID_FIELD_NUMBER: _ClassVar[int]
-    APPLIED_GRANT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_INTENT_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -667,9 +676,18 @@ class ObservedWorkerState(_message.Message):
     accepted_placement_set_digest: bytes
     converged_revision: int
     worker_phase: WorkerPhase
-    applied_artifact_grant_id: str
-    applied_grant_revision: int
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_generation: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., applied_artifact_grant_id: _Optional[str] = ..., applied_grant_revision: _Optional[int] = ...) -> None: ...
+    artifact_intent: ArtifactIntentStatus
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_generation: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., artifact_intent: _Optional[_Union[ArtifactIntentStatus, _Mapping]] = ...) -> None: ...
+
+class ArtifactIntentStatus(_message.Message):
+    __slots__ = ("revision", "delegation_id", "authorization_expires_at_unix")
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    DELEGATION_ID_FIELD_NUMBER: _ClassVar[int]
+    AUTHORIZATION_EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
+    revision: int
+    delegation_id: str
+    authorization_expires_at_unix: int
+    def __init__(self, revision: _Optional[int] = ..., delegation_id: _Optional[str] = ..., authorization_expires_at_unix: _Optional[int] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
     __slots__ = ("placement_id", "executor_generation", "dispatchable_plan_ids", "materializable_plan_ids", "faults", "accelerator", "placement_spec_digest", "materialization", "serving", "retained_fallback_spec_digest", "acquisition")

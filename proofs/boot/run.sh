@@ -35,4 +35,5 @@ nice -n 19 docker build --quiet -t "$image" "$proof_root/context" >/dev/null
 # network at all. Bind-mounting the host's /sys/fs/cgroup would have handed the proof the
 # host root instead, which is why it is not what this does.
 nice -n 19 docker run --rm --name "$container" --network none \
+    --add-host worker.tensorhub.com:127.0.0.1 \
     --cgroupns=private --privileged "$image"

@@ -62,7 +62,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import acquire, child, grants, observe, triage
+from cozy_runtime.internal.worker import acquire, artifact_access, child, grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -167,6 +167,8 @@ class WorkerOptions:
     root: Path
     worker_id: str = "wrk-local"
     instance_id: str = ""
+    worker_boot_id: str = ""
+    """Externally provisioned boot id for fixed pods; local workers mint one in-process."""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
     #: The defaults used to name a real SDXL release and a `sha256:00…00` artifact, which rode
     #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
@@ -203,6 +205,8 @@ class WorkerOptions:
     makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
+    artifact_client: artifact_access.ArtifactClient | None = None
+    worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
@@ -434,132 +438,6 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
 HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
-class AccessTokenError(Exception):
-    """A malformed COZY_ACCESS_TOKEN_SHA256 value, refused before anything binds."""
-
-
-class AccessTokenSet:
-    """The RENTED-POD claim credential (#495e/#560g): a set of sha256 hashes a Claim's
-    `proof` is checked against by hashing it.
-
-    The inversion is the whole design. A launcher that holds only hashes can provision a
-    pod and can never authenticate to it — the renter minted the token and told nobody,
-    so the hash the hub holds is not a credential and presenting it proves nothing. That
-    is why this class only ever hashes what it was shown and never renders what it holds.
-
-    Two value shapes, told apart by the value itself rather than by a flag:
-
-      * `sha256:<hex>` entries (comma- or newline-separated) — the LITERAL set, frozen at
-        launch. This is what a provider's create body carries into a pod's environment.
-      * anything else — a PATH to a file of those same entries, re-stat'd on every claim.
-        Rotation is only real if it CONVERGES (#560d), and an environment variable cannot
-        rotate: a hash added after launch admits nobody and a hash removed after launch
-        revokes nothing. A provisioner that intends to rotate delivers the path.
-
-    Everything about the path form is FAIL-CLOSED, exactly as cozy-media's reader is: an
-    unreadable file, a file holding no usable entry, or an mtime that moved BACKWARD
-    leaves the loaded set in place and admits nobody until it reads clean again.
-    """
-
-    def __init__(self, entries: tuple[str, ...] = (), path: Path | None = None) -> None:
-        self.path = path
-        self.entries = entries
-        self.size = -1
-        self.stamp = -1.0
-        self.lock = threading.Lock()
-        self.unreadable = ""
-
-    @classmethod
-    def parse(cls, value: str) -> AccessTokenSet | None:
-        """Build the set from the configured VALUE, or None when there is none."""
-        raw = value.strip()
-        if not raw:
-            return None
-        parts = [p.strip() for p in raw.replace(",", "\n").splitlines() if p.strip()]
-        literal = [p for p in parts if p.startswith("sha256:")]
-        if literal:
-            bad = [p for p in literal if not HASH_ENTRY.match(p)]
-            if bad or len(literal) != len(parts):
-                raise AccessTokenError(
-                    "COZY_ACCESS_TOKEN_SHA256 mixes hash entries with something that is not "
-                    "one; every entry must be `sha256:<64 lowercase hex>`, or the whole "
-                    "value must be a single path to a file of them"
-                )
-            return cls(entries=tuple(literal))
-        if len(parts) != 1:
-            raise AccessTokenError(
-                "COZY_ACCESS_TOKEN_SHA256 holds several entries and none is a "
-                "`sha256:<64 lowercase hex>` hash, so it is neither a hash set nor a path"
-            )
-        return cls(path=Path(parts[0]))
-
-    def reload(self) -> None:
-        """Re-read the hash file iff its (size, mtime) MOVED, refusing a move backward."""
-        if self.path is None:
-            return
-        try:
-            info = self.path.stat()
-        except OSError as err:
-            self.unreadable = f"{self.path} cannot be read: {err}"
-            self.entries = ()
-            return
-        with self.lock:
-            same = info.st_size == self.size and info.st_mtime == self.stamp
-            older = self.stamp >= 0 and info.st_mtime < self.stamp
-        if same:
-            return
-        if older:
-            # The credential epoch is monotone. A file that went backward is a restore
-            # or a clock, and either way it is not the rotation this worker last saw.
-            self.unreadable = f"{self.path} has an mtime older than the loaded set"
-            self.entries = ()
-            return
-        try:
-            text = self.path.read_text()
-        except OSError as err:
-            self.unreadable = f"{self.path} cannot be read: {err}"
-            self.entries = ()
-            return
-        found = tuple(
-            line.strip()
-            for line in text.replace(",", "\n").splitlines()
-            if HASH_ENTRY.match(line.strip())
-        )
-        if not found:
-            self.unreadable = f"{self.path} holds no `sha256:<64 hex>` entry"
-            self.entries = ()
-            return
-        with self.lock:
-            self.entries, self.size, self.stamp = found, info.st_size, info.st_mtime
-        self.unreadable = ""
-
-    def admits(self, presented: bytes) -> bool:
-        """Hash what was presented and compare it into the live set, constant-time.
-
-        One-directional on purpose: this answers whether a token is one of ours and can
-        never produce one. The hub-side hash presented AS the proof therefore refuses —
-        it is a hash, not a preimage, and `sha256("sha256:…")` is not in any set.
-        """
-        self.reload()
-        with self.lock:
-            entries = self.entries
-        digest = "sha256:" + hashlib.sha256(presented).hexdigest()
-        admitted = False
-        for entry in entries:
-            if hmac.compare_digest(digest, entry):
-                admitted = True
-        return admitted
-
-    def why_not(self) -> str:
-        """The refusal's cause, naming the unreadable set without rendering any of it."""
-        if self.unreadable:
-            return (
-                "this worker cannot read its own token-hash set, so it admits nobody: "
-                + self.unreadable
-            )
-        return "the presented proof is not a token this worker was provisioned with"
-
-
 class Worker:
     """The no-CUDA control parent — the machine's WORKER process (#455/#484; the name
     `Supervisor` is retired everywhere, and "supervision" survives only as the verb for its
@@ -575,7 +453,9 @@ class Worker:
             # Set before any package child exists and before the worker starts serving.
             # The uid split closes ordinary ptrace; non-dumpable is the explicit second belt.
             proctree.deny_process_inspection()
-        self.fence = OwnershipFence(worker_boot_id=f"boot-{uuid.uuid4().hex[:20]}")
+        self.fence = OwnershipFence(
+            worker_boot_id=options.worker_boot_id or f"boot-{uuid.uuid4().hex[:20]}"
+        )
         self.accepted = AcceptedDesiredState()
         #: The non-attempt narration lane. In NEITHER fence half (#484): it is neither an
         #: authority fact nor accepted intent, it is what this worker has been doing.
@@ -689,18 +569,13 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
-        #: The OTHER launch mode (#560g): a rented pod, whose launcher was given the hash
-        #: SET of a token the RENTER minted and that the launcher will never see. Config
-        #: already refused a worker handed both, so at most one of these is live.
-        self.access = AccessTokenSet.parse(config.access_token_hashes)
-        #: The standing ACQUISITION authority this worker last accepted (§3). Echoed on
-        #: every ObservedWorkerState so grant landing is observable with no ack lane.
-        self.grant_id = ""
-        self.grant_revision = 0
-        #: The STANDING acquisition authority (rev-2 §3). Empty until a grant lands; a
-        #: placement that reaches artifacts this worker does not hold then reports a typed
-        #: fault instead of fetching from nowhere.
-        self.grant = acquire.StandingGrant()
+        self.artifact_intent: artifact_access.ArtifactIntent | None = None
+        self.artifact_plan = artifact_access.ArtifactPlan()
+        self.artifact_resolutions: queue.Queue[artifact_access.ArtifactIntent | None] = (
+            queue.Queue()
+        )
+        self.resolved_package_ids: set[str] = set()
+        self.resolved_model_ids: set[str] = set()
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
@@ -1059,10 +934,19 @@ class Worker:
         # token, so neither does whoever provisioned it — and a self-spawned worker
         # compares against the credential its own launcher minted. Both are constant-time
         # and neither ever renders what it holds into a refusal.
-        if self.access is not None:
-            if not self.access.admits(claim.proof):
+        if self.config.record_owner_public_key:
+            try:
+                artifact_access.verify_claim_proof(
+                    claim,
+                    self.config.record_owner_public_key,
+                    worker_id=self.options.worker_id,
+                    worker_boot_id=self.fence.worker_boot_id,
+                    worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+                )
+            except artifact_access.ArtifactAccessRefusal as exc:
                 return reject(
-                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED, self.access.why_not()
+                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+                    exc.detail,
                 )
         elif self.bootstrap and not hmac.compare_digest(
             claim.proof.decode(errors="replace"), self.bootstrap
@@ -1383,8 +1267,8 @@ class Worker:
                     )
                 )
             return
-        if kind == "artifact_grant_update":
-            self.apply_artifact_grant(inner)
+        if kind == "ensure_artifacts":
+            self.apply_artifact_intent(inner)
             return
         if not self.fence.dispatch_open:
             self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
@@ -1406,71 +1290,67 @@ class Worker:
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
 
-    def apply_artifact_grant(self, update: pb.ArtifactGrantUpdate) -> None:
-        """Standing, refreshable ACQUISITION authority, on its OWN lane (§3, #480a).
+    def apply_artifact_intent(self, update: pb.EnsureArtifacts) -> None:
+        """Verify one signed logical set and queue direct Tensorhub redemption."""
 
-        REFRESHING ACCESS NEVER CHANGES IDENTITY. This handler touches no revision, no set
-        digest and no convergence fact — there is no field a refresh could substitute a
-        placement identity into, because the identities live in the set document, which a
-        grant cannot reach. `grant_revision` is monotonic: older is ignored, equal is
-        idempotent.
-
-        A grant MAY PRECEDE its set. Subjects not named by any desired spec are INERT, never
-        a refusal — pre-authorizing an incoming release is the normal rollout order.
-
-        WHAT THIS WORKER DOES WITH IT (cr-049): it records the standing authority, reports
-        it back on `applied_artifact_grant_id` / `applied_grant_revision` so grant landing is
-        observable without an ack lane, and then RE-DRIVES CONVERGENCE if the accepted set is
-        not yet converged. Convergence is a LEVEL, not a transaction (§1): a placement parked
-        at `MATERIALIZING` with `FAULT_KIND_GRANT_EXPIRED` is exactly the case a refresh
-        exists to clear, and it must clear without a new desired revision.
-
-        It still does not reinterpret opaque subjects as an inventory, and it never has to:
-        `worker/acquire.py` starts at the digests the desired spec NAMES and reaches every
-        other digest from a document it has already fetched and verified. The grant answers
-        only "may I, and from where".
-        """
-        if update.grant_revision < self.grant_revision:
-            self.note("grant", f"grant revision {update.grant_revision} ignored (older)")
+        if (
+            not self.config.record_owner_public_key
+            or self.options.artifact_client is None
+            or not self.options.worker_tls_certificate_digest
+        ):
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=self.options.worker_id,
+                    reason="artifact_delegation_unavailable",
+                    detail="this worker has no rental key or direct Tensorhub mTLS client",
+                )
+            )
             return
-        idempotent = update.grant_revision == self.grant_revision and self.grant_revision > 0
         try:
-            self.grant = acquire.StandingGrant.read(update)
-        except acquire.AcquisitionRefusal as exc:
-            self.note("grant", f"grant revision {update.grant_revision} REFUSED: {exc.code}")
+            intent = artifact_access.read_intent(
+                update,
+                self.config.record_owner_public_key,
+                worker_id=self.options.worker_id,
+                worker_boot_id=self.fence.worker_boot_id,
+                worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+            )
+        except artifact_access.ArtifactAccessRefusal as exc:
+            self.note("artifacts", f"delegation REFUSED: {exc.code}")
             self.engine.fault(
                 pb.Fault(
                     kind=exc.kind,
-                    subject=update.grant.grant_id or "(unnamed grant)",
+                    subject=self.options.worker_id,
                     reason=exc.code,
                     detail=safe(exc.detail),
                 )
             )
             return
-        self.grant_revision = update.grant_revision
-        self.grant_id = update.grant.grant_id
-        self.note(
-            "grant",
-            f"acquisition authority {update.grant.grant_id or '(unnamed)'} at revision "
-            f"{update.grant_revision}: {len(self.grant.subjects)} authorized subject(s), "
-            f"{len(self.grant.locations)} location(s), expiring {self.grant.expires_at_unix}",
-        )
-        revision = self.accepted.accepted_desired_state_revision
-        candidate = self.pending or self.placement
+        prior = self.artifact_intent
+        if prior is not None and intent.revision < prior.revision:
+            self.note("artifacts", f"revision {intent.revision} ignored (older)")
+            return
         if (
-            not idempotent
-            and candidate is not None
-            and self.accepted.converged_revision < revision
-            and candidate.materialization != pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            prior is not None
+            and intent.revision == prior.revision
+            and intent.logical_identity() != prior.logical_identity()
         ):
-            # REFRESHING ACCESS NEVER CHANGES IDENTITY: this re-runs convergence against the
-            # SAME accepted set bytes. No revision, set digest, or placement identity moves.
-            # A terminal content/receipt refusal is different: it is a verdict about this
-            # desired spec, so a newer ACCESS grant cannot make it retryable. Only a new
-            # desired revision clears that latch (cr-023 fallback-retention clause 5).
-            self.note("grant", f"re-driving convergence for revision {revision} on the refresh")
-            self.latched = ""
-            self.schedule_convergence(revision)
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=intent.delegation_id,
+                    reason="artifact_revision_conflict",
+                    detail="same artifact revision carries different package/model ids",
+                )
+            )
+            return
+        self.artifact_intent = intent
+        self.note(
+            "artifacts",
+            f"accepted revision {intent.revision} delegation {intent.delegation_id!r}, "
+            f"expiring {intent.expires_at_unix}",
+        )
+        self.artifact_resolutions.put(intent)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
@@ -1764,10 +1644,91 @@ class Worker:
                 else " from a standing start"
             ),
         )
-        self.schedule_convergence(desired.revision)
+        expected = (
+            documents.spell(candidate.installed_environment_receipt_digest)
+            if candidate.installed_environment_receipt_digest
+            else ""
+        )
+        local_receipt = (
+            self.options.environment_root / "receipts" / f"{expected[7:]}.json"
+            if self.options.environment_root is not None and expected
+            else None
+        )
+        if (
+            not candidate.installed_environment_receipt_digest
+            or self.artifact_plan.authorized()
+            or (local_receipt is not None and local_receipt.is_file())
+        ):
+            self.schedule_convergence(desired.revision)
+        else:
+            self.note(
+                "materialization",
+                f"revision {desired.revision} waits for direct artifact resolution",
+            )
 
     def schedule_convergence(self, revision: int) -> None:
         self.convergences.put(revision)
+
+    def artifact_resolution_lane(self) -> None:
+        """Redeem logical intent without blocking WorkerControl."""
+
+        while (intent := self.artifact_resolutions.get()) is not None:
+            if intent is not self.artifact_intent or self.options.artifact_client is None:
+                continue
+            packages = tuple(sorted(set(intent.package_release_ids) - self.resolved_package_ids))
+            models = tuple(sorted(set(intent.model_checkpoint_ids) - self.resolved_model_ids))
+            if not packages and not models:
+                continue
+            try:
+                plan = self.options.artifact_client.resolve(
+                    intent,
+                    package_release_ids=packages,
+                    model_checkpoint_ids=models,
+                )
+            except artifact_access.ArtifactAccessRefusal as exc:
+                if intent is not self.artifact_intent:
+                    continue
+                self.note("artifacts", f"resolve REFUSED: {exc.code}")
+                self.engine.fault(
+                    pb.Fault(
+                        kind=exc.kind,
+                        subject=intent.delegation_id,
+                        reason=exc.code,
+                        detail=safe(
+                            exc.detail
+                            + (f"; server_time_unix={exc.server_time}" if exc.server_time else "")
+                        ),
+                    )
+                )
+                if self.connected.is_set():
+                    self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+                continue
+            if intent is not self.artifact_intent:
+                continue
+            self.artifact_plan = self.artifact_plan.merged(plan)
+            self.engine.faults[:] = [
+                fault
+                for fault in self.engine.faults
+                if fault.kind != pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED
+                and fault.reason != "artifact_authorization_absent"
+            ]
+            self.note(
+                "artifacts",
+                f"resolved {len(plan.artifacts)} exact object(s) for revision "
+                f"{intent.revision}, expiring {plan.expires_at_unix}",
+            )
+            revision = self.accepted.accepted_desired_state_revision
+            candidate = self.pending or self.placement
+            if (
+                candidate is not None
+                and self.accepted.converged_revision < revision
+                and candidate.materialization
+                != pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            ):
+                self.latched = ""
+                self.schedule_convergence(revision)
+            if self.connected.is_set():
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def convergence_lane(self) -> None:
         """One non-control lane for slow, generation-fenced placement convergence."""
@@ -1947,10 +1908,9 @@ class Worker:
         receipt = (
             self.options.environment_root / "receipts" / f"{expected.removeprefix('sha256:')}.json"
         )
-        # A standing grant re-drives the full reachability walk even when the overlay is
-        # already present: that is how warm reuse is measured honestly for BOTH package
-        # and model legs. A preinstalled generation with no grant may still open locally.
-        if not receipt.exists() or self.grant.authorized():
+        # A direct plan re-drives the reachability walk while its exact locations are live.
+        # A preinstalled generation with no plan may still open locally.
+        if not receipt.exists() or self.artifact_plan.authorized():
             if self.options.artifact_cache is None:
                 self._materialization_failed(
                     placement,
@@ -1964,25 +1924,22 @@ class Worker:
                     terminal=False,
                 )
                 return None
-            if not self.grant.authorized():
-                # A DESIRED SUBJECT WITH NO GRANT DOES NOT REFUSE THE DESIRED STATE (§3):
-                # the placement reports MATERIALIZING with a typed fault and the outgoing
-                # spec keeps serving. A later ArtifactGrantUpdate re-drives this level.
+            if not self.artifact_plan.authorized():
                 self._materialization_failed(
                     placement,
                     pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_GRANT_EXPIRED,
+                        kind=pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
                         subject=placement.placement_id,
-                        reason="artifact_grant_absent",
+                        reason="artifact_authorization_absent",
                         detail="the accepted set names artifacts this worker does not hold "
-                        "and no standing ArtifactGrant authorizes acquiring them",
+                        "and no direct Tensorhub plan has landed",
                     ),
                     terminal=False,
                 )
                 return None
             try:
                 acquirer = acquire.Acquirer(
-                    self.grant,
+                    self.artifact_plan,
                     cache_root=self.options.artifact_cache,
                     environment_root=self.options.environment_root,
                     plans_root=self.config.cozy_home / "binding-plans",
@@ -2028,6 +1985,9 @@ class Worker:
                     self._observe_acquisition(placement, acquirer.observation.snapshot())
 
                 acquired = acquirer.acquire(placement, on_package_ready=package_ready)
+                self.resolved_package_ids.add(placement.package_release_id)
+                if self.artifact_intent is not None:
+                    self.resolved_model_ids.update(self.artifact_intent.model_checkpoint_ids)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,
@@ -3358,10 +3318,15 @@ class Worker:
             admission_generation=self.admission_generation,
             admission_state=self.admission_state(),
             available_attempt_slots=self.available_attempt_slots(),
-            # The grant lane is observable without an ack lane of its own (§3).
-            applied_artifact_grant_id=self.grant_id,
-            applied_grant_revision=self.grant_revision,
         )
+        if self.artifact_intent is not None:
+            observed.artifact_intent.CopyFrom(
+                pb.ArtifactIntentStatus(
+                    revision=self.artifact_intent.revision,
+                    delegation_id=self.artifact_intent.delegation_id,
+                    authorization_expires_at_unix=self.artifact_intent.expires_at_unix,
+                )
+            )
         if self.accepted.mode == "job":
             observed.job_capacity.CopyFrom(self.job_capacity())
         elif self.accepted.mode == "serving":
@@ -3556,6 +3521,11 @@ class Worker:
             threading.Thread(
                 target=self.convergence_lane, daemon=True, name="convergence-lane"
             ).start()
+            threading.Thread(
+                target=self.artifact_resolution_lane,
+                daemon=True,
+                name="artifact-resolution-lane",
+            ).start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
         try:
@@ -3573,6 +3543,7 @@ class Worker:
         self.stop.set()
         self.work.put(None)
         self.convergences.put(None)
+        self.artifact_resolutions.put(None)
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
@@ -3771,40 +3742,10 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             flush=True,
         )
         return int(Exit.structural)
-    # THE HASH SET, VALIDATED BEFORE ANYTHING BINDS (#560g). A malformed value is a
-    # provisioning mistake, and a worker that binds with an unusable credential set would
-    # discover it one claim later — at which point a port is open.
-    try:
-        access = AccessTokenSet.parse(config.access_token_hashes)
-    except AccessTokenError as exc:
-        print(f"[worker] refusing to bind {listen}: {exc}", file=sys.stderr, flush=True)
-        return int(Exit.structural)
-    if remote and access is not None and access.path is not None:
-        # The path form, proven READABLE at launch rather than at the first claim: a pod
-        # whose hash file never arrived admits nobody, and saying so now beats answering
-        # UNAUTHENTICATED to the renter who just paid for it.
-        access.reload()
-        if access.unreadable:
-            print(
-                f"[worker] refusing to bind {listen}: {access.why_not()}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return int(Exit.structural)
-    if remote and not config.bootstrap_credential and access is None:
-        # THE OTHER HALF OF THE SAME REFUSAL (#493 item 10). One-way TLS authenticates the
-        # WORKER to the dialer and says nothing about the dialer, and the Claim check is
-        # conditional on a credential being configured — so a TLS listener with no credential
-        # accepted whoever connected, and the first Claim owned the machine. Loopback and
-        # unix sockets stay legal without one: there the fence is the socket's own filesystem
-        # authority and the kernel's peer credentials, which is a real fence. Off-loopback
-        # there is no such thing, and a worker with no way to tell its owner from a stranger
-        # must not open the door at all.
+    if remote and not config.bootstrap_credential and not config.record_owner_public_key:
         print(
-            f"[worker] refusing to bind {listen} without a bootstrap credential: a "
-            "non-loopback listener authenticates its owner (COZY_BOOTSTRAP_CREDENTIAL when "
-            "the launcher minted the credential, COZY_ACCESS_TOKEN_SHA256 when a renter did) "
-            "or it does not serve — one-way TLS proves nothing about the dialer",
+            f"[worker] refusing to bind {listen} without RecordOwner authority: use a "
+            "launcher bootstrap credential or the fixed product-host signed Claim lane",
             file=sys.stderr,
             flush=True,
         )
