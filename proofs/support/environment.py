@@ -514,6 +514,9 @@ def _success(root: Path, name: str, receipt: bytes) -> dict[str, Any]:
         f"{name} installed content is not keyed by base family plus wheel digests",
     )
     _require(generation.is_dir(), f"{name} installed content is absent")
+    site = generation / "site-packages"
+    for metadata in ("endpoint.toml", "pyproject.toml", "uv.lock"):
+        _require((site / metadata).is_file(), f"{name} omitted project metadata {metadata}")
     _require(
         (generation / "endpoint-overlay-content.json").read_bytes() == content,
         f"{name} installed-content identity disagrees with its receipt",
