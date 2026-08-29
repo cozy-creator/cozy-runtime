@@ -1,1 +1,1 @@
-{"digest":"sha256:a1616ae8fb7c8bd28972f586b67f23f7445c15fd6ba54dfd7f67621b206f9cde","distribution":"proof-endpoint","filename":"proof_endpoint-1.0.0-py3-none-any.whl","import_roots":["project_endpoint"],"length":1212,"tags":["py3-none-any"],"version":"1.0.0"}
+{"digest":"sha256:8dbcdcafce5f9b3a8871eb6e930f22cceb94a2348c183a61645f595d3b90fca1","distribution":"proof-package","filename":"proof_package-1.0.0-py3-none-any.whl","import_roots":["project_package"],"length":1199,"tags":["py3-none-any"],"version":"1.0.0"}

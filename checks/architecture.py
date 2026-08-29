@@ -710,27 +710,27 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         "package-bundle.json": (
             bundle_bytes,
-            "ac3b9b3482fbc673ec62d4b2143b64254454c8e45f06987eedf4f39fb2701fb9",
+            "9a02bb4f507224140f1aa2c5281dfc13d4b2c0e200af2617c1593388fcd63105",
         ),
         "package-environment-spec.json": (
             environment_bytes,
-            "a34714c0610936206e1744a565da41301f58c8e1003b15ed55491e84077bca75",
+            "d17897b9c7048f359660e368c668be33a9c913ab9406eb0262e467f891f22819",
         ),
         "fixture-index.json": (
             index_bytes,
-            "2b6c46e40b0408c449d1a3d68751dc27c916a87a033fc516edfd233b621a26c7",
+            "735da16e57ecaf62d3169b9d2c23483d6f2046cff516883d41fb289070a422b6",
         ),
         "project-wheel.json": (
             project_bytes,
-            "e374821cce113ced053fe870c067fb2252ad32b649b5539ebb4847bf639aed22",
+            "fb196cac5916f5890a468075cfdc2dfa8134674b4abb9fda7a2a14ad8426f858",
         ),
         "resolution-lock.json": (
             resolution_lock_bytes,
-            "436a122eb921d2e9b3196c95390df7e633f198816a36ed33cbd962fdff0a7d63",
+            "1a1f34b8ada8cfd08d311208c24932a80fb52a147e5af374289257367e784b55",
         ),
         "resolved-wheel-set.json": (
             resolved_bytes,
-            "432c0052384b3c54ba0ca5d2336fd57b14633bbd6c8a7dcfce8ff5d4be7caa2d",
+            "f0dc0011192e18b55352ca91748cb268db0d3d5d992bfa6f2b6612fb1c9ca112",
         ),
     }
     for name, (payload, want_digest) in exact_contract.items():
