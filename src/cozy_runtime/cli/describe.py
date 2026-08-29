@@ -198,7 +198,10 @@ def _fields(struct: Json) -> list[str]:
     out = []
     for field in _as_list(struct["fields"]):
         assert isinstance(field, dict)
-        bits = [f"    {field['name']}: {_type(field['type'])}", str(field["wire"])]
+        bits = [
+            f"    {field['name']}: {_type(field['type'])}",
+            str(field.get("wire", "required")),
+        ]
         if (constraints := field.get("constraints")) is not None:
             assert isinstance(constraints, dict)
             bits.append("(" + ", ".join(f"{k}={v}" for k, v in sorted(constraints.items())) + ")")

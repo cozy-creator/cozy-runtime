@@ -614,9 +614,7 @@ def main() -> int:
         local_weightless = local.weightless_release_documents(
             {
                 "application": "weightless:app",
-                "entrypoints": [
-                    {"hidden": False, "kind": "entrypoint", "models": [], "name": "health"}
-                ],
+                "entrypoints": [{"models": [], "name": "health"}],
             }
         )
         assert local_weightless.artifact_object_set == empty_bytes
@@ -802,13 +800,10 @@ def main() -> int:
                 "application": "endpoint:app",
                 "entrypoints": [
                     {
-                        "hidden": False,
-                        "kind": "entrypoint",
                         "models": [
                             {
                                 "class": "Model",
                                 "component_use": {"run": ["transformer"]},
-                                "param": "model",
                                 "path": "generate.models.model",
                                 "stamps": {},
                             }
@@ -816,8 +811,6 @@ def main() -> int:
                         "name": "generate",
                     },
                     {
-                        "hidden": False,
-                        "kind": "entrypoint",
                         "models": [],
                         "name": "health",
                     },

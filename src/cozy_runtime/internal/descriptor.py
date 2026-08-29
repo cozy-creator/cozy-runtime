@@ -46,6 +46,8 @@ def build(found: Discovered) -> dict[str, Json]:
     entrypoints: list[Json] = []
     jobs: list[Json] = []
     for surface in found.surfaces:
+        if surface.hidden:
+            continue
         doc = _callable(surface)
         (jobs if surface.kind == "job" else entrypoints).append(doc)
     body: dict[str, Json] = {
@@ -72,8 +74,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
         "request": schema.render(surface.payload_type),
         "result": schema.render(surface.result_type),
     }
-    if surface.kind == "entrypoint":
-        doc["hidden"] = surface.hidden
     models = [_model(binding) for binding in surface.model_bindings]
     if models:
         doc["models"] = models
@@ -90,7 +90,6 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
     satisfies it is a binding-clock fact and is not here."""
     doc: dict[str, Json] = {
         "path": binding.path,
-        "param": binding.param,
         "class": binding.class_key,
         "stamps": dict(binding.stamps),
         # Declaration order encodes no control flow and no residency choice (§1.1), so the

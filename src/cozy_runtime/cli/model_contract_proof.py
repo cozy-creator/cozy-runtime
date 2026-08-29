@@ -552,8 +552,6 @@ def _derive_all(
             name = described["name"]
             surface = surfaces.get(name)
             if surface is None:
-                if described.get("hidden") is True:
-                    continue
                 raise ProofRefusal(
                     "model_contract_descriptor_invalid", f"{collection} surface {name!r} is absent"
                 )

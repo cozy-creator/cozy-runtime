@@ -535,9 +535,7 @@ def fence_artifact_object_sets() -> list[str]:
         local_bytes = local.weightless_release_documents(
             {
                 "application": "vector:weightless",
-                "entrypoints": [
-                    {"hidden": False, "kind": "entrypoint", "models": [], "name": "health"}
-                ],
+                "entrypoints": [{"models": [], "name": "health"}],
             }
         ).artifact_object_set
         if local_bytes != rendered["empty"]:
@@ -980,6 +978,7 @@ def fence_descriptor_minimality() -> list[str]:
         "error_model",
         "frozen",
         "gpu",
+        "hidden",
         "kind",
         "max_audio_channels",
         "max_audio_samples",
@@ -987,6 +986,7 @@ def fence_descriptor_minimality() -> list[str]:
         "max_pixels_per_frame",
         "max_video_frames",
         "placement",
+        "param",
         "preflight",
         "protocol",
         "request_features",
@@ -1007,6 +1007,8 @@ def fence_descriptor_minimality() -> list[str]:
             for key, item in value.items():
                 if key in forbidden:
                     bad.append(f"{where}.{key} is an unused descriptor fact")
+                if key == "wire" and item == "required":
+                    bad.append(f"{where}.wire repeats the required-field default")
                 visit(item, f"{where}.{key}")
         elif isinstance(value, list):
             for index, item in enumerate(value):

@@ -1012,9 +1012,9 @@ registry().acquire('g.models.m', h3.Fl2VAModel, Artifact(
         "topology_extra_keys",
     ),
     (
-        # #572d: a HIDDEN entrypoint is declared and not served. It keeps its descriptor
-        # place — it is real code — and the serving set excludes it.
-        "hidden-entrypoint-is-declared-and-not-served",
+        # #572d: a HIDDEN entrypoint remains a local registry fact but is not published or
+        # served. Descriptor construction owns the omission; this arm proves the author flag.
+        "hidden-entrypoint-is-local-and-not-served",
         """
 from cozy_runtime.author._signature import analyze
 
@@ -1026,7 +1026,7 @@ b = analyze(concealed, name='concealed', kind='entrypoint', hidden=True)
 assert a.hidden is False and b.hidden is True, (a.hidden, b.hidden)
 serving = [s.name for s in (a, b) if not s.hidden]
 assert serving == ['visible'], serving
-raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surface kept its surface')
+raise SystemExit('the serving set is ' + repr(serving) + ' and the hidden surface stayed local')
 """,
         "the serving set is ['visible']",
     ),
@@ -1672,7 +1672,7 @@ def run_environment_drift() -> str:
         target = drift / "cozy_runtime" / "internal" / "schema.py"
         target.write_text(
             target.read_text().replace(
-                'doc["wire"] = "required"',
+                'doc["wire"] = "optional"',
                 'doc["wire"] = "drifted"',
             )
         )

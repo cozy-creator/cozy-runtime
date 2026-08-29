@@ -46,12 +46,14 @@ def render(annotation: object) -> Json:
     return _render(annotation, frozenset())
 
 
-def _render(annotation: object, seen: frozenset[type], *, tag_required: bool = False) -> Json:
+def _render(
+    annotation: object, seen: frozenset[type], *, union_owns_tag_field: bool = False
+) -> Json:
     base, _ = strip(annotation)
     inner, optional = unwrap_optional(base)
     if optional:
         return {"union": sorted_union([_render(inner, seen), "null"])}
-    return _render_bare(inner, seen, tag_required=tag_required)
+    return _render_bare(inner, seen, union_owns_tag_field=union_owns_tag_field)
 
 
 def sorted_union(members: list[Json]) -> list[Json]:
@@ -59,7 +61,7 @@ def sorted_union(members: list[Json]) -> list[Json]:
     return sorted(members, key=write)
 
 
-def _render_bare(tp: object, seen: frozenset[type], *, tag_required: bool = False) -> Json:
+def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: bool = False) -> Json:
     if (name := _PRIMITIVES.get(tp)) is not None:
         return name
     origin = get_origin(tp)
@@ -86,7 +88,11 @@ def _render_bare(tp: object, seen: frozenset[type], *, tag_required: bool = Fals
         if issubclass(tp, enum.Enum):
             return {"literal": sorted_union([_literal(m.value) for m in tp])}
         if is_struct(tp):
-            return _struct(typing.cast(type[msgspec.Struct], tp), seen, tag_required=tag_required)
+            return _struct(
+                typing.cast(type[msgspec.Struct], tp),
+                seen,
+                union_owns_tag_field=union_owns_tag_field,
+            )
     raise ConformanceError(
         f"{tp!r} has no descriptor spelling — the request/result surface is primitives, "
         "enums, literals, containers, typed Assets, input Trees and msgspec structs",
@@ -135,12 +141,20 @@ def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
             code="tagged_union_incoherent",
         )
     rendered = sorted_union(
-        [_render(member, seen, tag_required=is_struct(strip(member)[0])) for member in members]
+        [
+            _render(member, seen, union_owns_tag_field=is_struct(strip(member)[0]))
+            for member in members
+        ]
     )
     return {"union": rendered, "tag_field": typing.cast(str, next(iter(fields)))}
 
 
-def _struct(tp: type[msgspec.Struct], seen: frozenset[type], *, tag_required: bool = False) -> Json:
+def _struct(
+    tp: type[msgspec.Struct],
+    seen: frozenset[type],
+    *,
+    union_owns_tag_field: bool = False,
+) -> Json:
     if tp in seen:
         raise ConformanceError(
             "recursive structs have no interoperable descriptor spelling",
@@ -149,25 +163,16 @@ def _struct(tp: type[msgspec.Struct], seen: frozenset[type], *, tag_required: bo
     nested = seen | {tp}
     config = tp.__struct_config__
     fields = [_field(f, nested) for f in msgspec.structs.fields(tp)]
-    if config.tag is not None:
-        if not isinstance(config.tag_field, str) or not config.tag_field:
-            raise ConformanceError(
-                f"tagged struct {tp.__name__} declares no string tag field",
-                code="tagged_union_incoherent",
-            )
-        tag = _literal(config.tag)
-        fields.insert(
-            0,
-            {
-                "name": config.tag_field,
-                "type": {"literal": [tag]},
-                "wire": "required" if tag_required else "optional",
-            },
+    if config.tag is not None and (not isinstance(config.tag_field, str) or not config.tag_field):
+        raise ConformanceError(
+            f"tagged struct {tp.__name__} declares no string tag field",
+            code="tagged_union_incoherent",
         )
     doc: dict[str, Json] = {"fields": fields}
     if config.tag is not None:
-        doc["tag_field"] = typing.cast(str, config.tag_field)
         doc["tag"] = _literal(config.tag)
+        if not union_owns_tag_field:
+            doc["tag_field"] = typing.cast(str, config.tag_field)
     return doc
 
 
@@ -180,9 +185,7 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
     omissible = any(isinstance(m, _ModelDefaultMarker) for m in markers)
     if omissible:
         doc["wire"] = "omissible"
-    elif field.required:
-        doc["wire"] = "required"
-    else:
+    elif not field.required:
         doc["wire"] = "optional"
     constraints = _constraints(markers)
     if constraints:

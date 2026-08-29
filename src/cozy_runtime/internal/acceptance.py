@@ -795,13 +795,7 @@ def _descriptor_entrypoint(descriptor_doc: LocalDocument, entrypoint: str) -> di
     if not isinstance(entries, list):
         raise AcceptanceRefusal("acceptance_descriptor_invalid", "entrypoints is not an array")
     row = next(
-        (
-            item
-            for item in entries
-            if isinstance(item, dict)
-            and item.get("hidden") is False
-            and item.get("name") == entrypoint
-        ),
+        (item for item in entries if isinstance(item, dict) and item.get("name") == entrypoint),
         None,
     )
     if not isinstance(row, dict):

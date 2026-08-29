@@ -1000,9 +1000,7 @@ def weightless_release_documents(
     entries = endpoint_descriptor.get("entrypoints")
     if not isinstance(entries, list):
         raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
-    visible: list[Mapping[str, Any]] = [
-        entry for entry in entries if isinstance(entry, Mapping) and entry.get("hidden") is False
-    ]
+    visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
     modeled = sorted(str(entry.get("name", "")) for entry in visible if entry.get("models"))

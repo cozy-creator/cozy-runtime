@@ -2,7 +2,6 @@
   "application": "marco_polo_endpoint:app",
   "entrypoints": [
     {
-      "hidden": false,
       "name": "marco",
       "request": {
         "fields": [
@@ -12,8 +11,7 @@
               "literal": [
                 "marco"
               ]
-            },
-            "wire": "required"
+            }
           }
         ]
       },
@@ -25,8 +23,7 @@
               "literal": [
                 "polo"
               ]
-            },
-            "wire": "required"
+            }
           }
         ]
       }

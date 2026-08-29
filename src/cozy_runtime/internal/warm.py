@@ -102,8 +102,8 @@ def _struct(node: dict[str, Any], path: str, spool: Path) -> dict[str, Any]:
     for field in node.get("fields", ()):
         name = str(field["name"])
         where = f"{path}.{name}" if path else name
-        wire = field.get("wire")
-        if wire != "required":
+        wire = field.get("wire", "required")
+        if wire in ("optional", "omissible"):
             # A default or an omissible field is left OUT: the neutral case is the one the
             # deployment would serve for a caller who said nothing.
             continue

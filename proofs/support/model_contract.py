@@ -147,12 +147,12 @@ def _prepare(args: argparse.Namespace) -> None:
     )
     descriptor_bytes = _canonical(descriptor_doc)
     descriptor_path = _write(inputs / "endpoint-descriptor.json", descriptor_bytes)
-    hidden = [
-        row["name"]
-        for row in descriptor_doc["entrypoints"]
-        if isinstance(row, dict) and row.get("hidden") is True
-    ]
-    _require(hidden == ["hidden_render"], f"unexpected hidden functions: {hidden!r}")
+    names = [row.get("name") for row in descriptor_doc["entrypoints"] if isinstance(row, dict)]
+    _require(names == ["metadata", "render"], f"unexpected published functions: {names!r}")
+    _require(
+        all("hidden" not in row for row in descriptor_doc["entrypoints"] if isinstance(row, dict)),
+        "the descriptor still carries the retired hidden field",
+    )
     bundle = _canonical(
         {
             "descriptor": _ref(descriptor_bytes),

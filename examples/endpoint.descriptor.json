@@ -2,7 +2,6 @@
   "application": "tiny_h3:app",
   "entrypoints": [
     {
-      "hidden": false,
       "models": [
         {
           "class": "Fl2VAModel",
@@ -26,7 +25,6 @@
               "visual_vae"
             ]
           },
-          "param": "model",
           "path": "generate.models.model",
           "stamps": {
             "task": "fl2va"
@@ -38,8 +36,7 @@
         "fields": [
           {
             "name": "prompt",
-            "type": "str",
-            "wire": "required"
+            "type": "str"
           },
           {
             "name": "first_frame",
@@ -121,29 +118,24 @@
             "name": "poster",
             "type": {
               "asset": "image"
-            },
-            "wire": "required"
+            }
           },
           {
             "name": "frames",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "audio_samples",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "checkpoint",
-            "type": "str",
-            "wire": "required"
+            "type": "str"
           }
         ]
       }
     },
     {
-      "hidden": false,
       "models": [
         {
           "class": "Ref2VAModel",
@@ -167,7 +159,6 @@
               "visual_vae"
             ]
           },
-          "param": "model",
           "path": "generate_ref.models.model",
           "stamps": {
             "task": "ref2va"
@@ -179,8 +170,7 @@
         "fields": [
           {
             "name": "prompt",
-            "type": "str",
-            "wire": "required"
+            "type": "str"
           },
           {
             "constraints": {
@@ -195,20 +185,10 @@
                   {
                     "fields": [
                       {
-                        "name": "kind",
-                        "type": {
-                          "literal": [
-                            "audio"
-                          ]
-                        },
-                        "wire": "required"
-                      },
-                      {
                         "name": "audio",
                         "type": {
                           "asset": "audio"
-                        },
-                        "wire": "required"
+                        }
                       },
                       {
                         "name": "sample_rate",
@@ -221,48 +201,26 @@
                         "wire": "optional"
                       }
                     ],
-                    "tag": "audio",
-                    "tag_field": "kind"
+                    "tag": "audio"
                   },
                   {
                     "fields": [
-                      {
-                        "name": "kind",
-                        "type": {
-                          "literal": [
-                            "image"
-                          ]
-                        },
-                        "wire": "required"
-                      },
                       {
                         "name": "image",
                         "type": {
                           "asset": "image"
-                        },
-                        "wire": "required"
+                        }
                       }
                     ],
-                    "tag": "image",
-                    "tag_field": "kind"
+                    "tag": "image"
                   },
                   {
                     "fields": [
                       {
-                        "name": "kind",
-                        "type": {
-                          "literal": [
-                            "video"
-                          ]
-                        },
-                        "wire": "required"
-                      },
-                      {
                         "name": "video",
                         "type": {
                           "asset": "video"
-                        },
-                        "wire": "required"
+                        }
                       },
                       {
                         "name": "soundtrack",
@@ -290,13 +248,11 @@
                         "wire": "optional"
                       }
                     ],
-                    "tag": "video",
-                    "tag_field": "kind"
+                    "tag": "video"
                   }
                 ]
               }
-            },
-            "wire": "required"
+            }
           },
           {
             "name": "first_frame",
@@ -378,23 +334,19 @@
             "name": "poster",
             "type": {
               "asset": "image"
-            },
-            "wire": "required"
+            }
           },
           {
             "name": "frames",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "audio_samples",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "checkpoint",
-            "type": "str",
-            "wire": "required"
+            "type": "str"
           }
         ]
       }
@@ -426,7 +378,6 @@
               "visual_vae"
             ]
           },
-          "param": "base",
           "path": "distill.models.base",
           "stamps": {
             "task": "fl2va"
@@ -443,8 +394,7 @@
               "le": 10000
             },
             "name": "steps",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "constraints": {
@@ -476,30 +426,25 @@
         "fields": [
           {
             "name": "steps_run",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "resumed_at",
-            "type": "int",
-            "wire": "required"
+            "type": "int"
           },
           {
             "name": "final_loss",
-            "type": "float",
-            "wire": "required"
+            "type": "float"
           },
           {
             "name": "receipt",
-            "type": "str",
-            "wire": "required"
+            "type": "str"
           },
           {
             "name": "manifest",
             "type": {
               "asset": "file"
-            },
-            "wire": "required"
+            }
           }
         ]
       }

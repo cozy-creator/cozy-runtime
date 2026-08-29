@@ -674,7 +674,7 @@ def descriptor_sections() -> None:
     base = descriptor.descriptor_digest(bodies["tiny_h3"])
     mutations: dict[str, Callable[[Any], object]] = {
         "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
-            {"name": "extra", "type": "int", "wire": "required"}
+            {"name": "extra", "type": "int"}
         ),
         "stamp (task=fl2va -> task=other)": lambda d: d["entrypoints"][0]["models"][0][
             "stamps"
@@ -682,7 +682,7 @@ def descriptor_sections() -> None:
         "component-use (one method's set)": lambda d: d["entrypoints"][0]["models"][0][
             "component_use"
         ].update(denoise=["fl2va_transformer", "smuggled"]),
-        "visibility (hidden toggled)": lambda d: d["entrypoints"][0].update(hidden=True),
+        "published surface removed": lambda d: d["entrypoints"].pop(),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
