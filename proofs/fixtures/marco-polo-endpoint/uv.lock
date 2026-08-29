@@ -89,7 +89,7 @@ wheels = [
 [[package]]
 name = "marco-polo-endpoint"
 version = "1.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cozy-runtime" },
 ]

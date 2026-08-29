@@ -17,9 +17,10 @@ returns:
 ```
 
 Publish it through Creator's endpoint-publish command, pointing `--dir` at this directory.
-Creator's fixed pure-Python packer produces the deterministic `py3-none-any` project wheel; this
-fixture intentionally declares no PEP 517 backend. `pyproject.toml`, `uv.lock`,
-the Runtime-derived canonical descriptor, and that wheel are the exact publication inputs. The
+Creator invokes `uv build --wheel`; this fixture declares `uv_build` and its existing flat module
+root explicitly. The backend produces a deterministic `py3-none-any` wheel without writing build
+output into the source tree. `pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor,
+and that wheel are the exact publication inputs. The
 descriptor is sent directly to Tensorhub and is not committed here. There is no release manifest
 and no author-selected worker profile: Tensorhub derives compatible base worker images from the
 locked Python/package requirements. The current remote contract admits one placement per worker,
