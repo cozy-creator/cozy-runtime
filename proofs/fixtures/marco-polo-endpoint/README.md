@@ -16,19 +16,19 @@ returns:
 {"message":"polo"}
 ```
 
-Build and exercise it from the Cozy Runtime repository:
+Publish it through the real Creator product path:
 
 ```sh
-uv build --wheel --project proofs/fixtures/marco-polo-endpoint --out-dir dist/marco-polo
-uv run --with dist/marco-polo/marco_polo_endpoint-1.0.0-py3-none-any.whl \
-  cozy-runtime --dir proofs/fixtures/marco-polo-endpoint describe --check
-uv run --with dist/marco-polo/marco_polo_endpoint-1.0.0-py3-none-any.whl \
-  cozy-runtime --dir proofs/fixtures/marco-polo-endpoint --json run marco message=marco
+cozy endpoint publish cozy/marco-polo --create --release acceptance-1 \
+  --dir proofs/fixtures/marco-polo-endpoint \
+  --profile torch2.13.0-cu130-cp312-linux-x86 \
+  --reason "Marco/Polo acceptance"
 ```
 
-`uv.lock`, `endpoint.descriptor.json`, and the deterministic wheel are the exact inputs a
-Tensorhub publication proof should upload. The current remote contract admits one placement per
+Creator's fixed pure-Python packer produces the deterministic `py3-none-any` project wheel; this
+fixture intentionally declares no PEP 517 backend. `uv.lock`, `endpoint.descriptor.json`, and that
+wheel are the exact publication inputs. The current remote contract admits one placement per
 worker, so publishing this fixture under two endpoint repositories can prove sequential same-pod
-replacement with `cozy rent revise`; it does not prove simultaneous stacking. The currently
-qualified RunPod base worker image is CUDA/GPU even though this endpoint itself performs no GPU
-work.
+replacement with `cozy rent revise`; it does not prove simultaneous stacking. The approved RunPod
+profiles use an RTX 4090 even though this endpoint itself performs no GPU work;
+`endpoint.release.json` records that placement compatibility and declares no model closure.
