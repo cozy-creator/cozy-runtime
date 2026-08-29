@@ -155,4 +155,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; v1 documents refused; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact endpoint bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; v1 documents refused; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"

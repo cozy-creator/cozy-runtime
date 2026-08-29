@@ -169,7 +169,7 @@ def run(
         raise CliError(
             "validation",
             str(exc),
-            "an endpoint's surface must be valid before it can run (§1.0)",
+            "a package's surface must be valid before it can run (§1.0)",
             Exit.validation,
         ) from exc
 
@@ -267,7 +267,7 @@ def run(
             job_records=job_records,
             workspace=workspace,
             release_id=release_id,
-            endpoint_descriptor=body if kind == "entrypoint" else None,
+            package_descriptor=body if kind == "entrypoint" else None,
             options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
@@ -341,7 +341,7 @@ def resolved_bindings(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Every declared slot's RESOLVED SELECTION, from the one resolver (cl-010's debt 7).
 
-    It prints what `endpoint.toml` SELECTS — the ref, the lane, and which rule won — plus
+    It prints what `package.toml` SELECTS — the ref, the lane, and which rule won — plus
     whatever the local CAS has for it. Deliberately NOT the full binding-plan record: an
     uninstalled artifact still has a selection, and a verb that refused `offline_miss` here
     would be useless for the question it exists to answer ("what does this project bind?").
@@ -357,7 +357,7 @@ def resolved_bindings(
         raise CliError(
             "validation",
             str(exc),
-            "an endpoint's surface must be valid before its bindings can resolve (§1.0)",
+            "a package's surface must be valid before its bindings can resolve (§1.0)",
             Exit.validation,
         ) from exc
     slots = [
@@ -384,7 +384,7 @@ def resolved_bindings(
         raise CliError(
             "validation",
             str(exc),
-            "code states capability, bindings state selection — name the slot in endpoint.toml",
+            "code states capability, bindings state selection — name the slot in package.toml",
             Exit.validation,
         ) from exc
     records: list[dict[str, Any]] = []

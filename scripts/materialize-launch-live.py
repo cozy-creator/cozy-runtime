@@ -134,10 +134,10 @@ def policy_worker(
     worker.placement = Placement(
         placement_id="placement-live",
         spec_digest=b"s" * 32,
-        endpoint_release_id="cozy/probe@live",
+        package_release_id="cozy/probe@live",
         environment_spec_digest=b"e" * 32,
         installed_environment_receipt_digest=b"i" * 32,
-        descriptor_digest=b"d" * 32,
+        package_descriptor_digest=b"d" * 32,
         model_object_set=("sha256:" + "0" * 64, 53),
         plan_ids=("plan-live",),
         plan_refs={},
@@ -184,8 +184,8 @@ def prepared_binding() -> DeclaredBinding:
         model_binding_path="probe.models.model",
         model_parameter_name="model",
         release="cozy/probe-model@live",
-        application="probe_endpoint:app",
-        descriptor_path="/verified/endpoint.descriptor.json",
+        application="probe_package:app",
+        descriptor_path="/verified/package.descriptor.json",
         store="/verified/store",
         config="/verified/model.json",
         variant="plain",
@@ -721,9 +721,9 @@ def main() -> int:
 
         construction = contract.ModelConstructionContract(
             candidate=contract.Candidate(
-                release="endpoint@release",
-                application="endpoint:app",
-                model_class="endpoint.models:Model",
+                release="package@release",
+                application="package:app",
+                model_class="package.models:Model",
                 factory="sha256:" + "c" * 64,
                 snapshot="sha256:" + snapshot,
                 config_digest="sha256:" + "d" * 64,
@@ -780,9 +780,9 @@ def main() -> int:
         config_asset_ref = ref(config_asset_bytes)
         bound_contract = contract.ModelConstructionContract(
             candidate=contract.Candidate(
-                release="endpoint@release",
-                application="endpoint:app",
-                model_class="endpoint.models:Model",
+                release="package@release",
+                application="package:app",
+                model_class="package.models:Model",
                 factory="factory-identity",
                 snapshot="sha256:" + snapshot,
                 config_digest=str(config_ref["digest"]),
@@ -797,7 +797,7 @@ def main() -> int:
         contract_ref = ref(contract_bytes)
         descriptor_bytes = canonical.write(
             {
-                "application": "endpoint:app",
+                "application": "package:app",
                 "entrypoints": [
                     {
                         "models": [
@@ -815,7 +815,7 @@ def main() -> int:
                         "name": "health",
                     },
                 ],
-                "format": "cozy.endpoint.descriptor/1",
+                "format": "cozy.package.descriptor/1",
                 "jobs": [],
             }
         )
@@ -840,7 +840,7 @@ def main() -> int:
                         "tensor_layout": layout_ref,
                     }
                 ],
-                "format": "cozy.endpoint.ResolvedModelBinding/1",
+                "format": "cozy.package.ResolvedModelBinding/1",
                 "model_construction_contract": contract_ref,
                 "stamps": [],
             }
@@ -849,17 +849,17 @@ def main() -> int:
         plan_bytes = canonical.write(
             {
                 "bindings": [{"binding": binding_ref, "slot": "model"}],
-                "descriptor": descriptor_ref,
+                "package_descriptor": descriptor_ref,
                 "entrypoint": "generate",
-                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+                "format": "cozy.package.EntrypointBindingPlan/1",
             }
         )
         weightless_plan_bytes = canonical.write(
             {
                 "bindings": [],
-                "descriptor": descriptor_ref,
+                "package_descriptor": descriptor_ref,
                 "entrypoint": "health",
-                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+                "format": "cozy.package.EntrypointBindingPlan/1",
             }
         )
         for artifact_ref, raw in (
@@ -891,7 +891,7 @@ def main() -> int:
                 "roots": [
                     {
                         "objects": [layout_ref],
-                        "role": "endpoint",
+                        "role": "package",
                         "root": model_root_ref,
                     }
                 ],
@@ -926,13 +926,13 @@ def main() -> int:
         selected = provisioned.read_provisioned_release(
             plan_documents,
             read_document=provisioned.staged_document_reader(binding_documents),
-            endpoint_release="endpoint@release",
+            package_release="package@release",
             store_root=root / "store",
             object_set=object_set,
             dtype_widths={"bfloat16": 2, "float32": 4},
         )
         resolved_binding = selected.bindings[str(plan_ref["digest"])]
-        assert resolved_binding.application == "endpoint:app"
+        assert resolved_binding.application == "package:app"
         assert resolved_binding.components == ("transformer",)
         # The TensorFS payload is FP8-sized, while the allocator destinations are BF16
         # plus one derived f32 buffer. Stored/custody bytes never become the fill budget.
@@ -979,7 +979,7 @@ def main() -> int:
             provisioned.read_provisioned_release(
                 plan_documents,
                 read_document=provisioned.staged_document_reader(binding_documents),
-                endpoint_release="endpoint@release",
+                package_release="package@release",
                 store_root=root / "store",
                 object_set=extra_object_set,
                 dtype_widths={"bfloat16": 2, "float32": 4},
@@ -992,7 +992,7 @@ def main() -> int:
             provisioned.read_provisioned_release(
                 {str(plan_ref["digest"]): plan_documents[str(plan_ref["digest"])]},
                 read_document=provisioned.staged_document_reader(binding_documents),
-                endpoint_release="endpoint@release",
+                package_release="package@release",
                 store_root=root / "store",
                 object_set=object_set,
                 dtype_widths={"bfloat16": 2, "float32": 4},

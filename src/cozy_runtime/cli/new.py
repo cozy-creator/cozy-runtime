@@ -1,4 +1,4 @@
-"""`cozy-runtime new <name>` — the minimal valid endpoint skeleton (§1.0/§1.7)."""
+"""`cozy-runtime new <name>` — the minimal valid package skeleton (§1.0/§1.7)."""
 
 from __future__ import annotations
 
@@ -57,19 +57,19 @@ warn_unreachable = true
 """
 
 
-def _endpoint_toml(pkg: str) -> str:
+def _package_toml(pkg: str) -> str:
     return f"""[application]
 object = "{pkg}:app"
 
-# Default bindings only — endpoint.toml is a default, never a source of truth.
+# Default bindings only — package.toml is a default, never a source of truth.
 # [bindings."MyModel"]
 # model = "org/model@release"
 """
 
 
-_MODULE = '''"""__PKG__ — a cozy-runtime endpoint.
+_MODULE = '''"""__PKG__ — a cozy-runtime package.
 
-Code states capability; endpoint.toml states selection. The SIGNATURE is the contract:
+Code states capability; package.toml states selection. The SIGNATURE is the contract:
 naming `out: Outputs` IS declaring the save capability, and a `model: MyModel` parameter
 is what derives `gpu`. Nothing else declares either.
 """
@@ -96,7 +96,7 @@ class GenerateResult(msgspec.Struct):
 
 @app.entrypoint
 def generate(ctx: Context, payload: GenerateRequest, out: Outputs) -> GenerateResult:
-    # Weightless: no model parameter yet, so this endpoint derives gpu=False. Adding
+    # Weightless: no model parameter yet, so this package derives gpu=False. Adding
     # `model: MyModel` binds real weights and gives you `model.for_request(ctx, seed=...)`.
     ctx.raise_if_cancelled()
     pixels = bytearray()
@@ -154,7 +154,7 @@ def _readme(name: str, pkg: str) -> str:
     uv run python -m {pkg}
     uv run cozy-runtime --json describe
 
-`cozy endpoint publish` invokes Runtime's read-only describe command and sends the canonical
+`cozy package publish` invokes Runtime's read-only describe command and sends the canonical
 descriptor bytes with the source release. Tensorhub independently derives and compares the
 same descriptor from the installed project wheel. Nothing generated is committed here.
 """
@@ -164,7 +164,7 @@ def run(name: str, target_dir: str) -> Result:
     if not NAME_RE.match(name):
         raise CliError(
             "usage",
-            f"invalid endpoint name {name!r}",
+            f"invalid package name {name!r}",
             "use a lowercase name starting with a letter: [a-z][a-z0-9_-]*",
             Exit.usage,
         )
@@ -180,7 +180,7 @@ def run(name: str, target_dir: str) -> Result:
 
     files = {
         "pyproject.toml": _pyproject(name, pkg),
-        "endpoint.toml": _endpoint_toml(pkg),
+        "package.toml": _package_toml(pkg),
         "README.md": _readme(name, pkg),
         ".gitignore": ".venv/\n__pycache__/\ndist/\n",
         f"src/{pkg}/__init__.py": _module(pkg),
@@ -204,7 +204,7 @@ def run(name: str, target_dir: str) -> Result:
             ("files", str(len(files))),
             (
                 descriptor.DIGEST_KEY,
-                descriptor.descriptor_digest(described.document),
+                descriptor.package_descriptor_digest(described.document),
             ),
         ),
         commands=(

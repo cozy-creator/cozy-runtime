@@ -1,6 +1,6 @@
 """Constructs that MUST derive correctly. If the harness cannot do these it can do nothing.
 
-Every case here is an ordinary shape real endpoints use, and each one is a place a naive
+Every case here is an ordinary shape real packages use, and each one is a place a naive
 census gets a subtly wrong answer: a tie counted twice as two destinations, a shared
 submodule counted once, a non-persistent buffer demanded from a checkpoint that has no
 such key, an fp32 island flattened to bf16.

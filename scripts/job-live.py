@@ -497,7 +497,7 @@ def _declare(source: str) -> str:
     """Import one planted module in a fresh process and return what describe said."""
     plant = fresh("arms") / "plant"
     plant.mkdir(parents=True, exist_ok=True)
-    (plant / "endpoint.toml").write_text('[application]\nobject = "ep:app"\n')
+    (plant / "package.toml").write_text('[application]\nobject = "ep:app"\n')
     (plant / "ep.py").write_text(_JOB_HEAD + "\n\n" + source)
     out = subprocess.run(
         [
@@ -526,7 +526,7 @@ def section_arms() -> None:
     )
     message = str(narrated.terminal.get("safe_message", ""))
     check(
-        "the attempt converges on the ENDPOINT's refusal, not on an executor death",
+        "the attempt converges on the PACKAGE's refusal, not on an executor death",
         narrated.status == "OUTCOME_STATUS_REFUSED" and "host_unfit" in message,
         f"{narrated.status}: {message[:110]}",
     )

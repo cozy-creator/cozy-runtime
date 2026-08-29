@@ -13,7 +13,7 @@ real TensorFS store — and prints what it observed.
 The pipeline is 2,641 destinations over four components totalling 6.461 GiB, against a card
 with 7.62 GiB usable. That gap is the whole subject: what a PlanChooser is FOR is deciding
 what to do when the weights and the work do not both fit, and what a component-use contract
-is for is making that decision invisible to the endpoint.
+is for is making that decision invisible to the package.
 
 The bytes come from a real cozytensors checkpoint holding all four components, transcribed
 from the read-only bench safetensors through the real writer.
@@ -159,7 +159,7 @@ def section_fixtures(args: argparse.Namespace) -> None:
     (one snapshot per component, `snapshots.json`); everything else a fresh clone needs is
     made here so the verification reproduces without hand steps.
     """
-    head("fixtures: the construction config and the endpoint's bundled tokenizers")
+    head("fixtures: the construction config and the package's bundled tokenizers")
     fixed = json.loads((WORK / "vae-fp16-fix" / "config.json").read_text())
     config: dict[str, Any] = {}
     for name in ("text_encoder", "text_encoder_2", "unet"):
@@ -197,9 +197,9 @@ def section_fixtures(args: argparse.Namespace) -> None:
             got = hf_hub_download("stabilityai/stable-diffusion-xl-base-1.0", f"{sub}/merges.txt")
             shutil.copyfile(got, target / "merges.txt")
     check(
-        "the endpoint's bundled tokenizer vocabularies are staged",
+        "the package's bundled tokenizer vocabularies are staged",
         all((project / sub / "merges.txt").is_file() for sub in ("tokenizer", "tokenizer_2")),
-        "an endpoint bundles its own vocabularies like the model library it imports; a path "
+        "a package bundles its own vocabularies like the model library it imports; a path "
         "in the construction config would refuse",
     )
     have = snapshots()
@@ -452,9 +452,9 @@ def section_stage(args: argparse.Namespace) -> None:
         f"resident at the end: {sorted(rows.get('resident', {}))}",
     )
     check(
-        "the endpoint made ZERO memory-management calls to do it",
+        "the package made ZERO memory-management calls to do it",
         True,
-        "its only vocabulary is @uses_components; the `endpoint-owns-no-residency` fence "
+        "its only vocabulary is @uses_components; the `package-owns-no-residency` fence "
         "proves it cannot name a residency operation at all",
     )
     confessions = (filled.get("triage") or {}).get("confessions", ())

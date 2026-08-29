@@ -1,4 +1,4 @@
-"""A weightless endpoint used to prove dynamic endpoint publication and placement."""
+"""A weightless package used to prove dynamic package publication and placement."""
 
 from __future__ import annotations
 

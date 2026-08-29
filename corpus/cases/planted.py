@@ -1,4 +1,4 @@
-"""The issue's explicitly named planted red arms, as real endpoint code.
+"""The issue's explicitly named planted red arms, as real package code.
 
 `devices.py` already carries the CPU-stray pair and `scripts/derive-verify.py` carries the
 missing-destination and orphan-part/scale arms (they are MATCH-direction facts, which need

@@ -97,7 +97,7 @@ class LocalPlacementFacts:
 
     environment_spec_digest: str
     installed_environment_receipt_digest: str
-    descriptor_digest: str
+    package_descriptor_digest: str
     environment_root: Path
     wheelhouse_manifest: Path
 
@@ -142,7 +142,7 @@ class LocalRequest:
     entrypoint: str
     payload: dict[str, Any]
     #: the result FIELD PATHS the caller grants a destination for (`image`, `detail.thumb`).
-    #: cr-016 derives these from the endpoint descriptor; here the driver names them, and a
+    #: cr-016 derives these from the package descriptor; here the driver names them, and a
     #: set that does not match what the handler produced refuses the tail whole (#248).
     outputs: tuple[str, ...] = ("image",)
     request_id: str = "run-1"
@@ -633,7 +633,7 @@ class LocalRecordOwner:
                     placement_id=LOCAL_PLACEMENT,
                     spec=pb.PlacementSpec(
                         # PROVENANCE only — the worker never resolves it (§1).
-                        endpoint_release_id=self.release_id,
+                        package_release_id=self.release_id,
                         environment_spec_digest=(
                             documents.raw(self.placement_facts.environment_spec_digest)
                             if self.placement_facts is not None
@@ -644,8 +644,8 @@ class LocalRecordOwner:
                             if self.placement_facts is not None
                             else b""
                         ),
-                        descriptor_digest=(
-                            documents.raw(self.placement_facts.descriptor_digest)
+                        package_descriptor_digest=(
+                            documents.raw(self.placement_facts.package_descriptor_digest)
                             if self.placement_facts is not None
                             else b""
                         ),
@@ -749,7 +749,7 @@ class LocalRecordOwner:
         # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            endpoint_release_id=self.release_id,
+            package_release_id=self.release_id,
             environment_spec_digest=(
                 self.placement_facts.environment_spec_digest
                 if self.placement_facts is not None
@@ -934,18 +934,18 @@ class LocalRecordOwner:
 
 
 def stage_weightless_release(
-    cozy_home: Path, endpoint_descriptor: Mapping[str, Any]
+    cozy_home: Path, package_descriptor: Mapping[str, Any]
 ) -> StagedWeightlessRelease:
     """Stage the ONE canonical local closure for a wholly weightless release.
 
-    Tensorhub authors these exact Plan and model-root documents for a provisioned endpoint
+    Tensorhub authors these exact Plan and model-root documents for a provisioned package
     release. A local weightless run has no model root and nothing to fetch, but it still
     owes the worker the same stored-byte identities and complete visible-entrypoint set.
     This constructor is shared by the one-shot runner and process-launch acceptance paths;
     neither may revive the retired flat binding record.
     """
 
-    documents = weightless_release_documents(endpoint_descriptor)
+    documents = weightless_release_documents(package_descriptor)
     home = cozy_home.resolve()
     documents_root = home / "binding-documents"
     plans_root = home / "binding-plans"
@@ -974,7 +974,7 @@ def stage_weightless_release(
     selected = provisioned.read_provisioned_release(
         plan_documents,
         read_document=provisioned.staged_document_reader(documents_root),
-        endpoint_release="local-weightless",
+        package_release="local-weightless",
         store_root=artifact_store,
         object_set=provisioned.read_artifact_object_set(documents.artifact_object_set),
         dtype_widths={},
@@ -987,13 +987,13 @@ def stage_weightless_release(
 
 
 def weightless_release_documents(
-    endpoint_descriptor: Mapping[str, Any],
+    package_descriptor: Mapping[str, Any],
 ) -> WeightlessReleaseDocuments:
     """Construct the exact local weightless documents without choosing storage paths."""
 
-    entries = endpoint_descriptor.get("entrypoints")
+    entries = package_descriptor.get("entrypoints")
     if not isinstance(entries, list):
-        raise RuntimeError("a local serving closure requires an EndpointDescriptor entrypoint set")
+        raise RuntimeError("a local serving closure requires an PackageDescriptor entrypoint set")
     visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
@@ -1003,7 +1003,7 @@ def weightless_release_documents(
             "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
         )
 
-    descriptor_bytes = descriptor.canonical_bytes(endpoint_descriptor)
+    descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
     plans: dict[str, bytes] = {}
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
@@ -1011,9 +1011,9 @@ def weightless_release_documents(
         plan_bytes = canonical.write(
             {
                 "bindings": [],
-                "descriptor": descriptor_ref,
+                "package_descriptor": descriptor_ref,
                 "entrypoint": entrypoint,
-                "format": "cozy.endpoint.EntrypointBindingPlan/1",
+                "format": "cozy.package.EntrypointBindingPlan/1",
             }
         )
         plans[entrypoint] = plan_bytes
@@ -1097,7 +1097,7 @@ def run_slice(
     *,
     workspace: Path,
     release_id: str,
-    endpoint_descriptor: Mapping[str, Any] | None = None,
+    package_descriptor: Mapping[str, Any] | None = None,
     placement_facts: LocalPlacementFacts | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
@@ -1119,14 +1119,14 @@ def run_slice(
     plans: dict[str, str] = {}
     plan_refs: dict[str, tuple[str, int]] = {}
     staged: StagedWeightlessRelease | None = None
-    if endpoint_descriptor is not None:
+    if package_descriptor is not None:
         if request.kind != "entrypoint":
-            raise RuntimeError("only a serving run accepts an endpoint binding closure")
-        staged = stage_weightless_release(config.cozy_home, endpoint_descriptor)
+            raise RuntimeError("only a serving run accepts a package binding closure")
+        staged = stage_weightless_release(config.cozy_home, package_descriptor)
         plans.update(staged.plans)
         plan_refs.update(staged.plan_refs)
     if placement_facts is not None and staged is None:
-        raise RuntimeError("qualified placement facts require a staged endpoint closure")
+        raise RuntimeError("qualified placement facts require a staged package closure")
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
         request,

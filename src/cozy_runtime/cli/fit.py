@@ -33,7 +33,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         raise CliError(
             "validation",
             str(exc),
-            "an endpoint's surface must be valid to be fitted",
+            "a package's surface must be valid to be fitted",
             Exit.validation,
         ) from exc
 

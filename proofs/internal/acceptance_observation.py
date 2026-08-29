@@ -22,7 +22,7 @@ from proof_data import installed_base_ownership, inventory, pack_installed, whee
 
 from cozy_runtime.internal import canonical, descriptor, local, overlay
 from cozy_runtime.internal.config import read_config
-from cozy_runtime.internal.materialize_launch import endpoint_overlay_input
+from cozy_runtime.internal.materialize_launch import package_overlay_input
 from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -38,7 +38,7 @@ def main() -> int:
     setup = sub.add_parser("setup")
     setup.add_argument("root", type=Path)
     setup.add_argument("project_wheel", type=Path)
-    setup.add_argument("descriptor", type=Path)
+    setup.add_argument("package_descriptor", type=Path)
     run = sub.add_parser("run")
     run.add_argument("root", type=Path)
     failure = sub.add_parser("failure")
@@ -47,7 +47,7 @@ def main() -> int:
     verify.add_argument("root", type=Path)
     args = parser.parse_args()
     if args.command == "setup":
-        _setup(args.root, args.project_wheel, args.descriptor)
+        _setup(args.root, args.project_wheel, args.package_descriptor)
     elif args.command == "run":
         _run(args.root)
     elif args.command == "failure":
@@ -116,9 +116,9 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     )
     bundle_raw = canonical.write(
         {
-            "descriptor": _ref(descriptor_raw),
-            "endpoint_release_id": "local/marco@acceptance-1",
-            "format": "tensorhub.endpoint_bundle/2",
+            "package_descriptor": _ref(descriptor_raw),
+            "package_release_id": "local/marco@acceptance-1",
+            "format": "tensorhub.package_bundle/2",
             "project_wheel": wheel(project, import_roots=True),
             "resolved_wheel_set": _ref(resolved_raw),
             "source_archive": _ref(b"source"),
@@ -127,17 +127,17 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
         }
     )
     environment_spec_raw = documents.canonical_bytes(
-        pb.EndpointEnvironmentSpec(
+        pb.PackageEnvironmentSpec(
             compatibility_profile=pb.CompatibilityProfile(**profile),
             platform_target=pb.PlatformTarget(**target),
-            endpoint_bundle_digest=documents.digest_of(bundle_raw),
+            package_bundle_digest=documents.digest_of(bundle_raw),
             project_wheel_digest=documents.raw(project.digest),
             wheelhouse_manifest_digest=documents.digest_of(wheelhouse_raw),
         )
     )
-    source = endpoint_overlay_input(
+    source = package_overlay_input(
         environment_spec_bytes=environment_spec_raw,
-        endpoint_bundle_bytes=bundle_raw,
+        package_bundle_bytes=bundle_raw,
         resolved_wheel_set_bytes=resolved_raw,
         wheelhouse_manifest_bytes=wheelhouse_raw,
         wheel_paths={project.digest: project_wheel.resolve()},
@@ -149,10 +149,10 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
         base_manifest=_write(inputs / "wheelhouse-manifest.json", wheelhouse_raw),
     )
     _write(inputs / "installed-environment-receipt.json", installed.receipt_bytes)
-    _write(inputs / "endpoint-environment-spec.json", environment_spec_raw)
-    _write(inputs / "endpoint-bundle.json", bundle_raw)
+    _write(inputs / "package-environment-spec.json", environment_spec_raw)
+    _write(inputs / "package-bundle.json", bundle_raw)
     _write(inputs / "resolved-wheel-set.json", resolved_raw)
-    _write(inputs / "endpoint-descriptor.json", descriptor_raw)
+    _write(inputs / "package-descriptor.json", descriptor_raw)
 
     closure = local.weightless_release_documents(descriptor_body)
     plan_rows: list[dict[str, Any]] = []
@@ -165,34 +165,34 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
         {
             "canonical_execution": {
                 "build_record_digest": _digest(b"build-record"),
-                "descriptor_digest": _digest(descriptor_raw),
-                "endpoint_control_manifest_digest": _digest(b"control-manifest"),
+                "package_descriptor_digest": _digest(descriptor_raw),
+                "package_control_manifest_digest": _digest(b"control-manifest"),
                 "environment_spec_digest": _digest(environment_spec_raw),
                 "installed_environment_receipt_digest": installed.receipt_digest,
             },
             "compatible_accelerator_models": ["CPU"],
             "function": "marco",
-            "kind": "tensorhub.endpoint_execution/2",
+            "kind": "tensorhub.package_execution/2",
             "model_roots": [],
         }
     )
-    execution_path = _write(inputs / "endpoint-execution.json", execution_raw)
+    execution_path = _write(inputs / "package-execution.json", execution_raw)
     binding_release_raw = canonical.write(
         {
-            "descriptor": _ref(descriptor_raw),
+            "package_descriptor": _ref(descriptor_raw),
             "documents": [
                 {"kind": row["kind"], "ref": _public_ref(row["ref"])} for row in plan_rows
             ],
-            "endpoint_execution_digest": _digest(execution_raw),
+            "package_execution_digest": _digest(execution_raw),
             "environment_spec": _ref(environment_spec_raw),
-            "format": "tensorhub.endpoint_binding_release/1",
+            "format": "tensorhub.package_binding_release/1",
             "installed_environment_receipt": _ref(installed.receipt_bytes),
             "object_set_digest": str(object_set_ref["digest"]),
         }
     )
-    _write(inputs / "endpoint-binding-release.json", binding_release_raw)
+    _write(inputs / "package-binding-release.json", binding_release_raw)
     fixture_request = {
-        "endpoint_descriptor": _local_ref(inputs / "endpoint-descriptor.json"),
+        "package_descriptor": _local_ref(inputs / "package-descriptor.json"),
         "entrypoint": "marco",
         "format": "cozy.runtime.AcceptanceFixtureRequest/1",
         "input_root": str(inputs),
@@ -202,8 +202,8 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
         "artifact_store": str(artifact_store),
         "binding_documents": plan_rows,
         "control_runtime_digest": base.digest,
-        "descriptor_digest": _digest(descriptor_raw),
-        "endpoint_release_id": "local/marco@acceptance-1",
+        "package_descriptor_digest": _digest(descriptor_raw),
+        "package_release_id": "local/marco@acceptance-1",
         "environment_root": str(environment_root),
         "environment_spec_digest": _digest(environment_spec_raw),
         "installed_environment_receipt_digest": installed.receipt_digest,
@@ -221,7 +221,7 @@ def _run(root: Path) -> None:
     payload = canonical.parse_canonical(payload_raw)
     if payload != {"message": "marco"}:
         raise ProofFailure(f"fixture changed: {payload!r}")
-    descriptor_body = descriptor.read_bytes((inputs / "endpoint-descriptor.json").read_bytes())
+    descriptor_body = descriptor.read_bytes((inputs / "package-descriptor.json").read_bytes())
     config = read_config(
         {
             "PATH": os.environ["PATH"],
@@ -232,7 +232,7 @@ def _run(root: Path) -> None:
     facts = local.LocalPlacementFacts(
         environment_spec_digest=str(state["environment_spec_digest"]),
         installed_environment_receipt_digest=str(state["installed_environment_receipt_digest"]),
-        descriptor_digest=str(state["descriptor_digest"]),
+        package_descriptor_digest=str(state["package_descriptor_digest"]),
         environment_root=Path(str(state["environment_root"])),
         wheelhouse_manifest=inputs / "wheelhouse-manifest.json",
     )
@@ -245,12 +245,12 @@ def _run(root: Path) -> None:
             request_id="acceptance-marco",
         ),
         workspace=root / "ordinary-attempt",
-        release_id=str(state["endpoint_release_id"]),
-        endpoint_descriptor=descriptor_body,
+        release_id=str(state["package_release_id"]),
+        package_descriptor=descriptor_body,
         placement_facts=facts,
         options=WorkerOptions(
             root=root / "ordinary-attempt" / "worker",
-            release_id=str(state["endpoint_release_id"]),
+            release_id=str(state["package_release_id"]),
             control_runtime_digest=str(state["control_runtime_digest"]),
             no_warm=True,
         ),
@@ -281,11 +281,11 @@ def _run(root: Path) -> None:
         "attempt_outcome": _local_ref(outcome_path),
         "binding_documents": state["binding_documents"],
         "control_runtime_digest": state["control_runtime_digest"],
-        "endpoint_binding_release": _local_ref(inputs / "endpoint-binding-release.json"),
-        "endpoint_bundle": _local_ref(inputs / "endpoint-bundle.json"),
-        "endpoint_descriptor": _local_ref(inputs / "endpoint-descriptor.json"),
-        "endpoint_environment_spec": _local_ref(inputs / "endpoint-environment-spec.json"),
-        "endpoint_execution": state["execution"],
+        "package_binding_release": _local_ref(inputs / "package-binding-release.json"),
+        "package_bundle": _local_ref(inputs / "package-bundle.json"),
+        "package_descriptor": _local_ref(inputs / "package-descriptor.json"),
+        "package_environment_spec": _local_ref(inputs / "package-environment-spec.json"),
+        "package_execution": state["execution"],
         "entrypoint": "marco",
         "environment_root": state["environment_root"],
         "fixture_payload": _local_ref(fixture_path),

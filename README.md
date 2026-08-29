@@ -1,7 +1,7 @@
 # cozy-runtime (v2)
 
 The worker runtime: author surface (`cozy_runtime.author`), worker, disposable device
-executor, and the single-endpoint CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
+executor, and the single-package CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
 `cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.
 
 **No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
@@ -12,7 +12,7 @@ the real thing and recording what it did, plus time/memory benchmarks.
 
 | package | role | may import |
 |---|---|---|
-| `cozy_runtime.author` | the whole author surface — the only package endpoint code imports | stdlib + msgspec |
+| `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
 | `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
 | `cozy_runtime.cli` | local RecordOwner adapter over the core | author, internal |
@@ -88,7 +88,7 @@ killed executor is therefore explainable from a directory, with no live process 
 
 **Every granted destination is CONTROL-PLANE-MINTED** (cr-042). The closed `HUB_CALLS` table
 in `internal/worker/grants.py` spends a grant minted for one invocation, so nothing the
-endpoint produced — and nothing a request body can influence — chooses where bytes land; a
+package produced — and nothing a request body can influence — chooses where bytes land; a
 destination with no row is a SECURITY EVENT. Every row is `file://` today.
 `OutputAccess.url`'s "presigned upload URL" is the PLANNED public route — tensorhub mints
 it, R2 sits behind it, the worker never holds the credential — and lands WITH host
@@ -97,8 +97,8 @@ Armed by `scripts/worker-live.py grants` end to end and `scripts/assets-live.py 
 the table.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
-installs `sandbox.refuse_network`, so endpoint or job code that dials is refused typed at
-the first `NETWORK_EVENTS` spelling. That bounds a BUGGY endpoint (law 15's same-tenant
+installs `sandbox.refuse_network`, so package or job code that dials is refused typed at
+the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
 rung). It is not a kernel bound: the executor runs in the worker's own network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
 hook. `scripts/lifecycle-live.py --only egress` observes both halves against one reachable
@@ -110,15 +110,15 @@ a wedge is consecutive observations that find the position unchanged. `give_up_a
 observations, not seconds — there is no boot timeout and there will not be one — and the
 `timing-decides-nothing` fence proves the observation plane cannot reach residency or placement.
 
-**Component residency is the runtime's, and the endpoint has no vocabulary for it.** An
-endpoint declares the possible heavyweight set of each public model operation with
+**Component residency is the runtime's, and the package has no vocabulary for it.** An
+package declares the possible heavyweight set of each public model operation with
 `@uses_components` and nothing else. Entering that scope ADMITS and MATERIALIZES the set
 before the body runs — freeing non-declared components, LRU over refcount-0 leases whose
 CUDA events have fired, until the plan's activation envelope fits ALLOCATABLE capacity —
 and leaving it records the fence and makes the bytes evictable. Eviction FREES; there is no
 host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cached CAS
-mapping. The `endpoint-owns-no-residency` fence proves the vocabulary is unreachable from
-endpoint code rather than merely unused.
+mapping. The `package-owns-no-residency` fence proves the vocabulary is unreachable from
+package code rather than merely unused.
 
 **The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
 coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming
@@ -136,11 +136,11 @@ against the line taken before its envelope was granted, and the record is journa
 ## The descriptor
 
 `internal/discovery.py` is the isolation boundary: it imports exactly the ONE `App` export
-endpoint.toml names, freezes it, and stops. Importing a module never registers anything, so
+package.toml names, freezes it, and stops. Importing a module never registers anything, so
 there is no recursive discovery, no dependency stubbing and no source parser — a red arm
 plants a self-registering sibling module and proves describe cannot see it.
 
-`internal/descriptor.py` is the schema home for `EndpointDescriptor`/`JobDescriptor`: only
+`internal/descriptor.py` is the schema home for `PackageDescriptor`/`JobDescriptor`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
 inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
@@ -152,19 +152,19 @@ refusals are shared and which are deliberate profile differences.
 The descriptor is derived, not committed. `cozy-runtime --json --dir PROJECT describe` writes
 the canonical descriptor bytes to stdout without modifying the project. Creator sends those
 bytes with the source release; Tensorhub independently derives the descriptor from the installed
-project wheel and compares it. `descriptor_digest` is SHA-256 over those canonical bytes.
+project wheel and compares it. `package_descriptor_digest` is SHA-256 over those canonical bytes.
 
 ## Commands
 
     uv sync
     uv run cozy-runtime version          # tag, commit, wire + python semvers
-    uv run cozy-runtime new <name>       # scaffold a minimal valid endpoint
+    uv run cozy-runtime new <name>       # scaffold a minimal valid package
     uv run cozy-runtime describe              # human-readable surface summary
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
     uv run python checks/architecture.py # architecture fences
     uv run python scripts/redarm.py      # plant each violation, prove it red, restore
     uv run python checks/declared_facts.py # every public Context/service fact has a live writer
-    uv run python scripts/verify.py      # live run of both example endpoints end to end
+    uv run python scripts/verify.py      # live run of both example packages end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
     proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
@@ -174,7 +174,7 @@ project wheel and compares it. `descriptor_digest` is SHA-256 over those canonic
     uv run --extra media python scripts/media-stream-live.py # cr-029 2/8-shot RSS + kill cleanup
 
 The model-contract proof builds a Runtime wheel, installs it into a fresh driver environment,
-and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its endpoint and
+and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its package and
 fake Torch packages live as ordinary, linted projects under `proofs/fixtures/`. They exercise the
 weightless control plane only; this proof makes no claim about real Torch, GPU execution, model
 loading, or output quality.
@@ -185,7 +185,7 @@ driver, matching the base worker image. The command hashes and inspects only the
 wheels, extracts them into private staging, precompiles that small overlay, and atomically
 publishes it. Cold and independent rebuilds produce the same compact receipt.
 
-### Installed base plus endpoint overlay
+### Installed base plus package overlay
 
 `internal/overlay.py` is the serving materializer. The image already contains Python,
 Torch/CUDA, cozy-runtime, TensorFS, and the registered base-family dependencies. A placement
@@ -198,14 +198,14 @@ canonical ownership document for that image: its existing platform target and ex
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
 sorted unique import roots: the five control rows in `WheelhouseManifest/3`, the project row in
-`EndpointBundle/2`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
+`PackageBundle/2`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
 There is no `/1` reader and no
 hardcoded protected-root list.
 
-Runtime hashes each arriving endpoint wheel once. A worker-boot-local verified-file receipt binds
+Runtime hashes each arriving package wheel once. A worker-boot-local verified-file receipt binds
 its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
 stat change or worker restart re-hashes before trust. Overlay admission consumes the receipt instead
 of hashing the same wheel again. Each verified wheel is extracted once into a root-owned immutable
@@ -215,16 +215,16 @@ metadata-only environment-spec change shares one compiled content tree and a one
 shares every unchanged installed inode. The spec-specific receipt remains a separate exact join.
 
 The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
-and drops endpoint execution to uid/gid 65533. Receipts, acquisition cache, journal and worker
+and drops package execution to uid/gid 65533. Receipts, acquisition cache, journal and worker
 credentials remain root-only. Content is root-owned/read-only, and executor scratch/probe state is
 private to one incarnation and deleted before the fixed uid is reused. A worker that cannot perform
 the identity split refuses before binding. Native/local development keeps its explicit same-user
-lane. Base bytecode is baked in the image and endpoint bytecode is compiled once per content
+lane. Base bytecode is baked in the image and package bytecode is compiled once per content
 identity. The executor starts with image Python and appends the exact content import root after
 image-owned paths.
 
 An overlay contains exactly one project wheel and at most 127 custom wheels. The Runtime bound is
-128 total endpoint-owned wheels, counting the project; 128 custom rows plus the project refuses
+128 total package-owned wheels, counting the project; 128 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
 The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
@@ -262,7 +262,7 @@ WheelhouseManifest/project/custom-wheel join.
 
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. The standing grant supplies access only. The non-control
-convergence lane starts endpoint and model acquisition together. As soon as endpoint overlay and
+convergence lane starts package and model acquisition together. As soon as package overlay and
 binding documents are admitted from a standing start, Runtime spawns the executor so interpreter
 and Torch import overlap continued TensorFS hydration; model preparation/fill still waits for the
 exact model closure. READY remains the join of overlay, TensorFS closure, binding resolution and
@@ -270,14 +270,14 @@ device construction. An outgoing placement is never disturbed by this optimizati
 refresh re-drives the same accepted revision without changing its identity.
 
 `PlacementStatus.acquisition` exposes that work as observation only. It retains
-endpoint/model start and end values from one process-monotonic clock plus cumulative
+package/model start and end values from one process-monotonic clock plus cumulative
 downloaded/reused bytes. Partial states are emitted while either leg runs; terminal values
 remain attached to that placement spec. These values are never read by admission,
 materialization, convergence, fallback, or readiness code. Cold proof checks interval overlap;
-warm proof checks zero downloaded endpoint bytes and exact verified reuse, while the real
+warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-The CLI proof builds and installs the current wheel plus an ordinary weightless endpoint
+The CLI proof builds and installs the current wheel plus an ordinary weightless package
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
 `cozy-runtime` command. It proves the current process exit matrix, read-only and exact-byte
 Descriptor/1 behavior, canonical/local/strict key classification through a real job, typed
@@ -293,7 +293,7 @@ the installed-base Python, a fresh overlay root, and a fresh receipt output. `wh
 contains only the project and optional custom wheels; base wheel bytes do not travel. It
 atomically publishes the overlay receipt bytes and prints their compact
 digest/length/generation reference. It
-does not accept an expected receipt, author release documents, fetch, resolve, or import endpoint
+does not accept an expected receipt, author release documents, fetch, resolve, or import package
 code.
 
 The request is ordinary JSON because it is a process input, not an identity document. Its field
@@ -302,8 +302,8 @@ set is closed; every path value is a normalized absolute local path:
 ```json
 {
   "format": "cozy.runtime.EnvironmentProofRequest/1",
-  "endpoint_environment_spec": "/proof/endpoint-environment-spec.json",
-  "endpoint_bundle": "/proof/endpoint-bundle.json",
+  "package_environment_spec": "/proof/package-environment-spec.json",
+  "package_bundle": "/proof/package-bundle.json",
   "resolved_wheel_set": "/proof/resolved-wheel-set.json",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
@@ -322,7 +322,7 @@ provider OCI readback; Creator independently validates and hash-binds its Manage
 {
   "format": "cozy.runtime.NativeWheelProofRequest/1",
   "device_index": 0,
-  "endpoint_environment_spec_digest": "sha256:<64 lowercase hex>",
+  "package_environment_spec_digest": "sha256:<64 lowercase hex>",
   "environment_root": "/proof/installed-environment",
   "installed_environment_receipt_digest": "sha256:<64 lowercase hex>",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
@@ -344,7 +344,7 @@ spec, installed receipt and overlay content digests, but carries no unmeasured r
 second executor. `fixture REQUEST.json PAYLOAD.json` derives a deterministic neutral payload from
 the exact descriptor; `observe REQUEST.json OBSERVATION.json` runs only after Tensorhub has sent
 that payload as an ordinary Worker attempt with `boot_warmup=false`. The observer re-joins the
-exact endpoint execution, binding release, EES/EndpointBundle/RWS/WHM/overlay receipt, placement,
+exact package execution, binding release, EES/PackageBundle/RWS/WHM/overlay receipt, placement,
 InvocationSpec, AttemptAccepted and AttemptOutcome and emits bounded canonical
 `cozy.runtime.ExecutionObservation/1`. It derives the canonical base-worker profile label and
 requires the authenticated ClaimAck control-Runtime digest to equal the WHM's `cozy-runtime`
@@ -372,7 +372,7 @@ stores those bytes and refs; it never authors or reserializes an MCC.
 The request is a closed local process input. Every descriptor model path appears exactly
 once; a function with no model is still recorded in the output index with `bindings: []`.
 Config and descriptor input refs bind exact local bytes for proof ingestion. Their generic
-`digest` is byte integrity and is never compared with semantic `descriptor_digest`:
+`digest` is byte integrity and is never compared with semantic `package_descriptor_digest`:
 
 ```json
 {
@@ -382,9 +382,9 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
   "project_wheel_digest": "sha256:<64 lowercase hex>",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
-  "endpoint_release_id": "endpoint-release-id",
-  "endpoint_descriptor": {
-    "path": "/proof/endpoint.descriptor.json",
+  "package_release_id": "package-release-id",
+  "package_descriptor": {
+    "path": "/proof/package.descriptor.json",
     "digest": "sha256:<64 lowercase hex>",
     "length": 5678
   },
@@ -401,7 +401,7 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 }
 ```
 
-An endpoint whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
+A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `describe` refuses the release if PyAV is absent. The descriptor publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
 
@@ -445,7 +445,7 @@ The base package installs and type-checks without it, exactly as it does without
 fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
 `ImportError` escaping a request.
 
-Two real endpoints on the author surface (weightless, no GPU), both driven end to end by
+Two real packages on the author surface (weightless, no GPU), both driven end to end by
 `scripts/verify.py`:
 
 | example | what it exercises |
@@ -453,9 +453,9 @@ Two real endpoints on the author surface (weightless, no GPU), both driven end t
 | `examples/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
 | `examples/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, a declared `DerivedCache`, and the `@app.job` that exercises JobDescriptor |
 
-`examples/tiny_diffusers.py` stands in for the model library an endpoint brings as an
+`examples/tiny_diffusers.py` stands in for the model library a package brings as an
 ordinary dependency (and registers its own construction adapter); `examples/tiny_artifacts.py`
-and `examples/endpoint.toml` are the RUNTIME's side — resolved artifacts and default
+and `examples/package.toml` are the RUNTIME's side — resolved artifacts and default
 bindings. Author code never names an artifact identifier; a fence proves it.
 
 `run` · `serve` · `job` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit` land in

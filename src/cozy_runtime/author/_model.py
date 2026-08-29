@@ -7,7 +7,7 @@ There is no slot object, no `artifacts=` dict, and the `Annotated` override-mark
 EMPTY at launch. The CLASS carries the admissibility stamps — one keyword per REQUIRED
 stamp from the family's OPEN uploader-minted vocabulary, stated once per role class.
 
-Construction identity is (endpoint release, model class, exact artifact snapshot + immutable
+Construction identity is (package release, model class, exact artifact snapshot + immutable
 config, construction/provider variant). Equal identities coalesce ONE single-flight model
 generation; unequal ones stay distinct instances with independent lifecycle and admission.
 
@@ -72,9 +72,9 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
 #:
 #: Every other rung the runtime can choose is invisible to author code by construction: the
 #: weights arrive as float tensors in the destinations the census named, and which stored
-#: bytes they came from is not a question the endpoint can ask. The `encoded_gemm` route is
+#: bytes they came from is not a question the package can ask. The `encoded_gemm` route is
 #: the one that cannot be invisible. Its leaf has no `.weight` — the payload and its scales
-#: ARE the weight, the module that multiplies by them is REPLACED, and an endpoint that
+#: ARE the weight, the module that multiplies by them is REPLACED, and a package that
 #: reaches into `layer.weight`, re-dtypes a submodule, or rebuilds a `nn.Linear` from one
 #: finds something that is not there.
 #:
@@ -84,7 +84,7 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
 #: it. `EXCLUDED_KEYWORDS` keeps `quantize` out of every method signature for the opposite
 #: and complementary reason — WHICH encoding serves is derived, never authored — and the two
 #: rules meet exactly here: the author never picks the encoding, and the runtime never
-#: replaces a leaf in an endpoint that did not say it could take one.
+#: replaces a leaf in a package that did not say it could take one.
 #:
 #: A string rather than a bool, and a closed vocabulary rather than an open one, because the
 #: class-keyword plane is uniformly string-valued (the stamps are) and because "refuse" then
@@ -92,7 +92,7 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
 ENCODED_LEAVES: Mapping[str, str] = {
     "refuse": "the runtime fills float destinations and never replaces a module; an "
     "artifact whose only qualified route on this device is native refuses typed",
-    "accept": "this endpoint's code touches its components through their FORWARD only — "
+    "accept": "this package's code touches its components through their FORWARD only — "
     "no `.weight` read, no per-module dtype walk, no submodule rebuilt from one — so a "
     "linear op may be replaced by a module whose weight is the stored role set",
 }
@@ -118,9 +118,9 @@ EXCLUDED_KEYWORDS: Mapping[str, str] = {
     "device": "placement is the runtime's; the method wrapper exposes no device",
     "dtype": "compute dtype is a plan decision, not a request knob",
     "torch_dtype": "compute dtype is a plan decision, not a request knob",
-    "path": "no filesystem path reaches endpoint code",
-    "checkpoint_path": "no filesystem path reaches endpoint code",
-    "weights_path": "no filesystem path reaches endpoint code",
+    "path": "no filesystem path reaches package code",
+    "checkpoint_path": "no filesystem path reaches package code",
+    "weights_path": "no filesystem path reaches package code",
     "offload": "there is no manual load/offload/staging API in request code",
     "pin": "pinning is the residency backend's",
     "pinned": "pinning is the residency backend's",
@@ -153,7 +153,7 @@ class ScopeCall:
 class ModelTestHarness:
     """Installs immutable construction facts and records component-scope calls.
 
-    It never invents outputs for model-specific methods: an endpoint test supplies model
+    It never invents outputs for model-specific methods: a package test supplies model
     behavior explicitly as author-built doubles (`for_test(pipe=FakeH3Pipeline())`).
     """
 
@@ -206,7 +206,7 @@ class Residency(Protocol):
     because admission, materialization, event fencing and eviction all need a device and
     this package is torch-free by construction. cozy-runtime supplies the body
     (`internal/residency.py`); a promoted Varena adapter would supply a different one and the
-    endpoint above would not be able to tell.
+    package above would not be able to tell.
 
     `admit` runs BEFORE method entry and either makes the declared set materialized or
     refuses typed. `release` runs after the body returns, records the event fence, and makes
@@ -326,7 +326,7 @@ def _refuse_lazy(method: str, result: object) -> None:
 
 
 class Model(Generic[PipelineT]):
-    """Base of an endpoint's reusable model class — the ONE long-lived model boundary.
+    """Base of a package's reusable model class — the ONE long-lived model boundary.
 
     The author owns WHAT the model is (`load`/`unload`, declared persistent state, the
     component-touching methods handlers call); the runtime owns WHEN they run and where
@@ -339,7 +339,7 @@ class Model(Generic[PipelineT]):
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
 
-    REFUSE is the default because the absence of a statement is not consent. An endpoint
+    REFUSE is the default because the absence of a statement is not consent. A package
     written before the native rung existed cannot have thought about whether its code
     survives leaf replacement, and reading its silence as "yes" would be the runtime
     deciding a question only the author can answer."""
@@ -525,7 +525,7 @@ class Model(Generic[PipelineT]):
         # touched and never who touched it, and the difference is not academic: a guarded
         # root is reached through `__getattr__`, so the offender is by definition NOT in
         # the message, and locating one cost a whole investigation that ended in "cause
-        # not located". The author frames are the interesting ones — an endpoint reading a
+        # not located". The author frames are the interesting ones — a package reading a
         # component outside its scope is the case this guard is FOR — so the runtime's own
         # frames are kept too, because the other case is the runtime probing a root it
         # installed, which is exactly what a bare message cannot distinguish.
@@ -563,7 +563,7 @@ class Model(Generic[PipelineT]):
                 raise CapabilityError(
                     f"{type(self).__name__}.{name} = {type(value).__name__}: request-local "
                     "state cannot escape onto the long-lived model — it lives on the "
-                    "RequestView or an endpoint-specific attempt object (§1.1.2)",
+                    "RequestView or a package-specific attempt object (§1.1.2)",
                     code="request_state_escape",
                     fields=[name],
                 )
@@ -879,7 +879,7 @@ class ModelRegistry:
             # GuardedComponent runs `__getattr__`, which checks the active component-use
             # scope. There is no scope during construction, so the RUNTIME'S OWN generic
             # probe tripped the RUNTIME'S OWN guard and poisoned the generation with
-            # `undeclared_component` naming a component no endpoint had touched.
+            # `undeclared_component` naming a component no package had touched.
             #
             # Read off the failing path itself once the refusal learned to name its caller:
             #     __getattr__ <- typing <genexpr> <- __instancecheck__ <- _schedulers
@@ -887,7 +887,7 @@ class ModelRegistry:
             #
             # It stayed hidden because `install_guards` installs nothing unless the
             # constructed object exposes a real `components` dict, and H3Pipeline is the
-            # first endpoint that does — so H3 is the first construction ever to be guarded
+            # first package that does — so H3 is the first construction ever to be guarded
             # at all. Both facts are facts about the CONSTRUCTED objects, and the ordering
             # is the whole fix: infrastructure reads them raw, and the guards go on
             # afterwards for the author code they were built for.
@@ -940,7 +940,7 @@ def _admit(cls: type[Model[Any]], artifact: Artifact) -> None:
     """The class's stamps JOIN THE CHECKPOINT'S VERIFIED STAMP SET BY MEMBERSHIP, fail-closed.
 
     A stamp key carries a SET of values, not a scalar, and that is not a loosening — it is
-    the ratified law (tensorhub.md §lane: "an endpoint `task=` requirement joins by set
+    the ratified law (tensorhub.md §lane: "a package `task=` requirement joins by set
     membership"), and the N-ARY PACKAGING RULE cannot be served without it. Stamps are a
     CHECKPOINT fact: the dual H3 artifact carries one `transformer` stamped `task=fl2va` and
     one `transformer_ref` stamped `task=ref2va`, so its lane contract is

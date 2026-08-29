@@ -3,7 +3,7 @@
 That is the COMPLETE discovery algorithm (§1.0). Importing a module never registers
 anything — registration is a method call on the app object — so there is nothing to
 harvest, no package to walk, no dependency to stub and no source to parse. Everything a
-descriptor says comes from the object endpoint.toml named.
+descriptor says comes from the object package.toml named.
 
 Execution containment is a TIER-INDEPENDENT property of the caller, not of this module:
 the trusted build runs `describe` in a disposable container of the already-built release
@@ -35,7 +35,7 @@ IMPORT_SECONDS = 60.0
 
 
 class DiscoveryError(ConformanceError):
-    """A BUILD refusal at the boundary: the endpoint cannot be discovered as configured."""
+    """A BUILD refusal at the boundary: the package cannot be discovered as configured."""
 
     default_code = "discovery"
 
@@ -55,18 +55,18 @@ class Discovered:
 
 
 def read_application(project: Path) -> str:
-    """`[application] object` from endpoint.toml, or the zero/ambiguous refusal."""
-    path = project / "endpoint.toml"
+    """`[application] object` from package.toml, or the zero/ambiguous refusal."""
+    path = project / "package.toml"
     if not path.is_file():
         raise DiscoveryError(
-            f"{path} does not exist: an endpoint repository has endpoint.toml naming its "
-            'one app export ([application] object = "my_endpoint:app")',
-            code="no_endpoint_toml",
+            f"{path} does not exist: a package repository has package.toml naming its "
+            'one app export ([application] object = "my_package:app")',
+            code="no_package_toml",
         )
     try:
         data = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as exc:
-        raise DiscoveryError(f"{path} is not valid TOML: {exc}", code="endpoint_toml") from exc
+        raise DiscoveryError(f"{path} is not valid TOML: {exc}", code="package_toml") from exc
     application = data.get("application", {})
     obj = application.get("object") if isinstance(application, dict) else None
     if not isinstance(obj, str) or not obj:
@@ -90,10 +90,10 @@ def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
 
 
 def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
-    """Freeze one descriptor-named export from the installed endpoint environment.
+    """Freeze one descriptor-named export from the installed package environment.
 
-    A materialized rental has an immutable venv, not a copied source tree or endpoint.toml.
-    The exact EndpointDescriptor supplies the application identity; importing anything else
+    A materialized rental has an immutable venv, not a copied source tree or package.toml.
+    The exact PackageDescriptor supplies the application identity; importing anything else
     or adding a host path would recreate the source/PYTHONPATH authority the adapter rejects.
     """
 
@@ -161,11 +161,11 @@ def _import(module_name: str, application: str) -> ModuleType:
 
 
 def _bindings(project: Path) -> Mapping[str, Mapping[str, object]]:
-    """endpoint.toml's binding table. NOT descriptor content — the fixed-point scan reads it
+    """package.toml's binding table. NOT descriptor content — the fixed-point scan reads it
     to prove no mutable binding leaked into the descriptor."""
     from cozy_runtime.internal.bindings import read_table
 
-    return read_table(project / "endpoint.toml")
+    return read_table(project / "package.toml")
 
 
 @contextmanager

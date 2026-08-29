@@ -2,7 +2,7 @@
 """cr-006 live verification: a REAL fp8-scaled-scalar artifact, filled and served.
 
 Not a test (tracker README #160): every leg below runs the real border, the real fill
-plane and the real endpoint, and prints numbers.
+plane and the real package, and prints numbers.
 
 The proof needs an artifact in the encoding proto-001 SELECTED (`fp8-scaled-scalar/1`,
 the Comfy `scaled_fp8` dialect). The H3 DiT that carries it is 72.90 GiB and its weights
@@ -640,7 +640,7 @@ def install_into(root: Path) -> str:
 
 
 def exec_one(spec_path: Path, out_path: Path) -> None:
-    """ONE request through the WHOLE real path — worker, executor, endpoint."""
+    """ONE request through the WHOLE real path — worker, executor, package."""
     import dataclasses
     import os
 

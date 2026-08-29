@@ -619,7 +619,7 @@ class AttemptEngine:
 
         This is the pre-admission half of the invocation kernel, run across the seam before
         anything is accepted. The worker cannot run it itself — resolving needs the
-        endpoint's declared types and this process never imports endpoint code — and it must
+        package's declared types and this process never imports package code — and it must
         not be skipped: a plan priced against a projection of the wire document is a plan
         chosen against a request nobody will run (codex audit, adopted 2026-08-25).
 
@@ -1386,7 +1386,7 @@ class AttemptEngine:
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,
             # which is why it installs `sandbox.refuse_network` (cr-042); that fence bounds
-            # a buggy endpoint at the Python layer and is not a kernel bound.
+            # a buggy package at the Python layer and is not a kernel bound.
             "inputs": inputs,
             "max_input_bytes": attempt.declared.max_input_bytes,
         }
@@ -1493,7 +1493,7 @@ class AttemptEngine:
         if breach:
             # THE ACCEPTED ENVELOPE WAS BREACHED. `_TERMINAL["failed"]` defaults to
             # AUTHOR_EXCEPTION because most failures are the handler's, and a device that ran
-            # out is the one class where the endpoint provably had no say — but it is not
+            # out is the one class where the package provably had no say — but it is not
             # CONSTRAINT_INFEASIBLE either. That code means "no plan fits", which is a
             # PRE-ENTRY answer this worker gives before it accepts anything; rendering a
             # post-accept OOM as one makes a planner or envelope defect read as a legitimate
@@ -2134,7 +2134,7 @@ class AttemptEngine:
         """
         envelope = pb.ResultEnvelope(
             # The DECLARED annotated result surface's identity, computed by the executor from
-            # the endpoint's own schema — never a digest of this particular value, which
+            # the package's own schema — never a digest of this particular value, which
             # would move every request and fence nothing.
             result_schema_digest=documents.raw(result.schema_digest),
             adjustments=[

@@ -1,4 +1,4 @@
-"""Authorized hardware proof for one already-materialized native endpoint overlay."""
+"""Authorized hardware proof for one already-materialized native package overlay."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ REQUEST_FORMAT = "cozy.runtime.NativeWheelProofRequest/1"
 EVIDENCE_FORMAT = "cozy.runtime.NativeWheelQualification/1"
 REQUEST_FIELDS = {
     "device_index",
-    "endpoint_environment_spec_digest",
+    "package_environment_spec_digest",
     "environment_root",
     "expected_result_digest",
     "fixture",
@@ -124,7 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ) from exc
         evidence = {
             "base_worker_profile": _profile_id(base),
-            "endpoint_environment_spec_digest": request.environment_spec_digest,
+            "package_environment_spec_digest": request.environment_spec_digest,
             "format": EVIDENCE_FORMAT,
             "host_capability": {
                 "gpu": gpu,
@@ -182,7 +182,7 @@ def _request(path: Path) -> Request:
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise _error("request fields are not closed")
     digests = (
-        "endpoint_environment_spec_digest",
+        "package_environment_spec_digest",
         "expected_result_digest",
         "installed_environment_receipt_digest",
     )
@@ -201,7 +201,7 @@ def _request(path: Path) -> Request:
         raise _error("fixture or device")
     return Request(
         device,
-        str(value["endpoint_environment_spec_digest"]),
+        str(value["package_environment_spec_digest"]),
         _existing_directory(_absolute(value["environment_root"], "environment_root")),
         str(value["expected_result_digest"]),
         fixture,

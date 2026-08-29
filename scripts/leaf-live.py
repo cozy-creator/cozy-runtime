@@ -104,7 +104,7 @@ def tfs_cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def construction_order() -> Path:
-    """Write the exact synthetic endpoint census TensorFS requires for artifact authorship."""
+    """Write the exact synthetic package census TensorFS requires for artifact authorship."""
     from cozy_runtime.author._loader import census as walk_census
 
     rows: list[list[str]] = []
@@ -710,7 +710,7 @@ def build_block(config: Any) -> LeafBlock:
 
 
 def make_model(consent: str | None) -> Any:
-    """The endpoint, with and without the consent declaration. Nothing else differs."""
+    """The package, with and without the consent declaration. Nothing else differs."""
     from cozy_runtime.author import Model, uses_components
     from cozy_runtime.author._loader import Loader
 
@@ -885,7 +885,7 @@ def fill() -> None:
 
     head("fill — the native rung end to end: consent, replacement, census, ledger")
 
-    # ARM, RED FIRST: an endpoint that never declared consent gets the typed refusal, and
+    # ARM, RED FIRST: a package that never declared consent gets the typed refusal, and
     # gets it before a destination is reserved.
     backend, rows = _backend("footprint")
     if not any(backend.resolved[r.key].route == "encoded_gemm" for r in rows):
@@ -898,17 +898,17 @@ def fill() -> None:
         return
     try:
         _acquire(backend, rows, None)
-        check("ARM: an endpoint that did not consent refuses", False, "it did not refuse")
+        check("ARM: a package that did not consent refuses", False, "it did not refuse")
     except FillRefusal as exc:
         check(
-            "ARM: an endpoint that never declared consent REFUSES, before any reservation",
+            "ARM: a package that never declared consent REFUSES, before any reservation",
             exc.code == "leaf_unconsented" and not backend.components,
             f"[{exc.code}] {str(exc)[:260]}",
         )
     except Exception as exc:  # the refusal may arrive wrapped by the loader's own boundary
         cause = getattr(exc, "__cause__", None) or exc
         check(
-            "ARM: an endpoint that never declared consent REFUSES, before any reservation",
+            "ARM: a package that never declared consent REFUSES, before any reservation",
             getattr(cause, "code", "") == "leaf_unconsented",
             f"[{getattr(cause, 'code', type(cause).__name__)}] {str(cause)[:260]}",
         )
@@ -987,7 +987,7 @@ def fill() -> None:
     with torch.inference_mode():
         out, _ = model.step(torch, x)
     check(
-        "the endpoint's own forward runs THROUGH the leaves and returns the contract dtype",
+        "the package's own forward runs THROUGH the leaves and returns the contract dtype",
         out.dtype == torch.bfloat16 and out.shape == (96, 64) and bool(torch.isfinite(out).all()),
         f"{tuple(out.shape)} {out.dtype}, finite",
     )

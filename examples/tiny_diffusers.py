@@ -1,6 +1,6 @@
-"""A stand-in for the model libraries an endpoint brings as an ordinary dependency.
+"""A stand-in for the model libraries a package brings as an ordinary dependency.
 
-cozy-runtime defines NO model architectures (§1.1): T is whatever the endpoint imports —
+cozy-runtime defines NO model architectures (§1.1): T is whatever the package imports —
 upstream diffusers where it exists, the author's own module where it doesn't. This file
 plays that part for the fixtures: two pipeline families with real component graphs, real
 `state_dict()` topologies, and deterministic weightless compute, so every construction,
@@ -101,7 +101,7 @@ def _linear(rows: int, cols: int, *, prefix: str) -> dict[str, TinyTensor]:
 class TinySdxlPipeline:
     """The whole-pipeline path: one `__call__`, four heavyweight components.
 
-    SDXL has TWO text encoders — the second is load-bearing, and an endpoint that declares
+    SDXL has TWO text encoders — the second is load-bearing, and a package that declares
     three components poisons at first touch of the fourth.
     """
 

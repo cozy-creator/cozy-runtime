@@ -81,7 +81,7 @@ def tfs_cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def construction_order() -> Path:
-    """Write the exact synthetic endpoint census TensorFS requires for artifact authorship."""
+    """Write the exact synthetic package census TensorFS requires for artifact authorship."""
     import torch
     from torch import nn
 

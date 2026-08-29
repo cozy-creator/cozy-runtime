@@ -134,7 +134,7 @@ def _leaf_class(torch: Any) -> Any:
 
         It stands exactly where the module it replaced stood, takes exactly that module's
         input and returns exactly that module's output dtype and shape. What it does not
-        have is a `.weight`: an endpoint that reaches for one is why author CONSENT is a
+        have is a `.weight`: a package that reaches for one is why author CONSENT is a
         precondition of this route rather than a courtesy.
         """
 

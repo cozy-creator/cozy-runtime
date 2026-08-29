@@ -1,4 +1,4 @@
-"""`cozy-runtime describe` — emit the EndpointDescriptor without loading weights.
+"""`cozy-runtime describe` — emit the PackageDescriptor without loading weights.
 
 Always read-only. Full `--json` output is the canonical publication input; there is no
 committed descriptor projection and therefore no writer or staleness-check mode.
@@ -30,7 +30,7 @@ def run(function: str | None, opts: Options) -> Result:
         raise CliError(
             "validation",
             str(exc),
-            "an endpoint's surface must be valid before it can be described (§1.0)",
+            "a package's surface must be valid before it can be described (§1.0)",
             Exit.validation,
         ) from exc
     if function is not None:
@@ -61,7 +61,7 @@ def _list(body: Mapping[str, Json]) -> Result:
     counts = desc.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
-    rows.append((desc.DIGEST_KEY, desc.descriptor_digest(body)))
+    rows.append((desc.DIGEST_KEY, desc.package_descriptor_digest(body)))
     return Result(
         rows=tuple(rows),
         document=body,

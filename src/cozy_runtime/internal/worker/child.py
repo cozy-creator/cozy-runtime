@@ -244,7 +244,7 @@ class ExecutorSupervision:
         self.root = root
         self.python = python
         self.overlay = ""
-        """The endpoint-only import root appended after image-owned packages."""
+        """The package-only import root appended after image-owned packages."""
         self.overlay_content_digest = ""
         self.jit_cache = ""
         """One worker-boot/content cache path, deleted after worker shutdown."""
@@ -623,7 +623,7 @@ class ExecutorSupervision:
         """Point the executor at one base interpreter, overlay, and node-local JIT scope."""
 
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
-            raise ExecutorGone(f"invalid endpoint content digest for JIT cache: {content_digest!r}")
+            raise ExecutorGone(f"invalid package content digest for JIT cache: {content_digest!r}")
         if (self.python, self.overlay, self.overlay_content_digest) == (
             python,
             overlay,

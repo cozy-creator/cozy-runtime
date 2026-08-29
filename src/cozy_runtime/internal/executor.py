@@ -365,8 +365,8 @@ class Executor:
             strict_keys=bool(binding.get("strict_keys", False)),
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
-        # the plan already chosen and the endpoint already imported; a plan whose route the
-        # endpoint cannot consent to is not a candidate, so it is never built.
+        # the plan already chosen and the package already imported; a plan whose route the
+        # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
         facts = PlanFacts(binding.get("delivery_cache") or binding.get("probe_cache") or ".")
         try:
@@ -613,7 +613,7 @@ class Executor:
         self.models = {binding["model_parameter_name"]: model}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
-        # set before the body runs; the endpoint cannot observe that it happened.
+        # set before the body runs; the package cannot observe that it happened.
         self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
@@ -702,7 +702,7 @@ class Executor:
             "custody": binding.get("custody", "canonical"),
             # THE COMPONENT-USE CONTRACT, as a construction fact. The worker prices a
             # staged rung against it and cannot read it any other way: the declaration lives
-            # on the endpoint's class, and that class is only ever imported here.
+            # on the package's class, and that class is only ever imported here.
             "declared_scopes": {
                 method: list(names) for method, names in sorted(component_use(model_cls).items())
             },
@@ -763,7 +763,7 @@ class Executor:
         """Import only the installed application and bind it to the exact descriptor."""
 
         application = str(binding.get("application") or "")
-        descriptor_path = str(binding.get("descriptor") or "")
+        descriptor_path = str(binding.get("package_descriptor") or "")
         if not application or not descriptor_path:
             raise RuntimeError("executor requires the canonical installed release identity")
         discovered = discover_installed(application)
@@ -771,7 +771,7 @@ class Executor:
         descriptor.compare(
             published,
             descriptor.build(discovered),
-            ("provisioned EndpointDescriptor", "installed endpoint"),
+            ("provisioned PackageDescriptor", "installed package"),
         )
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
@@ -780,7 +780,7 @@ class Executor:
         """A binding that declares NO MODEL: discover the release, be ready, import nothing.
 
         The whole cold path below is a fill, and there is nothing to fill. Returning here is
-        what makes a weightless endpoint servable at all — and it is the ONLY thing a
+        what makes a weightless package servable at all — and it is the ONLY thing a
         cardless runner can ever pass, because everything past this line imports torch
         (cl-013). There is no construction, so there is no construction identity: the
         digests are empty and say so rather than naming a build that never happened.
@@ -943,7 +943,7 @@ class Executor:
                 # Every value is a path inside this attempt's own spool: this process is
                 # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
                 # handler that dials one anyway is refused rather than merely unexpected.
-                # That fence is Python-level (cr-042) — it bounds a buggy endpoint, not a
+                # That fence is Python-level (cr-042) — it bounds a buggy package, not a
                 # hostile one, and there is no netns or seccomp under it.
                 assets=_granted_inputs(command),
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
@@ -952,7 +952,7 @@ class Executor:
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
 
         # §3.4 step 2: the exact D2H wait BEFORE the device lease releases. Everything the
-        # tail touches must already be immutable and independent of endpoint GPU state. A
+        # tail touches must already be immutable and independent of package GPU state. A
         # WEIGHTLESS generation holds no stream, so its quiescence is structural — there is
         # nothing that could still be moving.
         d2h_started = time.perf_counter()
@@ -1245,8 +1245,8 @@ class Executor:
 
         It runs HERE, in the disposable process, for one reason that is not convenience:
         synthesizing a payload needs the entrypoint's schema, and reading that schema in the
-        worker would mean importing endpoint code into the long-lived no-CUDA process.
-        An endpoint whose module scope touches torch would then contaminate the worker
+        worker would mean importing package code into the long-lived no-CUDA process.
+        A package whose module scope touches torch would then contaminate the worker
         forever. The executor already imported it and is already disposable.
         """
         from cozy_runtime.internal import schema, warm
@@ -1534,21 +1534,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.overlay:
         overlay = Path(args.overlay)
         if not overlay.is_absolute() or not overlay.is_dir():
-            print(f"[executor] invalid endpoint overlay {args.overlay!r}", file=sys.stderr)
+            print(f"[executor] invalid package overlay {args.overlay!r}", file=sys.stderr)
             return int(Exit.structural)
         # Base packages and this executor were resolved from the immutable image before
-        # the endpoint path existed. Append, never prepend: endpoint code is importable but
+        # the package path existed. Append, never prepend: package code is importable but
         # cannot win path order over torch, TensorFS, or cozy-runtime.
         sys.path.append(str(overlay))
 
     _capture_seal()
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
-    # Python-level egress from endpoint and job code; it is not a kernel bound and
+    # Python-level egress from package and job code; it is not a kernel bound and
     # `sandbox.refuse_network` says exactly which adversary that leaves.
     sandbox.refuse_network(
         "the executor is handed verified files in its attempt spool and never an address "
-        "(cr-012). Endpoint code that dials is a bug, and this is where the bug stops",
+        "(cr-012). Package code that dials is a bug, and this is where the bug stops",
         allow_unix_seam=True,
     )
     channel = connect(args.socket)

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Every public Context/service fact, exercised against a REAL invocation.
 
-Not a test suite: each arm below runs the production invocation kernel over a real endpoint
+Not a test suite: each arm below runs the production invocation kernel over a real package
 and reports the value the runtime actually WROTE, observed from inside author code. The
 point is the writer, not the reader.
 
 The v1 lesson this exists for, in v1's own words (pgw#1584): `ctx.boot_warmup`'s property,
 its docstring and its reader all shipped, but `grep -rn "boot_warmup=True" src/` returned
 nothing — so every `if ctx.boot_warmup:` arm in the fleet was unreachable code and every
-endpoint that had written one had written it for a flag that was permanently False. It was
+package that had written one had written it for a flag that was permanently False. It was
 found by a human running grep. This script is that grep, mechanized and tied to the
 SDK: COVERAGE IS ENFORCED — a public fact with no exercise here is a refusal, so Runtime's
 author contract and the exercise list cannot drift apart.

@@ -3,9 +3,9 @@ requires = ["uv_build>=0.9.18,<0.10"]
 build-backend = "uv_build"
 
 [project]
-name = "marco-polo-endpoint"
+name = "marco-polo-package"
 version = "1.0.0"
-description = "Weightless endpoint fixture for Tensorhub publication and worker placement proofs"
+description = "Weightless package fixture for Tensorhub publication and worker placement proofs"
 requires-python = ">=3.11"
 dependencies = ["cozy-runtime==0.0.3"]
 

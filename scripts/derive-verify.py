@@ -833,7 +833,7 @@ def section_gap_doctrine() -> None:
     check(
         "the descriptor's fixed point still forbids candidate-derived facts",
         "destinations" in _forbidden() and "topology_digest" in _forbidden(),
-        "the EndpointDescriptor is source-stable; this contract is the other clock",
+        "the PackageDescriptor is source-stable; this contract is the other clock",
     )
     print("  The two legal fix lanes, both exercised by the corpus:")
     print("    harness code — `custom_op_with_meta_kernel` derives once a shape function exists")

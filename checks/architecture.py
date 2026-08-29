@@ -5,8 +5,8 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports
   env-authority · single-config · no-interactive · excluded-keywords
-  no-identifiers-in-endpoint-code · one-attempt-kernel · timing-decides-nothing
-  endpoint-owns-no-residency · endpoint-owns-no-media-decode · reviewed-specs-exist
+  no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
+  package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
   one-address-predicate
   dynamic-pods-skip-boot-warm
@@ -240,14 +240,14 @@ def fence_excluded_keywords() -> list[str]:
     return bad
 
 
-#: An endpoint module is one that builds an `App()` — the file `describe` imports.
+#: A package module is one that builds an `App()` — the file `describe` imports.
 _MEDIA_PREFIXES = ("image/", "video/", "audio/", "text/", "application/", "model/")
 _IDENTIFIER = re.compile(r"^(hf|civitai|comfy|tensorhub):|^[a-z0-9][\w.-]*/[\w.-]+(@[\w.-]+)?$")
 #: A versioned FORMAT id (`adaln-tables/1`, `ggml-q4-k/v1`) is a schema name, not an artifact.
 _FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
 
 
-def endpoint_modules() -> list[pathlib.Path]:
+def package_modules() -> list[pathlib.Path]:
     modules = []
     for path in sorted((ROOT / "examples").glob("*.py")):
         tree = ast.parse(path.read_text())
@@ -258,15 +258,15 @@ def endpoint_modules() -> list[pathlib.Path]:
     return modules
 
 
-def endpoint_and_model_code() -> list[pathlib.Path]:
-    """Every module an ENDPOINT AUTHOR writes: the entrypoint modules and their models.
+def package_and_model_code() -> list[pathlib.Path]:
+    """Every module an PACKAGE AUTHOR writes: the entrypoint modules and their models.
 
-    `corpus/` counts — those are real endpoints against real weights, and the claim cr-008b
-    makes is about what an endpoint contains, not about what a weightless example contains.
+    `corpus/` counts — those are real packages against real weights, and the claim cr-008b
+    makes is about what a package contains, not about what a weightless example contains.
     The vendored venv is not author code and is excluded by path.
     """
-    paths = list(endpoint_modules())
-    for base in ("corpus/pipeline", "corpus/endpoint"):
+    paths = list(package_modules())
+    for base in ("corpus/pipeline", "corpus/package"):
         paths += sorted((ROOT / base).glob("*.py"))
     for name in ("sdxl_real.py", "sdxl_pipeline.py", "sdxl.py", "h3.py"):
         candidate = ROOT / "corpus" / name
@@ -275,7 +275,7 @@ def endpoint_and_model_code() -> list[pathlib.Path]:
     return paths
 
 
-#: Residency vocabulary. An endpoint that can name one of these can move bytes, and §1.1's
+#: Residency vocabulary. A package that can name one of these can move bytes, and §1.1's
 #: whole claim is that it cannot — the declaration is `@uses_components` and there is no
 #: second surface. `to`/`cuda` are deliberately ABSENT: casting a request tensor's dtype or
 #: placing a request input is ordinary module code, and the excluded-keyword fence already
@@ -299,16 +299,16 @@ RESIDENCY_NAMES = (
 )
 
 
-def fence_endpoint_owns_no_residency() -> list[str]:
-    """cr-008b's done-when, as a scan: an endpoint serves with ZERO memory-management calls.
+def fence_package_owns_no_residency() -> list[str]:
+    """cr-008b's done-when, as a scan: a package serves with ZERO memory-management calls.
 
     Not because its author is disciplined — because the vocabulary is not reachable from
-    endpoint code. The runtime admits and materializes a declared component set before
-    method entry, event-fences it, and makes it evictable after; an endpoint that could
+    package code. The runtime admits and materializes a declared component set before
+    method entry, event-fences it, and makes it evictable after; a package that could
     also do those things would be a second policy, and two policies is the v1 defect.
     """
     bad: list[str] = []
-    for path in endpoint_and_model_code():
+    for path in package_and_model_code():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             reached, line = "", 0
@@ -318,28 +318,28 @@ def fence_endpoint_owns_no_residency() -> list[str]:
                 reached, line = node.id, node.lineno
             if reached:
                 bad.append(
-                    f"{path.relative_to(ROOT)}:{line}: endpoint code names {reached!r} — "
+                    f"{path.relative_to(ROOT)}:{line}: package code names {reached!r} — "
                     "residency is the runtime's, declared with @uses_components and "
-                    "nothing else; an endpoint that can move bytes is a second policy"
+                    "nothing else; a package that can move bytes is a second policy"
                 )
     return bad
 
 
-def fence_endpoint_owns_no_media_decode() -> list[str]:
-    """cr-012's one-decoder law: endpoint code consumes `MediaDecoder` values.
+def fence_package_owns_no_media_decode() -> list[str]:
+    """cr-012's one-decoder law: package code consumes `MediaDecoder` values.
 
     Opening a container, reaching the runtime's private spool path, or calling a library
     path helper would create another fetch/decode authority with different bounds and clock
-    semantics. Those spellings are absent from endpoint/model code, not merely discouraged.
+    semantics. Those spellings are absent from package/model code, not merely discouraged.
     """
     bad: list[str] = []
-    for path in endpoint_and_model_code():
+    for path in package_and_model_code():
         tree = ast.parse(path.read_text())
         rel = path.relative_to(ROOT)
         for name in imports(tree):
             if name == "av" or name.startswith("av.") or name == "PIL" or name.startswith("PIL."):
                 bad.append(
-                    f"{rel}: endpoint code imports {name!r} — hydrated media decodes only "
+                    f"{rel}: package code imports {name!r} — hydrated media decodes only "
                     "through the Runtime-owned MediaDecoder"
                 )
         for node in ast.walk(tree):
@@ -347,18 +347,18 @@ def fence_endpoint_owns_no_media_decode() -> list[str]:
                 continue
             if node.attr in {"_local", "_path"}:
                 bad.append(
-                    f"{rel}:{node.lineno}: endpoint code reaches private media path "
+                    f"{rel}:{node.lineno}: package code reaches private media path "
                     f"{node.attr} — verified "
                     "input paths are Runtime-private"
                 )
             elif node.attr == "demux":
                 bad.append(
-                    f"{rel}:{node.lineno}: endpoint code demuxes packets — only immutable "
+                    f"{rel}:{node.lineno}: package code demuxes packets — only immutable "
                     "Runtime media events cross the author boundary"
                 )
             elif node.attr == "from_file":
                 bad.append(
-                    f"{rel}:{node.lineno}: endpoint code calls from_file — a library path/URL "
+                    f"{rel}:{node.lineno}: package code calls from_file — a library path/URL "
                     "decoder is a second media authority"
                 )
     return bad
@@ -368,11 +368,11 @@ def fence_no_identifiers() -> list[str]:
     """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
     model, release, checkpoint or adapter ref, in bindings or in string literals.
 
-    Code states capability; SELECTION is a binding (endpoint.toml, `--model`, the deploy
+    Code states capability; SELECTION is a binding (package.toml, `--model`, the deploy
     binding). Identity is exclusively deployment-side, so branching on one is unspellable.
     """
     bad: list[str] = []
-    for path in endpoint_modules():
+    for path in package_modules():
         for node in ast.walk(ast.parse(path.read_text())):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                 continue
@@ -384,7 +384,7 @@ def fence_no_identifiers() -> list[str]:
             if _IDENTIFIER.match(text):
                 bad.append(
                     f"{path.relative_to(ROOT)}:{node.lineno}: artifact identifier {text!r} in "
-                    "endpoint code — selection is a binding, never a literal"
+                    "package code — selection is a binding, never a literal"
                 )
     return bad
 
@@ -547,7 +547,7 @@ def fence_torch_free_import() -> list[str]:
     """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
 
     torch is an optional extra: the derive harness imports it INSIDE `torch_module()`, so a
-    cloned endpoint stays inspectable and the base package installs without a 3 GB wheel. A
+    cloned package stays inspectable and the base package installs without a 3 GB wheel. A
     module-scope `import torch` anywhere under `src/` breaks that, silently, for everyone.
     """
     bad = []
@@ -681,9 +681,24 @@ def fence_base_ownership_vectors() -> list[str]:
         else:
             bad.append("cr-027 admitted 128 custom wheels plus the project wheel")
     contract_root = ROOT / "vectors" / "tensorhub-wheel-contract"
-    bundle_bytes = (contract_root / "endpoint-bundle.json").read_bytes()
+    required_contract = (
+        "base-worker-image-wheelhouse.json",
+        "package-bundle.json",
+        "package-environment-spec.json",
+        "fixture-index.json",
+        "project-wheel.json",
+        "resolved-wheel-set.json",
+        "resolution-lock.json",
+    )
+    missing_contract = [name for name in required_contract if not (contract_root / name).is_file()]
+    if missing_contract:
+        return [
+            f"{contract_root}: missing exact Tensorhub package vector(s): "
+            + ", ".join(missing_contract)
+        ]
+    bundle_bytes = (contract_root / "package-bundle.json").read_bytes()
     wheelhouse_bytes = (contract_root / "base-worker-image-wheelhouse.json").read_bytes()
-    environment_bytes = (contract_root / "endpoint-environment-spec.json").read_bytes()
+    environment_bytes = (contract_root / "package-environment-spec.json").read_bytes()
     index_bytes = (contract_root / "fixture-index.json").read_bytes()
     project_bytes = (contract_root / "project-wheel.json").read_bytes()
     resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
@@ -693,11 +708,11 @@ def fence_base_ownership_vectors() -> list[str]:
             wheelhouse_bytes,
             "650f9e4010062d0895582a3e2d3e3c2ea21130d1b9ca30ed0de0f43eb1d2d655",
         ),
-        "endpoint-bundle.json": (
+        "package-bundle.json": (
             bundle_bytes,
             "ac3b9b3482fbc673ec62d4b2143b64254454c8e45f06987eedf4f39fb2701fb9",
         ),
-        "endpoint-environment-spec.json": (
+        "package-environment-spec.json": (
             environment_bytes,
             "a34714c0610936206e1744a565da41301f58c8e1003b15ed55491e84077bca75",
         ),
@@ -739,7 +754,7 @@ def fence_base_ownership_vectors() -> list[str]:
         or not isinstance(resolved, dict)
         or bundle.get("project_wheel") != project
     ):
-        bad.append(f"{contract_root}: project WheelFact differs from EndpointBundle bytes")
+        bad.append(f"{contract_root}: project WheelFact differs from PackageBundle bytes")
         return bad
     wheel_files = fixture.get("wheel_files")
     if not isinstance(wheel_files, dict) or not all(
@@ -748,9 +763,9 @@ def fence_base_ownership_vectors() -> list[str]:
         bad.append(f"{contract_root}: fixture wheel file map is invalid")
         return bad
     try:
-        joined = materialize_launch.endpoint_overlay_input(
+        joined = materialize_launch.package_overlay_input(
             environment_spec_bytes=environment_bytes,
-            endpoint_bundle_bytes=bundle_bytes,
+            package_bundle_bytes=bundle_bytes,
             resolved_wheel_set_bytes=resolved_bytes,
             wheelhouse_manifest_bytes=wheelhouse_bytes,
             wheel_paths={digest: contract_root / name for digest, name in wheel_files.items()},
@@ -760,7 +775,7 @@ def fence_base_ownership_vectors() -> list[str]:
     else:
         facts = [(wheel.distribution, wheel.owner, wheel.import_roots) for wheel in joined.wheels]
         if facts != [
-            ("proof-endpoint", "project", ("project_endpoint",)),
+            ("proof-package", "project", ("project_package",)),
             ("proof-custom", "custom", ("proof_custom",)),
         ]:
             bad.append(f"{contract_root}: Runtime joined wheel facts as {facts}")
@@ -975,7 +990,7 @@ def fence_descriptor_minimality() -> list[str]:
     expected = {"format", "application", "entrypoints", "jobs"}
     if set(document) != expected:
         bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
-    if document.get("format") != "cozy.endpoint.descriptor/1":
+    if document.get("format") != "cozy.package.descriptor/1":
         bad.append("descriptor has the wrong format")
     forbidden = {
         "attribute",
@@ -1026,7 +1041,7 @@ def fence_descriptor_minimality() -> list[str]:
             for index, item in enumerate(value):
                 visit(item, f"{where}[{index}]")
 
-    visit(document, "descriptor")
+    visit(document, "package_descriptor")
     return bad
 
 
@@ -1036,9 +1051,9 @@ def fence_descriptor_minimality() -> list[str]:
 #: implementation_digest and therefore every plan digest, so it is registered too. A literal
 #: outside this table is a new kind without its decision row.
 DOCUMENT_KINDS = {
-    "cozy.endpoint.descriptor/1": "internal/descriptor.py",
-    "cozy.endpoint.EntrypointBindingPlan/1": "internal/provisioned.py",
-    "cozy.endpoint.ResolvedModelBinding/1": "internal/provisioned.py",
+    "cozy.package.descriptor/1": "internal/descriptor.py",
+    "cozy.package.EntrypointBindingPlan/1": "internal/provisioned.py",
+    "cozy.package.ResolvedModelBinding/1": "internal/provisioned.py",
     "cozy.fp8-rowwise.dequant/1": "internal/encoding/formats.py",
     "cozy.fp8-scaled-scalar.dequant/1": "internal/encoding/formats.py",
     "cozy.mxfp8.dequant/1": "internal/encoding/formats.py",
@@ -1049,9 +1064,9 @@ DOCUMENT_KINDS = {
     "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
     "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
     "cozy.runtime.ConstructedGeneration/2": "internal/executor.py",
-    "cozy.runtime.EndpointOverlayContent/1": "internal/overlay.py",
-    "cozy.runtime.EndpointOverlayReceipt/1": "internal/overlay.py",
-    "cozy.runtime.EndpointWheelExtraction/1": "internal/overlay.py",
+    "cozy.runtime.PackageOverlayContent/1": "internal/overlay.py",
+    "cozy.runtime.PackageOverlayReceipt/1": "internal/overlay.py",
+    "cozy.runtime.PackageWheelExtraction/1": "internal/overlay.py",
     "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
     "cozy.runtime.ExecutionObservation/1": "internal/acceptance.py",
     "cozy.runtime.ExecutionObservationRequest/1": "internal/acceptance.py",
@@ -1081,7 +1096,7 @@ FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytens
 #: Modules that name a registered kind without declaring it (a second reader is fine; a
 #: second DECLARATION is the drift this fence exists for).
 KIND_READERS = {
-    "cozy.endpoint.EntrypointBindingPlan/1": {"internal/local.py"},
+    "cozy.package.EntrypointBindingPlan/1": {"internal/local.py"},
     "cozy.runtime.Ledger/0": {"internal/local.py"},
     "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
 }
@@ -1192,7 +1207,7 @@ def fence_construction_fill_order() -> list[str]:
 
 
 def fence_dynamic_pods_skip_boot_warm() -> list[str]:
-    """The fixed remote adapter must never run endpoint inference before dispatchability."""
+    """The fixed remote adapter must never run package inference before dispatchability."""
 
     path = SRC / "cli" / "materialize_launch.py"
     tree = ast.parse(path.read_text())
@@ -1214,7 +1229,7 @@ def fence_dynamic_pods_skip_boot_warm() -> list[str]:
     ):
         return [
             f"{path.relative_to(ROOT)}: fixed dynamic-pod child argv omits `--no-warm`; "
-            "endpoint inference can block activation before DISPATCHABLE"
+            "package inference can block activation before DISPATCHABLE"
         ]
     return []
 
@@ -1362,13 +1377,13 @@ def fence_measured_backend_version() -> list[str]:
 
 
 def fence_typed_model_binding() -> list[str]:
-    """Endpoint defaults name a `model`; the retired generic binding key cannot return."""
+    """Package defaults name a `model`; the retired generic binding key cannot return."""
 
     bad: list[str] = []
     paths = [
-        ROOT / "examples" / "endpoint.toml",
-        ROOT / "corpus" / "endpoint" / "endpoint.toml",
-        ROOT / "corpus" / "pipeline" / "endpoint.toml",
+        ROOT / "examples" / "package.toml",
+        ROOT / "corpus" / "package" / "package.toml",
+        ROOT / "corpus" / "pipeline" / "package.toml",
     ]
     for path in paths:
         document = tomllib.loads(path.read_text())
@@ -1400,10 +1415,10 @@ FENCES = {
     "single-config": fence_single_config,
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,
-    "no-identifiers-in-endpoint-code": fence_no_identifiers,
+    "no-identifiers-in-package-code": fence_no_identifiers,
     "timing-decides-nothing": fence_timing_decides_nothing,
-    "endpoint-owns-no-residency": fence_endpoint_owns_no_residency,
-    "endpoint-owns-no-media-decode": fence_endpoint_owns_no_media_decode,
+    "package-owns-no-residency": fence_package_owns_no_residency,
+    "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,

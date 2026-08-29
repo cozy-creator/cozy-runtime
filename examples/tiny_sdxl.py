@@ -1,4 +1,4 @@
-"""A real, runnable endpoint on the author surface — SDXL-shaped, weightless.
+"""A real, runnable package on the author surface — SDXL-shaped, weightless.
 
 Modeled line-for-line on `cozy-runtime-sdxl.md`, with one substitution: the pipeline comes
 from `tiny_diffusers` instead of diffusers, because cozy-runtime defines no model

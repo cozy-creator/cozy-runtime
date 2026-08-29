@@ -67,7 +67,7 @@ _SECRET_NAME = re.compile(
 )
 #: `token` and `signature` are the two credential words that are ALSO ordinary telemetry
 #: nouns: `output_tokens`, `tokens_per_second` and `eos_token` are counts, rates and
-#: vocabulary — the most obvious fields an inference endpoint emits — and refusing them made
+#: vocabulary — the most obvious fields an inference package emits — and refusing them made
 #: the guard a false positive at the one boundary it exists to protect. They are
 #: credential-shaped only when the name IS the bare word, or ends in it in the SINGULAR
 #: directly after a credential qualifier. A plural, a trailing word, or an unqualified

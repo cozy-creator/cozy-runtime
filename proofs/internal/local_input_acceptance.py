@@ -151,7 +151,7 @@ def _serving_slice(
         ),
         workspace=workspace,
         release_id=release_id,
-        endpoint_descriptor=body,
+        package_descriptor=body,
         options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         record_owner_hook=plant if accepted_mutation is not None else None,
     )

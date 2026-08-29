@@ -1,4 +1,4 @@
-"""The REAL SDXL UNet, as an endpoint: upstream diffusers, upstream config, real bytes.
+"""The REAL SDXL UNet, as a package: upstream diffusers, upstream config, real bytes.
 
 `corpus/sdxl.py` is the SHAPE of an SDXL pipeline built from `torch.nn` primitives so the
 derivation corpus can run anywhere. This file is the other half of that claim: the actual
@@ -7,9 +7,9 @@ config — 1,680 destinations, 4.782 GiB — constructed through the same one pr
 cr-005's fill moves real ecosystem weights into a real ecosystem module and cr-004's
 derive/serve fence gets re-run against bytes instead of a counter.
 
-The endpoint names no path, no repo and no checkpoint. It receives the artifact's immutable
+The package names no path, no repo and no checkpoint. It receives the artifact's immutable
 config as a typed read-only capability and hands it to the library's own constructor —
-which is what every real endpoint does, and why `Config.mapping()` exists.
+which is what every real package does, and why `Config.mapping()` exists.
 """
 
 from __future__ import annotations

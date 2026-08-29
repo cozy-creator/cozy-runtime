@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live verification of the author surface. Not a test suite: a real run.
 
-Every section below EXECUTES the real endpoints in `examples/` through the real invocation
+Every section below EXECUTES the real packages in `examples/` through the real invocation
 kernel and the real construction plane, and prints what actually happened. Refusals live in
 `scripts/redarm.py`, which plants each violation for real and observes the typed refusal.
 
@@ -118,10 +118,10 @@ def main() -> int:
                     print(f"  {'':<15}   {method}: {', '.join(names)}")
 
     # ---------------------------------------------------------------- bindings
-    head("bindings — code states capability, endpoint.toml states selection")
+    head("bindings — code states capability, package.toml states selection")
     slots = [b for s in describe(h3.app) for b in s.model_bindings]
     slots += [b for s in describe(ep.app) for b in s.model_bindings]
-    table = read_table(ROOT / "examples" / "endpoint.toml")
+    table = read_table(ROOT / "examples" / "package.toml")
     for resolved in resolve(slots, table).values():
         print(f"  {resolved}")
     override = resolve(slots, table, overrides={"generate.models.model": "cozy/h3-fl2va@v2"})
@@ -334,7 +334,7 @@ def main() -> int:
     print(f"  key: {cache_run.modulation_key}")
 
     # ---------------------------------------------------------------- backends
-    head("backend blindness — the same endpoint code on two fill routes")
+    head("backend blindness — the same package code on two fill routes")
     seen = {}
     for name, backend_impl in (("staged", StagedBackend()), ("resident", ResidentBackend())):
         registry = ModelRegistry(release=RELEASE, backend=backend_impl)
@@ -356,7 +356,7 @@ def main() -> int:
     # ---------------------------------------------------------------- test seam
     head("Model.for_test + ModelTestHarness — author doubles, recorded scopes, no GPU")
     # An author-built double is STRUCTURAL: the declared state's type is the real pipeline
-    # class, so the test says so once, here, and the endpoint stays fully typed.
+    # class, so the test says so once, here, and the package stays fully typed.
     fake_pipe = cast("MiniMaxH3ModularPipeline", FakeH3Pipeline())
     tested = h3.Fl2VAModel.for_test(
         pipe=fake_pipe,
@@ -595,16 +595,16 @@ def spelling_plain(payload: SpellingPayload) -> SpellingReply:
 
 async def spelling_async(payload: SpellingPayload) -> SpellingReply:
     """The I/O-shaped spelling. A caller cannot tell these two apart, and neither can the
-    descriptor: the spelling picks where the body runs, never what the endpoint offers."""
+    descriptor: the spelling picks where the body runs, never what the package offers."""
     return SpellingReply(payload.prompt)
 
 
 def temp_project(module: str) -> Path:
-    """A project root whose endpoint.toml names a DIFFERENT app export of these fixtures.
-    `examples/` is one endpoint project; describe is exercised over every fixture."""
+    """A project root whose package.toml names a DIFFERENT app export of these fixtures.
+    `examples/` is one package project; describe is exercised over every fixture."""
     root = Path(tempfile.mkdtemp(prefix=f"cozy-{module}-"))
-    bindings = (ROOT / "examples" / "endpoint.toml").read_text().partition("[bindings")
-    (root / "endpoint.toml").write_text(
+    bindings = (ROOT / "examples" / "package.toml").read_text().partition("[bindings")
+    (root / "package.toml").write_text(
         f'[application]\nobject = "{module}:app"\n\n[bindings{bindings[2]}'
     )
     return root
@@ -625,7 +625,7 @@ def descriptor_sections() -> None:
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
             f"{counts['model_bindings']} slots · {size:>6,} B canonical · {elapsed_ms:6.1f} ms · "
-            f"{descriptor.descriptor_digest(body)[:26]}…"
+            f"{descriptor.package_descriptor_digest(body)[:26]}…"
         )
 
     head("weights are never loaded — proven by a backend that refuses to be called")
@@ -671,7 +671,7 @@ def descriptor_sections() -> None:
 
     head("semantic digest — formatting is irrelevant and meaning is not")
     base_raw = descriptor.canonical_bytes(bodies["tiny_h3"])
-    base = descriptor.descriptor_digest(bodies["tiny_h3"])
+    base = descriptor.package_descriptor_digest(bodies["tiny_h3"])
     mutations: dict[str, Callable[[Any], object]] = {
         "schema (a new request field)": lambda d: d["entrypoints"][0]["request"]["fields"].append(
             {"name": "extra", "type": "int"}
@@ -687,7 +687,7 @@ def descriptor_sections() -> None:
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
         mutate(mutated)
-        moved = descriptor.descriptor_digest(mutated) != base
+        moved = descriptor.package_descriptor_digest(mutated) != base
         if not moved:
             raise AssertionError(f"descriptor meaning change did not move identity: {what}")
         print(f"  {what:34} digest moved: {moved}")
@@ -696,14 +696,14 @@ def descriptor_sections() -> None:
         dict(reversed(list(bodies["tiny_h3"].items()))), separators=(", ", ": ")
     ).encode()
     formatting_digests = {
-        descriptor.descriptor_digest(descriptor.read_bytes(raw, name))
+        descriptor.package_descriptor_digest(descriptor.read_bytes(raw, name))
         for name, raw in (("whitespace twin", whitespace_edit), ("key-order twin", reordered))
     }
     if formatting_digests != {base}:
         raise AssertionError("descriptor formatting changed semantic identity")
     print(f"  {'whitespace/key-order twins':34} one digest: True")
     for name, raw, code in (
-        ("duplicate key", b'{"format":"cozy.endpoint.descriptor/1","format":"x"}', "duplicate_key"),
+        ("duplicate key", b'{"format":"cozy.package.descriptor/1","format":"x"}', "duplicate_key"),
         (
             "non-finite number",
             base_raw.replace(b"{", b'{"bad":NaN,', 1),
@@ -712,7 +712,7 @@ def descriptor_sections() -> None:
     ):
         try:
             descriptor.read_bytes(raw, name)
-        except descriptor.StaleDescriptor as exc:
+        except descriptor.StalePackageDescriptor as exc:
             if code not in str(exc):
                 raise AssertionError(f"{name} refused for the wrong reason: {exc}") from exc
         else:
@@ -741,7 +741,7 @@ def descriptor_sections() -> None:
     # Where the two profiles part, and why. tfs restricts its own header codec harder than
     # RFC 8785; a descriptor carries float bounds, None defaults and non-ASCII literals.
     relaxed = {
-        "digest-uppercase": "the endpoint descriptor carries no embedded digest field",
+        "digest-uppercase": "the package descriptor carries no embedded digest field",
         "null-value": "null is a legal literal or optional-union member",
         "unicode-nfc": "author literals may be non-ASCII; JCS escapes, tfs forbids",
         "unicode-nfd": "same — normalization is not a canonical-JSON rule",

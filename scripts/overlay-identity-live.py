@@ -671,7 +671,7 @@ def main() -> int:
             canonical.write(
                 {
                     "device_index": None,
-                    "endpoint_environment_spec_digest": digest(b"native-custom"),
+                    "package_environment_spec_digest": digest(b"native-custom"),
                     "environment_root": str(root / "native-custom-installed"),
                     "expected_result_digest": canonical.digest({"value": 3}),
                     "fixture": "proof_native_custom.fixture:run",

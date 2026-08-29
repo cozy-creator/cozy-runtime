@@ -304,7 +304,7 @@ def probe() -> None:
 
 
 def make_model() -> Any:
-    """The endpoint. It DECLARES that its components are touched through their forward
+    """The package. It DECLARES that its components are touched through their forward
     only, which is the whole of what `encoded_leaves="accept"` states."""
     from cozy_runtime.author import Model, uses_components
     from cozy_runtime.author._loader import Loader

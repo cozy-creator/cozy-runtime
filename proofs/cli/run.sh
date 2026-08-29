@@ -35,7 +35,7 @@ mkdir "$proof_root/build"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$repo"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$project"
 runtime_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'cozy_runtime-*.whl' -print)
-fixture_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'proof_cli_endpoint-*.whl' -print)
+fixture_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'proof_cli_package-*.whl' -print)
 test -n "$runtime_wheel" && test -n "$fixture_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"

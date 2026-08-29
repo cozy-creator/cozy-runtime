@@ -133,7 +133,7 @@ def install_row(home: Path, store: str = "") -> None:
 def binding_record(entrypoint: str) -> dict[str, Any]:
     return {
         "entrypoint_binding_plan_id": plan_id_for(entrypoint),
-        "project": str(ROOT / "corpus" / "endpoint"),
+        "project": str(ROOT / "corpus" / "package"),
         "model_class": "SdxlUnetModel",
         "model_binding_path": f"{entrypoint}.models.model",
         "model_parameter_name": "model",

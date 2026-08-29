@@ -174,7 +174,7 @@ _SERVE_FLAGS: dict[str, str] = {
 
 #: Flags that carry no value.
 _SERVE_SWITCHES = ("--no-warm",)
-_WEIGHTLESS_ENDPOINT = "--weightless-endpoint"
+_WEIGHTLESS_PACKAGE = "--weightless-package"
 
 
 def serve(config: RuntimeConfig, args: list[str]) -> int:
@@ -200,13 +200,13 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         if name in _SERVE_SWITCHES:
             switches.append(name)
             continue
-        if name not in ("--socket", "--out", _WEIGHTLESS_ENDPOINT) and name not in _SERVE_FLAGS:
+        if name not in ("--socket", "--out", _WEIGHTLESS_PACKAGE) and name not in _SERVE_FLAGS:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
                 "serve takes --socket <path> [--out <dir>] "
                 + " ".join(f"[{f} <value>]" for f in sorted(_SERVE_FLAGS))
-                + f" [{_WEIGHTLESS_ENDPOINT} <dir>] [--no-warm]; directives, grants and "
+                + f" [{_WEIGHTLESS_PACKAGE} <dir>] [--no-warm]; directives, grants and "
                 "config arrive over the protocol",
                 Exit.usage,
             )
@@ -225,38 +225,38 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
     argv = ["--listen", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
-    weightless_endpoint = values.get(_WEIGHTLESS_ENDPOINT, "")
+    weightless_package = values.get(_WEIGHTLESS_PACKAGE, "")
     artifact_flags = ("--artifact-store", "--artifact-object-set")
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
-    if weightless_endpoint and supplied_artifacts:
+    if weightless_package and supplied_artifacts:
         raise CliError(
             "usage",
-            f"{_WEIGHTLESS_ENDPOINT} cannot be combined with {', '.join(supplied_artifacts)}",
-            "choose one launch mode: the explicit local weightless endpoint, or the exact "
+            f"{_WEIGHTLESS_PACKAGE} cannot be combined with {', '.join(supplied_artifacts)}",
+            "choose one launch mode: the explicit local weightless package, or the exact "
             "provisioned artifact store and object set",
             Exit.usage,
         )
-    if weightless_endpoint:
+    if weightless_package:
         from cozy_runtime.author import ConformanceError
         from cozy_runtime.internal import descriptor, local
         from cozy_runtime.internal.discovery import discover
 
-        endpoint = Path(weightless_endpoint).expanduser().resolve()
+        package = Path(weightless_package).expanduser().resolve()
         try:
-            found = discover(endpoint)
+            found = discover(package)
             staged = local.stage_weightless_release(config.cozy_home, descriptor.build(found))
         except ConformanceError as exc:
             raise CliError(
                 "validation",
                 str(exc),
-                "repair the endpoint surface before launching its local weightless worker",
+                "repair the package surface before launching its local weightless worker",
                 Exit.validation,
             ) from exc
         except RuntimeError as exc:
             raise CliError(
                 "structural",
                 str(exc),
-                "use the ordinary provisioned launch mode for any model-bearing endpoint",
+                "use the ordinary provisioned launch mode for any model-bearing package",
                 Exit.structural,
             ) from exc
         argv += [
@@ -265,14 +265,14 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "--artifact-object-set",
             str(staged.artifact_object_set),
         ]
-        os.chdir(endpoint)
+        os.chdir(package)
     elif len(supplied_artifacts) != len(artifact_flags):
         missing = [flag for flag in artifact_flags if flag not in values]
         raise CliError(
             "usage",
             "ordinary serve requires " + " and ".join(missing),
             "pass the exact provisioned --artifact-store and --artifact-object-set, or "
-            f"choose {_WEIGHTLESS_ENDPOINT} <dir> explicitly",
+            f"choose {_WEIGHTLESS_PACKAGE} <dir> explicitly",
             Exit.usage,
         )
     for flag, worker_flag in _SERVE_FLAGS.items():
@@ -288,7 +288,7 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
     """`cozy-runtime bindings` — the RESOLVED binding records, from the one resolver.
 
     cl-010's finding: no runtime verb emitted the resolved record, so cozy-creator grew a
-    second narrow reader of `endpoint.toml`'s selection grammar
+    second narrow reader of `package.toml`'s selection grammar
     (`internal/launch/bindings.go`) to get at the same three keys. Two readers of one closed
     grammar is exactly the duplication the CLI reference forbids, and the fix belongs here
     because this side owns the resolution. With this verb that file deletes — the deletion

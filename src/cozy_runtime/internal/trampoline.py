@@ -134,7 +134,7 @@ def main(argv: list[str]) -> None:
             )
 
     # Keep executor-directed signals out of the worker's group. Under process-tree
-    # containment, stop before endpoint import so the parent can fsync this exact birth and
+    # containment, stop before package import so the parent can fsync this exact birth and
     # PGID before allowing any first-party descendant to exist.
     proctree.own_process_group()
     if scope_backend == "process_tree":

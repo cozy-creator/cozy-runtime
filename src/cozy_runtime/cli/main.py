@@ -42,7 +42,7 @@ BUILT = (
 #: carrying any transfer-to-store logic of its own.
 UNAVAILABLE = ("ingest",)
 
-HELP = """cozy-runtime — everything a single endpoint venv can do alone
+HELP = """cozy-runtime — everything a single package venv can do alone
 
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
 
@@ -50,14 +50,14 @@ verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
   serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
-  describe [<fn>]                the EndpointDescriptor, without loading weights
+  describe [<fn>]                the PackageDescriptor, without loading weights
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/CAS/credential facts
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
   pull <ref> --hub <url>         fetch a hub checkpoint into the local CAS
   list [<ref-prefix>]            CAS-resident checkpoints, one artifact one size
   rm <ref> … --yes               remove artifacts from the local CAS
-  new <name>                     scaffold a minimal valid endpoint skeleton
+  new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
 run/job flags:
@@ -82,7 +82,7 @@ pull flags:
   --dry-run             the plan — what would move — without moving it
 
 serve modes (exactly one):
-  --weightless-endpoint <dir>                 stage a local model-free endpoint
+  --weightless-package <dir>                 stage a local model-free package
   --artifact-store <dir> --artifact-object-set <file>
                                                serve a provisioned release
 
@@ -90,7 +90,7 @@ global flags:
   --json           the full typed result as one JSON document
   --full           widen output, lift truncation
   --fields a,b,c   pick columns
-  --dir <path>     endpoint project root (default: cwd)
+  --dir <path>     package project root (default: cwd)
   -h, --help       this text
 """
 
@@ -114,7 +114,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
         if verb in _OWNS_ARGS:
             # The verb owns everything after itself. `run` has flags of its own and a
             # payload grammar that spells `key=value`; a global pass that tried to
-            # interpret those would have to know the endpoint's schema.
+            # interpret those would have to know the package's schema.
             args.append(item)
         elif item in ("-h", "--help"):
             want_help = True

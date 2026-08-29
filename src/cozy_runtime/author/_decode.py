@@ -57,8 +57,8 @@ class DecodeLimits:
             raise ValueError("every decode limit must be positive")
 
 
-# Structural codec ceilings, not endpoint policy. Duration and reference-count limits stay
-# at the endpoint; a field's mandatory max_decoded_bytes is normally the tighter bound.
+# Structural codec ceilings, not package policy. Duration and reference-count limits stay
+# at the package; a field's mandatory max_decoded_bytes is normally the tighter bound.
 DEFAULT_DECODE_LIMITS = DecodeLimits(
     max_decoded_bytes=2 * 1024**3,
     max_pixels_per_frame=8192 * 8192,
@@ -94,7 +94,7 @@ class DecodedAudio:
     """Planar native-clock PCM on the container's presentation timeline.
 
     ``start_time`` and a containing :class:`DecodedVideo`'s ``start_time`` share that
-    timeline, so an endpoint can preserve their exact A/V offset instead of assuming both
+    timeline, so a package can preserve their exact A/V offset instead of assuming both
     streams begin at zero.
     """
 

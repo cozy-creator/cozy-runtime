@@ -1,6 +1,6 @@
 """The adversarial-corpus harness: one hostile construct per case, three legal verdicts.
 
-Every case is a REAL endpoint module — real torch, real `nn.Module`s, a real `Model`
+Every case is a REAL package module — real torch, real `nn.Module`s, a real `Model`
 subclass whose real `load()` the derivation executes. Nothing is mocked (#160), and the
 scoreboard is produced by running them.
 
@@ -9,7 +9,7 @@ The verdicts:
 * **derived-correct** — the derived census equals a census of the SAME construction
   performed for real on CPU. This is the only verdict that requires the ground-truth diff,
   and the diff is the point: a refusal is visible, but a wrong derivation is not.
-* **typed-refusal** — the harness named the construct and refused. The endpoint changes.
+* **typed-refusal** — the harness named the construct and refused. The package changes.
 * **typed-harness-gap** — the harness named ITSELF as unable to see the construct. This
   file changes.
 * **silent-wrong** — the derivation succeeded and disagrees with reality. The red arm of

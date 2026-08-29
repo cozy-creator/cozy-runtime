@@ -25,7 +25,7 @@ from typing import Any, Literal
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
-#: not defaulted — an endpoint cannot opt back in.
+#: not defaulted — a package cannot opt back in.
 MPS_CHILD_ENV_LAW = ("PYTORCH_ENABLE_MPS_FALLBACK", "0")
 
 BACKENDS = ("cuda", "mps")
@@ -255,7 +255,7 @@ def child_env_law(kind: str) -> dict[str, str]:
 
 def qualification_gate(kind: str) -> None:
     """Refuses qualification on a backend whose probe suite does not exist yet. cr-006's
-    suite is CUDA; the MPS suite must qualify the ACTUAL endpoint graph, not one matmul
+    suite is CUDA; the MPS suite must qualify the ACTUAL package graph, not one matmul
     (#450), and lands with cr-021.
 
     `cpu` PASSES, and it is the same reading `present` already takes: a torch-bearing

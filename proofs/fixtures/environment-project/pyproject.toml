@@ -13,6 +13,6 @@ build-backend = "hatchling.build"
 packages = ["src/proof_environment_project"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"endpoint.toml" = "endpoint.toml"
+"package.toml" = "package.toml"
 "pyproject.toml" = "pyproject.toml"
 "uv.lock" = "uv.lock"

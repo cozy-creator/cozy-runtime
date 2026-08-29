@@ -59,8 +59,8 @@ def asset_paths(struct: Json, prefix: str = "") -> tuple[str, ...]:
 
     These ARE the output ids: the RecordOwner grants one destination per asset field path,
     and a set that does not match what the handler produced refuses the tail whole. Deriving
-    them from the descriptor is what makes `--out` a consequence of the endpoint's declared
-    result rather than a convention the CLI and the endpoint both have to remember.
+    them from the descriptor is what makes `--out` a consequence of the package's declared
+    result rather than a convention the CLI and the package both have to remember.
     """
     assert isinstance(struct, dict)
     found: list[str] = []
@@ -159,7 +159,7 @@ def parse(
 def extract_local_assets(document: dict[str, Any], payload_type: object) -> dict[str, LocalInput]:
     """Replace typed `@/absolute/file` leaves with path-free refs and return their grants.
 
-    The fully merged request is decoded through the endpoint's actual request type first.
+    The fully merged request is decoded through the package's actual request type first.
     That makes an Asset declaration, including a selected tagged-union arm, the sole path
     authority. A prompt or any other string beginning `@/` remains text.
     """

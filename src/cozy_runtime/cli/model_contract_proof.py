@@ -1,7 +1,7 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
 The command runs from base worker image Python plus a receipt-selected content overlay.
-It verifies that small overlay receipt and base-family join, then delegates endpoint import and
+It verifies that small overlay receipt and base-family join, then delegates package import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
 digest-addressed result directory by atomic rename.
@@ -27,9 +27,9 @@ from typing import Any
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import canonical, contract, overlay, sandbox
-from cozy_runtime.internal import descriptor as endpoint_descriptor
+from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
-from cozy_runtime.internal.descriptor import StaleDescriptor
+from cozy_runtime.internal.descriptor import StalePackageDescriptor
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.exits import Exit
 
@@ -45,8 +45,8 @@ _VARIANT = re.compile(r"^sm[0-9]{2,}$")
 
 REQUEST_FIELDS = {
     "bindings",
-    "endpoint_descriptor",
-    "endpoint_release_id",
+    "package_descriptor",
+    "package_release_id",
     "environment_generation",
     "environment_spec_digest",
     "format",
@@ -96,8 +96,8 @@ class ProofRequest:
     environment_spec_digest: str
     installed_environment_receipt: DocumentRef
     project_wheel_digest: str
-    endpoint_release_id: str
-    endpoint_descriptor: LocalDocumentRef
+    package_release_id: str
+    package_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
     wheelhouse_manifest: Path
 
@@ -212,14 +212,14 @@ def _read_request(path: Path) -> ProofRequest:
     paths = [row.path for row in bindings]
     if len(paths) != len(set(paths)):
         raise _request_error("bindings contains a duplicate descriptor model path")
-    release = value["endpoint_release_id"]
+    release = value["package_release_id"]
     if (
         not isinstance(release, str)
         or not release
         or len(release) > 256
         or release.strip() != release
     ):
-        raise _request_error("endpoint_release_id is not one bounded non-empty string")
+        raise _request_error("package_release_id is not one bounded non-empty string")
     return ProofRequest(
         environment_generation=_existing_directory(
             value["environment_generation"], "environment_generation"
@@ -231,8 +231,8 @@ def _read_request(path: Path) -> ProofRequest:
             value["installed_environment_receipt"], "installed_environment_receipt"
         ),
         project_wheel_digest=_digest(value["project_wheel_digest"], "project_wheel_digest"),
-        endpoint_release_id=release,
-        endpoint_descriptor=_local_ref(value["endpoint_descriptor"], "endpoint_descriptor"),
+        package_release_id=release,
+        package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
         bindings=bindings,
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
     )
@@ -463,16 +463,16 @@ def _child_entry(args: Sequence[str]) -> int:
         request = _read_request(request_path)
         installed = _verify_installed_generation(request)
         sys.path.append(str(installed.import_root))
-        descriptor_doc = _read_descriptor(request.endpoint_descriptor)
+        descriptor_doc = _read_descriptor(request.package_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:
-            raise ProofRefusal("model_contract_descriptor_invalid", "application is absent")
+            raise ProofRefusal("model_contract_package_descriptor_invalid", "application is absent")
         _warm_torch()
         sandbox.install(allow_write_prefixes=())
         sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
         found = discover_installed(application)
-        installed_descriptor = endpoint_descriptor.build(found)
-        endpoint_descriptor.compare(
+        installed_descriptor = package_descriptor.build(found)
+        package_descriptor.compare(
             descriptor_doc,
             installed_descriptor,
             ("the exact release descriptor", "the installed project wheel"),
@@ -487,7 +487,7 @@ def _child_entry(args: Sequence[str]) -> int:
     except overlay.OverlayRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
-    except (ConformanceError, StaleDescriptor, contract.ContractError) as err:
+    except (ConformanceError, StalePackageDescriptor, contract.ContractError) as err:
         _emit_child(
             {
                 "error": str(getattr(err, "code", "model_contract_conformance")),
@@ -512,7 +512,7 @@ def _child_entry(args: Sequence[str]) -> int:
 
 
 def _warm_torch() -> None:
-    """Warm torch's own lazy imports before rlimits, never endpoint code or a GPU."""
+    """Warm torch's own lazy imports before rlimits, never package code or a GPU."""
 
     __import__("torch")
     for name in ("torch._dynamo", "torch._refs"):
@@ -543,17 +543,20 @@ def _derive_all(
     for collection in ("entrypoints", "jobs"):
         entries = descriptor_doc[collection]
         if not isinstance(entries, list):
-            raise ProofRefusal("model_contract_descriptor_invalid", f"{collection} is not an array")
+            raise ProofRefusal(
+                "model_contract_package_descriptor_invalid", f"{collection} is not an array"
+            )
         for described in entries:
             if not isinstance(described, dict) or not isinstance(described.get("name"), str):
                 raise ProofRefusal(
-                    "model_contract_descriptor_invalid", f"{collection} row is invalid"
+                    "model_contract_package_descriptor_invalid", f"{collection} row is invalid"
                 )
             name = described["name"]
             surface = surfaces.get(name)
             if surface is None:
                 raise ProofRefusal(
-                    "model_contract_descriptor_invalid", f"{collection} surface {name!r} is absent"
+                    "model_contract_package_descriptor_invalid",
+                    f"{collection} surface {name!r} is absent",
                 )
             binding_rows: list[dict[str, Any]] = []
             for binding in surface.model_bindings:
@@ -576,7 +579,7 @@ def _derive_all(
                         binding,
                         source,
                         config,
-                        release=request.endpoint_release_id,
+                        release=request.package_release_id,
                         application=found.application,
                         variant=variant,
                     )
@@ -673,13 +676,13 @@ def _read_exact(ref: LocalDocumentRef, name: str) -> bytes:
 
 def _read_descriptor(ref: LocalDocumentRef) -> dict[str, Any]:
     """Read a review projection, then verify its semantic canonical ref."""
-    raw = _document_bytes(ref.path, "endpoint_descriptor")
-    document = endpoint_descriptor.read_bytes(raw, str(ref.path))
-    semantic = endpoint_descriptor.canonical_bytes(document)
+    raw = _document_bytes(ref.path, "package_descriptor")
+    document = package_descriptor.read_bytes(raw, str(ref.path))
+    semantic = package_descriptor.canonical_bytes(document)
     if len(semantic) != ref.length or _sha(semantic) != ref.digest:
         raise ProofRefusal(
             "model_contract_input_identity_mismatch",
-            f"endpoint_descriptor at {ref.path} does not mean {ref.digest}/{ref.length}",
+            f"package_descriptor at {ref.path} does not mean {ref.digest}/{ref.length}",
         )
     return document
 
@@ -723,7 +726,7 @@ def _decode_child(
         if len(raw) != length or _sha(raw) != digest:
             raise ProofRefusal("model_contract_child_invalid", "contract stored-byte identity")
         parsed = contract.read_contract(raw)
-        if parsed.candidate.release != request.endpoint_release_id:
+        if parsed.candidate.release != request.package_release_id:
             raise ProofRefusal("model_contract_child_invalid", "contract release identity")
         documents[digest] = raw
     functions = response["functions"]
@@ -731,10 +734,10 @@ def _decode_child(
         raise ProofRefusal("model_contract_child_invalid", "functions is not an array")
     index = {
         "application": response["application"],
-        "endpoint_descriptor": DocumentRef(
-            request.endpoint_descriptor.digest, request.endpoint_descriptor.length
+        "package_descriptor": DocumentRef(
+            request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
-        "endpoint_release_id": request.endpoint_release_id,
+        "package_release_id": request.package_release_id,
         "environment_spec_digest": request.environment_spec_digest,
         "format": INDEX_FORMAT,
         "functions": functions,

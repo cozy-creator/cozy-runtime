@@ -43,7 +43,7 @@ def report(label: str, samples: list[float], rss_kib: int) -> None:
 ITERATIONS = 3000
 
 # The per-call cost of the author surface, measured in one process against the real
-# endpoint in examples/. "kernel" is everything invoke() does around the handler: decode,
+# package in examples/. "kernel" is everything invoke() does around the handler: decode,
 # ModelDefault overlay + digest, RequestFeatures normalization, preflight, injection,
 # return validation and the output transaction. "handler" is the same handler called
 # directly with the same arguments, so the DIFFERENCE is the surface's overhead.
@@ -177,8 +177,8 @@ raw = descriptor.canonical_bytes(body)
 bench('descriptor.build (frozen app -> document)', lambda: descriptor.build(found), 200)
 bench('descriptor.canonical_bytes (publication output)',
       lambda: descriptor.canonical_bytes(body), 500)
-bench('descriptor_digest (canonical semantic hash)',
-      lambda: descriptor.descriptor_digest(body), 500)
+bench('package_descriptor_digest (canonical semantic hash)',
+      lambda: descriptor.package_descriptor_digest(body), 500)
 bench('canonical.parse (read publication bytes)', lambda: canonical.parse(raw), 500)
 bench('compare (the server proof comparison)',
       lambda: descriptor.compare(body, body, ('a', 'b')), 500)
@@ -202,7 +202,7 @@ def main() -> int:
         ("import msgspec (the one dependency)", [py, "-c", "import msgspec"]),
         ("import cozy_runtime.cli.main", [py, "-c", "import cozy_runtime.cli.main"]),
         ("bare python interpreter", [py, "-c", "pass"]),
-        # cr-003: what the build and CI actually pay per endpoint.
+        # cr-003: what the build and CI actually pay per package.
         ("cozy-runtime describe (h3)", [*DESCRIBE]),
         ("cozy-runtime describe --json", [*DESCRIBE, "--json"]),
     ]

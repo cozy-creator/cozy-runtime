@@ -2,7 +2,7 @@
 
 Two clocks (§1.0): `ConformanceError` refuses at BUILD (describe), everything else refuses
 at REQUEST time. The clock is the class, so a caller never has to read prose to know
-whether an endpoint is broken or a request is.
+whether a package is broken or a request is.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class AuthorError(Exception):
 
 
 class ConformanceError(AuthorError):
-    """A BUILD-time refusal: the endpoint's own surface is invalid (§1.7).
+    """A BUILD-time refusal: the package's own surface is invalid (§1.7).
 
     Same verdict class as a `mypy --strict` failure — describe is the second reader of the
     one signature, never a second contract.
@@ -127,11 +127,11 @@ NEUTRAL_ERROR_SET: Mapping[str, object] = {
 SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 
 #: The code a device out-of-memory escaping a handler reports under. It is RUNTIME-origin
-#: on purpose: residency is the runtime's whole job here, the endpoint owns no memory
-#: vocabulary at all (the `endpoint-owns-no-residency` fence proves it cannot even name
+#: on purpose: residency is the runtime's whole job here, the package owns no memory
+#: vocabulary at all (the `package-owns-no-residency` fence proves it cannot even name
 #: one), so blaming the author for the card running out is naming the one party that had no
 #: say. Measured: cl-003 watched a plan-arithmetic defect arrive as
-#: `AUTHOR_EXCEPTION/CAUSE_ORIGIN_AUTHOR` on an endpoint that made no memory call.
+#: `AUTHOR_EXCEPTION/CAUSE_ORIGIN_AUTHOR` on a package that made no memory call.
 DEVICE_OOM = "device_out_of_memory"
 
 

@@ -89,7 +89,7 @@ STATIC_ARMS = (
     ),
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
     Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
-    Arm("typed-model-binding", ROOT / "examples" / "endpoint.toml", '\nrepo = "legacy/model"\n'),
+    Arm("typed-model-binding", ROOT / "examples" / "package.toml", '\nrepo = "legacy/model"\n'),
     Arm("single-config", SRC / "cli" / "version.py", "def read_config() -> None: ...\n"),
     Arm("single-config", SRC / "cli" / "io.py", "CONFIG = {'smuggled': True}\n"),
     Arm("no-interactive", SRC / "cli" / "new.py", "ANSWER = input('name? ')\n"),
@@ -120,7 +120,7 @@ STATIC_ARMS = (
         "def place(device: str) -> None: ...\n",
     ),
     Arm(
-        "no-identifiers-in-endpoint-code",
+        "no-identifiers-in-package-code",
         ROOT / "examples" / "tiny_h3.py",
         '_PINNED = "minimaxai/h3@v1"\n',
     ),
@@ -137,35 +137,35 @@ STATIC_ARMS = (
     ),
     # cr-011's §1.3 rule, planted as the two ways it could break: the observation plane
     # IMPORTING a deciding module, and naming a residency operation without importing one.
-    # cr-008b's done-when as a plant: an endpoint that can move bytes is a second policy.
+    # cr-008b's done-when as a plant: a package that can move bytes is a second policy.
     Arm(
-        "endpoint-owns-no-residency",
+        "package-owns-no-residency",
         ROOT / "corpus" / "pipeline" / "sdxl_txt2img.py",
         "def _reclaim() -> None:\n    import torch\n\n    torch.cuda.empty_cache()\n",
     ),
     Arm(
-        "endpoint-owns-no-residency",
+        "package-owns-no-residency",
         ROOT / "corpus" / "sdxl_pipeline.py",
         "def _offload(pipe: object) -> None:\n    pipe.enable_model_cpu_offload()\n",
     ),
     Arm(
-        "endpoint-owns-no-media-decode",
+        "package-owns-no-media-decode",
         ROOT / "examples" / "tiny_h3.py",
         "def _second_decoder() -> None:\n    import av\n\n    av.open('request.mp4')\n",
     ),
     Arm(
-        "endpoint-owns-no-media-decode",
+        "package-owns-no-media-decode",
         ROOT / "examples" / "tiny_h3.py",
         "def _steal_asset_path(asset: object) -> object:\n    return asset._local\n",
     ),
     Arm(
-        "endpoint-owns-no-media-decode",
+        "package-owns-no-media-decode",
         ROOT / "examples" / "tiny_h3.py",
         "def _library_path_decode(reference: object) -> object:\n"
         "    return reference.from_file('request.mp4')\n",
     ),
     Arm(
-        "endpoint-owns-no-media-decode",
+        "package-owns-no-media-decode",
         ROOT / "examples" / "tiny_h3.py",
         "def _packet_decode(container: object) -> object:\n    return container.demux()\n",
     ),
@@ -313,7 +313,7 @@ LIVE_ARMS = (
     (
         # cr-051: the value guard inspects bytes and is the real defence; the NAME guard's
         # residual value is a credential in an unrecognised format. It must not eat the most
-        # obvious fields an inference endpoint emits — `tokens_per_second` and
+        # obvious fields an inference package emits — `tokens_per_second` and
         # `output_tokens` — while still refusing a field named for a credential.
         "observation-metric-names-are-not-credentials",
         "from cozy_runtime.author._observations import EventRing, ObservationRefusal\n"
@@ -1442,7 +1442,7 @@ def run_mistyped() -> str:
 
 
 # ---------------------------------------------------------------- cr-003: the boundary
-# Each arm builds a THROWAWAY endpoint project and runs the real `describe` verb over it.
+# Each arm builds a THROWAWAY package project and runs the real `describe` verb over it.
 # The refusal observed is the CLI's, exit code included — this is the build's own gate.
 
 _VALID_MODULE = """
@@ -1475,7 +1475,7 @@ BOUNDARY_ARMS: tuple[tuple[str, str, str, str, int], ...] = (
     ),
     (
         "no_application_named",
-        "# an endpoint.toml that names nothing\n",
+        "# a package.toml that names nothing\n",
         _VALID_MODULE,
         "names no [application] object",
         3,
@@ -1502,7 +1502,7 @@ BOUNDARY_ARMS: tuple[tuple[str, str, str, str, int], ...] = (
         3,
     ),
     (
-        "endpoint_job_name_collision",
+        "package_job_name_collision",
         '[application]\nobject = "ep:app"\n',
         _VALID_MODULE
         + """
@@ -1562,10 +1562,10 @@ def harvested_if_recursive(payload: SideIn) -> SideOut:
 """
 
 
-def _project(tmp: pathlib.Path, endpoint_toml: str, module: str) -> pathlib.Path:
-    project = tmp / "endpoint"
+def _project(tmp: pathlib.Path, package_toml: str, module: str) -> pathlib.Path:
+    project = tmp / "package"
     (project / "src" / "ep").mkdir(parents=True, exist_ok=True)
-    (project / "endpoint.toml").write_text(endpoint_toml)
+    (project / "package.toml").write_text(package_toml)
     (project / "src" / "ep" / "__init__.py").write_text(module)
     return project
 
@@ -1594,7 +1594,7 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
                 return f"NOT PROVEN — {name}: describe failed ({output.strip()[:120]})"
             if "harvested_if_recursive" in output:
                 return f"NOT PROVEN — {name}: a sibling module's registration was harvested"
-            skip = ("counts", "descriptor_digest", "next")
+            skip = ("counts", "package_descriptor_digest", "next")
             names = [
                 ln.split(":")[0]
                 for ln in output.splitlines()
@@ -1621,10 +1621,10 @@ def run_retired_descriptor_shapes() -> list[str]:
     def refused(name: str, document: dict[str, Any]) -> str:
         try:
             descriptor_document.read_bytes(json.dumps(document).encode(), name)
-        except descriptor_document.StaleDescriptor as exc:
-            if exc.code == "malformed_descriptor":
+        except descriptor_document.StalePackageDescriptor as exc:
+            if exc.code == "malformed_package_descriptor":
                 return f"red — retired_descriptor/{name}: {str(exc)[:120]}"
-            return f"NOT PROVEN — {name} refused with {exc.code}, not malformed_descriptor"
+            return f"NOT PROVEN — {name} refused with {exc.code}, not malformed_package_descriptor"
         return f"NOT PROVEN — retired descriptor shape {name} was accepted"
 
     hidden = clone()

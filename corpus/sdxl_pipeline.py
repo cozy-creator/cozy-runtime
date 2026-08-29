@@ -18,7 +18,7 @@ is a component-use contract, not a phase list: while `encode` runs, either encod
 touched and nothing else may. That is what the runtime admits and materializes against, and
 what an undeclared access poisons the executor for.
 
-The endpoint names no device, no placement, no offload and no backend — there is no such
+The package names no device, no placement, no offload and no backend — there is no such
 surface to name. Whether a component is resident when a method entered is the runtime's
 question, answered before entry, and this file cannot observe the answer.
 """

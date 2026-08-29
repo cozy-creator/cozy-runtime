@@ -26,7 +26,7 @@ from typing import Any, cast
 from google.protobuf.json_format import ParseDict, ParseError
 
 from cozy_runtime.internal import canonical, descriptor, overlay, provisioned, warm
-from cozy_runtime.internal.materialize_launch import LaunchRefusal, endpoint_overlay_input
+from cozy_runtime.internal.materialize_launch import LaunchRefusal, package_overlay_input
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
@@ -48,7 +48,7 @@ _BINDING_KINDS = frozenset(
         "model_config",
     }
 )
-_FIXTURE_FIELDS = frozenset({"endpoint_descriptor", "entrypoint", "format", "input_root"})
+_FIXTURE_FIELDS = frozenset({"package_descriptor", "entrypoint", "format", "input_root"})
 _OBSERVATION_FIELDS = frozenset(
     {
         "accelerator_qualification",
@@ -58,11 +58,11 @@ _OBSERVATION_FIELDS = frozenset(
         "attempt_outcome",
         "binding_documents",
         "control_runtime_digest",
-        "endpoint_binding_release",
-        "endpoint_bundle",
-        "endpoint_descriptor",
-        "endpoint_environment_spec",
-        "endpoint_execution",
+        "package_binding_release",
+        "package_bundle",
+        "package_descriptor",
+        "package_environment_spec",
+        "package_execution",
         "entrypoint",
         "environment_root",
         "fixture_payload",
@@ -117,7 +117,7 @@ def fixture_request(raw: bytes) -> bytes:
     request = _request(raw, FIXTURE_REQUEST_FORMAT, _FIXTURE_FIELDS)
     input_root = _directory(request["input_root"], "input_root")
     descriptor_doc = _local_document(
-        request["endpoint_descriptor"], "endpoint_descriptor", input_root
+        request["package_descriptor"], "package_descriptor", input_root
     )
     entrypoint = _identifier(request["entrypoint"], "entrypoint")
     return _fixture_payload(descriptor_doc, entrypoint)
@@ -134,11 +134,11 @@ def execution_observation(raw: bytes) -> bytes:
         for name in (
             "artifact_object_set",
             "attempt_outcome",
-            "endpoint_binding_release",
-            "endpoint_bundle",
-            "endpoint_descriptor",
-            "endpoint_environment_spec",
-            "endpoint_execution",
+            "package_binding_release",
+            "package_bundle",
+            "package_descriptor",
+            "package_environment_spec",
+            "package_execution",
             "fixture_payload",
             "invocation_spec",
             "installed_environment_receipt",
@@ -150,11 +150,11 @@ def execution_observation(raw: bytes) -> bytes:
     environment_root = _directory(request["environment_root"], "environment_root")
     artifact_store = _directory(request["artifact_store"], "artifact_store")
     environment = _environment(documents_by_name, environment_root)
-    endpoint_release_id = _endpoint_execution(documents_by_name, environment, entrypoint)
+    package_release_id = _package_execution(documents_by_name, environment, entrypoint)
     selected, model_contracts, binding_release = _binding_release(
         request,
         documents_by_name,
-        endpoint_release_id,
+        package_release_id,
         artifact_store,
         entrypoint,
         input_root,
@@ -162,7 +162,7 @@ def execution_observation(raw: bytes) -> bytes:
     placement_id, placement_spec_digest = _placement(
         documents_by_name,
         binding_release,
-        endpoint_release_id,
+        package_release_id,
         selected.entrypoint_binding_plan_id,
     )
     observed_spec = _digest(
@@ -175,7 +175,7 @@ def execution_observation(raw: bytes) -> bytes:
         )
 
     fixture = documents_by_name["fixture_payload"]
-    expected_fixture = _fixture_payload(documents_by_name["endpoint_descriptor"], entrypoint)
+    expected_fixture = _fixture_payload(documents_by_name["package_descriptor"], entrypoint)
     if fixture.raw != expected_fixture:
         raise AcceptanceRefusal(
             "acceptance_fixture_mismatch", "dispatched payload is not the descriptor fixture"
@@ -183,7 +183,7 @@ def execution_observation(raw: bytes) -> bytes:
     invocation = _invocation(
         documents_by_name["invocation_spec"],
         environment,
-        endpoint_release_id,
+        package_release_id,
         selected.entrypoint_binding_plan_id,
         fixture,
     )
@@ -218,9 +218,7 @@ def execution_observation(raw: bytes) -> bytes:
     output_manifest = _output_manifest(outcome.get("output_manifest"))
     result_digest, result_schema_digest = _result(outcome.get("result"))
     if result_digest:
-        expected_schema = _result_schema_digest(
-            documents_by_name["endpoint_descriptor"], entrypoint
-        )
+        expected_schema = _result_schema_digest(documents_by_name["package_descriptor"], entrypoint)
         if result_schema_digest != expected_schema:
             raise AcceptanceRefusal(
                 "attempt_result_schema_mismatch",
@@ -246,12 +244,12 @@ def execution_observation(raw: bytes) -> bytes:
         "boot_warmup": False,
         "binding_plan_digest": selected.entrypoint_binding_plan_id,
         "control_runtime_digest": environment.control_runtime_digest,
-        "descriptor_digest": documents_by_name["endpoint_descriptor"].digest,
-        "endpoint_binding_release_digest": documents_by_name["endpoint_binding_release"].digest,
-        "endpoint_execution_digest": documents_by_name["endpoint_execution"].digest,
-        "endpoint_release_id": endpoint_release_id,
+        "package_descriptor_digest": documents_by_name["package_descriptor"].digest,
+        "package_binding_release_digest": documents_by_name["package_binding_release"].digest,
+        "package_execution_digest": documents_by_name["package_execution"].digest,
+        "package_release_id": package_release_id,
         "entrypoint": entrypoint,
-        "environment_spec_digest": documents_by_name["endpoint_environment_spec"].digest,
+        "environment_spec_digest": documents_by_name["package_environment_spec"].digest,
         "execution_started": bool(outcome.get("execution_started", False)),
         "format": OBSERVATION_FORMAT,
         "installed_environment_receipt_digest": environment.installed.receipt_digest,
@@ -325,9 +323,9 @@ def _local_document(value: object, name: str, input_root: Path) -> LocalDocument
 
 def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> _Environment:
     receipt = _canonical_object(
-        documents_by_name["endpoint_binding_release"].raw, "endpoint_binding_release"
+        documents_by_name["package_binding_release"].raw, "package_binding_release"
     ).get("installed_environment_receipt")
-    receipt_ref = _embedded_ref(receipt, "endpoint_binding_release.installed_environment_receipt")
+    receipt_ref = _embedded_ref(receipt, "package_binding_release.installed_environment_receipt")
     receipt_doc = documents_by_name["installed_environment_receipt"]
     if receipt_doc.ref() != receipt_ref:
         raise AcceptanceRefusal(
@@ -357,23 +355,23 @@ def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> 
             )
         wheel_paths[_digest(row["digest"], f"overlay_wheels[{index}].digest")] = Path("/unread")
     try:
-        source = endpoint_overlay_input(
-            environment_spec_bytes=documents_by_name["endpoint_environment_spec"].raw,
-            endpoint_bundle_bytes=documents_by_name["endpoint_bundle"].raw,
+        source = package_overlay_input(
+            environment_spec_bytes=documents_by_name["package_environment_spec"].raw,
+            package_bundle_bytes=documents_by_name["package_bundle"].raw,
             resolved_wheel_set_bytes=documents_by_name["resolved_wheel_set"].raw,
             wheelhouse_manifest_bytes=documents_by_name["wheelhouse_manifest"].raw,
             wheel_paths=wheel_paths,
         )
     except LaunchRefusal as exc:
         raise AcceptanceRefusal(exc.code, exc.detail) from exc
-    if source.environment_spec_digest != documents_by_name["endpoint_environment_spec"].digest:
+    if source.environment_spec_digest != documents_by_name["package_environment_spec"].digest:
         raise AcceptanceRefusal(
             "environment_spec_identity_mismatch", source.environment_spec_digest
         )
     if overlay.expected_receipt_bytes(source) != receipt_doc.raw:
         raise AcceptanceRefusal(
             "installed_environment_receipt_mismatch",
-            "receipt bytes are not implied by EES/EndpointBundle/RWS/WHM",
+            "receipt bytes are not implied by EES/PackageBundle/RWS/WHM",
         )
     try:
         installed = overlay.open_generation(
@@ -385,7 +383,7 @@ def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> 
         )
     except overlay.OverlayRefusal as exc:
         raise AcceptanceRefusal(exc.code, exc.detail) from exc
-    spec = _canonical_object(documents_by_name["endpoint_environment_spec"].raw, "environment_spec")
+    spec = _canonical_object(documents_by_name["package_environment_spec"].raw, "environment_spec")
     profile = spec.get("compatibility_profile")
     if not isinstance(profile, dict):
         raise AcceptanceRefusal("environment_spec_invalid", "compatibility_profile is absent")
@@ -418,7 +416,7 @@ def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> 
     control_runtime_digest = _digest(
         runtime_rows[0].get("digest"), "wheelhouse_manifest.cozy-runtime.digest"
     )
-    bundle = _canonical_object(documents_by_name["endpoint_bundle"].raw, "endpoint_bundle")
+    bundle = _canonical_object(documents_by_name["package_bundle"].raw, "package_bundle")
     return _Environment(
         bundle,
         profile_name,
@@ -428,10 +426,10 @@ def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> 
     )
 
 
-def _endpoint_execution(
+def _package_execution(
     docs: Mapping[str, LocalDocument], environment: _Environment, entrypoint: str
 ) -> str:
-    execution = _canonical_object(docs["endpoint_execution"].raw, "endpoint_execution")
+    execution = _canonical_object(docs["package_execution"].raw, "package_execution")
     if (
         set(execution)
         != {
@@ -441,88 +439,90 @@ def _endpoint_execution(
             "kind",
             "model_roots",
         }
-        or execution.get("kind") != "tensorhub.endpoint_execution/2"
+        or execution.get("kind") != "tensorhub.package_execution/2"
     ):
-        raise AcceptanceRefusal("endpoint_execution_invalid", "wrong fields or kind")
+        raise AcceptanceRefusal("package_execution_invalid", "wrong fields or kind")
     if execution.get("function") != entrypoint:
-        raise AcceptanceRefusal("endpoint_execution_invalid", "function differs from entrypoint")
+        raise AcceptanceRefusal("package_execution_invalid", "function differs from entrypoint")
     model_roots = execution.get("model_roots")
     if not isinstance(model_roots, list):
-        raise AcceptanceRefusal("endpoint_execution_invalid", "model_roots is not an array")
+        raise AcceptanceRefusal("package_execution_invalid", "model_roots is not an array")
     prior_root = ""
     for index, root in enumerate(model_roots):
         if not isinstance(root, dict) or set(root) != {"checkpoint_id", "name", "org"}:
-            raise AcceptanceRefusal("endpoint_execution_invalid", f"model_roots[{index}]")
+            raise AcceptanceRefusal("package_execution_invalid", f"model_roots[{index}]")
         key = "\0".join(str(root.get(field, "")) for field in ("org", "name", "checkpoint_id"))
         if not all(isinstance(root.get(field), str) and root[field] for field in ("org", "name")):
-            raise AcceptanceRefusal("endpoint_execution_invalid", f"model_roots[{index}]")
+            raise AcceptanceRefusal("package_execution_invalid", f"model_roots[{index}]")
         _digest(root.get("checkpoint_id"), f"model_roots[{index}].checkpoint_id")
         if key <= prior_root:
-            raise AcceptanceRefusal("endpoint_execution_invalid", "model_roots not sorted unique")
+            raise AcceptanceRefusal("package_execution_invalid", "model_roots not sorted unique")
         prior_root = key
     object_set = provisioned.read_artifact_object_set(docs["artifact_object_set"].raw)
     if bool(model_roots) != bool(object_set.roots):
         raise AcceptanceRefusal(
-            "endpoint_execution_model_closure_mismatch",
+            "package_execution_model_closure_mismatch",
             "model_roots and exact ArtifactObjectSet disagree about weightless execution",
         )
     canonical_execution = execution.get("canonical_execution")
     expected = {
         "build_record_digest",
-        "descriptor_digest",
-        "endpoint_control_manifest_digest",
+        "package_descriptor_digest",
+        "package_control_manifest_digest",
         "environment_spec_digest",
         "installed_environment_receipt_digest",
     }
     if not isinstance(canonical_execution, dict) or set(canonical_execution) != expected:
-        raise AcceptanceRefusal("endpoint_execution_invalid", "canonical_execution is not closed")
+        raise AcceptanceRefusal("package_execution_invalid", "canonical_execution is not closed")
     joins = {
-        "descriptor_digest": docs["endpoint_descriptor"].digest,
-        "environment_spec_digest": docs["endpoint_environment_spec"].digest,
+        "package_descriptor_digest": docs["package_descriptor"].digest,
+        "environment_spec_digest": docs["package_environment_spec"].digest,
         "installed_environment_receipt_digest": environment.installed.receipt_digest,
     }
     for field, wanted in joins.items():
         if canonical_execution.get(field) != wanted:
-            raise AcceptanceRefusal("endpoint_execution_ref_mismatch", field)
-    release = environment.bundle.get("endpoint_release_id")
+            raise AcceptanceRefusal("package_execution_ref_mismatch", field)
+    release = environment.bundle.get("package_release_id")
     if not isinstance(release, str) or not release or len(release) > MAX_STRING:
-        raise AcceptanceRefusal("endpoint_bundle_invalid", "endpoint_release_id")
-    descriptor_ref = _embedded_ref(environment.bundle.get("descriptor"), "bundle.descriptor")
-    if descriptor_ref != docs["endpoint_descriptor"].ref():
-        raise AcceptanceRefusal("endpoint_bundle_ref_mismatch", "descriptor")
+        raise AcceptanceRefusal("package_bundle_invalid", "package_release_id")
+    descriptor_ref = _embedded_ref(
+        environment.bundle.get("package_descriptor"), "bundle.package_descriptor"
+    )
+    if descriptor_ref != docs["package_descriptor"].ref():
+        raise AcceptanceRefusal("package_bundle_ref_mismatch", "package_descriptor")
     return release
 
 
 def _binding_release(
     request: Mapping[str, Any],
     docs: Mapping[str, LocalDocument],
-    endpoint_release_id: str,
+    package_release_id: str,
     artifact_store: Path,
     entrypoint: str,
     input_root: Path,
 ) -> tuple[Any, list[str], Mapping[str, Any]]:
-    release = _canonical_object(docs["endpoint_binding_release"].raw, "endpoint_binding_release")
+    release = _canonical_object(docs["package_binding_release"].raw, "package_binding_release")
     expected = {
-        "descriptor",
+        "package_descriptor",
         "documents",
-        "endpoint_execution_digest",
+        "package_execution_digest",
         "environment_spec",
         "format",
         "installed_environment_receipt",
         "object_set_digest",
     }
-    if set(release) != expected or release.get("format") != "tensorhub.endpoint_binding_release/1":
-        raise AcceptanceRefusal("endpoint_binding_release_invalid", "wrong fields or format")
-    if release.get("endpoint_execution_digest") != docs["endpoint_execution"].digest:
-        raise AcceptanceRefusal("endpoint_binding_release_invalid", "execution digest")
+    if set(release) != expected or release.get("format") != "tensorhub.package_binding_release/1":
+        raise AcceptanceRefusal("package_binding_release_invalid", "wrong fields or format")
+    if release.get("package_execution_digest") != docs["package_execution"].digest:
+        raise AcceptanceRefusal("package_binding_release_invalid", "execution digest")
     for field, wanted in (
-        ("descriptor", docs["endpoint_descriptor"].ref()),
-        ("environment_spec", docs["endpoint_environment_spec"].ref()),
+        ("package_descriptor", docs["package_descriptor"].ref()),
+        ("environment_spec", docs["package_environment_spec"].ref()),
     ):
         if _embedded_ref(release.get(field), f"binding_release.{field}") != wanted:
-            raise AcceptanceRefusal("endpoint_binding_release_invalid", field)
+            raise AcceptanceRefusal("package_binding_release_invalid", field)
     if release.get("object_set_digest") != docs["artifact_object_set"].digest:
-        raise AcceptanceRefusal("endpoint_binding_release_invalid", "object_set_digest")
+        raise AcceptanceRefusal("package_binding_release_invalid", "object_set_digest")
 
     supplied = request.get("binding_documents")
     if not isinstance(supplied, list):
@@ -541,22 +541,22 @@ def _binding_release(
         local[document.digest] = (str(row["kind"]), document)
     declared = release.get("documents")
     if not isinstance(declared, list) or len(declared) != len(local):
-        raise AcceptanceRefusal("endpoint_binding_release_invalid", "document set size")
+        raise AcceptanceRefusal("package_binding_release_invalid", "document set size")
     prior = ("", "")
     plans: dict[str, provisioned.ExactDocument] = {}
     model_contracts: list[str] = []
     for index, row in enumerate(declared):
         if not isinstance(row, dict) or set(row) != {"kind", "ref"}:
-            raise AcceptanceRefusal("endpoint_binding_release_invalid", f"documents[{index}]")
+            raise AcceptanceRefusal("package_binding_release_invalid", f"documents[{index}]")
         kind = str(row.get("kind", ""))
         ref = _embedded_ref(row.get("ref"), f"binding_release.documents[{index}].ref")
         if (kind, ref.digest) <= prior or kind not in _BINDING_KINDS:
             raise AcceptanceRefusal(
-                "endpoint_binding_release_invalid", "documents not sorted unique"
+                "package_binding_release_invalid", "documents not sorted unique"
             )
         held = local.get(ref.digest)
         if held is None or held[0] != kind or held[1].ref() != ref:
-            raise AcceptanceRefusal("endpoint_binding_release_invalid", f"document {ref.digest}")
+            raise AcceptanceRefusal("package_binding_release_invalid", f"document {ref.digest}")
         if kind == "entrypoint_binding_plan":
             plans[ref.digest] = held[1].exact()
         elif kind == "model_construction_contract":
@@ -575,7 +575,7 @@ def _binding_release(
             ) from exc
         widths = provisioned.tensorfs_destination_widths(tensorfs)
     all_documents = {digest: document for digest, (_kind, document) in local.items()}
-    all_documents[docs["endpoint_descriptor"].digest] = docs["endpoint_descriptor"]
+    all_documents[docs["package_descriptor"].digest] = docs["package_descriptor"]
 
     def read_document(ref: provisioned.ArtifactRef, name: str) -> provisioned.ExactDocument:
         held = all_documents.get(ref.digest)
@@ -587,7 +587,7 @@ def _binding_release(
         resolved = provisioned.read_provisioned_release(
             plans,
             read_document=read_document,
-            endpoint_release=endpoint_release_id,
+            package_release=package_release_id,
             store_root=artifact_store,
             object_set=object_set,
             dtype_widths=widths,
@@ -605,7 +605,7 @@ def _binding_release(
 def _placement(
     docs: Mapping[str, LocalDocument],
     release: Mapping[str, Any],
-    endpoint_release_id: str,
+    package_release_id: str,
     binding_plan_digest: str,
 ) -> tuple[str, str]:
     placed = pb.DesiredPlacementSet(
@@ -624,12 +624,12 @@ def _placement(
     if not isinstance(placement_id, str) or not placement_id or not isinstance(spec, dict):
         raise AcceptanceRefusal("acceptance_placement_invalid", "placement id or spec")
     expected = {
-        "endpoint_release_id": endpoint_release_id,
-        "environment_spec_digest": docs["endpoint_environment_spec"].digest,
+        "package_release_id": package_release_id,
+        "environment_spec_digest": docs["package_environment_spec"].digest,
         "installed_environment_receipt_digest": _embedded_ref(
             release.get("installed_environment_receipt"), "binding_release.receipt"
         ).digest,
-        "descriptor_digest": docs["endpoint_descriptor"].digest,
+        "package_descriptor_digest": docs["package_descriptor"].digest,
     }
     for field, wanted in expected.items():
         if spec.get(field) != wanted:
@@ -654,7 +654,7 @@ def _placement(
         raise AcceptanceRefusal("acceptance_placement_invalid", "binding plans")
     release_documents = release.get("documents")
     if not isinstance(release_documents, list):
-        raise AcceptanceRefusal("endpoint_binding_release_invalid", "documents")
+        raise AcceptanceRefusal("package_binding_release_invalid", "documents")
     release_plans = {
         ref.digest: ref.length
         for row in release_documents
@@ -685,7 +685,7 @@ def _placement(
 def _invocation(
     document: LocalDocument,
     environment: _Environment,
-    endpoint_release_id: str,
+    package_release_id: str,
     binding_plan_digest: str,
     fixture: LocalDocument,
 ) -> Mapping[str, Any]:
@@ -693,8 +693,8 @@ def _invocation(
         value = documents.read(document.raw, pb.InvocationSpec)
     except documents.DocumentError as exc:
         raise AcceptanceRefusal(exc.code, exc.detail) from exc
-    if value.get("endpoint_release_id") != endpoint_release_id:
-        raise AcceptanceRefusal("acceptance_invocation_invalid", "endpoint_release_id")
+    if value.get("package_release_id") != package_release_id:
+        raise AcceptanceRefusal("acceptance_invocation_invalid", "package_release_id")
     if value.get("environment_spec_digest") != environment.environment_spec_digest:
         raise AcceptanceRefusal("acceptance_invocation_invalid", "environment_spec_digest")
     if value.get("payload_digest") != fixture.digest:
@@ -782,11 +782,13 @@ def _fixture_payload(descriptor_doc: LocalDocument, entrypoint: str) -> bytes:
 def _descriptor_entrypoint(descriptor_doc: LocalDocument, entrypoint: str) -> dict[str, Any]:
     try:
         body = descriptor.read_bytes(descriptor_doc.raw, str(descriptor_doc.path))
-    except descriptor.StaleDescriptor as exc:
+    except descriptor.StalePackageDescriptor as exc:
         raise AcceptanceRefusal(exc.default_code, str(exc)) from exc
     entries = body.get("entrypoints")
     if not isinstance(entries, list):
-        raise AcceptanceRefusal("acceptance_descriptor_invalid", "entrypoints is not an array")
+        raise AcceptanceRefusal(
+            "acceptance_package_descriptor_invalid", "entrypoints is not an array"
+        )
     row = next(
         (item for item in entries if isinstance(item, dict) and item.get("name") == entrypoint),
         None,
@@ -800,7 +802,7 @@ def _result_schema_digest(descriptor_doc: LocalDocument, entrypoint: str) -> str
     row = _descriptor_entrypoint(descriptor_doc, entrypoint)
     result = row.get("result")
     if result is None:
-        raise AcceptanceRefusal("acceptance_descriptor_invalid", "result schema is absent")
+        raise AcceptanceRefusal("acceptance_package_descriptor_invalid", "result schema is absent")
     return canonical.digest(result)
 
 

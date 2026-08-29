@@ -1,8 +1,8 @@
-"""Small endpoint overlays over the immutable base-worker-image Python environment.
+"""Small package overlays over the immutable base-worker-image Python environment.
 
 The base worker image already owns Python, Torch/CUDA, cozy-runtime, TensorFS, and their
-common dependencies. A placement therefore materializes only the endpoint project wheel
-and optional endpoint-owned custom wheels. It never creates a venv, resolves a dependency,
+common dependencies. A placement therefore materializes only the package project wheel
+and optional package-owned custom wheels. It never creates a venv, resolves a dependency,
 copies a base package, or re-hashes the base environment's RECORD tree.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
@@ -41,11 +41,11 @@ from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical, native_wheel
 
-RECEIPT_FORMAT = "cozy.runtime.EndpointOverlayReceipt/1"
-CONTENT_FORMAT = "cozy.runtime.EndpointOverlayContent/1"
-CONTENT_IDENTITY_NAME = "endpoint-overlay-content.json"
-WHEEL_EXTRACTION_FORMAT = "cozy.runtime.EndpointWheelExtraction/1"
-WHEEL_EXTRACTION_IDENTITY_NAME = "endpoint-wheel-extraction.json"
+RECEIPT_FORMAT = "cozy.runtime.PackageOverlayReceipt/1"
+CONTENT_FORMAT = "cozy.runtime.PackageOverlayContent/1"
+CONTENT_IDENTITY_NAME = "package-overlay-content.json"
+WHEEL_EXTRACTION_FORMAT = "cozy.runtime.PackageWheelExtraction/1"
+WHEEL_EXTRACTION_IDENTITY_NAME = "package-wheel-extraction.json"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/3"
@@ -103,7 +103,7 @@ _COMPATIBILITY_PROFILE_FIELDS = frozenset(
 
 
 class OverlayRefusal(Exception):
-    """A fail-closed endpoint-overlay verdict with a stable code."""
+    """A fail-closed package-overlay verdict with a stable code."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(f"{code}: {detail}")
@@ -248,7 +248,7 @@ def materialize(
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     expected_receipt_digest: str = "",
 ) -> InstalledOverlay:
-    """Verify and atomically publish endpoint content plus a placement receipt.
+    """Verify and atomically publish package content plus a placement receipt.
 
     Installed bytes are keyed only by the base family and sorted wheel digests.  The
     environment spec remains in the small placement receipt, so two specs with identical
@@ -309,7 +309,7 @@ def materialize(
             site = staging / OVERLAY_DIR
             site.mkdir(parents=True, mode=0o700)
             _compose_wheel_pools(pools, wheels, site)
-            # Endpoint code is small, but it should still pay compilation once at intake
+            # Package code is small, but it should still pay compilation once at intake
             # rather than once per executor. Base bytecode is already baked in the image.
             if not compileall.compile_dir(
                 site,
@@ -359,7 +359,7 @@ def open_generation(
 ) -> InstalledOverlay:
     """Open immutable content through one exact placement receipt without tree hashes.
 
-    The receipt and base-family manifest are small identity documents. The endpoint wheel
+    The receipt and base-family manifest are small identity documents. The package wheel
     bytes were hashed before atomic publication; the official image's OCI digest already
     protects its base environment. Re-reading every installed file would add startup cost
     without adding an independent trust boundary.
@@ -945,8 +945,8 @@ def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) 
 def _import_roots(names: set[str]) -> frozenset[str]:
     """Measure Python import roots without mistaking wheel data for modules.
 
-    A wheel may deliberately install repository metadata beside its packages (the endpoint
-    project carries ``endpoint.toml``).  A top-level filename is importable only when it is a
+    A wheel may deliberately install repository metadata beside its packages (the package
+    project carries ``package.toml``).  A top-level filename is importable only when it is a
     Python or native module; a directory is a package root only when the wheel installs an
     importable member below it.  The files are still extracted -- this function classifies
     ownership only.

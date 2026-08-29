@@ -430,7 +430,7 @@ def _cuda_images(path: Path) -> tuple[tuple[int, ...], tuple[int, ...]]:
 
 
 def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, object]:
-    """Join static evidence to the actual loader and GPU before any endpoint import."""
+    """Join static evidence to the actual loader and GPU before any package import."""
 
     wheel_defined = {symbol for item in inspection.members for symbol in item.defined_symbols}
     libraries = _host_libraries()

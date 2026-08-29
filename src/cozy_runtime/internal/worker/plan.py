@@ -72,7 +72,7 @@ class PreparedRequest:
     def unresolved(cls, entrypoint: str, features: Mapping[str, int]) -> PreparedRequest:
         """A request NOBODY RESOLVED — what `fit` prices a hypothetical against.
 
-        There is no endpoint process to prepare it, so the three digests are EMPTY and say
+        There is no package process to prepare it, so the three digests are EMPTY and say
         so. An admission path that reached for this would be pricing against an identity it
         cannot bind, which is the thing the record exists to stop.
         """
@@ -266,7 +266,7 @@ class DeclaredBinding:
     model_parameter_name: str
     release: str
     application: str = ""
-    """The exact EndpointDescriptor application imported from the installed venv."""
+    """The exact PackageDescriptor application imported from the installed venv."""
     descriptor_path: str = ""
     """Local path to the exact granted descriptor bytes; resolution, never identity."""
     store: str = ""
@@ -288,10 +288,10 @@ class DeclaredBinding:
     """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
     empty after `resolve` — a record naming none offers exactly the bytes the ref resolved
     to, and that one IS the reference because there is nothing to compare it against."""
-    endpoint_release: str = ""
-    """WHICH endpoint release this binding belongs to — `project`'s PATH-FREE counterpart
+    package_release: str = ""
+    """WHICH package release this binding belongs to — `project`'s PATH-FREE counterpart
     (#506a), and the reason a weightless construction key never has to name a directory.
-    Empty falls back to `release`, which is what a record that names no endpoint release
+    Empty falls back to `release`, which is what a record that names no package release
     already carried for a weightless binding."""
     objective: str = "latency"
     """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
@@ -346,7 +346,7 @@ class DeclaredBinding:
     def weightless(self) -> bool:
         """This deployment declares NO MODEL: no class, no store, no artifact.
 
-        A weightless endpoint is the only thing a cardless runner can ever serve, so it has
+        A weightless package is the only thing a cardless runner can ever serve, so it has
         to be servable — the boot path prepared every staged binding by FILLING it, and a
         binding with nothing to fill had no way through (cl-013). Its executor imports no
         torch and touches no device.
@@ -370,14 +370,14 @@ class DeclaredBinding:
         """
         if self.weightless:
             # Nothing is constructed, so the RELEASES are the construction: every weightless
-            # binding of one endpoint release shares one executor. It keyed on `project` —
+            # binding of one package release shares one executor. It keyed on `project` —
             # this machine's staging directory — which made the key machine-local for no
-            # gain, since the endpoint release names the same thing without a path (#506a).
+            # gain, since the package release names the same thing without a path (#506a).
             return canonical.digest(
                 {
                     "weightless": True,
                     "release": self.release,
-                    "endpoint_release": self.endpoint_release or self.release,
+                    "package_release": self.package_release or self.release,
                 }
             )
         return canonical.digest(
@@ -557,7 +557,7 @@ class PlanChooser:
             # loud half of cl-003's defect: the drift existed, this repository's own
             # reconciliation had already NAMED it, and the next request was priced against it
             # anyway — so a capacity fact arrived as an OOM in the middle of a VAE decode and
-            # was reported as the endpoint's exception. An unreconciled ledger reconciles
+            # was reported as the package's exception. An unreconciled ledger reconciles
             # (a fresh generation re-establishes it) or it refuses; it never guesses.
             raise PlanRefusal(
                 "ledger_unreconciled",

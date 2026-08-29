@@ -87,7 +87,7 @@ wheels = [
 ]
 
 [[package]]
-name = "marco-polo-endpoint"
+name = "marco-polo-package"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
