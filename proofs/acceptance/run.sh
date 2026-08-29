@@ -3,7 +3,7 @@ set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 proof_root=$(mktemp -d /tmp/cozy-acceptance-proof.XXXXXX)
-fixture="$repo/proofs/fixtures/marco-polo-package"
+fixture="$repo/examples/marco-polo"
 fixture_source="$proof_root/package-source"
 
 cleanup() {
@@ -31,9 +31,9 @@ runtime="$proof_root/driver/bin/cozy-runtime"
 driver="$repo/proofs/internal/acceptance_observation.py"
 descriptor="$proof_root/package-descriptor.json"
 (cd / && env -u PYTHONPATH "$runtime" --json \
-    --dir "$repo/proofs/fixtures/marco-polo-package" describe) >"$descriptor"
+    --dir "$repo/examples/marco-polo" describe) >"$descriptor"
 (cd / && env -u PYTHONPATH "$runtime" --json \
-    --dir "$repo/proofs/fixtures/marco-polo-package" describe) >"$proof_root/descriptor-replay.json"
+    --dir "$repo/examples/marco-polo" describe) >"$proof_root/descriptor-replay.json"
 cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH PATH="$PATH" HOME="$proof_root/home" \

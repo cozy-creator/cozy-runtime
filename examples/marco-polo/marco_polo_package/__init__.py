@@ -1,4 +1,4 @@
-"""A weightless package used to prove dynamic package publication and placement."""
+"""A weightless Marco/Polo package for publication and placement examples."""
 
 from __future__ import annotations
 

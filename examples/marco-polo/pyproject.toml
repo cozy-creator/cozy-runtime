@@ -5,12 +5,12 @@ build-backend = "uv_build"
 [project]
 name = "marco-polo-package"
 version = "1.0.0"
-description = "Weightless package fixture for Tensorhub publication and worker placement proofs"
+description = "Weightless Marco/Polo example for Tensorhub publication and worker placement"
 requires-python = ">=3.11"
 dependencies = ["cozy-runtime==0.0.3"]
 
 [tool.uv.sources]
-cozy-runtime = { path = "../../..", editable = true }
+cozy-runtime = { path = "../..", editable = true }
 
 [tool.uv.build-backend]
 module-root = ""

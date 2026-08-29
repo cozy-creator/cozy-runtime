@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 [[package]]
 name = "cozy-runtime"
 version = "0.0.3"
-source = { editable = "../../../" }
+source = { editable = "../../" }
 dependencies = [
     { name = "grpcio" },
     { name = "msgspec" },
@@ -95,7 +95,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "cozy-runtime", editable = "../../../" }]
+requires-dist = [{ name = "cozy-runtime", editable = "../../" }]
 
 [[package]]
 name = "msgspec"

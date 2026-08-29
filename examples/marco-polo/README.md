@@ -1,7 +1,7 @@
-# Marco/Polo package fixture
+# Marco/Polo example
 
-This is a real, weightless package project for Tensorhub source-publication and dynamic
-worker-placement proofs. Its project wheel contains only package code: the base worker image
+This is a real, weightless Cozy package that can be published to Tensorhub or run through
+dynamic worker-placement proofs. Its project wheel contains only package code: the base worker image
 provides Cozy Runtime and `msgspec`.
 
 The sole public entrypoint has this closed contract:
@@ -16,8 +16,15 @@ returns:
 {"message":"polo"}
 ```
 
-Publish it through Creator's package-publish command, pointing `--dir` at this directory.
-Creator invokes `uv build --wheel`; this fixture declares `uv_build` and its existing flat module
+Publish it through Cozy, pointing `--dir` at this directory:
+
+```sh
+cozy package publish cozy/marco-polo \
+  --release 1.0.0 \
+  --dir examples/marco-polo
+```
+
+Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module
 root explicitly. The backend produces a deterministic `py3-none-any` wheel without writing build
 output into the source tree. `pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor,
 and that wheel are the exact publication inputs. The
@@ -27,9 +34,9 @@ locked Python/package requirements. The current remote contract admits one place
 so publishing this fixture under two package repositories can prove sequential same-pod
 replacement with `cozy rent revise`; it does not prove simultaneous stacking.
 
-Creator derives the publication descriptor through this locked, read-only project command:
+Cozy derives the publication descriptor through this locked, read-only project command:
 
 ```sh
-uv run --locked --project proofs/fixtures/marco-polo-package \
-  cozy-runtime --json --dir proofs/fixtures/marco-polo-package describe
+uv run --locked --project examples/marco-polo \
+  cozy-runtime --json --dir examples/marco-polo describe
 ```

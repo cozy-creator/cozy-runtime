@@ -28,15 +28,15 @@ jobs:
       - run: |
           test "$(uv run cozy-runtime --json --dir examples describe)" = \
             "$(uv run cozy-runtime --json --dir examples describe)"
-          test "$(uv run --locked --project proofs/fixtures/marco-polo-package \
-            cozy-runtime --json --dir proofs/fixtures/marco-polo-package describe)" = \
-            "$(uv run --locked --project proofs/fixtures/marco-polo-package \
-            cozy-runtime --json --dir proofs/fixtures/marco-polo-package describe)"
+          test "$(uv run --locked --project examples/marco-polo \
+            cozy-runtime --json --dir examples/marco-polo describe)" = \
+            "$(uv run --locked --project examples/marco-polo \
+            cozy-runtime --json --dir examples/marco-polo describe)"
       - run: |
           a=$(mktemp -d)
           b=$(mktemp -d)
-          uv build --wheel --out-dir "$a" proofs/fixtures/marco-polo-package
-          uv build --wheel --out-dir "$b" proofs/fixtures/marco-polo-package
+          uv build --wheel --out-dir "$a" examples/marco-polo
+          uv build --wheel --out-dir "$b" examples/marco-polo
           cmp "$a"/*.whl "$b"/*.whl
           unzip -l "$a"/*.whl | grep -F 'marco_polo_package/__init__.py'
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
