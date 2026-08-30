@@ -393,6 +393,8 @@ def package_overlay_input(
             for wheel in wheels
         ),
     )
+
+
 def _closed(value: object, keys: set[str], name: str) -> None:
     if not isinstance(value, dict) or set(value) != keys:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__

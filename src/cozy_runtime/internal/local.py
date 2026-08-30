@@ -889,9 +889,7 @@ def stage_development_placement(
         entrypoint.name: documents.spell(entrypoint.entrypoint_binding_digest)
         for entrypoint in documents_.placement.entrypoints
     }
-    return StagedDevelopmentPlacement(
-        bindings, documents_.placement, artifact_store, cache
-    )
+    return StagedDevelopmentPlacement(bindings, documents_.placement, artifact_store, cache)
 
 
 def development_placement_documents(
@@ -1095,9 +1093,7 @@ def run_slice(
             development_project=Path.cwd().resolve(),
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
-            development_source_digest=documents.spell(
-                staged.placement.development.source_digest
-            ),
+            development_source_digest=documents.spell(staged.placement.development.source_digest),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")

@@ -491,9 +491,7 @@ def _package_selection(value: object) -> dict[str, Any]:
 
 
 def _development_package(value: object) -> dict[str, Any]:
-    row = _closed_document(
-        value, {"package", "release", "source_digest"}, "DevelopmentPackage"
-    )
+    row = _closed_document(value, {"package", "release", "source_digest"}, "DevelopmentPackage")
     _required(row, {"package", "release", "source_digest"}, "DevelopmentPackage")
     package = _identifier(row["package"], "DevelopmentPackage.package")
     release = _identifier(row["release"], "DevelopmentPackage.release")
@@ -560,8 +558,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         if not isinstance(wheels, list):
             raise documents.DocumentError("wrong_type", "Environment.wheels")
         wheel_rows = [
-            _wheel_fact(row, f"Environment.wheels[{index}]")
-            for index, row in enumerate(wheels)
+            _wheel_fact(row, f"Environment.wheels[{index}]") for index, row in enumerate(wheels)
         ]
         names = [str(row["distribution"]) for row in wheel_rows]
         if names != sorted(set(names)):
@@ -579,7 +576,10 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     else:
         _development_package(entry["development"])
         forbidden = {
-            "environment_digest", "environment_receipt_digest", "qualification", "environment"
+            "environment_digest",
+            "environment_receipt_digest",
+            "qualification",
+            "environment",
         } & set(entry)
         if forbidden:
             raise documents.DocumentError(

@@ -152,12 +152,12 @@ def _prepare(args: argparse.Namespace) -> None:
     package = {
         "package": "proof/proof-package",
         "project_wheel": {
-                "ref": {"digest": project_row["digest"], "length": project_row["length"]},
-                "distribution": project_row["distribution"],
-                "filename": project_row["filename"],
-                "import_roots": project_row["import_roots"],
-                "tags": project_row["tags"],
-                "version": project_row["version"],
+            "ref": {"digest": project_row["digest"], "length": project_row["length"]},
+            "distribution": project_row["distribution"],
+            "filename": project_row["filename"],
+            "import_roots": project_row["import_roots"],
+            "tags": project_row["tags"],
+            "version": project_row["version"],
         },
         "release": "1.0.0",
         "release_digest": _digest(b"proof release.json provenance"),

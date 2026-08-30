@@ -588,7 +588,8 @@ class Acquirer:
             reference_manifest = str(reference["manifest"]["digest"])
             model_class = str(declared.get("class", ""))
             if (
-                candidate.release not in {
+                candidate.release
+                not in {
                     release_digest,
                     release_digest.removeprefix("sha256:"),
                 }

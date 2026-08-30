@@ -1237,7 +1237,10 @@ def fence_development_placement() -> list[str]:
     except documents.DocumentError as exc:
         return [f"development Placement refused: {exc}"]
     forbidden = {
-        "environment", "environment_digest", "environment_receipt_digest", "qualification"
+        "environment",
+        "environment_digest",
+        "environment_receipt_digest",
+        "qualification",
     } & set(parsed)
     if forbidden:
         return [f"development Placement carries published field {sorted(forbidden)[0]}"]
