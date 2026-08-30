@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from cozy_runtime.internal import accel, proctree, spawn
-from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
+from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV, erased
 from cozy_runtime.internal.worker.child import ExecutorSupervision, OwnerRecord
 
 
@@ -97,6 +97,7 @@ def main() -> int:
     parser.add_argument("--tmp", default="/tmp/cozy-process-containment")
     parser.add_argument("--observe", type=float, default=10.0)
     parser.add_argument("--executor-uid", type=int, default=-1)
+    parser.add_argument("--expect-readonly-cgroup-v2", action="store_true")
     parser.add_argument("--expect-nonzero-capability-refusal", action="store_true")
     args = parser.parse_args()
     target_uid = os.geteuid() if args.executor_uid < 0 else args.executor_uid
@@ -124,20 +125,62 @@ def main() -> int:
     release_file = root / "release-leader"
 
     proctree.arm_subreaper()
-    scope = proctree.ProcessTreeScope(secrets.token_hex(32), target_uid)
+    scope = (
+        proctree.create_executor_scope(
+            proctree.executor_scope_namespace(root / "worker"), target_uid
+        )
+        if args.expect_readonly_cgroup_v2
+        else proctree.ProcessTreeScope(secrets.token_hex(32), target_uid)
+    )
+    if not isinstance(scope, proctree.ProcessTreeScope):
+        raise RuntimeError(f"expected process-tree selection, found {scope!r}")
     atexit.register(cleanup_scope, scope)
-    base_env = dict(os.environ)
-    base_env[EXECUTOR_SCOPE_ENV] = scope.token
+    planted_env = {**os.environ, "TENSORHUB_ADMIN_TOKEN": "must-not-reach-executor"}
+    base_env = {name: value for name, value in planted_env.items() if not erased(name)}
+    production_spawn = False
+    if args.expect_readonly_cgroup_v2:
+        production = ExecutorSupervision(
+            root=root / "production-worker",
+            python=sys.executable,
+            base_env=tuple(sorted(base_env.items())),
+            cozy_home=home,
+            device_process=lambda _pid: accel.ProcessMemory("absent", 0),
+            executor_uid=target_uid,
+            executor_gid=target_uid,
+            scratch_root=root / "production-scratch",
+        )
+        try:
+            executor = production.spawn(imposed={})
+            if not isinstance(executor.scope, proctree.ProcessTreeScope):
+                raise RuntimeError(f"production spawn selected {executor.scope!r}")
+            if (
+                executor.hello.get("no_new_privs") != "1"
+                or executor.hello.get("uid") != target_uid
+                or executor.hello.get("euid") != target_uid
+                or "TENSORHUB_ADMIN_TOKEN" in executor.hello.get("sealed", {})
+            ):
+                raise RuntimeError(f"production executor seal differs: {executor.hello!r}")
+            production.retire_current(executor, "read-only cgroup-v2 live proof")
+            production_spawn = True
+        finally:
+            production.close()
     leader_code = (
         "import os,pathlib,signal,time\n"
+        f"pathlib.Path({str(root / 'credential-absent')!r}).write_text("
+        "str('TENSORHUB_ADMIN_TOKEN' not in os.environ))\n"
         "child=os.fork()\n"
         "if child == 0:\n"
         " os.setsid()\n"
         " grand=os.fork()\n"
         " if grand: os._exit(0)\n"
         f" pathlib.Path({str(helper_file)!r}).write_text(str(os.getpid()))\n"
-        " while True: time.sleep(60)\n"
-        f"while not pathlib.Path({str(release_file)!r}).exists(): time.sleep(0.01)\n"
+        + (
+            f" os.execve({sys.executable!r}, [{sys.executable!r}, '-c', "
+            "'import time; time.sleep(60)'], {})\n"
+            if target_uid != os.geteuid()
+            else " while True: time.sleep(60)\n"
+        )
+        + f"while not pathlib.Path({str(release_file)!r}).exists(): time.sleep(0.01)\n"
     )
 
     supervision = ExecutorSupervision(
@@ -154,7 +197,7 @@ def main() -> int:
     spawned = spawn.spawn_executor(
         python=sys.executable,
         module_argv=["-c", leader_code],
-        base_env=tuple(sorted(os.environ.items())),
+        base_env=tuple(sorted(base_env.items())),
         imposed={EXECUTOR_SCOPE_ENV: scope.token},
         cwd=str(root),
         scope=scope,
@@ -169,8 +212,11 @@ def main() -> int:
     supervision._bind_owner(provisional, leader)
     proctree.signal_process(leader, signal.SIGCONT)
     detached = proctree.process_identity(wait_file(helper_file, args.observe))
+    if (root / "credential-absent").read_text() != "True":
+        raise RuntimeError("a Tensorhub credential reached the executor")
 
     wrong: proctree.ProcessIdentity | None = None
+    wrong_kind = "wrong_token"
     if target_uid == os.geteuid():
         wrong_scope = proctree.ProcessTreeScope(secrets.token_hex(32), target_uid)
         atexit.register(cleanup_scope, wrong_scope)
@@ -185,6 +231,13 @@ def main() -> int:
         wrong = proctree.process_identity(wrong_spawned.pid)
         proctree.wait_process_stopped(wrong, seconds=args.observe)
         proctree.signal_process(wrong, signal.SIGCONT)
+    else:
+        wrong_kind = "wrong_uid"
+        wrong_pid = os.fork()
+        if wrong_pid == 0:
+            while True:
+                time.sleep(60)
+        wrong = proctree.process_identity(wrong_pid)
 
     release_file.touch()
     os.waitpid(leader_pid, 0)
@@ -209,10 +262,13 @@ def main() -> int:
         recorded = successor._read_owner()
         if recorded is None:
             raise RuntimeError("durable owner disappeared before focused reclaim")
-        # This host uses cgroup v2, so it cannot pass the production v1 selector. Exercise
-        # the process-tree reclaim mechanism directly here; lifecycle-live on RunPod proves
-        # the production selection and recovery revalidation together.
-        successor._reclaim_owner(recorded, "focused process-tree mechanics")
+        # The read-only-cgroup-v2 arm uses the production restart selector. The older
+        # focused arm exercises the same reclaim mechanics directly because a normal local
+        # delegated cgroup-v2 host correctly selects its stronger kernel child scope.
+        if args.expect_readonly_cgroup_v2:
+            successor.sweep_orphans()
+        else:
+            successor._reclaim_owner(recorded, "focused process-tree mechanics")
         wait_absent(detached, args.observe)
         if successor._read_owner() is not None:
             raise RuntimeError("leaderless owner did not clear after exact reclaim")
@@ -235,7 +291,16 @@ def main() -> int:
         print("writable_cgroup_migration_refused=true")
     print("spawn_bound_before_continue=true")
     print(f"leader_gone=true detached_reclaimed={detached.pid}")
-    print("wrong_token_survived=true" if wrong is not None else "dedicated_uid_domain=true")
+    print("executor_credential_absent=true")
+    if args.expect_readonly_cgroup_v2:
+        current = Path("/sys/fs/cgroup") / proctree._own_cgroup_relative().lstrip("/")
+        print("cgroup_v2_read_only=true")
+        print(f"memory_max={proctree._bounded_cgroup_limit(current, 'memory.max')}")
+        print(f"pids_max={proctree._bounded_cgroup_limit(current, 'pids.max')}")
+        print(f"production_executor_spawn={str(production_spawn).lower()}")
+    print(f"{wrong_kind}_survived=true")
+    if target_uid != os.geteuid():
+        print("dedicated_uid_domain=true")
     print("durable_owner_cleared=true")
     return 0
 
