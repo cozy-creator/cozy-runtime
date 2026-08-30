@@ -1148,7 +1148,10 @@ def fence_document_kinds() -> list[str]:
     for descriptor in worker_pb2.DESCRIPTOR.message_types_by_name.values():
         want = f"{descriptor.full_name}/1"
         if documents.doc_format(descriptor.full_name) != want:
-            bad.append(f"worker document {descriptor.full_name!r} is not hardcut to {want!r}")
+            bad.append(
+                "src/cozy_runtime/protocol/documents.py: worker document "
+                f"{descriptor.full_name!r} is not hardcut to {want!r}"
+            )
     return bad
 
 
