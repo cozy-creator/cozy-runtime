@@ -2088,22 +2088,24 @@ def section_arms(args: argparse.Namespace) -> None:
             body["safe_message"][:130],
         )
 
-        head("the hub-call authorization table is CLOSED")
+        head("the HTTPS output row validates the exact destination")
         hub.ready(plan_id, 400, since=hub.mark())
         dispatch(
             hub,
             tmp,
             plan_id,
-            request_id="req-offtable",
+            request_id="req-blocked-output",
             payload={"steps": 1, "latent": 48},
-            destination_url="https://exfiltrate.example/upload",
+            destination_url=(
+                "https://169.254.169.254/upload?X-Amz-Signature=must-not-reach-terminal"
+            ),
         )
         body = terminal_body(
             hub.wait(
                 lambda m: (
                     m.attempt_outcome
                     if m.WhichOneof("msg") == "attempt_outcome"
-                    and m.attempt_outcome.request_id == "req-offtable"
+                    and m.attempt_outcome.request_id == "req-blocked-output"
                     else None
                 ),
                 300,
@@ -2111,12 +2113,10 @@ def section_arms(args: argparse.Namespace) -> None:
             )
         )
         check(
-            "a destination outside the closed table is a SECURITY EVENT, not a 404",
+            "a presigned-looking metadata/private destination refuses before a connection",
             body["status"] == 3
-            and (
-                "hub_call_unauthorized" in body["safe_message"]
-                or "grant_transport" in body["safe_message"]
-            ),
+            and "egress_blocked_address" in body["safe_message"]
+            and "must-not-reach-terminal" not in body["safe_message"],
             body["safe_message"][:150],
         )
     finally:

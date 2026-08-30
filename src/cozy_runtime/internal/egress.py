@@ -12,11 +12,9 @@ differed by `is_reserved`/`is_unspecified` and coincided only because CPython fo
 into `is_private` for v4 — an agreement by accident is the drift this module is for.
 
 `fetch_into` has NO production caller today (cr-042 deleted the worker's `https://` input
-grant row, whose allowlist never had a writer). It stays because it is the boundary the two
-named consumers must enter through — th-008's hub-minted input URLs and cr-012's author
-`Egress` capability — and because `scripts/assets-live.py egress` arms it against a real
-server. Whoever lands either consumer lands its allowlist writer with it; a second
-downloader beside this one is the defect above, restated.
+grant row, whose allowlist never had a writer). `put_from` has exactly one: the worker's
+control-plane-minted output grant. Both use the same URL/address validation below. A second
+network byte mover beside this module is the defect above, restated.
 
 **A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
 and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that
@@ -55,7 +53,7 @@ import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import BinaryIO
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 #: How much of a body one read() pulls. Small enough that a cap refusal happens promptly.
 CHUNK = 1 << 20
@@ -211,6 +209,14 @@ def _validate(url: str, policy: EgressPolicy) -> tuple[str, list[str]]:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError as exc:
         raise EgressRefusal("egress_url", f"the URL is malformed ({exc})") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise EgressRefusal(
+            "egress_url", "the URL carries user-info; credentials belong in no host"
+        )
+    if parsed.fragment:
+        raise EgressRefusal(
+            "egress_url", "the URL carries a fragment, which is not sent to a server"
+        )
     if parsed.scheme != "https" and not (policy.allow_private and parsed.scheme == "http"):
         raise EgressRefusal(
             "egress_scheme",
@@ -219,6 +225,113 @@ def _validate(url: str, policy: EgressPolicy) -> tuple[str, list[str]]:
         )
     policy.check_host(host)
     return host, policy.check_addresses(host, port)
+
+
+class _MeasuredReader:
+    """A file-like HTTP body that measures and bounds the bytes while they leave."""
+
+    def __init__(self, source: BinaryIO, expected_length: int, what: str) -> None:
+        self.source = source
+        self.expected_length = expected_length
+        self.what = what
+        self.length = 0
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self.source.read(size)
+        next_length = self.length + len(chunk)
+        if next_length > self.expected_length:
+            raise EgressRefusal(
+                "stream_over_declared_size",
+                f"{self.what}: the upload passed its declared {self.expected_length} B",
+            )
+        self.length = next_length
+        self.digest.update(chunk)
+        return chunk
+
+    def receipt(self) -> StreamReceipt:
+        if self.length != self.expected_length:
+            raise EgressRefusal(
+                "stream_under_declared_size",
+                f"{self.what}: the upload ended at {self.length} B and the grant declares "
+                f"{self.expected_length} B",
+            )
+        return StreamReceipt(self.length, self.digest.digest(), b"")
+
+
+def put_from(
+    url: str,
+    policy: EgressPolicy,
+    source: BinaryIO,
+    *,
+    expected_length: int,
+    media_type: str,
+    what: str = "output",
+) -> StreamReceipt:
+    """Stream one immutable object to an exact presigned URL.
+
+    The URL is already the control plane's per-attempt capability. Responses cannot choose a
+    replacement destination: a redirect target is fully validated, then refused. This is both
+    simpler and stricter than replaying a PUT body to an address absent from the grant.
+    """
+    import http.client
+
+    if expected_length < 0:
+        raise EgressRefusal("stream_invalid_length", f"{what}: negative expected length")
+    host, _ = _validate(url, policy)
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    connection_type = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(host, port, timeout=30)
+    measured = _MeasuredReader(source, expected_length, what)
+    try:
+        connection.request(
+            "PUT",
+            path,
+            body=measured,
+            headers={
+                "Accept-Encoding": "identity",
+                "Content-Length": str(expected_length),
+                "Content-Type": media_type or "application/octet-stream",
+                "If-None-Match": "*",
+            },
+        )
+        response = connection.getresponse()
+        try:
+            location = response.getheader("Location")
+            if 300 <= response.status < 400 and location:
+                redirected = urljoin(url, location)
+                # Validate the whole redirect even though we never follow it. This makes a
+                # metadata/private-address redirect a precise security refusal, while a benign
+                # same-host redirect still cannot replace the exact destination the grant named.
+                _validate(redirected, policy)
+                raise EgressRefusal(
+                    "egress_redirect_refused",
+                    f"{what}: HTTP {response.status} tried to replace the exact granted URL",
+                )
+            body = response.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                raise EgressRefusal(
+                    "egress_response_over_bound", f"{what}: the PUT response exceeded 64 KiB"
+                )
+            if not 200 <= response.status < 300:
+                raise EgressRefusal(
+                    "egress_http_error", f"{what}: HTTP {response.status} from {host}"
+                )
+        finally:
+            response.close()
+    except EgressRefusal:
+        raise
+    except (http.client.HTTPException, OSError) as exc:
+        raise EgressRefusal("egress_unreachable", f"{what}: {exc}") from exc
+    finally:
+        connection.close()
+    return measured.receipt()
 
 
 def fetch_into(

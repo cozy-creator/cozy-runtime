@@ -130,10 +130,10 @@ killed executor is therefore explainable from a directory, with no live process 
 **Every granted destination is CONTROL-PLANE-MINTED** (cr-042). The closed `HUB_CALLS` table
 in `internal/worker/grants.py` spends a grant minted for one invocation, so nothing the
 package produced — and nothing a request body can influence — chooses where bytes land; a
-destination with no row is a SECURITY EVENT. Every row is `file://` today.
-`OutputAccess.url`'s "presigned upload URL" is the PLANNED public route — tensorhub mints
-it, R2 sits behind it, the worker never holds the credential — and lands WITH host
-validation of the minted URL: that, not a filesystem-only table, is what keeps the property.
+destination with no row is a SECURITY EVENT. Inputs remain local. Outputs use either a local
+destination or the exact presigned HTTPS capability in `OutputAccess.url`; the worker streams
+with `Content-Length` and `If-None-Match: *`, validates every resolved address, and refuses a
+redirect-selected destination. Tensorhub holds the R2 credential; the worker never does.
 Armed by `scripts/worker-live.py grants` end to end and `scripts/assets-live.py egress` at
 the table.
 

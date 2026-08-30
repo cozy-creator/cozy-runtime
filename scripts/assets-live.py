@@ -581,10 +581,17 @@ def arms() -> None:
 
 def egress() -> None:
     head("egress — a real HTTP server: allowlist, per-hop SSRF, bounded reader, one predicate")
+    import hashlib
     import http.server
     import threading
 
-    from cozy_runtime.internal.egress import EgressPolicy, EgressRefusal, copy_bounded, fetch_into
+    from cozy_runtime.internal.egress import (
+        EgressPolicy,
+        EgressRefusal,
+        copy_bounded,
+        fetch_into,
+        put_from,
+    )
 
     def fetch(
         url: str, policy: EgressPolicy, *, declared: int | None = None, cap: int = 1 << 20
@@ -602,6 +609,8 @@ def egress() -> None:
         return sink.getvalue()
 
     body = png(8, 8, 5)
+
+    uploaded: dict[str, Any] = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:
@@ -646,6 +655,39 @@ def egress() -> None:
             self.send_response(404)
             self.end_headers()
 
+        def do_PUT(self) -> None:
+            length = int(self.headers.get("Content-Length", "-1"))
+            if self.path in ("/upload-under", "/upload-over"):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return
+            payload = self.rfile.read(length)
+            uploaded["path"] = self.path
+            uploaded["payload"] = payload
+            uploaded["content_length"] = self.headers.get("Content-Length")
+            uploaded["content_type"] = self.headers.get("Content-Type")
+            uploaded["if_none_match"] = self.headers.get("If-None-Match")
+            if self.path == "/upload-fail":
+                self.send_response(503)
+                self.end_headers()
+                return
+            if self.path == "/upload-redirect-private":
+                self.send_response(307)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+                self.end_headers()
+                return
+            if self.path == "/upload-redirect-same-host":
+                self.send_response(307)
+                self.send_header("Location", "/upload")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_port
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -660,6 +702,71 @@ def egress() -> None:
             got == body,
             f"{len(got)} B, byte for byte",
         )
+
+        payload = body * 4096
+        upload = put_from(
+            f"http://127.0.0.1:{port}/upload?signature=secret",
+            local,
+            io.BytesIO(payload),
+            expected_length=len(payload),
+            media_type="image/png",
+            what="media upload",
+        )
+        check(
+            "GREEN: one exact immutable output grant streams with its required headers",
+            uploaded
+            == {
+                "path": "/upload?signature=secret",
+                "payload": payload,
+                "content_length": str(len(payload)),
+                "content_type": "image/png",
+                "if_none_match": "*",
+            }
+            and upload.length == len(payload)
+            and upload.sha256 == hashlib.sha256(payload).digest(),
+            f"{upload.length} B PUT; If-None-Match={uploaded.get('if_none_match')!r}",
+        )
+
+        for path, want in (
+            ("upload-fail", "egress_http_error"),
+            ("upload-redirect-private", "egress_host_not_allowed"),
+            ("upload-redirect-same-host", "egress_redirect_refused"),
+        ):
+            try:
+                put_from(
+                    f"http://127.0.0.1:{port}/{path}",
+                    local,
+                    io.BytesIO(body),
+                    expected_length=len(body),
+                    media_type="image/png",
+                    what=path,
+                )
+                upload_refusal = "it succeeded"
+            except EgressRefusal as exc:
+                upload_refusal = exc.code
+            check(
+                f"ARM: {path.replace('-', ' ')} produces no successful upload receipt",
+                upload_refusal == want,
+                upload_refusal,
+            )
+
+        for path, declared, source_bytes, want in (
+            ("upload-under", len(body) + 1, body, "stream_under_declared_size"),
+            ("upload-over", len(body) - 1, body, "stream_over_declared_size"),
+        ):
+            try:
+                put_from(
+                    f"http://127.0.0.1:{port}/{path}",
+                    local,
+                    io.BytesIO(source_bytes),
+                    expected_length=declared,
+                    media_type="image/png",
+                    what=path,
+                )
+                size_refusal = "it succeeded"
+            except EgressRefusal as exc:
+                size_refusal = exc.code
+            check(f"ARM: {path} refuses before returning a receipt", size_refusal == want)
 
         # The SSRF arm. `allow_private=False` is the production posture; hop 0 is the
         # allowlisted host and hop 1 is 169.254.169.254, which is the exact bypass a
@@ -731,7 +838,6 @@ def egress() -> None:
                 exc.detail[:180],
             )
 
-        import hashlib
         import tempfile
         import tracemalloc
 
@@ -902,13 +1008,12 @@ def egress() -> None:
             )
 
             # cr-042: the closed table decides the destination, at the unit it decides it
-            # in; worker-live's `grants` section proves the same refusal end to end. The
-            # `https://` output row `OutputAccess.url` reserves is PLANNED — whoever adds it
-            # lands host validation of the minted URL and rewrites this arm around it.
+            # in; worker-live's `grants` section proves the same refusal end to end. HTTPS
+            # is now a real row, and its address must still clear the one egress predicate.
             exfiltrating = grants.BoundGrant(
                 outputs={
                     "image": grants.BoundOutput(
-                        "image", "https://exfiltrate.example/upload", 1 << 20, "image/png"
+                        "image", "https://169.254.169.254/upload", 1 << 20, "image/png"
                     )
                 }
             )
@@ -922,12 +1027,26 @@ def egress() -> None:
             except grants.GrantRefusal as exc:
                 exfiltration_refused = exc.code
             check(
-                "ARM: a destination the closed table has no row for is unwritable — there is "
-                "no `https://` output row yet",
-                exfiltration_refused in ("hub_call_unauthorized", "grant_transport"),
-                f"{exfiltration_refused or 'it wrote'} — every HUB_CALLS row is `file://` "
-                "today, so a destination the table never minted a row for does not resolve",
+                "ARM: an HTTPS grant resolving to metadata/private space is unwritable",
+                exfiltration_refused == "egress_blocked_address",
+                exfiltration_refused or "it wrote",
             )
+
+            redacting = grants.Authorizer()
+            try:
+                redacting.authorize(
+                    "grant_output_write",
+                    "GET",
+                    "https://media.example/object?X-Amz-Signature=do-not-log",
+                    {"output_id": "image", "length": 1},
+                )
+            except grants.GrantRefusal as exc:
+                redacted = "do-not-log" not in str(exc) and "do-not-log" not in str(
+                    redacting.refusals
+                )
+            else:
+                redacted = False
+            check("a presigned query is absent from refusal details and events", redacted)
 
             inside_parent = grant_root / "parent"
             inside_parent.mkdir()
