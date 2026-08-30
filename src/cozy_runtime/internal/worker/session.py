@@ -2022,6 +2022,7 @@ class Worker:
                 selection_root=self.options.environment_root / "selections",
                 artifact_store=self.options.artifact_store,
                 python=Path(sys.executable),
+                base_manifest=self.options.base_manifest,
                 verified_cache=self.verified_artifacts,
                 on_observation=lambda value: self._observe_acquisition(placement, value),
             )
@@ -3582,6 +3583,11 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         "(cr-049); content-addressed, so a replay re-fetches only what is missing",
     )
     parser.add_argument(
+        "--base-manifest",
+        default=str(overlay.DEFAULT_BASE_MANIFEST),
+        help="exact base worker image WheelhouseManifest used for overlay ownership",
+    )
+    parser.add_argument(
         "--artifact-store",
         required=True,
         help="verified TensorFS store populated from selected model Manifests",
@@ -3635,6 +3641,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
+        base_manifest=Path(args.base_manifest).resolve(),
         artifact_store=Path(args.artifact_store).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
         development_project=(

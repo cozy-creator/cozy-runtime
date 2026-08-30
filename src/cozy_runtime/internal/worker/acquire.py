@@ -239,6 +239,7 @@ class Acquirer:
         selection_root: Path,
         artifact_store: Path,
         python: Path,
+        base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
         verified_cache: VerifiedArtifactCache | None = None,
         on_observation: Any = None,
     ) -> None:
@@ -248,6 +249,7 @@ class Acquirer:
         self.selection_root = selection_root
         self.artifact_store = artifact_store
         self.python = python
+        self.base_manifest = base_manifest
         self.verified_cache = verified_cache or VerifiedArtifactCache()
         self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
         self._fetch_lock = Lock()
@@ -426,6 +428,7 @@ class Acquirer:
                 source,
                 self.environment_root,
                 python=self.python,
+                base_manifest=self.base_manifest,
                 expected_receipt_digest=receipt_digest,
             )
         except (LaunchRefusal, overlay.OverlayRefusal) as exc:
