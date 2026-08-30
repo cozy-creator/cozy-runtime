@@ -74,7 +74,7 @@ def prepare_boot(
     not one the pod can teach it. Hashing image-resident bytes to echo them back proves
     something the OCI digest already proved before this process existed.
 
-    PlacementSet/3 names model Manifests directly. There is no empty object-set document to
+    PlacementSet/1 names model Manifests directly. There is no empty object-set document to
     publish or reconcile at boot.
     """
 

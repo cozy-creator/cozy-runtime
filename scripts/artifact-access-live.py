@@ -103,7 +103,7 @@ def main() -> int:
             },
         )
     )
-    set_digest = hashlib.sha256(b"exact PlacementSet/3").digest()
+    set_digest = hashlib.sha256(b"exact PlacementSet/1").digest()
     with tempfile.TemporaryDirectory(prefix="cozy-artifact-access-") as raw:
         root = Path(raw)
         client = artifact_access.ArtifactClient(

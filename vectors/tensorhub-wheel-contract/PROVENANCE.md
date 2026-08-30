@@ -8,6 +8,6 @@ the preceding 962 bytes and has identity
 
 Runtime's `tensorhub-package-release` architecture fence consumes those exact canonical bytes,
 requires nested `{ref, distribution, filename, import_roots, tags, version}` project and dependency
-wheel facts, joins them with an inline PlacementSet/3 Environment, and proves the retired flat
+wheel facts, joins them with an inline PlacementSet/1 Environment, and proves the retired flat
 WheelFact shape refuses. The WheelhouseManifest and two small wheel files are retained from the
 earlier Tensorhub vector solely to exercise the complete Runtime join.

@@ -12,8 +12,7 @@ mapping below is proto3 -> JSON value:
   * enums spell as their NUMBER (R2: numbers are normative, names are not),
   * BYTES NAMING LAW: a `bytes` field named `digest`/`*_digest` is a 32-byte SHA-256 spelled
     `sha256:<hex>`; every other `bytes` field is opaque payload spelled base64,
-  * a `format` tag (`<full.Name>/<version>`) domain-separates two document kinds with equal
-    fields, AND two versions of one kind — see `DOC_VERSION` below.
+  * a `format` tag (`<full.Name>/1`) domain-separates two document kinds with equal fields.
 
 The reading half refuses what the writer cannot have produced: non-canonical encoding, an
 unknown key, a wrong `format`. That is what makes a planted service-class field on an
@@ -56,24 +55,10 @@ _INT_TYPES = frozenset(
 )
 _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 
-#: A digest-fenced document is NOT additively versioned: an unknown key REFUSES, so A NEW KEY
-#: IS A NEW DOCUMENT VERSION. The version rides the `format` tag, where it domain-separates
-#: two versions of one document exactly as the name domain-separates two documents. Read
-#: independently per language (#510g) — this map is the reader on this side of the wire.
-#:
-#: AttemptOutcomeBody/3 carries committed artifact receipts. PlacementSet/3 contains the exact
-#: selected environment and binding graph; WorkerSnapshotBody/3 reports binding digests.
-DOC_VERSION = {
-    "cozy.worker.v1.AttemptOutcomeBody": 3,
-    "cozy.worker.v1.InvocationSpec": 2,
-    "cozy.worker.v1.PlacementSet": 3,
-    "cozy.worker.v1.WorkerSnapshotBody": 3,
-}
-
 
 def doc_format(full_name: str) -> str:
-    """The `format` tag for a document kind: `<full.Name>/<version>`."""
-    return f"{full_name}/{DOC_VERSION.get(full_name, 1)}"
+    """The pre-release `format` tag for a document kind: `<full.Name>/1`."""
+    return f"{full_name}/1"
 
 
 class DocumentError(Exception):

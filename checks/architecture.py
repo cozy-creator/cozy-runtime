@@ -591,7 +591,7 @@ def fence_torch_free_import() -> list[str]:
 
 
 def fence_base_ownership_vectors() -> list[str]:
-    """Run the strict complete-base parser over frozen v2/refusal vectors."""
+    """Run the strict complete-base parser over frozen v1/refusal vectors."""
 
     import hashlib
 
@@ -628,14 +628,14 @@ def fence_base_ownership_vectors() -> list[str]:
             got = exc.code
         if got != expected:
             bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
-    wanted = {"legacy-v1-refused", "minimal-complete-v2", "unknown-provider-refused"}
+    wanted = {"minimal-complete-v1", "unknown-format-refused", "unknown-provider-refused"}
     if names != wanted:
         bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
     cross = ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse.json"
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if len(raw) != 25_503 or digest != (
-        "sha256:f5fc85a3dee5a9e92318356323f51f7c7ad5ca32d3e76a5c8839e0e0b6477cad"
+        "sha256:ebe66c52bb87be13b834b53d146ccfc7921b334313240e7431a3fd2dc9571c0a"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -1141,6 +1141,14 @@ def fence_document_kinds() -> list[str]:
                 f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
                 f"{owner} — a second declaration of one kind"
             )
+
+    from cozy.worker.v1 import worker_pb2
+    from cozy_runtime.protocol import documents
+
+    for descriptor in worker_pb2.DESCRIPTOR.message_types_by_name.values():
+        want = f"{descriptor.full_name}/1"
+        if documents.doc_format(descriptor.full_name) != want:
+            bad.append(f"worker document {descriptor.full_name!r} is not hardcut to {want!r}")
     return bad
 
 

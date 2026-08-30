@@ -373,7 +373,7 @@ def _release(
             "base_distributions": base_distributions,
             "base_import_roots": base_import_roots,
             "compatibility_profile": profile,
-            "format": "WheelhouseManifest/3",
+            "format": "WheelhouseManifest/1",
             "minimum_cuda_version": "none" if cpu else "12.6",
             "minimum_driver_version": "none" if cpu else "560.28.03",
             "platform_target": dict(target),

@@ -1,4 +1,4 @@
-"""Acquire the exact bytes selected by one PlacementSet/3.
+"""Acquire the exact bytes selected by one PlacementSet/1.
 
 The PlacementSet is the complete statement of WHAT to run. Tensorhub's mTLS response contains
 only short-lived locations for the closure the Hub derives from that accepted set. This module
@@ -157,7 +157,7 @@ def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlaceme
     Product local venvs use :class:`Acquirer` and exact EnvironmentReceipt just like pods. The
     `cozy-runtime run` source-checkout lane already executes the checked-out project directly;
     this narrow seam keeps that development feature while still deriving its binding identities
-    from PlacementSet/3 rather than reviving binding-plan files.
+    from PlacementSet/1 rather than reviving binding-plan files.
     """
 
     if placement.models or any(entrypoint.get("slots") for entrypoint in placement.entrypoints):
@@ -183,7 +183,7 @@ def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlaceme
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "binding_entrypoint_set_mismatch",
-            "PlacementSet/3 does not cover every descriptor entrypoint",
+            "PlacementSet/1 does not cover every descriptor entrypoint",
         )
     package_release = placement.package_release[0]
     environment_digest = documents.spell(placement.environment_digest)
@@ -207,7 +207,7 @@ def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlaceme
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "qualification_selection_mismatch",
-            "Qualification does not authorize this exact PlacementSet/3 selection",
+            "Qualification does not authorize this exact PlacementSet/1 selection",
         )
     bindings = {
         str(row["entrypoint_binding_digest"]): DeclaredBinding(
@@ -287,7 +287,7 @@ class Acquirer:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                         "artifact_plan_missing",
-                        f"{digest} is reached by PlacementSet/3 and absent locally and "
+                        f"{digest} is reached by PlacementSet/1 and absent locally and "
                         "from the plan",
                     )
                 if deadline <= int(time.time()):
@@ -548,7 +548,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "qualification_selection_mismatch",
-                "Qualification does not authorize this exact PlacementSet/3 selection",
+                "Qualification does not authorize this exact PlacementSet/1 selection",
             )
         self._stage(qualification_digest, qualification_raw)
         visible = _visible_entrypoints(descriptor)
@@ -633,7 +633,7 @@ class Acquirer:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     "selected_binding_mismatch",
-                    f"{name}: MCC candidate does not equal PlacementSet/3",
+                    f"{name}: MCC candidate does not equal PlacementSet/1",
                 )
             components = tuple(str(row["component"]) for row in slot.get("components", []))
             if components != tuple(row.component for row in construction.destination_sets):
@@ -697,7 +697,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",
-                "PlacementSet/3 does not cover every descriptor entrypoint",
+                "PlacementSet/1 does not cover every descriptor entrypoint",
             )
         return bindings, count
 
