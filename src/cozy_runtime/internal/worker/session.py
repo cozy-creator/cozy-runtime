@@ -2035,32 +2035,7 @@ class Worker:
                 on_observation=lambda value: self._observe_acquisition(placement, value),
             )
 
-            def package_ready(installed: overlay.InstalledOverlay) -> None:
-                """Start cold interpreter/Torch import while model bytes still hydrate."""
-
-                if revision != self.accepted.accepted_desired_state_revision:
-                    return
-                if self.supervision.current is not None:
-                    return
-                self.supervision.use_overlay(
-                    str(installed.python), str(installed.import_root), installed.content_digest
-                )
-                try:
-                    executor = self.supervision.spawn(imposed=self.imposed())
-                except ExecutorGone as exc:
-                    raise acquire.AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        "executor_early_spawn_failed",
-                        str(exc),
-                    ) from exc
-                self.note(
-                    "boot",
-                    f"generation {executor.incarnation} pid {executor.pid} spawned after "
-                    "package overlay admission while model hydration continued",
-                )
-                self._observe_acquisition(placement, acquirer.observation.snapshot())
-
-            acquired = acquirer.acquire(placement, on_package_ready=package_ready)
+            acquired = acquirer.acquire(placement)
             self.note(
                 "materialization",
                 f"revision {revision} acquired {acquired.wheels} wheel(s), "
@@ -2136,6 +2111,10 @@ class Worker:
         if self.placement is placement:
             # No outgoing placement exists to keep serving: latch on this placement, which moves
             # its serving axis OFFLINE and leaves `converged_revision` behind, typed.
+            self.note(
+                "materialization",
+                f"placement REFUSED ({fault.reason}): {safe(fault.detail)}",
+            )
             self.latch(fault)
             return
         # FALLBACK-RETENTION (#474 clauses 1, 4 and 5): the outgoing placement never stopped
@@ -2190,7 +2169,11 @@ class Worker:
             )
             self.latched = "unresolved_job_descriptor"
             return
-        self.jobs[job.job_descriptor_id] = JobBinding.read(json.loads(record.read_text()))
+        binding = JobBinding.read(json.loads(record.read_text()))
+        self.supervision.use_overlay(
+            self.supervision.python, binding.overlay, binding.overlay_content_digest
+        )
+        self.jobs[job.job_descriptor_id] = binding
         self.engine.jobs = self.jobs
         self.job_caps = job.resource_caps
         self.reclaim_on_terminal = job.reclaim_on_terminal

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -340,18 +340,11 @@ class Acquirer:
                     )
         return path
 
-    def acquire(
-        self,
-        placement: Any,
-        *,
-        on_package_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
-    ) -> AcquiredPlacement:
+    def acquire(self, placement: Any) -> AcquiredPlacement:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
             package_future = pool.submit(self._run_package, placement)
             model_future = pool.submit(self._run_model, placement)
             installed, bindings, documents_count = package_future.result()
-            if on_package_ready is not None:
-                on_package_ready(installed)
             model_objects = model_future.result()
         self._verify_model_refs(bindings)
         return AcquiredPlacement(
@@ -449,13 +442,18 @@ class Acquirer:
             count = 0
             for model in placement.models:
                 manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
-                manifest_path = self.fetch(manifest_digest, manifest_length)
-                manifest_raw = manifest_path.read_bytes()
-                store.put_manifest(manifest_raw, manifest_digest, manifest_length)
-                direct = _manifest_entries(manifest_raw)
-                for digest, length in direct:
-                    path = self.fetch(digest, length)
-                    store.put_file(str(path), digest, length)
+                try:
+                    manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
+                    _verify_bytes(manifest_raw, manifest_digest, manifest_length)
+                except Exception as exc:
+                    if getattr(exc, "code", "") != "OBJECT_ABSENT":
+                        raise
+                    manifest_path = self.fetch(manifest_digest, manifest_length)
+                    manifest_raw = manifest_path.read_bytes()
+                    store.put_manifest(manifest_raw, manifest_digest, manifest_length)
+                    for digest, length in _manifest_entries(manifest_raw):
+                        path = self.fetch(digest, length)
+                        store.put_file(str(path), digest, length)
                 reached = {
                     (str(row["id"]), int(row["length"])) for row in store.walk(manifest_digest)
                 }
@@ -489,7 +487,7 @@ class Acquirer:
                         reused=max(0, outcome.bytes_total - outcome.bytes_moved),
                     )
                 else:
-                    store.acquire_manifest(manifest_digest).close()
+                    store.acquire_manifest(manifest_digest).release()
                 count += len(closure)
             return count
         except AcquisitionRefusal:
@@ -710,7 +708,7 @@ class Acquirer:
             store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
             for binding in bindings.values():
                 for digest in {binding.reference_snapshot, *binding.snapshots.values()}:
-                    store.acquire_manifest(digest).close()
+                    store.acquire_manifest(digest).release()
         except Exception as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
@@ -749,6 +747,16 @@ def _verify_file(path: Path, digest: str, length: int | None) -> bytes:
             f"measured {measured}/{len(raw)}, expected {digest}/{length or 'measured length'}",
         )
     return raw
+
+
+def _verify_bytes(raw: bytes, digest: str, length: int) -> None:
+    measured = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if len(raw) != length or measured != digest:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+            "local_artifact_identity_mismatch",
+            f"measured {measured}/{len(raw)}, expected {digest}/{length}",
+        )
 
 
 def _document(raw: bytes, name: str) -> dict[str, Any]:

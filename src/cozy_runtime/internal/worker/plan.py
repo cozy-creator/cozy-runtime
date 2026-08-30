@@ -200,7 +200,10 @@ class JobBinding:
 
     job_descriptor_id: str
     build_id: str
-    project: str
+    application: str
+    package_descriptor: str
+    overlay: str
+    overlay_content_digest: str
     job: str
     """The registered `@app.job` name this descriptor id resolves to."""
     gpu_count: int = 0

@@ -4,7 +4,7 @@
 # Exact generated-byte provenance is enforced by CI's vendored-drift check.
 from cozy_runtime.protocol import WIRE_MINOR
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 # The two independent semvers reported by `cozy-runtime version`.
 PYTHON_CONTRACT_VERSION = "0.0.2"
