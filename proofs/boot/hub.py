@@ -307,7 +307,7 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             assert set(request) == {
                 "creator_signature",
                 "delegation_canonical_bytes",
-                "model_checkpoint_ids",
+                "model_manifest_ids",
                 "package_release_ids",
             }
             delegation_bytes = base64.b64decode(
@@ -320,11 +320,11 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             )
             delegation = documents.read(delegation_bytes, pb.ArtifactDelegation)
             packages = request["package_release_ids"]
-            models = request["model_checkpoint_ids"]
+            models = request["model_manifest_ids"]
             assert packages == sorted(set(packages))
             assert models == sorted(set(models))
             assert set(packages).issubset(delegation.get("package_release_ids", []))
-            assert set(models).issubset(delegation.get("model_checkpoint_ids", []))
+            assert set(models).issubset(delegation.get("model_manifest_ids", []))
             now = int(time.time())
             expires = min(int(delegation["expires_at_unix"]), now + 600)
             assert expires > now

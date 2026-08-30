@@ -444,7 +444,7 @@ def ensure_artifacts(
         worker_tls_certificate_digest=documents.raw(worker_tls_certificate_digest),
         revision=1,
         package_release_ids=[hub.PACKAGE_RELEASE],
-        model_checkpoint_ids=["sha256:" + hashlib.sha256(b"proof-checkpoint").hexdigest()],
+        model_manifest_ids=["sha256:" + hashlib.sha256(b"proof-manifest").hexdigest()],
         delegation_id=delegation_id,
         expires_at_unix=DEADLINE,
     )

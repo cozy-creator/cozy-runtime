@@ -100,7 +100,7 @@ def main() -> int:
         worker_tls_certificate_digest=documents.raw(tls_digest),
         revision=9,
         package_release_ids=["cozy/marco-polo@v1"],
-        model_checkpoint_ids=["sha256:" + "4" * 64],
+        model_manifest_ids=["sha256:" + "4" * 64],
         delegation_id="delegation-proto013",
         expires_at_unix=now,
     )
@@ -116,6 +116,34 @@ def main() -> int:
         worker_boot_id=boot_id,
         worker_tls_certificate_digest=tls_digest,
     )
+    for retired, code in (
+        (
+            {**json.loads(delegation_bytes), "format": "cozy.worker.v1.ArtifactDelegation/1"},
+            "artifact_delegation_unknown_format",
+        ),
+        (
+            {**json.loads(delegation_bytes), "model_checkpoint_ids": ["sha256:" + "4" * 64]},
+            "artifact_delegation_unknown_field",
+        ),
+    ):
+        if "model_checkpoint_ids" in retired:
+            retired.pop("model_manifest_ids")
+        retired_bytes = json.dumps(retired, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            artifact_access.read_intent(
+                pb.EnsureArtifacts(
+                    delegation_canonical_bytes=retired_bytes,
+                    creator_signature=private.sign(retired_bytes),
+                ),
+                public,
+                worker_id=worker_id,
+                worker_boot_id=boot_id,
+                worker_tls_certificate_digest=tls_digest,
+            )
+        except artifact_access.ArtifactAccessRefusal as exc:
+            assert exc.code == code
+        else:
+            raise AssertionError(f"retired ArtifactDelegation shape was accepted: {retired!r}")
     bad_update = pb.EnsureArtifacts()
     bad_update.CopyFrom(update)
     bad_update.creator_signature = bytes([bad_update.creator_signature[0] ^ 1]) + bytes(
@@ -165,13 +193,13 @@ def main() -> int:
         plan = client.resolve(
             intent,
             package_release_ids=intent.package_release_ids,
-            model_checkpoint_ids=intent.model_checkpoint_ids,
+            model_manifest_ids=intent.model_manifest_ids,
         )
         try:
             client.resolve(
                 intent,
                 package_release_ids=("foreign/package@v1",),
-                model_checkpoint_ids=intent.model_checkpoint_ids,
+                model_manifest_ids=intent.model_manifest_ids,
             )
         except artifact_access.ArtifactAccessRefusal as exc:
             assert exc.code == "artifact_resolve_subset_invalid"
@@ -210,7 +238,7 @@ def main() -> int:
         expired_client.resolve(
             intent,
             package_release_ids=intent.package_release_ids,
-            model_checkpoint_ids=intent.model_checkpoint_ids,
+            model_manifest_ids=intent.model_manifest_ids,
         )
     except artifact_access.ArtifactAccessRefusal as exc:
         assert exc.code == "worker_artifacts.delegation_expired"
