@@ -961,12 +961,10 @@ DOCUMENT_KINDS = {
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
-#: Tensorhub currently authors these two package-chain documents.  They disappear in the
-#: coordinated PackageRelease/PlacementSet hardcut; Runtime must not claim them as its formats.
+#: Tensorhub authors the environment-independent package release. PlacementSet is covered by the
+#: worker-protocol prefix above; no binding-plan or model-binding documents survive.
 FOREIGN_DOCUMENT_KINDS = {
     "cozy.package.release/1",
-    "cozy.package.EntrypointBindingPlan/1",
-    "cozy.package.ResolvedModelBinding/1",
 }
 #: Modules that name a registered kind without declaring it (a second reader is fine; a
 #: second DECLARATION is the drift this fence exists for).

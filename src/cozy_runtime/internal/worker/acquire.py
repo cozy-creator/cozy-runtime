@@ -25,7 +25,6 @@ from cozy_runtime.internal import (
     fill,
     overlay,
     placement_materialization,
-    provisioned,
     pull,
 )
 from cozy_runtime.internal import (
@@ -660,7 +659,7 @@ class Acquirer:
                 )
             try:
                 model_weight_bytes = contract.destination_resident_bytes(
-                    construction, provisioned.tensorfs_destination_widths(fill.tensorfs_module())
+                    construction, contract.tensorfs_destination_widths(fill.tensorfs_module())
                 )
             except (contract.ContractError, fill.FillRefusal) as exc:
                 raise AcquisitionRefusal(

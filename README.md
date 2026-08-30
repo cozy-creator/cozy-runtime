@@ -60,11 +60,12 @@ wrapper executable has no compatibility alias; placement acquisition now lives i
 `internal/placement_materialization.py`.
 
 The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record containing the rental's
-Ed25519 control public key and the media bearer's sorted hashes. Claim and `EnsureArtifacts`
-signatures open only WorkerControl; media hashes open only media HTTP. Neither reaches an
-executor. Runtime redeems package/model intent at the code-owned
-configured HTTPS authority with its existing per-boot TLS leaf, then downloads the returned exact
-R2 plan directly. No CA bypass, proxy certificate header, or endpoint-authentication fallback exists.
+Ed25519 control public key and the media bearer's sorted hashes. Claim authenticates the
+RecordOwner; media hashes open only media HTTP. Neither reaches an executor. The exact
+PlacementSet is the sole artifact intent. Runtime names only its digest to the code-owned HTTPS
+authority over its existing per-boot mTLS leaf, then downloads the complete returned R2 plan
+directly. No delegation document, CA bypass, proxy certificate header, or authentication fallback
+exists.
 
 | module | role |
 |---|---|
@@ -235,8 +236,8 @@ The image's OCI digest owns image-resident integrity. `WheelhouseManifest/3` is 
 canonical ownership document for that image: its existing platform target and exact control-wheel
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
-sorted unique import roots: the five control rows in `WheelhouseManifest/3`, the project row in
-`PackageBundle/3`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
+sorted unique import roots: the image rows in `WheelhouseManifest/3`, the project row in
+`PackageRelease/1`, and each selected overlay row embedded in `PlacementSet/3`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
