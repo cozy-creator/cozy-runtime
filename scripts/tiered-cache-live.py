@@ -84,7 +84,7 @@ def _cloud_hydrate(
     )
     result = pull.PullResult(
         ref=ref.digest,
-        snapshot=ref.digest.removeprefix("sha256:"),
+        manifest_id=ref.digest.removeprefix("sha256:"),
         store=str(store.root),
         streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
@@ -214,8 +214,8 @@ def main() -> int:
             def local_cloud_pull(
                 tensorfs_module: Any,
                 store: Any,
-                snapshot: str,
-                snapshot_length: int,
+                manifest_id: str,
+                manifest_length: int,
                 granted: list[pull.Read],
                 *,
                 timeout: float | None = None,
@@ -228,7 +228,8 @@ def main() -> int:
                 assert tensorfs_module is tensorfs
                 assert timeout is None and cache_store is None and not allow_local
                 rows = list(granted)
-                assert snapshot == manifest_ref.digest and snapshot_length == manifest_ref.length
+                assert manifest_id == manifest_ref.digest
+                assert manifest_length == manifest_ref.length
                 assert {row.object_id for row in rows} == {
                     manifest_ref.digest,
                     segment_ref.digest,
@@ -250,7 +251,7 @@ def main() -> int:
                 )
 
             cloud_only_local = root / "cloud-only-local"
-            with mock.patch.object(pull, "pull_granted_snapshot", side_effect=local_cloud_pull):
+            with mock.patch.object(pull, "pull_granted_manifest", side_effect=local_cloud_pull):
                 cloud_only = materialize_objects(
                     cloud_only_grants,
                     cloud_only_set,

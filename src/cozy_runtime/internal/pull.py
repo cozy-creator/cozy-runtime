@@ -96,11 +96,13 @@ def open_store(tensorfs: Any, root: Path) -> Any:
 
     root.mkdir(parents=True, exist_ok=True)
     try:
-        return (
-            tensorfs.Store.open(str(root))
-            if (root / "store.json").is_file()
-            else tensorfs.Store.init(str(root))
-        )
+        if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
+            return tensorfs.Store.open(str(root))
+        if any(root.iterdir()):
+            # Let TensorFS produce the typed old-layout/malformed-store refusal. Initializing
+            # beside foreign bytes would create two apparent authorities in one directory.
+            return tensorfs.Store.open(str(root))
+        return tensorfs.Store.init(str(root))
     except Exception as exc:
         raise PullRefusal(
             "border_refused",
@@ -292,15 +294,13 @@ def _hub_error(exc: urllib.error.HTTPError, path: str) -> PullRefusal:
 
 @dataclass(frozen=True, slots=True)
 class Resolved:
-    """One exact checkpoint. A ref plus a lane selector went in; a digest came out."""
+    """One exact model manifest. A ref plus a lane selector went in; a digest came out."""
 
     org: str
     name: str
     release: str
-    #: BARE 64-hex. The digest is the identity, and every document that carries one carries
-    #: it prefixed — so the two spellings are kept apart deliberately rather than trusted to
-    #: agree: `snapshot` is what an ObjectRef holds, `path_id` is what the hub's routes take.
-    snapshot: str
+    #: BARE 64-hex manifest_id. Routes use its prefixed spelling.
+    manifest_id: str
     lane: str = ""
     stamps: dict[str, tuple[str, ...]] = field(default_factory=dict)
     """THE RESOLVED LANE'S STAMPED-FACT SET (#567d) — the third coordinate of the contract
@@ -311,35 +311,25 @@ class Resolved:
     class closed — which is the honest outcome, not a default."""
 
     @property
-    def path_id(self) -> str:
-        return "sha256:" + self.snapshot
+    def manifest_ref(self) -> str:
+        return "sha256:" + self.manifest_id
 
 
 def resolve(
     base: str, ref: str, deadline: Deadline, *, lane: str = "", token: str = ""
 ) -> Resolved:
-    """`org/model[@release|@sha256:...]` -> one exact checkpoint, decided by the HUB.
+    """`org/model[@release|@sha256:...]` -> one exact manifest, decided by the HUB.
 
     Resolution is not re-implemented here on purpose: the hub owns the release/lane
     vocabulary, and a client that resolved locally would need a copy of it that goes stale.
     """
     q = urllib.parse.urlencode({"ref": ref, **({"lane": lane} if lane else {})})
     doc = _json(base, f"/v1/models/resolve?{q}", deadline, token=token)
-    # The hub's own spelling for "the exact bytes this ref names". `checkpoint_id` is what
-    # `/v1/models/resolve` returns and `snapshot_id` is what the checkpoint listing returns;
-    # both
-    # are read rather than one of them being assumed, because a client that guessed would
-    # fail on whichever route it did not test against.
-    snapshot = str(
-        doc.get("checkpoint_id")
-        or doc.get("snapshot_id")
-        or doc.get("checkpoint", {}).get("snapshot_id")
-        or ""
-    ).strip()
-    if not snapshot:
+    manifest_id = str(doc.get("manifest_id") or "").strip()
+    if not manifest_id:
         raise PullRefusal(
             "ref_not_found",
-            f"{ref}: the hub resolved it to no checkpoint",
+            f"{ref}: the hub resolved it to no manifest",
             "check the ref and the lane selector; `--lane` narrows a release with several",
             cause=json.dumps(doc)[:400],
         )
@@ -348,7 +338,7 @@ def resolve(
     if not separator or not org or not name:
         raise PullRefusal(
             "hub_refused",
-            f"{ref}: the hub resolved a checkpoint without its model identity",
+            f"{ref}: the hub resolved a manifest without its model identity",
             "upgrade the hub; /v1/models/resolve must return the owning model",
             cause=json.dumps(doc)[:400],
         )
@@ -356,8 +346,8 @@ def resolve(
         org=org,
         name=name,
         release=str(doc.get("release") or ""),
-        snapshot=snapshot.removeprefix("sha256:"),
-        lane=lane,
+        manifest_id=manifest_id.removeprefix("sha256:"),
+        lane=str(doc.get("lane") or lane),
         stamps=_stamps(doc.get("stamps")),
     )
 
@@ -392,32 +382,32 @@ class Read:
 def reads(base: str, at: Resolved, deadline: Deadline, *, token: str = "") -> list[Read]:
     """The hub's read authorizations — the mirror of a publish grant.
 
-    This is a CLAIM about what the checkpoint reaches. Nothing is trusted about it: the
+    This is a CLAIM about what the manifest reaches. Nothing is trusted about it: the
     lengths and digests are handed to the border as the EXPECTATION each object must meet,
     and an object that arrives as anything else is refused, not accepted with a warning.
     """
-    path = f"/v1/models/{at.org}/{at.name}/checkpoints/{at.path_id}/reads"
+    path = f"/v1/models/{at.org}/{at.name}/manifests/{at.manifest_ref}/reads"
     doc = _json(base, path, deadline, token=token, body={})
     out = [Read(str(r["object_id"]), int(r["length"]), str(r["url"])) for r in doc.get("reads", [])]
     if not out:
         raise PullRefusal(
             "ref_not_found",
-            f"sha256:{at.snapshot}: the hub authorized no reads for this checkpoint",
-            "the checkpoint exists in the catalog but reaches no custodied object; the hub's "
+            f"sha256:{at.manifest_id}: the hub authorized no reads for this manifest",
+            "the manifest exists in the catalog but reaches no custodied object; the hub's "
             "own envelope names the repair",
         )
     return out
 
 
 def manifest(base: str, at: Resolved, deadline: Deadline) -> bytes:
-    """The snapshot manifest's exact bytes, served verbatim by the hub.
+    """The manifest's exact bytes, served verbatim by the hub.
 
     Deliberately read whole: a manifest is a bounded canonical DOCUMENT, not the artifact.
     Its bytes still cross the same verifying door as every tensor object — the border checks
     them against the digest the ref resolved to, so a hub that served the wrong manifest is
     caught at the door rather than believed.
     """
-    url = base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/checkpoints/{at.path_id}/manifest"
+    url = base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/manifests/{at.manifest_ref}"
     guard(url, allow_local=local_hub(base))
     try:
         with _open(urllib.request.Request(url), deadline) as resp:
@@ -427,7 +417,7 @@ def manifest(base: str, at: Resolved, deadline: Deadline) -> bytes:
     except urllib.error.URLError as exc:
         raise PullRefusal(
             "hub_unreachable",
-            f"the hub at {base} did not serve the manifest for sha256:{at.snapshot}",
+            f"the hub at {base} did not serve the manifest for sha256:{at.manifest_id}",
             "check --hub and that the hub is serving",
             cause=str(exc),
         ) from exc
@@ -441,7 +431,7 @@ class PullResult:
     """What a pull actually did — counted, never estimated."""
 
     ref: str
-    snapshot: str
+    manifest_id: str
     store: str
     #: The release the HUB resolved this ref to, or "" when the ref pinned a digest and the
     #: hub therefore named none. It is carried because the local index row is keyed by a ref
@@ -464,7 +454,7 @@ class PullResult:
     def document(self) -> dict[str, object]:
         return {
             "ref": self.ref,
-            "snapshot": "sha256:" + self.snapshot,
+            "manifest_id": "sha256:" + self.manifest_id,
             "store": self.store,
             "declared": self.declared,
             "held": self.held,
@@ -529,18 +519,18 @@ def pull(
     declared = reads(base, at, deadline, token=token)
     doc = manifest(base, at, deadline)
 
-    session = session or ("pull-" + at.snapshot[:12])
+    session = session or ("pull-" + at.manifest_id[:12])
     plan = _plan(
         tensorfs,
         store,
         session,
-        at.snapshot,
+        at.manifest_id,
         len(doc),
         [(r.object_id, r.length) for r in declared],
     )
     result = PullResult(
         ref=ref,
-        snapshot=at.snapshot,
+        manifest_id=at.manifest_id,
         store=str(store.root),
         release=at.release,
         stamps=dict(at.stamps),
@@ -558,7 +548,7 @@ def pull(
         plan,
         result,
         urls={r.object_id: r.url for r in declared},
-        in_hand={"sha256:" + at.snapshot: doc},
+        in_hand={"sha256:" + at.manifest_id: doc},
         deadline=deadline,
         allow_local=local_hub(base),
         streams=streams,
@@ -567,11 +557,11 @@ def pull(
     return result
 
 
-def pull_granted_snapshot(
+def pull_granted_manifest(
     tensorfs: Any,
     store: Any,
-    snapshot: str,
-    snapshot_length: int,
+    manifest_id: str,
+    manifest_length: int,
     granted: Sequence[Read],
     *,
     timeout: float | None = None,
@@ -581,12 +571,12 @@ def pull_granted_snapshot(
     cache_store: Any | None = None,
     allow_local: bool = False,
 ) -> PullResult:
-    """Admit one exact SnapshotManifest closure from closed direct HTTPS grants.
+    """Admit one exact Manifest closure from closed direct HTTPS grants.
 
     Rental provisioning already carries delivery authority, so resolving a mutable hub ref
     would add a second meaning clock.  This door instead takes one already-selected root and
     the exact per-root object rows which TensorFS must verify.  The caller partitions a
-    release-wide ObjectSet by SnapshotManifest reachability; this function deliberately does
+    release-wide ObjectSet by Manifest reachability; this function deliberately does
     not guess that a union of several roots is one root's closure.
 
     Every object, including the root manifest, travels through ``fetch_admit``.  No local
@@ -594,18 +584,18 @@ def pull_granted_snapshot(
     inherited proxy or the loopback development carve-out.
     """
 
-    root = snapshot.removeprefix("sha256:")
+    root = manifest_id.removeprefix("sha256:")
     root_id = "sha256:" + root
     if (
         len(root) != 64
         or any(c not in "0123456789abcdef" for c in root)
-        or not isinstance(snapshot_length, int)
-        or isinstance(snapshot_length, bool)
-        or snapshot_length <= 0
+        or not isinstance(manifest_length, int)
+        or isinstance(manifest_length, bool)
+        or manifest_length <= 0
     ):
         raise PullRefusal(
             "artifact_incomplete",
-            f"{snapshot}: not one bounded SnapshotManifest reference",
+            f"{manifest_id}: not one bounded Manifest reference",
             "supply the exact sha256 digest and positive stored-byte length from the binding",
         )
     rows = list(granted)
@@ -613,7 +603,7 @@ def pull_granted_snapshot(
         raise PullRefusal(
             "artifact_incomplete",
             f"{root_id}: direct grants are absent or not sorted by object id",
-            "derive one sorted, unique grant list for this SnapshotManifest closure",
+            "derive one sorted, unique grant list for this Manifest closure",
         )
     by_id: dict[str, Read] = {}
     for row in rows:
@@ -639,11 +629,11 @@ def pull_granted_snapshot(
             )
         by_id[row.object_id] = row
     root_row = by_id.get(root_id)
-    if root_row is None or root_row.length != snapshot_length:
+    if root_row is None or root_row.length != manifest_length:
         raise PullRefusal(
             "artifact_incomplete",
-            f"{root_id}: root grant length does not equal {snapshot_length}",
-            "grant the exact SnapshotManifest bytes named by the resolved binding",
+            f"{root_id}: root grant length does not equal {manifest_length}",
+            "grant the exact Manifest bytes named by the resolved binding",
         )
 
     streams = max(1, int(streams))
@@ -653,12 +643,12 @@ def pull_granted_snapshot(
         store,
         session or ("provision-" + root[:12]),
         root,
-        snapshot_length,
+        manifest_length,
         [(row.object_id, row.length) for row in rows if row.object_id != root_id],
     )
     result = PullResult(
         ref=root_id,
-        snapshot=root,
+        manifest_id=root,
         store=str(store.root),
         streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
@@ -710,21 +700,22 @@ def _execute_plan(
 
     def one(item: tuple[str, int]) -> None:
         object_id, length = item
+        is_manifest = object_id.removeprefix("sha256:") == result.manifest_id
         raw = in_hand.get(object_id)
         if cache_store is not None and _admit_cached(
-            tensorfs, cache_store, store, object_id, length, degraded
+            tensorfs, cache_store, store, object_id, length, is_manifest, degraded
         ):
             source = "network_cache"
         elif raw is not None:
             _admit(tensorfs, store, plan["document"], object_id, _Bytes(raw))
-            _backfill(tensorfs, store, cache_store, object_id, length, degraded)
+            _backfill(tensorfs, store, cache_store, object_id, length, is_manifest, degraded)
             source = "cloud"
         else:
             url = urls.get(object_id)
             if url is None:
                 raise PullRefusal(
                     "artifact_incomplete",
-                    f"{object_id}: the SnapshotManifest reaches it and no exact grant exists",
+                    f"{object_id}: the Manifest reaches it and no exact grant exists",
                     "repair the closed grant plane; Runtime never resolves an ungranted object",
                 )
             _fetch(
@@ -737,7 +728,7 @@ def _execute_plan(
                 allow_local,
                 no_proxy=no_proxy,
             )
-            _backfill(tensorfs, store, cache_store, object_id, length, degraded)
+            _backfill(tensorfs, store, cache_store, object_id, length, is_manifest, degraded)
             source = "cloud"
         with ledger:
             result.fetched += 1
@@ -785,9 +776,10 @@ def _admit_cached(
     local_store: Any,
     object_id: str,
     length: int,
+    is_manifest: bool,
     degraded: Callable[[str], None],
 ) -> bool:
-    transfer = tensorfs.transfer_object
+    transfer = tensorfs.transfer_manifest if is_manifest else tensorfs.transfer_object
     try:
         transfer(cache_store, local_store, object_id, length)
     except Exception as exc:
@@ -805,11 +797,12 @@ def _backfill(
     cache_store: Any | None,
     object_id: str,
     length: int,
+    is_manifest: bool,
     degraded: Callable[[str], None],
 ) -> None:
     if cache_store is None:
         return
-    transfer = tensorfs.transfer_object
+    transfer = tensorfs.transfer_manifest if is_manifest else tensorfs.transfer_object
     try:
         transfer(local_store, cache_store, object_id, length)
     except Exception:
@@ -860,12 +853,14 @@ def _plan(
     tensorfs: Any,
     store: Any,
     session: str,
-    snapshot: str,
-    snapshot_length: int,
+    manifest_id: str,
+    manifest_length: int,
     declared: Sequence[tuple[str, int]],
 ) -> dict[str, Any]:
     try:
-        return dict(tensorfs.fetch_plan(store, session, snapshot, snapshot_length, list(declared)))
+        return dict(
+            tensorfs.fetch_plan(store, session, manifest_id, manifest_length, list(declared))
+        )
     except Exception as exc:
         raise _border(exc, "border_refused") from exc
 

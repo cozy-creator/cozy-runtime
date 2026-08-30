@@ -76,8 +76,17 @@ def pulled(out: str) -> dict[str, Any]:
 
 
 def objects(root: pathlib.Path) -> dict[str, pathlib.Path]:
-    d = root / "objects" / "sha256"
-    return {p.name: p for p in d.rglob("*") if p.is_file()} if d.is_dir() else {}
+    found: dict[str, pathlib.Path] = {}
+    for namespace in ("blobs", "manifests"):
+        directory = root / namespace
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            digest_name = path.name.removesuffix(".json")
+            found[f"{namespace}:{digest_name}"] = path
+    return found
 
 
 def digest(path: pathlib.Path) -> str:
@@ -122,17 +131,17 @@ def phase_pull(a: argparse.Namespace) -> None:
     else:
         ok("the dry-run plan is what actually happened", "same fetch_plan call, not an estimate")
 
-    verify(a, res["snapshot"])
+    verify(a, res["manifest_id"])
     if a.source:
         identical(a, pathlib.Path(a.source), pathlib.Path(a.store))
 
 
-def verify(a: argparse.Namespace, snapshot: str, root: str = "") -> None:
+def verify(a: argparse.Namespace, manifest_id: str, root: str = "") -> None:
     """The destination proves the artifact itself — a local walk over local bytes."""
     if not a.tfs:
         return
     out = subprocess.run(
-        [a.tfs, "snapshot", "verify", root or a.store, snapshot.removeprefix("sha256:")],
+        [a.tfs, "manifest", "verify", root or a.store, manifest_id.removeprefix("sha256:")],
         capture_output=True,
         text=True,
     )
@@ -147,12 +156,13 @@ def identical(a: argparse.Namespace, src: pathlib.Path, dst: pathlib.Path) -> No
     if missing:
         return bad("objects never arrived", f"{len(missing)} missing")
     total = 0
-    for name, p in have.items():
-        if p.read_bytes() != got[name].read_bytes():
-            return bad("BYTES DIFFER after the round trip", name)
-        if digest(got[name]) != name:
-            return bad("a pulled object does not hash to its own id", name)
-        total += got[name].stat().st_size
+    for key, path in have.items():
+        if path.read_bytes() != got[key].read_bytes():
+            return bad("BYTES DIFFER after the round trip", key)
+        expected = key.partition(":")[2]
+        if digest(got[key]) != expected:
+            return bad("a pulled object does not hash to its own id", key)
+        total += got[key].stat().st_size
     ok(
         "published -> pulled is BIT-IDENTICAL",
         f"{len(have)} objects, {total} B ({total / 2**20:.1f} MiB), every digest re-derived here",
@@ -270,7 +280,7 @@ def phase_streams(a: argparse.Namespace) -> None:
         )
     if got["serial"][0]["bytes_moved"] != got["concurrent"][0]["bytes_moved"]:
         bad("the two walks moved different byte totals")
-    verify(a, got["concurrent"][0]["snapshot"], str(wide))
+    verify(a, got["concurrent"][0]["manifest_id"], str(wide))
     shutil.rmtree(serial, ignore_errors=True)
     shutil.rmtree(wide, ignore_errors=True)
 
@@ -305,8 +315,9 @@ def phase_idem(a: argparse.Namespace) -> None:
 def phase_heal(a: argparse.Namespace) -> None:
     head("heal — a corrupted local object is repaired, not skipped as 'already present'")
     have = objects(pathlib.Path(a.store))
-    victim = max(have.values(), key=lambda p: p.stat().st_size)
-    name = victim.name
+    blobs = {key: path for key, path in have.items() if key.startswith("blobs:")}
+    victim_key, victim = max(blobs.items(), key=lambda item: item[1].stat().st_size)
+    name = victim_key.partition(":")[2]
     victim.chmod(0o644)
     data = bytearray(victim.read_bytes())
     data[len(data) // 3] ^= 0xFF
@@ -319,9 +330,9 @@ def phase_heal(a: argparse.Namespace) -> None:
     res = pulled(run.stdout)
     if res["fetched"] != 1:
         return bad("the corruption was not repaired alone", f"{res['fetched']} objects re-fetched")
-    if digest(pathlib.Path(a.store) / "objects" / "sha256" / name[:2] / name[2:4] / name) != name:
+    if digest(pathlib.Path(a.store) / "blobs" / name[:2] / name[2:4] / name) != name:
         return bad("the object still does not hash to its id")
-    quarantined = list((pathlib.Path(a.store) / "quarantine").glob(name + "*"))
+    quarantined = list((pathlib.Path(a.store) / ".tensorfs" / "quarantine").glob(name + "*"))
     ok("exactly the corrupted object was re-fetched", f"{res['held']} held, 1 fetched, healed")
     if quarantined:
         ok(
@@ -399,7 +410,7 @@ def phase_resume(a: argparse.Namespace) -> None:
             "the resume re-fetched ONLY what was missing",
             f"{res['held']} held ({res['bytes_held']} B kept), {res['fetched']} fetched",
         )
-    verify(a, res["snapshot"])
+    verify(a, res["manifest_id"])
     shutil.rmtree(store, ignore_errors=True)
 
 
@@ -414,24 +425,38 @@ def phase_door(a: argparse.Namespace) -> None:
     root.mkdir(parents=True)
     store = tensorfs.Store.init(str(root))
     have = objects(src)
-    snap = None
-    for name in have:
+    manifest_key = None
+    for key in have:
+        if not key.startswith("manifests:"):
+            continue
+        manifest_id = key.partition(":")[2]
         try:
-            store_snapshot = subprocess.run(
-                [a.tfs, "snapshot", "show", str(src), name], capture_output=True
+            stored_manifest = subprocess.run(
+                [a.tfs, "manifest", "show", str(src), manifest_id], capture_output=True
             )
-            if store_snapshot.returncode == 0:
-                snap = name
+            if stored_manifest.returncode == 0:
+                manifest_key = key
                 break
         except OSError:
             break
-    if snap is None:
-        return ok("door SKIPPED", "no --tfs binary to identify the snapshot object")
+    if manifest_key is None:
+        return ok("door SKIPPED", "no --tfs binary to identify the manifest")
 
-    declared = [("sha256:" + n, p.stat().st_size) for n, p in sorted(have.items()) if n != snap]
-    plan = tensorfs.fetch_plan(store, "door", snap, have[snap].stat().st_size, declared)
+    manifest_id = manifest_key.partition(":")[2]
+    declared = [
+        ("sha256:" + key.partition(":")[2], path.stat().st_size)
+        for key, path in sorted(have.items())
+        if key.startswith("blobs:")
+    ]
+    plan = tensorfs.fetch_plan(
+        store, "door", manifest_id, have[manifest_key].stat().st_size, declared
+    )
     doc = plan["document"]
-    big = max((n for n in have if n != snap), key=lambda n: have[n].stat().st_size)
+    big = max(
+        (key for key in have if key.startswith("blobs:")),
+        key=lambda key: have[key].stat().st_size,
+    )
+    big_id = big.partition(":")[2]
     size = have[big].stat().st_size
     cut = max(size // 2, 1)
 
@@ -479,17 +504,17 @@ def phase_door(a: argparse.Namespace) -> None:
     ):
         before = set(store.objects())
         try:
-            tensorfs.fetch_admit(store, doc, "sha256:" + big, source)
+            tensorfs.fetch_admit(store, doc, "sha256:" + big_id, source)
             bad(f"{label}: ADMITTED", "the door let it through")
         except Exception as exc:
-            left = len(list((root / "tmp").iterdir()))
+            left = len(list((root / ".tensorfs" / "tmp").iterdir()))
             if set(store.objects()) != before or left:
                 bad(f"{label}: refused but left state", f"{left} temp file(s)")
             else:
                 ok(f"{label}: refused, committed NOTHING", f"{type(exc).__name__}: {str(exc)[:70]}")
 
     with open(have[big], "rb") as f:
-        got = tensorfs.fetch_admit(store, doc, "sha256:" + big, f)
+        got = tensorfs.fetch_admit(store, doc, "sha256:" + big_id, f)
     ok("the same object, honest, admits", f"{got['id'][:23]}… {got['length']} B")
     grew = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 - rss0
     if grew * 2**20 > size / 4:

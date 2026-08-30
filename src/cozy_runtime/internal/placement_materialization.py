@@ -277,7 +277,7 @@ def materialize_objects(
             timeout = None if deadline is None else float(deadline) - time.time()
             if timeout is not None and timeout <= 0:
                 raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
-            outcome = pull.pull_granted_snapshot(
+            outcome = pull.pull_granted_manifest(
                 tensorfs,
                 store,
                 group.root.digest,

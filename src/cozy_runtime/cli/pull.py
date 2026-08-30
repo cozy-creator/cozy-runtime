@@ -140,7 +140,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     except transport.PullRefusal as refusal:
         raise _refuse(refusal, config) from refusal
 
-    facts = _header_facts(tensorfs, store, outcome.snapshot)
+    facts = _header_facts(tensorfs, store, outcome.manifest_id)
     row = artifacts.Artifact(
         ref=_installed_ref(flags.get("--as", ""), ref, outcome.release),
         store=str(store.root),
@@ -151,7 +151,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         # arrived perfectly and cannot be served. An N-ary checkpoint carries every
         # component under one digest, which is what this map says and why it is read from
         # the header rather than assumed to be one.
-        snapshots={name: "sha256:" + outcome.snapshot for name in facts.components},
+        snapshots={name: "sha256:" + outcome.manifest_id for name in facts.components},
         lane=flags.get("--lane", "") or "plain",
         bytes=facts.stored_bytes,
         tensors=facts.tensors,
@@ -171,7 +171,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
         document={**outcome.document(), "components": list(facts.components)},
         rows=(
             ("ref", row.ref),
-            ("snapshot", "sha256:" + outcome.snapshot),
+            ("manifest", "sha256:" + outcome.manifest_id),
             ("store", str(store.root)),
             ("components", f"{', '.join(facts.components)} — {facts.tensors} tensors"),
             (
@@ -234,8 +234,8 @@ class _Facts:
     stored_bytes: int
 
 
-def _header_facts(tensorfs: Any, store: Any, snapshot: str) -> _Facts:
-    """What the PULLED snapshot's own header says it holds.
+def _header_facts(tensorfs: Any, store: Any, manifest_id: str) -> _Facts:
+    """What the pulled manifest's CozyTensors header says it holds.
 
     Read here rather than taken from the transport because the transport counts OBJECTS and
     the index row is about TENSORS: `bytes_total` includes the manifest and the encoding
@@ -244,15 +244,12 @@ def _header_facts(tensorfs: Any, store: Any, snapshot: str) -> _Facts:
     row this writes is a row that plane can resolve.
     """
     try:
-        header_bytes = store.snapshot("sha256:" + snapshot)["header"]
-        closure = tensorfs.Closure()
-        for spec in tensorfs.parse_header(header_bytes)["encodings"]:
-            closure.insert(store.document(str(spec["sha256"])))
-        header = tensorfs.parse_header(header_bytes, closure)
+        header_bytes = store.manifest("sha256:" + manifest_id)["header"]
+        header = tensorfs.parse_header(header_bytes)
     except Exception as exc:
         raise CliError(
             "validation",
-            f"sha256:{snapshot}: the pulled snapshot's header did not parse — "
+            f"sha256:{manifest_id}: the pulled manifest's header did not parse — "
             f"{type(exc).__name__}: {exc}",
             "the objects landed and verified; the header this build reads is not the header "
             "the hub published. Re-pull, and if it repeats the catalog's header is suspect",
@@ -295,8 +292,8 @@ def _preview(
         doc = transport.manifest(hub, at, deadline)
         plan = tensorfs.fetch_plan(
             store,
-            "dry-" + at.snapshot[:12],
-            at.snapshot,
+            "dry-" + at.manifest_id[:12],
+            at.manifest_id,
             len(doc),
             [(r.object_id, r.length) for r in declared],
         )
@@ -305,7 +302,7 @@ def _preview(
     return Result(
         document={
             "ref": ref,
-            "snapshot": "sha256:" + at.snapshot,
+            "manifest_id": "sha256:" + at.manifest_id,
             "store": str(store.root),
             "held": len(plan["held"]),
             "wanted": len(plan["wanted"]),
@@ -314,7 +311,7 @@ def _preview(
             "dry_run": True,
         },
         rows=(
-            ("snapshot", "sha256:" + at.snapshot),
+            ("manifest", "sha256:" + at.manifest_id),
             ("would fetch", f"{len(plan['wanted'])} object(s), {plan['wanted_bytes']} B"),
             ("already held", f"{len(plan['held'])} object(s), {plan['held_bytes']} B"),
         ),
