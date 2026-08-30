@@ -17,9 +17,9 @@ must see. Nothing widens the table at runtime; a new call site is a new reviewed
 **EVERY DESTINATION IS CONTROL-PLANE-MINTED, never named by request content.** The grant is
 minted for one invocation and spent here, so nothing the package produced — and nothing a
 request body can influence — chooses where bytes land: a destination the table has no row
-for refuses typed, and `scripts/worker-live.py grants` plants
-`https://exfiltrate.example/upload` for the `hub_call_unauthorized` SECURITY EVENT. Every
-input row is `file://` today. The output row also admits the exact `https://` presigned URL
+for refuses typed. `scripts/worker-live.py grants` plants a presigned-looking metadata-address
+destination and observes `egress_blocked_address` through the real terminal. Every input row is
+`file://` today. The output row also admits the exact `https://` presigned URL
 already carried by `OutputAccess.url`: Tensorhub mints it, R2 sits behind it, and the worker
 never holds bucket credentials. `internal.egress` validates every resolved address and refuses
 a redirect-selected destination. That is what keeps the property; a `file://`-only table never
