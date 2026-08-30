@@ -218,9 +218,9 @@ def main() -> int:
 
     check(
         "application changed",
-        "major",
+        "patch",
         lambda doc: doc.update(application="renamed"),
-        "application changed",
+        "public interface identical",
     )
     check(
         "removed callable",

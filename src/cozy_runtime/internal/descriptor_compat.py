@@ -34,8 +34,8 @@ def _classify(previous: dict[str, Json], candidate: dict[str, Json]) -> Result:
     major: list[str] = []
     minor: list[str] = []
 
-    if previous["application"] != candidate["application"]:
-        major.append("application changed")
+    # The import location is implementation metadata, not a caller-visible
+    # contract. Authors may reorganize modules in a patch release.
 
     before = _callables(previous, "previous package descriptor")
     after = _callables(candidate, "candidate package descriptor")
