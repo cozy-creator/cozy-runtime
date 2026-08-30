@@ -1662,14 +1662,14 @@ class Worker:
             if intent is not self.artifact_intent or self.options.artifact_client is None:
                 continue
             packages = tuple(sorted(set(intent.package_release_ids) - self.resolved_package_ids))
-            models = tuple(sorted(set(intent.model_checkpoint_ids) - self.resolved_model_ids))
+            models = tuple(sorted(set(intent.model_manifest_ids) - self.resolved_model_ids))
             if not packages and not models:
                 continue
             try:
                 plan = self.options.artifact_client.resolve(
                     intent,
                     package_release_ids=packages,
-                    model_checkpoint_ids=models,
+                    model_manifest_ids=models,
                 )
             except artifact_access.ArtifactAccessRefusal as exc:
                 if intent is not self.artifact_intent:
@@ -1973,7 +1973,7 @@ class Worker:
                 acquired = acquirer.acquire(placement, on_package_ready=package_ready)
                 self.resolved_package_ids.add(placement.package_release_id)
                 if self.artifact_intent is not None:
-                    self.resolved_model_ids.update(self.artifact_intent.model_checkpoint_ids)
+                    self.resolved_model_ids.update(self.artifact_intent.model_manifest_ids)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,

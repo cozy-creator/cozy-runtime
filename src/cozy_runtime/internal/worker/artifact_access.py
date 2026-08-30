@@ -54,12 +54,12 @@ class ArtifactIntent:
     worker_tls_certificate_digest: str
     revision: int
     package_release_ids: tuple[str, ...]
-    model_checkpoint_ids: tuple[str, ...]
+    model_manifest_ids: tuple[str, ...]
     delegation_id: str
     expires_at_unix: int
 
     def logical_identity(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self.package_release_ids, self.model_checkpoint_ids
+        return self.package_release_ids, self.model_manifest_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +181,7 @@ def read_intent(
     packages = _logical_ids(
         value.get("package_release_ids"), "package_release_ids", MAX_PACKAGE_IDS
     )
-    models = _logical_ids(value.get("model_checkpoint_ids"), "model_checkpoint_ids", MAX_MODEL_IDS)
+    models = _logical_ids(value.get("model_manifest_ids"), "model_manifest_ids", MAX_MODEL_IDS)
     if not packages and not models:
         raise ArtifactAccessRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -192,7 +192,7 @@ def read_intent(
         raise ArtifactAccessRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "artifact_model_id_invalid",
-            "model checkpoint ids are exact sha256 identities",
+            "model manifest ids are exact sha256 identities",
         )
     tls_digest = str(value["worker_tls_certificate_digest"])
     bindings = {
@@ -216,7 +216,7 @@ def read_intent(
         worker_tls_certificate_digest=tls_digest,
         revision=int(value["revision"]),
         package_release_ids=packages,
-        model_checkpoint_ids=models,
+        model_manifest_ids=models,
         delegation_id=str(value["delegation_id"]),
         expires_at_unix=int(value["expires_at_unix"]),
     )
@@ -289,10 +289,10 @@ class ArtifactClient:
         intent: ArtifactIntent,
         *,
         package_release_ids: Sequence[str],
-        model_checkpoint_ids: Sequence[str],
+        model_manifest_ids: Sequence[str],
     ) -> ArtifactPlan:
         packages = tuple(package_release_ids)
-        models = tuple(model_checkpoint_ids)
+        models = tuple(model_manifest_ids)
         if packages != tuple(sorted(set(packages))) or models != tuple(sorted(set(models))):
             raise ArtifactAccessRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -300,7 +300,7 @@ class ArtifactClient:
                 "requested logical ids are sorted unique sets",
             )
         if not set(packages).issubset(intent.package_release_ids) or not set(models).issubset(
-            intent.model_checkpoint_ids
+            intent.model_manifest_ids
         ):
             raise ArtifactAccessRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -315,7 +315,7 @@ class ArtifactClient:
                 "delegation_canonical_bytes": base64.b64encode(intent.canonical_bytes).decode(
                     "ascii"
                 ),
-                "model_checkpoint_ids": list(models),
+                "model_manifest_ids": list(models),
                 "package_release_ids": list(packages),
             },
             sort_keys=True,

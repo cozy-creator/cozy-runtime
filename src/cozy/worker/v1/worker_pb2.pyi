@@ -598,14 +598,14 @@ class EnsureArtifacts(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., delegation_canonical_bytes: _Optional[bytes] = ..., creator_signature: _Optional[bytes] = ...) -> None: ...
 
 class ArtifactDelegation(_message.Message):
-    __slots__ = ("rental_id", "worker_id", "worker_boot_id", "worker_tls_certificate_digest", "revision", "package_release_ids", "model_checkpoint_ids", "delegation_id", "expires_at_unix")
+    __slots__ = ("rental_id", "worker_id", "worker_boot_id", "worker_tls_certificate_digest", "revision", "package_release_ids", "model_manifest_ids", "delegation_id", "expires_at_unix")
     RENTAL_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     REVISION_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_RELEASE_IDS_FIELD_NUMBER: _ClassVar[int]
-    MODEL_CHECKPOINT_IDS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_MANIFEST_IDS_FIELD_NUMBER: _ClassVar[int]
     DELEGATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
     rental_id: str
@@ -614,10 +614,10 @@ class ArtifactDelegation(_message.Message):
     worker_tls_certificate_digest: bytes
     revision: int
     package_release_ids: _containers.RepeatedScalarFieldContainer[str]
-    model_checkpoint_ids: _containers.RepeatedScalarFieldContainer[str]
+    model_manifest_ids: _containers.RepeatedScalarFieldContainer[str]
     delegation_id: str
     expires_at_unix: int
-    def __init__(self, rental_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ..., revision: _Optional[int] = ..., package_release_ids: _Optional[_Iterable[str]] = ..., model_checkpoint_ids: _Optional[_Iterable[str]] = ..., delegation_id: _Optional[str] = ..., expires_at_unix: _Optional[int] = ...) -> None: ...
+    def __init__(self, rental_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ..., revision: _Optional[int] = ..., package_release_ids: _Optional[_Iterable[str]] = ..., model_manifest_ids: _Optional[_Iterable[str]] = ..., delegation_id: _Optional[str] = ..., expires_at_unix: _Optional[int] = ...) -> None: ...
 
 class JobDirective(_message.Message):
     __slots__ = ("build_id", "job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count")
