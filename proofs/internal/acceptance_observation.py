@@ -20,7 +20,7 @@ from typing import Any, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
 from proof_data import installed_base_ownership, inventory, pack_installed, wheel
 
-from cozy_runtime.internal import canonical, descriptor, local, overlay
+from cozy_runtime.internal import canonical, descriptor, local, overlay, qualification
 from cozy_runtime.internal.config import read_config
 from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.worker.session import WorkerOptions
@@ -193,7 +193,6 @@ def _setup(root: Path, project_wheel: Path, descriptor_path: Path) -> None:
     fixture_request = {
         "package_descriptor": _local_ref(inputs / "package-descriptor.json"),
         "entrypoint": "marco",
-        "format": "cozy.runtime.AcceptanceFixtureRequest/1",
         "input_root": str(inputs),
     }
     _json(root / "fixture-request.json", fixture_request)
@@ -288,7 +287,6 @@ def _run(root: Path) -> None:
         "entrypoint": "marco",
         "environment_root": state["environment_root"],
         "fixture_payload": _local_ref(fixture_path),
-        "format": "cozy.runtime.ExecutionObservationRequest/1",
         "input_root": str(inputs),
         "installed_environment_receipt": _local_ref(inputs / "installed-environment-receipt.json"),
         "invocation_spec": _local_ref(invocation_path),
@@ -302,11 +300,8 @@ def _run(root: Path) -> None:
 
 
 def _verify(root: Path) -> None:
-    value = canonical.parse_canonical((root / "execution-observation.json").read_bytes())
-    if not isinstance(value, dict):
-        raise ProofFailure("observation is not an object")
+    value = _execution_evidence(root / "execution-observation.json")
     expected = {
-        "format": "cozy.runtime.ExecutionObservation/1",
         "boot_warmup": False,
         "entrypoint": "marco",
         "execution_started": True,
@@ -325,14 +320,22 @@ def _verify(root: Path) -> None:
         raise ProofFailure("observation did not bind the exact Marco fixture")
     if "candidate_id" in value or "qualification_id" in value or "outputs_aborted" in value:
         raise ProofFailure("observation claimed a Hub-owned correlation or abort fact")
-    failed = canonical.parse_canonical((root / "failed-observation.json").read_bytes())
-    if not isinstance(failed, dict) or failed.get("status") != int(
-        pb.OutcomeStatus.OUTCOME_STATUS_FAILED
-    ):
+    failed = _execution_evidence(root / "failed-observation.json")
+    if failed.get("status") != int(pb.OutcomeStatus.OUTCOME_STATUS_FAILED):
         raise ProofFailure("failure observation was not banked neutrally")
     if failed.get("execution_started") is not True or failed.get("result_digest") != "":
         raise ProofFailure("failure observation invented success or dropped execution_started")
     print("acceptance observation: ordinary Marco -> Polo attempt banked with exact closure")
+
+
+def _execution_evidence(path: Path) -> dict[str, Any]:
+    try:
+        kind, evidence = qualification.read(path.read_bytes())
+    except qualification.QualificationError as exc:
+        raise ProofFailure(f"execution qualification is invalid: {exc}") from exc
+    if kind != "execution":
+        raise ProofFailure(f"execution qualification has kind {kind!r}")
+    return evidence
 
 
 def _failure(root: Path) -> None:

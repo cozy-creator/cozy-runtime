@@ -1154,34 +1154,22 @@ def fence_descriptor_minimality() -> list[str]:
 #: they enter implementation/plan digests but are not documents.
 DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
-    "cozy.package.EntrypointBindingPlan/1": "internal/provisioned.py",
-    "cozy.package.ResolvedModelBinding/1": "internal/provisioned.py",
-    "cozy.pod-readiness/1": "internal/readiness.py",
-    "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
-    "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
-    "cozy.runtime.PackageOverlayContent/1": "internal/overlay.py",
-    "cozy.runtime.PackageOverlayReceipt/1": "internal/overlay.py",
-    "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
-    "cozy.runtime.ExecutionObservation/1": "internal/acceptance.py",
-    "cozy.runtime.ExecutionObservationRequest/1": "internal/acceptance.py",
-    "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
+    "cozy.runtime.EnvironmentReceipt/1": "internal/overlay.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
-    "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
-    "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
-    "cozy.runtime.NativeOperatorObservation/1": "internal/native_wheel.py",
-    "cozy.runtime.NativeHostQualification/1": "internal/native_wheel.py",
-    "cozy.runtime.NativeWheelProofRequest/1": "cli/native_wheel_proof.py",
-    "cozy.runtime.NativeWheelQualification/1": "cli/native_wheel_proof.py",
-    "cozy.runtime.NativeWheelInspection/1": "internal/native_wheel.py",
-    "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
+    "cozy.runtime.Qualification/1": "internal/qualification.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
+#: Tensorhub currently authors these two package-chain documents.  They disappear in the
+#: coordinated PackageRelease/PlacementSet hardcut; Runtime must not claim them as its formats.
+FOREIGN_DOCUMENT_KINDS = {
+    "cozy.package.EntrypointBindingPlan/1",
+    "cozy.package.ResolvedModelBinding/1",
+}
 #: Modules that name a registered kind without declaring it (a second reader is fine; a
 #: second DECLARATION is the drift this fence exists for).
 KIND_READERS = {
-    "cozy.package.EntrypointBindingPlan/1": {"internal/local.py"},
     "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
 }
 _VERSIONED_LITERAL_PATTERN = (
@@ -1223,7 +1211,11 @@ def fence_document_kinds() -> list[str]:
     """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
     bad: list[str] = []
     for path, rel, lineno, kind in versioned_literals():
-        if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in IMPLEMENTATION_IDS:
+        if (
+            kind.startswith(FOREIGN_KIND_PREFIXES)
+            or kind in FOREIGN_DOCUMENT_KINDS
+            or kind in IMPLEMENTATION_IDS
+        ):
             continue
         owner = DOCUMENT_KINDS.get(kind)
         if owner is None:

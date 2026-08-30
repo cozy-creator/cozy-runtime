@@ -655,7 +655,6 @@ def main() -> int:
         receipt = json.loads(payload)
         note(f"receipt published: {len(payload)} B, {len(receipt)} fields")
 
-        assert receipt["format"] == "cozy.pod-readiness/1"
         assert receipt["pod_boot_id"] == boot_id
         assert receipt["observed_record_owner_auth"] == {
             "control_public_key_ed25519_b64url": control_public_key_text,
@@ -841,7 +840,6 @@ def main() -> int:
             content_identity = json.dumps(
                 {
                     "base_family_digest": receipt_value["base_family_digest"],
-                    "format": "cozy.runtime.PackageOverlayContent/1",
                     "wheel_digests": sorted(
                         row["digest"] for row in receipt_value["overlay_wheels"]
                     ),

@@ -13,15 +13,15 @@ acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
   "accepted" never includes seconds of unjournaled preparation: the worker prepares
   first, journals second.
 
-The AttemptPlan is a canonical DOCUMENT (tfs-013's writer) so `plan_digest` on
-AttemptAccepted is an identity a RecordOwner can hold, and the summary beside it is the
-CLOSED observable projection — the RecordOwner sees what was chosen, not only that
-something was.
+The AttemptPlan is an in-process typed value. ``plan_digest`` is a domain-separated hash of its
+closed projection, while the typed protocol summary tells the RecordOwner what was chosen.  It is
+not a separately stored or version-negotiated document.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -131,7 +131,6 @@ class AttemptPlan:
 
     def document(self) -> dict[str, Any]:
         return {
-            "format": "cozy.runtime.AttemptPlan/1",
             "delivery": self.delivery,
             "materialization": self.materialization,
             "delivery_variant": self.delivery_variant,
@@ -153,7 +152,8 @@ class AttemptPlan:
         }
 
     def digest(self) -> str:
-        return canonical.digest(self.document())
+        encoded = canonical.write(self.document())
+        return "sha256:" + hashlib.sha256(b"cozy.runtime.attempt-plan\0" + encoded).hexdigest()
 
     @classmethod
     def for_job(cls, binding: JobBinding, caps: Mapping[str, int]) -> AttemptPlan:
@@ -161,8 +161,8 @@ class AttemptPlan:
 
         A job has no placement ladder to walk because it has no serving residency to trade
         against: it is one run-to-completion attempt that owns its devices for its whole
-        life. The document is still a real AttemptPlan so `plan_digest` on AttemptAccepted
-        stays an identity a RecordOwner can hold — the same fence, one lane over.
+        life. The plan still has a stable domain-separated digest on AttemptAccepted — the same
+        fence, one lane over — without pretending the private planner value is a file format.
         """
         return cls(
             delivery="job",

@@ -675,7 +675,6 @@ def main() -> int:
                     "environment_root": str(root / "native-custom-installed"),
                     "expected_result_digest": canonical.digest({"value": 3}),
                     "fixture": "proof_native_custom.fixture:run",
-                    "format": "cozy.runtime.NativeWheelProofRequest/1",
                     "installed_environment_receipt_digest": native_installed.receipt_digest,
                     "python": str(proof_python),
                     "wheelhouse_manifest": str(manifest),

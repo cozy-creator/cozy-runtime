@@ -35,9 +35,7 @@ from proof_data import write as _write
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
-RECEIPT_FORMAT = "cozy.runtime.PackageOverlayReceipt/1"
-CONTENT_FORMAT = "cozy.runtime.PackageOverlayContent/1"
+RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -486,7 +484,6 @@ def _request(
     value = {
         **release,
         "environment_root": environment_root.resolve(),
-        "format": REQUEST_FORMAT,
         "python": python.resolve(),
     }
     _json(root / f"request-{name}.json", value)
@@ -525,7 +522,6 @@ def _success(root: Path, name: str, receipt: bytes) -> dict[str, Any]:
     content = _canonical(
         {
             "base_family_digest": receipt_value.get("base_family_digest"),
-            "format": CONTENT_FORMAT,
             "wheel_digests": sorted(str(row.get("digest")) for row in wheel_rows),
         }
     )

@@ -90,10 +90,11 @@ R2 plan directly. No CA bypass, proxy certificate header, or endpoint-authentica
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
-boundary. `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
+boundary: PackageDescriptor, EnvironmentReceipt, ModelConstructionContract, and the discriminated
+Qualification document. `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
 implementation, plan, and generation digests; those names are executable identity, not document
-formats. Proof-local state and benchmark reports are typed by their command/path and carry no
-global format tag.
+formats. Command requests, planner values, journal rows, proof-local state, and benchmark reports
+are typed by their command/path or storage table and carry no global format tag.
 
 The worker never imports torch, and that is proved against the RUNNING process
 (`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
@@ -348,7 +349,6 @@ set is closed; every path value is a normalized absolute local path:
 
 ```json
 {
-  "format": "cozy.runtime.EnvironmentProofRequest/1",
   "package_environment_spec": "/proof/package-environment-spec.json",
   "package_bundle": "/proof/package-bundle.json",
   "resolved_wheel_set": "/proof/resolved-wheel-set.json",
@@ -366,7 +366,6 @@ and echoing one is not proof. Tensorhub joins Runtime's measured evidence to pro
 
 ```json
 {
-  "format": "cozy.runtime.NativeWheelProofRequest/1",
   "device_index": 0,
   "package_environment_spec_digest": "sha256:<64 lowercase hex>",
   "environment_root": "/proof/installed-environment",
@@ -383,16 +382,18 @@ CPython ABI, OS/CPU, glibc, complete installed distribution/version set, Torch r
 build. It requires both reports to be identical and to satisfy the exact WheelhouseManifest using
 minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM are measured through
 `nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
-immutable `NativeWheelQualification/1` output binds these measurements to the WHM, environment
-spec, installed receipt and overlay content digests, but carries no unmeasured realization claim.
+immutable `Qualification/1` output with `kind: "native-wheel"` binds these measurements to the
+WHM, environment spec, installed receipt and overlay content digests, but carries no unmeasured
+realization claim. Static inspection, host checks, and operator observations are nested evidence,
+not three additional document formats.
 
 `cozy-acceptance-proof` closes the remaining per-release admission sample without introducing a
 second executor. `fixture REQUEST.json PAYLOAD.json` derives a deterministic neutral payload from
 the exact descriptor; `observe REQUEST.json OBSERVATION.json` runs only after Tensorhub has sent
 that payload as an ordinary Worker attempt with `boot_warmup=false`. The observer re-joins the
 exact package execution, binding release, EES/PackageBundle/RWS/WHM/overlay receipt, placement,
-InvocationSpec, AttemptAccepted and AttemptOutcome and emits bounded canonical
-`cozy.runtime.ExecutionObservation/1`. It derives the canonical base-worker profile label and
+InvocationSpec, AttemptAccepted and AttemptOutcome and emits the bounded execution arm of
+`cozy.runtime.Qualification/1`. It derives the canonical base-worker profile label and
 requires the authenticated ClaimAck control-Runtime digest to equal the WHM's `cozy-runtime`
 WheelFact. All local documents must remain beneath one explicit `input_root`; environment and
 TensorFS stores are separately declared roots. A model-bound request must have the exact TensorFS
@@ -411,8 +412,8 @@ The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
 it verifies the overlay/base-family join, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
-offline construction sandbox. The fresh output directory appears atomically and contains
-`model-construction-proof.json` plus exact digest-named files under `contracts/`. Tensorhub
+offline construction sandbox. The fresh output directory appears atomically and contains the
+model arm in `qualification.json` plus exact digest-named files under `contracts/`. Tensorhub
 stores those bytes and refs; it never authors or reserializes an MCC.
 
 The request is a closed local process input. Every descriptor model path appears exactly
@@ -422,7 +423,6 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 
 ```json
 {
-  "format": "cozy.runtime.ModelConstructionProofRequest/1",
   "environment_generation": "/proof/environment/contents/<content-identity>",
   "environment_spec_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
