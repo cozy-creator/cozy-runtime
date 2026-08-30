@@ -193,6 +193,12 @@ the canonical descriptor bytes to stdout without modifying the project. Creator 
 bytes with the source release; Tensorhub independently derives the descriptor from the installed
 project wheel and compares it. `package_descriptor_digest` is SHA-256 over those canonical bytes.
 
+Runtime also owns the descriptor's semantic-version comparison. Tensorhub invokes the narrow
+process boundary below with two exact descriptors; it prints one compact JSON result whose
+classification is `patch`, `minor`, or `major`. It imports no package code and authors no document.
+
+    python -m cozy_runtime.cli.descriptor_compat previous.json candidate.json
+
 ## Commands
 
     uv sync
