@@ -94,7 +94,7 @@ class RuntimeConfig:
     rest of the config and projected across the executor seal by the worker."""
 
     record_owner_public_key: bytes = b""
-    """Raw Ed25519 key that verifies private-rental artifact delegations.
+    """Raw Ed25519 key that verifies private-rental Claim proofs.
 
     Empty on local/public workers. It never enters an executor environment.
     """
@@ -106,7 +106,7 @@ class WorkerHostConfig:
 
     Paths are image-contract constants from ``runtime-worker-host-paths.json`` rather than
     environment configuration. The readiness HMAC remains supervisor-only. Desired placements,
-    signed artifact intent, and attempts arrive after Claim over WorkerControl.
+    accepted placements and attempts arrive after Claim over WorkerControl.
     """
 
     worker_id: str
@@ -116,12 +116,12 @@ class WorkerHostConfig:
     control_public_key_ed25519_b64url: str
     media_token_sha256: tuple[str, ...]
     lease_expiry_unix: int
-    artifact_origin: WorkerArtifactOrigin
+    tensorhub_origin: TensorhubOrigin
     child_base_env: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerArtifactOrigin:
+class TensorhubOrigin:
     """One operator-owned HTTPS authority; TLS always terminates in Tensorhub."""
 
     value: str
@@ -129,14 +129,14 @@ class WorkerArtifactOrigin:
     port: int
 
 
-# The CLOSED non-HMAC child projection of PodEnvironmentContract/1. Unknown COZY_* names refuse;
-# provider/image inheritance is not a configuration channel.
+# The CLOSED non-HMAC host projection of PodEnvironmentContract/1. Unknown COZY_* and
+# TENSORHUB_* names refuse; provider/image inheritance is not a configuration channel.
 WORKER_HOST_ENV = {
     "COZY_WORKER_ID",
     "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WORKER_LEASE_EXPIRY_UNIX",
     "COZY_RECORD_OWNER_AUTH_JSON",
-    "COZY_WORKER_ARTIFACT_ORIGIN",
+    "TENSORHUB_ORIGIN",
     "COZY_WORKER_INTERNAL_PORT",
 }
 
@@ -175,7 +175,7 @@ _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 _ED25519_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
-def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
+def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
     """Refuse anything except canonical ``https://host[:port]``."""
 
     if (
@@ -185,8 +185,8 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
     ):
         raise ConfigError(
             "worker_host_config",
-            "COZY_WORKER_ARTIFACT_ORIGIN is not one bounded HTTPS origin",
-            "set the operator-owned Tensorhub worker API origin",
+            "TENSORHUB_ORIGIN is not one bounded HTTPS origin",
+            "set the Tensorhub API origin",
         )
     try:
         parsed = urlsplit(value)
@@ -194,8 +194,8 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
     except ValueError as exc:
         raise ConfigError(
             "worker_host_config",
-            "COZY_WORKER_ARTIFACT_ORIGIN has an invalid port",
-            "set the operator-owned Tensorhub worker API origin",
+            "TENSORHUB_ORIGIN has an invalid port",
+            "set the Tensorhub API origin",
         ) from exc
     explicit_port = ""
     has_explicit_port = False
@@ -222,10 +222,10 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
     ):
         raise ConfigError(
             "worker_host_config",
-            "COZY_WORKER_ARTIFACT_ORIGIN is not canonical https://host[:port]",
-            "set the operator-owned Tensorhub worker API origin",
+            "TENSORHUB_ORIGIN is not canonical https://host[:port]",
+            "set the Tensorhub API origin",
         )
-    return WorkerArtifactOrigin(value=value, host=parsed.hostname, port=port)
+    return TensorhubOrigin(value=value, host=parsed.hostname, port=port)
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -275,7 +275,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
 
 
 def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerHostConfig:
-    """Read the fixed product-host handoff once; admit no extra ``COZY_*`` name."""
+    """Read the fixed product-host handoff once; admit no extra product env name."""
 
     global _worker_host_read
     if _worker_host_read:
@@ -293,7 +293,10 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
             "execute the image-owned cozy-runtime-worker without source paths",
         )
     if unknown := sorted(
-        name for name in env if name.startswith("COZY_") and name not in WORKER_HOST_ENV
+        name
+        for name in env
+        if (name.startswith("COZY_") or name.startswith("TENSORHUB_"))
+        and name not in WORKER_HOST_ENV
     ):
         raise ConfigError(
             "worker_host_config",
@@ -390,7 +393,7 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
-        artifact_origin=parse_worker_artifact_origin(required("COZY_WORKER_ARTIFACT_ORIGIN")),
+        tensorhub_origin=parse_tensorhub_origin(required("TENSORHUB_ORIGIN")),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV

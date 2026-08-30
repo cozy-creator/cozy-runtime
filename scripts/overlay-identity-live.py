@@ -26,7 +26,7 @@ from cozy_runtime.internal import (
     native_wheel,
     overlay,
 )
-from cozy_runtime.internal.worker import acquire, artifact_access, child
+from cozy_runtime.internal.worker import acquire, child, downloads
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -180,7 +180,7 @@ def source(
 
 def acquirer(
     root: Path,
-    plan: artifact_access.ArtifactPlan,
+    plan: downloads.DownloadPlan,
     verified: acquire.VerifiedArtifactCache,
 ) -> acquire.Acquirer:
     return acquire.Acquirer(
@@ -955,15 +955,15 @@ def main() -> int:
         cached.write_bytes(project[1].read_bytes())
         cached.chmod(0o400)
         expires = int(time.time()) + 60
-        plan = artifact_access.ArtifactPlan(
+        plan = downloads.DownloadPlan(
             server_time_unix=int(time.time()),
             expires_at_unix=int(time.time()) + 60,
-            artifacts={
-                project[0].digest: artifact_access.PlanArtifact(
+            files={
+                project[0].digest: downloads.DownloadFile(
                     project[0].digest,
                     project[0].length,
                     "wheel",
-                    "https://artifacts.invalid/project.whl",
+                    "https://r2.invalid/project.whl",
                     expires,
                 )
             },
