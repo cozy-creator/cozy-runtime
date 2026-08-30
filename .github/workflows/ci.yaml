@@ -101,7 +101,7 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     env:
-      WORKER_PROTOCOL_SHA: b964911bbea880d90eee7e568e0b8c0e2aa73f21
+      WORKER_PROTOCOL_SHA: ec39ea28ddebd22ab7124e47132b1fb015b2a6fd
     steps:
       - uses: actions/checkout@v4
       # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and

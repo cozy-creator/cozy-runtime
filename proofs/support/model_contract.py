@@ -121,7 +121,7 @@ def _prepare(args: argparse.Namespace) -> None:
             "base_distributions": base_distributions,
             "base_import_roots": base_import_roots,
             "compatibility_profile": profile,
-            "format": "WheelhouseManifest/3",
+            "format": "WheelhouseManifest/1",
             "minimum_cuda_version": "none",
             "minimum_driver_version": "none",
             "platform_target": target,

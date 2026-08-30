@@ -1265,7 +1265,7 @@ class Worker:
         """ClaimAck + the one recovery snapshot, for a claim this worker can actually serve.
 
         `control_runtime_digest` is the exact image-owned cozy-runtime wheel fact from
-        WheelhouseManifest/3. OCI identity remains the provider-readback axis; neither is
+        WheelhouseManifest/1. OCI identity remains the provider-readback axis; neither is
         substituted for the other.
         """
         ack = pb.ClaimAck(
@@ -3550,7 +3550,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--control-runtime-digest",
         default="",
-        help="the exact image-owned cozy-runtime wheel digest from WheelhouseManifest/3; "
+        help="the exact image-owned cozy-runtime wheel digest from WheelhouseManifest/1; "
         "absent for native workers",
     )
     parser.add_argument("--git-commit", default="")

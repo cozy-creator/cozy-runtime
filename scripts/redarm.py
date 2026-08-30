@@ -95,6 +95,11 @@ STATIC_ARMS = (
     Arm("forbidden-dependency", SRC / "internal" / "config.py", "import varena\n"),
     Arm("forbidden-dependency", ROOT / "pyproject.toml", 'dependencies = ["tensorhub", '),
     Arm(
+        "document-kinds",
+        SRC / "protocol" / "documents.py",
+        "\n\ndef doc_format(full_name: str) -> str:\n    return f'{full_name}/2'\n",
+    ),
+    Arm(
         "typed-model-binding",
         ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml",
         '\nrepo = "legacy/model"\n',

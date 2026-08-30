@@ -597,11 +597,11 @@ class LocalRecordOwner:
             return directive
         # THE SET IS CONTENT-ADDRESSED, NOT ECHO-ADDRESSED (§4). The one-digester rule
         # (#454) is retired with the duplicate structured representation it needed: the
-        # RecordOwner authors the canonical `PlacementSet/3` document ONCE and sends its
+        # RecordOwner authors the canonical `PlacementSet/1` document ONCE and sends its
         # exact bytes, and the worker RECOMPUTES the digest before parsing a field. There is
         # no second place for the set to disagree with itself.
         if self.placement is None:
-            raise LocalBindingError("a serving run has no selected PlacementSet/3 placement")
+            raise LocalBindingError("a serving run has no selected PlacementSet/1 placement")
         placement_set = pb.PlacementSet(placements=[self.placement])
         canonical_bytes, set_digest = documents.identity(placement_set)
         self.placement_set_digest = set_digest
@@ -871,7 +871,7 @@ class LocalRecordOwner:
 def stage_weightless_release(
     cozy_home: Path, package_descriptor: Mapping[str, Any]
 ) -> StagedWeightlessRelease:
-    """Stage one exact model-free PlacementSet/3 for source-checkout development."""
+    """Stage one exact model-free PlacementSet/1 for source-checkout development."""
 
     release = weightless_release_documents(package_descriptor)
     home = cozy_home.resolve()

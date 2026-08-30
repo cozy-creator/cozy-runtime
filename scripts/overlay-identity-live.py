@@ -124,7 +124,7 @@ def base_manifest(path: Path) -> str:
                 "python_abi": "cp312",
                 "torch_release": "2.13.0",
             },
-            "format": "WheelhouseManifest/3",
+            "format": "WheelhouseManifest/1",
             "minimum_cuda_version": "none",
             "minimum_driver_version": "none",
             "platform_target": {

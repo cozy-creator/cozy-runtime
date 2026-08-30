@@ -527,7 +527,7 @@ def serving_directive(
 ) -> pb.DesiredWorkerState:
     """The full-replace DesiredWorkerState carrying a CONTENT-ADDRESSED DesiredPlacementSet.
 
-    The set travels as its exact canonical `PlacementSet/3` bytes plus their digest; the
+    The set travels as its exact canonical `PlacementSet/1` bytes plus their digest; the
     worker RECOMPUTES before it parses a field (§4). The duplicate structured form the
     frozen wire carried is deleted, so there is no second place for the set to disagree
     with itself.

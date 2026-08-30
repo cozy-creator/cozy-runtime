@@ -239,17 +239,16 @@ therefore installs only its deterministic project wheel and optional exact custo
 never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
 archives after extraction.
 
-The image's OCI digest owns image-resident integrity. `WheelhouseManifest/3` is the complete
+The image's OCI digest owns image-resident integrity. `WheelhouseManifest/1` is the complete
 canonical ownership document for that image: its existing platform target and exact control-wheel
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
-sorted unique import roots: the image rows in `WheelhouseManifest/3`, the project row in
-`PackageRelease/1`, and each selected overlay row embedded in `PlacementSet/3`. Runtime strictly parses those exact bytes, rejects
+sorted unique import roots: the image rows in `WheelhouseManifest/1`, the project row in
+`PackageRelease/1`, and each selected overlay row embedded in `PlacementSet/1`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
-There is no `/1` reader and no
-hardcoded protected-root list.
+There is no version-compatibility reader and no hardcoded protected-root list.
 
 Runtime hashes each arriving package wheel once. A worker-boot-local verified-file receipt binds
 its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
@@ -314,7 +313,7 @@ never enter an overlay receipt/content identity, and are never published as rele
 placement consumes this same overlay path; OCI provenance belongs to Tensorhub qualification
 evidence, while the portable receipt remains the exact WheelhouseManifest/project/custom-wheel join.
 
-On a remote placement, `PlacementSet/2` names one exact
+On a remote placement, `PlacementSet/1` names one exact
 `model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
 exact digest/length/HTTPS locations directly from Tensorhub over mTLS. The non-control
 convergence lane starts package and model acquisition together. As soon as package overlay and
