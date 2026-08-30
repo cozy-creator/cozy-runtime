@@ -178,7 +178,11 @@ _ED25519_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
 def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
     """Refuse anything except canonical ``https://host[:port]``."""
 
-    if value.strip() != value or len(value.encode()) > 512:
+    if (
+        value.strip() != value
+        or len(value.encode()) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise ConfigError(
             "worker_host_config",
             "COZY_WORKER_ARTIFACT_ORIGIN is not one bounded HTTPS origin",
@@ -193,6 +197,16 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
             "COZY_WORKER_ARTIFACT_ORIGIN has an invalid port",
             "set the operator-owned Tensorhub worker API origin",
         ) from exc
+    explicit_port = ""
+    has_explicit_port = False
+    if parsed.netloc.startswith("["):
+        closing = parsed.netloc.find("]")
+        if closing >= 0 and parsed.netloc[closing + 1 :].startswith(":"):
+            explicit_port = parsed.netloc[closing + 2 :]
+            has_explicit_port = True
+    elif ":" in parsed.netloc:
+        explicit_port = parsed.netloc.rsplit(":", 1)[1]
+        has_explicit_port = True
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -203,6 +217,7 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
         or parsed.fragment
         or parsed.netloc != parsed.netloc.lower()
         or value != f"https://{parsed.netloc}"
+        or (has_explicit_port and explicit_port != str(port))
         or not 1 <= port <= 65535
     ):
         raise ConfigError(
