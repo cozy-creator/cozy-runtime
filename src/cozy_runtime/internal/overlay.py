@@ -41,8 +41,7 @@ from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical, native_wheel
 
-RECEIPT_FORMAT = "cozy.runtime.PackageOverlayReceipt/1"
-CONTENT_FORMAT = "cozy.runtime.PackageOverlayContent/1"
+RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 CONTENT_IDENTITY_NAME = "package-overlay-content.json"
 WHEEL_EXTRACTION_COMPLETE = ".complete"
 OVERLAY_DIR = "site-packages"
@@ -373,20 +372,7 @@ def open_generation(
         raise OverlayRefusal("overlay_receipt_absent", str(exc)) from exc
     if _sha(receipt_bytes) != receipt_digest:
         raise OverlayRefusal("overlay_receipt_corrupt", str(receipt_path))
-    try:
-        value = canonical.parse_canonical(receipt_bytes)
-    except canonical.CanonicalError as exc:
-        raise OverlayRefusal("overlay_receipt_invalid", str(exc)) from exc
-    if not isinstance(value, dict) or set(value) != {
-        "base_family_digest",
-        "environment_spec_digest",
-        "format",
-        "overlay_wheels",
-        "project_wheel_digest",
-    }:
-        raise OverlayRefusal("overlay_receipt_invalid", "wrong fields")
-    if value.get("format") != RECEIPT_FORMAT:
-        raise OverlayRefusal("overlay_receipt_invalid", "wrong format")
+    value = parse_environment_receipt(receipt_bytes)
     if value.get("environment_spec_digest") != environment_spec_digest:
         raise OverlayRefusal("overlay_receipt_wrong_spec", environment_spec_digest)
     base_digest = value.get("base_family_digest")
@@ -433,6 +419,69 @@ def open_generation(
         content_digest=content_digest,
         reused=reused,
     )
+
+
+def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
+    """Read the one exact installed-environment observation."""
+
+    try:
+        value = canonical.parse_canonical(raw)
+    except canonical.CanonicalError as exc:
+        raise OverlayRefusal("overlay_receipt_invalid", str(exc)) from exc
+    fields = {
+        "base_family_digest",
+        "environment_spec_digest",
+        "format",
+        "overlay_wheels",
+        "project_wheel_digest",
+    }
+    if not isinstance(value, dict) or set(value) != fields or value.get("format") != RECEIPT_FORMAT:
+        raise OverlayRefusal("overlay_receipt_invalid", "wrong fields or format")
+    for field in ("base_family_digest", "environment_spec_digest", "project_wheel_digest"):
+        item = value.get(field)
+        if not isinstance(item, str):
+            raise OverlayRefusal("overlay_receipt_invalid", f"{field} is not a digest")
+        _require_digest(item, field)
+    rows = value.get("overlay_wheels")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 128:
+        raise OverlayRefusal("overlay_receipt_invalid", "overlay_wheels is empty or oversized")
+    distributions: list[str] = []
+    digests: set[str] = set()
+    projects = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {
+            "digest",
+            "distribution",
+            "owner",
+            "version",
+        }:
+            raise OverlayRefusal("overlay_receipt_invalid", f"overlay_wheels[{index}] fields")
+        digest = row.get("digest")
+        distribution = row.get("distribution")
+        owner = row.get("owner")
+        version = row.get("version")
+        if (
+            not isinstance(digest, str)
+            or _DIGEST.fullmatch(digest) is None
+            or digest in digests
+            or not isinstance(distribution, str)
+            or not normalized_distribution(distribution)
+            or not isinstance(version, str)
+            or not valid_wheel_version(version)
+            or owner not in {"custom", "project"}
+        ):
+            raise OverlayRefusal("overlay_receipt_invalid", f"overlay_wheels[{index}] values")
+        digests.add(digest)
+        distributions.append(distribution)
+        projects += owner == "project"
+    if distributions != sorted(set(distributions)) or projects != 1:
+        raise OverlayRefusal(
+            "overlay_receipt_invalid", "overlay wheels are not sorted unique with one project"
+        )
+    project_digest = value["project_wheel_digest"]
+    if not any(row["owner"] == "project" and row["digest"] == project_digest for row in rows):
+        raise OverlayRefusal("overlay_receipt_invalid", "project wheel digest is not the project")
+    return value
 
 
 def _read_base_manifest(path: Path, expected_digest: str) -> BaseManifest:
@@ -1246,7 +1295,6 @@ def _receipt(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
 def _content_identity(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
     return {
         "base_family_digest": source.base_family_digest,
-        "format": CONTENT_FORMAT,
         "wheel_digests": sorted(wheel.digest for wheel in wheels),
     }
 
@@ -1277,7 +1325,6 @@ def _content_identity_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]
     _require_digest(base, "base_family_digest")
     return {
         "base_family_digest": base,
-        "format": CONTENT_FORMAT,
         "wheel_digests": sorted(digests),
     }
 

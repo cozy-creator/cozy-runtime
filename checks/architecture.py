@@ -5,7 +5,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports · author-import-boundary · prelaunch-version
   env-authority · single-config · no-interactive · excluded-keywords
-  document-kinds · implementation-ids · report-format-tags
+  document-kinds · qualification-kinds · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
@@ -1154,34 +1154,22 @@ def fence_descriptor_minimality() -> list[str]:
 #: they enter implementation/plan digests but are not documents.
 DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
-    "cozy.package.EntrypointBindingPlan/1": "internal/provisioned.py",
-    "cozy.package.ResolvedModelBinding/1": "internal/provisioned.py",
-    "cozy.pod-readiness/1": "internal/readiness.py",
-    "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
-    "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
-    "cozy.runtime.PackageOverlayContent/1": "internal/overlay.py",
-    "cozy.runtime.PackageOverlayReceipt/1": "internal/overlay.py",
-    "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
-    "cozy.runtime.ExecutionObservation/1": "internal/acceptance.py",
-    "cozy.runtime.ExecutionObservationRequest/1": "internal/acceptance.py",
-    "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
+    "cozy.runtime.EnvironmentReceipt/1": "internal/overlay.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
-    "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
-    "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
-    "cozy.runtime.NativeOperatorObservation/1": "internal/native_wheel.py",
-    "cozy.runtime.NativeHostQualification/1": "internal/native_wheel.py",
-    "cozy.runtime.NativeWheelProofRequest/1": "cli/native_wheel_proof.py",
-    "cozy.runtime.NativeWheelQualification/1": "cli/native_wheel_proof.py",
-    "cozy.runtime.NativeWheelInspection/1": "internal/native_wheel.py",
-    "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
+    "cozy.runtime.Qualification/1": "qualification.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
+#: Tensorhub currently authors these two package-chain documents.  They disappear in the
+#: coordinated PackageRelease/PlacementSet hardcut; Runtime must not claim them as its formats.
+FOREIGN_DOCUMENT_KINDS = {
+    "cozy.package.EntrypointBindingPlan/1",
+    "cozy.package.ResolvedModelBinding/1",
+}
 #: Modules that name a registered kind without declaring it (a second reader is fine; a
 #: second DECLARATION is the drift this fence exists for).
 KIND_READERS = {
-    "cozy.package.EntrypointBindingPlan/1": {"internal/local.py"},
     "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
 }
 _VERSIONED_LITERAL_PATTERN = (
@@ -1222,8 +1210,23 @@ def versioned_literals() -> Iterator[tuple[pathlib.Path, str, int, str]]:
 def fence_document_kinds() -> list[str]:
     """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
     bad: list[str] = []
+    expected = {
+        "cozy.package.descriptor/1",
+        "cozy.runtime.EnvironmentReceipt/1",
+        "cozy.runtime.ModelConstructionContract/1",
+        "cozy.runtime.Qualification/1",
+    }
+    if set(DOCUMENT_KINDS) != expected:
+        bad.append(
+            "Runtime document survivors differ from the proto-007 hardcut: "
+            f"got={sorted(DOCUMENT_KINDS)} expected={sorted(expected)}"
+        )
     for path, rel, lineno, kind in versioned_literals():
-        if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in IMPLEMENTATION_IDS:
+        if (
+            kind.startswith(FOREIGN_KIND_PREFIXES)
+            or kind in FOREIGN_DOCUMENT_KINDS
+            or kind in IMPLEMENTATION_IDS
+        ):
             continue
         owner = DOCUMENT_KINDS.get(kind)
         if owner is None:
@@ -1237,6 +1240,53 @@ def fence_document_kinds() -> list[str]:
                 f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
                 f"{owner} — a second declaration of one kind"
             )
+    return bad
+
+
+def fence_qualification_kinds() -> list[str]:
+    """Every retained Qualification arm has one real producer, reader, and durable writer."""
+
+    roles = {
+        "execution": (
+            SRC / "internal" / "acceptance.py",
+            ROOT / "proofs" / "internal" / "acceptance_observation.py",
+            SRC / "cli" / "acceptance_proof.py",
+            "handle.write(body)",
+        ),
+        "model": (
+            SRC / "cli" / "model_contract_proof.py",
+            ROOT / "proofs" / "support" / "model_contract.py",
+            SRC / "cli" / "model_contract_proof.py",
+            "temporary / INDEX_NAME",
+        ),
+        "native-wheel": (
+            SRC / "cli" / "native_wheel_proof.py",
+            ROOT / "scripts" / "overlay-identity-live.py",
+            SRC / "cli" / "native_wheel_proof.py",
+            "_publish(evidence_path, payload)",
+        ),
+    }
+    bad: list[str] = []
+    qualification = (SRC / "qualification.py").read_text()
+    for kind, (producer, reader, storage, storage_marker) in roles.items():
+        if f'"{kind}": frozenset(' not in qualification:
+            bad.append(f"Qualification kind {kind!r} has no closed evidence field set")
+        if (
+            re.search(rf'qualification\.document\(\s*"{re.escape(kind)}"', producer.read_text())
+            is None
+        ):
+            bad.append(f"{producer.relative_to(ROOT)}: does not produce Qualification {kind!r}")
+        reader_source = reader.read_text()
+        if ".read(" not in reader_source or (
+            f'kind != "{kind}"' not in reader_source and f'kind == "{kind}"' not in reader_source
+        ):
+            bad.append(f"{reader.relative_to(ROOT)}: does not read Qualification {kind!r}")
+        if storage_marker not in storage.read_text():
+            bad.append(
+                f"{storage.relative_to(ROOT)}: does not durably publish Qualification {kind!r}"
+            )
+    if '"environment": frozenset(' in qualification:
+        bad.append("Qualification retains dead environment arm; EnvironmentReceipt is the proof")
     return bad
 
 
@@ -1555,6 +1605,7 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
+    "qualification-kinds": fence_qualification_kinds,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,
     "construction-fill-order": fence_construction_fill_order,

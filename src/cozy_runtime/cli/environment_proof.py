@@ -17,12 +17,10 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.refusal import LaunchRefusal
 
-REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 REQUEST_FIELDS = {
     "package_bundle",
     "package_environment_spec",
     "environment_root",
-    "format",
     "python",
     "resolved_wheel_set",
     "wheel_files",
@@ -150,14 +148,12 @@ def _read_request(path: Path) -> ProofRequest:
         raise CliError(
             "environment_proof_request_invalid",
             str(err),
-            f"provide one UTF-8 {REQUEST_FORMAT} object with no duplicate keys",
+            "provide one UTF-8 request object with no duplicate keys",
             Exit.validation,
         ) from err
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__
         raise _request_error(f"fields={fields} expected={sorted(REQUEST_FIELDS)}")
-    if value["format"] != REQUEST_FORMAT:
-        raise _request_error(f"format is {value['format']!r}")
     wheels = value["wheel_files"]
     if not isinstance(wheels, dict) or not wheels:
         raise _request_error("wheel_files is not a non-empty digest-to-path object")
@@ -184,7 +180,7 @@ def _request_error(detail: str) -> CliError:
     return CliError(
         "environment_proof_request_invalid",
         detail,
-        f"provide the closed {REQUEST_FORMAT} local-path request",
+        "provide the closed local-path request described by cozy-environment-proof --help",
         Exit.validation,
     )
 

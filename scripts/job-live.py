@@ -858,12 +858,22 @@ def section_identity() -> None:
         f"{len(cli_bytes)} B identical",
     )
     # The receipt the runtime MINTS is the receipt the CLI RENDERS. It was journaled before
-    # the terminal named it and then dropped from the document, so a producer could not read
+    # the terminal named it and then dropped from the journal record, so a producer could not read
     # its own publication from the verb that made it (job-001).
     receipt = document.get("publication") or {}
     check(
-        "`job --json` renders the typed publication receipt",
-        receipt.get("format") == "cozy.runtime.PublicationReceipt/1"
+        "`job --json` renders the typed publication record",
+        set(receipt)
+        == {
+            "attempt",
+            "build_id",
+            "grant_id",
+            "mode",
+            "outputs",
+            "request_id",
+            "subject_id",
+            "total_bytes",
+        }
         and receipt.get("mode") == "job"
         and bool(receipt.get("outputs")),
         f"{receipt.get('grant_id')} · {len(receipt.get('outputs') or [])} output(s) · "

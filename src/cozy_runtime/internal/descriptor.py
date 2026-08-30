@@ -6,6 +6,7 @@ Its one identity is SHA-256 over canonical JSON. Creator obtains those exact byt
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from typing import cast
@@ -208,7 +209,10 @@ def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
     for entry in jobs:
         assert isinstance(entry, dict)
         if entry["name"] == name:
-            return canonical.digest({"format": "cozy.runtime.JobDescriptor/1", **entry})
+            encoded = canonical.write(entry)
+            return (
+                "sha256:" + hashlib.sha256(b"cozy.runtime.job-descriptor\0" + encoded).hexdigest()
+            )
     raise ConformanceError(
         f"this release registers no job named {name!r}: it has "
         f"{', '.join(str(j['name']) for j in jobs if isinstance(j, dict)) or 'no jobs'}",

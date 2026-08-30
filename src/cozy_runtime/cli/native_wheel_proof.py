@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from cozy_runtime import qualification
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
     canonical,
@@ -24,15 +25,12 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.exits import Exit
 
-REQUEST_FORMAT = "cozy.runtime.NativeWheelProofRequest/1"
-EVIDENCE_FORMAT = "cozy.runtime.NativeWheelQualification/1"
 REQUEST_FIELDS = {
     "device_index",
     "package_environment_spec_digest",
     "environment_root",
     "expected_result_digest",
     "fixture",
-    "format",
     "installed_environment_receipt_digest",
     "python",
     "wheelhouse_manifest",
@@ -122,21 +120,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise native_wheel.NativeWheelRefusal(
                     "overlay_native_jit_cache_invalid", str(exc)
                 ) from exc
-        evidence = {
-            "base_worker_profile": _profile_id(base),
-            "package_environment_spec_digest": request.environment_spec_digest,
-            "format": EVIDENCE_FORMAT,
-            "host_capability": {
-                "gpu": gpu,
-                "seat": running_seat,
+        evidence = qualification.document(
+            "native-wheel",
+            {
+                "base_worker_profile": _profile_id(base),
+                "package_environment_spec_digest": request.environment_spec_digest,
+                "host_capability": {
+                    "gpu": gpu,
+                    "seat": running_seat,
+                },
+                "host_qualification": host,
+                "installed_environment_receipt_digest": request.installed_receipt_digest,
+                "operator_observation": operator,
+                "overlay_content_digest": installed.content_digest,
+                "static_inspection": inspection.document(),
+                "wheelhouse_manifest_digest": base_digest,
             },
-            "host_qualification": host,
-            "installed_environment_receipt_digest": request.installed_receipt_digest,
-            "operator_observation": operator,
-            "overlay_content_digest": installed.content_digest,
-            "static_inspection": inspection.document(),
-            "wheelhouse_manifest_digest": base_digest,
-        }
+        )
         payload = canonical.write(evidence)
         _publish(evidence_path, payload)
         print(
@@ -186,11 +186,11 @@ def _request(path: Path) -> Request:
         "expected_result_digest",
         "installed_environment_receipt_digest",
     )
-    if value["format"] != REQUEST_FORMAT or any(
+    if any(
         not isinstance(value[name], str) or canonical.DIGEST_RE.fullmatch(value[name]) is None
         for name in digests
     ):
-        raise _error("request format or digest")
+        raise _error("request digest")
     fixture = value["fixture"]
     device = value["device_index"]
     if (
@@ -297,6 +297,6 @@ def _error(detail: str, code: Exit = Exit.validation) -> CliError:
     return CliError(
         "native_wheel_proof_request_invalid",
         detail,
-        f"provide one closed {REQUEST_FORMAT} over an installed exact overlay",
+        "provide one closed cozy-native-wheel-proof request over an installed exact overlay",
         code,
     )

@@ -33,9 +33,6 @@ from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical
 
-EVIDENCE_FORMAT = "cozy.runtime.NativeWheelInspection/1"
-HOST_EVIDENCE_FORMAT = "cozy.runtime.NativeHostQualification/1"
-OPERATOR_EVIDENCE_FORMAT = "cozy.runtime.NativeOperatorObservation/1"
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
 MAX_STRING_TABLE_BYTES = 64 << 20
@@ -125,7 +122,6 @@ class Inspection:
 
     def document(self) -> dict[str, object]:
         return {
-            "format": EVIDENCE_FORMAT,
             "members": [
                 {
                     "cubin_sms": list(item.cubin_sms),
@@ -500,7 +496,6 @@ def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, obj
                 f"sm_{gpu_sm}: no matching cubin or forward PTX in {','.join(unsupported)}",
             )
     return {
-        "format": HOST_EVIDENCE_FORMAT,
         "gpu_sm": gpu_sm,
         "host_library_count": len(visited),
         "inspection_digest": canonical.digest(inspection.document()),
@@ -735,7 +730,6 @@ def qualify_operator(
     return {
         "expected_result_digest": expected_result_digest,
         "fixture": fixture,
-        "format": OPERATOR_EVIDENCE_FORMAT,
         "result_digest": result_digest,
     }
 

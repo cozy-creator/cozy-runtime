@@ -264,7 +264,7 @@ class AttemptRecord:
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
-    #: cr-009's PublicationReceipt document, once the output transaction committed one
+    #: cr-009's typed publication record, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     def begin_reclaim(self) -> bool:

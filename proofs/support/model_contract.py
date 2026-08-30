@@ -28,11 +28,10 @@ from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
 
+from cozy_runtime import qualification as runtime_qualification
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-ENVIRONMENT_REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
-MODEL_REQUEST_FORMAT = "cozy.runtime.ModelConstructionProofRequest/1"
 _STATE_FIELDS = {
     "config",
     "config_digest",
@@ -193,7 +192,6 @@ def _prepare(args: argparse.Namespace) -> None:
     wheel_files = {project.digest: str(package_path)}
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
-        "format": ENVIRONMENT_REQUEST_FORMAT,
         "python": str(args.python.resolve()),
         "wheel_files": wheel_files,
     }
@@ -245,7 +243,6 @@ def _write_model_request(root: Path, name: str) -> None:
             "package_release_id": "proof-release",
             "environment_generation": environment["generation"],
             "environment_spec_digest": state["environment_spec_digest"],
-            "format": MODEL_REQUEST_FORMAT,
             "installed_environment_receipt": {
                 "digest": _digest(receipt),
                 "length": len(receipt),
@@ -281,13 +278,11 @@ def _verify(root: Path) -> None:
         observations[0]["digest"] == observations[1]["digest"],
         "cold and rebuild model-contract observation digests differ",
     )
-    index = _parse_canonical(outputs[0]["model-construction-proof.json"])
-    if not isinstance(index, dict):
-        raise ProofFailure("model-construction proof index is not an object")
-    _require(
-        index["format"] == "cozy.runtime.ModelConstructionProof/1",
-        "model-construction proof index has the wrong format",
-    )
+    try:
+        kind, index = runtime_qualification.read(outputs[0]["qualification.json"])
+    except runtime_qualification.QualificationError as exc:
+        raise ProofFailure(f"model qualification is invalid: {exc}") from exc
+    _require(kind == "model", f"model qualification has kind {kind!r}")
     names = [row["name"] for row in index["functions"]]
     _require(names == ["metadata", "render"], f"unexpected visible functions: {names!r}")
     _require(index["functions"][0]["bindings"] == [], "metadata unexpectedly has a binding")

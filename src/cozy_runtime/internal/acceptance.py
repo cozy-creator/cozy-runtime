@@ -3,7 +3,7 @@
 Tensorhub dispatches the sample through the ordinary Worker protocol.  This module does not
 launch, prepare, fill, invoke, encode, upload, or decide admission.  It derives the one
 deterministic descriptor fixture and, after the ordinary AttemptAccepted/AttemptOutcome exchange,
-joins the exact provisioned closure into a bounded canonical ``ExecutionObservation``.
+joins the exact provisioned closure into the execution arm of one bounded ``Qualification``.
 
 The RecordOwner remains responsible for aborting qualification outputs and for authoring the
 ``ModelAdmissionDecision``.  Runtime cannot observe either act and does not echo them as facts.
@@ -25,6 +25,7 @@ from typing import Any, cast
 
 from google.protobuf.json_format import ParseDict, ParseError
 
+from cozy_runtime import qualification
 from cozy_runtime.internal import canonical, descriptor, overlay, provisioned, warm
 from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.refusal import LaunchRefusal
@@ -33,9 +34,6 @@ from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-FIXTURE_REQUEST_FORMAT = "cozy.runtime.AcceptanceFixtureRequest/1"
-OBSERVATION_REQUEST_FORMAT = "cozy.runtime.ExecutionObservationRequest/1"
-OBSERVATION_FORMAT = "cozy.runtime.ExecutionObservation/1"
 MAX_OBSERVATION_BYTES = 1 << 20
 MAX_STRING = 256
 
@@ -49,7 +47,7 @@ _BINDING_KINDS = frozenset(
         "model_config",
     }
 )
-_FIXTURE_FIELDS = frozenset({"package_descriptor", "entrypoint", "format", "input_root"})
+_FIXTURE_FIELDS = frozenset({"package_descriptor", "entrypoint", "input_root"})
 _OBSERVATION_FIELDS = frozenset(
     {
         "accelerator_qualification",
@@ -67,7 +65,6 @@ _OBSERVATION_FIELDS = frozenset(
         "entrypoint",
         "environment_root",
         "fixture_payload",
-        "format",
         "invocation_spec",
         "installed_environment_receipt",
         "input_root",
@@ -115,7 +112,7 @@ class _Environment:
 def fixture_request(raw: bytes) -> bytes:
     """Derive the exact neutral payload Tensorhub dispatches as an ordinary attempt."""
 
-    request = _request(raw, FIXTURE_REQUEST_FORMAT, _FIXTURE_FIELDS)
+    request = _request(raw, _FIXTURE_FIELDS)
     input_root = _directory(request["input_root"], "input_root")
     descriptor_doc = _local_document(
         request["package_descriptor"], "package_descriptor", input_root
@@ -127,7 +124,7 @@ def fixture_request(raw: bytes) -> bytes:
 def execution_observation(raw: bytes) -> bytes:
     """Validate one ordinary attempt and author its canonical Runtime observation."""
 
-    request = _request(raw, OBSERVATION_REQUEST_FORMAT, _OBSERVATION_FIELDS)
+    request = _request(raw, _OBSERVATION_FIELDS)
     entrypoint = _identifier(request["entrypoint"], "entrypoint")
     input_root = _directory(request["input_root"], "input_root")
     documents_by_name = {
@@ -252,7 +249,6 @@ def execution_observation(raw: bytes) -> bytes:
         "entrypoint": entrypoint,
         "environment_spec_digest": documents_by_name["package_environment_spec"].digest,
         "execution_started": bool(outcome.get("execution_started", False)),
-        "format": OBSERVATION_FORMAT,
         "installed_environment_receipt_digest": environment.installed.receipt_digest,
         "invocation_spec_digest": documents_by_name["invocation_spec"].digest,
         "logical_model_digest": logical_model_digest,
@@ -267,7 +263,7 @@ def execution_observation(raw: bytes) -> bytes:
         "status": int(outcome.get("status", 0)),
         "worker_resources": resources,
     }
-    encoded = canonical.write(observation)
+    encoded = canonical.write(qualification.document("execution", observation))
     if len(encoded) > MAX_OBSERVATION_BYTES:
         raise AcceptanceRefusal(
             "execution_observation_oversized",
@@ -276,7 +272,7 @@ def execution_observation(raw: bytes) -> bytes:
     return encoded
 
 
-def _request(raw: bytes, wanted_format: str, fields: frozenset[str]) -> dict[str, Any]:
+def _request(raw: bytes, fields: frozenset[str]) -> dict[str, Any]:
     try:
         value = canonical.parse(raw)
     except canonical.CanonicalError as exc:
@@ -285,10 +281,6 @@ def _request(raw: bytes, wanted_format: str, fields: frozenset[str]) -> dict[str
         got = sorted(value) if isinstance(value, dict) else type(value).__name__
         raise AcceptanceRefusal(
             "acceptance_request_invalid", f"fields={got} expected={sorted(fields)}"
-        )
-    if value.get("format") != wanted_format:
-        raise AcceptanceRefusal(
-            "acceptance_request_invalid", f"format={value.get('format')!r} expected={wanted_format}"
         )
     return value
 
@@ -332,22 +324,11 @@ def _environment(documents_by_name: Mapping[str, LocalDocument], root: Path) -> 
         raise AcceptanceRefusal(
             "installed_environment_receipt_mismatch", "binding release names another receipt"
         )
-    receipt_value = _canonical_object(receipt_doc.raw, "installed_environment_receipt")
-    if (
-        set(receipt_value)
-        != {
-            "base_family_digest",
-            "environment_spec_digest",
-            "format",
-            "overlay_wheels",
-            "project_wheel_digest",
-        }
-        or receipt_value.get("format") != overlay.RECEIPT_FORMAT
-    ):
-        raise AcceptanceRefusal("installed_environment_receipt_invalid", "wrong fields or format")
-    rows = receipt_value.get("overlay_wheels")
-    if not isinstance(rows, list) or not rows:
-        raise AcceptanceRefusal("installed_environment_receipt_invalid", "overlay_wheels is empty")
+    try:
+        receipt_value = overlay.parse_environment_receipt(receipt_doc.raw)
+    except overlay.OverlayRefusal as exc:
+        raise AcceptanceRefusal("installed_environment_receipt_invalid", exc.detail) from exc
+    rows = receipt_value["overlay_wheels"]
     wheel_paths: dict[str, Path] = {}
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or not isinstance(row.get("digest"), str):

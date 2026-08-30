@@ -1,4 +1,4 @@
-"""Measured PodReadinessReceipt/1 facts for the fixed Runtime worker."""
+"""Measured bootstrap-readiness facts for the fixed Runtime worker."""
 
 from __future__ import annotations
 
@@ -236,7 +236,7 @@ def receipt_payload(
     media_internal_port: int,
     gpus: list[RuntimeGPU],
 ) -> bytes:
-    """The PodReadinessReceipt/1 payload: everything the pod MEASURED about itself.
+    """The bootstrap payload: everything the pod MEASURED about itself.
 
     Six fields went with cr-048 —
     `provision_spec_digest`, `provision_bundle_digest`,
@@ -263,13 +263,12 @@ def receipt_payload(
     Protocol identity is the package major plus the additive minor exchanged on the control
     stream. Exact generated-binding provenance belongs to the build and CI, not a pod receipt.
 
-    The format tag stays `cozy.pod-readiness/1`: the bootstrap's HMAC domain separator
-    spells it, the bootstrap treats these bytes as opaque, and nothing has ever booted.
+    The one-shot HMAC envelope and the fixed bootstrap route already identify this payload;
+    embedding a second version tag in the authenticated bytes created another schema authority.
     """
 
     return canonical.write(
         {
-            "format": "cozy.pod-readiness/1",
             "media_foreign_credential_refused": True,
             "media_internal_port": media_internal_port,
             "media_listener_bound": True,

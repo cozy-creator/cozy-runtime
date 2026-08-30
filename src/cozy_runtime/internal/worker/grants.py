@@ -668,9 +668,9 @@ def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str
 
 @dataclass(frozen=True, slots=True)
 class PublicationReceipt:
-    """ONE canonical bundle snapshot per publication (cr-009).
+    """ONE typed journal record per publication (cr-009).
 
-    What an attempt actually wrote, as a document with its own identity: the scope it wrote
+    What an attempt actually wrote, as a closed record with its own identity: the scope it wrote
     under, whose build wrote it, which attempt, and every entry with its digest and length.
     A RecordOwner validates it by recomputing this document from what it already holds —
     the publication contract it minted and the manifest on the terminal — and roots and
@@ -698,7 +698,6 @@ class PublicationReceipt:
     def document(self) -> dict[str, Any]:
         rows = sorted(self.outputs, key=lambda entry: entry.output_id)
         return {
-            "format": "cozy.runtime.PublicationReceipt/1",
             "mode": self.mode,
             "grant_id": self.grant_id,
             "build_id": self.build_id,
@@ -720,7 +719,10 @@ class PublicationReceipt:
     def digest(self) -> str:
         from cozy_runtime.internal import canonical
 
-        return canonical.digest(self.document())
+        encoded = canonical.write(self.document())
+        return (
+            "sha256:" + hashlib.sha256(b"cozy.runtime.publication-receipt\0" + encoded).hexdigest()
+        )
 
 
 def write_output(

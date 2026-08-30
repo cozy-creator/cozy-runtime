@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime import qualification
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import canonical, contract, overlay, sandbox
@@ -33,9 +34,7 @@ from cozy_runtime.internal.descriptor import StalePackageDescriptor
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.exits import Exit
 
-REQUEST_FORMAT = "cozy.runtime.ModelConstructionProofRequest/1"
-INDEX_FORMAT = "cozy.runtime.ModelConstructionProof/1"
-INDEX_NAME = "model-construction-proof.json"
+INDEX_NAME = "qualification.json"
 CONTRACTS_DIR = "contracts"
 RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
 MEMORY_CAP_BYTES = 24 << 30
@@ -49,7 +48,6 @@ REQUEST_FIELDS = {
     "package_release_id",
     "environment_generation",
     "environment_spec_digest",
-    "format",
     "installed_environment_receipt",
     "project_wheel_digest",
     "wheelhouse_manifest",
@@ -203,8 +201,6 @@ def _read_request(path: Path) -> ProofRequest:
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__
         raise _request_error(f"fields={fields} expected={sorted(REQUEST_FIELDS)}")
-    if value["format"] != REQUEST_FORMAT:
-        raise _request_error(f"format is {value['format']!r}")
     bindings_value = value["bindings"]
     if not isinstance(bindings_value, list):
         raise _request_error("bindings is not an array")
@@ -291,7 +287,7 @@ def _request_error(detail: str) -> CliError:
     return CliError(
         "model_contract_proof_request_invalid",
         detail,
-        f"provide one closed {REQUEST_FORMAT} request",
+        "provide one closed cozy-model-contract-proof request",
         Exit.validation,
     )
 
@@ -732,19 +728,18 @@ def _decode_child(
     functions = response["functions"]
     if not isinstance(functions, list):
         raise ProofRefusal("model_contract_child_invalid", "functions is not an array")
-    index = {
+    evidence = {
         "application": response["application"],
         "package_descriptor": DocumentRef(
             request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
         "package_release_id": request.package_release_id,
         "environment_spec_digest": request.environment_spec_digest,
-        "format": INDEX_FORMAT,
         "functions": functions,
         "installed_environment_receipt": request.installed_environment_receipt.render(),
         "project_wheel_digest": request.project_wheel_digest,
     }
-    return index, documents
+    return qualification.document("model", evidence), documents
 
 
 def _publish(output: Path, index: bytes, documents: Mapping[str, bytes]) -> None:
