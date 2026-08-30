@@ -45,7 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from cozy_runtime.internal import canonical, descriptor, provisioned
+from cozy_runtime import qualification
+from cozy_runtime.internal import canonical, descriptor, overlay
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -73,58 +74,38 @@ GRANT_TAIL_SECONDS = 300
 
 
 class LocalBindingError(Exception):
-    """The request names an entrypoint this run staged no binding plan for."""
+    """The request names an entrypoint this run staged no binding for."""
 
 
 @dataclass(frozen=True, slots=True)
 class StagedWeightlessRelease:
-    """The complete local form of one canonical, model-free serving closure."""
+    """One exact model-free PlacementSet selection for source-checkout development."""
 
-    plans: Mapping[str, str]
-    plan_refs: Mapping[str, tuple[str, int]]
-    descriptor: Path
+    bindings: Mapping[str, str]
+    placement: pb.Placement
     artifact_store: Path
-    artifact_object_set: Path
-
-
-@dataclass(frozen=True, slots=True)
-class LocalPlacementFacts:
-    """Exact qualified release facts for a production-shaped local protocol run.
-
-    This changes only what the local RecordOwner puts in the ordinary Placement and
-    InvocationSpec.  The same worker convergence, executor and attempt path consume it.
-    """
-
-    environment_spec_digest: str
-    installed_environment_receipt_digest: str
-    package_descriptor_digest: str
-    environment_root: Path
-    wheelhouse_manifest: Path
+    artifact_cache: Path
 
 
 @dataclass(frozen=True, slots=True)
 class WeightlessReleaseDocuments:
-    """Exact bytes behind both local staging and pre-spawn subject resolution."""
+    """Exact bytes and Placement behind local source-checkout execution."""
 
     descriptor: bytes
-    plans: Mapping[str, bytes]
-    artifact_object_set: bytes
+    package_release: bytes
+    environment_receipt: bytes
+    qualification: bytes
+    wheelhouse_manifest: bytes
+    placement: pb.Placement
 
     def subjects(self) -> tuple[dict[str, Any], ...]:
-        rows: list[dict[str, Any]] = []
-        for entrypoint, raw in sorted(self.plans.items()):
-            ref = _exact_ref(raw)
-            digest = str(ref["digest"])
-            rows.append(
-                {
-                    "entrypoint": entrypoint,
-                    "subject_id": digest,
-                    "kind": "plan",
-                    "digest": digest,
-                    "length": int(ref["length"]),
-                }
-            )
-        return tuple(rows)
+        return tuple(
+            {
+                "entrypoint": entrypoint.name,
+                "digest": documents.spell(entrypoint.entrypoint_binding_digest),
+            }
+            for entrypoint in self.placement.entrypoints
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,25 +264,21 @@ class LocalRecordOwner:
         self,
         request: LocalRequest,
         bindings: dict[str, str],
-        plan_refs: dict[str, tuple[str, int]],
         workspace: Path,
         *,
         release_id: str,
-        placement_facts: LocalPlacementFacts | None = None,
-        model_object_set: bytes = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}',
+        placement: pb.Placement | None = None,
         auto_ack: bool = True,
         on_progress: Any = None,
         ready_timeout: float = 1800.0,
     ) -> None:
         self.request = request
-        self.bindings = bindings  # entrypoint -> entrypoint_binding_plan_id
-        self.plan_refs = plan_refs
+        self.bindings = bindings  # entrypoint -> entrypoint_binding_digest
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
         self.release_id = release_id
-        self.placement_facts = placement_facts
-        self.model_object_set = model_object_set
+        self.placement = placement
         self.auto_ack = auto_ack
         self.ready_timeout = ready_timeout
         self.ended = "unstarted"
@@ -505,8 +482,8 @@ class LocalRecordOwner:
         )
         self._send(pb.RecordOwnerFrame(desired_state=self._desired_state()))
 
-    def _plan_id(self) -> str:
-        """The binding plan this request runs against, or the typed refusal that it has none.
+    def _binding_digest(self) -> str:
+        """The selected binding this request runs against, or a typed refusal.
 
         A request naming an entrypoint no binding plan covers is an ORDINARY RecordOwner
         condition — a stale install, a renamed function, a `--model` for the wrong slot —
@@ -514,18 +491,17 @@ class LocalRecordOwner:
         which #306 already showed turns a one-line condition into a run that ends with no
         terminal at all.
         """
-        plan_id = self.bindings.get(self.request.entrypoint)
-        if plan_id is None:
+        binding_digest = self.bindings.get(self.request.entrypoint)
+        if binding_digest is None:
             known = ", ".join(sorted(self.bindings)) or "no entrypoints"
             raise LocalBindingError(
-                f"no binding plan covers {self.request.entrypoint!r}: this run staged "
-                f"plans for {known}"
+                f"no binding covers {self.request.entrypoint!r}: this run selected {known}"
             )
-        return plan_id
+        return binding_digest
 
     def _on_observed_state(self, report: pb.ObservedWorkerState) -> None:
         """DISPATCHABILITY is learned from the worker's own durable ObservedWorkerState: the
-        placement's SERVING axis plus `dispatchable_plan_ids` in serving mode, job capacity
+        placement's SERVING axis plus `dispatchable_binding_digests` in serving mode, job capacity
         in job mode — and, in BOTH, the one worker-level admission fence (§6). The owner
         dispatches against the generation it last saw, and echoes it on the offer."""
         self.reports.append(report)
@@ -546,13 +522,13 @@ class LocalRecordOwner:
         if self.request.kind == "job":
             ready = open_window and report.job_capacity.jobs_available > 0
         else:
-            plan_id = self._plan_id()
+            binding_digest = documents.raw(self._binding_digest())
             status = next((d for d in report.placements if d.placement_id == LOCAL_PLACEMENT), None)
             ready = (
                 status is not None
                 and open_window
                 and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
-                and plan_id in status.dispatchable_plan_ids
+                and binding_digest in status.dispatchable_binding_digests
             )
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
@@ -621,50 +597,12 @@ class LocalRecordOwner:
             return directive
         # THE SET IS CONTENT-ADDRESSED, NOT ECHO-ADDRESSED (§4). The one-digester rule
         # (#454) is retired with the duplicate structured representation it needed: the
-        # RecordOwner authors the canonical `PlacementSet/2` document ONCE and sends its
+        # RecordOwner authors the canonical `PlacementSet/3` document ONCE and sends its
         # exact bytes, and the worker RECOMPUTES the digest before parsing a field. There is
         # no second place for the set to disagree with itself.
-        object_set_ref = _exact_ref(self.model_object_set)
-        object_set_digest = str(object_set_ref["digest"])
-        placement_set = pb.PlacementSet(
-            placements=[
-                pb.Placement(
-                    placement_id=LOCAL_PLACEMENT,
-                    # PROVENANCE only — the worker never resolves it (§1).
-                    package_release_id=self.release_id,
-                    environment_spec_digest=(
-                        documents.raw(self.placement_facts.environment_spec_digest)
-                        if self.placement_facts is not None
-                        else b""
-                    ),
-                    installed_environment_receipt_digest=(
-                        documents.raw(self.placement_facts.installed_environment_receipt_digest)
-                        if self.placement_facts is not None
-                        else b""
-                    ),
-                    package_descriptor_digest=(
-                        documents.raw(self.placement_facts.package_descriptor_digest)
-                        if self.placement_facts is not None
-                        else b""
-                    ),
-                    binding_plans=[
-                        pb.ArtifactSubject(
-                            subject_id=plan_id,
-                            kind="plan",
-                            digest=documents.raw(self.plan_refs[plan_id][0]),
-                            length=self.plan_refs[plan_id][1],
-                        )
-                        for plan_id in sorted(set(self.bindings.values()))
-                    ],
-                    model_object_set=pb.ArtifactSubject(
-                        subject_id=object_set_digest,
-                        kind="model_object_set",
-                        digest=documents.raw(object_set_digest),
-                        length=len(self.model_object_set),
-                    ),
-                )
-            ]
-        )
+        if self.placement is None:
+            raise LocalBindingError("a serving run has no selected PlacementSet/3 placement")
+        placement_set = pb.PlacementSet(placements=[self.placement])
         canonical_bytes, set_digest = documents.identity(placement_set)
         self.placement_set_digest = set_digest
         self.placement_set_canonical_bytes = canonical_bytes
@@ -739,7 +677,7 @@ class LocalRecordOwner:
         ]
 
     def _dispatch(self) -> None:
-        plan_id = "" if self.request.kind == "job" else self._plan_id()
+        binding_digest = "" if self.request.kind == "job" else self._binding_digest()
         self.grant_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # Invocation payload identity is the exact canonical typed-argument document. A
@@ -747,9 +685,9 @@ class LocalRecordOwner:
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
             package_release_id=self.release_id,
-            environment_spec_digest=(
-                self.placement_facts.environment_spec_digest
-                if self.placement_facts is not None
+            environment_digest=(
+                documents.spell(self.placement.environment_digest)
+                if self.placement is not None
                 else ""
             ),
             config_digest="",
@@ -772,8 +710,8 @@ class LocalRecordOwner:
                 )
             )
         else:
-            spec.serving.entrypoint_binding_plan_id = plan_id
-            spec.serving.attempt_binding_id = plan_id
+            spec.serving.entrypoint_binding_digest = binding_digest
+            spec.serving.attempt_binding_id = binding_digest
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
         self.spec_canonical_bytes = canonical_bytes
@@ -933,60 +871,32 @@ class LocalRecordOwner:
 def stage_weightless_release(
     cozy_home: Path, package_descriptor: Mapping[str, Any]
 ) -> StagedWeightlessRelease:
-    """Stage the ONE canonical local closure for a wholly weightless release.
+    """Stage one exact model-free PlacementSet/3 for source-checkout development."""
 
-    Tensorhub authors these exact Plan and model-root documents for a provisioned package
-    release. A local weightless run has no model root and nothing to fetch, but it still
-    owes the worker the same stored-byte identities and complete visible-entrypoint set.
-    This constructor is shared by the one-shot runner and process-launch acceptance paths;
-    neither may revive the retired flat binding record.
-    """
-
-    documents = weightless_release_documents(package_descriptor)
+    release = weightless_release_documents(package_descriptor)
     home = cozy_home.resolve()
-    documents_root = home / "binding-documents"
-    plans_root = home / "binding-plans"
-    object_sets_root = home / "artifact-object-sets"
+    cache = home / "artifact-cache"
     artifact_store = home / "store"
     artifact_store.mkdir(parents=True, exist_ok=True)
-
-    _, descriptor_path = _stage_exact(documents_root, documents.descriptor)
-    plans: dict[str, str] = {}
-    plan_refs: dict[str, tuple[str, int]] = {}
-    plan_documents: dict[str, provisioned.ExactDocument] = {}
-    for entrypoint, plan_bytes in sorted(documents.plans.items()):
-        plan_ref, plan_path = _stage_exact(plans_root, plan_bytes)
-        plan_id = str(plan_ref["digest"])
-        length = int(plan_ref["length"])
-        plans[entrypoint] = plan_id
-        plan_refs[plan_id] = (plan_id, length)
-        plan_documents[plan_id] = provisioned.ExactDocument(
-            provisioned.ArtifactRef(plan_id, length), plan_path, plan_bytes
-        )
-
-    _, artifact_object_set = _stage_exact(object_sets_root, documents.artifact_object_set)
-
-    # Exercise the same closed reader the worker will use after its process boundary. This
-    # proves the local writer produced no private dialect before a caller tries to launch it.
-    selected = provisioned.read_provisioned_release(
-        plan_documents,
-        read_document=provisioned.staged_document_reader(documents_root),
-        package_release="local-weightless",
-        store_root=artifact_store,
-        object_set=provisioned.read_artifact_object_set(documents.artifact_object_set),
-        dtype_widths={},
-    )
-    if set(selected.bindings) != set(plan_refs):
-        raise RuntimeError("the staged local binding set did not survive canonical validation")
-    return StagedWeightlessRelease(
-        plans, plan_refs, descriptor_path, artifact_store, artifact_object_set
-    )
+    for raw in (
+        release.descriptor,
+        release.package_release,
+        release.environment_receipt,
+        release.qualification,
+        release.wheelhouse_manifest,
+    ):
+        _stage_exact(cache, raw)
+    bindings = {
+        entrypoint.name: documents.spell(entrypoint.entrypoint_binding_digest)
+        for entrypoint in release.placement.entrypoints
+    }
+    return StagedWeightlessRelease(bindings, release.placement, artifact_store, cache)
 
 
 def weightless_release_documents(
     package_descriptor: Mapping[str, Any],
 ) -> WeightlessReleaseDocuments:
-    """Construct the exact local weightless documents without choosing storage paths."""
+    """Construct the exact local model-free selection without choosing storage paths."""
 
     entries = package_descriptor.get("entrypoints")
     if not isinstance(entries, list):
@@ -1002,26 +912,100 @@ def weightless_release_documents(
 
     descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
-    plans: dict[str, bytes] = {}
-    for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
-        entrypoint = str(entry.get("name", ""))
-        plan_bytes = canonical.write(
-            {
-                "bindings": [],
-                "package_descriptor": descriptor_ref,
-                "entrypoint": entrypoint,
-                "format": "cozy.package.EntrypointBindingPlan/1",
-            }
-        )
-        plans[entrypoint] = plan_bytes
-
-    object_set_bytes = canonical.write(
+    source_manifest = canonical.write(
+        {"entries": [{"blob": descriptor_ref, "kind": "file", "path": "package.descriptor.json"}]}
+    )
+    source_ref = _exact_ref(source_manifest)
+    project_wheel = b"source-checkout development wheel placeholder"
+    project_ref = _exact_ref(project_wheel)
+    package_release = canonical.write(
         {
-            "kind": provisioned.ARTIFACT_OBJECT_SET_KIND,
-            "roots": [],
+            "dependency_wheels": [],
+            "format": "cozy.package.release/1",
+            "project_wheel": {
+                "ref": project_ref,
+                "distribution": "development-package",
+                "filename": "development_package-0-py3-none-any.whl",
+                "import_roots": [],
+                "tags": ["py3-none-any"],
+                "version": "0",
+            },
+            "requires_python": ">=3.11",
+            "requirements": [],
+            "source_manifest": source_ref,
         }
     )
-    return WeightlessReleaseDocuments(descriptor_bytes, plans, object_set_bytes)
+    wheelhouse = canonical.write({"development": True})
+    environment = pb.Environment(
+        wheelhouse_manifest=pb.Ref(
+            digest=documents.raw(str(_exact_ref(wheelhouse)["digest"])),
+            length=len(wheelhouse),
+        )
+    )
+    environment_body = documents.body(environment)
+    environment_digest = documents.embedded_document_digest(
+        environment_body, "cozy.worker.v1.Environment"
+    )
+    entrypoints: list[pb.Entrypoint] = []
+    for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
+        name = str(entry["name"])
+        binding_digest = hashlib.sha256(canonical.write({"name": name, "slots": []})).digest()
+        entrypoints.append(pb.Entrypoint(name=name, entrypoint_binding_digest=binding_digest))
+    entrypoint_bodies = [documents.body(entrypoint) for entrypoint in entrypoints]
+    bindings_digest = hashlib.sha256(
+        canonical.write({"entrypoints": entrypoint_bodies, "models": []})
+    ).digest()
+    receipt_bytes = canonical.write(
+        {
+            "base_family_digest": str(_exact_ref(wheelhouse)["digest"]),
+            "environment_digest": documents.spell(environment_digest),
+            "format": overlay.RECEIPT_FORMAT,
+            "overlay_wheels": [
+                {
+                    "digest": str(project_ref["digest"]),
+                    "distribution": "development-package",
+                    "owner": "project",
+                    "version": "0",
+                }
+            ],
+            "project_wheel_digest": str(project_ref["digest"]),
+        }
+    )
+    selection = qualification.selection_digest(
+        bindings_digest=documents.spell(bindings_digest),
+        environment_digest=documents.spell(environment_digest),
+        environment_receipt=_exact_ref(receipt_bytes),
+        package_descriptor=descriptor_ref,
+        package_release=_exact_ref(package_release),
+    )
+    qualification_bytes = canonical.write(qualification.document(selection))
+    placement = pb.Placement(
+        placement_id=LOCAL_PLACEMENT,
+        package_release=pb.Ref(
+            digest=documents.raw(str(_exact_ref(package_release)["digest"])),
+            length=len(package_release),
+        ),
+        environment_digest=environment_digest,
+        environment_receipt_digest=hashlib.sha256(receipt_bytes).digest(),
+        package_descriptor=pb.Ref(
+            digest=documents.raw(str(descriptor_ref["digest"])), length=len(descriptor_bytes)
+        ),
+        bindings_digest=bindings_digest,
+        entrypoints=entrypoints,
+        qualification=pb.Ref(
+            digest=documents.raw(str(_exact_ref(qualification_bytes)["digest"])),
+            length=len(qualification_bytes),
+        ),
+        environment=environment,
+    )
+    return WeightlessReleaseDocuments(
+        descriptor_bytes,
+        package_release,
+        receipt_bytes,
+        qualification_bytes,
+        wheelhouse,
+        placement,
+    )
 
 
 def _exact_ref(raw: bytes) -> dict[str, Any]:
@@ -1032,7 +1016,7 @@ def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
     ref = _exact_ref(raw)
     digest = str(ref["digest"])
     root.mkdir(parents=True, exist_ok=True)
-    path = (root / f"{digest.removeprefix('sha256:')}.json").resolve()
+    path = (root / digest.removeprefix("sha256:")).resolve()
     try:
         with path.open("xb") as handle:
             handle.write(raw)
@@ -1095,7 +1079,6 @@ def run_slice(
     workspace: Path,
     release_id: str,
     package_descriptor: Mapping[str, Any] | None = None,
-    placement_facts: LocalPlacementFacts | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
@@ -1113,52 +1096,33 @@ def run_slice(
         raise RuntimeError(
             "flat local binding records were removed; supply the canonical provisioned closure"
         )
-    plans: dict[str, str] = {}
-    plan_refs: dict[str, tuple[str, int]] = {}
+    bindings: dict[str, str] = {}
     staged: StagedWeightlessRelease | None = None
     if package_descriptor is not None:
         if request.kind != "entrypoint":
             raise RuntimeError("only a serving run accepts a package binding closure")
         staged = stage_weightless_release(config.cozy_home, package_descriptor)
-        plans.update(staged.plans)
-        plan_refs.update(staged.plan_refs)
-    if placement_facts is not None and staged is None:
-        raise RuntimeError("qualified placement facts require a staged package closure")
+        bindings.update(staged.bindings)
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
         request,
-        plans,
-        plan_refs,
+        bindings,
         workspace,
-        release_id=release_id,
-        placement_facts=placement_facts,
-        model_object_set=(
-            staged.artifact_object_set.read_bytes()
-            if staged is not None
-            else b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
+        release_id=(
+            staged.placement.package_release.digest.hex() if staged is not None else release_id
         ),
+        placement=staged.placement if staged is not None else None,
         auto_ack=auto_ack,
     )
     options = options or WorkerOptions(root=workspace / "worker")
     if staged is not None:
         if options.artifact_store not in (None, staged.artifact_store):
             raise RuntimeError("local closure and worker name different artifact stores")
-        if options.artifact_object_set not in (None, staged.artifact_object_set):
-            raise RuntimeError("local closure and worker name different artifact object sets")
         options = dataclasses.replace(
             options,
             artifact_store=staged.artifact_store,
-            artifact_object_set=staged.artifact_object_set,
-            environment_root=(
-                placement_facts.environment_root
-                if placement_facts is not None
-                else options.environment_root
-            ),
-            base_manifest=(
-                placement_facts.wheelhouse_manifest
-                if placement_facts is not None
-                else options.base_manifest
-            ),
+            artifact_cache=staged.artifact_cache,
+            development_project=Path.cwd().resolve(),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")

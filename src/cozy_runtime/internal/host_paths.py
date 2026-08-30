@@ -12,12 +12,9 @@ _VECTOR = files("cozy_runtime.vectors").joinpath("runtime-worker-host-paths.json
 _EXPECTED = {
     "artifact_cache",
     "artifact_store",
-    "binding_documents",
-    "binding_plans",
     "boot_data",
     "boot_id",
     "bootstrap_state",
-    "empty_object_set",
     "environment_root",
     "media_root",
     "readiness_envelope",
@@ -46,12 +43,9 @@ PATHS: Final = _load()
 
 ARTIFACT_CACHE: Final = PATHS["artifact_cache"]
 ARTIFACT_STORE: Final = PATHS["artifact_store"]
-BINDING_DOCUMENTS: Final = PATHS["binding_documents"]
-BINDING_PLANS: Final = PATHS["binding_plans"]
 BOOT_DATA: Final = PATHS["boot_data"]
 BOOT_ID: Final = PATHS["boot_id"]
 BOOTSTRAP_STATE: Final = PATHS["bootstrap_state"]
-EMPTY_OBJECT_SET: Final = PATHS["empty_object_set"]
 ENVIRONMENT_ROOT: Final = PATHS["environment_root"]
 MEDIA_ROOT: Final = PATHS["media_root"]
 READINESS_ENVELOPE: Final = PATHS["readiness_envelope"]

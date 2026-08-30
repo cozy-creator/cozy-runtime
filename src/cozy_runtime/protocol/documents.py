@@ -61,15 +61,13 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 #: two versions of one document exactly as the name domain-separates two documents. Read
 #: independently per language (#510g) — this map is the reader on this side of the wire.
 #:
-#: ArtifactDelegation/2 names exact model manifests. PlacementSet /2 adds the exact model-object
-#: set to desired-state identity.
-#: AttemptOutcomeBody/3 carries committed artifact receipts.
+#: AttemptOutcomeBody/3 carries committed artifact receipts. PlacementSet/3 contains the exact
+#: selected environment and binding graph; WorkerSnapshotBody/3 reports binding digests.
 DOC_VERSION = {
-    "cozy.worker.v1.ArtifactDelegation": 2,
     "cozy.worker.v1.AttemptOutcomeBody": 3,
-    "cozy.worker.v1.PackageEnvironmentSpec": 2,
-    "cozy.worker.v1.PlacementSet": 2,
-    "cozy.worker.v1.WorkerSnapshotBody": 2,
+    "cozy.worker.v1.InvocationSpec": 2,
+    "cozy.worker.v1.PlacementSet": 3,
+    "cozy.worker.v1.WorkerSnapshotBody": 3,
 }
 
 
@@ -135,7 +133,7 @@ def _field(fd: FD, value: Any, where: str) -> Any:
     if fd.type == FD.TYPE_STRING:
         return _ascii(str(value), where)
     if fd.type == FD.TYPE_BYTES:
-        if fd.name == "digest" or fd.name.endswith("_digest"):
+        if fd.name == "digest" or fd.name.endswith(("_digest", "_digests")):
             return spell(bytes(value))
         return base64.b64encode(bytes(value)).decode()
     if fd.type == FD.TYPE_MESSAGE:

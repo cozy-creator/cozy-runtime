@@ -32,12 +32,7 @@ from cozy_runtime.internal.config import (
     RuntimeConfig,
     read_worker_host_config,
 )
-from cozy_runtime.internal.placement_materialization import (
-    EMPTY_ARTIFACT_OBJECT_SET,
-    PreparedBoot,
-    _publish_exact,
-    materialize_objects,
-)
+from cozy_runtime.internal.placement_materialization import PreparedBoot, materialize_objects
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.grants import Authorizer, GrantRefusal
@@ -69,7 +64,7 @@ class PolicyExecutor:
     """A live worker-session seam double: every executor command is counted, never hidden."""
 
     def __init__(self) -> None:
-        self.ready_plans = {"plan-live"}
+        self.ready_bindings = {"plan-live"}
         self.calls: list[str] = []
         self.prepare_reply: dict[str, Any] | None = None
         self.incarnation = 1
@@ -120,7 +115,6 @@ def policy_worker(
         root=root,
         environment_root=environment_root,
         artifact_store=root / "store",
-        artifact_object_set=root / "object-set.json",
         accelerator_backend=accelerator_backend,
         no_warm=no_warm,
     )
@@ -135,13 +129,18 @@ def policy_worker(
     worker.placement = Placement(
         placement_id="placement-live",
         placement_set_digest=b"s" * 32,
-        package_release_id="cozy/probe@live",
-        environment_spec_digest=b"e" * 32,
-        installed_environment_receipt_digest=b"i" * 32,
-        package_descriptor_digest=b"d" * 32,
-        model_object_set=("sha256:" + "0" * 64, 53),
-        plan_ids=("plan-live",),
-        plan_refs={},
+        package_release=("sha256:" + "1" * 64, 1),
+        environment_digest=b"e" * 32,
+        environment_receipt_digest=b"i" * 32,
+        package_descriptor=("sha256:" + "2" * 64, 1),
+        bindings_digest=b"b" * 32,
+        models=(),
+        entrypoints=({"name": "probe", "entrypoint_binding_digest": "plan-live", "slots": []},),
+        qualification=("sha256:" + "3" * 64, 1),
+        environment={
+            "wheelhouse_manifest": {"digest": "sha256:" + "4" * 64, "length": 1},
+            "wheels": [],
+        },
         materialization=pb.MaterializationState.MATERIALIZATION_STATE_STAGED,
         serving=pb.ServingState.SERVING_STATE_ACTIVATING,
     )
@@ -217,7 +216,7 @@ def prove_pre_ready_claim(root: Path) -> None:
 
 def prepared_binding() -> DeclaredBinding:
     return DeclaredBinding(
-        entrypoint_binding_plan_id="plan-live",
+        entrypoint_binding_digest="plan-live",
         entrypoint="probe",
         model_class="ProbeModel",
         model_binding_path="probe.models.model",
@@ -274,9 +273,9 @@ def prove_delivery_activation(root: Path) -> None:
         root / "plain-delivery", environment_root=root / "environments", no_warm=False
     )
     binding = prepared_binding()
-    worker.bindings = {binding.entrypoint_binding_plan_id: binding}
+    worker.bindings = {binding.entrypoint_binding_digest: binding}
     worker.engine.bindings = worker.bindings
-    executor.ready_plans.clear()
+    executor.ready_bindings.clear()
     executor.prepare_reply = prepare_reply()
     worker.activate_executor()
     assert executor.calls == ["prepare"]
@@ -299,9 +298,9 @@ def prove_delivery_activation(root: Path) -> None:
         root / "broken-observation", environment_root=root / "environments", no_warm=False
     )
     broken_binding = prepared_binding()
-    broken.bindings = {broken_binding.entrypoint_binding_plan_id: broken_binding}
+    broken.bindings = {broken_binding.entrypoint_binding_digest: broken_binding}
     broken.engine.bindings = broken.bindings
-    broken_executor.ready_plans.clear()
+    broken_executor.ready_bindings.clear()
     broken_executor.prepare_reply = {"ok": True}
     broken.activate_executor()
     assert broken.placement is not None
@@ -603,7 +602,7 @@ def main() -> int:
         assert config.artifact_origin.port == 443
         worker_options = _worker_options(
             config,
-            PreparedBoot(root / "store", root / "object-set.json", root / "cache"),
+            PreparedBoot(root / "store", root / "cache"),
             "boot-live",
             [
                 {
@@ -652,7 +651,7 @@ def main() -> int:
         assert cpu_gpus == []
         cpu_options = _worker_options(
             config,
-            PreparedBoot(root / "cpu-store", root / "cpu-object-set.json", root / "cpu-cache"),
+            PreparedBoot(root / "cpu-store", root / "cpu-cache"),
             "cpu-boot-live",
             cpu_gpus,
             certificate_der=b"certificate-der",
@@ -664,7 +663,7 @@ def main() -> int:
         try:
             _worker_options(
                 config,
-                PreparedBoot(root / "bad-store", root / "bad-set.json", root / "bad-cache"),
+                PreparedBoot(root / "bad-store", root / "bad-cache"),
                 "bad-cuda-boot",
                 [],
                 certificate_der=b"certificate-der",
@@ -693,24 +692,8 @@ def main() -> int:
                 "entrypoints": [{"models": [], "name": "health"}],
             }
         )
-        assert local_weightless.artifact_object_set == empty_bytes
-        assert ref(local_weightless.artifact_object_set) == {
-            "digest": "sha256:d60755ff474871fce1e9705850245780895c1d2b798750f7692962c2d64d8856",
-            "length": 53,
-        }
-        assert local_weightless.artifact_object_set == EMPTY_ARTIFACT_OBJECT_SET
-        boot_root = root / "boot"
-        boot_root.mkdir()
-        published = boot_root / "artifact-object-set.json"
-        _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
-        _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
-        assert published.read_bytes() == EMPTY_ARTIFACT_OBJECT_SET
-        try:
-            _publish_exact(published, EMPTY_ARTIFACT_OBJECT_SET + b"\n", boot_root)
-        except LaunchRefusal as exc:
-            assert exc.code == "boot_document_conflict"
-        else:
-            raise AssertionError("a different boot document overwrote the published bytes")
+        assert local_weightless.placement.models == []
+        assert len(local_weightless.placement.entrypoints) == 1
 
         empty_store = materialize_objects(
             {},

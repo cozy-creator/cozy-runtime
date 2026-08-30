@@ -123,7 +123,7 @@ class Executor:
     channel: Channel
     seal_digest: str
     hello: dict[str, Any] = field(default_factory=dict)
-    ready_plans: set[str] = field(default_factory=set)
+    ready_bindings: set[str] = field(default_factory=set)
     construction_key: str = ""
     prepared_binding_set: frozenset[str] = frozenset()
     prepared_model: PreparedModel | None = None
@@ -927,7 +927,7 @@ class ExecutorSupervision:
     def _invalidate_locked(self, expected: Executor, why: str) -> bool:
         if self.current is not expected:
             return False
-        expected.ready_plans.clear()
+        expected.ready_bindings.clear()
         expected.poisoned = expected.poisoned or why
         if self.on_invalidate is not None:
             self.on_invalidate(why)

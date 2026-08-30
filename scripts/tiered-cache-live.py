@@ -203,7 +203,11 @@ def main() -> int:
             )
             observation = acquire.AcquisitionObservation()
             observation.start("model")
-            acquire.observe_model_sources(observation, warm)
+            observation.add(
+                "model",
+                downloaded=warm.sources["cloud"]["bytes"],
+                reused=(warm.sources["local"]["bytes"] + warm.sources["network_cache"]["bytes"]),
+            )
             observation.finish("model")
             cached_bytes = sum(ref.length for ref in unique.values())
             assert warm.sources == {

@@ -201,7 +201,6 @@ def _worker_options(
         environment_root=host_paths.ENVIRONMENT_ROOT,
         artifact_cache=prepared.artifact_cache,
         artifact_store=prepared.artifact_store,
-        artifact_object_set=prepared.artifact_object_set,
         artifact_client=ArtifactClient(
             host_paths.TLS_CERTIFICATE,
             host_paths.TLS_PRIVATE_KEY,

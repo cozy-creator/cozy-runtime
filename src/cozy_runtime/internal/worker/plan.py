@@ -1,4 +1,4 @@
-"""The PlanChooser, the AttemptPlan, and the local resolution of a binding plan.
+"""The PlanChooser, the AttemptPlan, and the local resolution of a binding.
 
 Two things live together because they are one decision made in one place, before durable
 acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
@@ -101,7 +101,7 @@ class AttemptPlan:
     reserved_host_bytes: int
     reserved_pinned_bytes: int
     headroom_bytes: int
-    entrypoint_binding_plan_id: str
+    entrypoint_binding_digest: str
     model_construction_digest: str
     """The LOGICAL model: reference variant, topology, config, factory. Identical across
     every delivery variant of one model, which is what makes it a usable deployment fence."""
@@ -140,7 +140,7 @@ class AttemptPlan:
             "reserved_host_bytes": self.reserved_host_bytes,
             "reserved_pinned_bytes": self.reserved_pinned_bytes,
             "headroom_bytes": self.headroom_bytes,
-            "entrypoint_binding_plan_id": self.entrypoint_binding_plan_id,
+            "entrypoint_binding_digest": self.entrypoint_binding_digest,
             "model_construction_digest": self.model_construction_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "request_features_digest": self.request_features_digest,
@@ -173,7 +173,7 @@ class AttemptPlan:
             reserved_host_bytes=int(caps.get("rss", 0)),
             reserved_pinned_bytes=0,
             headroom_bytes=0,
-            entrypoint_binding_plan_id=binding.job_descriptor_id,
+            entrypoint_binding_digest=binding.job_descriptor_id,
             model_construction_digest="",
             decision_explanation=(
                 f"job_attempt: {binding.job!r} on {max(binding.gpu_count, 0)} declared device "
@@ -259,12 +259,14 @@ class DeclaredBinding:
     constructs it after following stored-byte references; paths below are machine resolution.
     """
 
-    entrypoint_binding_plan_id: str
+    entrypoint_binding_digest: str
     entrypoint: str
     model_class: str
     model_binding_path: str
     model_parameter_name: str
     release: str
+    environment_digest: str = ""
+    """The exact inline Environment selected beside this binding."""
     application: str = ""
     """The exact PackageDescriptor application imported from the installed venv."""
     descriptor_path: str = ""
@@ -358,7 +360,7 @@ class DeclaredBinding:
         return self.snapshots.get(component, self.reference_snapshot)
 
     def construction_key(self) -> str:
-        """Two binding plans over the SAME construction share one executor generation.
+        """Two bindings over the SAME construction share one executor generation.
 
         The OFFERED variant set is inside the key BY ITS BYTES — store, snapshot and the
         per-component snapshot map, not the label somebody typed. A name is a deployment's
@@ -739,7 +741,7 @@ class PlanChooser:
             reserved_host_bytes=declared.host_bytes,
             reserved_pinned_bytes=declared.pinned_bytes,
             headroom_bytes=activations.value,
-            entrypoint_binding_plan_id=declared.entrypoint_binding_plan_id,
+            entrypoint_binding_digest=declared.entrypoint_binding_digest,
             model_construction_digest=prepared_model.logical_model_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,

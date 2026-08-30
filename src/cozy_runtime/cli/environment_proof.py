@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -18,11 +19,10 @@ from cozy_runtime.internal.placement_materialization import package_overlay_inpu
 from cozy_runtime.internal.refusal import LaunchRefusal
 
 REQUEST_FIELDS = {
-    "package_bundle",
-    "package_environment_spec",
+    "environment",
     "environment_root",
+    "package_release",
     "python",
-    "resolved_wheel_set",
     "wheel_files",
     "wheelhouse_manifest",
 }
@@ -30,13 +30,14 @@ REQUEST_FIELDS = {
 
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
-    environment_spec: Path
-    package_bundle: Path
-    resolved_wheel_set: Path
+    package_release: Path
+    environment_path: Path
     wheelhouse_manifest: Path
     wheel_files: Mapping[str, Path]
     python: Path
     environment_root: Path
+    environment: Mapping[str, object]
+    environment_digest: str
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -70,13 +71,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Exit.validation,
             )
         source = package_overlay_input(
-            environment_spec_bytes=_document_bytes(
-                request.environment_spec, "package_environment_spec"
-            ),
-            package_bundle_bytes=_document_bytes(request.package_bundle, "package_bundle"),
-            resolved_wheel_set_bytes=_document_bytes(
-                request.resolved_wheel_set, "resolved_wheel_set"
-            ),
+            package_release_bytes=_document_bytes(request.package_release, "package_release"),
+            environment=request.environment,
+            environment_digest=request.environment_digest,
             wheelhouse_manifest_bytes=_document_bytes(
                 request.wheelhouse_manifest, "wheelhouse_manifest"
             ),
@@ -163,16 +160,30 @@ def _read_request(path: Path) -> ProofRequest:
             raise _request_error(f"wheel_files key {digest!r} is not sha256:<64 lowercase hex>")
         wheel_files[digest] = _existing_file(local_path, f"wheel_files[{digest}]")
     environment_root = _fresh_root(value["environment_root"])
+    environment_path = _existing_file(value["environment"], "environment")
+    try:
+        environment = canonical.parse_canonical(_document_bytes(environment_path, "environment"))
+    except canonical.CanonicalError as err:
+        raise _request_error(f"environment: {err}") from err
+    if not isinstance(environment, dict) or not set(environment).issubset(
+        {"wheelhouse_manifest", "wheels"}
+    ):
+        raise _request_error("environment is not one closed nested Environment object")
+    environment_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical.write({**environment, "format": "cozy.worker.v1.Environment/1"})
+        ).hexdigest()
+    )
     return ProofRequest(
-        environment_spec=_existing_file(
-            value["package_environment_spec"], "package_environment_spec"
-        ),
-        package_bundle=_existing_file(value["package_bundle"], "package_bundle"),
-        resolved_wheel_set=_existing_file(value["resolved_wheel_set"], "resolved_wheel_set"),
+        package_release=_existing_file(value["package_release"], "package_release"),
+        environment_path=environment_path,
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,
         python=_existing_executable(value["python"]),
         environment_root=environment_root,
+        environment=environment,
+        environment_digest=environment_digest,
     )
 
 

@@ -83,8 +83,7 @@ pull flags:
 
 serve modes (exactly one):
   --weightless-package <dir>                 stage a local model-free package
-  --artifact-store <dir> --artifact-object-set <file>
-                                               serve a provisioned release
+  --artifact-store <dir>                       serve selected model Manifests
 
 global flags:
   --json           the full typed result as one JSON document

@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime import qualification
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import canonical, contract, overlay, sandbox
@@ -34,7 +33,7 @@ from cozy_runtime.internal.descriptor import StalePackageDescriptor
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.exits import Exit
 
-INDEX_NAME = "qualification.json"
+INDEX_NAME = "result.json"
 CONTRACTS_DIR = "contracts"
 RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
 MEMORY_CAP_BYTES = 24 << 30
@@ -45,11 +44,10 @@ _VARIANT = re.compile(r"^sm[0-9]{2,}$")
 REQUEST_FIELDS = {
     "bindings",
     "package_descriptor",
-    "package_release_id",
+    "package_release",
     "environment_generation",
-    "environment_spec_digest",
+    "environment_digest",
     "installed_environment_receipt",
-    "project_wheel_digest",
     "wheelhouse_manifest",
 }
 REF_FIELDS = {"digest", "length"}
@@ -91,10 +89,9 @@ class BindingRequest:
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
     environment_generation: Path
-    environment_spec_digest: str
+    environment_digest: str
     installed_environment_receipt: DocumentRef
-    project_wheel_digest: str
-    package_release_id: str
+    package_release: LocalDocumentRef
     package_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
     wheelhouse_manifest: Path
@@ -208,26 +205,15 @@ def _read_request(path: Path) -> ProofRequest:
     paths = [row.path for row in bindings]
     if len(paths) != len(set(paths)):
         raise _request_error("bindings contains a duplicate descriptor model path")
-    release = value["package_release_id"]
-    if (
-        not isinstance(release, str)
-        or not release
-        or len(release) > 256
-        or release.strip() != release
-    ):
-        raise _request_error("package_release_id is not one bounded non-empty string")
     return ProofRequest(
         environment_generation=_existing_directory(
             value["environment_generation"], "environment_generation"
         ),
-        environment_spec_digest=_digest(
-            value["environment_spec_digest"], "environment_spec_digest"
-        ),
+        environment_digest=_digest(value["environment_digest"], "environment_digest"),
         installed_environment_receipt=_ref(
             value["installed_environment_receipt"], "installed_environment_receipt"
         ),
-        project_wheel_digest=_digest(value["project_wheel_digest"], "project_wheel_digest"),
-        package_release_id=release,
+        package_release=_local_ref(value["package_release"], "package_release"),
         package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
         bindings=bindings,
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
@@ -368,7 +354,7 @@ def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOver
     installed = overlay.open_generation(
         request.environment_generation.parent.parent,
         receipt_digest=request.installed_environment_receipt.digest,
-        environment_spec_digest=request.environment_spec_digest,
+        environment_digest=request.environment_digest,
         base_manifest=request.wheelhouse_manifest,
         reused=True,
     )
@@ -383,10 +369,11 @@ def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOver
             "verified receipt length differs from the request",
         )
     receipt = canonical.parse_canonical(installed.receipt_bytes)
-    if (
-        not isinstance(receipt, dict)
-        or receipt.get("project_wheel_digest") != request.project_wheel_digest
-    ):
+    release = canonical.parse_canonical(_read_exact(request.package_release, "package_release"))
+    project_wheel = release.get("project_wheel") if isinstance(release, dict) else None
+    project_ref = project_wheel.get("ref") if isinstance(project_wheel, dict) else None
+    project_digest = project_ref.get("digest") if isinstance(project_ref, dict) else None
+    if not isinstance(receipt, dict) or receipt.get("project_wheel_digest") != project_digest:
         raise ProofRefusal(
             "model_contract_project_wheel_mismatch",
             "verified environment receipt names a different project wheel",
@@ -575,7 +562,7 @@ def _derive_all(
                         binding,
                         source,
                         config,
-                        release=request.package_release_id,
+                        release=request.package_release.digest,
                         application=found.application,
                         variant=variant,
                     )
@@ -722,7 +709,7 @@ def _decode_child(
         if len(raw) != length or _sha(raw) != digest:
             raise ProofRefusal("model_contract_child_invalid", "contract stored-byte identity")
         parsed = contract.read_contract(raw)
-        if parsed.candidate.release != request.package_release_id:
+        if parsed.candidate.release != request.package_release.digest:
             raise ProofRefusal("model_contract_child_invalid", "contract release identity")
         documents[digest] = raw
     functions = response["functions"]
@@ -733,13 +720,14 @@ def _decode_child(
         "package_descriptor": DocumentRef(
             request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
-        "package_release_id": request.package_release_id,
-        "environment_spec_digest": request.environment_spec_digest,
+        "package_release": DocumentRef(
+            request.package_release.digest, request.package_release.length
+        ).render(),
+        "environment_digest": request.environment_digest,
         "functions": functions,
         "installed_environment_receipt": request.installed_environment_receipt.render(),
-        "project_wheel_digest": request.project_wheel_digest,
     }
-    return qualification.document("model", evidence), documents
+    return evidence, documents
 
 
 def _publish(output: Path, index: bytes, documents: Mapping[str, bytes]) -> None:

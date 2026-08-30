@@ -52,12 +52,11 @@ from typing import Any
 
 from cozy_runtime.internal import (
     accel,
+    canonical,
     child_env,
-    fill,
     hostfacts,
     overlay,
     proctree,
-    provisioned,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -89,7 +88,6 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
     PlanChooser,
-    PlanRefusal,
     PreparedModel,
 )
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -196,8 +194,6 @@ class WorkerOptions:
     """Exact base-worker-image WheelhouseManifest path; fixed default in production."""
     artifact_store: Path | None = None
     """The verified TensorFS store populated from the canonical model-root closure."""
-    artifact_object_set: Path | None = None
-    """The exact model-root document used by the shared provisioned-release reader."""
     artifact_cache: Path | None = None
     """Where the dynamic acquisition lane writes the exact bytes it fetches (cr-049).
 
@@ -206,6 +202,8 @@ class WorkerOptions:
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
     artifact_client: artifact_access.ArtifactClient | None = None
+    development_project: Path | None = None
+    """Source-checkout-only model-free execution; product local venvs leave this absent."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -231,15 +229,15 @@ class Placement:
 
     placement_id: str
     placement_set_digest: bytes
-    package_release_id: str
-    environment_spec_digest: bytes
-    installed_environment_receipt_digest: bytes
-    package_descriptor_digest: bytes
-    model_object_set: tuple[str, int]
-    plan_ids: tuple[str, ...]
-    plan_refs: dict[str, tuple[str, int]]
-    """Subject id -> exact artifact digest/length; only the digest becomes a local path."""
-    model_object_set_path: Path | None = None
+    package_release: tuple[str, int]
+    environment_digest: bytes
+    environment_receipt_digest: bytes
+    package_descriptor: tuple[str, int]
+    bindings_digest: bytes
+    models: tuple[dict[str, Any], ...]
+    entrypoints: tuple[dict[str, Any], ...]
+    qualification: tuple[str, int]
+    environment: dict[str, Any]
     acquisition: pb.PlacementAcquisitionObservation = field(
         default_factory=pb.PlacementAcquisitionObservation
     )
@@ -380,51 +378,251 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
     placements = document.get("placements", [])
     if not isinstance(placements, list):
         raise documents.DocumentError("wrong_type", "`placements` is a list of Placement")
-    known_placement = {f.name for f in pb.Placement.DESCRIPTOR.fields}
-    known_subject = {f.name for f in pb.ArtifactSubject.DESCRIPTOR.fields}
     for entry in placements:
         if not isinstance(entry, dict):
             raise documents.DocumentError("wrong_type", "a Placement is a JSON object")
-        for key in entry:
-            if key not in known_placement:
-                raise documents.DocumentError("unknown_field", f"Placement: unknown key {key!r}")
-        prior_subject = ""
-        for subject in entry.get("binding_plans", []):
-            if not isinstance(subject, dict):
-                raise documents.DocumentError("wrong_type", "an ArtifactSubject is an object")
-            for key in subject:
-                if key not in known_subject:
-                    raise documents.DocumentError(
-                        "unknown_field", f"ArtifactSubject: unknown key {key!r}"
-                    )
-            if set(subject) != {"digest", "kind", "length", "subject_id"}:
-                raise documents.DocumentError(
-                    "artifact_subject_incomplete",
-                    "a binding-plan subject requires subject_id, kind, digest, and length",
-                )
-            subject_id = subject["subject_id"]
-            digest = subject["digest"]
-            length = subject["length"]
-            if (
-                not isinstance(subject_id, str)
-                or not subject_id
-                or subject_id <= prior_subject
-                or subject["kind"] != "plan"
-                or not isinstance(digest, str)
-                or HASH_ENTRY.fullmatch(digest) is None
-                or not isinstance(length, int)
-                or isinstance(length, bool)
-                or length <= 0
-            ):
-                raise documents.DocumentError(
-                    "artifact_subject_invalid",
-                    "binding-plan subjects are sorted unique exact plan artifacts",
-                )
-            prior_subject = subject_id
+        _placement_profile(entry)
     return [entry for entry in placements if isinstance(entry, dict)]
 
 
 HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _closed_document(value: object, fields: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not set(value).issubset(fields):
+        raise documents.DocumentError("unknown_field", f"{name} has a non-closed field set")
+    return value
+
+
+def _required(value: Mapping[str, Any], fields: set[str], name: str) -> None:
+    missing = fields - set(value)
+    if missing:
+        raise documents.DocumentError("missing_field", f"{name} lacks {sorted(missing)[0]}")
+
+
+def _exact_ref(value: object, name: str) -> dict[str, Any]:
+    row = _closed_document(value, {"digest", "length"}, name)
+    _required(row, {"digest", "length"}, name)
+    digest = row["digest"]
+    length = row["length"]
+    if (
+        not isinstance(digest, str)
+        or HASH_ENTRY.fullmatch(digest) is None
+        or not isinstance(length, int)
+        or isinstance(length, bool)
+        or length <= 0
+    ):
+        raise documents.DocumentError("invalid_ref", f"{name} is not an exact positive Ref")
+    return row
+
+
+def _identifier(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise documents.DocumentError("invalid_identifier", f"{name} is empty or padded")
+    if len(value) > 256 or any(not 0x20 <= ord(char) <= 0x7E for char in value):
+        raise documents.DocumentError("invalid_identifier", f"{name} is not bounded ASCII")
+    return value
+
+
+def _sorted_unique_strings(value: object, name: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) for item in value)
+        or value != sorted(set(value))
+    ):
+        raise documents.DocumentError("sort_order", f"{name} is not sorted unique")
+    return value
+
+
+def _wheel_fact(value: object, name: str) -> dict[str, Any]:
+    row = _closed_document(
+        value, {"ref", "distribution", "version", "filename", "import_roots", "tags"}, name
+    )
+    _required(row, {"ref", "distribution", "version", "filename"}, name)
+    _exact_ref(row["ref"], f"{name}.ref")
+    distribution = _identifier(row["distribution"], f"{name}.distribution")
+    if distribution != distribution.lower() or any(
+        not part or not part.isalnum() for part in distribution.split("-")
+    ):
+        raise documents.DocumentError("wheel_fact_invalid", f"{name}.distribution")
+    _identifier(row["version"], f"{name}.version")
+    _identifier(row["filename"], f"{name}.filename")
+    _sorted_unique_strings(row.get("import_roots", []), f"{name}.import_roots")
+    _sorted_unique_strings(row.get("tags", []), f"{name}.tags")
+    return row
+
+
+def _placement_profile(entry: dict[str, Any]) -> None:
+    fields = {
+        "placement_id",
+        "package_release",
+        "environment_digest",
+        "environment_receipt_digest",
+        "package_descriptor",
+        "bindings_digest",
+        "models",
+        "entrypoints",
+        "qualification",
+        "environment",
+    }
+    _closed_document(entry, fields, "Placement")
+    _required(
+        entry,
+        fields - {"models"},
+        "Placement",
+    )
+    _identifier(entry["placement_id"], "Placement.placement_id")
+    for name in ("package_release", "package_descriptor", "qualification"):
+        _exact_ref(entry[name], f"Placement.{name}")
+    for name in ("environment_digest", "environment_receipt_digest", "bindings_digest"):
+        if not isinstance(entry[name], str) or HASH_ENTRY.fullmatch(entry[name]) is None:
+            raise documents.DocumentError("malformed_digest", f"Placement.{name}")
+
+    environment = _closed_document(
+        entry["environment"], {"wheelhouse_manifest", "wheels"}, "Environment"
+    )
+    _required(environment, {"wheelhouse_manifest"}, "Environment")
+    _exact_ref(environment["wheelhouse_manifest"], "Environment.wheelhouse_manifest")
+    wheels = environment.get("wheels", [])
+    if not isinstance(wheels, list):
+        raise documents.DocumentError("wrong_type", "Environment.wheels")
+    wheel_rows = [
+        _wheel_fact(row, f"Environment.wheels[{index}]") for index, row in enumerate(wheels)
+    ]
+    names = [str(row["distribution"]) for row in wheel_rows]
+    if names != sorted(set(names)):
+        raise documents.DocumentError("sort_order", "Environment.wheels")
+    measured_environment = documents.spell(
+        documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
+    )
+    if measured_environment != entry["environment_digest"]:
+        raise documents.DocumentError(
+            "environment_digest_mismatch",
+            f"measured {measured_environment}, expected {entry['environment_digest']}",
+        )
+
+    models = entry.get("models", [])
+    if not isinstance(models, list):
+        raise documents.DocumentError("wrong_type", "Placement.models")
+    model_ids: list[str] = []
+    for index, value in enumerate(models):
+        model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
+        _required(model, {"id", "repo", "version", "lane", "manifest"}, "Model")
+        model_ids.append(_identifier(model["id"], f"models[{index}].id"))
+        for name in ("repo", "version", "lane"):
+            _identifier(model[name], f"models[{index}].{name}")
+        _exact_ref(model["manifest"], f"models[{index}].manifest")
+    if model_ids != sorted(set(model_ids)):
+        raise documents.DocumentError("sort_order", "Placement.models")
+    known_models = set(model_ids)
+
+    entrypoints = entry["entrypoints"]
+    if not isinstance(entrypoints, list) or not entrypoints:
+        raise documents.DocumentError("missing_field", "Placement.entrypoints")
+    entrypoint_names: list[str] = []
+    for entrypoint_index, value in enumerate(entrypoints):
+        entrypoint = _closed_document(
+            value, {"name", "entrypoint_binding_digest", "slots"}, "Entrypoint"
+        )
+        _required(entrypoint, {"name", "entrypoint_binding_digest"}, "Entrypoint")
+        entrypoint_names.append(
+            _identifier(entrypoint["name"], f"entrypoints[{entrypoint_index}].name")
+        )
+        slots = entrypoint.get("slots", [])
+        if not isinstance(slots, list):
+            raise documents.DocumentError("wrong_type", "Entrypoint.slots")
+        slot_names: list[str] = []
+        for slot_index, value in enumerate(slots):
+            slot = _closed_document(
+                value,
+                {
+                    "slot",
+                    "reference_model_id",
+                    "config",
+                    "components",
+                    "model_construction_contract",
+                    "stamps",
+                },
+                "Slot",
+            )
+            _required(
+                slot,
+                {"slot", "reference_model_id", "config", "model_construction_contract"},
+                "Slot",
+            )
+            slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
+            if slot["reference_model_id"] not in known_models:
+                raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
+            config = _closed_document(slot["config"], {"document", "assets"}, "Config")
+            _required(config, {"document"}, "Config")
+            _exact_ref(config["document"], "Config.document")
+            assets = config.get("assets", [])
+            if not isinstance(assets, list):
+                raise documents.DocumentError("wrong_type", "Config.assets")
+            asset_names: list[str] = []
+            for asset_index, value in enumerate(assets):
+                asset = _closed_document(value, {"name", "model_id", "ref"}, "Asset")
+                _required(asset, {"name", "model_id", "ref"}, "Asset")
+                asset_names.append(_identifier(asset["name"], f"assets[{asset_index}].name"))
+                if asset["model_id"] not in known_models:
+                    raise documents.DocumentError("unknown_model", "Asset.model_id")
+                _exact_ref(asset["ref"], "Asset.ref")
+            if asset_names != sorted(set(asset_names)):
+                raise documents.DocumentError("sort_order", "Config.assets")
+            components = slot.get("components", [])
+            if not isinstance(components, list):
+                raise documents.DocumentError("wrong_type", "Slot.components")
+            component_names: list[str] = []
+            for value in components:
+                component = _closed_document(value, {"component", "model_id"}, "Component")
+                _required(component, {"component", "model_id"}, "Component")
+                component_names.append(_identifier(component["component"], "Component.component"))
+                if component["model_id"] not in known_models:
+                    raise documents.DocumentError("unknown_model", "Component.model_id")
+            if len(component_names) != len(set(component_names)):
+                raise documents.DocumentError("sort_order", "Slot.components")
+            _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
+            stamps = slot.get("stamps", [])
+            if not isinstance(stamps, list):
+                raise documents.DocumentError("wrong_type", "Slot.stamps")
+            stamp_ids: list[tuple[str, str]] = []
+            for value in stamps:
+                stamp = _closed_document(value, {"component", "key", "values"}, "Stamp")
+                _required(stamp, {"component", "key", "values"}, "Stamp")
+                component_name = _identifier(stamp["component"], "Stamp.component")
+                key = _identifier(stamp["key"], "Stamp.key")
+                if component_name not in component_names:
+                    raise documents.DocumentError("unknown_component", "Stamp.component")
+                if not _sorted_unique_strings(stamp["values"], "Stamp.values"):
+                    raise documents.DocumentError("missing_field", "Stamp.values")
+                stamp_ids.append((component_name, key))
+            if stamp_ids != sorted(set(stamp_ids)):
+                raise documents.DocumentError("sort_order", "Slot.stamps")
+        if slot_names != sorted(set(slot_names)):
+            raise documents.DocumentError("sort_order", "Entrypoint.slots")
+        expected_entrypoint = (
+            "sha256:"
+            + hashlib.sha256(
+                canonical.write({"name": entrypoint["name"], "slots": slots})
+            ).hexdigest()
+        )
+        if entrypoint["entrypoint_binding_digest"] != expected_entrypoint:
+            raise documents.DocumentError(
+                "entrypoint_binding_digest_mismatch", str(entrypoint["name"])
+            )
+    if entrypoint_names != sorted(set(entrypoint_names)):
+        raise documents.DocumentError("sort_order", "Placement.entrypoints")
+    expected_bindings = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical.write({"entrypoints": entrypoints, "models": models})
+        ).hexdigest()
+    )
+    if entry["bindings_digest"] != expected_bindings:
+        raise documents.DocumentError(
+            "bindings_digest_mismatch",
+            f"measured {expected_bindings}, expected {entry['bindings_digest']}",
+        )
 
 
 class Worker:
@@ -558,13 +756,8 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
-        self.artifact_intent: artifact_access.ArtifactIntent | None = None
         self.artifact_plan = artifact_access.ArtifactPlan()
-        self.artifact_resolutions: queue.Queue[artifact_access.ArtifactIntent | None] = (
-            queue.Queue()
-        )
-        self.resolved_package_ids: set[str] = set()
-        self.resolved_model_ids: set[str] = set()
+        self.artifact_resolutions: queue.Queue[bytes | None] = queue.Queue()
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
@@ -1256,9 +1449,6 @@ class Worker:
                     )
                 )
             return
-        if kind == "ensure_artifacts":
-            self.apply_artifact_intent(inner)
-            return
         if not self.fence.dispatch_open:
             self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
             return
@@ -1278,70 +1468,6 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
-
-    def apply_artifact_intent(self, update: pb.EnsureArtifacts) -> None:
-        """Verify one signed logical set and queue direct Tensorhub redemption."""
-
-        if (
-            not self.config.record_owner_public_key
-            or self.options.artifact_client is None
-            or not self.options.worker_tls_certificate_digest
-        ):
-            self.engine.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=self.options.worker_id,
-                    reason="artifact_delegation_unavailable",
-                    detail="this worker has no rental key or direct Tensorhub mTLS client",
-                )
-            )
-            return
-        try:
-            intent = artifact_access.read_intent(
-                update,
-                self.config.record_owner_public_key,
-                worker_id=self.options.worker_id,
-                worker_boot_id=self.fence.worker_boot_id,
-                worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
-            )
-        except artifact_access.ArtifactAccessRefusal as exc:
-            self.note("artifacts", f"delegation REFUSED: {exc.code}")
-            self.engine.fault(
-                pb.Fault(
-                    kind=exc.kind,
-                    subject=self.options.worker_id,
-                    reason=exc.code,
-                    detail=safe(exc.detail),
-                )
-            )
-            return
-        prior = self.artifact_intent
-        if prior is not None and intent.revision < prior.revision:
-            self.note("artifacts", f"revision {intent.revision} ignored (older)")
-            return
-        if (
-            prior is not None
-            and intent.revision == prior.revision
-            and intent.logical_identity() != prior.logical_identity()
-        ):
-            self.engine.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=intent.delegation_id,
-                    reason="artifact_revision_conflict",
-                    detail="same artifact revision carries different package/model ids",
-                )
-            )
-            return
-        self.artifact_intent = intent
-        self.note(
-            "artifacts",
-            f"accepted revision {intent.revision} delegation {intent.delegation_id!r}, "
-            f"expiring {intent.expires_at_unix}",
-        )
-        self.artifact_resolutions.put(intent)
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
@@ -1555,29 +1681,30 @@ class Worker:
         # every materialization failure free.
         entry = placements[0]
         placement_id = str(entry.get("placement_id", ""))
-        subjects = [dict(row) for row in entry.get("binding_plans", [])]
-        plan_ids = tuple(
-            str(row.get("subject_id", "")) for row in subjects if row.get("subject_id")
-        )
-        plan_refs = {
-            str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
-        }
-        model_object_set = dict(entry.get("model_object_set", {}))
+        package_release = dict(entry.get("package_release", {}))
+        package_descriptor = dict(entry.get("package_descriptor", {}))
+        qualification = dict(entry.get("qualification", {}))
         candidate = Placement(
             placement_id=placement_id,
             placement_set_digest=desired_set.placement_set_digest,
-            package_release_id=str(entry.get("package_release_id", "")),
-            environment_spec_digest=_digest_field(entry.get("environment_spec_digest")),
-            installed_environment_receipt_digest=_digest_field(
-                entry.get("installed_environment_receipt_digest")
+            package_release=(
+                str(package_release.get("digest", "")),
+                int(package_release.get("length", 0)),
             ),
-            package_descriptor_digest=_digest_field(entry.get("package_descriptor_digest")),
-            model_object_set=(
-                str(model_object_set.get("digest", "")),
-                int(model_object_set.get("length", 0)),
+            environment_digest=_digest_field(entry.get("environment_digest")),
+            environment_receipt_digest=_digest_field(entry.get("environment_receipt_digest")),
+            package_descriptor=(
+                str(package_descriptor.get("digest", "")),
+                int(package_descriptor.get("length", 0)),
             ),
-            plan_ids=plan_ids,
-            plan_refs=plan_refs,
+            bindings_digest=_digest_field(entry.get("bindings_digest")),
+            models=tuple(dict(row) for row in entry.get("models", [])),
+            entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
+            qualification=(
+                str(qualification.get("digest", "")),
+                int(qualification.get("length", 0)),
+            ),
+            environment=dict(entry.get("environment", {})),
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
             # placement_id, new set digest) retains the outgoing set as the pin; a fresh
             # placement has none, and an empty pin means replacement is PAUSED — which is
@@ -1631,8 +1758,8 @@ class Worker:
             ),
         )
         expected = (
-            documents.spell(candidate.installed_environment_receipt_digest)
-            if candidate.installed_environment_receipt_digest
+            documents.spell(candidate.environment_receipt_digest)
+            if candidate.environment_receipt_digest
             else ""
         )
         local_receipt = (
@@ -1641,7 +1768,8 @@ class Worker:
             else None
         )
         if (
-            not candidate.installed_environment_receipt_digest
+            not candidate.environment_receipt_digest
+            or self.options.development_project is not None
             or self.artifact_plan.authorized()
             or (local_receipt is not None and local_receipt.is_file())
         ):
@@ -1651,34 +1779,30 @@ class Worker:
                 "materialization",
                 f"revision {desired.revision} waits for direct artifact resolution",
             )
+            self.artifact_resolutions.put(desired_set.placement_set_digest)
 
     def schedule_convergence(self, revision: int) -> None:
         self.convergences.put(revision)
 
     def artifact_resolution_lane(self) -> None:
-        """Redeem logical intent without blocking WorkerControl."""
+        """Resolve the accepted PlacementSet digest without blocking WorkerControl."""
 
-        while (intent := self.artifact_resolutions.get()) is not None:
-            if intent is not self.artifact_intent or self.options.artifact_client is None:
-                continue
-            packages = tuple(sorted(set(intent.package_release_ids) - self.resolved_package_ids))
-            models = tuple(sorted(set(intent.model_manifest_ids) - self.resolved_model_ids))
-            if not packages and not models:
+        while (set_digest := self.artifact_resolutions.get()) is not None:
+            if (
+                set_digest != self.accepted.accepted_placement_set_digest
+                or self.options.artifact_client is None
+            ):
                 continue
             try:
-                plan = self.options.artifact_client.resolve(
-                    intent,
-                    package_release_ids=packages,
-                    model_manifest_ids=models,
-                )
+                plan = self.options.artifact_client.resolve(set_digest)
             except artifact_access.ArtifactAccessRefusal as exc:
-                if intent is not self.artifact_intent:
+                if set_digest != self.accepted.accepted_placement_set_digest:
                     continue
                 self.note("artifacts", f"resolve REFUSED: {exc.code}")
                 self.engine.fault(
                     pb.Fault(
                         kind=exc.kind,
-                        subject=intent.delegation_id,
+                        subject=documents.spell(set_digest),
                         reason=exc.code,
                         detail=safe(
                             exc.detail
@@ -1689,19 +1813,18 @@ class Worker:
                 if self.connected.is_set():
                     self.send(pb.WorkerFrame(observed_state=self.observed_state()))
                 continue
-            if intent is not self.artifact_intent:
+            if set_digest != self.accepted.accepted_placement_set_digest:
                 continue
-            self.artifact_plan = self.artifact_plan.merged(plan)
+            self.artifact_plan = plan
             self.engine.faults[:] = [
                 fault
                 for fault in self.engine.faults
-                if fault.kind != pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED
-                and fault.reason != "artifact_authorization_absent"
+                if fault.reason != "artifact_authorization_absent"
             ]
             self.note(
                 "artifacts",
-                f"resolved {len(plan.artifacts)} exact object(s) for revision "
-                f"{intent.revision}, expiring {plan.expires_at_unix}",
+                f"resolved {len(plan.artifacts)} exact object(s) for PlacementSet "
+                f"{documents.spell(set_digest)[:23]}…, expiring {plan.expires_at_unix}",
             )
             revision = self.accepted.accepted_desired_state_revision
             candidate = self.pending or self.placement
@@ -1738,8 +1861,8 @@ class Worker:
         (fallback-retention #474 clauses 1-2), so an incoming failure costs zero intake
         interruption and LATCHES for this desired revision rather than looping (clause 5).
 
-        `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured InstalledEnvironmentReceipt
-        equals `installed_environment_receipt_digest`; it is unspeakable otherwise (§8).
+        `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured EnvironmentReceipt equals
+        `environment_receipt_digest`; it is unspeakable otherwise (§8).
         """
         candidate = self.pending or self.placement
         assert candidate is not None
@@ -1756,35 +1879,20 @@ class Worker:
                 f"{documents.spell(candidate.placement_set_digest)[:23]}… is materializing"
             )
 
-        installed = (
-            self._acquire(candidate, revision)
-            if candidate.installed_environment_receipt_digest
-            else None
-        )
-        if candidate.installed_environment_receipt_digest and installed is None:
-            return
-        # A preinstalled overlay receipt says nothing about TensorFS/model-root custody.
-        # Dynamic acquisition sets the exact object-set path itself; warm/local reuse must
-        # bind the independently staged document before resolving plans. Requiring this
-        # only when `installed is None` left every preinstalled package with an overlay but
-        # no model closure, including the truthful empty closure of a weightless package.
-        if candidate.model_object_set_path is None and not self._bind_preinstalled_object_set(
-            candidate
-        ):
+        acquired = self._acquire(candidate, revision)
+        if acquired is None:
             return
         if revision != self.accepted.accepted_desired_state_revision:
             self.note("materialization", f"revision {revision} was superseded after acquisition")
             return
+        installed = acquired.installed
         if installed is not None:
             changed = self.supervision.use_overlay(
                 str(installed.python), str(installed.import_root), installed.content_digest
             )
             if changed and self.supervision.current is not None:
                 self.supervision.current.poisoned = "package overlay generation changed"
-
-        bindings = self._resolve_bindings(candidate)
-        if bindings is None:
-            return
+        bindings = dict(acquired.bindings)
         if revision != self.accepted.accepted_desired_state_revision:
             self.note("materialization", f"revision {revision} was superseded before hand-off")
             return
@@ -1813,36 +1921,10 @@ class Worker:
             f"revision {revision} STAGED: placement "
             f"{candidate.placement_id or '(unnamed)'} in set "
             f"{documents.spell(candidate.placement_set_digest)[:23]}… with {len(self.bindings)} of "
-            f"{len(candidate.plan_ids)} binding plan(s) resolved, "
+            f"{len(candidate.entrypoints)} binding(s) resolved, "
             f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
         self.activate_executor()
-
-    def _bind_preinstalled_object_set(self, placement: Placement) -> bool:
-        """Bind the local/native lane's already-staged exact model-object set."""
-
-        path = self.options.artifact_object_set
-        expected_digest, expected_length = placement.model_object_set
-        try:
-            raw = path.read_bytes() if path is not None else b""
-        except OSError:
-            raw = b""
-        measured = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
-        if len(raw) != expected_length or measured != expected_digest:
-            self._materialization_failed(
-                placement,
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    subject=placement.placement_id,
-                    reason="model_object_set_identity_mismatch",
-                    detail=f"staged {measured}/{len(raw)}, expected "
-                    f"{expected_digest}/{expected_length}",
-                ),
-                terminal=True,
-            )
-            return False
-        placement.model_object_set_path = path
-        return True
 
     def await_drained(self) -> None:
         """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
@@ -1857,13 +1939,13 @@ class Worker:
             if attempt.state in self.engine.HELD:
                 self.await_settled(attempt)
 
-    def _acquire(self, placement: Placement, revision: int) -> overlay.InstalledOverlay | None:
+    def _acquire(self, placement: Placement, revision: int) -> acquire.AcquiredPlacement | None:
         """Fetch what the spec reaches and join its receipt to content-keyed installed bytes.
 
         Returns the installed generation, or None having already typed the fault and left the
         outgoing placement serving.
         """
-        expected = documents.spell(placement.installed_environment_receipt_digest)
+        expected = documents.spell(placement.environment_receipt_digest)
         if not expected:
             self._materialization_failed(
                 placement,
@@ -1877,6 +1959,33 @@ class Worker:
                 terminal=True,
             )
             return None
+        if self.options.development_project is not None:
+            if self.options.artifact_cache is None:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=placement.placement_id,
+                        reason="artifact_cache_absent",
+                        detail="source-checkout selection bytes require --artifact-cache",
+                    ),
+                    terminal=False,
+                )
+                return None
+            try:
+                return acquire.preinstalled_weightless(placement, self.options.artifact_cache)
+            except acquire.AcquisitionRefusal as exc:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=exc.kind,
+                        subject=placement.placement_id,
+                        reason=exc.code,
+                        detail=safe(exc.detail),
+                    ),
+                    terminal=True,
+                )
+                return None
         if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
@@ -1891,163 +2000,104 @@ class Worker:
                 terminal=False,
             )
             return None
-        receipt = (
-            self.options.environment_root / "receipts" / f"{expected.removeprefix('sha256:')}.json"
-        )
-        # A direct plan re-drives the reachability walk while its exact locations are live.
-        # A preinstalled generation with no plan may still open locally.
-        if not receipt.exists() or self.artifact_plan.authorized():
-            if self.options.artifact_cache is None:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=placement.placement_id,
-                        reason="artifact_cache_absent",
-                        detail="no --artifact-cache was provisioned, so there is nowhere to "
-                        "put the exact bytes this placement reaches",
-                    ),
-                    terminal=False,
-                )
-                return None
-            if not self.artifact_plan.authorized():
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
-                        subject=placement.placement_id,
-                        reason="artifact_authorization_absent",
-                        detail="the accepted set names artifacts this worker does not hold "
-                        "and no direct Tensorhub plan has landed",
-                    ),
-                    terminal=False,
-                )
-                return None
-            try:
-                acquirer = acquire.Acquirer(
-                    self.artifact_plan,
-                    cache_root=self.options.artifact_cache,
-                    environment_root=self.options.environment_root,
-                    plans_root=self.config.cozy_home / "binding-plans",
-                    documents_root=self.config.cozy_home / "binding-documents",
-                    object_sets_root=self.options.environment_root.parent / "model-object-sets",
-                    artifact_store=self.options.artifact_store,
-                    python=Path(sys.executable),
-                    verified_cache=self.verified_artifacts,
-                    on_observation=lambda value: self._observe_acquisition(placement, value),
-                )
-
-                def package_ready(installed: overlay.InstalledOverlay) -> None:
-                    """Start cold interpreter/Torch import while model bytes still hydrate."""
-
-                    if revision != self.accepted.accepted_desired_state_revision:
-                        return
-                    # One executor is the entire device lane. An outgoing placement keeps
-                    # serving untouched until the ordinary staged handoff; early spawn is
-                    # available only from a standing start.
-                    if self.supervision.current is not None:
-                        return
-                    self.supervision.use_overlay(
-                        str(installed.python),
-                        str(installed.import_root),
-                        installed.content_digest,
-                    )
-                    try:
-                        executor = self.supervision.spawn(imposed=self.imposed())
-                    except ExecutorGone as exc:
-                        raise acquire.AcquisitionRefusal(
-                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            "executor_early_spawn_failed",
-                            str(exc),
-                        ) from exc
-                    self.note(
-                        "boot",
-                        f"generation {executor.incarnation} pid {executor.pid} spawned "
-                        "after package overlay admission while model hydration continued",
-                    )
-                    # Make the overlap externally observable immediately; otherwise the
-                    # next state frame might be the model leg's terminal update and the
-                    # optimization would exist without a proof surface.
-                    self._observe_acquisition(placement, acquirer.observation.snapshot())
-
-                acquired = acquirer.acquire(placement, on_package_ready=package_ready)
-                self.resolved_package_ids.add(placement.package_release_id)
-                if self.artifact_intent is not None:
-                    self.resolved_model_ids.update(self.artifact_intent.model_manifest_ids)
-            except acquire.AcquisitionRefusal as exc:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=exc.kind,
-                        subject=placement.placement_id,
-                        reason=exc.code,
-                        detail=safe(exc.detail),
-                    ),
-                    terminal=exc.kind
-                    in (
-                        pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                        pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
-                    ),
-                )
-                return None
-            except (OSError, overlay.OverlayRefusal) as exc:
-                reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                        if isinstance(exc, overlay.OverlayRefusal)
-                        else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        subject=placement.placement_id,
-                        reason=reason,
-                        detail=safe(str(exc)),
-                    ),
-                    terminal=isinstance(exc, overlay.OverlayRefusal),
-                )
-                return None
-            placement.model_object_set_path = acquired.object_set
-            self.note(
-                "materialization",
-                f"revision {revision} acquired {acquired.wheels} wheel(s), "
-                f"{len(acquired.plans)} plan(s) and {len(acquired.documents)} reached "
-                f"document(s), hydrated {acquired.model_objects} model object(s) — "
-                f"{acquired.fetched_bytes} new byte(s) — and published "
-                f"content {acquired.installed.content_digest} at "
-                f"{acquired.installed.generation}; verified {acquired.verified_bytes} byte(s), "
-                f"trusted same-boot reuse {acquired.trusted_reuse_bytes} byte(s)",
-            )
-        # Open the small receipt and base-family document. Wheel bytes were hashed before
-        # atomic publication; image-resident bytes are already fixed by the OCI digest.
-        try:
-            installed = overlay.open_generation(
-                self.options.environment_root,
-                receipt_digest=expected,
-                environment_spec_digest=documents.spell(placement.environment_spec_digest),
-                base_manifest=self.options.base_manifest,
-            )
-        except (overlay.OverlayRefusal, OSError) as exc:
-            reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
-            unavailable = reason in {"overlay_receipt_absent", "io_error"}
+        if self.options.artifact_cache is None:
             self._materialization_failed(
                 placement,
                 pb.Fault(
-                    kind=(
-                        pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE
-                        if unavailable
-                        else pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                    ),
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=placement.placement_id,
+                    reason="artifact_cache_absent",
+                    detail="--artifact-cache is the one local landing area for exact "
+                    "PlacementSet references",
+                ),
+                terminal=False,
+            )
+            return None
+        try:
+            acquirer = acquire.Acquirer(
+                self.artifact_plan,
+                cache_root=self.options.artifact_cache,
+                environment_root=self.options.environment_root,
+                selection_root=self.options.environment_root / "selections",
+                artifact_store=self.options.artifact_store,
+                python=Path(sys.executable),
+                verified_cache=self.verified_artifacts,
+                on_observation=lambda value: self._observe_acquisition(placement, value),
+            )
+
+            def package_ready(installed: overlay.InstalledOverlay) -> None:
+                """Start cold interpreter/Torch import while model bytes still hydrate."""
+
+                if revision != self.accepted.accepted_desired_state_revision:
+                    return
+                if self.supervision.current is not None:
+                    return
+                self.supervision.use_overlay(
+                    str(installed.python), str(installed.import_root), installed.content_digest
+                )
+                try:
+                    executor = self.supervision.spawn(imposed=self.imposed())
+                except ExecutorGone as exc:
+                    raise acquire.AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        "executor_early_spawn_failed",
+                        str(exc),
+                    ) from exc
+                self.note(
+                    "boot",
+                    f"generation {executor.incarnation} pid {executor.pid} spawned after "
+                    "package overlay admission while model hydration continued",
+                )
+                self._observe_acquisition(placement, acquirer.observation.snapshot())
+
+            acquired = acquirer.acquire(placement, on_package_ready=package_ready)
+            self.note(
+                "materialization",
+                f"revision {revision} acquired {acquired.wheels} wheel(s), "
+                f"{acquired.documents} selected document(s), hydrated "
+                f"{acquired.model_objects} model object(s) — "
+                f"{acquired.fetched_bytes} new byte(s) — and published "
+                + (
+                    f"content {acquired.installed.content_digest} at "
+                    f"{acquired.installed.generation}; "
+                    if acquired.installed is not None
+                    else "source-checkout content; "
+                )
+                + f"verified {acquired.verified_bytes} byte(s), "
+                f"trusted same-boot reuse {acquired.trusted_reuse_bytes} byte(s)",
+            )
+            return acquired
+        except acquire.AcquisitionRefusal as exc:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=exc.kind,
+                    subject=placement.placement_id,
+                    reason=exc.code,
+                    detail=safe(exc.detail),
+                ),
+                terminal=exc.kind
+                in (
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                    pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
+                ),
+            )
+            return None
+        except (OSError, overlay.OverlayRefusal) as exc:
+            reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
+                    if isinstance(exc, overlay.OverlayRefusal)
+                    else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                     subject=placement.placement_id,
                     reason=reason,
                     detail=safe(str(exc)),
                 ),
-                terminal=not unavailable,
+                terminal=isinstance(exc, overlay.OverlayRefusal),
             )
             return None
-        self.note(
-            "materialization",
-            f"opened overlay receipt {expected[:23]}… at {installed.generation}",
-        )
-        return installed
 
     def _observe_acquisition(
         self, placement: Placement, value: pb.PlacementAcquisitionObservation
@@ -2057,109 +2107,6 @@ class Worker:
         placement.acquisition.CopyFrom(value)
         if placement is self.placement and self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-
-    def _resolve_bindings(self, placement: Placement) -> dict[str, DeclaredBinding] | None:
-        """Re-measure every staged plan record, then read the ONE provisioned release."""
-
-        missing: list[str] = []
-        plan_documents: dict[str, provisioned.ExactDocument] = {}
-        for plan_id in placement.plan_ids:
-            plan_digest, plan_length = placement.plan_refs[plan_id]
-            record = (
-                self.config.cozy_home
-                / "binding-plans"
-                / f"{plan_digest.removeprefix('sha256:')}.json"
-            )
-            if not record.is_file():
-                missing.append(plan_id)
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=plan_id,
-                        reason="unresolved_binding_plan",
-                        detail=f"no local record for {plan_id}",
-                    )
-                )
-                continue
-            try:
-                record_bytes = record.read_bytes()
-            except OSError as exc:
-                missing.append(plan_id)
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=plan_id,
-                        reason="binding_plan_unreadable",
-                        detail=safe(str(exc)),
-                    )
-                )
-                continue
-            measured_digest = "sha256:" + hashlib.sha256(record_bytes).hexdigest()
-            if len(record_bytes) != plan_length or measured_digest != plan_digest:
-                missing.append(plan_id)
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                        subject=plan_id,
-                        reason="binding_plan_identity_mismatch",
-                        detail=f"measured {measured_digest}/{len(record_bytes)}, expected "
-                        f"{plan_digest}/{plan_length}",
-                    )
-                )
-                continue
-            plan_documents[plan_id] = provisioned.ExactDocument(
-                provisioned.ArtifactRef(plan_digest, plan_length), record, record_bytes
-            )
-        code = ""
-        detail = ""
-        if not missing:
-            try:
-                if self.options.artifact_store is None or self.options.artifact_object_set is None:
-                    raise PlanRefusal(
-                        "artifact_store_required",
-                        "canonical provisioned bindings require the verified TensorFS store "
-                        "and exact model-root document",
-                    )
-                object_set_path = placement.model_object_set_path
-                if object_set_path is None:
-                    raise PlanRefusal(
-                        "model_object_set_required",
-                        "the placement has no staged exact model object-set document",
-                    )
-                object_set = provisioned.read_artifact_object_set(object_set_path.read_bytes())
-                selected = provisioned.read_provisioned_release(
-                    plan_documents,
-                    read_document=provisioned.staged_document_reader(
-                        self.config.cozy_home / "binding-documents"
-                    ),
-                    package_release=placement.package_release_id,
-                    store_root=self.options.artifact_store,
-                    object_set=object_set,
-                    # A weightless release never opens TensorFS. Defer the facade lookup
-                    # until the shared reader actually reaches a model-bearing binding.
-                    dtype_widths=lambda: provisioned.tensorfs_destination_widths(
-                        fill.tensorfs_module()
-                    ),
-                )
-                return dict(selected.bindings)
-            except (OSError, PlanRefusal, fill.FillRefusal) as refusal:
-                code = (
-                    refusal.code
-                    if isinstance(refusal, (PlanRefusal, fill.FillRefusal))
-                    else "artifact_object_set_unreadable"
-                )
-                detail = refusal.detail if isinstance(refusal, PlanRefusal) else str(refusal)
-        self._materialization_failed(
-            placement,
-            pb.Fault(
-                kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                subject=placement.placement_id,
-                reason=code or "unresolved_binding_plans",
-                detail=safe(detail or f"{len(missing)} binding plan(s) did not resolve"),
-            ),
-            terminal=False,
-        )
-        return None
 
     def _materialization_failed(
         self, placement: Placement, fault: pb.Fault, *, terminal: bool
@@ -2314,11 +2261,11 @@ class Worker:
                 "constructions, but one executor can own exactly one prepared generation"
             )
             for binding in self.bindings.values():
-                self.failed_bindings[binding.entrypoint_binding_plan_id] = detail
+                self.failed_bindings[binding.entrypoint_binding_digest] = detail
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=binding.entrypoint_binding_plan_id,
+                        subject=binding.entrypoint_binding_digest,
                         reason="multiple_constructions_unsupported",
                         detail=detail,
                     )
@@ -2335,7 +2282,7 @@ class Worker:
             return
 
         construction_key, group = next(iter(by_construction.items()))
-        binding_set = frozenset(binding.entrypoint_binding_plan_id for binding in group)
+        binding_set = frozenset(binding.entrypoint_binding_digest for binding in group)
         executor = self.supervision.current
         if (
             executor is not None
@@ -2345,26 +2292,26 @@ class Worker:
             and executor.prepared_binding_set == binding_set
             and executor.prepared_model is not None
         ):
-            executor.ready_plans.clear()
+            executor.ready_bindings.clear()
             for binding in group:
                 if binding.expected_logical_model_digest and (
                     binding.expected_logical_model_digest
                     != executor.prepared_model.logical_model_digest
                 ):
-                    self.failed_bindings[binding.entrypoint_binding_plan_id] = (
+                    self.failed_bindings[binding.entrypoint_binding_digest] = (
                         "logical model digest mismatch"
                     )
                     continue
-                executor.ready_plans.add(binding.entrypoint_binding_plan_id)
-                self.prepared_models[binding.entrypoint_binding_plan_id] = executor.prepared_model
+                executor.ready_bindings.add(binding.entrypoint_binding_digest)
+                self.prepared_models[binding.entrypoint_binding_digest] = executor.prepared_model
             self.engine.bindings = self.bindings
             self.engine.prepared_models = self.prepared_models
             self.note(
                 "boot",
                 f"reused generation {executor.incarnation} pid {executor.pid} for the same "
-                f"construction ({len(executor.ready_plans)} binding plan(s))",
+                f"construction ({len(executor.ready_bindings)} binding(s))",
             )
-            if executor.ready_plans:
+            if executor.ready_bindings:
                 # The high-water mark moves BEFORE the edge is published. `set_serving`
                 # reports immediately — dispatchability is an edge — and `converged_revision`
                 # CLAMPS itself back until serving actually says DISPATCHABLE, so writing it
@@ -2385,7 +2332,7 @@ class Worker:
                 executor.alive()
                 and not executor.poisoned
                 and not executor.reserved_for_job
-                and not executor.ready_plans
+                and not executor.ready_bindings
                 and executor.prepared_model is None
             ):
                 self.note(
@@ -2479,11 +2426,11 @@ class Worker:
                 self.monitor.end(subject, "executor_gone")
                 detail = f"executor disappeared during prepare: {exc}"[:1024]
                 for member in group:
-                    self.failed_bindings[member.entrypoint_binding_plan_id] = detail
+                    self.failed_bindings[member.entrypoint_binding_digest] = detail
                     self.engine.fault(
                         pb.Fault(
                             kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            subject=member.entrypoint_binding_plan_id,
+                            subject=member.entrypoint_binding_digest,
                             reason="executor_gone_during_prepare",
                             detail=safe(detail),
                         )
@@ -2514,7 +2461,7 @@ class Worker:
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=first.entrypoint_binding_plan_id,
+                        subject=first.entrypoint_binding_digest,
                         reason=str(reply.get("code")),
                         # SANITIZED, like every other detail that crosses this wire (#574b).
                         # The document profile is printable ASCII; refusal prose in this
@@ -2537,7 +2484,7 @@ class Worker:
                 # the binding that earned it, its entrypoints refuse naming it, and the
                 # loop goes on to the next group.
                 for member in group:
-                    self.failed_bindings[member.entrypoint_binding_plan_id] = (
+                    self.failed_bindings[member.entrypoint_binding_digest] = (
                         f"{reply.get('code')}: {detail}"
                     )
                 # #567c's SECOND HALF: a refusal reduced to its class name is a refusal
@@ -2549,7 +2496,7 @@ class Worker:
                 # and on everything else they are context.
                 self.note(
                     "boot",
-                    f"prepare REFUSED for {first.entrypoint_binding_plan_id[:20]}: "
+                    f"prepare REFUSED for {first.entrypoint_binding_digest[:20]}: "
                     f"{reply.get('code')} - {detail} "
                     f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
                     f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
@@ -2583,11 +2530,11 @@ class Worker:
                 ):
                     self.note(
                         "boot",
-                        f"{binding.entrypoint_binding_plan_id[:20]}… construction digest mismatch",
+                        f"{binding.entrypoint_binding_digest[:20]}… construction digest mismatch",
                     )
                     continue
-                executor.ready_plans.add(binding.entrypoint_binding_plan_id)
-                self.prepared_models[binding.entrypoint_binding_plan_id] = resolved
+                executor.ready_bindings.add(binding.entrypoint_binding_digest)
+                self.prepared_models[binding.entrypoint_binding_digest] = resolved
             self.engine.bindings = self.bindings
             self.engine.prepared_models = self.prepared_models
             self.ledger.observe_construction(reply["facts"])
@@ -2606,7 +2553,7 @@ class Worker:
             )
             self.note(
                 "boot",
-                f"prepared {len(group)} binding plan(s) in {took:.0f} ms — "
+                f"prepared {len(group)} binding(s) in {took:.0f} ms — "
                 f"{reply['facts']['filled']} destinations, "
                 f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
                 f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
@@ -2668,7 +2615,7 @@ class Worker:
         if executor is None:
             return False
         for plan_id, binding in self.bindings.items():
-            if plan_id not in executor.ready_plans:
+            if plan_id not in executor.ready_bindings:
                 continue
             spool = self.root / "warm" / binding.entrypoint
             spool.mkdir(parents=True, exist_ok=True)
@@ -3305,14 +3252,6 @@ class Worker:
             admission_state=self.admission_state(),
             available_attempt_slots=self.available_attempt_slots(),
         )
-        if self.artifact_intent is not None:
-            observed.artifact_intent.CopyFrom(
-                pb.ArtifactIntentStatus(
-                    revision=self.artifact_intent.revision,
-                    delegation_id=self.artifact_intent.delegation_id,
-                    authorization_expires_at_unix=self.artifact_intent.expires_at_unix,
-                )
-            )
         if self.accepted.mode == "job":
             observed.job_capacity.CopyFrom(self.job_capacity())
         elif self.accepted.mode == "serving":
@@ -3341,7 +3280,7 @@ class Worker:
     def placement_status(self) -> pb.PlacementStatus:
         """Per-placement truth on TWO AXES (#473/#482), and `readiness_epoch` is not among
         them: it is DELETED, not renamed (#486b), because the serving axis plus
-        `dispatchable_plan_ids` already carry what a placement can serve and the worker-level
+        `dispatchable_binding_digests` carry what a placement can serve and the worker-level
         `admission_generation` carries whether an offer is admissible. `attempt_credits` is
         gone for the same reason, one level up.
 
@@ -3352,10 +3291,14 @@ class Worker:
         """
         assert self.placement is not None
         executor = self.supervision.current
-        dispatchable = sorted(executor.ready_plans) if executor is not None else []
-        # DISJOINT by construction (the proto says so): a plan is either servable now or
+        dispatchable = sorted(executor.ready_bindings) if executor is not None else []
+        selected = {
+            str(entrypoint["entrypoint_binding_digest"])
+            for entrypoint in self.placement.entrypoints
+        }
+        # DISJOINT by construction (the proto says so): a binding is either servable now or
         # still to be materialized, never counted in both.
-        materializable = sorted(set(self.placement.plan_ids) - set(dispatchable))
+        materializable = sorted(selected - set(dispatchable))
         status = pb.PlacementStatus(
             placement_id=self.placement.placement_id,
             placement_set_digest=self.placement.placement_set_digest,
@@ -3365,8 +3308,8 @@ class Worker:
                 self.placement.retained_fallback_placement_set_digest
             ),
             executor_generation=self.supervision.incarnation,
-            dispatchable_plan_ids=dispatchable,
-            materializable_plan_ids=materializable,
+            dispatchable_binding_digests=[documents.raw(value) for value in dispatchable],
+            materializable_binding_digests=[documents.raw(value) for value in materializable],
             faults=[
                 f
                 for f in self.engine.faults[-8:]
@@ -3640,13 +3583,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--artifact-store",
         required=True,
-        help="verified TensorFS store populated from the provisioned model-root object set",
+        help="verified TensorFS store populated from selected model Manifests",
     )
-    parser.add_argument(
-        "--artifact-object-set",
-        required=True,
-        help="exact canonical model-root document for provisioned binding validation",
-    )
+    parser.add_argument("--development-project", default="", help=argparse.SUPPRESS)
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -3696,8 +3635,10 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
         artifact_store=Path(args.artifact_store).resolve(),
-        artifact_object_set=Path(args.artifact_object_set).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
+        development_project=(
+            Path(args.development_project).resolve() if args.development_project else None
+        ),
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

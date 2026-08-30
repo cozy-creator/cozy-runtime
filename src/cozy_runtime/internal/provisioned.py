@@ -215,7 +215,7 @@ def read_provisioned_release(
             f"{sorted(delivered_model_roots)}",
         )
     return ProvisionedRelease(
-        bindings={binding.entrypoint_binding_plan_id: binding for binding in bindings.values()},
+        bindings={binding.entrypoint_binding_digest: binding for binding in bindings.values()},
         documents=documents,
         config_assets=config_assets,
     )
@@ -285,7 +285,7 @@ def _read_binding(
     application = _nonempty(descriptor.get("application"), "package_descriptor.application")
     if not models:
         return DeclaredBinding(
-            entrypoint_binding_plan_id=plan_id,
+            entrypoint_binding_digest=plan_id,
             entrypoint=entrypoint,
             package_release=package_release,
             model_class="",
@@ -430,7 +430,7 @@ def _read_binding(
     except contract.ContractError as exc:
         raise PlanRefusal(exc.code, str(exc)) from exc
     return DeclaredBinding(
-        entrypoint_binding_plan_id=plan_id,
+        entrypoint_binding_digest=plan_id,
         entrypoint=entrypoint,
         package_release=package_release,
         model_class=model_class,
