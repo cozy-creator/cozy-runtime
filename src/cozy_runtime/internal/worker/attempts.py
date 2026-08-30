@@ -877,7 +877,7 @@ class AttemptEngine:
                 f"no entrypoint binding {plan_id[:24]}… is selected on this worker",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        package_release_id = declared.package_release.removeprefix("sha256:")
+        package_release_id = declared.package_release
         if attempt.spec.get("package_release_id") != package_release_id:
             raise AttemptRefusal(
                 "package_release_mismatch",
