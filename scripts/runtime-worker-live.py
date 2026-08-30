@@ -587,6 +587,7 @@ def main() -> int:
             "https://worker.tensorhub.com:0443",
             "https://worker.tensorhub.com\x00.evil",
             "https://worker.tensorhub.com\x7f.evil",
+            "https://worker.tensorhub.com .evil",
         ):
             try:
                 read_worker_host_config({**env, "COZY_WORKER_ARTIFACT_ORIGIN": bad_origin})
