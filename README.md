@@ -86,6 +86,13 @@ TLS leaf, then downloads the returned exact R2 plan directly.
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
 | `internal/fill.py` | the fill plane: a TensorFS `Checkpoint`, the pinned ring, the transaction |
 
+`checks/architecture.py` keeps versioned identities in two disjoint registries.
+`DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
+boundary. `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
+implementation, plan, and generation digests; those names are executable identity, not document
+formats. Proof-local state and benchmark reports are typed by their command/path and carry no
+global format tag.
+
 The worker never imports torch, and that is proved against the RUNNING process
 (`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
 list), not against the import graph.

@@ -33,7 +33,17 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 ENVIRONMENT_REQUEST_FORMAT = "cozy.runtime.EnvironmentProofRequest/1"
 MODEL_REQUEST_FORMAT = "cozy.runtime.ModelConstructionProofRequest/1"
-STATE_FORMAT = "cozy.runtime.proof.ModelContractState/1"
+_STATE_FIELDS = {
+    "config",
+    "config_digest",
+    "config_length",
+    "descriptor_length",
+    "environment_spec_digest",
+    "package_descriptor",
+    "package_descriptor_digest",
+    "project_wheel_digest",
+    "wheelhouse_manifest",
+}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -202,7 +212,6 @@ def _prepare(args: argparse.Namespace) -> None:
             "package_descriptor_digest": _digest(descriptor_bytes),
             "descriptor_length": len(descriptor_bytes),
             "environment_spec_digest": _digest(spec),
-            "format": STATE_FORMAT,
             "project_wheel_digest": project.digest,
             "wheelhouse_manifest": str(paths["wheelhouse_manifest"]),
         },
@@ -309,8 +318,8 @@ def _verify(root: Path) -> None:
 
 def _state(root: Path) -> dict[str, Any]:
     value = _read_json(root / "proof-state.json")
-    if not isinstance(value, dict) or value.get("format") != STATE_FORMAT:
-        raise ProofFailure("proof state is not the expected closed local format")
+    if not isinstance(value, dict) or set(value) != _STATE_FIELDS:
+        raise ProofFailure("proof state does not have the expected closed local fields")
     return value
 
 

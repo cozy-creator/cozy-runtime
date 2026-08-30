@@ -70,7 +70,7 @@ MIB = 1 << 20
 
 PASS = 0
 FAIL = 0
-REPORT: dict[str, Any] = {"format": "cozy.runtime.mxfp8_native/1"}
+REPORT: dict[str, Any] = {}
 
 
 def head(title: str) -> None:
