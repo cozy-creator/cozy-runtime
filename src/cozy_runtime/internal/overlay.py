@@ -198,7 +198,7 @@ class VerifiedFile:
 
 @dataclass(frozen=True, slots=True)
 class Input:
-    environment_spec_digest: str
+    environment_digest: str
     base_family_digest: str
     project_wheel_digest: str
     wheels: tuple[Wheel, ...]
@@ -253,7 +253,7 @@ def materialize(
     wheels join the same compiled content without weakening the receipt join.
     """
 
-    _require_digest(source.environment_spec_digest, "environment_spec_digest")
+    _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.base_family_digest, "base_family_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
     if expected_receipt_digest:
@@ -279,7 +279,7 @@ def materialize(
         return open_generation(
             root,
             receipt_digest=receipt_digest,
-            environment_spec_digest=source.environment_spec_digest,
+            environment_digest=source.environment_digest,
             base_manifest=base_manifest,
             reused=True,
             python=python,
@@ -339,7 +339,7 @@ def materialize(
     return open_generation(
         root,
         receipt_digest=receipt_digest,
-        environment_spec_digest=source.environment_spec_digest,
+        environment_digest=source.environment_digest,
         base_manifest=base_manifest,
         reused=reused,
         python=python,
@@ -350,7 +350,7 @@ def open_generation(
     root: Path,
     *,
     receipt_digest: str,
-    environment_spec_digest: str,
+    environment_digest: str,
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     reused: bool = True,
     python: Path = Path(sys.executable),
@@ -364,7 +364,7 @@ def open_generation(
     """
 
     _require_digest(receipt_digest, "receipt_digest")
-    _require_digest(environment_spec_digest, "environment_spec_digest")
+    _require_digest(environment_digest, "environment_digest")
     receipt_path = root / "receipts" / f"{receipt_digest.removeprefix('sha256:')}.json"
     try:
         receipt_bytes = receipt_path.read_bytes()
@@ -373,8 +373,8 @@ def open_generation(
     if _sha(receipt_bytes) != receipt_digest:
         raise OverlayRefusal("overlay_receipt_corrupt", str(receipt_path))
     value = parse_environment_receipt(receipt_bytes)
-    if value.get("environment_spec_digest") != environment_spec_digest:
-        raise OverlayRefusal("overlay_receipt_wrong_spec", environment_spec_digest)
+    if value.get("environment_digest") != environment_digest:
+        raise OverlayRefusal("overlay_receipt_wrong_environment", environment_digest)
     base_digest = value.get("base_family_digest")
     if not isinstance(base_digest, str):
         raise OverlayRefusal("overlay_receipt_invalid", "base family is not a digest")
@@ -430,14 +430,14 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
         raise OverlayRefusal("overlay_receipt_invalid", str(exc)) from exc
     fields = {
         "base_family_digest",
-        "environment_spec_digest",
+        "environment_digest",
         "format",
         "overlay_wheels",
         "project_wheel_digest",
     }
     if not isinstance(value, dict) or set(value) != fields or value.get("format") != RECEIPT_FORMAT:
         raise OverlayRefusal("overlay_receipt_invalid", "wrong fields or format")
-    for field in ("base_family_digest", "environment_spec_digest", "project_wheel_digest"):
+    for field in ("base_family_digest", "environment_digest", "project_wheel_digest"):
         item = value.get(field)
         if not isinstance(item, str):
             raise OverlayRefusal("overlay_receipt_invalid", f"{field} is not a digest")
@@ -1277,7 +1277,7 @@ def _install_path(name: str) -> PurePosixPath | None:
 def _receipt(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
     return {
         "base_family_digest": source.base_family_digest,
-        "environment_spec_digest": source.environment_spec_digest,
+        "environment_digest": source.environment_digest,
         "format": RECEIPT_FORMAT,
         "overlay_wheels": [
             {

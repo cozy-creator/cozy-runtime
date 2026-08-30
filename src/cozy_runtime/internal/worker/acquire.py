@@ -1,49 +1,44 @@
-"""The acquisition walk: desired bytes plus one direct Tensorhub plan become local state.
+"""Acquire the exact bytes selected by one PlacementSet/3.
 
-`converge_placement` used to only VERIFY: it read a receipt-selected generation that something
-else had already built and binding-plan records something else had already staged. Nothing
-built or staged them, because cr-048 retired the boot closure that did. This module is the
-missing door.
-
-**The set is the authority on WHAT; the plan is access only.** The walk never reads the plan's
-artifact `kind` to decide what a digest means — it
-starts at the two digests the Placement names (`environment_spec_digest`,
-`installed_environment_receipt_digest`) plus the spec's binding-plan subjects, and every
-further digest is REACHED from a document already fetched and verified:
-
-    environment_spec -> package_bundle -> resolved_wheel_set + wheelhouse_manifest -> wheels
-    binding_plan     -> resolved_model_binding -> model_construction_contract + model config
-    binding_plan     -> descriptor
-
-That reachability is th-044/th-046's canonical join, and it already exists as documents;
-`placement_materialization.environment_input` is its reader. What never existed was a caller. This
-module is that caller. The plan is never interpreted as a wheel or model closure.
-
-Every byte enters through `placement_materialization.fetch_exact`: one bounded exact-digest HTTPS
-GET, no proxy, no redirect, no content transform, sha256-and-length before trust. There is
-no second fetcher.
+The PlacementSet is the complete statement of WHAT to run. Tensorhub's mTLS response contains
+only short-lived locations for the closure the Hub derives from that accepted set. This module
+never reads an artifact role from the access plan and never reconstructs the deleted bundle,
+environment-specification, object-set, or binding documents.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
 from typing import Any, Literal, TypeAlias
 
-from cozy_runtime.internal import canonical, overlay, placement_materialization, provisioned
+from cozy_runtime import qualification
+from cozy_runtime.internal import (
+    canonical,
+    contract,
+    fill,
+    overlay,
+    placement_materialization,
+    pull,
+)
+from cozy_runtime.internal import (
+    descriptor as package_descriptor,
+)
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.artifact_access import ArtifactPlan
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 FaultKind: TypeAlias = pb.FaultKind
 LegName: TypeAlias = Literal["package", "model"]
-
-#: Documents in the walk are small and bounded; a wheel is capped by `fetch_exact` itself.
+PACKAGE_RELEASE_FORMAT = "cozy.package.release/1"
 MAX_DOCUMENT_BYTES = 64 << 20
 
 
@@ -66,11 +61,7 @@ class _Leg:
 
 
 class AcquisitionObservation:
-    """Observation-only acquisition clocks and byte counters.
-
-    No method returns a verdict and callback failures are swallowed deliberately: telemetry
-    cannot gate fetch, materialization, acceptance, or convergence.
-    """
+    """Observation-only acquisition clocks and byte counters."""
 
     def __init__(self, callback: Any = None) -> None:
         self._lock = Lock()
@@ -81,9 +72,7 @@ class AcquisitionObservation:
         with self._lock:
             row = self._legs[leg]
             row.started = max(1, time.monotonic_ns())
-            row.ended = 0
-            row.downloaded = 0
-            row.reused = 0
+            row.ended = row.downloaded = row.reused = 0
             snapshot = self._snapshot_locked()
         self._publish(snapshot)
 
@@ -125,19 +114,12 @@ class AcquisitionObservation:
     def _publish(self, snapshot: pb.PlacementAcquisitionObservation) -> None:
         if self._callback is None:
             return
-        try:
+        with suppress(Exception):
             self._callback(snapshot)
-        except Exception:
-            return
 
 
 class VerifiedArtifactCache:
-    """One worker-boot's stable-file receipts for exact acquisition bytes.
-
-    The table is deliberately memory-only: restart loses every receipt and therefore
-    re-hashes cached bytes once.  Within a boot, root-owned cache files may be trusted only
-    while their complete stat identity remains unchanged.
-    """
+    """One worker-boot's stable-file receipts for exact acquisition bytes."""
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -157,39 +139,96 @@ class VerifiedArtifactCache:
         return receipt
 
 
-def observe_model_sources(
-    observation: AcquisitionObservation, outcome: placement_materialization.MaterializedObjects
-) -> None:
-    """Project TensorFS source evidence into the model leg's counters."""
-
-    observation.add(
-        "model",
-        downloaded=outcome.sources["cloud"]["bytes"],
-        reused=(outcome.sources["local"]["bytes"] + outcome.sources["network_cache"]["bytes"]),
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
-    """What one converged acquisition produced, all of it re-measurable on disk."""
-
-    installed: overlay.InstalledOverlay
-    object_set: Path
+    installed: overlay.InstalledOverlay | None
+    bindings: Mapping[str, DeclaredBinding]
     model_objects: int
-    plans: tuple[str, ...]
-    documents: tuple[str, ...]
+    documents: int
     wheels: int
     fetched_bytes: int
     verified_bytes: int
     trusted_reuse_bytes: int
 
 
-class Acquirer:
-    """One placement's acquisition against one direct-Tensorhub plan.
+def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlacement:
+    """Resolve a source-checkout development placement without inventing an install overlay.
 
-    Storage is a constructor argument and never a document field: local paths are the
-    provisioner's choice and no canonical document may name one.
+    Product local venvs use :class:`Acquirer` and exact EnvironmentReceipt just like pods. The
+    `cozy-runtime run` source-checkout lane already executes the checked-out project directly;
+    this narrow seam keeps that development feature while still deriving its binding identities
+    from PlacementSet/3 rather than reviving binding-plan files.
     """
+
+    if placement.models or any(entrypoint.get("slots") for entrypoint in placement.entrypoints):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "development_placement_not_weightless",
+            "source-checkout execution supports only model-free entrypoints",
+        )
+    descriptor_digest, descriptor_length = placement.package_descriptor
+    descriptor_path = cache_root / descriptor_digest.removeprefix("sha256:")
+    _verify_file(descriptor_path, descriptor_digest, descriptor_length)
+    try:
+        descriptor = package_descriptor.read_bytes(
+            descriptor_path.read_bytes(), str(descriptor_path)
+        )
+    except package_descriptor.StalePackageDescriptor as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+        ) from exc
+    visible = _visible_entrypoints(descriptor)
+    selected = {str(row["name"]): row for row in placement.entrypoints}
+    if set(visible) != set(selected):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "binding_entrypoint_set_mismatch",
+            "PlacementSet/3 does not cover every descriptor entrypoint",
+        )
+    package_release = placement.package_release[0]
+    environment_digest = documents.spell(placement.environment_digest)
+    receipt_digest = documents.spell(placement.environment_receipt_digest)
+    receipt_path = cache_root / receipt_digest.removeprefix("sha256:")
+    receipt_raw = _verify_file(receipt_path, receipt_digest, None)
+    qualification_digest, qualification_length = placement.qualification
+    qualification_path = cache_root / qualification_digest.removeprefix("sha256:")
+    qualification_raw = _verify_file(qualification_path, qualification_digest, qualification_length)
+    expected_selection = qualification.selection_digest(
+        bindings_digest=documents.spell(placement.bindings_digest),
+        environment_digest=environment_digest,
+        environment_receipt={"digest": receipt_digest, "length": len(receipt_raw)},
+        package_descriptor={"digest": descriptor_digest, "length": descriptor_length},
+        package_release={
+            "digest": placement.package_release[0],
+            "length": placement.package_release[1],
+        },
+    )
+    if qualification.read(qualification_raw) != expected_selection:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "qualification_selection_mismatch",
+            "Qualification does not authorize this exact PlacementSet/3 selection",
+        )
+    bindings = {
+        str(row["entrypoint_binding_digest"]): DeclaredBinding(
+            entrypoint_binding_digest=str(row["entrypoint_binding_digest"]),
+            entrypoint=name,
+            package_release=package_release,
+            release=package_release,
+            environment_digest=environment_digest,
+            model_class="",
+            model_binding_path="",
+            model_parameter_name="",
+            application=str(descriptor.get("application", "")),
+            descriptor_path=str(descriptor_path),
+        )
+        for name, row in selected.items()
+    }
+    return AcquiredPlacement(None, bindings, 0, 3, 0, 0, descriptor_length, 0)
+
+
+class Acquirer:
+    """One placement's concurrent package/model acquisition."""
 
     def __init__(
         self,
@@ -197,9 +236,7 @@ class Acquirer:
         *,
         cache_root: Path,
         environment_root: Path,
-        plans_root: Path,
-        documents_root: Path,
-        object_sets_root: Path,
+        selection_root: Path,
         artifact_store: Path,
         python: Path,
         verified_cache: VerifiedArtifactCache | None = None,
@@ -208,16 +245,11 @@ class Acquirer:
         self.plan = plan
         self.cache_root = cache_root
         self.environment_root = environment_root
-        self.plans_root = plans_root
-        self.documents_root = documents_root
-        self.object_sets_root = object_sets_root
+        self.selection_root = selection_root
         self.artifact_store = artifact_store
         self.python = python
         self.verified_cache = verified_cache or VerifiedArtifactCache()
-        self.fetched_bytes = 0
-        self.verified_bytes = 0
-        self.trusted_reuse_bytes = 0
-        self.wheels = 0
+        self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
         self._fetch_lock = Lock()
         self._new_digests: set[str] = set()
         self._metric_digests: set[str] = set()
@@ -225,64 +257,52 @@ class Acquirer:
         self._thread = local()
         self.observation = AcquisitionObservation(on_observation)
 
-    # ---- the one door bytes enter through -------------------------------------------
-
-    def _deadline(self, digest: str) -> int:
-        """The Tensorhub plan's expiry is the download deadline."""
-
-        deadline = self.plan.deadline(digest)
-        if deadline <= 0:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
-                "artifact_authorization_absent",
-                "a direct artifact plan states when it expires or authorizes nothing",
-            )
-        if time.time() >= deadline:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
-                "artifact_authorization_expired",
-                f"the direct artifact plan for {digest} expired at {deadline}",
-            )
-        return deadline
-
     def fetch(self, digest: str, length: int, *, observe: bool = True) -> Path:
-        """Fetch one AUTHORIZED digest. Authority is checked before a socket is opened."""
+        """Read one reached exact ref locally, or fetch it through the current Hub plan."""
 
-        authorized = self.plan.subjects.get(digest)
-        if authorized is None:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "artifact_plan_missing",
-                f"{digest} is reached by the desired spec but absent from Tensorhub's plan",
-            )
-        if authorized != length:
+        target = self.cache_root / digest.removeprefix("sha256:")
+        planned = self.plan.subjects.get(digest)
+        if planned is not None and planned != length:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
                 "artifact_length_conflict",
-                f"{digest} is named at {length} B and authorized at {authorized} B",
+                f"{digest} is named at {length} B and planned at {planned} B",
             )
-        target = self.cache_root / digest.removeprefix("sha256:")
         already = target.exists()
         trusted = self.verified_cache.trusted(digest, length, target)
         trusted_before = trusted is not None
         try:
             if trusted is not None:
                 path = target
+            elif already:
+                _verify_file(target, digest, length)
+                path = target
+                trusted = self.verified_cache.record(digest, length, target)
             else:
-                url = self.plan.locations.get(digest)
-                if not url:
+                location = self.plan.locations.get(digest)
+                deadline = self.plan.deadline(digest)
+                if planned is None or not location:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        "artifact_location_absent",
-                        f"{digest} is authorized but the plan carries no location for it",
+                        "artifact_plan_missing",
+                        f"{digest} is reached by PlacementSet/3 and absent locally and "
+                        "from the plan",
+                    )
+                if deadline <= int(time.time()):
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                        "artifact_grant_expired",
+                        f"the presigned read for {digest} expired at {deadline}",
                     )
                 path = placement_materialization.fetch_exact(
-                    {"digest": digest, "length": length, "url": url},
+                    {"digest": digest, "length": length, "url": location},
                     self.cache_root,
-                    deadline=self._deadline(digest),
+                    deadline=deadline,
                     allow_local=self.plan.allow_local,
                 )
                 trusted = self.verified_cache.record(digest, length, path)
+        except AcquisitionRefusal:
+            raise
         except LaunchRefusal as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH
@@ -291,6 +311,7 @@ class Acquirer:
                     "grant_identity_mismatch",
                     "grant_length_mismatch",
                     "local_artifact_digest_mismatch",
+                    "local_artifact_identity_mismatch",
                     "local_artifact_invalid",
                 }
                 else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
@@ -298,10 +319,7 @@ class Acquirer:
                 exc.detail,
             ) from exc
         with self._fetch_lock:
-            # Content-addressed resume: a complete object is never re-fetched, so the
-            # measured cost of a replay is the objects that were still missing (§1
-            # Recovery). Only new bytes are counted.
-            if not already and digest not in self._new_digests and target == path:
+            if not already and digest not in self._new_digests:
                 self._new_digests.add(digest)
                 self.fetched_bytes += length
             if digest not in self._metric_digests:
@@ -312,17 +330,13 @@ class Acquirer:
                     self.verified_bytes += length
             leg = getattr(self._thread, "leg", None)
             if observe and leg in self._observed_digests:
-                observed = self._observed_digests[leg]
-                if digest not in observed:
-                    observed.add(digest)
+                seen = self._observed_digests[leg]
+                if digest not in seen:
+                    seen.add(digest)
                     self.observation.add(
-                        leg,
-                        downloaded=0 if already else length,
-                        reused=length if already else 0,
+                        leg, downloaded=0 if already else length, reused=length if already else 0
                     )
         return path
-
-    # ---- the walk ---------------------------------------------------------------------
 
     def acquire(
         self,
@@ -330,25 +344,19 @@ class Acquirer:
         *,
         on_package_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
     ) -> AcquiredPlacement:
-        """Fetch, build, and stage everything one Placement reaches. Fail closed."""
-
-        # The package closure and model-object closure are the two observed legs. They
-        # start together. Binding/model documents are small package control bytes and ride
-        # the package leg; model-object-set document bytes are identity and excluded from
-        # the model byte counter by protocol definition.
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
             package_future = pool.submit(self._run_package, placement)
             model_future = pool.submit(self._run_model, placement)
-            installed, plans, staged = package_future.result()
+            installed, bindings, documents_count = package_future.result()
             if on_package_ready is not None:
                 on_package_ready(installed)
-            object_set, model_objects = model_future.result()
+            model_objects = model_future.result()
+        self._verify_model_refs(bindings)
         return AcquiredPlacement(
             installed=installed,
-            object_set=object_set,
+            bindings=bindings,
             model_objects=model_objects,
-            plans=plans,
-            documents=staged,
+            documents=documents_count,
             wheels=self.wheels,
             fetched_bytes=self.fetched_bytes,
             verified_bytes=self.verified_bytes,
@@ -357,17 +365,17 @@ class Acquirer:
 
     def _run_package(
         self, placement: Any
-    ) -> tuple[overlay.InstalledOverlay, tuple[str, ...], tuple[str, ...]]:
+    ) -> tuple[overlay.InstalledOverlay, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
             installed = self._environment(placement)
-            plans, staged = self._bindings(placement)
-            return installed, plans, staged
+            bindings, count = self._bindings(placement, installed)
+            return installed, bindings, count
         finally:
             self.observation.finish("package")
 
-    def _run_model(self, placement: Any) -> tuple[Path, int]:
+    def _run_model(self, placement: Any) -> int:
         self._thread.leg = "model"
         self.observation.start("model")
         try:
@@ -375,135 +383,44 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _models(self, placement: Any) -> tuple[Path, int]:
-        """Fetch the exact object-set document, then hydrate every model root into TensorFS."""
-
-        digest, length = placement.model_object_set
-        if not digest or length <= 0:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "model_object_set_absent",
-                "PlacementSet/2 names one exact model_object_set subject",
-            )
-        raw = self.fetch(digest, length, observe=False).read_bytes()
-        self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        self.object_sets_root.chmod(0o755)
-        try:
-            object_set = provisioned.read_artifact_object_set(raw)
-        except Exception as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "model_object_set_invalid",
-                str(exc),
-            ) from exc
-        locations: dict[str, str] = {}
-        for object_digest, object_length in object_set.refs.items():
-            authorized = self.plan.subjects.get(object_digest)
-            if authorized != object_length:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                    "model_object_plan_missing",
-                    f"{object_digest} is required at {object_length} B and planned at "
-                    f"{authorized!r}",
-                )
-            location = self.plan.locations.get(object_digest)
-            if not location:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                    "model_object_location_absent",
-                    object_digest,
-                )
-            locations[object_digest] = location
-        try:
-            deadlines = [self.plan.deadline(digest) for digest in object_set.refs]
-            deadline = min(deadlines) if deadlines else self.plan.expires_at_unix
-            if deadline <= 0 or time.time() >= deadline:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
-                    "artifact_authorization_expired",
-                    f"model artifact plan expired at {deadline}",
-                )
-            outcome = placement_materialization.materialize_objects(
-                locations,
-                object_set,
-                cache=None,
-                deadline=deadline,
-                store_root=self.artifact_store,
-                allow_local=self.plan.allow_local,
-            )
-        except LaunchRefusal as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                exc.code,
-                exc.detail,
-            ) from exc
-        observe_model_sources(self.observation, outcome)
-        self._stage(self.object_sets_root, digest, raw)
-        return self.object_sets_root / _name(digest), len(object_set.refs)
-
     def _environment(self, placement: Any) -> overlay.InstalledOverlay:
-        """Environment spec -> source/custom wheels -> one small installed-base overlay."""
-
-        spec_digest = documents.spell(placement.environment_spec_digest)
-        receipt_digest = documents.spell(placement.installed_environment_receipt_digest)
-        if not spec_digest or not receipt_digest:
+        release_digest, release_length = placement.package_release
+        release_raw = self.fetch(release_digest, release_length).read_bytes()
+        environment_digest = documents.spell(placement.environment_digest)
+        receipt_digest = documents.spell(placement.environment_receipt_digest)
+        wheelhouse = _ref(placement.environment["wheelhouse_manifest"], "wheelhouse_manifest")
+        wheelhouse_raw = self.fetch(*wheelhouse).read_bytes()
+        release = _document(release_raw, "package_release")
+        if release.get("format") != PACKAGE_RELEASE_FORMAT:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "environment_identity_absent",
-                "a Placement names its environment and its expected receipt, or it is "
-                "not one this worker can materialize",
+                "package_release_format",
+                str(release.get("format")),
             )
-        spec_length = self._authorized_length(spec_digest, "environment_spec")
-        spec_bytes = self.fetch(spec_digest, spec_length).read_bytes()
-        spec = self._parse(spec_bytes, "environment_spec")
-        bundle_ref = self._digest_ref(spec, "package_bundle_digest", "environment_spec")
-        wheelhouse_ref = self._digest_ref(spec, "wheelhouse_manifest_digest", "environment_spec")
-        bundle_bytes = self.fetch(
-            bundle_ref, self._authorized_length(bundle_ref, "package_bundle")
-        ).read_bytes()
-        bundle = self._parse(bundle_bytes, "package_bundle")
-        # The source tree proves what the project wheel was built from. It is
-        # provenance, not an executable placement object, so do not fetch it.
-        self._ref(bundle.get("source_tree"), "source_tree")
-        resolved_ref = self._ref(bundle.get("resolved_wheel_set"), "resolved_wheel_set")
-        wheelhouse_bundle_ref = self._ref(bundle.get("wheelhouse_manifest"), "wheelhouse_manifest")
-        if wheelhouse_bundle_ref[0] != wheelhouse_ref:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "wheelhouse_manifest_ref_mismatch",
-                "the package bundle and the environment spec name different wheelhouses",
-            )
-        resolved_bytes = self.fetch(*resolved_ref).read_bytes()
-        wheelhouse_bytes = self.fetch(*wheelhouse_bundle_ref).read_bytes()
-        resolved = self._parse(resolved_bytes, "resolved_wheel_set")
-        self._parse(wheelhouse_bytes, "wheelhouse_manifest")
-
+        wheel_rows = [release["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
-        verified_wheels: dict[str, overlay.VerifiedFile] = {}
-        for row in (
-            bundle.get("project_wheel"),
-            *self._rows(resolved.get("wheels"), "resolved_wheel_set"),
-        ):
-            digest, length = self._wheel_ref(row)
-            wheel_paths[digest] = self.fetch(digest, length)
-            verified = self.verified_cache.trusted(digest, length, wheel_paths[digest])
-            if verified is None:
+        verified: dict[str, overlay.VerifiedFile] = {}
+        for row in wheel_rows:
+            digest, length = _ref(row["ref"], "wheel.ref")
+            path = self.fetch(digest, length)
+            wheel_paths[digest] = path
+            receipt = self.verified_cache.trusted(digest, length, path)
+            if receipt is None:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
                     "wheel_verification_receipt_absent",
                     digest,
                 )
-            verified_wheels[digest] = verified
+            verified[digest] = receipt
         self.wheels = len(wheel_paths)
-
         try:
             source = placement_materialization.package_overlay_input(
-                environment_spec_bytes=spec_bytes,
-                package_bundle_bytes=bundle_bytes,
-                resolved_wheel_set_bytes=resolved_bytes,
-                wheelhouse_manifest_bytes=wheelhouse_bytes,
+                package_release_bytes=release_raw,
+                environment=placement.environment,
+                environment_digest=environment_digest,
+                wheelhouse_manifest_bytes=wheelhouse_raw,
                 wheel_paths=wheel_paths,
-                verified_wheels=verified_wheels,
+                verified_wheels=verified,
             )
             return overlay.materialize(
                 source,
@@ -520,157 +437,391 @@ class Acquirer:
                 exc.detail,
             ) from exc
 
-    def _bindings(self, placement: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Stage the plan records and every document those plans REACH."""
+    def _models(self, placement: Any) -> int:
+        if not placement.models:
+            return 0
+        try:
+            tensorfs = fill.tensorfs_module()
+            store = pull.open_store(tensorfs, self.artifact_store)
+            count = 0
+            for model in placement.models:
+                manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
+                manifest_path = self.fetch(manifest_digest, manifest_length)
+                manifest_raw = manifest_path.read_bytes()
+                store.put_manifest(manifest_raw, manifest_digest, manifest_length)
+                direct = _manifest_entries(manifest_raw)
+                for digest, length in direct:
+                    path = self.fetch(digest, length)
+                    store.put_file(str(path), digest, length)
+                reached = {
+                    (str(row["id"]), int(row["length"])) for row in store.walk(manifest_digest)
+                }
+                closure = {(manifest_digest, manifest_length), *reached}
+                if self.plan.authorized():
+                    reads: list[pull.Read] = []
+                    for digest, length in sorted(closure):
+                        planned = self.plan.subjects.get(digest)
+                        location = self.plan.locations.get(digest)
+                        if planned != length or not location:
+                            raise AcquisitionRefusal(
+                                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                                "model_manifest_plan_incomplete",
+                                f"{digest} is reached at {length} B and not exactly planned",
+                            )
+                        reads.append(pull.Read(digest, length, location))
+                    deadline = min(self.plan.deadline(digest) for digest, _ in closure)
+                    outcome = pull.pull_granted_manifest(
+                        tensorfs,
+                        store,
+                        manifest_digest,
+                        manifest_length,
+                        reads,
+                        timeout=max(0.001, float(deadline) - time.time()),
+                        session="placement-" + manifest_digest[7:19],
+                        allow_local=self.plan.allow_local,
+                    )
+                    self.observation.add(
+                        "model",
+                        downloaded=outcome.bytes_moved,
+                        reused=max(0, outcome.bytes_total - outcome.bytes_moved),
+                    )
+                else:
+                    store.acquire_manifest(manifest_digest).close()
+                count += len(closure)
+            return count
+        except AcquisitionRefusal:
+            raise
+        except (pull.PullRefusal, fill.FillRefusal) as exc:
+            code = exc.code if isinstance(exc, pull.PullRefusal) else "tensorfs_refused"
+            detail = exc.message if isinstance(exc, pull.PullRefusal) else str(exc)
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED, code, detail
+            ) from exc
+        except Exception as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                "tensorfs_refused",
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
 
-        self.plans_root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        self.documents_root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        self.plans_root.chmod(0o755)
-        self.documents_root.chmod(0o755)
-        staged: list[str] = []
-        package_descriptor_digest = documents.spell(placement.package_descriptor_digest)
-        for plan_id in placement.plan_ids:
-            plan_digest, plan_length = placement.plan_refs[plan_id]
-            plan_path = self.fetch(plan_digest, plan_length)
-            self._stage(self.plans_root, plan_digest, plan_path.read_bytes())
-            plan = self._parse(plan_path.read_bytes(), "entrypoint_binding_plan")
-            plan_descriptor = self._ref(plan.get("package_descriptor"), "plan.package_descriptor")
-            if plan_descriptor[0] != package_descriptor_digest:
+    def _bindings(
+        self, placement: Any, installed: overlay.InstalledOverlay
+    ) -> tuple[Mapping[str, DeclaredBinding], int]:
+        descriptor_digest, descriptor_length = placement.package_descriptor
+        descriptor_path = self._stage(
+            descriptor_digest, self.fetch(descriptor_digest, descriptor_length).read_bytes()
+        )
+        try:
+            descriptor = package_descriptor.read_bytes(
+                descriptor_path.read_bytes(), str(descriptor_path)
+            )
+        except package_descriptor.StalePackageDescriptor as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+            ) from exc
+        qualification_digest, qualification_length = placement.qualification
+        qualification_raw = self.fetch(qualification_digest, qualification_length).read_bytes()
+        try:
+            selected = qualification.read(qualification_raw)
+            expected = qualification.selection_digest(
+                bindings_digest=documents.spell(placement.bindings_digest),
+                environment_digest=documents.spell(placement.environment_digest),
+                environment_receipt={
+                    "digest": installed.receipt_digest,
+                    "length": len(installed.receipt_bytes),
+                },
+                package_descriptor={
+                    "digest": descriptor_digest,
+                    "length": descriptor_length,
+                },
+                package_release={
+                    "digest": placement.package_release[0],
+                    "length": placement.package_release[1],
+                },
+            )
+        except qualification.QualificationError as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "qualification_invalid", str(exc)
+            ) from exc
+        if selected != expected:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "qualification_selection_mismatch",
+                "Qualification does not authorize this exact PlacementSet/3 selection",
+            )
+        self._stage(qualification_digest, qualification_raw)
+        visible = _visible_entrypoints(descriptor)
+        models = {str(row["id"]): row for row in placement.models}
+        package_release = placement.package_release[0]
+        bindings: dict[str, DeclaredBinding] = {}
+        count = 2
+        for entrypoint in placement.entrypoints:
+            name = str(entrypoint["name"])
+            binding_digest = str(entrypoint["entrypoint_binding_digest"])
+            described = visible.get(name)
+            if described is None:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "plan_package_descriptor_mismatch",
-                    f"{plan_id} names descriptor {plan_descriptor[0]}, the spec names "
-                    f"{package_descriptor_digest}",
+                    "binding_package_descriptor_invalid",
+                    f"descriptor has no entrypoint {name!r}",
                 )
-            staged.append(self._document(*plan_descriptor, "package_descriptor"))
-            for binding in self._rows(plan.get("bindings"), "entrypoint_binding_plan"):
-                if not isinstance(binding, dict):
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "plan_binding_invalid",
-                        "a plan binding is a JSON object",
-                    )
-                binding_ref = self._ref(binding.get("binding"), "plan.binding")
-                staged.append(self._document(*binding_ref, "resolved_model_binding"))
-                model = self._parse(
-                    (self.documents_root / _name(binding_ref[0])).read_bytes(),
-                    "resolved_model_binding",
-                )
-                config = model.get("config")
-                if not isinstance(config, dict):
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "resolved_model_binding_invalid",
-                        "config is a JSON object",
-                    )
-                contract = self._ref(
-                    model.get("model_construction_contract"), "model_construction_contract"
-                )
-                staged.append(self._document(*contract, "model_construction_contract"))
-                document = self._ref(config.get("document"), "model_config")
-                staged.append(self._document(*document, "model_config"))
-        return tuple(placement.plan_ids), tuple(sorted(set(staged)))
-
-    # ---- staging and parsing ------------------------------------------------------------
-
-    def _document(self, digest: str, length: int, name: str) -> str:
-        self._stage(self.documents_root, digest, self.fetch(digest, length).read_bytes())
-        return digest
-
-    def _stage(self, root: Path, digest: str, raw: bytes) -> None:
-        """Publish exact bytes once under their own digest; a replay converges."""
-
-        target = root / _name(digest)
-        if target.exists():
-            if target.read_bytes() != raw:
+            slots = entrypoint.get("slots", [])
+            described_models = described.get("models", [])
+            if not isinstance(described_models, list) or len(slots) != len(described_models):
                 raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    "staged_document_conflict",
-                    f"{target} already holds different bytes",
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
+            if len(slots) > 1:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "binding_slot_count_unsupported",
+                    "this Runtime currently supports at most one selected model slot per "
+                    "entrypoint",
+                )
+            application = str(descriptor.get("application", ""))
+            if not slots:
+                bindings[binding_digest] = DeclaredBinding(
+                    entrypoint_binding_digest=binding_digest,
+                    entrypoint=name,
+                    package_release=package_release,
+                    release=package_release,
+                    environment_digest=documents.spell(placement.environment_digest),
+                    model_class="",
+                    model_binding_path="",
+                    model_parameter_name="",
+                    application=application,
+                    descriptor_path=str(descriptor_path),
+                )
+                continue
+            slot = slots[0]
+            declared = described_models[0]
+            if (
+                not isinstance(declared, dict)
+                or declared.get("path") != f"{name}.models.{slot['slot']}"
+            ):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "binding_package_descriptor_invalid",
+                    name,
+                )
+            config_ref = _ref(slot["config"]["document"], "slot.config.document")
+            config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
+            contract_ref = _ref(slot["model_construction_contract"], "slot.mcc")
+            contract_raw = self.fetch(*contract_ref).read_bytes()
+            self._stage(contract_ref[0], contract_raw)
+            count += 2
+            try:
+                construction = contract.read_contract(contract_raw)
+            except contract.ContractError as exc:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "model_construction_contract_invalid",
+                    str(exc),
+                ) from exc
+            candidate = construction.candidate
+            reference = models[str(slot["reference_model_id"])]
+            reference_manifest = str(reference["manifest"]["digest"])
+            model_class = str(declared.get("class", ""))
+            if (
+                candidate.release not in {package_release, package_release.removeprefix("sha256:")}
+                or candidate.application != application
+                or not candidate.model_class.endswith(":" + model_class)
+                or candidate.snapshot != reference_manifest
+                or candidate.config_digest != config_ref[0]
+            ):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "selected_binding_mismatch",
+                    f"{name}: MCC candidate does not equal PlacementSet/3",
+                )
+            components = tuple(str(row["component"]) for row in slot.get("components", []))
+            if components != tuple(row.component for row in construction.destination_sets):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "selected_binding_mismatch",
+                    f"{name}: component order differs from the MCC",
+                )
+            snapshots = {
+                str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
+                for row in slot.get("components", [])
+            }
+            stamps: dict[str, set[str]] = {}
+            for row in slot.get("stamps", []):
+                stamps.setdefault(str(row["key"]), set()).update(str(v) for v in row["values"])
+            descriptor_stamps = declared.get("stamps", {})
+            if not isinstance(descriptor_stamps, dict) or any(
+                value not in stamps.get(str(key), set()) for key, value in descriptor_stamps.items()
+            ):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "selected_binding_mismatch",
+                    f"{name}: descriptor stamps are not selected",
+                )
+            try:
+                model_weight_bytes = contract.destination_resident_bytes(
+                    construction, contract.tensorfs_destination_widths(fill.tensorfs_module())
+                )
+            except (contract.ContractError, fill.FillRefusal) as exc:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "model_construction_contract_invalid",
+                    str(exc),
+                ) from exc
+            bindings[binding_digest] = DeclaredBinding(
+                entrypoint_binding_digest=binding_digest,
+                entrypoint=name,
+                package_release=package_release,
+                release=package_release,
+                environment_digest=documents.spell(placement.environment_digest),
+                model_class=model_class,
+                model_binding_path=str(declared["path"]),
+                model_parameter_name=str(slot["slot"]),
+                application=application,
+                descriptor_path=str(descriptor_path),
+                store=str(self.artifact_store),
+                config=str(config_path),
+                variant=candidate.hardware_variant,
+                reference_snapshot=reference_manifest,
+                components=components,
+                snapshots=snapshots,
+                stamps={key: tuple(sorted(values)) for key, values in sorted(stamps.items())},
+                model_weight_bytes=model_weight_bytes,
+                expected_logical_model_digest=contract.logical_model_digest(construction),
+            )
+            for asset in slot["config"].get("assets", []):
+                ref = _ref(asset["ref"], "slot.config.asset")
+                self._stage(ref[0], self.fetch(*ref).read_bytes())
+                count += 1
+        if set(visible) != {str(row["name"]) for row in placement.entrypoints}:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "binding_entrypoint_set_mismatch",
+                "PlacementSet/3 does not cover every descriptor entrypoint",
+            )
+        return bindings, count
+
+    def _verify_model_refs(self, bindings: Mapping[str, DeclaredBinding]) -> None:
+        if not any(not binding.weightless for binding in bindings.values()):
             return
-        temporary = root / f".stage-{digest.removeprefix('sha256:')[:16]}"
+        try:
+            store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+            for binding in bindings.values():
+                for digest in {binding.reference_snapshot, *binding.snapshots.values()}:
+                    store.acquire_manifest(digest).close()
+        except Exception as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                "selected_model_manifest_unavailable",
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+    def _stage(self, digest: str, raw: bytes) -> Path:
+        self.selection_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self.selection_root.chmod(0o755)
+        target = self.selection_root / digest.removeprefix("sha256:")
+        if target.exists():
+            _verify_file(target, digest, len(raw))
+            return target
+        temporary = self.selection_root / f".stage-{digest[7:23]}"
         temporary.write_bytes(raw)
         temporary.chmod(0o444)
         temporary.replace(target)
+        return target
 
-    def _authorized_length(self, digest: str, name: str) -> int:
-        length = self.plan.subjects.get(digest)
-        if length is None:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "artifact_plan_missing",
-                f"{name} {digest} is named by the desired spec and absent from the plan",
-            )
-        return length
 
-    def _parse(self, raw: bytes, name: str) -> dict[str, Any]:
-        try:
-            value = canonical.parse_canonical(raw)
-        except canonical.CanonicalError as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_noncanonical", str(exc)
-            ) from exc
-        if not isinstance(value, dict):
+def _verify_file(path: Path, digest: str, length: int | None) -> bytes:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+            "local_artifact_unreadable",
+            str(exc),
+        ) from exc
+    measured = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if (length is not None and len(raw) != length) or measured != digest:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+            "local_artifact_identity_mismatch",
+            f"measured {measured}/{len(raw)}, expected {digest}/{length or 'measured length'}",
+        )
+    return raw
+
+
+def _document(raw: bytes, name: str) -> dict[str, Any]:
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_too_large", str(len(raw))
+        )
+    try:
+        value = canonical.parse_canonical(raw)
+    except canonical.CanonicalError as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_noncanonical", str(exc)
+        ) from exc
+    if not isinstance(value, dict):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_invalid", "not an object"
+        )
+    return value
+
+
+def _ref(value: object, name: str) -> tuple[str, int]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"digest", "length"}
+        or not isinstance(value.get("digest"), str)
+        or not str(value["digest"]).startswith("sha256:")
+        or len(str(value["digest"])) != 71
+        or not isinstance(value.get("length"), int)
+        or isinstance(value["length"], bool)
+        or int(value["length"]) <= 0
+    ):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            f"{name}_ref_invalid",
+            "reference is exactly {digest,length}",
+        )
+    return str(value["digest"]), int(value["length"])
+
+
+def _manifest_entries(raw: bytes) -> set[tuple[str, int]]:
+    manifest = _document(raw, "model_manifest")
+    if set(manifest) != {"entries"} or not isinstance(manifest["entries"], list):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "model_manifest_invalid",
+            "Manifest has one entries array",
+        )
+    refs: set[tuple[str, int]] = set()
+    for row in manifest["entries"]:
+        if not isinstance(row, dict) or set(row) != {"blob", "kind", "path"}:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                f"{name}_invalid",
-                "a canonical document is a JSON object",
+                "model_manifest_invalid",
+                "entry fields are closed",
             )
-        return value
-
-    def _digest_ref(self, document: Mapping[str, Any], key: str, name: str) -> str:
-        value = document.get(key)
-        if not isinstance(value, str) or not value.startswith("sha256:"):
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                f"{name}_invalid",
-                f"{key} is not `sha256:<hex>`",
-            )
-        return value
-
-    def _ref(self, value: object, name: str) -> tuple[str, int]:
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"digest", "length"}
-            or not isinstance(value["digest"], str)
-            or not value["digest"].startswith("sha256:")
-            or not isinstance(value["length"], int)
-            or isinstance(value["length"], bool)
-            or value["length"] <= 0
-        ):
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                f"{name}_ref_invalid",
-                "an artifact reference is exactly {digest, length}",
-            )
-        return str(value["digest"]), int(value["length"])
-
-    def _rows(self, value: object, name: str) -> list[Any]:
-        if not isinstance(value, list):
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                f"{name}_invalid",
-                "the inventory is not a list",
-            )
-        return list(value)
-
-    def _wheel_ref(self, row: object) -> tuple[str, int]:
-        if (
-            not isinstance(row, dict)
-            or not isinstance(row.get("digest"), str)
-            or not str(row["digest"]).startswith("sha256:")
-            or not isinstance(row.get("length"), int)
-            or isinstance(row["length"], bool)
-            or row["length"] <= 0
-        ):
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "wheel_inventory_invalid",
-                "a wheel inventory row names its exact digest and length",
-            )
-        return str(row["digest"]), int(row["length"])
+        refs.add(_ref(row["blob"], "manifest.entry.blob"))
+    return refs
 
 
-def _name(digest: str) -> str:
-    return f"{digest.removeprefix('sha256:')}.json"
+def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = descriptor.get("entrypoints")
+    if not isinstance(rows, list):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "package_descriptor_invalid",
+            "entrypoints is not an array",
+        )
+    visible = {
+        str(row["name"]): row
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    if len(visible) != len(rows) or not visible:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "package_descriptor_invalid",
+            "entrypoint names are not unique",
+        )
+    return visible

@@ -155,7 +155,6 @@ _SERVE_FLAGS: dict[str, str] = {
     "--grant-root": "--grant-root",
     "--environment-root": "--environment-root",
     "--artifact-store": "--artifact-store",
-    "--artifact-object-set": "--artifact-object-set",
     "--artifact-cache": "--artifact-cache",
     "--control-runtime-digest": "--control-runtime-digest",
     "--accelerator-backend": "--accelerator-backend",
@@ -226,14 +225,14 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
     argv = ["--listen", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
     weightless_package = values.get(_WEIGHTLESS_PACKAGE, "")
-    artifact_flags = ("--artifact-store", "--artifact-object-set")
+    artifact_flags = ("--artifact-store",)
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
     if weightless_package and supplied_artifacts:
         raise CliError(
             "usage",
             f"{_WEIGHTLESS_PACKAGE} cannot be combined with {', '.join(supplied_artifacts)}",
             "choose one launch mode: the explicit local weightless package, or the exact "
-            "provisioned artifact store and object set",
+            "provisioned artifact store",
             Exit.usage,
         )
     if weightless_package:
@@ -262,8 +261,10 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         argv += [
             "--artifact-store",
             str(staged.artifact_store),
-            "--artifact-object-set",
-            str(staged.artifact_object_set),
+            "--artifact-cache",
+            str(staged.artifact_cache),
+            "--development-project",
+            str(package),
         ]
         os.chdir(package)
     elif len(supplied_artifacts) != len(artifact_flags):
@@ -271,7 +272,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         raise CliError(
             "usage",
             "ordinary serve requires " + " and ".join(missing),
-            "pass the exact provisioned --artifact-store and --artifact-object-set, or "
+            "pass the exact provisioned --artifact-store, or "
             f"choose {_WEIGHTLESS_PACKAGE} <dir> explicitly",
             Exit.usage,
         )

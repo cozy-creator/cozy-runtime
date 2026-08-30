@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
+from cozy_runtime.internal import canonical  # noqa: E402
 from cozy_runtime.internal.readiness import WORKER_TLS_SERVER_NAME  # noqa: E402
 from cozy_runtime.protocol import WIRE_MINOR, documents  # noqa: E402
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
@@ -474,7 +475,7 @@ class Hub:
         """DISPATCHABLE, on the two axes plus the one admission fence — not "READY".
 
         Three facts, checked together because each says something the others do not: the
-        placement's SERVING axis, the plan's presence in `dispatchable_plan_ids`, and an
+        placement's SERVING axis, the plan's presence in `dispatchable_binding_digests`, and an
         OPEN admission window with a free seat.
         """
 
@@ -485,7 +486,7 @@ class Hub:
             status = self.deployment(report)
             if (
                 status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
-                and plan_id in status.dispatchable_plan_ids
+                and documents.raw(plan_id) in status.dispatchable_binding_digests
                 and report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
                 and report.available_attempt_slots > 0
             ):
@@ -522,46 +523,16 @@ def read_addr(root: Path, process: Any, budget: float = 60.0) -> str:
 
 
 def serving_directive(
-    release: str, plan_ids: list[str], posture: Any, plan_root: Path, revision: int = 1
+    placement: pb.Placement, posture: Any, revision: int = 1
 ) -> pb.DesiredWorkerState:
     """The full-replace DesiredWorkerState carrying a CONTENT-ADDRESSED DesiredPlacementSet.
 
-    The set travels as its exact canonical `PlacementSet/2` bytes plus their digest; the
+    The set travels as its exact canonical `PlacementSet/3` bytes plus their digest; the
     worker RECOMPUTES before it parses a field (§4). The duplicate structured form the
     frozen wire carried is deleted, so there is no second place for the set to disagree
     with itself.
     """
-    subjects = []
-    for plan_id in sorted(plan_ids):
-        source = plan_root / f"{plan_id.split(':')[-1]}.json"
-        raw = source.read_bytes()
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        (plan_root / f"{digest.removeprefix('sha256:')}.json").write_bytes(raw)
-        subjects.append(
-            pb.ArtifactSubject(
-                subject_id=plan_id,
-                kind="plan",
-                digest=documents.raw(digest),
-                length=len(raw),
-            )
-        )
-    empty_object_set = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
-    object_set_digest = "sha256:" + hashlib.sha256(empty_object_set).hexdigest()
-    placement_set = pb.PlacementSet(
-        placements=[
-            pb.Placement(
-                placement_id=PLACEMENT,
-                package_release_id=release,
-                binding_plans=subjects,
-                model_object_set=pb.ArtifactSubject(
-                    digest=documents.raw(object_set_digest),
-                    subject_id=object_set_digest,
-                    kind="model_object_set",
-                    length=len(empty_object_set),
-                ),
-            )
-        ]
-    )
+    placement_set = pb.PlacementSet(placements=[placement])
     canonical_bytes, set_digest = documents.identity(placement_set)
     return pb.DesiredWorkerState(
         revision=revision,
@@ -587,7 +558,7 @@ def snapshot() -> str:
 
 def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     return {
-        "entrypoint_binding_plan_id": plan_id,
+        "entrypoint_binding_digest": plan_id,
         "project": str(ROOT / "corpus" / "package"),
         "model_class": "SdxlUnetModel",
         "model_binding_path": f"{entrypoint}.models.model",
@@ -768,7 +739,7 @@ def stage(
         plan_id = plan_id_for(entrypoint, release)
         record = binding_record(plan_id, entrypoint)
         record.update(over)
-        record["entrypoint_binding_plan_id"] = plan_id
+        record["entrypoint_binding_digest"] = plan_id
         record["entrypoint"] = entrypoint
         record["release"] = release
         record["artifact_ref"] = str(facts["ref"] or release)
@@ -829,19 +800,43 @@ def start_worker(
                 check=True,
             )
         staged = stage_weightless_release(home, descriptor.build(discover(project)))
-        ids = dict(staged.plans)
+        ids = dict(staged.bindings)
+        placement = staged.placement
         artifact_store = staged.artifact_store
-        artifact_object_set = staged.artifact_object_set
+        artifact_cache = staged.artifact_cache
     else:
         executor_python = Path(sys.executable)
         ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
         artifact_store = Path(store or working_store(WORK / "store"))
-        artifact_object_set = home / "artifact-object-set.json"
-        artifact_object_set.write_bytes(b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}')
+        artifact_cache = home / "artifact-cache"
+        artifact_cache.mkdir()
+        selected_environment = pb.Environment(
+            wheelhouse_manifest=pb.Ref(digest=b"w" * 32, length=1)
+        )
+        entries = []
+        for name in sorted(ids):
+            binding_digest = hashlib.sha256(canonical.write({"name": name, "slots": []})).digest()
+            ids[name] = documents.spell(binding_digest)
+            entries.append(pb.Entrypoint(name=name, entrypoint_binding_digest=binding_digest))
+        placement = pb.Placement(
+            placement_id=PLACEMENT,
+            package_release=pb.Ref(digest=b"r" * 32, length=1),
+            environment_digest=documents.embedded_document_digest(
+                documents.body(selected_environment), "cozy.worker.v1.Environment"
+            ),
+            environment_receipt_digest=b"i" * 32,
+            package_descriptor=pb.Ref(digest=b"d" * 32, length=1),
+            bindings_digest=hashlib.sha256(
+                canonical.write(
+                    {"entrypoints": [documents.body(row) for row in entries], "models": []}
+                )
+            ).digest(),
+            entrypoints=entries,
+            qualification=pb.Ref(digest=b"q" * 32, length=1),
+            environment=selected_environment,
+        )
     hub = hub or Hub()
-    hub.directive = serving_directive(
-        release, sorted(ids.values()), posture, home / "binding-plans"
-    )
+    hub.directive = serving_directive(placement, posture)
     hub.revision = 1
     # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
     # neighbour holds 5 GiB fails with a device shortfall that is true and uninformative.
@@ -878,8 +873,9 @@ def start_worker(
         str(grace),
         "--artifact-store",
         str(artifact_store),
-        "--artifact-object-set",
-        str(artifact_object_set),
+        "--artifact-cache",
+        str(artifact_cache),
+        *(("--development-project", str(project)) if weightless_project is not None else ()),
         *(("--no-warm",) if no_warm else ()),
         *extra,
     ]
@@ -961,7 +957,7 @@ def make_spec(
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
     spec = pb.InvocationSpec(
         package_release_id=release,
-        environment_spec_digest="sha256:" + "11" * 32,
+        environment_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
         inputs=[
@@ -979,7 +975,7 @@ def make_spec(
         ],
         deadline_unix_ms=deadline_ms,
     )
-    spec.serving.entrypoint_binding_plan_id = plan_id
+    spec.serving.entrypoint_binding_digest = plan_id
     spec.serving.attempt_binding_id = plan_id
     if extra_key:
         # The PLANT: a key the closed document has no slot for. It is written by hand
@@ -1178,10 +1174,10 @@ def section_attempt(args: argparse.Namespace) -> dict[str, Any]:
         )
         check(
             "DISPATCHABLE means first-request-servable, not connected — per placement",
-            plan_id in status.dispatchable_plan_ids
+            documents.raw(plan_id) in status.dispatchable_binding_digests
             and report.available_attempt_slots > 0
             and report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN,
-            f"{len(status.dispatchable_plan_ids)} dispatchable plan(s), "
+            f"{len(status.dispatchable_binding_digests)} dispatchable plan(s), "
             f"{report.available_attempt_slots} attempt slot(s) in an "
             f"{pb.AdmissionState.Name(report.admission_state)} window",
         )
@@ -2622,7 +2618,7 @@ def section_results(args: argparse.Namespace) -> None:
         body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
         spec = pb.InvocationSpec(
             package_release_id=RELEASE,
-            environment_spec_digest="sha256:" + "11" * 32,
+            environment_digest="sha256:" + "11" * 32,
             config_digest="sha256:" + "22" * 32,
             payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),
             inputs=[
@@ -2639,7 +2635,7 @@ def section_results(args: argparse.Namespace) -> None:
                 pb.OutputBinding(output_id="preview", max_bytes=8 * MIB),
             ],
         )
-        spec.serving.entrypoint_binding_plan_id = pair_id
+        spec.serving.entrypoint_binding_digest = pair_id
         spec.serving.attempt_binding_id = pair_id
         canonical_bytes, digest = documents.identity(spec)
         grant = pb.DeliveryGrant(
@@ -2844,7 +2840,7 @@ def section_resident(args: argparse.Namespace) -> dict[str, Any]:
         row["ready_s"] = round(time.perf_counter() - boot, 2)
         check(
             "the four-component pipeline reached DISPATCHABLE",
-            plan_id in hub.deployment(report).dispatchable_plan_ids,
+            documents.raw(plan_id) in hub.deployment(report).dispatchable_binding_digests,
             f"{row['ready_s']:.1f} s, executor generation "
             f"{hub.deployment(report).executor_generation}",
         )
@@ -3149,8 +3145,8 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "the worker starts DISPATCHABLE and says which plans it can serve",
             hub.deployment(ready).serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
-            and plan_id in hub.deployment(ready).dispatchable_plan_ids,
-            f"{len(hub.deployment(ready).dispatchable_plan_ids)} dispatchable plan(s), "
+            and documents.raw(plan_id) in hub.deployment(ready).dispatchable_binding_digests,
+            f"{len(hub.deployment(ready).dispatchable_binding_digests)} dispatchable plan(s), "
             f"executor generation {hub.deployment(ready).executor_generation}",
         )
         _, digest = dispatch(
@@ -3197,9 +3193,9 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
         check(
             "the forceful kill CLOSES admission at the RecordOwner seat",
             dropped.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
-            and not list(hub.deployment(dropped).dispatchable_plan_ids),
+            and not list(hub.deployment(dropped).dispatchable_binding_digests),
             f"{pb.AdmissionState.Name(dropped.admission_state)} with "
-            f"{len(hub.deployment(dropped).dispatchable_plan_ids)} dispatchable plan(s), "
+            f"{len(hub.deployment(dropped).dispatchable_binding_digests)} dispatchable plan(s), "
             f"{drop_ms:.0f} ms after the cancel was sent (serving "
             f"{pb.ServingState.Name(hub.deployment(dropped).serving)}, admission generation "
             f"{dropped.admission_generation})",
@@ -3262,7 +3258,7 @@ def section_readiness(args: argparse.Namespace) -> dict[str, Any]:
             report
             for report in hub.reports()
             if hub.deployment(report).serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
-            and serve_id in hub.deployment(report).dispatchable_plan_ids
+            and documents.raw(serve_id) in hub.deployment(report).dispatchable_binding_digests
         ]
         check(
             "and DISPATCHABLE came back only once the executor was re-prepared",

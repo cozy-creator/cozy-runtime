@@ -2,10 +2,10 @@
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
 Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
-  forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
+  forbidden-dependency · canonical-numbers · torch-free-import
   package-imports · author-import-boundary · prelaunch-version
   env-authority · single-config · no-interactive · excluded-keywords
-  document-kinds · qualification-kinds · implementation-ids · report-format-tags
+  document-kinds · qualification-selection · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
@@ -562,70 +562,6 @@ def fence_canonical_numbers() -> list[str]:
     return bad[:10]
 
 
-def fence_artifact_object_sets() -> list[str]:
-    """Reproduce the model-only ArtifactObjectSet bytes and digests from frozen vectors."""
-
-    import hashlib
-    import json
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical, local, provisioned
-    from cozy_runtime.internal.worker.plan import PlanRefusal
-
-    bad: list[str] = []
-    path = ROOT / "vectors" / "artifact-object-sets.jsonl"
-    rows = [line for line in path.read_text().splitlines() if line.strip()]
-    names: set[str] = set()
-    rendered: dict[str, bytes] = {}
-    for line_number, line in enumerate(rows, 1):
-        vector = json.loads(line)
-        if not isinstance(vector, dict):
-            bad.append(f"{path}:{line_number}: vector is not an object")
-            continue
-        name = vector.get("name")
-        if not isinstance(name, str) or name in names:
-            bad.append(f"{path}:{line_number}: vector name is absent or duplicated")
-            continue
-        names.add(name)
-        document = vector.get("document")
-        expected = vector.get("canonical")
-        expected_digest = vector.get("digest")
-        if (
-            not isinstance(document, dict)
-            or not isinstance(expected, str)
-            or not isinstance(expected_digest, str)
-        ):
-            bad.append(f"{path}:{line_number}: vector fields are incomplete")
-            continue
-        raw = canonical.write(document)
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        if raw.decode() != expected or digest != expected_digest:
-            bad.append(
-                f"{path}:{line_number}: wrote {raw.decode()!r} / {digest}, "
-                f"expected {expected!r} / {expected_digest}"
-            )
-            continue
-        try:
-            provisioned.read_artifact_object_set(raw)
-        except PlanRefusal as exc:
-            bad.append(f"{path}:{line_number}: strict reader refused {exc.code}: {exc.detail}")
-        rendered[name] = raw
-    if not rows:
-        bad.append(f"{path} is empty — a vector file that vanishes must not read green")
-    elif names != {"empty", "one-model-root"}:
-        bad.append(f"{path}: vector names are {sorted(names)}, want empty and one-model-root")
-    if "empty" in rendered:
-        local_bytes = local.weightless_release_documents(
-            {
-                "application": "vector:weightless",
-                "entrypoints": [{"models": [], "name": "health"}],
-            }
-        ).artifact_object_set
-        if local_bytes != rendered["empty"]:
-            bad.append(f"{path}: the local weightless writer diverges from the empty vector")
-    return bad[:10]
-
-
 def fence_torch_free_import() -> list[str]:
     """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
 
@@ -658,15 +594,9 @@ def fence_base_ownership_vectors() -> list[str]:
     """Run the strict complete-base parser over frozen v2/refusal vectors."""
 
     import hashlib
-    import importlib
-    import tempfile
 
     sys.path.insert(0, str(ROOT / "src"))
     from cozy_runtime.internal import canonical, overlay
-
-    placement_materialization = importlib.import_module(
-        "cozy_runtime.internal.placement_materialization"
-    )
 
     bad: list[str] = []
     path = ROOT / "vectors" / "base-ownership.jsonl"
@@ -745,7 +675,7 @@ def fence_base_ownership_vectors() -> list[str]:
                 *(counted_wheel(index, "custom") for index in range(custom_count)),
             )
             return overlay.Input(
-                environment_spec_digest="sha256:" + "1" * 64,
+                environment_digest="sha256:" + "1" * 64,
                 base_family_digest=digest,
                 project_wheel_digest=project.digest,
                 wheels=wheels,
@@ -765,136 +695,6 @@ def fence_base_ownership_vectors() -> list[str]:
                 )
         else:
             bad.append("cr-027 admitted 128 custom wheels plus the project wheel")
-    contract_root = ROOT / "vectors" / "tensorhub-wheel-contract"
-    required_contract = (
-        "base-worker-image-wheelhouse.json",
-        "package-bundle.json",
-        "package-environment-spec.json",
-        "fixture-index.json",
-        "project-wheel.json",
-        "resolved-wheel-set.json",
-        "resolution-lock.json",
-        "source-tree.json",
-    )
-    missing_contract = [name for name in required_contract if not (contract_root / name).is_file()]
-    if missing_contract:
-        return [
-            f"{contract_root}: missing exact Tensorhub package vector(s): "
-            + ", ".join(missing_contract)
-        ]
-    bundle_bytes = (contract_root / "package-bundle.json").read_bytes()
-    wheelhouse_bytes = (contract_root / "base-worker-image-wheelhouse.json").read_bytes()
-    environment_bytes = (contract_root / "package-environment-spec.json").read_bytes()
-    index_bytes = (contract_root / "fixture-index.json").read_bytes()
-    project_bytes = (contract_root / "project-wheel.json").read_bytes()
-    resolved_bytes = (contract_root / "resolved-wheel-set.json").read_bytes()
-    resolution_lock_bytes = (contract_root / "resolution-lock.json").read_bytes()
-    source_tree_bytes = (contract_root / "source-tree.json").read_bytes()
-    exact_contract = {
-        "base-worker-image-wheelhouse.json": (
-            wheelhouse_bytes,
-            "f5fc85a3dee5a9e92318356323f51f7c7ad5ca32d3e76a5c8839e0e0b6477cad",
-        ),
-        "package-bundle.json": (
-            bundle_bytes,
-            "f12a0a7170b7fa22ee572b5668c81db14501bb9a6746e11bb5b8fc1e266e5fa6",
-        ),
-        "package-environment-spec.json": (
-            environment_bytes,
-            "6144ab858c10e1b85ba1bc0e606e70c13441b23a447889f4233f90c11daeac5b",
-        ),
-        "fixture-index.json": (
-            index_bytes,
-            "e91c55e4ce31fd8b7d027882e0a9dae4dce658e07d53a074f6dcc8a5e095b46a",
-        ),
-        "project-wheel.json": (
-            project_bytes,
-            "fb196cac5916f5890a468075cfdc2dfa8134674b4abb9fda7a2a14ad8426f858",
-        ),
-        "resolution-lock.json": (
-            resolution_lock_bytes,
-            "57d1ec1c637d6ebbff889bc3f59631452d45cbffd5616807f1f9627c8da4f3ca",
-        ),
-        "resolved-wheel-set.json": (
-            resolved_bytes,
-            "e5c3664d48456b61249fd369d75d68f3d1ee4b02c243adeff236bacd436e2b94",
-        ),
-        "source-tree.json": (
-            source_tree_bytes,
-            "6d4a297f2e1faae52a71f9260ff1507ca67823322ac075bbbf37c7c122f99c05",
-        ),
-    }
-    for name, (payload, want_digest) in exact_contract.items():
-        got_digest = hashlib.sha256(payload).hexdigest()
-        if got_digest != want_digest:
-            bad.append(f"{contract_root / name}: exact Tensorhub bytes hash to {got_digest}")
-    try:
-        bundle = canonical.parse_canonical(bundle_bytes)
-        # fixture-index is an exact foreign test manifest, not an execution identity
-        # document. Tensorhub's Go struct order is retained byte-for-byte and is not JCS.
-        fixture = canonical.parse(index_bytes)
-        project = canonical.parse_canonical(project_bytes)
-        resolved = canonical.parse_canonical(resolved_bytes)
-        source_tree = canonical.parse_canonical(source_tree_bytes)
-    except canonical.CanonicalError as exc:
-        bad.append(f"{contract_root}: Tensorhub wheel contract is noncanonical: {exc}")
-        return bad
-    if (
-        not isinstance(bundle, dict)
-        or not isinstance(fixture, dict)
-        or not isinstance(project, dict)
-        or not isinstance(resolved, dict)
-        or not isinstance(source_tree, dict)
-        or bundle.get("project_wheel") != project
-    ):
-        bad.append(f"{contract_root}: project WheelFact differs from PackageBundle bytes")
-        return bad
-    source_tree_ref = {
-        "digest": "sha256:" + hashlib.sha256(source_tree_bytes).hexdigest(),
-        "length": len(source_tree_bytes),
-    }
-    if (
-        bundle.get("source_tree") != source_tree_ref
-        or fixture.get("source_tree") != source_tree_ref
-    ):
-        bad.append(f"{contract_root}: source tree bytes differ from bundle/index references")
-        return bad
-    wheel_files = fixture.get("wheel_files")
-    if not isinstance(wheel_files, dict) or not all(
-        isinstance(digest, str) and isinstance(name, str) for digest, name in wheel_files.items()
-    ):
-        bad.append(f"{contract_root}: fixture wheel file map is invalid")
-        return bad
-    try:
-        joined = placement_materialization.package_overlay_input(
-            environment_spec_bytes=environment_bytes,
-            package_bundle_bytes=bundle_bytes,
-            resolved_wheel_set_bytes=resolved_bytes,
-            wheelhouse_manifest_bytes=wheelhouse_bytes,
-            wheel_paths={digest: contract_root / name for digest, name in wheel_files.items()},
-        )
-    except Exception as exc:
-        bad.append(f"{contract_root}: Runtime refused Tensorhub-authored join: {exc}")
-    else:
-        facts = [(wheel.distribution, wheel.owner, wheel.import_roots) for wheel in joined.wheels]
-        if facts != [
-            ("proof-package", "project", ("project_package",)),
-            ("proof-custom", "custom", ("proof_custom",)),
-        ]:
-            bad.append(f"{contract_root}: Runtime joined wheel facts as {facts}")
-        else:
-            try:
-                with tempfile.TemporaryDirectory(prefix="cozy-th-wheel-contract-") as temporary:
-                    installed = overlay.materialize(
-                        joined,
-                        pathlib.Path(temporary),
-                        base_manifest=contract_root / "base-worker-image-wheelhouse.json",
-                        python=pathlib.Path(sys.executable),
-                    )
-                    if not installed.generation.is_dir():
-                        bad.append(f"{contract_root}: exact Tensorhub overlay was not published")
-            except overlay.OverlayRefusal as exc:
-                bad.append(f"{contract_root}: exact Tensorhub wheels refused: {exc}")
     return bad
 
 
@@ -1161,11 +961,10 @@ DOCUMENT_KINDS = {
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
-#: Tensorhub currently authors these two package-chain documents.  They disappear in the
-#: coordinated PackageRelease/PlacementSet hardcut; Runtime must not claim them as its formats.
+#: Tensorhub authors the environment-independent package release. PlacementSet is covered by the
+#: worker-protocol prefix above; no binding-plan or model-binding documents survive.
 FOREIGN_DOCUMENT_KINDS = {
-    "cozy.package.EntrypointBindingPlan/1",
-    "cozy.package.ResolvedModelBinding/1",
+    "cozy.package.release/1",
 }
 #: Modules that name a registered kind without declaring it (a second reader is fine; a
 #: second DECLARATION is the drift this fence exists for).
@@ -1243,51 +1042,37 @@ def fence_document_kinds() -> list[str]:
     return bad
 
 
-def fence_qualification_kinds() -> list[str]:
-    """Every retained Qualification arm has one real producer, reader, and durable writer."""
+def fence_qualification_selection() -> list[str]:
+    """Qualification binds exactly one selected PlacementSet fact tuple."""
 
-    roles = {
-        "execution": (
-            SRC / "internal" / "acceptance.py",
-            ROOT / "proofs" / "internal" / "acceptance_observation.py",
-            SRC / "cli" / "acceptance_proof.py",
-            "handle.write(body)",
-        ),
-        "model": (
-            SRC / "cli" / "model_contract_proof.py",
-            ROOT / "proofs" / "support" / "model_contract.py",
-            SRC / "cli" / "model_contract_proof.py",
-            "temporary / INDEX_NAME",
-        ),
-        "native-wheel": (
-            SRC / "cli" / "native_wheel_proof.py",
-            ROOT / "scripts" / "overlay-identity-live.py",
-            SRC / "cli" / "native_wheel_proof.py",
-            "_publish(evidence_path, payload)",
-        ),
-    }
-    bad: list[str] = []
-    qualification = (SRC / "qualification.py").read_text()
-    for kind, (producer, reader, storage, storage_marker) in roles.items():
-        if f'"{kind}": frozenset(' not in qualification:
-            bad.append(f"Qualification kind {kind!r} has no closed evidence field set")
-        if (
-            re.search(rf'qualification\.document\(\s*"{re.escape(kind)}"', producer.read_text())
-            is None
-        ):
-            bad.append(f"{producer.relative_to(ROOT)}: does not produce Qualification {kind!r}")
-        reader_source = reader.read_text()
-        if ".read(" not in reader_source or (
-            f'kind != "{kind}"' not in reader_source and f'kind == "{kind}"' not in reader_source
-        ):
-            bad.append(f"{reader.relative_to(ROOT)}: does not read Qualification {kind!r}")
-        if storage_marker not in storage.read_text():
-            bad.append(
-                f"{storage.relative_to(ROOT)}: does not durably publish Qualification {kind!r}"
-            )
-    if '"environment": frozenset(' in qualification:
-        bad.append("Qualification retains dead environment arm; EnvironmentReceipt is the proof")
-    return bad
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime import qualification
+    from cozy_runtime.internal import canonical
+
+    ref = {"digest": "sha256:" + "1" * 64, "length": 1}
+    try:
+        selected = qualification.selection_digest(
+            bindings_digest="sha256:" + "2" * 64,
+            environment_digest="sha256:" + "3" * 64,
+            environment_receipt=ref,
+            package_descriptor=ref,
+            package_release=ref,
+        )
+        raw = canonical.write(qualification.document(selected))
+        if qualification.read(raw) != selected:
+            return ["Qualification selection does not round-trip"]
+        changed = qualification.selection_digest(
+            bindings_digest="sha256:" + "4" * 64,
+            environment_digest="sha256:" + "3" * 64,
+            environment_receipt=ref,
+            package_descriptor=ref,
+            package_release=ref,
+        )
+        if changed == selected:
+            return ["Qualification selection ignores bindings_digest"]
+    except qualification.QualificationError as exc:
+        return [f"Qualification selection refused its own closed tuple: {exc}"]
+    return []
 
 
 def fence_implementation_ids() -> list[str]:
@@ -1591,7 +1376,6 @@ FENCES = {
     "descriptor-minimality": fence_descriptor_minimality,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
-    "artifact-object-sets": fence_artifact_object_sets,
     "base-ownership-vectors": fence_base_ownership_vectors,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
@@ -1605,7 +1389,7 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
-    "qualification-kinds": fence_qualification_kinds,
+    "qualification-selection": fence_qualification_selection,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,
     "construction-fill-order": fence_construction_fill_order,

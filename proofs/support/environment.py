@@ -130,40 +130,6 @@ def _prepare(args: argparse.Namespace) -> None:
         _request(root, name, normal, root / f"environment-{name}", args.python)
     _request(root, "reuse", normal, root / "environment-cold", args.python)
 
-    legacy_resolved = _release(
-        inputs / "resolved-v1",
-        _target(),
-        project,
-        (resolved,),
-        base_wheels,
-        normal_paths,
-        resolved_format="ResolvedWheelSet/1",
-    )
-    _request(
-        root,
-        "resolved-v1",
-        legacy_resolved,
-        root / "environment-resolved-v1",
-        args.python,
-    )
-
-    legacy_bundle = _release(
-        inputs / "package-bundle-v2",
-        _target(),
-        project,
-        (resolved,),
-        base_wheels,
-        normal_paths,
-        legacy_bundle=True,
-    )
-    _request(
-        root,
-        "package-bundle-v2",
-        legacy_bundle,
-        root / "environment-package-bundle-v2",
-        args.python,
-    )
-
     missing = dict(normal)
     missing["wheel_files"] = {
         digest: path
@@ -197,23 +163,6 @@ def _prepare(args: argparse.Namespace) -> None:
         normal_paths,
     )
     _request(root, "renamed", renamed, root / "environment-renamed", args.python)
-
-    overlay_bytes_mismatch = _release(
-        inputs / "overlay-bytes-mismatch",
-        _target(),
-        project,
-        (resolved,),
-        base_wheels,
-        normal_paths,
-        overlay_bytes_override=resolved.length + 1,
-    )
-    _request(
-        root,
-        "overlay-bytes-mismatch",
-        overlay_bytes_mismatch,
-        root / "environment-overlay-bytes-mismatch",
-        args.python,
-    )
 
     oversized_fact = _release(
         inputs / "oversized-fact",
@@ -392,9 +341,6 @@ def _release(
     wheel_paths: Mapping[str, Path],
     *,
     import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
-    resolved_format: str = "ResolvedWheelSet/3",
-    overlay_bytes_override: int | None = None,
-    legacy_bundle: bool = False,
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
@@ -417,61 +363,59 @@ def _release(
             "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
         }
     )
-    resolved_rows = []
+    selected_rows = []
     for wheel in resolved_wheels:
         row = _wheel(wheel, import_roots=True)
         if import_root_overrides and wheel.distribution in import_root_overrides:
             row["import_roots"] = list(import_root_overrides[wheel.distribution])
-        resolved_rows.append(row)
-    resolved = _canonical(
+        selected_rows.append(_nested_wheel(row))
+    project_fact = _nested_wheel(_wheel(project, import_roots=True))
+    package_release = _canonical(
         {
-            "compatibility_profile": profile,
-            "format": resolved_format,
-            "overlay_bytes": (
-                sum(wheel.length for wheel in resolved_wheels)
-                if overlay_bytes_override is None
-                else overlay_bytes_override
-            ),
-            "platform_target": dict(target),
-            "resolution_lock_digest": _digest(b"proof-resolution-lock"),
-            "resolution_lock_length": len(b"proof-resolution-lock"),
-            "wheelhouse_manifest_digest": _digest(wheelhouse),
-            "wheels": resolved_rows,
+            "dependency_wheels": [],
+            "format": "cozy.package.release/1",
+            "project_wheel": project_fact,
+            "requires_python": ">=3.11",
+            "requirements": [],
+            "source_manifest": _ref(b'{"entries":[]}'),
         }
     )
-    descriptor = _canonical({"format": "proof.PackageDescriptor/1"})
-    bundle_fields = {
-        "package_descriptor": _ref(descriptor),
-        "package_release_id": "proof-release",
-        "format": "tensorhub.package_bundle/2" if legacy_bundle else "tensorhub.package_bundle/3",
-        "project_wheel": _wheel(project, import_roots=True),
-        "resolved_wheel_set": _ref(resolved),
-        "wheelhouse_manifest": _ref(wheelhouse),
-    }
-    if legacy_bundle:
-        bundle_fields.update(
-            source_archive=_ref(b"proof-source"),
-            source_lock=_ref(b"proof-lock"),
-        )
-    else:
-        bundle_fields["source_tree"] = _ref(b"proof-source-tree")
-    bundle = _canonical(bundle_fields)
-    spec = documents.canonical_bytes(
-        pb.PackageEnvironmentSpec(
-            compatibility_profile=pb.CompatibilityProfile(**profile),
-            platform_target=pb.PlatformTarget(**target),
-            package_bundle_digest=documents.digest_of(bundle),
-            project_wheel_digest=documents.raw(project.digest),
-            wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
-        )
+    environment = pb.Environment(
+        wheelhouse_manifest=pb.Ref(digest=documents.digest_of(wheelhouse), length=len(wheelhouse)),
+        wheels=[_proto_wheel(row) for row in selected_rows],
     )
     return {
-        "package_environment_spec": _write(root / "environment.json", spec),
-        "package_bundle": _write(root / "bundle.json", bundle),
-        "resolved_wheel_set": _write(root / "resolved.json", resolved),
+        "package_release": _write(root / "package-release.json", package_release),
+        "environment": _write(
+            root / "environment.json",
+            _canonical({**documents.body(environment), "wheels": selected_rows}),
+        ),
         "wheelhouse_manifest": _write(root / "wheelhouse.json", wheelhouse),
         "wheel_files": dict(wheel_paths),
     }
+
+
+def _nested_wheel(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "ref": {"digest": row["digest"], "length": row["length"]},
+        "distribution": row["distribution"],
+        "filename": row["filename"],
+        "import_roots": row["import_roots"],
+        "tags": row["tags"],
+        "version": row["version"],
+    }
+
+
+def _proto_wheel(row: Mapping[str, Any]) -> pb.WheelFact:
+    ref = cast(Mapping[str, Any], row["ref"])
+    return pb.WheelFact(
+        ref=pb.Ref(digest=documents.raw(str(ref["digest"])), length=int(ref["length"])),
+        distribution=str(row["distribution"]),
+        filename=str(row["filename"]),
+        import_roots=[str(value) for value in cast(Sequence[Any], row["import_roots"])],
+        tags=[str(value) for value in cast(Sequence[Any], row["tags"])],
+        version=str(row["version"]),
+    )
 
 
 def _request(

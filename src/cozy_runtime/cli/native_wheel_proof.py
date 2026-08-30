@@ -13,7 +13,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from cozy_runtime import qualification
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
     canonical,
@@ -27,7 +26,7 @@ from cozy_runtime.internal.exits import Exit
 
 REQUEST_FIELDS = {
     "device_index",
-    "package_environment_spec_digest",
+    "environment_digest",
     "environment_root",
     "expected_result_digest",
     "fixture",
@@ -40,7 +39,7 @@ REQUEST_FIELDS = {
 @dataclass(frozen=True, slots=True)
 class Request:
     device_index: int | None
-    environment_spec_digest: str
+    environment_digest: str
     environment_root: Path
     expected_result_digest: str
     fixture: str
@@ -64,7 +63,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         installed = overlay.open_generation(
             request.environment_root,
             receipt_digest=request.installed_receipt_digest,
-            environment_spec_digest=request.environment_spec_digest,
+            environment_digest=request.environment_digest,
             base_manifest=request.wheelhouse_manifest,
             python=request.python,
         )
@@ -120,23 +119,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise native_wheel.NativeWheelRefusal(
                     "overlay_native_jit_cache_invalid", str(exc)
                 ) from exc
-        evidence = qualification.document(
-            "native-wheel",
-            {
-                "base_worker_profile": _profile_id(base),
-                "package_environment_spec_digest": request.environment_spec_digest,
-                "host_capability": {
-                    "gpu": gpu,
-                    "seat": running_seat,
-                },
-                "host_qualification": host,
-                "installed_environment_receipt_digest": request.installed_receipt_digest,
-                "operator_observation": operator,
-                "overlay_content_digest": installed.content_digest,
-                "static_inspection": inspection.document(),
-                "wheelhouse_manifest_digest": base_digest,
+        evidence = {
+            "base_worker_profile": _profile_id(base),
+            "environment_digest": request.environment_digest,
+            "host_capability": {
+                "gpu": gpu,
+                "seat": running_seat,
             },
-        )
+            "host_qualification": host,
+            "installed_environment_receipt_digest": request.installed_receipt_digest,
+            "operator_observation": operator,
+            "overlay_content_digest": installed.content_digest,
+            "static_inspection": inspection.document(),
+            "wheelhouse_manifest_digest": base_digest,
+        }
         payload = canonical.write(evidence)
         _publish(evidence_path, payload)
         print(
@@ -182,7 +178,7 @@ def _request(path: Path) -> Request:
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise _error("request fields are not closed")
     digests = (
-        "package_environment_spec_digest",
+        "environment_digest",
         "expected_result_digest",
         "installed_environment_receipt_digest",
     )
@@ -201,7 +197,7 @@ def _request(path: Path) -> Request:
         raise _error("fixture or device")
     return Request(
         device,
-        str(value["package_environment_spec_digest"]),
+        str(value["environment_digest"]),
         _existing_directory(_absolute(value["environment_root"], "environment_root")),
         str(value["expected_result_digest"]),
         fixture,

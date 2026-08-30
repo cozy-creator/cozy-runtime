@@ -399,7 +399,7 @@ class AttemptEngine:
         self.posture = posture
         #: the NVML per-process reader, so the out-of-allocator meter has a real producer
         self.device_process = device_process
-        #: binding plan ids whose boot warm pass FAILED. Every attempt served under one
+        #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
@@ -868,13 +868,26 @@ class AttemptEngine:
                 "names neither; a worker that guessed would run the wrong lifecycle",
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
-        plan_id = serving["entrypoint_binding_plan_id"]
+        plan_id = serving["entrypoint_binding_digest"]
         declared = self.bindings.get(plan_id)
         prepared_model = self.prepared_models.get(plan_id)
         if declared is None or prepared_model is None:
             raise AttemptRefusal(
-                "unknown_binding_plan",
-                f"no EntrypointBindingPlan {plan_id[:24]}… is bound on this worker",
+                "unknown_binding",
+                f"no entrypoint binding {plan_id[:24]}… is selected on this worker",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        package_release_id = declared.package_release.removeprefix("sha256:")
+        if attempt.spec.get("package_release_id") != package_release_id:
+            raise AttemptRefusal(
+                "package_release_mismatch",
+                "InvocationSpec does not name the selected PackageRelease",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        if attempt.spec.get("environment_digest") != declared.environment_digest:
+            raise AttemptRefusal(
+                "environment_mismatch",
+                "InvocationSpec does not name the selected Environment",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
         attempt.declared = declared
@@ -894,7 +907,7 @@ class AttemptEngine:
                 "no live executor: an online attempt is accepted only against a Ready one",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
-        if plan_id not in executor.ready_plans:
+        if plan_id not in executor.ready_bindings:
             # A binding that FAILED to prepare says so in its own words (#572d). "the
             # executor is ready for nothing" is true of a faulted binding and tells the
             # caller nothing about why THIS one cannot serve, while its siblings can.
@@ -908,7 +921,7 @@ class AttemptEngine:
                 )
             raise AttemptRefusal(
                 "executor_not_ready",
-                f"the executor is ready for {sorted(executor.ready_plans) or 'nothing'}, "
+                f"the executor is ready for {sorted(executor.ready_bindings) or 'nothing'}, "
                 f"not {plan_id[:24]}… — the directive prepares an executor before an "
                 "attempt may be accepted against it, and serving never accepts-then-"
                 "cold-loads",
@@ -983,7 +996,7 @@ class AttemptEngine:
                         "placement_id": attempt.placement_id,
                         "executor_generation": attempt.executor_generation,
                         "executor_pid": attempt.executor_pid,
-                        "entrypoint_binding_plan_id": plan_id,
+                        "entrypoint_binding_digest": plan_id,
                     },
                 )
         except Exception:
@@ -1667,7 +1680,7 @@ class AttemptEngine:
                 f"{row.get('field')}: requested {row.get('requested')}, served "
                 f"{row.get('applied')} - {row.get('reason')}",
             )
-        plan_id = attempt.declared.entrypoint_binding_plan_id if attempt.declared else ""
+        plan_id = attempt.declared.entrypoint_binding_digest if attempt.declared else ""
         why = self.degraded.get(plan_id)
         if why:
             attempt.confess(
@@ -1812,7 +1825,7 @@ class AttemptEngine:
             subject_id=(
                 attempt.job.job_descriptor_id
                 if attempt.job is not None
-                else (attempt.declared.entrypoint_binding_plan_id if attempt.declared else "")
+                else (attempt.declared.entrypoint_binding_digest if attempt.declared else "")
             ),
             request_id=attempt.request_id,
             attempt=attempt.attempt,

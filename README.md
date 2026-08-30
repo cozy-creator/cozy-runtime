@@ -60,11 +60,12 @@ wrapper executable has no compatibility alias; placement acquisition now lives i
 `internal/placement_materialization.py`.
 
 The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record containing the rental's
-Ed25519 control public key and the media bearer's sorted hashes. Claim and `EnsureArtifacts`
-signatures open only WorkerControl; media hashes open only media HTTP. Neither reaches an
-executor. Runtime redeems package/model intent at the code-owned
-configured HTTPS authority with its existing per-boot TLS leaf, then downloads the returned exact
-R2 plan directly. No CA bypass, proxy certificate header, or endpoint-authentication fallback exists.
+Ed25519 control public key and the media bearer's sorted hashes. Claim authenticates the
+RecordOwner; media hashes open only media HTTP. Neither reaches an executor. The exact
+PlacementSet is the sole artifact intent. Runtime names only its digest to the code-owned HTTPS
+authority over its existing per-boot mTLS leaf, then downloads the complete returned R2 plan
+directly. No delegation document, CA bypass, proxy certificate header, or authentication fallback
+exists.
 
 | module | role |
 |---|---|
@@ -235,8 +236,8 @@ The image's OCI digest owns image-resident integrity. `WheelhouseManifest/3` is 
 canonical ownership document for that image: its existing platform target and exact control-wheel
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
-sorted unique import roots: the five control rows in `WheelhouseManifest/3`, the project row in
-`PackageBundle/3`, and each custom row in `ResolvedWheelSet/3`. Runtime strictly parses those exact bytes, rejects
+sorted unique import roots: the image rows in `WheelhouseManifest/3`, the project row in
+`PackageRelease/1`, and each selected overlay row embedded in `PlacementSet/3`. Runtime strictly parses those exact bytes, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
@@ -336,7 +337,8 @@ private hooks are not presented as CLI evidence. The full scenario census and re
 are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
-Its closed local request names the four exact release documents, every wheel file by digest,
+Its closed local request names the exact PackageRelease, selected Environment and base
+WheelhouseManifest, plus every overlay wheel file by digest,
 the installed-base Python, a fresh overlay root, and a fresh receipt output. `wheel_files`
 contains only the project and optional custom wheels; base wheel bytes do not travel. It
 atomically publishes the overlay receipt bytes and prints their compact
@@ -349,9 +351,8 @@ set is closed; every path value is a normalized absolute local path:
 
 ```json
 {
-  "package_environment_spec": "/proof/package-environment-spec.json",
-  "package_bundle": "/proof/package-bundle.json",
-  "resolved_wheel_set": "/proof/resolved-wheel-set.json",
+  "package_release": "/proof/package-release.json",
+  "environment": "/proof/environment.json",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
   "python": "/opt/conda/bin/python",
@@ -367,7 +368,7 @@ and echoing one is not proof. Tensorhub joins Runtime's measured evidence to pro
 ```json
 {
   "device_index": 0,
-  "package_environment_spec_digest": "sha256:<64 lowercase hex>",
+  "environment_digest": "sha256:<64 lowercase hex>",
   "environment_root": "/proof/installed-environment",
   "installed_environment_receipt_digest": "sha256:<64 lowercase hex>",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
@@ -382,38 +383,16 @@ CPython ABI, OS/CPU, glibc, complete installed distribution/version set, Torch r
 build. It requires both reports to be identical and to satisfy the exact WheelhouseManifest using
 minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM are measured through
 `nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
-immutable `Qualification/1` output with `kind: "native-wheel"` binds these measurements to the
-WHM, environment spec, installed receipt and overlay content digests, but carries no unmeasured
-realization claim. Static inspection, host checks, and operator observations are nested evidence,
-not three additional document formats.
-
-`cozy-acceptance-proof` closes the remaining per-release admission sample without introducing a
-second executor. `fixture REQUEST.json PAYLOAD.json` derives a deterministic neutral payload from
-the exact descriptor; `observe REQUEST.json OBSERVATION.json` runs only after Tensorhub has sent
-that payload as an ordinary Worker attempt with `boot_warmup=false`. The observer re-joins the
-exact package execution, binding release, EES/PackageBundle/RWS/WHM/overlay receipt, placement,
-InvocationSpec, AttemptAccepted and AttemptOutcome and emits the bounded execution arm of
-`cozy.runtime.Qualification/1`. It derives the canonical base-worker profile label and
-requires the authenticated ClaimAck control-Runtime digest to equal the WHM's `cozy-runtime`
-WheelFact. All local documents must remain beneath one explicit `input_root`; environment and
-TensorFS stores are separately declared roots. A model-bound request must have the exact TensorFS
-closure available or refuses—it never substitutes a weightless proof.
-
-`worker_resources`, `accelerator_qualification`, and `attempt_accepted` are exact existing
-worker-protocol projections supplied by the authenticated RecordOwner session; the local CLI
-validates their shape and joins them but does not authenticate their transport origin. Tensorhub
-does that, separately aborts the qualification output transaction against the terminal manifest,
-and alone authors `ModelAdmissionDecision`. Consequently Runtime evidence contains no candidate,
-qualification, provider, cost, reclaim, or `outputs_aborted` claim. Failure observations are
-banked honestly; only Tensorhub policy may turn a successful, execution-started, schema-valid,
-fully-aborted sample into admission.
+command emits a bounded result DTO containing those measured facts. Tensorhub normalizes the
+result into its own rows and alone authors the final two-field Qualification after all required
+evidence is accepted.
 
 The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
 it verifies the overlay/base-family join, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
 offline construction sandbox. The fresh output directory appears atomically and contains the
-model arm in `qualification.json` plus exact digest-named files under `contracts/`. Tensorhub
+result in `result.json` plus exact digest-named files under `contracts/`. Tensorhub
 stores those bytes and refs; it never authors or reserializes an MCC.
 
 The request is a closed local process input. Every descriptor model path appears exactly
@@ -424,11 +403,14 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 ```json
 {
   "environment_generation": "/proof/environment/contents/<content-identity>",
-  "environment_spec_digest": "sha256:<64 lowercase hex>",
+  "environment_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
-  "project_wheel_digest": "sha256:<64 lowercase hex>",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
-  "package_release_id": "package-release-id",
+  "package_release": {
+    "path": "/proof/package-release.json",
+    "digest": "sha256:<64 lowercase hex>",
+    "length": 3456
+  },
   "package_descriptor": {
     "path": "/proof/package.descriptor.json",
     "digest": "sha256:<64 lowercase hex>",

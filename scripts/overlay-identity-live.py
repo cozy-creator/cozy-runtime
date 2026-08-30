@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from cozy_runtime import qualification
 from cozy_runtime.internal import (
     canonical,
     child_env,
@@ -163,7 +162,7 @@ def source(
 ) -> overlay.Input:
     rows = (project, custom)
     return overlay.Input(
-        environment_spec_digest=digest(spec.encode()),
+        environment_digest=digest(spec.encode()),
         base_family_digest=family,
         project_wheel_digest=project[0].digest,
         wheels=tuple(row[0] for row in rows),
@@ -188,9 +187,7 @@ def acquirer(
         plan,
         cache_root=root / "cache",
         environment_root=root / "environment",
-        plans_root=root / "plans",
-        documents_root=root / "documents",
-        object_sets_root=root / "sets",
+        selection_root=root / "selections",
         artifact_store=root / "store",
         python=Path(sys.executable),
         verified_cache=verified,
@@ -670,24 +667,17 @@ def main() -> int:
         else:
             raise AssertionError("no-kernel-image operator failure was admitted")
 
-        native_payload = canonical.write(
-            qualification.document(
-                "native-wheel",
-                {
-                    "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
-                    "host_capability": {"gpu": None, "seat": measured_seat},
-                    "host_qualification": native_host,
-                    "installed_environment_receipt_digest": native_installed.receipt_digest,
-                    "operator_observation": operator_evidence,
-                    "overlay_content_digest": native_installed.content_digest,
-                    "package_environment_spec_digest": digest(b"native-custom"),
-                    "static_inspection": native_inspection.document(),
-                    "wheelhouse_manifest_digest": family,
-                },
-            )
-        )
-        kind, native_evidence = qualification.read(native_payload)
-        assert kind == "native-wheel"
+        native_evidence = {
+            "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
+            "environment_digest": digest(b"native-custom"),
+            "host_capability": {"gpu": None, "seat": measured_seat},
+            "host_qualification": native_host,
+            "installed_environment_receipt_digest": native_installed.receipt_digest,
+            "operator_observation": operator_evidence,
+            "overlay_content_digest": native_installed.content_digest,
+            "static_inspection": native_inspection.document(),
+            "wheelhouse_manifest_digest": family,
+        }
         assert native_evidence["installed_environment_receipt_digest"] == (
             native_installed.receipt_digest
         )
@@ -696,7 +686,7 @@ def main() -> int:
         assert proof_python.is_file()
         native_request = {
             "device_index": None,
-            "package_environment_spec_digest": digest(b"native-custom"),
+            "environment_digest": digest(b"native-custom"),
             "environment_root": str(root / "native-custom-installed"),
             "expected_result_digest": canonical.digest({"value": 3}),
             "fixture": "proof_native_custom.fixture:run",
@@ -734,7 +724,7 @@ def main() -> int:
             overlay.open_generation(
                 environment,
                 receipt_digest=cold.receipt_digest,
-                environment_spec_digest=digest(b"spec-one"),
+                environment_digest=digest(b"spec-one"),
                 base_manifest=mutable_manifest,
                 python=Path(sys.executable),
             )
@@ -1004,7 +994,7 @@ def main() -> int:
         try:
             acquirer(cache_root, plan, verified).fetch(project[0].digest, project[0].length)
         except acquire.AcquisitionRefusal as exc:
-            assert exc.code == "local_artifact_digest_mismatch"
+            assert exc.code == "local_artifact_identity_mismatch"
             assert exc.kind == pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH
         else:
             raise AssertionError("changed-stat corrupt cache bytes were trusted")

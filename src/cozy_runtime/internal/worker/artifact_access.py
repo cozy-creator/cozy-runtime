@@ -1,15 +1,13 @@
-"""Cozy-signed artifact intent and the worker's one direct Tensorhub client."""
+"""The worker's one direct, mTLS-authenticated Tensorhub artifact client."""
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import http.client
 import json
 import re
 import ssl
-import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,8 +24,6 @@ WORKER_TENSORHUB_PATH = "/v1/worker/artifacts/resolve"
 MAX_REQUEST_BYTES = 128 << 10
 MAX_RESPONSE_BYTES = 8 << 20
 MAX_ARTIFACTS = 4096
-MAX_PACKAGE_IDS = 64
-MAX_MODEL_IDS = 256
 RESOLVE_TIMEOUT_SECONDS = 30
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -42,24 +38,6 @@ class ArtifactAccessRefusal(Exception):
         self.code = code
         self.detail = detail
         self.server_time = server_time
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactIntent:
-    canonical_bytes: bytes
-    signature: bytes
-    rental_id: str
-    worker_id: str
-    worker_boot_id: str
-    worker_tls_certificate_digest: str
-    revision: int
-    package_release_ids: tuple[str, ...]
-    model_manifest_ids: tuple[str, ...]
-    delegation_id: str
-    expires_at_unix: int
-
-    def logical_identity(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self.package_release_ids, self.model_manifest_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,104 +117,6 @@ def verify_claim_proof(
     _verify_signature(public_key, claim.proof, transcript, "claim_proof")
 
 
-def read_intent(
-    update: pb.EnsureArtifacts,
-    public_key: bytes,
-    *,
-    worker_id: str,
-    worker_boot_id: str,
-    worker_tls_certificate_digest: str,
-) -> ArtifactIntent:
-    """Verify one exact delegation before trusting or forwarding any field."""
-
-    _verify_signature(
-        public_key,
-        update.creator_signature,
-        update.delegation_canonical_bytes,
-        "artifact_delegation",
-    )
-    try:
-        value = documents.read(update.delegation_canonical_bytes, pb.ArtifactDelegation)
-    except documents.DocumentError as exc:
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            f"artifact_delegation_{exc.code}",
-            exc.detail,
-        ) from exc
-    required = (
-        "rental_id",
-        "worker_id",
-        "worker_boot_id",
-        "worker_tls_certificate_digest",
-        "revision",
-        "delegation_id",
-        "expires_at_unix",
-    )
-    if any(not value.get(name) for name in required):
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "artifact_delegation_incomplete",
-            "delegation identity, revision, and expiry are required",
-        )
-    packages = _logical_ids(
-        value.get("package_release_ids"), "package_release_ids", MAX_PACKAGE_IDS
-    )
-    models = _logical_ids(value.get("model_manifest_ids"), "model_manifest_ids", MAX_MODEL_IDS)
-    if not packages and not models:
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "artifact_delegation_empty",
-            "a delegation names at least one package or model",
-        )
-    if any(_DIGEST.fullmatch(model) is None for model in models):
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "artifact_model_id_invalid",
-            "model manifest ids are exact sha256 identities",
-        )
-    tls_digest = str(value["worker_tls_certificate_digest"])
-    bindings = {
-        "worker_id": (str(value["worker_id"]), worker_id),
-        "worker_boot_id": (str(value["worker_boot_id"]), worker_boot_id),
-        "worker_tls_certificate_digest": (tls_digest, worker_tls_certificate_digest),
-    }
-    mismatch = next((name for name, (got, wanted) in bindings.items() if got != wanted), "")
-    if mismatch:
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "artifact_delegation_binding_mismatch",
-            mismatch,
-        )
-    return ArtifactIntent(
-        canonical_bytes=bytes(update.delegation_canonical_bytes),
-        signature=bytes(update.creator_signature),
-        rental_id=str(value["rental_id"]),
-        worker_id=worker_id,
-        worker_boot_id=worker_boot_id,
-        worker_tls_certificate_digest=tls_digest,
-        revision=int(value["revision"]),
-        package_release_ids=packages,
-        model_manifest_ids=models,
-        delegation_id=str(value["delegation_id"]),
-        expires_at_unix=int(value["expires_at_unix"]),
-    )
-
-
-def _logical_ids(value: object, name: str, maximum: int) -> tuple[str, ...]:
-    if (
-        not isinstance(value, list)
-        or len(value) > maximum
-        or not all(isinstance(item, str) and 0 < len(item) <= 256 for item in value)
-        or value != sorted(set(value))
-    ):
-        raise ArtifactAccessRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "artifact_delegation_ids_invalid",
-            f"{name} is a bounded sorted unique string set",
-        )
-    return tuple(value)
-
-
 def _verify_signature(public_key: bytes, signature: bytes, payload: bytes, subject: str) -> None:
     if len(public_key) != 32 or len(signature) != 64:
         raise ArtifactAccessRefusal(
@@ -269,7 +149,12 @@ class _Connection(Protocol):
 
 
 class ArtifactClient:
-    """Redeem signed intent at Tensorhub's fixed mTLS-only worker authority."""
+    """Resolve one active PlacementSet at Tensorhub's mTLS-only worker authority.
+
+    The pinned client certificate identifies the rental, worker and boot. Tensorhub owns the
+    accepted PlacementSet and derives its complete artifact closure. Restating either identity
+    or inventory in this request would create a second authorization document.
+    """
 
     def __init__(
         self,
@@ -284,40 +169,17 @@ class ArtifactClient:
         self.origin = origin
         self.connection = connection
 
-    def resolve(
-        self,
-        intent: ArtifactIntent,
-        *,
-        package_release_ids: Sequence[str],
-        model_manifest_ids: Sequence[str],
-    ) -> ArtifactPlan:
-        packages = tuple(package_release_ids)
-        models = tuple(model_manifest_ids)
-        if packages != tuple(sorted(set(packages))) or models != tuple(sorted(set(models))):
+    def resolve(self, placement_set_digest: bytes) -> ArtifactPlan:
+        try:
+            spelled = documents.spell(placement_set_digest)
+        except documents.DocumentError as exc:
             raise ArtifactAccessRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "artifact_resolve_subset_invalid",
-                "requested logical ids are sorted unique sets",
-            )
-        if not set(packages).issubset(intent.package_release_ids) or not set(models).issubset(
-            intent.model_manifest_ids
-        ):
-            raise ArtifactAccessRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "artifact_resolve_subset_invalid",
-                "requested logical ids exceed the signed delegation",
-            )
+                "worker_artifacts.placement_set_digest_invalid",
+                exc.detail,
+            ) from exc
         payload = json.dumps(
-            {
-                "creator_signature": base64.urlsafe_b64encode(intent.signature)
-                .rstrip(b"=")
-                .decode("ascii"),
-                "delegation_canonical_bytes": base64.b64encode(intent.canonical_bytes).decode(
-                    "ascii"
-                ),
-                "model_manifest_ids": list(models),
-                "package_release_ids": list(packages),
-            },
+            {"placement_set_digest": spelled},
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -327,15 +189,7 @@ class ArtifactClient:
                 "artifact_resolve_request_too_large",
                 f"{len(payload)} bytes",
             )
-        now = int(time.time())
-        if now >= intent.expires_at_unix:
-            raise ArtifactAccessRefusal(
-                pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED,
-                "worker_artifacts.delegation_expired",
-                f"delegation expired at {intent.expires_at_unix}",
-            )
-        timeout = float(max(1, min(RESOLVE_TIMEOUT_SECONDS, intent.expires_at_unix - now)))
-        connection = self._connection(timeout)
+        connection = self._connection(float(RESOLVE_TIMEOUT_SECONDS))
         try:
             connection.request(
                 "POST",
@@ -362,11 +216,7 @@ class ArtifactClient:
         value = _json_object(raw)
         if response.status != 200:
             raise _error_response(value, response.status)
-        return _plan(
-            value,
-            intent,
-            allow_local=pull.local_hub(self.origin.value),
-        )
+        return _plan(value, allow_local=pull.local_hub(self.origin.value))
 
     def _connection(self, timeout: float) -> _Connection:
         if self.connection is not None:
@@ -420,20 +270,14 @@ def _error_response(value: Mapping[str, Any], status: int) -> ArtifactAccessRefu
         )
     code = str(error["code"])
     return ArtifactAccessRefusal(
-        (
-            pb.FaultKind.FAULT_KIND_AUTHORIZATION_EXPIRED
-            if code == "worker_artifacts.delegation_expired"
-            else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED
-        ),
+        pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
         code,
         str(error["message"]),
         server_time=server_time,
     )
 
 
-def _plan(
-    value: Mapping[str, Any], intent: ArtifactIntent, *, allow_local: bool = False
-) -> ArtifactPlan:
+def _plan(value: Mapping[str, Any], *, allow_local: bool = False) -> ArtifactPlan:
     if set(value) != {"artifacts", "expires_at_unix", "server_time_unix"}:
         raise _plan_invalid("fields")
     server_time = value.get("server_time_unix")
@@ -445,7 +289,7 @@ def _plan(
         or server_time <= 0
         or not isinstance(expires, int)
         or isinstance(expires, bool)
-        or not server_time < expires <= intent.expires_at_unix
+        or not server_time < expires
         or not isinstance(rows, list)
         or not 1 <= len(rows) <= MAX_ARTIFACTS
     ):

@@ -127,7 +127,7 @@ def binding_record(
     one logical model — and it stays in the record; what left it (#567e) are the single
     artifact's own facts, which the index row below carries instead."""
     return {
-        "entrypoint_binding_plan_id": Q.plan_id_for("generate"),
+        "entrypoint_binding_digest": Q.plan_id_for("generate"),
         "project": str(ROOT / "corpus" / "pipeline"),
         "model_class": "SdxlPipelineModel",
         "model_binding_path": "generate.models.model",
@@ -908,7 +908,7 @@ def arms() -> None:
     offered = tuple(Variant.read(row) for row in variants())
     reference = next(row for row in offered if row.reference)
     declared = DeclaredBinding(
-        entrypoint_binding_plan_id=Q.plan_id_for("generate"),
+        entrypoint_binding_digest=Q.plan_id_for("generate"),
         entrypoint="generate",
         model_class="SdxlPipelineModel",
         model_binding_path="generate.models.model",

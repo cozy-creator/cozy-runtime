@@ -1,119 +1,89 @@
-"""The one stored Runtime qualification document.
+"""The one stored Runtime qualification decision.
 
-The command that produced a qualification supplies the context and request version.  Only the
-successful, independently retained evidence needs a portable discriminator.  Environment, model,
-native-wheel, and execution qualification therefore share this one closed envelope instead of
-each growing request, result, inspection, and observation formats of its own.
-
-Environment qualification does not get an arm here: the EnvironmentReceipt is already the exact
-measured proof-seat observation.  Wrapping it would create the second environment document this
-collapse is meant to remove.
+Proof-seat evidence is normalized Hub state, not a portable report hierarchy. Once all required
+environment, model, native-wheel, and execution checks pass, Tensorhub authors this two-field
+decision over the exact selected facts. PlacementSet carries its ref; Runtime recomputes the
+selection digest before trusting it.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
-from typing import Any, Literal, cast
+from typing import Any
 
 from cozy_runtime.internal import canonical
 
 FORMAT = "cozy.runtime.Qualification/1"
-Kind = Literal["execution", "model", "native-wheel"]
-KINDS = frozenset({"execution", "model", "native-wheel"})
-EVIDENCE_FIELDS = {
-    "execution": frozenset(
-        {
-            "accelerator_qualification",
-            "attempt_metrics",
-            "attempt_outcome_digest",
-            "attempt_plan_digest",
-            "base_worker_profile",
-            "binding_plan_digest",
-            "boot_warmup",
-            "control_runtime_digest",
-            "entrypoint",
-            "environment_spec_digest",
-            "execution_started",
-            "installed_environment_receipt_digest",
-            "invocation_spec_digest",
-            "logical_model_digest",
-            "model_construction_contract_digests",
-            "object_set_digest",
-            "output_manifest",
-            "overlay_content_digest",
-            "package_binding_release_digest",
-            "package_descriptor_digest",
-            "package_execution_digest",
-            "package_release_id",
-            "payload_digest",
-            "placement_set_digest",
-            "result_digest",
-            "result_schema_digest",
-            "status",
-            "worker_resources",
-        }
-    ),
-    "model": frozenset(
-        {
-            "application",
-            "environment_spec_digest",
-            "functions",
-            "installed_environment_receipt",
-            "package_descriptor",
-            "package_release_id",
-            "project_wheel_digest",
-        }
-    ),
-    "native-wheel": frozenset(
-        {
-            "base_worker_profile",
-            "host_capability",
-            "host_qualification",
-            "installed_environment_receipt_digest",
-            "operator_observation",
-            "overlay_content_digest",
-            "package_environment_spec_digest",
-            "static_inspection",
-            "wheelhouse_manifest_digest",
-        }
-    ),
-}
 
 
 class QualificationError(Exception):
-    """A malformed qualification document."""
+    """A malformed or mismatched qualification decision."""
 
 
-def document(kind: Kind, evidence: Mapping[str, Any]) -> dict[str, Any]:
-    """Build one qualification without preserving a nested legacy report envelope."""
+def selection_digest(
+    *,
+    bindings_digest: str,
+    environment_digest: str,
+    environment_receipt: Mapping[str, Any],
+    package_descriptor: Mapping[str, Any],
+    package_release: Mapping[str, Any],
+) -> str:
+    """Hash the closed selection preimage. Qualification and placement id are excluded."""
 
-    if kind not in KINDS:
-        raise QualificationError(f"unknown qualification kind {kind!r}")
-    _closed_evidence(kind, evidence)
-    return {"evidence": dict(evidence), "format": FORMAT, "kind": kind}
+    for name, value in (
+        ("bindings_digest", bindings_digest),
+        ("environment_digest", environment_digest),
+    ):
+        if canonical.DIGEST_RE.fullmatch(value) is None:
+            raise QualificationError(f"{name} is not sha256:<64 lowercase hex>")
+    refs = {
+        "environment_receipt": _ref(environment_receipt, "environment_receipt"),
+        "package_descriptor": _ref(package_descriptor, "package_descriptor"),
+        "package_release": _ref(package_release, "package_release"),
+    }
+    preimage = canonical.write(
+        {
+            "bindings_digest": bindings_digest,
+            "environment_digest": environment_digest,
+            **refs,
+        }
+    )
+    return "sha256:" + hashlib.sha256(preimage).hexdigest()
 
 
-def read(raw: bytes) -> tuple[Kind, dict[str, Any]]:
-    """Read exact canonical qualification bytes and return their typed evidence."""
+def document(selection: str) -> dict[str, str]:
+    if canonical.DIGEST_RE.fullmatch(selection) is None:
+        raise QualificationError("selection_digest is not sha256:<64 lowercase hex>")
+    return {"format": FORMAT, "selection_digest": selection}
 
+
+def read(raw: bytes) -> str:
     try:
         value = canonical.parse_canonical(raw)
     except canonical.CanonicalError as exc:
         raise QualificationError(str(exc)) from exc
-    if not isinstance(value, dict) or set(value) != {"evidence", "format", "kind"}:
+    if not isinstance(value, dict) or set(value) != {"format", "selection_digest"}:
         raise QualificationError("qualification fields are not closed")
-    kind = value.get("kind")
-    evidence = value.get("evidence")
-    if value.get("format") != FORMAT or kind not in KINDS or not isinstance(evidence, dict):
-        raise QualificationError("qualification format, kind, or evidence is invalid")
-    typed_kind = cast(Kind, kind)
-    _closed_evidence(typed_kind, evidence)
-    return typed_kind, dict(evidence)
+    selection = value.get("selection_digest")
+    if value.get("format") != FORMAT or not isinstance(selection, str):
+        raise QualificationError("qualification format or selection digest is invalid")
+    if canonical.DIGEST_RE.fullmatch(selection) is None:
+        raise QualificationError("selection_digest is not sha256:<64 lowercase hex>")
+    return selection
 
 
-def _closed_evidence(kind: Kind, evidence: Mapping[str, Any]) -> None:
-    expected = EVIDENCE_FIELDS[kind]
-    if set(evidence) != expected:
-        raise QualificationError(
-            f"{kind} evidence fields={sorted(evidence)} expected={sorted(expected)}"
-        )
+def _ref(value: Mapping[str, Any], name: str) -> dict[str, Any]:
+    if set(value) != {"digest", "length"}:
+        raise QualificationError(f"{name} is not a closed Ref")
+    digest = value.get("digest")
+    length = value.get("length")
+    if (
+        not isinstance(digest, str)
+        or canonical.DIGEST_RE.fullmatch(digest) is None
+        or not isinstance(length, int)
+        or isinstance(length, bool)
+        or length <= 0
+    ):
+        raise QualificationError(f"{name} is not a positive exact Ref")
+    return {"digest": digest, "length": length}

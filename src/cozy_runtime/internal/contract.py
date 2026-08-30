@@ -31,6 +31,7 @@ from typing import Any, Literal, cast
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.encoding import TORCH_DTYPES
 
 CONTRACT_SCHEMA = "cozy.runtime.model_construction_contract.v1"
 ATTESTATION_SCHEMA = "cozy.runtime.model_construction_attestation.v1"
@@ -49,6 +50,17 @@ class ContractError(Exception):
         super().__init__(message)
         self.code = code
         self.fields = tuple(fields)
+
+
+def tensorfs_destination_widths(tensorfs: Any) -> Mapping[str, int]:
+    """Project TensorFS's one dtype-width table into contract/torch spellings."""
+
+    source = getattr(tensorfs, "DTYPES", {})
+    return {
+        torch_name: int(source[storage_name])
+        for storage_name, torch_name in TORCH_DTYPES.items()
+        if storage_name in source
+    }
 
 
 # ------------------------------------------------------------------------------ rows

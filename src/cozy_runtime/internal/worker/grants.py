@@ -690,7 +690,7 @@ class PublicationReceipt:
     into. Empty on the serving lane, which publishes into granted destinations only."""
     build_id: str
     subject_id: str
-    """`job_descriptor_id` in job mode, `entrypoint_binding_plan_id` in serving mode."""
+    """`job_descriptor_id` in job mode, `entrypoint_binding_digest` in serving mode."""
     request_id: str
     attempt: int
     outputs: tuple[pb.OutputEntry, ...]

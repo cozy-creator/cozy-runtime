@@ -31,25 +31,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, fill, host_paths, overlay, provisioned, pull
+from cozy_runtime.internal import canonical, host_paths, overlay, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
-PACKAGE_BUNDLE_FORMAT = "tensorhub.package_bundle/3"
-ENVIRONMENT_SPEC_FORMAT = "cozy.worker.v1.PackageEnvironmentSpec/2"
-RESOLVED_WHEEL_SET_FORMAT = "ResolvedWheelSet/3"
-MAX_RESOLUTION_LOCK_BYTES = 16 << 20
+PACKAGE_RELEASE_FORMAT = "cozy.package.release/1"
+ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
 MAX_OVERLAY_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
 ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
 LOCAL_ARTIFACT_STORE_ROOT = host_paths.ARTIFACT_STORE
 ARTIFACT_CACHE_ROOT = host_paths.ARTIFACT_CACHE
-PLANS_ROOT = host_paths.BINDING_PLANS
-BINDING_DOCUMENTS_ROOT = host_paths.BINDING_DOCUMENTS
-#: The canonical EMPTY ArtifactObjectSet. A pod that boots with no placement holds no
-#: objects, and the worker's launch grammar requires the document to exist and be exact
-#: rather than letting "absent" mean "anything".
-EMPTY_ARTIFACT_OBJECT_SET = b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}'
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20
 
@@ -59,29 +51,7 @@ class PreparedBoot:
     """What a pod knows about itself once it is ready and still empty."""
 
     artifact_store: Path
-    artifact_object_set: Path
     artifact_cache: Path
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedObjects:
-    store: Path
-    sources: dict[str, dict[str, int]]
-    network_cache_degradations: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class CacheMount:
-    """One attached provider network-cache volume, for :func:`materialize_objects`.
-
-    The retired provision spec was this value's only carrier. Nothing supplies it at boot
-    any more — an empty pod materializes nothing — so it arrives with the dynamic grant lane
-    that will drive object materialization, or not at all.
-    """
-
-    mount_path: Path
-    cache_volume_id: str
-    provider_volume_id: str
 
 
 def prepare_boot(
@@ -91,8 +61,7 @@ def prepare_boot(
     artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
     artifact_cache_root: Path = ARTIFACT_CACHE_ROOT,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: check the deadline, lay two roots, publish one
-    empty document. Nothing is read, nothing is fetched, nothing is hashed.
+    """Bring the pod to READY-BUT-EMPTY: check the deadline and lay its two CAS roots.
 
     The deadline check converts a boot that is already too late into a NAMED refusal.
     Tensorhub stops polling at the same instant either way, so all it decides is whether
@@ -105,12 +74,8 @@ def prepare_boot(
     not one the pod can teach it. Hashing image-resident bytes to echo them back proves
     something the OCI digest already proved before this process existed.
 
-    THE EMPTY OBJECT SET STAYS. It is not a claim to anybody: it is the document the
-    worker started three lines later demands by its launch grammar (`--artifact-object-set`
-    is required), reads unconditionally the moment a placement carries plans, and compares
-    against the model roots that placement uses. Empty is the TRUE answer for a pod holding
-    no objects, and it is what lets a weightless placement converge with no grant lane at
-    all; withholding it would turn that convergence into a BINDING_UNAVAILABLE fault.
+    PlacementSet/3 names model Manifests directly. There is no empty object-set document to
+    publish or reconcile at boot.
     """
 
     if time.time() >= config.lease_expiry_unix:
@@ -121,11 +86,8 @@ def prepare_boot(
     _directory(artifact_store_root, mode=0o755)
     _directory(artifact_cache_root)
     _directory(boot_root)
-    object_set = boot_root / "artifact-object-set.json"
-    _publish_exact(object_set, EMPTY_ARTIFACT_OBJECT_SET, boot_root)
     return PreparedBoot(
         artifact_store=artifact_store_root,
-        artifact_object_set=object_set,
         artifact_cache=artifact_cache_root,
     )
 
@@ -219,166 +181,6 @@ def fetch_exact(
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-
-
-def materialize_objects(
-    grants: Mapping[str, str],
-    object_set: provisioned.ArtifactObjectSet,
-    *,
-    cache: CacheMount | None,
-    deadline: int | None,
-    store_root: Path,
-    allow_local: bool = False,
-) -> MaterializedObjects:
-    """Admit each exact model closure into the required worker-local TensorFS CAS.
-
-    `grants` is Tensorhub's per-object-id download plan. The old Creator-relayed grant vehicle
-    retired; exact-digest TensorFS admission did not.
-    """
-
-    refs = object_set.refs
-    required = set(refs)
-    missing = sorted(required - set(grants))
-    if missing:
-        raise LaunchRefusal("object_grant_missing", missing[0])
-    cache_root: Path | None = None
-    if cache is not None:
-        cache_root = cache.mount_path / "tensorfs"
-        _require_separate_store_roots(store_root, cache.mount_path, cache_root)
-    degradations: set[str] = set()
-    source_by_object: dict[str, str] = {}
-    try:
-        if not object_set.roots:
-            _directory(store_root)
-            return MaterializedObjects(
-                store=store_root,
-                sources=_source_usage(source_by_object, refs),
-                network_cache_degradations=(),
-            )
-        tensorfs = fill.tensorfs_module()
-        store = pull.open_store(tensorfs, store_root)
-        cache_store = None
-        if cache is not None:
-            assert cache_root is not None
-            cache_store = _open_cache_store(tensorfs, cache.mount_path, cache_root, degradations)
-        for group in object_set.roots:
-            closure = (group.root, *group.objects)
-            rows = sorted(
-                (
-                    pull.Read(
-                        object_id=ref.digest,
-                        length=ref.length,
-                        url=grants[ref.digest],
-                    )
-                    for ref in closure
-                ),
-                key=lambda row: row.object_id,
-            )
-            timeout = None if deadline is None else float(deadline) - time.time()
-            if timeout is not None and timeout <= 0:
-                raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
-            outcome = pull.pull_granted_manifest(
-                tensorfs,
-                store,
-                group.root.digest,
-                group.root.length,
-                rows,
-                timeout=timeout,
-                session="provision-" + group.root.digest.removeprefix("sha256:")[:12],
-                cache_store=cache_store,
-                allow_local=allow_local,
-            )
-            for object_id, source in outcome.sources.items():
-                source_by_object.setdefault(object_id, source)
-            degradations.update(outcome.cache_degradations)
-        if set(source_by_object) != required:
-            raise LaunchRefusal(
-                "object_materialization_refused", "source evidence does not cover the object set"
-            )
-    except LaunchRefusal:
-        raise
-    except pull.PullRefusal as exc:
-        raise LaunchRefusal("object_materialization_refused", f"{exc.code}: {exc.message}") from exc
-    except Exception as exc:
-        raise LaunchRefusal(
-            "object_materialization_refused", f"TensorFS unavailable: {type(exc).__name__}"
-        ) from exc
-    return MaterializedObjects(
-        store=store_root,
-        sources=_source_usage(source_by_object, refs),
-        network_cache_degradations=tuple(sorted(degradations)),
-    )
-
-
-def _open_cache_store(
-    tensorfs: Any, cache_mount: Path, cache_root: Path, degradations: set[str]
-) -> Any | None:
-    try:
-        if not stat.S_ISDIR(cache_mount.stat().st_mode):
-            raise NotADirectoryError(cache_mount)
-        return pull.open_store(tensorfs, cache_root)
-    except (OSError, pull.PullRefusal):
-        degradations.add("unavailable")
-        return None
-
-
-def _source_usage(
-    source_by_object: Mapping[str, str], refs: Mapping[str, int]
-) -> dict[str, dict[str, int]]:
-    usage = {source: {"bytes": 0, "objects": 0} for source in ("cloud", "local", "network_cache")}
-    for object_id, source in source_by_object.items():
-        row = usage.get(source)
-        if row is None or object_id not in refs:
-            raise LaunchRefusal("object_materialization_refused", "invalid source evidence")
-        row["bytes"] += refs[object_id]
-        row["objects"] += 1
-    return usage
-
-
-def _require_separate_store_roots(local_store: Path, cache_mount: Path, cache_root: Path) -> None:
-    """Refuse lexical, symlink, and bind-mount aliases before either store can be touched."""
-
-    def overlaps(left: Path, right: Path) -> bool:
-        return left == right or left in right.parents or right in left.parents
-
-    lexical_local = Path(os.path.abspath(local_store))
-    lexical_mount = Path(os.path.abspath(cache_mount))
-    lexical_cache = Path(os.path.abspath(cache_root))
-    if overlaps(lexical_local, lexical_mount) or overlaps(lexical_local, lexical_cache):
-        raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths overlap")
-    try:
-        resolved_local = local_store.resolve(strict=False)
-        resolved_mount = cache_mount.resolve(strict=False)
-        resolved_cache = cache_root.resolve(strict=False)
-    except OSError:
-        resolved_local, resolved_mount, resolved_cache = (
-            lexical_local,
-            lexical_mount,
-            lexical_cache,
-        )
-    if overlaps(resolved_local, resolved_mount) or overlaps(resolved_local, resolved_cache):
-        raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
-
-    local_lineage = (local_store, *local_store.parents[:-1])
-    cache_lineage = (cache_mount, *cache_mount.parents[:-1])
-    try:
-        if any(
-            candidate.exists() and os.path.samefile(candidate, cache_mount)
-            for candidate in local_lineage
-        ) or any(
-            candidate.exists() and os.path.samefile(candidate, local_store)
-            for candidate in cache_lineage
-        ):
-            raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
-        if (
-            cache_root.exists()
-            and local_store.exists()
-            and os.path.samefile(local_store, cache_root)
-        ):
-            raise LaunchRefusal("artifact_store_alias", "local CAS and network cache paths alias")
-    except OSError:
-        # An unavailable cache is allowed; lexical and resolvable aliases have already refused.
-        return
 
 
 def _ref(value: object, name: str, *, allow_extra: bool = False) -> dict[str, Any]:
@@ -506,136 +308,73 @@ def control_runtime_digest(
 
 def package_overlay_input(
     *,
-    environment_spec_bytes: bytes,
-    package_bundle_bytes: bytes,
-    resolved_wheel_set_bytes: bytes,
+    package_release_bytes: bytes,
+    environment: Mapping[str, Any],
+    environment_digest: str,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
     verified_wheels: Mapping[str, overlay.VerifiedFile] | None = None,
 ) -> overlay.Input:
-    """Join exact publication documents and package-only wheel grants."""
+    """Join one PackageRelease with the selected inline Environment.
 
-    spec = _document(environment_spec_bytes, "environment_spec")
-    bundle = _document(package_bundle_bytes, "package_bundle")
-    resolved = _document(resolved_wheel_set_bytes, "resolved_wheel_set")
+    PackageRelease is environment-independent. The Placement selects a WheelhouseManifest and
+    exact non-base overlay wheels directly, so there is no bundle, resolution lock, resolved
+    wheel set, or independent environment-specification document to reconcile.
+    """
+
+    release = _document(package_release_bytes, "package_release")
     _closed(
-        spec,
+        release,
         {
-            "compatibility_profile",
-            "package_bundle_digest",
-            "format",
-            "platform_target",
-            "project_wheel_digest",
-            "wheelhouse_manifest_digest",
-        },
-        "environment_spec",
-    )
-    if spec["format"] != ENVIRONMENT_SPEC_FORMAT:
-        raise LaunchRefusal("environment_spec_format", str(spec["format"]))
-    _closed(
-        bundle,
-        {
-            "package_descriptor",
-            "package_release_id",
+            "dependency_wheels",
             "format",
             "project_wheel",
-            "resolved_wheel_set",
-            "source_tree",
-            "wheelhouse_manifest",
+            "requires_python",
+            "requirements",
+            "source_manifest",
         },
-        "package_bundle",
+        "package_release",
     )
-    if bundle["format"] != PACKAGE_BUNDLE_FORMAT:
-        raise LaunchRefusal("package_bundle_format", str(bundle["format"]))
-    _ref(bundle["source_tree"], "source_tree")
-    _closed(
-        resolved,
-        {
-            "compatibility_profile",
-            "format",
-            "overlay_bytes",
-            "platform_target",
-            "resolution_lock_digest",
-            "resolution_lock_length",
-            "wheelhouse_manifest_digest",
-            "wheels",
-        },
-        "resolved_wheel_set",
-    )
-    if resolved["format"] != RESOLVED_WHEEL_SET_FORMAT:
-        raise LaunchRefusal("resolved_wheel_set_format", str(resolved["format"]))
-    _require_digest(resolved["resolution_lock_digest"], "resolved_wheel_set.resolution_lock_digest")
-    resolution_lock_length = resolved["resolution_lock_length"]
+    if release["format"] != PACKAGE_RELEASE_FORMAT:
+        raise LaunchRefusal("package_release_format", str(release["format"]))
+    _ref(release["source_manifest"], "source_manifest")
+    requires_python = release["requires_python"]
+    requirements = release["requirements"]
+    if not isinstance(requires_python, str) or not requires_python:
+        raise LaunchRefusal("package_release_invalid", "requires_python is empty")
     if (
-        not isinstance(resolution_lock_length, int)
-        or isinstance(resolution_lock_length, bool)
-        or not 0 < resolution_lock_length <= MAX_RESOLUTION_LOCK_BYTES
+        not isinstance(requirements, list)
+        or any(not isinstance(item, str) or not item for item in requirements)
+        or requirements != sorted(set(requirements))
     ):
+        raise LaunchRefusal("package_release_invalid", "requirements are not sorted unique")
+    _wheels(release["dependency_wheels"], "package_release", import_roots=True, nested_ref=True)
+
+    _closed(environment, {"wheelhouse_manifest", "wheels"}, "environment")
+    wheelhouse_ref = _ref(environment["wheelhouse_manifest"], "wheelhouse_manifest")
+    measured_environment = (
+        "sha256:"
+        + hashlib.sha256(canonical.write({**environment, "format": ENVIRONMENT_FORMAT})).hexdigest()
+    )
+    if measured_environment != environment_digest:
         raise LaunchRefusal(
-            "resolved_wheel_set_invalid", "resolution_lock_length is not positive and bounded"
+            "environment_digest_mismatch",
+            f"measured {measured_environment}, expected {environment_digest}",
         )
-    _require_digest(spec["package_bundle_digest"], "environment_spec.package_bundle_digest")
-    _require_digest(spec["project_wheel_digest"], "environment_spec.project_wheel_digest")
-    _require_digest(
-        spec["wheelhouse_manifest_digest"], "environment_spec.wheelhouse_manifest_digest"
-    )
-    _matches(package_bundle_bytes, str(spec["package_bundle_digest"]), "package_bundle")
-    _matches(
-        wheelhouse_manifest_bytes,
-        str(spec["wheelhouse_manifest_digest"]),
-        "wheelhouse_manifest",
-    )
+    _ref_matches(wheelhouse_ref, wheelhouse_manifest_bytes, "wheelhouse_manifest")
     try:
-        base_manifest = overlay.parse_base_manifest(
-            wheelhouse_manifest_bytes, str(spec["wheelhouse_manifest_digest"])
-        )
+        overlay.parse_base_manifest(wheelhouse_manifest_bytes, str(wheelhouse_ref["digest"]))
     except overlay.OverlayRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
-    _ref_matches(bundle["resolved_wheel_set"], resolved_wheel_set_bytes, "resolved_wheel_set")
-    _ref_matches(bundle["wheelhouse_manifest"], wheelhouse_manifest_bytes, "wheelhouse_manifest")
-    if bundle["wheelhouse_manifest"] != {
-        "digest": spec["wheelhouse_manifest_digest"],
-        "length": len(wheelhouse_manifest_bytes),
-    }:
-        raise LaunchRefusal(
-            "wheelhouse_manifest_ref_mismatch", "bundle and environment spec disagree"
-        )
-    if resolved["wheelhouse_manifest_digest"] != spec["wheelhouse_manifest_digest"]:
-        raise LaunchRefusal(
-            "wheelhouse_manifest_ref_mismatch", "resolved set and environment spec disagree"
-        )
-    if not isinstance(spec["platform_target"], dict) or not (
-        spec["platform_target"]
-        == resolved["platform_target"]
-        == dict(base_manifest.platform_target)
-    ):
-        raise LaunchRefusal("platform_target_mismatch", "release documents disagree")
-    if not isinstance(spec["compatibility_profile"], dict) or not (
-        spec["compatibility_profile"]
-        == resolved["compatibility_profile"]
-        == dict(base_manifest.compatibility_profile)
-    ):
-        raise LaunchRefusal("compatibility_profile_mismatch", "release documents disagree")
 
-    project = _wheel(bundle["project_wheel"], "project", import_roots=True)
+    project = _wheel(release["project_wheel"], "project", import_roots=True, nested_ref=True)
     if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
         raise LaunchRefusal("project_wheel_not_pure", "project wheel must be exactly py3-none-any")
-    if project.digest != spec["project_wheel_digest"]:
-        raise LaunchRefusal("project_wheel_mismatch", project.digest)
     wheels = [project]
-    custom_wheels = _wheels(resolved["wheels"], "bundle", import_roots=True)
-    overlay_bytes = resolved["overlay_bytes"]
+    custom_wheels = _wheels(
+        environment.get("wheels", []), "environment", import_roots=True, nested_ref=True
+    )
     measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
-    if (
-        not isinstance(overlay_bytes, int)
-        or isinstance(overlay_bytes, bool)
-        or overlay_bytes != measured_custom_bytes
-        or overlay_bytes > MAX_OVERLAY_BYTES
-    ):
-        raise LaunchRefusal(
-            "resolved_wheel_set_overlay_bytes_mismatch",
-            f"declared={overlay_bytes!r} measured_custom={measured_custom_bytes}",
-        )
     if project.length > MAX_OVERLAY_BYTES - measured_custom_bytes:
         raise LaunchRefusal(
             "overlay_byte_budget_exceeded",
@@ -655,7 +394,7 @@ def package_overlay_input(
         extra = sorted(set(wheel_paths) - granted_digests)
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
     return overlay.Input(
-        environment_spec_digest=_digest(environment_spec_bytes),
+        environment_digest=environment_digest,
         base_family_digest=_digest(wheelhouse_manifest_bytes),
         project_wheel_digest=project.digest,
         wheels=tuple(wheels),
@@ -711,10 +450,12 @@ def _matches(raw: bytes, digest: str, name: str) -> None:
         )
 
 
-def _wheels(value: object, owner: str, *, import_roots: bool = False) -> list[overlay.Wheel]:
+def _wheels(
+    value: object, owner: str, *, import_roots: bool = False, nested_ref: bool = False
+) -> list[overlay.Wheel]:
     if not isinstance(value, list):
         raise LaunchRefusal(f"{owner}_wheel_inventory_invalid", "wheels is not a list")
-    wheels = [_wheel(row, owner, import_roots=import_roots) for row in value]
+    wheels = [_wheel(row, owner, import_roots=import_roots, nested_ref=nested_ref) for row in value]
     names = [wheel.distribution for wheel in wheels]
     if names != sorted(names) or len(names) != len(set(names)):
         raise LaunchRefusal(
@@ -723,13 +464,27 @@ def _wheels(value: object, owner: str, *, import_roots: bool = False) -> list[ov
     return wheels
 
 
-def _wheel(value: object, owner: str, *, import_roots: bool = False) -> overlay.Wheel:
-    keys = {"digest", "distribution", "filename", "length", "tags", "version"}
+def _wheel(
+    value: object, owner: str, *, import_roots: bool = False, nested_ref: bool = False
+) -> overlay.Wheel:
+    keys = (
+        {"ref", "distribution", "filename", "tags", "version"}
+        if nested_ref
+        else {
+            "digest",
+            "distribution",
+            "filename",
+            "length",
+            "tags",
+            "version",
+        }
+    )
     if import_roots:
         keys.add("import_roots")
     if not isinstance(value, dict) or set(value) != keys:
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel row has the wrong fields")
-    digest = value["digest"]
+    reference = _ref(value["ref"], f"{owner}_wheel") if nested_ref else value
+    digest = reference["digest"]
     _require_digest(digest, f"{owner}_wheel.digest")
     distribution = value["distribution"]
     filename = value["filename"]
@@ -742,7 +497,7 @@ def _wheel(value: object, owner: str, *, import_roots: bool = False) -> overlay.
         or not overlay.valid_wheel_version(str(version))
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel strings are empty or invalid")
-    length = value["length"]
+    length = reference["length"]
     tags = value["tags"]
     if (
         not isinstance(length, int)
@@ -774,7 +529,7 @@ def _wheel(value: object, owner: str, *, import_roots: bool = False) -> overlay.
         digest=str(digest),
         length=length,
         tags=tuple(tags),
-        owner={"project": "project", "bundle": "custom"}[owner],
+        owner={"project": "project", "environment": "custom"}[owner],
         import_roots=tuple(roots),
     )
 

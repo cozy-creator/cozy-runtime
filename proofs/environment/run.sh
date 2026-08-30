@@ -119,16 +119,13 @@ run_refusal missing 6 wheel_grant_set_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
 run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
-run_refusal overlay-bytes-mismatch 6 resolved_wheel_set_overlay_bytes_mismatch no
-run_refusal oversized-fact 6 bundle_wheel_invalid no
+run_refusal oversized-fact 6 environment_wheel_invalid no
 run_refusal duplicate 6 overlay_wheel_member_invalid no
 run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
 run_refusal build-request 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
-run_refusal resolved-v1 6 resolved_wheel_set_format no
-run_refusal package-bundle-v2 6 package_bundle_invalid no
 run_refusal base-distribution 6 overlay_shadows_base_distribution no
 grep -q 'image_version=1.0.0' "$proof_root/base-distribution.stderr"
 run_refusal base-import-root 6 overlay_shadows_base_import no
@@ -156,4 +153,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts; legacy bundle and wheel-set documents refused; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts from PackageRelease plus PlacementSet/3; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"

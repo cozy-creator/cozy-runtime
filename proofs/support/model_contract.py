@@ -28,7 +28,6 @@ from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
 
-from cozy_runtime import qualification as runtime_qualification
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -37,10 +36,12 @@ _STATE_FIELDS = {
     "config_digest",
     "config_length",
     "descriptor_length",
-    "environment_spec_digest",
+    "environment_digest",
     "package_descriptor",
     "package_descriptor_digest",
-    "project_wheel_digest",
+    "package_release",
+    "package_release_digest",
+    "package_release_length",
     "wheelhouse_manifest",
 }
 
@@ -127,18 +128,6 @@ def _prepare(args: argparse.Namespace) -> None:
             "wheels": [_wheel(entry, import_roots=True) for entry, _ in base_pairs],
         }
     )
-    resolved = _canonical(
-        {
-            "compatibility_profile": profile,
-            "format": "ResolvedWheelSet/3",
-            "overlay_bytes": 0,
-            "platform_target": target,
-            "resolution_lock_digest": _digest(b"proof-resolution-lock"),
-            "resolution_lock_length": len(b"proof-resolution-lock"),
-            "wheelhouse_manifest_digest": _digest(wheelhouse),
-            "wheels": [],
-        }
-    )
     config = _canonical({"width": 4})
     descriptor_path = args.package_descriptor.resolve()
     descriptor_bytes = descriptor_path.read_bytes()
@@ -162,30 +151,37 @@ def _prepare(args: argparse.Namespace) -> None:
         all("hidden" not in row for row in descriptor_doc["entrypoints"] if isinstance(row, dict)),
         "the descriptor still carries the retired hidden field",
     )
-    bundle = _canonical(
+    project_row = _wheel(project, import_roots=True)
+    package_release = _canonical(
         {
-            "package_descriptor": _ref(descriptor_bytes),
-            "package_release_id": "proof-release",
-            "format": "tensorhub.package_bundle/3",
-            "project_wheel": _wheel(project, import_roots=True),
-            "resolved_wheel_set": _ref(resolved),
-            "source_tree": _ref(b"proof-source-tree"),
-            "wheelhouse_manifest": _ref(wheelhouse),
+            "dependency_wheels": [],
+            "format": "cozy.package.release/1",
+            "project_wheel": {
+                "ref": {"digest": project_row["digest"], "length": project_row["length"]},
+                "distribution": project_row["distribution"],
+                "filename": project_row["filename"],
+                "import_roots": project_row["import_roots"],
+                "tags": project_row["tags"],
+                "version": project_row["version"],
+            },
+            "requires_python": ">=3.11",
+            "requirements": [],
+            "source_manifest": _ref(b'{"entries":[]}'),
         }
     )
-    spec = documents.canonical_bytes(
-        pb.PackageEnvironmentSpec(
-            compatibility_profile=pb.CompatibilityProfile(**profile),
-            platform_target=pb.PlatformTarget(**target),
-            package_bundle_digest=documents.digest_of(bundle),
-            project_wheel_digest=documents.raw(project.digest),
-            wheelhouse_manifest_digest=documents.digest_of(wheelhouse),
-        )
+    environment = pb.Environment(
+        wheelhouse_manifest=pb.Ref(digest=documents.digest_of(wheelhouse), length=len(wheelhouse))
+    )
+    environment_body = {**documents.body(environment), "wheels": []}
+    environment_digest = documents.digest_of(
+        _canonical({**environment_body, "format": "cozy.worker.v1.Environment/1"})
     )
     paths = {
-        "package_environment_spec": _write(inputs / "environment.json", spec),
-        "package_bundle": _write(inputs / "bundle.json", bundle),
-        "resolved_wheel_set": _write(inputs / "resolved.json", resolved),
+        "package_release": _write(inputs / "package-release.json", package_release),
+        "environment": _write(
+            inputs / "environment.json",
+            _canonical(environment_body),
+        ),
         "wheelhouse_manifest": _write(inputs / "wheelhouse.json", wheelhouse),
     }
     config_path = _write(inputs / "model-config.json", config)
@@ -209,8 +205,10 @@ def _prepare(args: argparse.Namespace) -> None:
             "package_descriptor": str(descriptor_path),
             "package_descriptor_digest": _digest(descriptor_bytes),
             "descriptor_length": len(descriptor_bytes),
-            "environment_spec_digest": _digest(spec),
-            "project_wheel_digest": project.digest,
+            "environment_digest": documents.spell(environment_digest),
+            "package_release": str(paths["package_release"]),
+            "package_release_digest": _digest(package_release),
+            "package_release_length": len(package_release),
             "wheelhouse_manifest": str(paths["wheelhouse_manifest"]),
         },
     )
@@ -240,14 +238,17 @@ def _write_model_request(root: Path, name: str) -> None:
                 "length": state["descriptor_length"],
                 "path": state["package_descriptor"],
             },
-            "package_release_id": "proof-release",
+            "package_release": {
+                "digest": state["package_release_digest"],
+                "length": state["package_release_length"],
+                "path": state["package_release"],
+            },
             "environment_generation": environment["generation"],
-            "environment_spec_digest": state["environment_spec_digest"],
+            "environment_digest": state["environment_digest"],
             "installed_environment_receipt": {
                 "digest": _digest(receipt),
                 "length": len(receipt),
             },
-            "project_wheel_digest": state["project_wheel_digest"],
             "wheelhouse_manifest": state["wheelhouse_manifest"],
         },
     )
@@ -278,11 +279,9 @@ def _verify(root: Path) -> None:
         observations[0]["digest"] == observations[1]["digest"],
         "cold and rebuild model-contract observation digests differ",
     )
-    try:
-        kind, index = runtime_qualification.read(outputs[0]["qualification.json"])
-    except runtime_qualification.QualificationError as exc:
-        raise ProofFailure(f"model qualification is invalid: {exc}") from exc
-    _require(kind == "model", f"model qualification has kind {kind!r}")
+    index = _parse_canonical(outputs[0]["result.json"])
+    if not isinstance(index, dict):
+        raise ProofFailure("model proof result is not an object")
     names = [row["name"] for row in index["functions"]]
     _require(names == ["metadata", "render"], f"unexpected visible functions: {names!r}")
     _require(index["functions"][0]["bindings"] == [], "metadata unexpectedly has a binding")
