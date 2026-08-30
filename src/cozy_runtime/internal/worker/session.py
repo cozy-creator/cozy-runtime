@@ -1771,6 +1771,7 @@ class Worker:
             not candidate.environment_receipt_digest
             or self.options.development_project is not None
             or self.artifact_plan.authorized()
+            or (self.options.artifact_client is None and self.options.artifact_cache is not None)
             or (local_receipt is not None and local_receipt.is_file())
         ):
             self.schedule_convergence(desired.revision)
