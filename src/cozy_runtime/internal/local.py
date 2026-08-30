@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from cozy_runtime.internal import bindings as binding_table
-from cozy_runtime.internal import canonical, descriptor, fill, pull
+from cozy_runtime.internal import canonical, descriptor, fill
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -445,9 +445,19 @@ class LocalRecordOwner:
                 raise RuntimeError(
                     f"accepted placement {accepted.placement_id!r}, offered {LOCAL_PLACEMENT!r}"
                 )
-            if construction:
+            modeled = bool(
+                self.placement is not None
+                and any(
+                    entrypoint.name == self.request.entrypoint and entrypoint.slots
+                    for entrypoint in self.placement.entrypoints
+                )
+            )
+            if modeled:
+                if len(construction) != hashlib.sha256().digest_size:
+                    raise RuntimeError("a local modeled acceptance lacks its construction identity")
+            elif construction:
                 raise RuntimeError("a local weightless acceptance invents model construction")
-            if (
+            elif (
                 accepted.plan.delivery != "native"
                 or accepted.plan.materialization
                 or accepted.plan.placement != "all_resident"
@@ -551,6 +561,31 @@ class LocalRecordOwner:
                 and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
                 and binding_digest in status.dispatchable_binding_digests
             )
+            if status is not None and not self.dispatched and not ready:
+                selected_fault = next(
+                    (
+                        fault
+                        for fault in report.faults
+                        if fault.subject in {LOCAL_PLACEMENT, self._binding_digest()}
+                        and fault.kind
+                        in {
+                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                        }
+                    ),
+                    None,
+                )
+                if selected_fault is not None:
+                    self.marks.setdefault("ready", time.perf_counter())
+                    self.ended = "worker_error"
+                    self.error = (
+                        f"placement activation refused: {selected_fault.reason}: "
+                        f"{selected_fault.detail}"
+                    )[:400]
+                    self.done.set()
+                    self.host.close()
+                    return
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
             self.dispatched = True
@@ -1071,6 +1106,7 @@ def development_placement_documents(
             release=source_digest,
             application=str(package_descriptor.get("application", "")),
             descriptor_path=descriptor_path,
+            development_project=str(found.project) if found is not None else "",
             store=str(selected.store) if selected is not None else "",
             config=config_path,
             variant=selected.variant if selected is not None else "",
@@ -1137,7 +1173,9 @@ def _resolve_development_models(
     resolved: dict[str, _DevelopmentModel] = {}
     store_root = artifact_store.resolve()
     try:
-        store = pull.open_store(tensorfs, store_root)
+        if not store_root.is_dir():
+            raise FileNotFoundError(store_root)
+        store = tensorfs.Store.open(str(store_root))
     except Exception as exc:
         raise RuntimeError(
             f"development_model_store_absent: {store_root}: {type(exc).__name__}: {exc}"
@@ -1213,22 +1251,8 @@ def _resolve_development_models(
         if not isinstance(components_value, Mapping) or not components_value:
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         components = tuple(sorted(str(component) for component in components_value))
-        assets_value = header.get("assets", {})
-        if not isinstance(assets_value, Mapping):
-            raise RuntimeError(f"development_model_assets_invalid: {binding.ref}")
-        if assets_value:
-            raise RuntimeError(
-                "development_model_assets_unsupported: local modeled development does not "
-                f"yet stream TensorFS logical assets for {binding.ref}"
-            )
-        selected_assets: dict[str, Mapping[str, Any]] = {}
-        actual_stamps: dict[str, tuple[str, ...]] = {}
-        if slot.stamps:
-            required = ", ".join(f"{key}={value}" for key, value in sorted(slot.stamps.items()))
-            raise RuntimeError(
-                "development_model_stamps_unavailable: local TensorFS Repository releases "
-                f"carry no uploader/catalog stamp set for {binding.ref}: {required}"
-            )
+        selected_assets = _development_assets(binding.ref, header.get("assets", {}))
+        actual_stamps = _development_stamps(binding.ref, slot.stamps)
         try:
             model_weight_bytes = sum(int(row["length"]) for row in store.walk(manifest_digest))
         except Exception as exc:
@@ -1249,12 +1273,38 @@ def _resolve_development_models(
             assets=selected_assets,
             stamps=actual_stamps,
             store=store_root,
-            variant=lane,
+            # Repository lane and accelerator hardware are independent facts. Development
+            # carries no caller-authored hardware variant; the executor derives smNN from
+            # the measured device after it initializes the accelerator.
+            variant="",
             custody="canonical",
             model_weight_bytes=model_weight_bytes,
             vram_floor_bytes=0,
         )
     return resolved
+
+
+def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"development_model_assets_invalid: {binding_ref}")
+    if value:
+        raise RuntimeError(
+            "development_model_assets_unsupported: local modeled development does not "
+            f"yet stream TensorFS logical assets for {binding_ref}"
+        )
+    return {}
+
+
+def _development_stamps(
+    binding_ref: str, required_stamps: Mapping[str, str]
+) -> Mapping[str, tuple[str, ...]]:
+    if required_stamps:
+        required = ", ".join(f"{key}={value}" for key, value in sorted(required_stamps.items()))
+        raise RuntimeError(
+            "development_model_stamps_unavailable: local TensorFS Repository releases "
+            f"carry no uploader/catalog stamp set for {binding_ref}: {required}"
+        )
+    return {}
 
 
 def _exact_model_ref(value: str) -> tuple[str, str, str]:
@@ -1420,6 +1470,7 @@ def run_slice(
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
             development_source_digest=documents.spell(staged.placement.development.source_digest),
+            development_binding_overrides=dict(development_binding_overrides or {}),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")

@@ -51,6 +51,14 @@ __future__ = _Future()
 
 class _Cuda:
     @staticmethod
+    def init() -> None:
+        return None
+
+    @staticmethod
+    def reset_peak_memory_stats() -> None:
+        return None
+
+    @staticmethod
     def is_initialized() -> bool:
         return False
 

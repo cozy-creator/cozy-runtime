@@ -274,6 +274,8 @@ class DeclaredBinding:
     """The exact PackageDescriptor application imported from the installed venv."""
     descriptor_path: str = ""
     """Local path to the exact granted descriptor bytes; resolution, never identity."""
+    development_project: str = ""
+    """Launch-local source path for DevelopmentPackage discovery; never protocol identity."""
     store: str = ""
     config: str = ""
     variant: str = ""

@@ -1295,6 +1295,23 @@ def fence_development_placement() -> list[str]:
         for binding in acquired.bindings.values()
     ):
         return ["development binding invented an Environment identity"]
+    for call, code in (
+        (
+            lambda: local._development_stamps("proof/tiny@1", {"family": "tiny"}),
+            "development_model_stamps_unavailable",
+        ),
+        (
+            lambda: local._development_assets("proof/tiny@1", {"tokenizer": {}}),
+            "development_model_assets_unsupported",
+        ),
+    ):
+        try:
+            call()
+        except RuntimeError as exc:
+            if not str(exc).startswith(code + ":"):
+                return [f"modeled development limitation refused as {exc}"]
+        else:
+            return [f"modeled development admitted unsupported fact instead of {code}"]
     return []
 
 

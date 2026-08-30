@@ -1,9 +1,10 @@
 """`cozy-runtime run` and `cozy-runtime job` — the git-clone contract's load-bearing verbs.
 
 One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` uses.
-Weightless entrypoints and jobs remain local. Model-bound entrypoints require Tensorhub's
-canonical selected provision closure; this verb refuses rather than minting a second flat
-binding contract.
+Weightless entrypoints and jobs remain local. Model-bound entrypoints use the explicit
+DevelopmentPackage lane: the existing package.toml resolver selects a local TensorFS Repository
+release and the worker independently re-derives that exact selection before STAGED. No flat
+binding record or published Qualification is minted.
 
 What this module DOES NOT do is decide anything the runtime decides. The plan, the ladder,
 the confession and the shortfall all arrive on the outcome; this renders them.

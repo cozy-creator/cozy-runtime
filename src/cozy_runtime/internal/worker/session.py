@@ -203,11 +203,13 @@ class WorkerOptions:
     reports a typed fault rather than guessing a directory."""
     artifact_client: artifact_access.ArtifactClient | None = None
     development_project: Path | None = None
-    """Source-checkout-only model-free execution; product local venvs leave this absent."""
+    """Explicit same-user source-checkout execution; product published venvs leave absent."""
     development_package: str = ""
     development_release: str = ""
     development_source_digest: str = ""
     """Exact launch facts the development Placement must echo."""
+    development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
+    """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -2090,6 +2092,7 @@ class Worker:
                     source_digest=self.options.development_source_digest,
                     found=found,
                     artifact_store=self.options.artifact_store,
+                    binding_overrides=self.options.development_binding_overrides,
                 )
                 return acquire.preinstalled_development(
                     placement,
@@ -2531,6 +2534,7 @@ class Worker:
                         "binding": {
                             "application": first.application,
                             "package_descriptor": first.descriptor_path,
+                            "development_project": first.development_project,
                             "model_class": first.model_class,
                             "model_binding_path": first.model_binding_path,
                             "model_parameter_name": first.model_parameter_name,
@@ -2542,6 +2546,7 @@ class Worker:
                             "snapshot": first.reference_snapshot,
                             "release": first.release,
                             "variant": first.variant,
+                            "development": first.development,
                             # THE STAMP PLANE'S LAST HOP (#567d). The index row carries what the
                             # hub verified at publish; the executor hands it to `Artifact`, and
                             # a model class's keywords join it there. Dropping it here is what
@@ -2717,6 +2722,14 @@ class Worker:
         # any working binding becomes dispatchable and refuses only what actually failed.
         if len(self.failed_bindings) >= len(self.bindings):
             self.latched = "prepare refused: every binding"
+            if self.options.development_project is not None and self.placement is not None:
+                # A source-checkout generation has one placement and no retained published
+                # fallback. Creator's readiness owner treats FAILED materialization as the
+                # terminal answer and replaces this generation; leaving it STAGED/OFFLINE
+                # made a permanent prepare refusal look like an endlessly activating model.
+                self.placement.materialization = (
+                    pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+                )
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
             return
         if self.failed_bindings:
