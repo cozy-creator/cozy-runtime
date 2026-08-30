@@ -132,13 +132,13 @@ def digests_of(alias: str) -> tuple[str, ...]:
 # alias-keyed spelling had neither.
 
 #: `plain/1` — one `value` role carrying the logical bytes verbatim.
-SPEC_PLAIN = "sha256:88c2f114d68d7e30f0a003a0880a28ded359476ac3cddb7891b6ab7f056d9907"
+SPEC_PLAIN = "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd"
 
 #: `fp8-rowwise/1`, rank-1 `[out]` scale. v1's `fp8-w8a8` writer.
-SPEC_ROWWISE = "sha256:2148c93613ec8e563732936e74a585f5623953f3d053dfc12bd72780f37d4f09"
+SPEC_ROWWISE = "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5"
 
 #: `fp8-rowwise/1`, rank-2 `[out, 1]` scale — a KEPT trailing unit axis, physically distinct.
-SPEC_ROWWISE_KEEPDIM = "sha256:6ca5bf0e304655d7338816bc91e73336361e6a4384b4c35d4aed5296f39dad6e"
+SPEC_ROWWISE_KEEPDIM = "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78"
 
 #: `fp8-scaled-scalar/1` WITH the rank-0 activation `input_scale` (H3's 150 modules).
 #:
@@ -152,27 +152,42 @@ SPEC_ROWWISE_KEEPDIM = "sha256:6ca5bf0e304655d7338816bc91e73336361e6a4384b4c35d4
 #: vector document this provider is READ AGAINST is byte-identical to the one the new spec
 #: names (`cac6671a…`). What moved in the spec document is its prose and its acquisition of
 #: those very vectors; the physical byte contract did not.
-SPEC_SCALED_SCALAR = "sha256:1ae27bbdfd44b099cb3081fbd35e46e6bacb5da7a0c611a4cc6f11d90d0c59c0"
+SPEC_SCALED_SCALAR = "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f"
 
 #: `fp8-scaled-scalar/1` weight-scale only (H3's 50 `mlp.fc2`). One artifact, two role sets.
 #: Same move, same review: roles (`data`, `weight_scale`) unchanged and the vendored vectors
 #: (`e7bf8223…`) are the ones the new spec names.
 SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
-    "sha256:3b560936a385ce7971698e8f9b792caaf0339eb77e7856e83e770a9e573a11d0"
+    "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489"
 )
 
 #: `mxfp8/1` — E4M3 elements, one E8M0 byte per 32-element block along the last axis.
-SPEC_MXFP8 = "sha256:d16296b28ddfc0813d713e1e245cbd06cbff7d71dc90347cd1ac3cb7efc1f92d"
+SPEC_MXFP8 = "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80"
 
-#: Reviewed digest -> the vendored vector document under `encoding/vectors/` that the spec
-#: names. `plain/1`'s vectors are built inside the registry rather than mined, and its route
-#: decodes nothing, so it has no entry — its evidence is the fill plane's byte-identity proof.
-SPEC_VECTORS: dict[str, str] = {
-    SPEC_ROWWISE: "fp8-rowwise.json",
-    SPEC_ROWWISE_KEEPDIM: "fp8-rowwise-keepdim.json",
-    SPEC_SCALED_SCALAR: "fp8-scaled-scalar.json",
-    SPEC_SCALED_SCALAR_WEIGHT_ONLY: "fp8-scaled-scalar-weight-only.json",
-    SPEC_MXFP8: "mxfp8.json",
+#: Reviewed digest -> (vendored fixture filename, exact vector-byte digest) from that nested spec.
+#: Qualification checks both before executing a case. `plain/1`'s route decodes nothing, so it
+#: has no entry — its evidence is the fill plane's byte-identity proof.
+SPEC_VECTORS: dict[str, tuple[str, str]] = {
+    SPEC_ROWWISE: (
+        "fp8-rowwise.json",
+        "sha256:e7a1264e4b60ac9f800736b23b3e3c50bb3e6ed506bdc30a2769abfc850ef2ba",
+    ),
+    SPEC_ROWWISE_KEEPDIM: (
+        "fp8-rowwise-keepdim.json",
+        "sha256:55e4b815d169c5b6959decdb54a89a7af94c26f9f4ac7339c25d6b365582dd27",
+    ),
+    SPEC_SCALED_SCALAR: (
+        "fp8-scaled-scalar.json",
+        "sha256:ed0ee586675b05cfff658e61a8f46712e679be3cfac350b878c5e0b69e5732d4",
+    ),
+    SPEC_SCALED_SCALAR_WEIGHT_ONLY: (
+        "fp8-scaled-scalar-weight-only.json",
+        "sha256:2326cbd4a1ccaac484792bba04f07e19bc59d61fd913cbe5a4a9a66e469a9374",
+    ),
+    SPEC_MXFP8: (
+        "mxfp8.json",
+        "sha256:9950f32248a14b37267c17d8d8e1fd9c8a281c8291183ee390908e2f00326a22",
+    ),
 }
 
 

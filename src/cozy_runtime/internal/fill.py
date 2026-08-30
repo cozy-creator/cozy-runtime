@@ -386,7 +386,7 @@ class PlanRow:
 
 
 class Checkpoint:
-    """One snapshot of a TensorFS store, opened through the tfs-007 facade.
+    """One model manifest in a TensorFS store, opened through the tfs-007 facade.
 
     This class is the ONLY place in the runtime that speaks to TensorFS, and it is
     deliberately thin. Object verification, GC-safe holds, plan ordering, dtype names, the
@@ -398,27 +398,20 @@ class Checkpoint:
     verified per object in Python; none of that survives, and none of it needs to.
     """
 
-    def __init__(self, root: str | Path, snapshot_id: str) -> None:
+    def __init__(self, root: str | Path, manifest_id: str) -> None:
         tensorfs = tensorfs_module()
         self.tensorfs = tensorfs
         self.root = str(root)
-        self.snapshot_id = snapshot_id
-        with store_refusals(f"opening snapshot {snapshot_id[:23]}"):
+        self.manifest_id = manifest_id
+        with store_refusals(f"opening manifest {manifest_id[:23]}"):
             self.store = tensorfs.Store.open(self.root)
-            snapshot = self.store.snapshot(snapshot_id)
-            self.header_bytes: bytes = snapshot["header"]
-            # THE HEADER IS PARSED AGAINST ITS OWN ENCODING CLOSURE (cr-006). The header
-            # cites a spec digest per tensor and lists those spec objects; reading them
-            # back out of the CAS and re-validating is how "the decode targets come from
-            # the header's cited specs" stops being a claim. It is also law 18: a
-            # RecordOwner's authority is not worker safety, so the worker re-checks that
-            # each tensor's stored ROLES are the roles its cited spec declares — which is
-            # TensorFS's fact, asked of TensorFS rather than reimplemented here.
-            closure = tensorfs.Closure()
-            for ref in tensorfs.parse_header(self.header_bytes)["encodings"]:
-                closure.insert(self.store.document(str(ref["sha256"])))
-            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes, closure)
-            self.specs: tuple[str, ...] = tuple(closure.digests())
+            manifest = self.store.manifest(manifest_id)
+            self.header_bytes: bytes = manifest["header"]
+            # Encoding definitions are nested directly in cozytensors/1. TensorFS parses
+            # and validates the header once and exposes each definition with the digest
+            # that tensor rows cite; there is no second closure-object lookup.
+            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes)
+            self.specs = tuple(str(row["id"]) for row in self.header["encodings"])
         from cozy_runtime.internal.encoding import aliases
 
         self._aliases = aliases()
@@ -540,9 +533,9 @@ class Checkpoint:
             )
 
     def acquire(self) -> Any:
-        """A verified read lease over the whole snapshot. The GC-safe hold registers FIRST."""
-        with store_refusals(f"acquiring a lease on {self.snapshot_id[:23]}"):
-            return self.store.acquire_snapshot(self.snapshot_id)
+        """A verified read lease over the whole manifest. The GC-safe hold registers FIRST."""
+        with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
+            return self.store.acquire_manifest(self.manifest_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1159,7 +1152,7 @@ class StreamingFillBackend:
             store=store,
             snapshot=snapshot,
             snapshots=(
-                {name: book.snapshot_id for name, book in checkpoint.items()}
+                {name: book.manifest_id for name, book in checkpoint.items()}
                 if isinstance(checkpoint, Mapping)
                 else {}
             ),

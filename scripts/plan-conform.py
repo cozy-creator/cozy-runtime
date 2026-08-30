@@ -643,8 +643,8 @@ def specs() -> None:
     check(
         "a reviewed digest carries the producer-mined VECTOR DOCUMENT the spec names",
         all(
-            (ROOT / "src/cozy_runtime/internal/encoding/vectors" / n).is_file()
-            for n in SPEC_VECTORS.values()
+            (ROOT / "src/cozy_runtime/internal/encoding/vectors" / name).is_file()
+            for name, _ in SPEC_VECTORS.values()
         ),
         f"{len(SPEC_VECTORS)} vendored documents — the suite DECODES them, so `reviewed` "
         "means the exact producer bytes ran through the exact provider",

@@ -761,7 +761,7 @@ def main() -> int:
                 self.completed = True
 
         tensorfs = FakeTensorFS()
-        outcome = pull.pull_granted_snapshot(
+        outcome = pull.pull_granted_manifest(
             tensorfs,
             FakeStore(root / "store"),
             "sha256:" + snapshot,
@@ -773,7 +773,7 @@ def main() -> int:
         )
         assert tensorfs.completed and outcome.held == 2 and outcome.fetched == 0
         try:
-            pull.pull_granted_snapshot(
+            pull.pull_granted_manifest(
                 tensorfs,
                 FakeStore(root / "store"),
                 snapshot,

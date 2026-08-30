@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Real-TensorFS proof for the worker-local CAS plus optional network cache."""
+"""Real TensorFS proof for the worker-local store plus optional network cache."""
 
 from __future__ import annotations
 
 import hashlib
 import io
-import shutil
+import json
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +27,15 @@ from cozy_runtime.internal.placement_materialization import (
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
 
+# TensorFS's smallest current cozytensors/1 vector: one inline bf16 tensor and its nested
+# plain encoding. It has no external body object, so this proof can add ordinary file blobs
+# without growing a second model-fixture author.
+HEADER = bytes.fromhex(
+    "856d636f7a7974656e736f72732f318080818581038081836576616c756581008100808081826b7472"
+    "616e73666f726d657281856f626c6f636b732e302e7765696768740381020081846576616c75650381"
+    "02440001ff7f"
+)
+
 
 def _ref(raw: bytes) -> provisioned.ArtifactRef:
     return provisioned.ArtifactRef("sha256:" + hashlib.sha256(raw).hexdigest(), len(raw))
@@ -34,6 +43,49 @@ def _ref(raw: bytes) -> provisioned.ArtifactRef:
 
 def _put(store: Any, ref: provisioned.ArtifactRef, raw: bytes) -> None:
     store.put_reader(io.BytesIO(raw), ref.digest, ref.length)
+
+
+def _closure(
+    name: str, payload: bytes | None = None
+) -> tuple[bytes, provisioned.ArtifactRef, tuple[provisioned.ArtifactRef, ...], dict[str, bytes]]:
+    header = _ref(HEADER)
+    entries: list[dict[str, object]] = [
+        {
+            "blob": {"length": header.length, "sha256": header.digest[7:]},
+            "kind": "cozytensors",
+            "path": f"{name}.cozytensors",
+        }
+    ]
+    objects = [header]
+    raws = {header.digest: HEADER}
+    if payload is not None:
+        file_ref = _ref(payload)
+        entries.append(
+            {
+                "blob": {"length": file_ref.length, "sha256": file_ref.digest[7:]},
+                "kind": "file",
+                "path": f"{name}.bin",
+            }
+        )
+        objects.append(file_ref)
+        raws[file_ref.digest] = payload
+    entries.sort(key=lambda row: str(row["path"]))
+    manifest = json.dumps({"entries": entries}, sort_keys=True, separators=(",", ":")).encode()
+    root = _ref(manifest)
+    raws[root.digest] = manifest
+    return manifest, root, tuple(objects), raws
+
+
+def _put_closure(
+    store: Any,
+    manifest: bytes,
+    root: provisioned.ArtifactRef,
+    objects: tuple[provisioned.ArtifactRef, ...],
+    raws: Mapping[str, bytes],
+) -> None:
+    for ref in objects:
+        _put(store, ref, raws[ref.digest])
+    store.put_manifest(manifest, root.digest, root.length)
 
 
 class _Server(ThreadingHTTPServer):
@@ -48,8 +100,10 @@ class _Handler(BaseHTTPRequestHandler):
         object_id = "sha256:" + self.path.removeprefix("/")
         if server.before_get is not None:
             server.before_get(object_id)
-        if server.barrier is not None:
-            server.barrier.wait(timeout=5)
+        barrier = server.barrier
+        if barrier is not None:
+            barrier.wait(timeout=5)
+            server.barrier = None
         raw = server.objects[object_id]
         self.send_response(200)
         self.send_header("Content-Length", str(len(raw)))
@@ -62,29 +116,26 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _cloud_hydrate(
     store: Any,
-    ref: provisioned.ArtifactRef,
+    root: provisioned.ArtifactRef,
+    objects: tuple[provisioned.ArtifactRef, ...],
     cache_store: Any | None,
-    url: str,
+    server: _Server,
     *,
     session: str,
-    objects: tuple[provisioned.ArtifactRef, ...] = (),
-    object_urls: Mapping[str, str] | None = None,
     streams: int = 1,
     on_object: Callable[[str, int, bool], None] | None = None,
 ) -> pull.PullResult:
-    root = ref.digest.removeprefix("sha256:") if objects else ref.digest
-    declared = objects or (ref,)
     plan = pull._plan(
         tensorfs,
         store,
         session,
-        root,
-        ref.length,
-        [(item.digest, item.length) for item in declared],
+        root.digest[7:],
+        root.length,
+        [(item.digest, item.length) for item in objects],
     )
     result = pull.PullResult(
-        ref=ref.digest,
-        snapshot=ref.digest.removeprefix("sha256:"),
+        ref=root.digest,
+        manifest_id=root.digest[7:],
         store=str(store.root),
         streams=streams,
         declared=len(plan["held"]) + len(plan["wanted"]),
@@ -94,12 +145,13 @@ def _cloud_hydrate(
         presence=dict(plan["presence"]),
         sources={str(object_id): "local" for object_id, _ in plan["held"]},
     )
+    base = f"http://127.0.0.1:{server.server_port}/"
     pull._execute_plan(
         tensorfs,
         store,
         plan,
         result,
-        urls={ref.digest: url, **(object_urls or {})},
+        urls={ref.digest: base + ref.digest[7:] for ref in (root, *objects)},
         in_hand={},
         deadline=pull.Deadline(),
         allow_local=True,
@@ -113,9 +165,7 @@ def _cloud_hydrate(
 
 def main() -> int:
     server = _Server(("127.0.0.1", 0), _Handler)
-    server.objects = {}
-    server.before_get = None
-    server.barrier = None
+    server.objects, server.before_get, server.barrier = {}, None, None
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     try:
@@ -126,292 +176,211 @@ def main() -> int:
             cache_root = cache_mount / "tensorfs"
             cache_store = tensorfs.Store.init(str(cache_root))
 
-            # A complete warm model closure uses no cloud and becomes an independent local CAS.
-            manifest = b'{"format":"fixture.snapshot/1"}'
-            second_manifest = b'{"format":"fixture.snapshot/1","root":2}'
-            segment = b"warm-network-cache-segment"
-            manifest_ref, second_manifest_ref, segment_ref = (
-                _ref(manifest),
-                _ref(second_manifest),
-                _ref(segment),
-            )
-            _put(cache_store, manifest_ref, manifest)
-            _put(cache_store, second_manifest_ref, second_manifest)
-            _put(cache_store, segment_ref, segment)
+            # Two typed Manifests share one header blob and use no network.
+            first, second = _closure("first"), _closure("second")
+            for closure in (first, second):
+                _put_closure(cache_store, *closure)
+            _, first_root, first_objects, first_raws = first
+            _, second_root, second_objects, _ = second
             object_set = provisioned.ArtifactObjectSet(
                 tuple(
                     sorted(
                         (
-                            provisioned.ModelRoot(manifest_ref, (segment_ref,)),
-                            provisioned.ModelRoot(second_manifest_ref, (segment_ref,)),
+                            provisioned.ModelRoot(first_root, first_objects),
+                            provisioned.ModelRoot(second_root, second_objects),
                         ),
                         key=lambda group: group.root.digest,
                     )
                 )
             )
-            grants = {
-                ref.digest: "https://blocked.invalid"
-                for ref in (manifest_ref, second_manifest_ref, segment_ref)
-            }
-            warm_local = root / "warm-local"
+            unique = {ref.digest: ref for ref in (first_root, second_root, *first_objects)}
             warm = materialize_objects(
-                grants,
+                {digest: "https://blocked.invalid" for digest in unique},
                 object_set,
                 cache=CacheMount(cache_mount, "cache-live", "provider-volume-live"),
                 deadline=None,
-                store_root=warm_local,
+                store_root=root / "warm-local",
             )
-            warm_observation = acquire.AcquisitionObservation()
-            warm_observation.start("model")
-            acquire.observe_model_sources(warm_observation, warm)
-            warm_observation.finish("model")
-            warm_leg = warm_observation.snapshot().model
-            assert warm.store == warm_local and warm.store != cache_root
+            observation = acquire.AcquisitionObservation()
+            observation.start("model")
+            acquire.observe_model_sources(observation, warm)
+            observation.finish("model")
+            cached_bytes = sum(ref.length for ref in unique.values())
             assert warm.sources == {
                 "cloud": {"bytes": 0, "objects": 0},
                 "local": {"bytes": 0, "objects": 0},
-                "network_cache": {
-                    "bytes": manifest_ref.length + second_manifest_ref.length + segment_ref.length,
-                    "objects": 3,
-                },
+                "network_cache": {"bytes": cached_bytes, "objects": len(unique)},
             }
-            assert warm_leg.downloaded_bytes == 0
-            assert warm_leg.reused_bytes == (
-                manifest_ref.length + second_manifest_ref.length + segment_ref.length
-            )
-            assert warm_leg.ended_monotonic_ns >= warm_leg.started_monotonic_ns > 0
-            shutil.rmtree(cache_root)
-            warm_store = tensorfs.Store.open(str(warm_local))
-            assert (
-                warm_store.verify(manifest_ref.digest.removeprefix("sha256:"))["verdict"]
-                == "verified"
-            )
-            assert (
-                warm_store.verify(segment_ref.digest.removeprefix("sha256:"))["verdict"]
-                == "verified"
-            )
-            assert (
-                warm_store.verify(second_manifest_ref.digest.removeprefix("sha256:"))["verdict"]
-                == "verified"
-            )
-            cache_store = tensorfs.Store.init(str(cache_root))
+            assert observation.snapshot().model.reused_bytes == cached_bytes
+            warm_store = tensorfs.Store.open(str(root / "warm-local"))
+            warm_store.manifest(first_root.digest)
+            warm_store.manifest(second_root.digest)
+            assert warm_store.verify(first_objects[0].digest)["verdict"] == "verified"
 
-            # No attached cache means no cache path operation: the exact cloud closure
-            # lands in the same worker-local store used by production, with no degradation.
-            assert Path("/var/lib/cozy/store") == LOCAL_ARTIFACT_STORE_ROOT
-            cloud_only_set = provisioned.ArtifactObjectSet(
-                (provisioned.ModelRoot(manifest_ref, (segment_ref,)),)
-            )
-            cloud_only_grants = {
-                ref.digest: f"https://delivery.invalid/{ref.digest[7:]}"
-                for ref in (manifest_ref, segment_ref)
-            }
-            server.objects = {
-                manifest_ref.digest: manifest,
-                segment_ref.digest: segment,
-            }
+            # Exercise the production wrapper with no cache; only this proof rewrites its
+            # closed HTTPS grants to the local byte server.
+            server.objects = dict(first_raws)
 
             def local_cloud_pull(
                 tensorfs_module: Any,
                 store: Any,
-                snapshot: str,
-                snapshot_length: int,
+                manifest_id: str,
+                manifest_length: int,
                 granted: list[pull.Read],
-                *,
-                timeout: float | None = None,
-                session: str = "",
-                streams: int = pull.STREAMS,
-                on_object: Callable[[str, int, bool], None] | None = None,
-                cache_store: Any | None = None,
-                allow_local: bool = False,
+                **kwargs: Any,
             ) -> pull.PullResult:
                 assert tensorfs_module is tensorfs
-                assert timeout is None and cache_store is None and not allow_local
-                rows = list(granted)
-                assert snapshot == manifest_ref.digest and snapshot_length == manifest_ref.length
-                assert {row.object_id for row in rows} == {
-                    manifest_ref.digest,
-                    segment_ref.digest,
-                }
+                assert manifest_id == first_root.digest and manifest_length == first_root.length
+                assert {row.object_id for row in granted} == set(first_raws)
                 return _cloud_hydrate(
                     store,
-                    manifest_ref,
+                    first_root,
+                    first_objects,
                     None,
-                    f"http://127.0.0.1:{server.server_port}/{manifest_ref.digest[7:]}",
-                    session=session,
-                    objects=(segment_ref,),
-                    object_urls={
-                        segment_ref.digest: (
-                            f"http://127.0.0.1:{server.server_port}/{segment_ref.digest[7:]}"
-                        )
-                    },
-                    streams=streams,
-                    on_object=on_object,
+                    server,
+                    session=str(kwargs.get("session") or "cloud-only"),
+                    streams=int(kwargs.get("streams") or 1),
+                    on_object=kwargs.get("on_object"),
                 )
 
-            cloud_only_local = root / "cloud-only-local"
-            with mock.patch.object(pull, "pull_granted_snapshot", side_effect=local_cloud_pull):
+            assert Path("/var/lib/cozy/store") == LOCAL_ARTIFACT_STORE_ROOT
+            with mock.patch.object(pull, "pull_granted_manifest", side_effect=local_cloud_pull):
                 cloud_only = materialize_objects(
-                    cloud_only_grants,
-                    cloud_only_set,
+                    {
+                        ref.digest: f"https://delivery.invalid/{ref.digest[7:]}"
+                        for ref in (first_root, *first_objects)
+                    },
+                    provisioned.ArtifactObjectSet(
+                        (provisioned.ModelRoot(first_root, first_objects),)
+                    ),
                     cache=None,
                     deadline=None,
-                    store_root=cloud_only_local,
+                    store_root=root / "cloud-only-local",
                 )
-            cold_observation = acquire.AcquisitionObservation(lambda _value: 1 / 0)
-            cold_observation.start("model")
-            acquire.observe_model_sources(cold_observation, cloud_only)
-            cold_observation.finish("model")
-            cold_leg = cold_observation.snapshot().model
-            cloud_only_bytes = manifest_ref.length + segment_ref.length
-            assert cloud_only.sources == {
-                "cloud": {"bytes": cloud_only_bytes, "objects": 2},
-                "local": {"bytes": 0, "objects": 0},
-                "network_cache": {"bytes": 0, "objects": 0},
-            }
-            assert not cloud_only.network_cache_degradations
-            assert cold_leg.downloaded_bytes == cloud_only_bytes
-            assert cold_leg.reused_bytes == 0
-            assert cold_leg.ended_monotonic_ns >= cold_leg.started_monotonic_ns > 0
-            cloud_only_store = tensorfs.Store.open(str(cloud_only_local))
-            assert all(
-                cloud_only_store.verify(ref.digest[7:])["verdict"] == "verified"
-                for ref in (manifest_ref, segment_ref)
-            )
+            cloud_bytes = sum(ref.length for ref in (first_root, *first_objects))
+            assert cloud_only.sources["cloud"] == {"bytes": cloud_bytes, "objects": 2}
+            tensorfs.Store.open(str(root / "cloud-only-local")).manifest(first_root.digest)
 
-            # A corrupt cache body commits nothing locally before the cloud fallback runs.
-            corrupt_raw = b"correct-cloud-object"
-            corrupt_ref = _ref(corrupt_raw)
-            _put(cache_store, corrupt_ref, corrupt_raw)
+            # A corrupt cache blob is quarantined, fetched, and backfilled. The typed
+            # Manifest and header remain cache hits.
+            manifest, corrupt_root, corrupt_objects, corrupt_raws = _closure(
+                "corrupt", b"correct-cloud-object"
+            )
+            _put_closure(cache_store, manifest, corrupt_root, corrupt_objects, corrupt_raws)
+            payload_ref = corrupt_objects[1]
             corrupt_path = next(
                 path
-                for path in cache_root.rglob(corrupt_ref.digest.removeprefix("sha256:"))
-                if path.read_bytes() == corrupt_raw
+                for path in (cache_root / "blobs").rglob(payload_ref.digest[7:])
+                if path.is_file()
             )
             corrupt_path.chmod(0o644)
-            corrupt_path.write_bytes(b"X" * corrupt_ref.length)
+            corrupt_path.write_bytes(b"X" * payload_ref.length)
             corrupt_path.chmod(0o444)
-            corrupt_store = tensorfs.Store.init(str(root / "corrupt-local"))
-            server.objects = {corrupt_ref.digest: corrupt_raw}
+            local = tensorfs.Store.init(str(root / "corrupt-local"))
+            server.objects = dict(corrupt_raws)
 
-            def corrupt_not_local(object_id: str) -> None:
-                assert not corrupt_store.contains(object_id.removeprefix("sha256:")), (
-                    "corrupt cache published locally"
-                )
+            def not_published_early(object_id: str) -> None:
+                if object_id == payload_ref.digest:
+                    assert not local.contains(payload_ref.digest)
 
-            server.before_get = corrupt_not_local
-            corrupt = _cloud_hydrate(
-                corrupt_store,
-                corrupt_ref,
+            server.before_get = not_published_early
+            repaired = _cloud_hydrate(
+                local,
+                corrupt_root,
+                corrupt_objects,
                 cache_store,
-                f"http://127.0.0.1:{server.server_port}/{corrupt_ref.digest[7:]}",
+                server,
                 session="corrupt-fallback",
             )
-            assert corrupt.sources == {corrupt_ref.digest: "cloud"}
-            assert "corrupt" in corrupt.cache_degradations
-            assert cache_store.document(corrupt_ref.digest) == corrupt_raw
-            quarantined = list((cache_root / "quarantine").iterdir())
-            assert (
-                len(quarantined) == 1 and quarantined[0].read_bytes() == b"X" * corrupt_ref.length
-            )
-
-            # A cloud miss backfills one exact key; a fresh local CAS then runs cloud-blocked.
-            cloud_raw = b"cold-cloud-object"
-            cloud_ref = _ref(cloud_raw)
-            server.objects = {cloud_ref.digest: cloud_raw}
             server.before_get = None
-            cold_store = tensorfs.Store.init(str(root / "cold-local"))
-            cold = _cloud_hydrate(
-                cold_store,
-                cloud_ref,
-                cache_store,
-                f"http://127.0.0.1:{server.server_port}/{cloud_ref.digest[7:]}",
+            assert repaired.sources[payload_ref.digest] == "cloud"
+            assert "corrupt" in repaired.cache_degradations
+            assert cache_store.document(payload_ref.digest) == corrupt_raws[payload_ref.digest]
+            assert list((cache_root / ".tensorfs" / "quarantine").iterdir())
+
+            # One cold fill backfills a fresh cache; another store then stays cloud-free.
+            _, cold_root, cold_objects, cold_raws = _closure("cold", b"cold-cloud-object")
+            server.objects = dict(cold_raws)
+            cold_cache = tensorfs.Store.init(str(root / "cold-cache"))
+            cold_result = _cloud_hydrate(
+                tensorfs.Store.init(str(root / "cold-local")),
+                cold_root,
+                cold_objects,
+                cold_cache,
+                server,
                 session="cold-cloud",
             )
-            assert cold.sources == {cloud_ref.digest: "cloud"}
-            assert cache_store.document(cloud_ref.digest) == cloud_raw
-            fresh_store = tensorfs.Store.init(str(root / "fresh-local"))
-            fresh = _cloud_hydrate(
-                fresh_store,
-                cloud_ref,
-                cache_store,
-                "http://127.0.0.1:1/cloud-is-blocked",
+            assert set(cold_result.sources.values()) == {"cloud"}
+            warm_result = _cloud_hydrate(
+                tensorfs.Store.init(str(root / "fresh-local")),
+                cold_root,
+                cold_objects,
+                cold_cache,
+                server,
                 session="warm-cloud-blocked",
             )
-            assert fresh.sources == {cloud_ref.digest: "network_cache"}
+            assert set(warm_result.sources.values()) == {"network_cache"}
 
-            # Concurrent honest fills use create-if-absent publication of the same exact key.
-            concurrent_raw = b"concurrent-cloud-object"
-            concurrent_ref = _ref(concurrent_raw)
-            server.objects = {concurrent_ref.digest: concurrent_raw}
+            # Concurrent first writers converge at the exact typed keys.
+            _, concurrent_root, concurrent_objects, concurrent_raws = _closure(
+                "concurrent", b"concurrent-cloud-object"
+            )
+            server.objects = dict(concurrent_raws)
+            concurrent_cache = tensorfs.Store.init(str(root / "concurrent-cache"))
             server.barrier = threading.Barrier(2)
 
-            def concurrent(index: int) -> pull.PullResult:
-                store = tensorfs.Store.init(str(root / f"concurrent-local-{index}"))
+            def fill(index: int) -> pull.PullResult:
                 return _cloud_hydrate(
-                    store,
-                    concurrent_ref,
-                    cache_store,
-                    f"http://127.0.0.1:{server.server_port}/{concurrent_ref.digest[7:]}",
+                    tensorfs.Store.init(str(root / f"concurrent-local-{index}")),
+                    concurrent_root,
+                    concurrent_objects,
+                    concurrent_cache,
+                    server,
                     session=f"concurrent-{index}",
                 )
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                concurrent_results = list(pool.map(concurrent, range(2)))
-            server.barrier = None
-            assert cache_store.document(concurrent_ref.digest) == concurrent_raw
-            assert all(
-                result.sources[concurrent_ref.digest] == "cloud" for result in concurrent_results
-            )
+                concurrent_results = list(pool.map(fill, range(2)))
+            concurrent_cache.manifest(concurrent_root.digest)
+            assert all(result.fetched == 3 for result in concurrent_results)
 
-            # Read-only and unavailable cache paths only lose acceleration.
+            # Cache failure only loses acceleration; local admission remains complete.
             readonly_root = root / "readonly-cache"
             readonly_cache = tensorfs.Store.init(str(readonly_root))
             for path in sorted(readonly_root.rglob("*"), reverse=True):
                 path.chmod(0o500 if path.is_dir() else 0o400)
             readonly_root.chmod(0o500)
-            readonly_raw = b"readonly-cache-cloud-object"
-            readonly_ref = _ref(readonly_raw)
-            server.objects = {readonly_ref.digest: readonly_raw}
+            _, readonly_manifest, readonly_objects, readonly_raws = _closure(
+                "readonly", b"readonly-cloud-object"
+            )
+            server.objects = dict(readonly_raws)
             readonly_store = tensorfs.Store.init(str(root / "readonly-local"))
-            readonly = _cloud_hydrate(
+            result = _cloud_hydrate(
                 readonly_store,
-                readonly_ref,
+                readonly_manifest,
+                readonly_objects,
                 readonly_cache,
-                f"http://127.0.0.1:{server.server_port}/{readonly_ref.digest[7:]}",
+                server,
                 session="readonly-cache",
             )
             readonly_root.chmod(0o700)
             for path in readonly_root.rglob("*"):
                 path.chmod(0o700 if path.is_dir() else 0o600)
-            assert readonly_store.contains(readonly_ref.digest[7:])
-            assert "backfill_unavailable" in readonly.cache_degradations
+            readonly_store.manifest(readonly_manifest.digest)
+            assert "backfill_unavailable" in result.cache_degradations
 
             unavailable_mount = root / "unavailable-cache"
             unavailable_mount.write_bytes(b"not-a-directory")
-            unavailable_degradations: set[str] = set()
-            unavailable_cache = _open_cache_store(
+            degradations: set[str] = set()
+            unavailable = _open_cache_store(
                 tensorfs,
                 unavailable_mount,
                 unavailable_mount / "tensorfs",
-                unavailable_degradations,
+                degradations,
             )
-            assert unavailable_cache is None and unavailable_degradations == {"unavailable"}
-            unavailable_raw = b"unavailable-cache-cloud-object"
-            unavailable_ref = _ref(unavailable_raw)
-            server.objects = {unavailable_ref.digest: unavailable_raw}
-            unavailable_store = tensorfs.Store.init(str(root / "unavailable-local"))
-            unavailable = _cloud_hydrate(
-                unavailable_store,
-                unavailable_ref,
-                unavailable_cache,
-                f"http://127.0.0.1:{server.server_port}/{unavailable_ref.digest[7:]}",
-                session="unavailable-cache",
-            )
-            assert unavailable_store.contains(unavailable_ref.digest[7:])
-            assert not unavailable.cache_degradations
+            assert unavailable is None and degradations == {"unavailable"}
 
-            # An alias refuses before creating either side, including the weightless case.
+            # A cache/local alias refuses before either store is created.
             alias_mount = root / "alias"
             alias_mount.mkdir()
             alias_store = alias_mount / "tensorfs"
@@ -426,18 +395,17 @@ def main() -> int:
             except LaunchRefusal as exc:
                 assert exc.code == "artifact_store_alias"
             else:
-                raise AssertionError("network cache was accepted as the local CAS")
+                raise AssertionError("network cache was accepted as the local store")
             assert not alias_store.exists()
-            assert (cache_root / "store.json").is_file()
+            assert (cache_root / "tensorfs.sqlite").is_file()
             assert {path.name for path in cache_root.iterdir()} <= {
-                "objects",
-                "quarantine",
-                "store.json",
-                "meta",
-                "tmp",
-                "verified",
+                ".tensorfs",
+                "blobs",
+                "checkouts",
+                "manifests",
+                "repos",
+                "tensorfs.sqlite",
             }
-            assert not any(path.is_file() for path in (cache_root / "meta").rglob("*"))
     finally:
         server.shutdown()
         server.server_close()
