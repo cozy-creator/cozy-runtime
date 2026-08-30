@@ -783,12 +783,13 @@ def write_output(
     if not stat.S_ISREG(source_info.st_mode):
         raise GrantRefusal("output_spool_io", f"{output_id}: output spool is not a regular file")
     length = int(source_info.st_size)
-    auth.authorize("grant_output_write", "PUT", url, {"output_id": output_id, "length": length})
     if destination.max_bytes and length > destination.max_bytes:
         raise GrantRefusal(
             "output_too_large",
             f"{output_id}: {length} B over the granted {destination.max_bytes} B",
         )
+    selected_media_type = _output_media_type(output_id, destination.mime_type, media_type)
+    auth.authorize("grant_output_write", "PUT", url, {"output_id": output_id, "length": length})
     parsed = _parse_grant_url(url)
     if parsed.scheme == "https":
         host = parsed.hostname or ""
@@ -803,7 +804,7 @@ def write_output(
                     egress.EgressPolicy(allowed_hosts=(host,)),
                     opened,
                     expected_length=length,
-                    media_type=media_type,
+                    media_type=selected_media_type,
                     what=f"output {output_id!r}",
                 )
         except egress.EgressRefusal as exc:
@@ -818,7 +819,7 @@ def write_output(
             output_id=output_id,
             digest=receipt.sha256,
             length=receipt.length,
-            mime_type=media_type or "application/octet-stream",
+            mime_type=selected_media_type,
         )
 
     path = _local(destination.url, grant.file_base_url)
@@ -870,10 +871,23 @@ def write_output(
         output_id=output_id,
         digest=receipt.sha256,
         length=receipt.length,
-        # The media type the AUTHOR declared when the asset was saved.
-        # `application/octet-stream` remains the honest answer when nothing declared one.
-        mime_type=media_type or "application/octet-stream",
+        mime_type=selected_media_type,
     )
+
+
+def _output_media_type(output_id: str, bound: str, produced: str) -> str:
+    """Join the invocation's MIME contract to the type observed from the author result."""
+    from cozy_runtime.author._media import normalize
+
+    exact = normalize(bound)
+    observed = normalize(produced)
+    if exact and observed != exact:
+        raise GrantRefusal(
+            "output_media_type_mismatch",
+            f"{output_id}: the invocation binds {exact!r}, but the produced output declares "
+            f"{observed or 'no media type'!r}",
+        )
+    return exact or observed or "application/octet-stream"
 
 
 def abort_outputs(spool: Path) -> int:

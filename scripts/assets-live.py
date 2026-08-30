@@ -309,7 +309,7 @@ def roundtrip() -> None:
     )
     manifest = outcome.get("manifest") or []
     check(
-        "the OutputEntry declares the AUTHOR's media type (cl-010 debt 2)",
+        "an unbound OutputEntry carries the AUTHOR's observed media type",
         bool(manifest) and manifest[0].get("mime_type") == "image/png",
         f"{manifest[0].get('mime_type') if manifest else 'no manifest'} — the product can "
         "name the file `image.png` without sniffing",
@@ -1021,7 +1021,11 @@ def egress() -> None:
             source.write_bytes(png(8, 8, 9))
             try:
                 grants.write_output(
-                    exfiltrating, "image", source, grants.Authorizer(roots=(str(grant_root),))
+                    exfiltrating,
+                    "image",
+                    source,
+                    grants.Authorizer(roots=(str(grant_root),)),
+                    media_type="image/png",
                 )
                 exfiltration_refused = ""
             except grants.GrantRefusal as exc:
@@ -1121,11 +1125,44 @@ def egress() -> None:
                 for _ in range(streamed // MIB):
                     written.write(chunk)
                     expected.update(chunk)
+            mismatch_destination = output_root / "mismatched.bin"
+            mismatch_auth = grants.Authorizer(roots=(str(output_root),))
+            try:
+                grants.write_output(
+                    grants.BoundGrant(
+                        outputs={
+                            "video": grants.BoundOutput(
+                                "video",
+                                f"file://{mismatch_destination}",
+                                streamed,
+                                "video/mp4; profile=bound",
+                            )
+                        }
+                    ),
+                    "video",
+                    source,
+                    mismatch_auth,
+                    media_type="image/png",
+                )
+                mismatch = "it wrote"
+            except grants.GrantRefusal as exc:
+                mismatch = exc.code
+            check(
+                "ARM: produced MIME must match the invocation before any grant is spent",
+                mismatch == "output_media_type_mismatch"
+                and mismatch_auth.allowed == 0
+                and not mismatch_destination.exists(),
+                mismatch,
+            )
+
             destination = output_root / "published.bin"
             output_grant = grants.BoundGrant(
                 outputs={
                     "video": grants.BoundOutput(
-                        "video", f"file://{destination}", streamed, "video/mp4"
+                        "video",
+                        f"file://{destination}",
+                        streamed,
+                        "video/mp4; profile=bound",
                     )
                 }
             )
@@ -1135,7 +1172,7 @@ def egress() -> None:
                 "video",
                 source,
                 grants.Authorizer(roots=(str(output_root),)),
-                media_type="video/mp4",
+                media_type="VIDEO/MP4; profile=produced",
             )
             _, output_peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
@@ -1147,6 +1184,25 @@ def egress() -> None:
                 and destination.stat().st_size == streamed
                 and output_peak < 8 * MIB,
                 f"{output_entry.length // MIB} MiB, {output_peak / MIB:.2f} MiB peak Python heap",
+            )
+
+            fallback_destination = output_root / "untyped.bin"
+            fallback = grants.write_output(
+                grants.BoundGrant(
+                    outputs={
+                        "file": grants.BoundOutput(
+                            "file", f"file://{fallback_destination}", streamed, ""
+                        )
+                    }
+                ),
+                "file",
+                source,
+                grants.Authorizer(roots=(str(output_root),)),
+            )
+            check(
+                "an untyped binding and untyped result remain honest octet-stream",
+                fallback.mime_type == "application/octet-stream"
+                and fallback_destination.stat().st_size == streamed,
             )
 
         # ------------------------------------------------------------------ cr-042
