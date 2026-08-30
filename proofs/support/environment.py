@@ -138,6 +138,23 @@ def _prepare(args: argparse.Namespace) -> None:
     }
     _request(root, "missing", missing, root / "environment-missing", args.python)
 
+    conflicting = dict(normal)
+    environment = _parse_canonical(Path(str(normal["environment"])).read_bytes())
+    if not isinstance(environment, dict) or not isinstance(environment.get("wheels"), list):
+        raise ProofFailure("normal environment is not a selected wheel object")
+    wheels = cast(list[dict[str, Any]], environment["wheels"])
+    wheels[0] = {**wheels[0], "version": "9.9.9"}
+    conflicting["environment"] = _write(
+        inputs / "conflicting-environment.json", _canonical(environment)
+    )
+    _request(
+        root,
+        "conflicting-dependency",
+        conflicting,
+        root / "environment-conflicting-dependency",
+        args.python,
+    )
+
     extra = dict(normal)
     extra["wheel_files"] = {**_paths(normal["wheel_files"]), torch.digest: torch_path}
     _request(root, "extra", extra, root / "environment-extra", args.python)
@@ -372,7 +389,7 @@ def _release(
     project_fact = _nested_wheel(_wheel(project, import_roots=True))
     package_release = _canonical(
         {
-            "dependency_wheels": [],
+            "dependency_wheels": selected_rows,
             "format": "cozy.package.release/1",
             "project_wheel": project_fact,
             "requires_python": ">=3.11",

@@ -717,6 +717,108 @@ ENGINE_CLASS = "AttemptEngine"
 ENGINE_BUILDER = "internal/worker/session.py"
 
 
+def fence_tensorhub_package_release() -> list[str]:
+    """Consume Tensorhub's exact nested-wheel PackageRelease fixture."""
+
+    import hashlib
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import canonical
+    from cozy_runtime.internal.placement_materialization import package_overlay_input
+    from cozy_runtime.internal.refusal import LaunchRefusal
+
+    root = ROOT / "vectors" / "tensorhub-wheel-contract"
+    path = root / "package-release-v1.json"
+    stored = path.read_bytes()
+    bad: list[str] = []
+    got = hashlib.sha256(stored).hexdigest()
+    want = "add41cdc1e6f19e43f9f7f411fd07dd038ad62126c2299c2c234950b71682725"
+    if got != want:
+        return [f"{path.relative_to(ROOT)}: stored fixture hashes to {got}, want {want}"]
+    if not stored.endswith(b"\n") or stored.endswith(b"\n\n"):
+        return [f"{path.relative_to(ROOT)}: producer fixture must carry one trailing LF"]
+    raw = stored[:-1]
+    document_digest = hashlib.sha256(raw).hexdigest()
+    if document_digest != "26d75c61b144538a6954c276c6d903816623325f7f75fa845652aaedbfeb8630":
+        return [f"{path.relative_to(ROOT)}: canonical document hashes to {document_digest}"]
+    try:
+        release = canonical.parse_canonical(raw)
+    except canonical.CanonicalError as exc:
+        return [f"{path.relative_to(ROOT)}: producer bytes are not canonical: {exc}"]
+    if not isinstance(release, dict):
+        return [f"{path.relative_to(ROOT)}: PackageRelease is not an object"]
+    project = release.get("project_wheel")
+    dependencies = release.get("dependency_wheels")
+    if (
+        not isinstance(project, dict)
+        or not isinstance(dependencies, list)
+        or len(dependencies) != 1
+    ):
+        return [f"{path.relative_to(ROOT)}: nested wheel fixture is incomplete"]
+    dependency = dependencies[0]
+    if not isinstance(dependency, dict):
+        return [f"{path.relative_to(ROOT)}: dependency wheel is not an object"]
+    fields = {"distribution", "filename", "import_roots", "ref", "tags", "version"}
+    for name, wheel in (("project_wheel", project), ("dependency_wheels[0]", dependency)):
+        if set(wheel) != fields:
+            bad.append(f"{path.relative_to(ROOT)}: {name} is not one nested selected wheel")
+    if bad:
+        return bad
+
+    manifest_path = root / "base-worker-image-wheelhouse.json"
+    manifest = manifest_path.read_bytes()
+    manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    environment = {
+        "wheelhouse_manifest": {"digest": manifest_digest, "length": len(manifest)},
+        "wheels": dependencies,
+    }
+    environment_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical.write({**environment, "format": "cozy.worker.v1.Environment/1"})
+        ).hexdigest()
+    )
+    project_ref = project.get("ref")
+    dependency_ref = dependency.get("ref")
+    if not isinstance(project_ref, dict) or not isinstance(dependency_ref, dict):
+        return [f"{path.relative_to(ROOT)}: nested wheel ref is absent"]
+    wheel_paths = {
+        str(project_ref.get("digest")): root / "wheels" / "proof_package-1.0.0-py3-none-any.whl",
+        str(dependency_ref.get("digest")): root / "wheels" / "proof_custom-1.0.0-py3-none-any.whl",
+    }
+    try:
+        joined = package_overlay_input(
+            package_release_bytes=raw,
+            environment=environment,
+            environment_digest=environment_digest,
+            wheelhouse_manifest_bytes=manifest,
+            wheel_paths=wheel_paths,
+        )
+    except LaunchRefusal as exc:
+        return [f"{path.relative_to(ROOT)}: Runtime refused Tensorhub fixture: {exc}"]
+    facts = [(wheel.distribution, wheel.owner) for wheel in joined.wheels]
+    if facts != [("proof-package", "project"), ("proof-custom", "custom")]:
+        bad.append(f"{path.relative_to(ROOT)}: Runtime joined wheel facts as {facts}")
+
+    flat = dict(project)
+    flat.update(project_ref)
+    flat.pop("ref", None)
+    try:
+        package_overlay_input(
+            package_release_bytes=canonical.write({**release, "project_wheel": flat}),
+            environment=environment,
+            environment_digest=environment_digest,
+            wheelhouse_manifest_bytes=manifest,
+            wheel_paths=wheel_paths,
+        )
+    except LaunchRefusal as exc:
+        if exc.code != "project_wheel_invalid":
+            bad.append(f"flat project wheel refused as {exc.code}, want project_wheel_invalid")
+    else:
+        bad.append("Runtime admitted the retired flat project WheelFact")
+    return bad
+
+
 def fence_one_attempt_kernel() -> list[str]:
     bad: list[str] = []
     for path in py_files():
@@ -1377,6 +1479,7 @@ FENCES = {
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "base-ownership-vectors": fence_base_ownership_vectors,
+    "tensorhub-package-release": fence_tensorhub_package_release,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "author-import-boundary": fence_author_import_boundary,
