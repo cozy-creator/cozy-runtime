@@ -17,6 +17,8 @@ here, which is exactly the duplication the CLI reference forbids.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from pathlib import Path
 
@@ -174,7 +176,12 @@ _SERVE_FLAGS: dict[str, str] = {
 
 #: Flags that carry no value.
 _SERVE_SWITCHES = ("--no-warm",)
-_WEIGHTLESS_PACKAGE = "--weightless-package"
+_DEVELOPMENT_FLAGS = (
+    "--development-project",
+    "--development-package",
+    "--development-release",
+    "--development-source-digest",
+)
 
 
 def serve(config: RuntimeConfig, args: list[str]) -> int:
@@ -200,13 +207,13 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         if name in _SERVE_SWITCHES:
             switches.append(name)
             continue
-        if name not in ("--socket", "--out", _WEIGHTLESS_PACKAGE) and name not in _SERVE_FLAGS:
+        if name not in ("--socket", "--out", *_DEVELOPMENT_FLAGS) and name not in _SERVE_FLAGS:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
                 "serve takes --socket <path> [--out <dir>] "
                 + " ".join(f"[{f} <value>]" for f in sorted(_SERVE_FLAGS))
-                + f" [{_WEIGHTLESS_PACKAGE} <dir>] [--no-warm]; directives, grants and "
+                + " [internal development flags] [--no-warm]; directives, grants and "
                 "config arrive over the protocol",
                 Exit.usage,
             )
@@ -225,38 +232,53 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     root = Path(values.get("--out") or (config.cozy_home / "worker"))
     argv = ["--listen", socket if ":" in socket else f"unix:{socket}", "--root", str(root)]
-    weightless_package = values.get(_WEIGHTLESS_PACKAGE, "")
-    artifact_flags = ("--artifact-store",)
-    supplied_artifacts = [flag for flag in artifact_flags if flag in values]
-    if weightless_package and supplied_artifacts:
+    development = {flag: values.get(flag, "") for flag in _DEVELOPMENT_FLAGS}
+    if any(development.values()) and not all(development.values()):
+        missing = [flag for flag, value in development.items() if not value]
         raise CliError(
             "usage",
-            f"{_WEIGHTLESS_PACKAGE} cannot be combined with {', '.join(supplied_artifacts)}",
-            "choose one launch mode: the explicit local weightless package, or the exact "
+            "development launch is missing " + ", ".join(missing),
+            "Creator supplies project, package, release, and source digest together",
+            Exit.usage,
+        )
+    artifact_flags = ("--artifact-store",)
+    supplied_artifacts = [flag for flag in artifact_flags if flag in values]
+    if all(development.values()) and supplied_artifacts:
+        raise CliError(
+            "usage",
+            f"--development-project cannot be combined with {', '.join(supplied_artifacts)}",
+            "choose one launch mode: the explicit local source checkout, or the exact "
             "provisioned artifact store",
             Exit.usage,
         )
-    if weightless_package:
+    if all(development.values()):
         from cozy_runtime.author import ConformanceError
         from cozy_runtime.internal import descriptor, local
         from cozy_runtime.internal.discovery import discover
 
-        package = Path(weightless_package).expanduser().resolve()
+        project = Path(development["--development-project"]).expanduser().resolve()
         try:
-            found = discover(package)
-            staged = local.stage_weightless_release(config.cozy_home, descriptor.build(found))
+            found = discover(project)
+            staged = local.stage_development_placement(
+                config.cozy_home,
+                descriptor.build(found),
+                package=development["--development-package"],
+                release=development["--development-release"],
+                source_digest=development["--development-source-digest"],
+            )
         except ConformanceError as exc:
             raise CliError(
                 "validation",
                 str(exc),
-                "repair the package surface before launching its local weightless worker",
+                "repair the package surface before launching its local development worker",
                 Exit.validation,
             ) from exc
         except RuntimeError as exc:
+            code, separator, detail = str(exc).partition(": ")
             raise CliError(
-                "structural",
-                str(exc),
-                "use the ordinary provisioned launch mode for any model-bearing package",
+                code if code == "development_modeled_unsupported" else "structural",
+                detail if separator else str(exc),
+                "published execution is required for model-bearing packages in this increment",
                 Exit.structural,
             ) from exc
         argv += [
@@ -265,16 +287,22 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "--artifact-cache",
             str(staged.artifact_cache),
             "--development-project",
-            str(package),
+            str(project),
+            "--development-package",
+            development["--development-package"],
+            "--development-release",
+            development["--development-release"],
+            "--development-source-digest",
+            development["--development-source-digest"],
         ]
-        os.chdir(package)
+        os.chdir(project)
     elif len(supplied_artifacts) != len(artifact_flags):
         missing = [flag for flag in artifact_flags if flag not in values]
         raise CliError(
             "usage",
             "ordinary serve requires " + " and ".join(missing),
             "pass the exact provisioned --artifact-store, or "
-            f"choose {_WEIGHTLESS_PACKAGE} <dir> explicitly",
+            "use Creator's explicit development launch for a local source checkout",
             Exit.usage,
         )
     for flag, worker_flag in _SERVE_FLAGS.items():
@@ -284,6 +312,98 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     # THE CONFIG THIS VERB ALREADY READ. `session.main` reads it itself because it is a
     # process entrypoint too; calling that from here was a second read and refused.
     return serve_worker(config, argv)
+
+
+def development_placement(_config: RuntimeConfig, args: list[str], opts: Options) -> Result:
+    """Internal Creator plumbing for one honest source-checkout PlacementSet."""
+
+    from cozy_runtime.author import ConformanceError
+    from cozy_runtime.internal import descriptor, local
+    from cozy_runtime.internal.discovery import discover
+    from cozy_runtime.internal.worker.session import SEMVER
+    from cozy_runtime.protocol import documents
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    values: dict[str, str] = {}
+    rest = list(args)
+    allowed = {"--package", "--release", "--source-digest"}
+    while rest:
+        flag = rest.pop(0)
+        if flag not in allowed or not rest:
+            raise CliError(
+                "usage",
+                f"development-placement received invalid argument {flag!r}",
+                "pass --package <org/name> --release <semver> --source-digest sha256:<hex>",
+                Exit.usage,
+            )
+        values[flag] = rest.pop(0)
+    missing = sorted(allowed - set(values))
+    if missing:
+        raise CliError(
+            "usage",
+            "development-placement is missing " + ", ".join(missing),
+            "Creator supplies all three exact development facts",
+            Exit.usage,
+        )
+    package = values["--package"]
+    release = values["--release"]
+    source_digest = values["--source-digest"]
+    if (
+        package.count("/") != 1
+        or not all(package.split("/"))
+        or SEMVER.fullmatch(release) is None
+        or len(source_digest) != 71
+        or not source_digest.startswith("sha256:")
+        or any(char not in "0123456789abcdef" for char in source_digest[7:])
+    ):
+        raise CliError(
+            "validation",
+            "development package, release, or source digest is invalid",
+            "use org/name, SemVer, and sha256:<64 lowercase hex>",
+            Exit.validation,
+        )
+    project = Path(opts.dir).expanduser().resolve()
+    try:
+        development = local.development_placement_documents(
+            descriptor.build(discover(project)),
+            package=package,
+            release=release,
+            source_digest=source_digest,
+        )
+    except ConformanceError as exc:
+        raise CliError(
+            "validation", str(exc), "repair the package surface", Exit.validation
+        ) from exc
+    except RuntimeError as exc:
+        code, separator, detail = str(exc).partition(": ")
+        raise CliError(
+            code if code == "development_modeled_unsupported" else "structural",
+            detail if separator else str(exc),
+            "published execution is required for model-bearing packages in this increment",
+            Exit.structural,
+        ) from exc
+    placement_bytes = documents.canonical_bytes(pb.PlacementSet(placements=[development.placement]))
+    placement_digest = "sha256:" + hashlib.sha256(placement_bytes).hexdigest()
+    descriptor_digest = "sha256:" + hashlib.sha256(development.descriptor).hexdigest()
+    document = {
+        "package": package,
+        "release": release,
+        "source_digest": source_digest,
+        "placement_set": {
+            "canonical_bytes_base64": base64.b64encode(placement_bytes).decode(),
+            "digest": placement_digest,
+            "length": len(placement_bytes),
+        },
+        "package_descriptor": {
+            "canonical_bytes_base64": base64.b64encode(development.descriptor).decode(),
+            "digest": descriptor_digest,
+            "length": len(development.descriptor),
+        },
+    }
+    return Result(
+        rows=(("package", package), ("release", release), ("source_digest", source_digest)),
+        document=document,
+    )
 
 
 def bindings(config: RuntimeConfig, opts: Options) -> Result:

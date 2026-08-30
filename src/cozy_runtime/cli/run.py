@@ -32,8 +32,9 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.local import (
     LocalRequest,
     SliceOutcome,
+    development_placement_documents,
+    development_source_digest,
     run_slice,
-    weightless_release_documents,
 )
 from cozy_runtime.internal.worker.session import WorkerOptions
 
@@ -251,7 +252,7 @@ def run(
         inputs=inputs,
         org=(flags.get("--org") or ["local"])[0],
     )
-    release_id = str(body["application"])
+    package_revision_digest = development_source_digest(project)
     # The worker narrates itself to stdout, which is the right place for a long-lived
     # `serve` process and the wrong place for a verb whose stdout IS a result document. The
     # narration is not suppressed — it is a real progress channel — it just goes where
@@ -266,9 +267,13 @@ def run(
             request,
             job_records=job_records,
             workspace=workspace,
-            release_id=release_id,
+            package_revision_digest=package_revision_digest,
             package_descriptor=body if kind == "entrypoint" else None,
-            options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
+            options=WorkerOptions(
+                root=workspace / "worker",
+                release_id=package_revision_digest,
+                no_warm=True,
+            ),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
 
@@ -372,7 +377,18 @@ def resolved_bindings(
             for surface in found.surfaces
             if surface.kind == "entrypoint" and not surface.hidden
         ]
-        plans = list(weightless_release_documents(desc.build(found)).subjects()) if visible else []
+        plans = (
+            list(
+                development_placement_documents(
+                    desc.build(found),
+                    package="local/development-package",
+                    release="0.0.0",
+                    source_digest=development_source_digest(project),
+                ).subjects()
+            )
+            if visible
+            else []
+        )
         return [], plans
     try:
         # ONE resolve over the WHOLE declared slot set, which is what a serving deployment

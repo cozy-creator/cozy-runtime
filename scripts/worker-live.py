@@ -172,6 +172,8 @@ class Hub:
     call: Any = None
     root_cert: bytes | None = None
     token: str = ""
+    package_revision_digest: str = ""
+    development: bool = False
     connected: threading.Event = field(default_factory=threading.Event)
 
     # ------------------------------------------------------------ dialing
@@ -775,10 +777,15 @@ def start_worker(
     project = weightless_project or Path(
         str((overrides or {}).get("project") or ROOT / "corpus" / "package")
     )
+    development_args: tuple[str, ...] = ()
+    package_revision_digest = "sha256:" + hashlib.sha256(release.encode()).hexdigest()
     if weightless_project is not None:
         from cozy_runtime.internal import descriptor
         from cozy_runtime.internal.discovery import discover
-        from cozy_runtime.internal.local import stage_weightless_release
+        from cozy_runtime.internal.local import (
+            development_source_digest,
+            stage_development_placement,
+        )
 
         # The device child intentionally erases PYTHONPATH. Build a harness-owned ordinary
         # environment so the arm crosses the same installed-package boundary as a
@@ -799,11 +806,28 @@ def start_worker(
                 ],
                 check=True,
             )
-        staged = stage_weightless_release(home, descriptor.build(discover(project)))
+        staged = stage_development_placement(
+            home,
+            descriptor.build(discover(project)),
+            package="local/development-package",
+            release="0.0.0",
+            source_digest=development_source_digest(project),
+        )
         ids = dict(staged.bindings)
         placement = staged.placement
         artifact_store = staged.artifact_store
         artifact_cache = staged.artifact_cache
+        development_args = (
+            "--development-project",
+            str(project),
+            "--development-package",
+            staged.placement.development.package,
+            "--development-release",
+            staged.placement.development.release,
+            "--development-source-digest",
+            documents.spell(staged.placement.development.source_digest),
+        )
+        package_revision_digest = documents.spell(staged.placement.development.source_digest)
     else:
         executor_python = Path(sys.executable)
         ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
@@ -820,7 +844,19 @@ def start_worker(
             entries.append(pb.Entrypoint(name=name, entrypoint_binding_digest=binding_digest))
         placement = pb.Placement(
             placement_id=PLACEMENT,
-            package_release=pb.Ref(digest=b"r" * 32, length=1),
+            package=pb.PackageSelection(
+                package="cozy/sdxl-package",
+                release="1.0.0",
+                release_digest=hashlib.sha256(release.encode()).digest(),
+                project_wheel=pb.WheelFact(
+                    ref=pb.Ref(digest=b"r" * 32, length=1),
+                    distribution="sdxl-package",
+                    version="1.0.0",
+                    filename="sdxl_package-1.0.0-py3-none-any.whl",
+                    import_roots=["sdxl_gpu"],
+                    tags=["py3-none-any"],
+                ),
+            ),
             environment_digest=documents.embedded_document_digest(
                 documents.body(selected_environment), "cozy.worker.v1.Environment"
             ),
@@ -836,6 +872,8 @@ def start_worker(
             environment=selected_environment,
         )
     hub = hub or Hub()
+    hub.package_revision_digest = package_revision_digest
+    hub.development = weightless_project is not None
     hub.directive = serving_directive(placement, posture)
     hub.revision = 1
     # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
@@ -875,7 +913,7 @@ def start_worker(
         str(artifact_store),
         "--artifact-cache",
         str(artifact_cache),
-        *(("--development-project", str(project)) if weightless_project is not None else ()),
+        *development_args,
         *(("--no-warm",) if no_warm else ()),
         *extra,
     ]
@@ -947,6 +985,7 @@ def make_spec(
     outputs: int = 1,
     output_id: str = "image",
     max_bytes: int = 8 * MIB,
+    environment_digest: str = "sha256:" + "11" * 32,
 ) -> tuple[bytes, bytes]:
     """The InvocationSpec document: input identities, output contracts and the deadline all
     INSIDE the digest (#439). Defaults mirror `dispatch`'s so a spec built here and a grant
@@ -955,9 +994,14 @@ def make_spec(
         body = payload_raw
     else:
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
+    revision_digest = (
+        release
+        if release.startswith("sha256:") and len(release) == 71
+        else "sha256:" + hashlib.sha256(release.encode()).hexdigest()
+    )
     spec = pb.InvocationSpec(
-        package_release_id=release,
-        environment_digest="sha256:" + "11" * 32,
+        package_revision_digest=revision_digest,
+        environment_digest=environment_digest,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
         inputs=[
@@ -1009,6 +1053,8 @@ def dispatch(
     placement_id: str = PLACEMENT,
     admission_generation: int = -1,
 ) -> tuple[bytes, bytes]:
+    if hub.package_revision_digest and (hub.development or release == RELEASE):
+        release = hub.package_revision_digest
     canonical_bytes, digest = spec_override or make_spec(
         plan_id,
         deadline_ms=deadline_ms,
@@ -1018,6 +1064,7 @@ def dispatch(
         outputs=outputs,
         output_id=output_id,
         max_bytes=max_bytes,
+        environment_digest="" if hub.development else "sha256:" + "11" * 32,
     )
     body, path = stage_payload(tmp, request_id, payload or DEFAULT_PAYLOAD)
     del body
@@ -2617,7 +2664,7 @@ def section_results(args: argparse.Namespace) -> None:
         pair_payload = {"steps": 1, "latent": 48}
         body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
         spec = pb.InvocationSpec(
-            package_release_id=RELEASE,
+            package_revision_digest="sha256:" + hashlib.sha256(RELEASE.encode()).hexdigest(),
             environment_digest="sha256:" + "11" * 32,
             config_digest="sha256:" + "22" * 32,
             payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),

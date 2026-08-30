@@ -258,7 +258,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         ),
         [binding_record(**spec.get("binding", {}))],
         workspace=workspace,
-        release_id=RELEASE,
+        package_revision_digest=RELEASE,
         options=WorkerOptions(
             root=workspace / "worker",
             release_id=RELEASE,

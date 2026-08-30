@@ -116,11 +116,11 @@ run_refusal() {
 }
 
 run_refusal missing 6 wheel_grant_set_mismatch no
-run_refusal conflicting-dependency 6 package_dependency_selection_mismatch no
+run_refusal conflicting-dependency 6 wheel_filename_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
 run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
-run_refusal oversized-fact 6 package_release_wheel_invalid no
+run_refusal oversized-fact 6 environment_wheel_invalid no
 run_refusal duplicate 6 overlay_wheel_member_invalid no
 run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
@@ -154,4 +154,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts from PackageRelease plus PlacementSet/1; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts from direct PackageSelection plus PlacementSet/1; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"

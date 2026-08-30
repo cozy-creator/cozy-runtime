@@ -38,7 +38,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 FaultKind: TypeAlias = pb.FaultKind
 LegName: TypeAlias = Literal["package", "model"]
-PACKAGE_RELEASE_FORMAT = "cozy.package.release/1"
 MAX_DOCUMENT_BYTES = 64 << 20
 
 
@@ -151,13 +150,12 @@ class AcquiredPlacement:
     trusted_reuse_bytes: int
 
 
-def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlacement:
+def preinstalled_development(placement: Any, cache_root: Path) -> AcquiredPlacement:
     """Resolve a source-checkout development placement without inventing an install overlay.
 
-    Product local venvs use :class:`Acquirer` and exact EnvironmentReceipt just like pods. The
-    `cozy-runtime run` source-checkout lane already executes the checked-out project directly;
-    this narrow seam keeps that development feature while still deriving its binding identities
-    from PlacementSet/1 rather than reviving binding-plan files.
+    Published execution uses :class:`Acquirer` and an exact qualified EnvironmentReceipt. This
+    explicit same-user lane executes its launch-local source and trusts no invented release,
+    project wheel, environment, or qualification document.
     """
 
     if placement.models or any(entrypoint.get("slots") for entrypoint in placement.entrypoints):
@@ -185,37 +183,15 @@ def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlaceme
             "binding_entrypoint_set_mismatch",
             "PlacementSet/1 does not cover every descriptor entrypoint",
         )
-    package_release = placement.package_release[0]
-    environment_digest = documents.spell(placement.environment_digest)
-    receipt_digest = documents.spell(placement.environment_receipt_digest)
-    receipt_path = cache_root / receipt_digest.removeprefix("sha256:")
-    receipt_raw = _verify_file(receipt_path, receipt_digest, None)
-    qualification_digest, qualification_length = placement.qualification
-    qualification_path = cache_root / qualification_digest.removeprefix("sha256:")
-    qualification_raw = _verify_file(qualification_path, qualification_digest, qualification_length)
-    expected_selection = qualification.selection_digest(
-        bindings_digest=documents.spell(placement.bindings_digest),
-        environment_digest=environment_digest,
-        environment_receipt={"digest": receipt_digest, "length": len(receipt_raw)},
-        package_descriptor={"digest": descriptor_digest, "length": descriptor_length},
-        package_release={
-            "digest": placement.package_release[0],
-            "length": placement.package_release[1],
-        },
-    )
-    if qualification.read(qualification_raw) != expected_selection:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "qualification_selection_mismatch",
-            "Qualification does not authorize this exact PlacementSet/1 selection",
-        )
+    source_digest = str(placement.development["source_digest"])
     bindings = {
         str(row["entrypoint_binding_digest"]): DeclaredBinding(
             entrypoint_binding_digest=str(row["entrypoint_binding_digest"]),
             entrypoint=name,
-            package_release=package_release,
-            release=package_release,
-            environment_digest=environment_digest,
+            package_revision_digest=source_digest,
+            release=source_digest,
+            environment_digest="",
+            development=True,
             model_class="",
             model_binding_path="",
             model_parameter_name="",
@@ -224,7 +200,7 @@ def preinstalled_weightless(placement: Any, cache_root: Path) -> AcquiredPlaceme
         )
         for name, row in selected.items()
     }
-    return AcquiredPlacement(None, bindings, 0, 3, 0, 0, descriptor_length, 0)
+    return AcquiredPlacement(None, bindings, 0, 1, 0, 0, descriptor_length, 0)
 
 
 class Acquirer:
@@ -379,20 +355,11 @@ class Acquirer:
             self.observation.finish("model")
 
     def _environment(self, placement: Any) -> overlay.InstalledOverlay:
-        release_digest, release_length = placement.package_release
-        release_raw = self.fetch(release_digest, release_length).read_bytes()
         environment_digest = documents.spell(placement.environment_digest)
         receipt_digest = documents.spell(placement.environment_receipt_digest)
         wheelhouse = _ref(placement.environment["wheelhouse_manifest"], "wheelhouse_manifest")
         wheelhouse_raw = self.fetch(*wheelhouse).read_bytes()
-        release = _document(release_raw, "package_release")
-        if release.get("format") != PACKAGE_RELEASE_FORMAT:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "package_release_format",
-                str(release.get("format")),
-            )
-        wheel_rows = [release["project_wheel"], *placement.environment.get("wheels", [])]
+        wheel_rows = [placement.package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
         verified: dict[str, overlay.VerifiedFile] = {}
         for row in wheel_rows:
@@ -410,7 +377,7 @@ class Acquirer:
         self.wheels = len(wheel_paths)
         try:
             source = placement_materialization.package_overlay_input(
-                package_release_bytes=release_raw,
+                package=placement.package,
                 environment=placement.environment,
                 environment_digest=environment_digest,
                 wheelhouse_manifest_bytes=wheelhouse_raw,
@@ -535,10 +502,7 @@ class Acquirer:
                     "digest": descriptor_digest,
                     "length": descriptor_length,
                 },
-                package_release={
-                    "digest": placement.package_release[0],
-                    "length": placement.package_release[1],
-                },
+                package=placement.package,
             )
         except qualification.QualificationError as exc:
             raise AcquisitionRefusal(
@@ -553,7 +517,7 @@ class Acquirer:
         self._stage(qualification_digest, qualification_raw)
         visible = _visible_entrypoints(descriptor)
         models = {str(row["id"]): row for row in placement.models}
-        package_release = placement.package_release[0]
+        release_digest = str(placement.package["release_digest"])
         bindings: dict[str, DeclaredBinding] = {}
         count = 2
         for entrypoint in placement.entrypoints:
@@ -584,8 +548,8 @@ class Acquirer:
                 bindings[binding_digest] = DeclaredBinding(
                     entrypoint_binding_digest=binding_digest,
                     entrypoint=name,
-                    package_release=package_release,
-                    release=package_release,
+                    package_revision_digest=release_digest,
+                    release=release_digest,
                     environment_digest=documents.spell(placement.environment_digest),
                     model_class="",
                     model_binding_path="",
@@ -624,7 +588,11 @@ class Acquirer:
             reference_manifest = str(reference["manifest"]["digest"])
             model_class = str(declared.get("class", ""))
             if (
-                candidate.release not in {package_release, package_release.removeprefix("sha256:")}
+                candidate.release
+                not in {
+                    release_digest,
+                    release_digest.removeprefix("sha256:"),
+                }
                 or candidate.application != application
                 or not candidate.model_class.endswith(":" + model_class)
                 or candidate.snapshot != reference_manifest
@@ -671,8 +639,8 @@ class Acquirer:
             bindings[binding_digest] = DeclaredBinding(
                 entrypoint_binding_digest=binding_digest,
                 entrypoint=name,
-                package_release=package_release,
-                release=package_release,
+                package_revision_digest=release_digest,
+                release=release_digest,
                 environment_digest=documents.spell(placement.environment_digest),
                 model_class=model_class,
                 model_binding_path=str(declared["path"]),

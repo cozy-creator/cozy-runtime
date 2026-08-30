@@ -21,7 +21,7 @@ from cozy_runtime.internal.refusal import LaunchRefusal
 REQUEST_FIELDS = {
     "environment",
     "environment_root",
-    "package_release",
+    "package",
     "python",
     "wheel_files",
     "wheelhouse_manifest",
@@ -30,7 +30,7 @@ REQUEST_FIELDS = {
 
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
-    package_release: Path
+    package: Mapping[str, object]
     environment_path: Path
     wheelhouse_manifest: Path
     wheel_files: Mapping[str, Path]
@@ -71,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Exit.validation,
             )
         source = package_overlay_input(
-            package_release_bytes=_document_bytes(request.package_release, "package_release"),
+            package=request.package,
             environment=request.environment,
             environment_digest=request.environment_digest,
             wheelhouse_manifest_bytes=_document_bytes(
@@ -176,7 +176,7 @@ def _read_request(path: Path) -> ProofRequest:
         ).hexdigest()
     )
     return ProofRequest(
-        package_release=_existing_file(value["package_release"], "package_release"),
+        package=_package(value["package"]),
         environment_path=environment_path,
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,
@@ -194,6 +194,13 @@ def _request_error(detail: str) -> CliError:
         "provide the closed local-path request described by cozy-environment-proof --help",
         Exit.validation,
     )
+
+
+def _package(value: object) -> Mapping[str, object]:
+    fields = {"package", "project_wheel", "release", "release_digest"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _request_error("package is not one closed PackageSelection object")
+    return value
 
 
 def _existing_file(value: object, name: str) -> Path:

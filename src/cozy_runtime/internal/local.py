@@ -36,6 +36,7 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -45,8 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from cozy_runtime import qualification
-from cozy_runtime.internal import canonical, descriptor, overlay
+from cozy_runtime.internal import canonical, descriptor
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -78,7 +78,7 @@ class LocalBindingError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class StagedWeightlessRelease:
+class StagedDevelopmentPlacement:
     """One exact model-free PlacementSet selection for source-checkout development."""
 
     bindings: Mapping[str, str]
@@ -88,14 +88,10 @@ class StagedWeightlessRelease:
 
 
 @dataclass(frozen=True, slots=True)
-class WeightlessReleaseDocuments:
+class DevelopmentPlacementDocuments:
     """Exact bytes and Placement behind local source-checkout execution."""
 
     descriptor: bytes
-    package_release: bytes
-    environment_receipt: bytes
-    qualification: bytes
-    wheelhouse_manifest: bytes
     placement: pb.Placement
 
     def subjects(self) -> tuple[dict[str, Any], ...]:
@@ -266,7 +262,7 @@ class LocalRecordOwner:
         bindings: dict[str, str],
         workspace: Path,
         *,
-        release_id: str,
+        package_revision_digest: str,
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
         on_progress: Any = None,
@@ -277,7 +273,7 @@ class LocalRecordOwner:
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
-        self.release_id = release_id
+        self.package_revision_digest = package_revision_digest
         self.placement = placement
         self.auto_ack = auto_ack
         self.ready_timeout = ready_timeout
@@ -585,7 +581,7 @@ class LocalRecordOwner:
             # is no binding plan to prepare, no warm pool to fill and no serving pointer.
             directive.job.CopyFrom(
                 pb.JobDirective(
-                    build_id=self.release_id,
+                    build_id=self.package_revision_digest,
                     job_descriptor_id=self.request.job_descriptor_id,
                     resource_caps=pb.ResourceCaps(
                         device_required=False, max_rss_bytes=0, max_disk_bytes=0
@@ -684,9 +680,12 @@ class LocalRecordOwner:
         # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            package_release_id=self.release_id,
+            package_revision_digest=self.package_revision_digest,
             environment_digest=(
-                documents.spell(self.placement.environment_digest)
+                ""
+                if self.placement is not None
+                and self.placement.WhichOneof("package_mode") == "development"
+                else documents.spell(self.placement.environment_digest)
                 if self.placement is not None
                 else ""
             ),
@@ -704,7 +703,7 @@ class LocalRecordOwner:
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
-                    build_id=self.release_id,
+                    build_id=self.package_revision_digest,
                     job_descriptor_id=self.request.job_descriptor_id,
                     publication_contract=self._publication(),
                 )
@@ -868,34 +867,38 @@ class LocalRecordOwner:
 # --------------------------------------------------------------------------- the runner
 
 
-def stage_weightless_release(
-    cozy_home: Path, package_descriptor: Mapping[str, Any]
-) -> StagedWeightlessRelease:
+def stage_development_placement(
+    cozy_home: Path,
+    package_descriptor: Mapping[str, Any],
+    *,
+    package: str,
+    release: str,
+    source_digest: str,
+) -> StagedDevelopmentPlacement:
     """Stage one exact model-free PlacementSet/1 for source-checkout development."""
 
-    release = weightless_release_documents(package_descriptor)
+    documents_ = development_placement_documents(
+        package_descriptor, package=package, release=release, source_digest=source_digest
+    )
     home = cozy_home.resolve()
     cache = home / "artifact-cache"
     artifact_store = home / "store"
     artifact_store.mkdir(parents=True, exist_ok=True)
-    for raw in (
-        release.descriptor,
-        release.package_release,
-        release.environment_receipt,
-        release.qualification,
-        release.wheelhouse_manifest,
-    ):
-        _stage_exact(cache, raw)
+    _stage_exact(cache, documents_.descriptor)
     bindings = {
         entrypoint.name: documents.spell(entrypoint.entrypoint_binding_digest)
-        for entrypoint in release.placement.entrypoints
+        for entrypoint in documents_.placement.entrypoints
     }
-    return StagedWeightlessRelease(bindings, release.placement, artifact_store, cache)
+    return StagedDevelopmentPlacement(bindings, documents_.placement, artifact_store, cache)
 
 
-def weightless_release_documents(
+def development_placement_documents(
     package_descriptor: Mapping[str, Any],
-) -> WeightlessReleaseDocuments:
+    *,
+    package: str,
+    release: str,
+    source_digest: str,
+) -> DevelopmentPlacementDocuments:
     """Construct the exact local model-free selection without choosing storage paths."""
 
     entries = package_descriptor.get("entrypoints")
@@ -907,44 +910,18 @@ def weightless_release_documents(
     modeled = sorted(str(entry.get("name", "")) for entry in visible if entry.get("models"))
     if modeled:
         raise RuntimeError(
-            "a local weightless closure cannot invent model bindings for " + ", ".join(modeled)
+            "development_modeled_unsupported: source-checkout serving currently supports "
+            "model-free entrypoints only; modeled: " + ", ".join(modeled)
         )
+    if package.count("/") != 1 or not all(package.split("/")) or not release:
+        raise RuntimeError("development package identity or release is invalid")
+    try:
+        source_raw = documents.raw(source_digest)
+    except documents.DocumentError as exc:
+        raise RuntimeError("development source digest is invalid") from exc
 
     descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
-    project_wheel = b"source-checkout development wheel placeholder"
-    project_ref = _exact_ref(project_wheel)
-    package_release = canonical.write(
-        {
-            "dependency_wheels": [],
-            "format": "cozy.package.release/1",
-            "package": "local/development-package",
-            "package_descriptor": descriptor_ref,
-            "project_wheel": {
-                "ref": project_ref,
-                "distribution": "development-package",
-                "filename": "development_package-0-py3-none-any.whl",
-                "import_roots": [],
-                "tags": ["py3-none-any"],
-                "version": "0",
-            },
-            "requires_python": ">=3.11",
-            "requirements": [],
-            "release": "0.0.0",
-            "source_files": [],
-        }
-    )
-    wheelhouse = canonical.write({"development": True})
-    environment = pb.Environment(
-        wheelhouse_manifest=pb.Ref(
-            digest=documents.raw(str(_exact_ref(wheelhouse)["digest"])),
-            length=len(wheelhouse),
-        )
-    )
-    environment_body = documents.body(environment)
-    environment_digest = documents.embedded_document_digest(
-        environment_body, "cozy.worker.v1.Environment"
-    )
     entrypoints: list[pb.Entrypoint] = []
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
         name = str(entry["name"])
@@ -954,61 +931,44 @@ def weightless_release_documents(
     bindings_digest = hashlib.sha256(
         canonical.write({"entrypoints": entrypoint_bodies, "models": []})
     ).digest()
-    receipt_bytes = canonical.write(
-        {
-            "base_family_digest": str(_exact_ref(wheelhouse)["digest"]),
-            "environment_digest": documents.spell(environment_digest),
-            "format": overlay.RECEIPT_FORMAT,
-            "overlay_wheels": [
-                {
-                    "digest": str(project_ref["digest"]),
-                    "distribution": "development-package",
-                    "owner": "project",
-                    "version": "0",
-                }
-            ],
-            "project_wheel_digest": str(project_ref["digest"]),
-        }
-    )
-    selection = qualification.selection_digest(
-        bindings_digest=documents.spell(bindings_digest),
-        environment_digest=documents.spell(environment_digest),
-        environment_receipt=_exact_ref(receipt_bytes),
-        package_descriptor=descriptor_ref,
-        package_release=_exact_ref(package_release),
-    )
-    qualification_bytes = canonical.write(qualification.document(selection))
     placement = pb.Placement(
         placement_id=LOCAL_PLACEMENT,
-        package_release=pb.Ref(
-            digest=documents.raw(str(_exact_ref(package_release)["digest"])),
-            length=len(package_release),
+        development=pb.DevelopmentPackage(
+            package=package,
+            release=release,
+            source_digest=source_raw,
         ),
-        environment_digest=environment_digest,
-        environment_receipt_digest=hashlib.sha256(receipt_bytes).digest(),
         package_descriptor=pb.Ref(
             digest=documents.raw(str(descriptor_ref["digest"])), length=len(descriptor_bytes)
         ),
         bindings_digest=bindings_digest,
         entrypoints=entrypoints,
-        qualification=pb.Ref(
-            digest=documents.raw(str(_exact_ref(qualification_bytes)["digest"])),
-            length=len(qualification_bytes),
-        ),
-        environment=environment,
     )
-    return WeightlessReleaseDocuments(
-        descriptor_bytes,
-        package_release,
-        receipt_bytes,
-        qualification_bytes,
-        wheelhouse,
-        placement,
-    )
+    return DevelopmentPlacementDocuments(descriptor_bytes, placement)
 
 
 def _exact_ref(raw: bytes) -> dict[str, Any]:
     return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
+
+
+def development_source_digest(root: Path) -> str:
+    """Hash one local source snapshot without Git, caches, environments, or build output."""
+
+    digest = hashlib.sha256()
+    ignored = {".git", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache", "dist", "outputs"}
+    for current, directories, filenames in os.walk(root):
+        directories[:] = sorted(name for name in directories if name not in ignored)
+        for filename in sorted(filenames):
+            path = Path(current, filename)
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix().encode()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            with path.open("rb") as handle:
+                while chunk := handle.read(1 << 20):
+                    digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
 
 
 def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
@@ -1076,7 +1036,7 @@ def run_slice(
     binding_records: list[dict[str, Any]] | None = None,
     *,
     workspace: Path,
-    release_id: str,
+    package_revision_digest: str,
     package_descriptor: Mapping[str, Any] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
@@ -1096,19 +1056,28 @@ def run_slice(
             "flat local binding records were removed; supply the canonical provisioned closure"
         )
     bindings: dict[str, str] = {}
-    staged: StagedWeightlessRelease | None = None
+    staged: StagedDevelopmentPlacement | None = None
     if package_descriptor is not None:
         if request.kind != "entrypoint":
             raise RuntimeError("only a serving run accepts a package binding closure")
-        staged = stage_weightless_release(config.cozy_home, package_descriptor)
+        source_digest = development_source_digest(Path.cwd().resolve())
+        staged = stage_development_placement(
+            config.cozy_home,
+            package_descriptor,
+            package="local/development-package",
+            release="0.0.0",
+            source_digest=source_digest,
+        )
         bindings.update(staged.bindings)
     stage_job_plans(config.cozy_home, job_records or [])
     record_owner = LocalRecordOwner(
         request,
         bindings,
         workspace,
-        release_id=(
-            staged.placement.package_release.digest.hex() if staged is not None else release_id
+        package_revision_digest=(
+            documents.spell(staged.placement.development.source_digest)
+            if staged is not None
+            else package_revision_digest
         ),
         placement=staged.placement if staged is not None else None,
         auto_ack=auto_ack,
@@ -1122,6 +1091,9 @@ def run_slice(
             artifact_store=staged.artifact_store,
             artifact_cache=staged.artifact_cache,
             development_project=Path.cwd().resolve(),
+            development_package=staged.placement.development.package,
+            development_release=staged.placement.development.release,
+            development_source_digest=documents.spell(staged.placement.development.source_digest),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
