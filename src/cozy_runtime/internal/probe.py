@@ -724,9 +724,7 @@ def _spec_vectors(
     vector_ref = SPEC_VECTORS.get(str(provider.encoding))
     return {
         "kind": "spec-vectors",
-        "document": (
-            {"filename": vector_ref[0], "sha256": vector_ref[1]} if vector_ref else None
-        ),
+        "document": ({"filename": vector_ref[0], "sha256": vector_ref[1]} if vector_ref else None),
         "cases": cases,
         "passed": all(c["passed"] for c in cases),
     }
