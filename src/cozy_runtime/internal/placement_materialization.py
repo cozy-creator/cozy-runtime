@@ -328,16 +328,47 @@ def package_overlay_input(
         {
             "dependency_wheels",
             "format",
+            "package",
+            "package_descriptor",
             "project_wheel",
+            "release",
             "requires_python",
             "requirements",
-            "source_manifest",
+            "source_files",
         },
         "package_release",
     )
     if release["format"] != PACKAGE_RELEASE_FORMAT:
         raise LaunchRefusal("package_release_format", str(release["format"]))
-    _ref(release["source_manifest"], "source_manifest")
+    package = release["package"]
+    version = release["release"]
+    if (
+        not isinstance(package, str)
+        or package.count("/") != 1
+        or not all(package.split("/"))
+        or not isinstance(version, str)
+        or not version
+    ):
+        raise LaunchRefusal("package_release_invalid", "package or release identity is invalid")
+    _ref(release["package_descriptor"], "package_descriptor")
+    source_files = release["source_files"]
+    if not isinstance(source_files, list):
+        raise LaunchRefusal("package_release_invalid", "source_files is not an array")
+    prior_path = ""
+    for source in source_files:
+        _closed(source, {"digest", "length", "path"}, "source_file")
+        source_path = source["path"]
+        if (
+            not isinstance(source["digest"], str)
+            or not source["digest"].startswith("sha256:")
+            or not isinstance(source["length"], int)
+            or source["length"] < 0
+            or not isinstance(source_path, str)
+            or not source_path
+            or source_path <= prior_path
+        ):
+            raise LaunchRefusal("package_release_invalid", "source_files is invalid or unsorted")
+        prior_path = source_path
     requires_python = release["requires_python"]
     requirements = release["requirements"]
     if not isinstance(requires_python, str) or not requires_python:

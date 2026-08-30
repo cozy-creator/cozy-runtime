@@ -732,14 +732,14 @@ def fence_tensorhub_package_release() -> list[str]:
     stored = path.read_bytes()
     bad: list[str] = []
     got = hashlib.sha256(stored).hexdigest()
-    want = "add41cdc1e6f19e43f9f7f411fd07dd038ad62126c2299c2c234950b71682725"
+    want = "9fc018fcda64fee307ee7db28b632b7abe15dd77c290451525c632ab4a0c16fe"
     if got != want:
         return [f"{path.relative_to(ROOT)}: stored fixture hashes to {got}, want {want}"]
     if not stored.endswith(b"\n") or stored.endswith(b"\n\n"):
         return [f"{path.relative_to(ROOT)}: producer fixture must carry one trailing LF"]
     raw = stored[:-1]
     document_digest = hashlib.sha256(raw).hexdigest()
-    if document_digest != "26d75c61b144538a6954c276c6d903816623325f7f75fa845652aaedbfeb8630":
+    if document_digest != "a7169ae741990c565ad3f6cd27ff2ce28c294aba53815156d2ad70422c39dbbd":
         return [f"{path.relative_to(ROOT)}: canonical document hashes to {document_digest}"]
     try:
         release = canonical.parse_canonical(raw)

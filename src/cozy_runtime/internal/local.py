@@ -912,16 +912,14 @@ def weightless_release_documents(
 
     descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
-    source_manifest = canonical.write(
-        {"entries": [{"blob": descriptor_ref, "kind": "file", "path": "package.descriptor.json"}]}
-    )
-    source_ref = _exact_ref(source_manifest)
     project_wheel = b"source-checkout development wheel placeholder"
     project_ref = _exact_ref(project_wheel)
     package_release = canonical.write(
         {
             "dependency_wheels": [],
             "format": "cozy.package.release/1",
+            "package": "local/development-package",
+            "package_descriptor": descriptor_ref,
             "project_wheel": {
                 "ref": project_ref,
                 "distribution": "development-package",
@@ -932,7 +930,8 @@ def weightless_release_documents(
             },
             "requires_python": ">=3.11",
             "requirements": [],
-            "source_manifest": source_ref,
+            "release": "0.0.0",
+            "source_files": [],
         }
     )
     wheelhouse = canonical.write({"development": True})

@@ -2,9 +2,9 @@
 
 `package-release-v1.json` is copied byte-for-byte from Tensorhub's
 `vectors/package-release-v1.json`. Its stored file includes one trailing LF and hashes to
-`add41cdc1e6f19e43f9f7f411fd07dd038ad62126c2299c2c234950b71682725`; the canonical document is
-the preceding 773 bytes and has identity
-`sha256:26d75c61b144538a6954c276c6d903816623325f7f75fa845652aaedbfeb8630`.
+`9fc018fcda64fee307ee7db28b632b7abe15dd77c290451525c632ab4a0c16fe`; the canonical document is
+the preceding 962 bytes and has identity
+`sha256:a7169ae741990c565ad3f6cd27ff2ce28c294aba53815156d2ad70422c39dbbd`.
 
 Runtime's `tensorhub-package-release` architecture fence consumes those exact canonical bytes,
 requires nested `{ref, distribution, filename, import_roots, tags, version}` project and dependency
