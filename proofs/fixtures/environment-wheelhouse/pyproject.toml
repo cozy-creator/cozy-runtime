@@ -2,7 +2,7 @@
 name = "proof-environment-wheelhouse"
 version = "3.0.0"
 description = "Repository-only wheelhouse wheel for the Runtime environment proof"
-requires-python = ">=3.11"
+requires-python = ">=3.14,<3.15"
 dependencies = []
 
 [build-system]

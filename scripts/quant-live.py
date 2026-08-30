@@ -96,7 +96,7 @@ def gpu_used_mib() -> int:
             timeout=20,
             check=True,
         ).stdout
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+    except OSError, subprocess.SubprocessError, ValueError, IndexError:
         return -1
     mine = 0
     for line in apps.strip().splitlines():

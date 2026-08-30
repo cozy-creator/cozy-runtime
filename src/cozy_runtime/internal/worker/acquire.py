@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal
 
 from cozy_runtime import qualification
 from cozy_runtime.internal import (
@@ -36,8 +36,8 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-FaultKind: TypeAlias = pb.FaultKind
-LegName: TypeAlias = Literal["package", "model"]
+type FaultKind = pb.FaultKind
+type LegName = Literal["package", "model"]
 MAX_DOCUMENT_BYTES = 64 << 20
 
 

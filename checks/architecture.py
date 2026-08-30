@@ -3,7 +3,7 @@
 
 Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import
-  package-imports · author-import-boundary · prelaunch-version
+  package-imports · author-import-boundary · prelaunch-version · python-abi
   env-authority · single-config · no-interactive · excluded-keywords
   document-kinds · qualification-selection · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
@@ -83,6 +83,56 @@ def fence_prelaunch_version() -> list[str]:
         else:
             if major != 0:
                 bad.append(f"{where} must remain 0.x until proto-014 cuts the v1 contract")
+    return bad
+
+
+def fence_python_abi() -> list[str]:
+    """The distribution, tooling and bundled packages target ordinary CPython 3.14."""
+
+    bad: list[str] = []
+    requirement = ">=3.14,<3.15"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    if project.get("project", {}).get("requires-python") != requirement:
+        bad.append(f"pyproject.toml: requires-python must be {requirement!r}")
+    if project.get("tool", {}).get("mypy", {}).get("python_version") != "3.14":
+        bad.append("pyproject.toml: mypy must check the Python 3.14 language surface")
+
+    pin = ROOT / ".python-version"
+    if not pin.is_file() or pin.read_text() != "3.14+gil\n":
+        bad.append(".python-version: must pin uv to the standard 3.14+gil interpreter")
+
+    bundled = sorted((ROOT / "examples").rglob("pyproject.toml"))
+    bundled += sorted((ROOT / "proofs" / "fixtures").rglob("pyproject.toml"))
+    for path in bundled:
+        value = tomllib.loads(path.read_text()).get("project", {}).get("requires-python")
+        if value != requirement:
+            bad.append(f"{path.relative_to(ROOT)}: requires-python must be {requirement!r}")
+
+    for path in (
+        ROOT / "uv.lock",
+        ROOT / "examples" / "marco-polo" / "uv.lock",
+        ROOT / "proofs" / "fixtures" / "environment-project" / "uv.lock",
+    ):
+        if tomllib.loads(path.read_text()).get("requires-python") != "==3.14.*":
+            bad.append(f"{path.relative_to(ROOT)}: lock does not cover exactly Python 3.14")
+
+    scaffold = (SRC / "cli" / "new.py").read_text()
+    for expected in (
+        'requires-python = ">=3.14,<3.15"',
+        'dependencies = ["cozy-runtime>={__version__},<0.1"]',
+        'python_version = "3.14"',
+    ):
+        if expected not in scaffold:
+            bad.append(f"src/cozy_runtime/cli/new.py: generated package omits {expected!r}")
+
+    runtime = (SRC / "_interpreter.py").read_text()
+    for expected in (
+        'sys.implementation.name != "cpython"',
+        "sys.version_info[:2] != (3, 14)",
+        'sysconfig.get_config_var("Py_GIL_DISABLED") == 1',
+    ):
+        if expected not in runtime:
+            bad.append(f"src/cozy_runtime/_interpreter.py: runtime ABI guard omits {expected!r}")
     return bad
 
 
@@ -1611,6 +1661,7 @@ def fence_typed_model_binding() -> list[str]:
 
 FENCES = {
     "prelaunch-version": fence_prelaunch_version,
+    "python-abi": fence_python_abi,
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
     "descriptor-minimality": fence_descriptor_minimality,

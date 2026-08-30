@@ -502,7 +502,7 @@ class _ScopeHost(Protocol):
 _ADAPTERS: dict[type, Callable[[Config], object]] = {}
 
 
-def register_adapter(cls: type[T], factory: Callable[[Config], T]) -> None:
+def register_adapter[T](cls: type[T], factory: Callable[[Config], T]) -> None:
     """Register the EXACT construction adapter for a pipeline class, making `load(T)` legal.
 
     A library ships this beside the class it constructs (the runtime ships the diffusers

@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Generic, TypeAlias, TypeVar
+from typing import Annotated, TypeAlias, TypeVar
 
 from cozy_runtime.author._errors import ConformanceError
 
@@ -55,7 +55,7 @@ Preflight: TypeAlias = Annotated[T, PREFLIGHT]
 
 
 @dataclass(frozen=True, slots=True)
-class Shape(Generic[K]):
+class Shape[K]:
     """Author-only knowledge: a preset value's mapping to demand axes.
 
     Only needed when the axis is NOT already an axis-named field. Canonical form is

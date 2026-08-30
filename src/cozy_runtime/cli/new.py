@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from cozy_runtime import __version__
 from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import descriptor
@@ -27,8 +28,8 @@ def _pyproject(name: str, pkg: str) -> str:
     return f"""[project]
 name = "{name}"
 version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = ["cozy-runtime"]
+requires-python = ">=3.14,<3.15"
+dependencies = ["cozy-runtime>={__version__},<0.1"]
 
 [project.optional-dependencies]
 # CUDA-extras torch convention: hosts install the extra matching their accelerator.
@@ -50,7 +51,7 @@ build-backend = "hatchling.build"
 packages = ["src/{pkg}"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 files = ["src"]
 strict = true
 warn_unreachable = true

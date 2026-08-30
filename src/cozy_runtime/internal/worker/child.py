@@ -865,7 +865,7 @@ class ExecutorSupervision:
                 self._reclaim_owner(owner, "provisional spawn without a captured birth")
                 return
             os.kill(pid, signal.SIGKILL)
-        except (ChildProcessError, ProcessLookupError):
+        except ChildProcessError, ProcessLookupError:
             self._reclaim_owner(owner, "provisional spawn without a captured birth")
             return
         deadline = time.monotonic() + RECLAIM_SECONDS

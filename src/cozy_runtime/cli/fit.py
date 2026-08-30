@@ -98,7 +98,7 @@ def _free_bytes(facts: hostfacts.HostFacts) -> int:
             check=True,
         ).stdout.strip()
         return int(out.splitlines()[0]) * MIB
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+    except OSError, subprocess.SubprocessError, ValueError, IndexError:
         return -1
 
 

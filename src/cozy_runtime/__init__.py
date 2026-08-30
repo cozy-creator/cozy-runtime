@@ -2,9 +2,12 @@
 
 # Worker-protocol's runtime identity is the protobuf package major plus its additive minor.
 # Exact generated-byte provenance is enforced by CI's vendored-drift check.
+from cozy_runtime import _interpreter as _interpreter
 from cozy_runtime.protocol import WIRE_MINOR
 
-__version__ = "0.0.6"
+del _interpreter
+
+__version__ = "0.0.7"
 
 # The two independent semvers reported by `cozy-runtime version`.
 PYTHON_CONTRACT_VERSION = "0.0.2"
