@@ -158,7 +158,6 @@ def census(
     receipts.append(ckpt.declare("topology", body, operation_key="census/topology").declaration_id)
 
     document = {
-        "format": "cozy.jobs.StructuralCensus/1",
         "store": payload.store.ref,
         "topology_digest": topology,
         "components": {

@@ -5,6 +5,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports · author-import-boundary · prelaunch-version
   env-authority · single-config · no-interactive · excluded-keywords
+  document-kinds · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
@@ -26,6 +27,7 @@ import pathlib
 import re
 import sys
 import tomllib
+from collections.abc import Iterator
 
 from packaging.version import InvalidVersion, Version
 
@@ -1148,19 +1150,12 @@ def fence_descriptor_minimality() -> list[str]:
 
 #: proto-007 (#616.a): the registry of document kinds this repo AUTHORS, each with its one
 #: declaring module. A format name exists only for a document that crosses a repo/process
-#: boundary AND is stored or digested; a provider `name()` is in the preimage of every
-#: implementation_digest and therefore every plan digest, so it is registered too. A literal
-#: outside this table is a new kind without its decision row.
+#: boundary AND is stored or digested. Provider implementation IDs are separately fenced below:
+#: they enter implementation/plan digests but are not documents.
 DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
     "cozy.package.EntrypointBindingPlan/1": "internal/provisioned.py",
     "cozy.package.ResolvedModelBinding/1": "internal/provisioned.py",
-    "cozy.fp8-rowwise.dequant/1": "internal/encoding/formats.py",
-    "cozy.fp8-scaled-scalar.dequant/1": "internal/encoding/formats.py",
-    "cozy.mxfp8.dequant/1": "internal/encoding/formats.py",
-    "cozy.plain.verbatim/1": "internal/encoding/formats.py",
-    "cozy.fp8-rowwise.native-leaf/1": "internal/encoding/leaves.py",
-    "cozy.mxfp8.native-leaf/1": "internal/encoding/leaves.py",
     "cozy.pod-readiness/1": "internal/readiness.py",
     "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
     "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
@@ -1201,31 +1196,109 @@ KIND_READERS = {
     "cozy.runtime.Ledger/0": {"internal/local.py"},
     "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
 }
-KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)"')
+_VERSIONED_LITERAL_PATTERN = (
+    r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.'
+    r'[A-Za-z0-9_.-]+/\d+)"'
+)
+VERSIONED_LITERAL = re.compile(_VERSIONED_LITERAL_PATTERN)
+
+#: Provider `name()` values are executable implementation identity, not document formats. The
+#: exact strings are in every implementation_digest and therefore in every plan/generation digest;
+#: moving them between fence registries must never rename or renumber them.
+IMPLEMENTATION_IDS = {
+    "cozy.fp8-rowwise.dequant/1": "internal/encoding/formats.py",
+    "cozy.fp8-scaled-scalar.dequant/1": "internal/encoding/formats.py",
+    "cozy.mxfp8.dequant/1": "internal/encoding/formats.py",
+    "cozy.plain.verbatim/1": "internal/encoding/formats.py",
+    "cozy.fp8-rowwise.native-leaf/1": "internal/encoding/leaves.py",
+    "cozy.mxfp8.native-leaf/1": "internal/encoding/leaves.py",
+}
+IMPLEMENTATION_ID_READERS = {
+    "cozy.mxfp8.dequant/1": {
+        "internal/encoding/leaves.py",
+        "internal/encoding/selection.py",
+    },
+}
 
 
-def fence_document_kinds() -> list[str]:
-    """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
-    bad: list[str] = []
+def versioned_literals() -> Iterator[tuple[pathlib.Path, str, int, str]]:
     for path in py_files():
         rel = path.relative_to(SRC).as_posix()
         if rel.endswith("_pb2.py"):
             continue
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            for kind in KIND_LITERAL.findall(line):
-                if kind.startswith(FOREIGN_KIND_PREFIXES):
-                    continue
-                owner = DOCUMENT_KINDS.get(kind)
-                if owner is None:
+            for literal in VERSIONED_LITERAL.findall(line):
+                yield path, rel, lineno, literal
+
+
+def fence_document_kinds() -> list[str]:
+    """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
+    bad: list[str] = []
+    for path, rel, lineno, kind in versioned_literals():
+        if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in IMPLEMENTATION_IDS:
+            continue
+        owner = DOCUMENT_KINDS.get(kind)
+        if owner is None:
+            bad.append(
+                f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, a document kind "
+                "outside DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and "
+                "a boundary + storage/digest party (proto-007)"
+            )
+        elif rel != owner and rel not in KIND_READERS.get(kind, set()):
+            bad.append(
+                f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
+                f"{owner} — a second declaration of one kind"
+            )
+    return bad
+
+
+def fence_implementation_ids() -> list[str]:
+    """Every executable provider ID has one owner and is never a document kind."""
+    bad: list[str] = []
+    overlap = sorted(DOCUMENT_KINDS.keys() & IMPLEMENTATION_IDS.keys())
+    if overlap:
+        bad.append("versioned identifier registry overlap: " + repr(overlap))
+
+    owned: dict[str, int] = {implementation: 0 for implementation in IMPLEMENTATION_IDS}
+    for path, rel, lineno, implementation in versioned_literals():
+        owner = IMPLEMENTATION_IDS.get(implementation)
+        if owner is None:
+            continue
+        readers = IMPLEMENTATION_ID_READERS.get(implementation, set())
+        if rel == owner:
+            owned[implementation] += 1
+        elif rel not in readers:
+            bad.append(
+                f"{path.relative_to(ROOT)}:{lineno}: names implementation ID "
+                f"{implementation!r}, owned by {owner} — add a reader explicitly or "
+                "remove the second declaration"
+            )
+
+    for implementation, owner in IMPLEMENTATION_IDS.items():
+        if owned[implementation] == 0:
+            bad.append(f"{implementation!r} has no literal in its owner {owner}")
+    return bad
+
+
+RETIRED_REPORT_FORMAT = re.compile(
+    r"cozy\.(?:jobs\.StructuralCensus|runtime\.(?:leaf_(?:fill|forward)|"
+    r"mxfp8_(?:delta|lane_ranking|native|rowwise_derivation|w8a8)|"
+    r"proof\.ModelContractState))/\d+"
+)
+
+
+def fence_report_format_tags() -> list[str]:
+    """Proof-local state and reports are path/command typed, never global document formats."""
+    bad: list[str] = []
+    roots = (ROOT / "corpus", ROOT / "proofs", ROOT / "scripts", SRC)
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if retired := RETIRED_REPORT_FORMAT.search(line):
                     bad.append(
-                        f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, a document kind "
-                        "outside DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and "
-                        "a boundary + storage/digest party (proto-007)"
-                    )
-                elif rel != owner and rel not in KIND_READERS.get(kind, set()):
-                    bad.append(
-                        f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
-                        f"{owner} — a second declaration of one kind"
+                        f"{path.relative_to(ROOT)}:{lineno}: retired proof/report format "
+                        f"{retired.group(0)!r}; keep the plain typed data and let its "
+                        "command/path establish the local shape"
                     )
     return bad
 
@@ -1494,6 +1567,8 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
+    "implementation-ids": fence_implementation_ids,
+    "report-format-tags": fence_report_format_tags,
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,

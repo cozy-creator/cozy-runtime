@@ -459,7 +459,6 @@ def compare() -> None:
     (ROOT / "delta.json").write_text(
         json.dumps(
             {
-                "format": "cozy.runtime.mxfp8_delta/1",
                 "source": {"repo": REPO, "revision": REV, "member": MEMBER, "block": BLOCK},
                 "device": mx_backend.device_facts.predicate,
                 "snapshot_mxfp8": (ROOT / "snapshot-mxfp8.txt").read_text().strip(),
@@ -612,7 +611,6 @@ def derive() -> None:
     (ROOT / "derive.json").write_text(
         json.dumps(
             {
-                "format": "cozy.runtime.mxfp8_rowwise_derivation/1",
                 "source": {"repo": REPO, "revision": REV, "member": MEMBER, "block": BLOCK},
                 "quantizer_rule": "floor(log2(block amax)) - 8 + 127, clamped [0,254]",
                 "row_scale_rule": "rowmax|V| / 448, continuous f32, floor 1e-12",
@@ -880,9 +878,7 @@ def w8a8() -> None:
         "bare_gemm_fast_accum_speedup_x": bf16_us / gemm_fast_us,
         "device": f"sm{capability[0]}{capability[1]}",
     }
-    (ROOT / "w8a8.json").write_text(
-        json.dumps({"format": "cozy.runtime.mxfp8_w8a8/1", "tensors": banked}, indent=1)
-    )
+    (ROOT / "w8a8.json").write_text(json.dumps({"tensors": banked}, indent=1))
 
 
 def _fp8_leaf(torch: Any, weight: Any, scale: Any, fast_accum: bool) -> Any:
@@ -989,7 +985,6 @@ def blockforward() -> None:
     (ROOT / "blockforward.json").write_text(
         json.dumps(
             {
-                "format": "cozy.runtime.mxfp8_lane_ranking/1",
                 "protocol": "1x512x5376 through the block GEMM chain, bf16 arm as reference",
                 "source": {"repo": REPO, "revision": REV, "member": MEMBER, "block": BLOCK},
                 "device": f"sm{torch.cuda.get_device_capability(0)[0]}"

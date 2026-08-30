@@ -439,7 +439,6 @@ def fill() -> None:
     (ROOT / "fill.json").write_text(
         json.dumps(
             {
-                "format": "cozy.runtime.leaf_fill/1",
                 "source": {"repo": REPO, "revision": REV, "member": MEMBER, "block": BLOCK},
                 "snapshot": (ROOT / "snapshot-rowwise.txt").read_text().strip(),
                 "device": f"sm{leaf_backend.device_facts.sm}",
@@ -511,7 +510,6 @@ def forward() -> None:
     (ROOT / "forward.json").write_text(
         json.dumps(
             {
-                "format": "cozy.runtime.leaf_forward/1",
                 "protocol": "1x512x5376 through the block's real GEMM chain, bf16 arm as "
                 "reference; identical module in every arm",
                 "source": {"repo": REPO, "revision": REV, "member": MEMBER, "block": BLOCK},
