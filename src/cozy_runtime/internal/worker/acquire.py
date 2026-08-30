@@ -166,6 +166,10 @@ def preinstalled_development(
 
     actual = placement.document
     expected = documents.body(expected_placement)
+    # Placement ID is RecordOwner routing, not package/model selection identity. A local
+    # owner may remint it while preserving the exact development closure.
+    comparable_actual = {key: value for key, value in actual.items() if key != "placement_id"}
+    comparable_expected = {key: value for key, value in expected.items() if key != "placement_id"}
     if actual.get("package_descriptor") != expected.get("package_descriptor"):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -221,7 +225,7 @@ def preinstalled_development(
                     "development_model_slot_changed",
                     name,
                 )
-    if actual != expected:
+    if comparable_actual != comparable_expected:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "development_placement_changed",

@@ -704,7 +704,10 @@ class Executor:
         self.facts = {
             "cuda_init_ms": round(cuda_ms, 2),
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
-            "fill_ms": backend.stats["fill_ms"],
+            # An all-inline checkpoint commits without opening the object stream. No stream
+            # wall was measured in that case, and zero is the exact value rather than an
+            # absent-stat KeyError after a successful construction.
+            "fill_ms": backend.stats.get("fill_ms", 0),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": memory["driver_free_bytes"],
@@ -764,7 +767,7 @@ class Executor:
                 # Decode scratch is PRICED by the envelope and no longer metered by a
                 # fill-local counter (#613); -1 is the spelling for NOT MEASURED.
                 scratch_bytes=-1,
-                fill_ms=int(backend.stats["fill_ms"]),
+                fill_ms=int(backend.stats.get("fill_ms", 0)),
                 decode_ms=int(backend.decoded["ms"]),
                 reference_deviation_rel_l2=(
                     0.0 if plan.variant == plan.reference_variant else -1.0
