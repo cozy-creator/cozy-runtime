@@ -1799,6 +1799,14 @@ class Worker:
             except artifact_access.ArtifactAccessRefusal as exc:
                 if set_digest != self.accepted.accepted_placement_set_digest:
                     continue
+                if exc.code == "worker_artifacts.worker_inactive":
+                    self.note("artifacts", "resolve waiting for RecordOwner acceptance relay")
+                    if (
+                        not self.stop.wait(1)
+                        and set_digest == self.accepted.accepted_placement_set_digest
+                    ):
+                        self.artifact_resolutions.put(set_digest)
+                    continue
                 self.note("artifacts", f"resolve REFUSED: {exc.code}")
                 self.engine.fault(
                     pb.Fault(
