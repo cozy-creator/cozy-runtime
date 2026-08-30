@@ -1180,7 +1180,6 @@ DOCUMENT_KINDS = {
     "cozy.runtime.plan-fact/1": "internal/planfacts.py",
     "cozy.runtime.probe/1": "internal/probe.py",
     "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
-    "cozy.runtime.ResolvedExecutionPlan/1": "internal/resolution.py",
     "cozy.runtime.TriageWriteReceipt/1": "internal/worker/triage.py",
     "cozy.runtime.WitnessBoot/1": "internal/witness.py",
     "cozy.runtime.WitnessDeath/1": "internal/witness.py",

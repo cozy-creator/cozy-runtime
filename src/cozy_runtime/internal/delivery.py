@@ -14,7 +14,7 @@ one joint decision over whole plans.
 **What it still is, and why it is worth keeping.** A route's COST CLASS is a real fact that
 belongs somewhere, and nothing else knows it: *when* is a decode paid — never, once at fill,
 again on every stage-in, or inside the forward pass? That question has an answer per route
-and per placement, it is the whole of pgw#1505, and `ResolvedExecutionPlan.wire_materialization`
+and per placement, it is the whole of pgw#1505, and `ResolvedModelPlan.wire_materialization`
 reads it to derive the wire's `materialization` field honestly. The `jit_decode` entry is the
 other reason: an UNBUILT rung is data, and its only consumer is the sentence a refusal prints
 when someone asks for it.
@@ -169,7 +169,7 @@ def cost_class(route: str, placement: str) -> str:
     The only place the placement axis and the delivery axis meet, and it is a lookup rather
     than a decision: a `decoded_float` tensor under `component_staged` re-decodes on every
     stage-in, which is `per_transition`, and the same tensor under `all_resident` decodes
-    once. `ResolvedExecutionPlan` reads this to derive its wire fields.
+    once. `ResolvedModelPlan` reads this to derive its wire fields.
     """
     if route == "verbatim" or route == "encoded_gemm":
         return "none"

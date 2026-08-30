@@ -551,15 +551,13 @@ def serving_directive(
         placements=[
             pb.Placement(
                 placement_id=PLACEMENT,
-                spec=pb.PlacementSpec(
-                    package_release_id=release,
-                    binding_plans=subjects,
-                    model_object_set=pb.ArtifactSubject(
-                        digest=documents.raw(object_set_digest),
-                        subject_id=object_set_digest,
-                        kind="model_object_set",
-                        length=len(empty_object_set),
-                    ),
+                package_release_id=release,
+                binding_plans=subjects,
+                model_object_set=pb.ArtifactSubject(
+                    digest=documents.raw(object_set_digest),
+                    subject_id=object_set_digest,
+                    kind="model_object_set",
+                    length=len(empty_object_set),
                 ),
             )
         ]

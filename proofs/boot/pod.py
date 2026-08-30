@@ -989,8 +989,8 @@ def main() -> int:
                 pb.ServingState.SERVING_STATE_DISPATCHABLE,
             ), describe(refused)
             assert (
-                refused.placements[0].placement_spec_digest
-                == staged.placements[0].placement_spec_digest
+                refused.placements[0].placement_set_digest
+                == staged.placements[0].placement_set_digest
             ), describe(refused)
             note(f"mismatched revision 4 REFUSED, outgoing keeps serving: {describe(refused)}")
 
