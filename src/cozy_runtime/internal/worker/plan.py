@@ -319,7 +319,7 @@ class DeclaredBinding:
     authoring it — means the executor DERIVES it at prepare from measured device capacity,
     the artifact's destination bytes and `vram_floor_bytes`; an explicit 0 means every
     component stays resident. Whatever value is APPLIED is stamped into the
-    ConstructedGeneration digest (cr-025)."""
+    executor's domain-separated constructed-generation digest (cr-025)."""
     tenancy: str = "local"
     """`local` (single-tenant: capacity never refuses above the floor, it deepens the ladder
     and confesses) or `shared` (a shortfall is a RESCHEDULE for the RecordOwner, never a

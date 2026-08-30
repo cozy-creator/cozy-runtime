@@ -689,6 +689,7 @@ class Worker:
     process: subprocess.Popen[bytes]
     hub: Hub
     log: Path
+    plans: dict[str, str]
 
     def stop(self, sig: int = signal.SIGTERM) -> int | None:
         if self.process.poll() is None:
@@ -793,14 +794,50 @@ def start_worker(
     overrides: dict[str, Any] | None = None,
     release: str = RELEASE,
     connect: bool = True,
+    weightless_project: Path | None = None,
 ) -> Worker:
     """Spawn the worker (which SERVES the protocol, #436), then dial and claim it."""
     home = tmp / "home"
     root = tmp / "worker"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
-    project = Path(str((overrides or {}).get("project") or ROOT / "corpus" / "package"))
+    project = weightless_project or Path(
+        str((overrides or {}).get("project") or ROOT / "corpus" / "package")
+    )
+    if weightless_project is not None:
+        from cozy_runtime.internal import descriptor
+        from cozy_runtime.internal.discovery import discover
+        from cozy_runtime.internal.local import stage_weightless_release
+
+        # The device child intentionally erases PYTHONPATH. Build a harness-owned ordinary
+        # environment so the arm crosses the same installed-package boundary as a
+        # provisioned release instead of weakening that isolation for a test harness.
+        environment = tmp / "environment"
+        executor_python = environment / "bin" / "python"
+        if not executor_python.is_file():
+            subprocess.run(["uv", "venv", str(environment)], check=True)
+            subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    str(executor_python),
+                    str(ROOT),
+                    str(project),
+                ],
+                check=True,
+            )
+        staged = stage_weightless_release(home, descriptor.build(discover(project)))
+        ids = dict(staged.plans)
+        artifact_store = staged.artifact_store
+        artifact_object_set = staged.artifact_object_set
+    else:
+        executor_python = Path(sys.executable)
+        ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
+        artifact_store = Path(store or working_store(WORK / "store"))
+        artifact_object_set = home / "artifact-object-set.json"
+        artifact_object_set.write_bytes(b'{"kind":"tensorhub.resolved_object_set/1","roots":[]}')
     hub = hub or Hub()
     hub.directive = serving_directive(
         release, sorted(ids.values()), posture, home / "binding-plans"
@@ -814,7 +851,7 @@ def start_worker(
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "COZY_HOME": str(home),
-        "PYTHONPATH": f"{ROOT}:{ROOT / 'src'}",
+        "PYTHONPATH": f"{project}:{ROOT}:{ROOT / 'src'}",
     }
     (root / "control.addr").unlink(missing_ok=True)
     socket_path = str(tmp / "control.sock")
@@ -831,14 +868,18 @@ def start_worker(
         f"unix:{socket_path}",
         "--root",
         str(root),
-        "--project",
-        str(project),
         "--instance-id",
         instance_id or f"ins-{uuid.uuid4().hex[:12]}",
         "--release-id",
         release,
+        "--python",
+        str(executor_python),
         "--grace",
         str(grace),
+        "--artifact-store",
+        str(artifact_store),
+        "--artifact-object-set",
+        str(artifact_object_set),
         *(("--no-warm",) if no_warm else ()),
         *extra,
     ]
@@ -868,7 +909,7 @@ def start_worker(
     hub.process, hub.log = process, log
     if connect:
         hub.connect(read_addr(root, process))
-    return Worker(home, root, process, hub, log)
+    return Worker(home, root, process, hub, log, ids)
 
 
 def _pump(process: subprocess.Popen[bytes], log: Path) -> None:
@@ -2044,22 +2085,36 @@ def section_arms(args: argparse.Namespace) -> None:
 def section_journal(args: argparse.Namespace) -> None:
     """Journal honesty, executor honesty, and the worker restart."""
     tmp = Path(args.tmp)
+    project = ROOT / "examples" / "marco-polo"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     idle = gpu_used_mib()
 
     head("a journal that cannot durably commit acknowledges NOTHING and executes NOTHING")
-    # 3,600 B leaves room for the worker's own boot `session` row (~200 B) under the
-    # 4,096 B limit, and none for the acceptance row after it — which is the write the arm
-    # is about. Grown too far, the plant bites at boot and the arm never reaches its subject.
-    grown = prefill_journal(tmp / "worker", 3600)
+    # 2,300 B leaves room for the session, ownership and accepted PlacementSet rows under
+    # the 4,096 B limit, and none for the attempt acceptance after them. Grown too far, the
+    # plant bites during claim/convergence and the arm never reaches its subject.
+    grown = prefill_journal(tmp / "worker", 2300)
     print(f"  the journal starts at {grown} B under a 4096 B planted file-size limit")
-    worker = start_worker(tmp, entrypoints=("denoise",), no_warm=True, rlimit_fsize=4096)
+    worker = start_worker(
+        tmp,
+        entrypoints=("marco",),
+        no_warm=True,
+        rlimit_fsize=4096,
+        weightless_project=project,
+    )
     hub = worker.hub
-    plan_id = plan_id_for("denoise")
+    plan_id = worker.plans["marco"]
     try:
         hub.ready(plan_id, 400)
-        dispatch(hub, tmp, plan_id, request_id="req-enospc")
+        dispatch(
+            hub,
+            tmp,
+            plan_id,
+            request_id="req-enospc",
+            payload={"message": "marco"},
+            outputs=0,
+        )
         time.sleep(5.0)
         accepted = hub.accepted("req-enospc")
         terminals = hub.terminals("req-enospc")
@@ -2084,15 +2139,23 @@ def section_journal(args: argparse.Namespace) -> None:
     tmp2 = Path(args.tmp + "-corrupt")
     shutil.rmtree(tmp2, ignore_errors=True)
     tmp2.mkdir(parents=True)
-    worker = start_worker(tmp2, entrypoints=("denoise",), no_warm=True, instance_id="ins-fixed")
+    worker = start_worker(
+        tmp2,
+        entrypoints=("marco",),
+        no_warm=True,
+        instance_id="ins-fixed",
+        weightless_project=project,
+    )
     try:
-        worker.hub.ready(plan_id_for("denoise"), 400)
+        plan_id = worker.plans["marco"]
+        worker.hub.ready(plan_id, 400)
         dispatch(
             worker.hub,
             tmp2,
-            plan_id_for("denoise"),
+            plan_id,
             request_id="req-j",
-            payload={"steps": 1, "latent": 48},
+            payload={"message": "marco"},
+            outputs=0,
         )
         worker.hub.wait(
             lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
@@ -2107,7 +2170,12 @@ def section_journal(args: argparse.Namespace) -> None:
         data[target] = data[target] ^ 0x20
         journal.write_bytes(bytes(data))
         restarted = start_worker(
-            tmp2, entrypoints=("denoise",), no_warm=True, instance_id="ins-fixed", connect=False
+            tmp2,
+            entrypoints=("marco",),
+            no_warm=True,
+            instance_id="ins-fixed",
+            connect=False,
+            weightless_project=project,
         )
         code = restarted.process.wait(timeout=60)
         check(
@@ -2124,17 +2192,25 @@ def section_journal(args: argparse.Namespace) -> None:
     tmp3 = Path(args.tmp + "-restart")
     shutil.rmtree(tmp3, ignore_errors=True)
     tmp3.mkdir(parents=True)
-    worker = start_worker(tmp3, entrypoints=("denoise",), no_warm=True, instance_id="ins-stable")
+    worker = start_worker(
+        tmp3,
+        entrypoints=("marco",),
+        no_warm=True,
+        instance_id="ins-stable",
+        weightless_project=project,
+    )
     hub = worker.hub
     try:
-        hub.ready(plan_id_for("denoise"), 400)
+        plan_id = worker.plans["marco"]
+        hub.ready(plan_id, 400)
         hub.auto_ack = False
         dispatch(
             hub,
             tmp3,
-            plan_id_for("denoise"),
+            plan_id,
             request_id="req-restart",
-            payload={"steps": 1, "latent": 48},
+            payload={"message": "marco"},
+            outputs=0,
         )
         terminal = hub.wait(
             lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
@@ -2147,7 +2223,11 @@ def section_journal(args: argparse.Namespace) -> None:
         worker.process.wait(timeout=20)
         worker.hub.close()
         restarted = start_worker(
-            tmp3, entrypoints=("denoise",), no_warm=True, instance_id="ins-stable"
+            tmp3,
+            entrypoints=("marco",),
+            no_warm=True,
+            instance_id="ins-stable",
+            weightless_project=project,
         )
         hub2 = restarted.hub
         check(

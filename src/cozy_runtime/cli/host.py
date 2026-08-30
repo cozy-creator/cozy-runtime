@@ -99,7 +99,7 @@ def list_artifacts(config: RuntimeConfig, prefix: str, opts: Options) -> Result:
     )
     return Result(
         rows=tuple(rows),
-        document=[row.document() for row in installed] if opts.json else None,
+        document=[row.view() for row in installed] if opts.json else None,
         next=("cozy-runtime rm <ref> --yes — remove one from the local CAS",),
     )
 

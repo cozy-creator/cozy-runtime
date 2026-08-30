@@ -545,9 +545,10 @@ class Ledger:
             )
         return out
 
-    def document(self) -> dict[str, Any]:
+    def measurement(self) -> dict[str, Any]:
+        """Current typed ledger fields for journal, triage, and local reporting."""
+
         return {
-            "format": "cozy.runtime.Ledger/0",
             "classes": [counter.document() for counter in self.counters()],
             "unreadable": sorted(self.unreadable),
             "unreconciled": self.unreconciled,

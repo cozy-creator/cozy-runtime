@@ -40,21 +40,22 @@ acceptance fact and are returned so the caller can bank them (cr-006's checklist
 growth toward per-shape search is out of scope by construction, because there is no
 shape loop here to grow.
 
-First-writer-wins persistence (the tcg#84 pattern): the cache file is created with
-`O_EXCL`, and a loser reads the winner's bytes rather than overwriting them.
+First-writer-wins persistence is one SQLite row keyed by the exact probe inputs. A loser
+reads the winner's row rather than overwriting it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import os
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import cache as runtime_cache
 from cozy_runtime.internal.encoding import (
     SPEC_VECTORS,
     TORCH_DTYPES,
@@ -869,7 +870,7 @@ def qualify(
         digest: (tuple(value) if isinstance(value, tuple | list) else (value,))
         for digest, value in providers.items()
     }
-    key = canonical.digest(
+    key_preimage = canonical.write(
         {
             "tuple": device.tuple_key(),
             "release": release,
@@ -888,8 +889,8 @@ def qualify(
             "dtypes": sorted(output_dtypes),
         }
     )
-    path = Path(cache) / f"{key.removeprefix('sha256:')[:32]}.json" if cache else None
-    cached = _read(path)
+    key = "sha256:" + hashlib.sha256(b"cozy.runtime.probe\0" + key_preimage).hexdigest()
+    cached = _read(cache, key)
     if cached is not None:
         return _table(cached), cached
 
@@ -986,7 +987,6 @@ def qualify(
                     }
                 )
     result = {
-        "format": "cozy.runtime.probe/1",
         "tuple": device.tuple_key(),
         "device": device.document(),
         "device_predicate": device.predicate,
@@ -995,7 +995,7 @@ def qualify(
         "suite_ms": (time.perf_counter_ns() - started) // 1_000_000,
         "observations": observations,
     }
-    _write(path, result)
+    _write(cache, key, result)
     return _table(result), result
 
 
@@ -1039,25 +1039,40 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
     return caps
 
 
-def _read(path: Path | None) -> dict[str, Any] | None:
-    if path is None or not path.is_file():
+def _read(root: Path | str | None, key: str) -> dict[str, Any] | None:
+    if root is None:
+        return None
+    with runtime_cache.connect(root) as database:
+        row = database.execute(
+            "SELECT result_json FROM probe_results WHERE cache_key = ?", (key,)
+        ).fetchone()
+    if row is None:
         return None
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) and data.get("format") == "cozy.runtime.probe/1" else None
+        data = json.loads(str(row["result_json"]))
+    except ValueError as exc:
+        raise runtime_cache.CacheError(f"probe row {key} is not JSON") from exc
+    required = {
+        "tuple",
+        "device",
+        "device_predicate",
+        "runtime_release",
+        "runtime",
+        "suite_ms",
+        "observations",
+    }
+    if not isinstance(data, dict) or set(data) != required:
+        raise runtime_cache.CacheError(f"probe row {key} has the wrong fields")
+    return data
 
 
-def _write(path: Path | None, result: Mapping[str, Any]) -> None:
+def _write(root: Path | str | None, key: str, result: Mapping[str, Any]) -> None:
     """FIRST WRITER WINS. A loser leaves the winner's bytes alone and moves on."""
-    if path is None:
+    if root is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps(result, sort_keys=True, indent=1).encode()
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        return
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(body)
+    with runtime_cache.connect(root) as database:
+        database.execute(
+            "INSERT OR IGNORE INTO probe_results (cache_key, result_json) VALUES (?, ?)",
+            (key, json.dumps(result, sort_keys=True, separators=(",", ":"))),
+        )
+        database.commit()

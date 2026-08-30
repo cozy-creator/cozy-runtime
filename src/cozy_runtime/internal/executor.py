@@ -653,9 +653,8 @@ class Executor:
         # this" has a different answer from "which BYTES are resident", and one digest could
         # only ever answer one of them.
         self.plan = plan
-        self.constructed_model_digest = canonical.digest(
+        constructed_preimage = canonical.write(
             {
-                "format": "cozy.runtime.ConstructedGeneration/2",
                 "logical_model_digest": self.logical_model_digest,
                 "plan_digest": plan.digest(),
                 "topology_digest": record.topology_digest,
@@ -663,6 +662,12 @@ class Executor:
                 # THE APPLIED CEILING — derived or declared — never the wire's absent 0 (cl-027).
                 "resident_budget_bytes": resident_budget,
             }
+        )
+        self.constructed_model_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                b"cozy.runtime.constructed-generation\0" + constructed_preimage
+            ).hexdigest()
         )
         expected = command.get("expect_construction_digest") or ""
         if expected and expected != self.logical_model_digest:

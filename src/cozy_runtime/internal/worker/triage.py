@@ -1,4 +1,4 @@
-"""The WorkerTriageBundle: ONE bounded document per terminal attempt. The schema FREEZES here.
+"""One bounded triage record per terminal attempt.
 
 Debugging a failed attempt on a dead rented pod is v1's dominant triage cost, and the reason
 is always the same: the evidence lived in the process. When the process is gone — killed,
@@ -47,16 +47,12 @@ from typing import Any
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.journal import Journal
 
-BUNDLE_FORMAT = "cozy.runtime.WorkerTriageBundle/1"
-RECEIPT_FORMAT = "cozy.runtime.TriageWriteReceipt/1"
-
 #: `TriageBundleRef.length` is bounded at 1 MiB by the protocol. The assembler trims to it.
 MAX_BUNDLE_BYTES = 1 << 20
 
 #: The document's CLOSED top-level key set. A reader may check it exactly; a writer that
 #: wants a new section changes this line, which is a schema change and looks like one.
 SECTIONS = (
-    "format",
     "subject_id",
     "attempt",
     "plan",
@@ -94,14 +90,6 @@ class Receipt:
     bundle_digest: str
     length: int
     journal_seq: int
-
-    def document(self) -> dict[str, Any]:
-        return {
-            "format": RECEIPT_FORMAT,
-            "subject_id": self.subject_id,
-            "bundle_digest": self.bundle_digest,
-            "length": self.length,
-        }
 
 
 @dataclass(slots=True)
@@ -155,7 +143,6 @@ class Assembly:
         caps["max_bundle_bytes"] = MAX_BUNDLE_BYTES
         caps["truncated"] = bool(shed or caps.get("dropped", 0))
         return {
-            "format": BUNDLE_FORMAT,
             "subject_id": self.subject_id,
             "attempt": self.attempt,
             "plan": self.plan,
@@ -201,7 +188,6 @@ class BundleStore:
         journaled = self.journal.append(
             "triage",
             {
-                "format": RECEIPT_FORMAT,
                 "subject_id": assembly.subject_id,
                 "bundle_digest": digest,
                 "length": len(data),
@@ -227,8 +213,25 @@ class BundleStore:
                 row = canonical.parse_canonical(rest)
             except canonical.CanonicalError:
                 continue
-            if isinstance(row, dict) and row.get("kind") == "triage":
-                found[str(row["body"]["subject_id"])] = row["body"]
+            if not isinstance(row, dict) or row.get("kind") != "triage":
+                continue
+            body = row.get("body")
+            if not isinstance(body, dict) or set(body) != {
+                "subject_id",
+                "bundle_digest",
+                "length",
+            }:
+                continue
+            subject = body.get("subject_id")
+            digest = body.get("bundle_digest")
+            length = body.get("length")
+            if (
+                not isinstance(subject, str)
+                or not isinstance(digest, str)
+                or not isinstance(length, int)
+            ):
+                continue
+            found[subject] = body
         return found
 
     @staticmethod
@@ -244,8 +247,8 @@ class BundleStore:
             raise TriageError("bundle_absent", f"no triage bundle for subject {subject_id!r}")
         data = path.read_bytes()
         document = canonical.parse_canonical(data)
-        if not isinstance(document, dict) or document.get("format") != BUNDLE_FORMAT:
-            raise TriageError("bundle_malformed", f"{subject_id}: not a {BUNDLE_FORMAT}")
+        if not isinstance(document, dict) or set(document) != set(SECTIONS):
+            raise TriageError("bundle_malformed", f"{subject_id}: wrong triage fields")
         if journal_path is not None:
             receipt = BundleStore.receipts(journal_path).get(subject_id)
             if receipt is None:
@@ -273,12 +276,12 @@ def explain(document: dict[str, Any]) -> list[str]:
     lines = [
         f"attempt   {attempt.get('request_id')}#{attempt.get('attempt')} "
         f"({document.get('subject_id')})",
-        f"spec      {str(attempt.get('exec_spec_digest', ''))[:30]}",
+        f"spec      {str(attempt.get('invocation_spec_digest', ''))[:30]}",
         f"outcome   {terminal.get('status')} / {terminal.get('cause_code')} "
         f"from {terminal.get('cause_origin')}",
         f"because   {terminal.get('safe_message', '')[:300]}",
-        f"executor  incarnation {attempt.get('executor_incarnation')} "
-        f"admission generation {attempt.get('admission_generation')}",
+        f"executor  generation {attempt.get('executor_generation')} "
+        f"admission generation {document.get('posture', {}).get('admission_generation')}",
     ]
     for fault in document.get("faults", ()):
         lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")

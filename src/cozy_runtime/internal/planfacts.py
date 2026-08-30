@@ -1,4 +1,4 @@
-"""#549.2 — measured envelopes, keyed by RESOLVED-PLAN DIGEST, in immutable per-run files.
+"""#549.2 — measured envelopes, keyed by RESOLVED-PLAN DIGEST, in private SQLite rows.
 
 **What this replaces, and why it was a real defect.** `DeliveryTable` keyed a measured
 envelope by `(variant, rung)`. Neither half of that key binds the thing the numbers describe:
@@ -18,22 +18,16 @@ own digest, which binds all five by construction (`resolution.py`'s `ResolvedMod
 hashes the snapshot map, the per-tensor implementation digests, the runtime identity, the
 device identity, the construction facts and the config digest).
 
-**Immutable per-run files, and the choice is stated.** The old table was a shared JSON
-document that every writer LOADED, MERGED and rewrote through a single `.partial` path. Two
-concurrent prepares each read the file, each merged their own row, and the second `os.replace`
-silently dropped the first's — a lost-update race with no lock and no detection. The two ways
-out are a properly locked store or immutable per-run facts, and this picks the second:
+**Immutable per-run rows, and the choice is stated.** The old table was a shared JSON
+document that every writer loaded, merged and rewrote. Two concurrent prepares could silently
+drop one observation. Each run now inserts one row under a unique `(plan_digest, run_id)` key:
 
-* a run writes ONE file, named by its own run digest, with `O_EXCL`. There is nothing to
-  merge, so there is nothing to lose. A collision is impossible rather than handled.
-* reading is a directory listing and a fold. Every run's observation survives, which is also
+* a run inserts ONE row. There is nothing to merge, so there is nothing to lose.
+* reading is a query and a fold. Every run's observation survives, which is also
   what makes `samples` an honest count instead of an incremented integer nobody can audit.
-* no lock means no lock to leak on a killed pod, which is the failure mode a file lock would
-  have introduced on exactly the machines this runs on.
+* SQLite supplies the concurrency and crash boundary; there is no hand-rolled file lock.
 
-The cost is directory growth, which is bounded in practice by the plan digest: one directory
-per distinct plan, one small file per prepare of it, and `prune` exists for an operator who
-wants a ceiling.
+`prune` remains the explicit operator ceiling.
 
 **Old label-keyed files are INVALID and are not migrated.** They live under a different name
 (`delivery-*.json`), nothing here reads them, and the numbers inside them cannot be
@@ -44,17 +38,15 @@ records: measurement-minted, and a re-measure re-mints.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical
-
-FORMAT = "cozy.runtime.plan-fact/1"
+from cozy_runtime.internal import cache, canonical
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,32 +73,6 @@ class RunFact:
     plan's own is 0.0 by construction."""
     evidence: str = ""
     at_ns: int = 0
-
-    def document(self) -> dict[str, Any]:
-        return {
-            "format": FORMAT,
-            "plan_digest": self.plan_digest,
-            "run_id": self.run_id,
-            "stored_bytes": self.stored_bytes,
-            "resident_bytes": self.resident_bytes,
-            "scratch_bytes": self.scratch_bytes,
-            "fill_ms": self.fill_ms,
-            "decode_ms": self.decode_ms,
-            "step_ms": self.step_ms,
-            "reference_deviation_rel_l2": self.reference_deviation_rel_l2,
-            "evidence": self.evidence,
-            "at_ns": self.at_ns,
-        }
-
-    @classmethod
-    def read(cls, record: Mapping[str, Any]) -> RunFact | None:
-        if record.get("format") != FORMAT:
-            return None
-        known = {f for f in cls.__dataclass_fields__}
-        try:
-            return cls(**{k: v for k, v in record.items() if k in known})
-        except TypeError:
-            return None
 
 
 #: The numeric fields a fold aggregates, and whether "measured" means `>= 0`.
@@ -210,75 +176,95 @@ def fold(plan_digest: str, runs: Iterable[RunFact]) -> PlanFact:
 
 
 class PlanFacts:
-    """The on-disk store: one directory per plan digest, one immutable file per run.
+    """The private cache: one immutable SQLite row per run.
 
     It is a DEVICE-and-BUILD property, like the probe cache, and it lives beside that one
-    under `cozy_home` rather than beside a checkpoint — but unlike the probe cache it is not
-    first-writer-wins, because two runs of one plan are two observations and both are true.
+    under `cozy_home` rather than beside a checkpoint. Unlike the probe cache it retains
+    every distinct run, because two runs of one plan are two observations and both are true.
     """
 
     def __init__(self, root: Path | str | None) -> None:
         self.root = Path(root) if root is not None else None
 
-    def directory(self, plan_digest: str) -> Path | None:
-        if self.root is None:
-            return None
-        return self.root / "plan-facts" / plan_digest.removeprefix("sha256:")[:32]
-
     def runs(self, plan_digest: str) -> list[RunFact]:
-        folder = self.directory(plan_digest)
-        if folder is None or not folder.is_dir():
+        if self.root is None:
             return []
-        out: list[RunFact] = []
-        for path in sorted(folder.glob("*.json")):
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
-                # A half-written file cannot exist here — every write is O_EXCL over a whole
-                # body — so an unreadable one is a damaged disk or a foreign file, and
-                # skipping it is honest: it contributes no sample rather than a zero.
-                continue
-            record = RunFact.read(data) if isinstance(data, dict) else None
-            if record is not None:
-                out.append(record)
-        return out
+        with cache.connect(self.root) as database:
+            rows = database.execute(
+                """
+                SELECT plan_digest, run_id, stored_bytes, resident_bytes, scratch_bytes,
+                       fill_ms, decode_ms, step_ms, reference_deviation_rel_l2, evidence, at_ns
+                FROM plan_facts WHERE plan_digest = ? ORDER BY at_ns, run_id
+                """,
+                (plan_digest,),
+            )
+            return [RunFact(**dict(row)) for row in rows]
 
     def get(self, plan_digest: str) -> PlanFact:
         return fold(plan_digest, self.runs(plan_digest))
 
+    def digests(self) -> tuple[str, ...]:
+        """Every plan with at least one banked run, for operator/reporting views."""
+
+        if self.root is None:
+            return ()
+        with cache.connect(self.root) as database:
+            rows = database.execute("SELECT DISTINCT plan_digest FROM plan_facts ORDER BY 1")
+            return tuple(str(row["plan_digest"]) for row in rows)
+
     def bank(self, fact: RunFact) -> Path | None:
-        """Write ONE run's observation. `O_EXCL`, no merge, no rewrite, no `.partial`.
+        """Insert ONE run's observation. No merge and no rewrite.
 
         A run id collision means the same run wrote twice, which is a caller bug rather than
-        a race, so it is left alone exactly as the probe cache leaves a winner's bytes alone.
+        a race, so the existing row is left alone.
         """
-        folder = self.directory(fact.plan_digest)
-        if folder is None:
+        if self.root is None:
             return None
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{fact.run_id}.json"
-        body = json.dumps(fact.document(), sort_keys=True, indent=1).encode()
-        try:
-            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            return path
-        with os.fdopen(handle, "wb") as out:
-            out.write(body)
-        return path
+        with cache.connect(self.root) as database:
+            database.execute(
+                """
+                INSERT OR IGNORE INTO plan_facts (
+                    plan_digest, run_id, stored_bytes, resident_bytes, scratch_bytes, fill_ms,
+                    decode_ms, step_ms, reference_deviation_rel_l2, evidence, at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact.plan_digest,
+                    fact.run_id,
+                    fact.stored_bytes,
+                    fact.resident_bytes,
+                    fact.scratch_bytes,
+                    fact.fill_ms,
+                    fact.decode_ms,
+                    fact.step_ms,
+                    fact.reference_deviation_rel_l2,
+                    fact.evidence,
+                    fact.at_ns,
+                ),
+            )
+            database.commit()
+        return self.root / cache.FILENAME
 
     def prune(self, plan_digest: str, keep: int) -> int:
         """Drop all but the `keep` newest runs of one plan. An operator's ceiling, never
         automatic: a store that silently forgot its own samples would make `samples` a lie."""
-        folder = self.directory(plan_digest)
-        if folder is None or not folder.is_dir():
+        if self.root is None:
             return 0
-        files = sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        dropped = 0
-        for path in files[max(keep, 0) :]:
-            with __import__("contextlib").suppress(OSError):
-                path.unlink()
-                dropped += 1
-        return dropped
+        with cache.connect(self.root) as database:
+            removed = database.execute(
+                """
+                DELETE FROM plan_facts
+                WHERE plan_digest = ? AND run_id IN (
+                    SELECT run_id FROM plan_facts
+                    WHERE plan_digest = ?
+                    ORDER BY at_ns DESC, run_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (plan_digest, plan_digest, max(keep, 0)),
+            ).rowcount
+            database.commit()
+        return removed
 
 
 def run_id(plan_digest: str, device_tuple: str, release: str) -> str:
@@ -290,17 +276,16 @@ def run_id(plan_digest: str, device_tuple: str, release: str) -> str:
     nanosecond clock is not guaranteed to advance between two calls in one process, and two
     runs colliding would silently drop the second's observation.
     """
-    return canonical.digest(
+    preimage = canonical.write(
         {
             "plan": plan_digest,
             "device": device_tuple,
             "release": release,
-            # HEX STRINGS, not integers. `canonical.digest` is the RFC 8785 writer and it
-            # REFUSES an integer outside the interoperable 2**53 range — a nanosecond clock
-            # reading is about 1.8e18, so spelling it as a number is a `number_range`
-            # refusal at the moment a run tries to bank its own fact. Found by the arm.
+            # HEX STRINGS, not integers. `canonical.write` refuses an integer outside the
+            # interoperable 2**53 range, while a nanosecond clock is about 1.8e18.
             "at_ns_hex": f"{time.time_ns():x}",
             "pid_hex": f"{os.getpid():x}",
             "entropy": os.urandom(8).hex(),
         }
-    ).removeprefix("sha256:")[:32]
+    )
+    return hashlib.sha256(b"cozy.runtime.plan-run\0" + preimage).hexdigest()[:32]
