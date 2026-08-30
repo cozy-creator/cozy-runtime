@@ -2,7 +2,7 @@
 
 The PlacementSet is the complete statement of WHAT to run. Tensorhub's mTLS response contains
 only short-lived locations for the closure the Hub derives from that accepted set. This module
-never reads an artifact role from the access plan and never reconstructs the deleted bundle,
+never reads a file role from the download plan and never reconstructs the deleted bundle,
 environment-specification, object-set, or binding documents.
 """
 
@@ -31,7 +31,7 @@ from cozy_runtime.internal import (
     descriptor as package_descriptor,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
-from cozy_runtime.internal.worker.artifact_access import ArtifactPlan
+from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -208,7 +208,7 @@ class Acquirer:
 
     def __init__(
         self,
-        plan: ArtifactPlan,
+        plan: DownloadPlan,
         *,
         cache_root: Path,
         environment_root: Path,
@@ -262,14 +262,14 @@ class Acquirer:
                 if planned is None or not location:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        "artifact_plan_missing",
+                        "download_plan_missing",
                         f"{digest} is reached by PlacementSet/1 and absent locally and "
                         "from the plan",
                     )
                 if deadline <= int(time.time()):
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        "artifact_grant_expired",
+                        "download_url_expired",
                         f"the presigned read for {digest} expired at {deadline}",
                     )
                 path = placement_materialization.fetch_exact(

@@ -1,4 +1,4 @@
-"""The worker's one direct, mTLS-authenticated Tensorhub artifact client."""
+"""The worker's one direct, mTLS-authenticated Tensorhub download client."""
 
 from __future__ import annotations
 
@@ -16,21 +16,21 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from cozy_runtime.internal import pull
-from cozy_runtime.internal.config import WorkerArtifactOrigin
+from cozy_runtime.internal.config import TensorhubOrigin
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-WORKER_TENSORHUB_PATH = "/v1/worker/artifacts/resolve"
+WORKER_DOWNLOADS_PATH = "/v1/worker/downloads/resolve"
 MAX_REQUEST_BYTES = 128 << 10
 MAX_RESPONSE_BYTES = 8 << 20
-MAX_ARTIFACTS = 4096
+MAX_FILES = 4096
 RESOLVE_TIMEOUT_SECONDS = 30
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
-class ArtifactAccessRefusal(Exception):
-    """A typed intent, authorization, or direct-resolve refusal."""
+class DownloadRefusal(Exception):
+    """A typed Claim or package/model download refusal."""
 
     def __init__(self, kind: pb.FaultKind, code: str, detail: str, *, server_time: int = 0) -> None:
         super().__init__(f"{code}: {detail}")
@@ -41,7 +41,7 @@ class ArtifactAccessRefusal(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class PlanArtifact:
+class DownloadFile:
     digest: str
     length: int
     kind: str
@@ -50,35 +50,35 @@ class PlanArtifact:
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactPlan:
+class DownloadPlan:
     server_time_unix: int = 0
     expires_at_unix: int = 0
-    artifacts: Mapping[str, PlanArtifact] = field(default_factory=dict)
+    files: Mapping[str, DownloadFile] = field(default_factory=dict)
     allow_local: bool = False
 
     @property
     def subjects(self) -> dict[str, int]:
-        return {digest: row.length for digest, row in self.artifacts.items()}
+        return {digest: row.length for digest, row in self.files.items()}
 
     @property
     def locations(self) -> dict[str, str]:
-        return {digest: row.url for digest, row in self.artifacts.items()}
+        return {digest: row.url for digest, row in self.files.items()}
 
     def authorized(self) -> bool:
-        return bool(self.artifacts)
+        return bool(self.files)
 
-    def merged(self, newer: ArtifactPlan) -> ArtifactPlan:
-        rows = dict(self.artifacts)
-        rows.update(newer.artifacts)
-        return ArtifactPlan(
+    def merged(self, newer: DownloadPlan) -> DownloadPlan:
+        rows = dict(self.files)
+        rows.update(newer.files)
+        return DownloadPlan(
             server_time_unix=max(self.server_time_unix, newer.server_time_unix),
             expires_at_unix=max(self.expires_at_unix, newer.expires_at_unix),
-            artifacts=dict(sorted(rows.items())),
+            files=dict(sorted(rows.items())),
             allow_local=self.allow_local or newer.allow_local,
         )
 
     def deadline(self, digest: str) -> int:
-        row = self.artifacts.get(digest)
+        row = self.files.get(digest)
         return row.expires_at_unix if row is not None else 0
 
 
@@ -93,7 +93,7 @@ def verify_claim_proof(
     """Verify the canonical private-rental Claim transcript."""
 
     if claim.worker_id != worker_id or claim.worker_boot_id != worker_boot_id:
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "claim_proof_binding_mismatch",
             "Claim does not name this worker and boot",
@@ -101,7 +101,7 @@ def verify_claim_proof(
     try:
         tls_digest = documents.raw(worker_tls_certificate_digest)
     except documents.DocumentError as exc:
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "claim_proof_tls_digest_invalid",
             exc.detail,
@@ -119,7 +119,7 @@ def verify_claim_proof(
 
 def _verify_signature(public_key: bytes, signature: bytes, payload: bytes, subject: str) -> None:
     if len(public_key) != 32 or len(signature) != 64:
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             f"{subject}_signature_invalid",
             "the configured Ed25519 key or carried signature has the wrong length",
@@ -127,7 +127,7 @@ def _verify_signature(public_key: bytes, signature: bytes, payload: bytes, subje
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(signature, payload)
     except (InvalidSignature, ValueError) as exc:
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             f"{subject}_signature_invalid",
             f"{subject} was not signed by this rental's Cozy key",
@@ -148,19 +148,19 @@ class _Connection(Protocol):
     def close(self) -> None: ...
 
 
-class ArtifactClient:
+class DownloadClient:
     """Resolve one active PlacementSet at Tensorhub's mTLS-only worker authority.
 
     The pinned client certificate identifies the rental, worker and boot. Tensorhub owns the
-    accepted PlacementSet and derives its complete artifact closure. Restating either identity
-    or inventory in this request would create a second authorization document.
+    accepted PlacementSet and derives its complete package/model file closure. Restating either
+    identity or inventory in this request would create a second download request.
     """
 
     def __init__(
         self,
         certificate: Path,
         private_key: Path,
-        origin: WorkerArtifactOrigin,
+        origin: TensorhubOrigin,
         *,
         connection: Callable[[float], _Connection] | None = None,
     ) -> None:
@@ -169,13 +169,13 @@ class ArtifactClient:
         self.origin = origin
         self.connection = connection
 
-    def resolve(self, placement_set_digest: bytes) -> ArtifactPlan:
+    def resolve(self, placement_set_digest: bytes) -> DownloadPlan:
         try:
             spelled = documents.spell(placement_set_digest)
         except documents.DocumentError as exc:
-            raise ArtifactAccessRefusal(
+            raise DownloadRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "worker_artifacts.placement_set_digest_invalid",
+                "worker_downloads.placement_set_digest_invalid",
                 exc.detail,
             ) from exc
         payload = json.dumps(
@@ -184,33 +184,33 @@ class ArtifactClient:
             separators=(",", ":"),
         ).encode()
         if len(payload) > MAX_REQUEST_BYTES:
-            raise ArtifactAccessRefusal(
+            raise DownloadRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "artifact_resolve_request_too_large",
+                "worker_downloads.request_too_large",
                 f"{len(payload)} bytes",
             )
         connection = self._connection(float(RESOLVE_TIMEOUT_SECONDS))
         try:
             connection.request(
                 "POST",
-                WORKER_TENSORHUB_PATH,
+                WORKER_DOWNLOADS_PATH,
                 payload,
                 {"Accept": "application/json", "Content-Type": "application/json"},
             )
             response = connection.getresponse()
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         except (OSError, TimeoutError, http.client.HTTPException) as exc:
-            raise ArtifactAccessRefusal(
+            raise DownloadRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "worker_artifacts.unreachable",
+                "worker_downloads.unreachable",
                 type(exc).__name__,
             ) from exc
         finally:
             connection.close()
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise ArtifactAccessRefusal(
+            raise DownloadRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "worker_artifacts.response_too_large",
+                "worker_downloads.response_too_large",
                 f"more than {MAX_RESPONSE_BYTES} bytes",
             )
         value = _json_object(raw)
@@ -235,21 +235,21 @@ def _json_object(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-            "worker_artifacts.response_invalid",
+            "worker_downloads.response_invalid",
             "response is not JSON",
         ) from exc
     if not isinstance(value, dict):
-        raise ArtifactAccessRefusal(
+        raise DownloadRefusal(
             pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-            "worker_artifacts.response_invalid",
+            "worker_downloads.response_invalid",
             "response is not an object",
         )
     return value
 
 
-def _error_response(value: Mapping[str, Any], status: int) -> ArtifactAccessRefusal:
+def _error_response(value: Mapping[str, Any], status: int) -> DownloadRefusal:
     error = value.get("error")
     server_time = value.get("server_time_unix")
     if (
@@ -263,13 +263,13 @@ def _error_response(value: Mapping[str, Any], status: int) -> ArtifactAccessRefu
         or isinstance(server_time, bool)
         or server_time <= 0
     ):
-        return ArtifactAccessRefusal(
+        return DownloadRefusal(
             pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-            "worker_artifacts.error_invalid",
+            "worker_downloads.error_invalid",
             f"HTTP {status}",
         )
     code = str(error["code"])
-    return ArtifactAccessRefusal(
+    return DownloadRefusal(
         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
         code,
         str(error["message"]),
@@ -277,12 +277,12 @@ def _error_response(value: Mapping[str, Any], status: int) -> ArtifactAccessRefu
     )
 
 
-def _plan(value: Mapping[str, Any], *, allow_local: bool = False) -> ArtifactPlan:
-    if set(value) != {"artifacts", "expires_at_unix", "server_time_unix"}:
+def _plan(value: Mapping[str, Any], *, allow_local: bool = False) -> DownloadPlan:
+    if set(value) != {"files", "expires_at_unix", "server_time_unix"}:
         raise _plan_invalid("fields")
     server_time = value.get("server_time_unix")
     expires = value.get("expires_at_unix")
-    rows = value.get("artifacts")
+    rows = value.get("files")
     if (
         not isinstance(server_time, int)
         or isinstance(server_time, bool)
@@ -291,14 +291,14 @@ def _plan(value: Mapping[str, Any], *, allow_local: bool = False) -> ArtifactPla
         or isinstance(expires, bool)
         or not server_time < expires
         or not isinstance(rows, list)
-        or not 1 <= len(rows) <= MAX_ARTIFACTS
+        or not 1 <= len(rows) <= MAX_FILES
     ):
         raise _plan_invalid("header")
-    artifacts: dict[str, PlanArtifact] = {}
+    files: dict[str, DownloadFile] = {}
     prior = ""
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"digest", "kind", "length", "url"}:
-            raise _plan_invalid("artifact fields")
+            raise _plan_invalid("file fields")
         digest = row.get("digest")
         length = row.get("length")
         kind = row.get("kind")
@@ -315,16 +315,16 @@ def _plan(value: Mapping[str, Any], *, allow_local: bool = False) -> ArtifactPla
             or not isinstance(url, str)
             or not url.startswith("https://")
         ):
-            raise _plan_invalid("artifact value")
-        artifacts[digest] = PlanArtifact(digest, length, kind, url, expires)
+            raise _plan_invalid("file value")
+        files[digest] = DownloadFile(digest, length, kind, url, expires)
         prior = digest
-    return ArtifactPlan(server_time, expires, artifacts, allow_local)
+    return DownloadPlan(server_time, expires, files, allow_local)
 
 
-def _plan_invalid(detail: str) -> ArtifactAccessRefusal:
-    return ArtifactAccessRefusal(
+def _plan_invalid(detail: str) -> DownloadRefusal:
+    return DownloadRefusal(
         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-        "worker_artifacts.plan_invalid",
+        "worker_downloads.plan_invalid",
         detail,
     )
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Live ClaimProof and PlacementSet-digest artifact-resolution proof."""
+"""Live ClaimProof and package/model download-resolution proof."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import tempfile
@@ -13,8 +14,12 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from cozy_runtime.internal.config import parse_worker_artifact_origin
-from cozy_runtime.internal.worker import acquire, artifact_access
+from cozy_runtime.internal.config import (
+    ConfigError,
+    parse_tensorhub_origin,
+    read_worker_host_config,
+)
+from cozy_runtime.internal.worker import acquire, downloads
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -49,6 +54,34 @@ def main() -> int:
     public = private.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
+    for unknown in ("COZY_UNKNOWN", "TENSORHUB_CA_DER_B64URL"):
+        try:
+            read_worker_host_config({unknown: "unknown"})
+        except ConfigError as exc:
+            assert f"unknown worker environment variable {unknown}" == exc.message
+        else:
+            raise AssertionError(f"worker admitted {unknown}")
+    origin = "https://cozy-dev.ngrok.example"
+    host_config = read_worker_host_config(
+        {
+            "COZY_WORKER_ID": "worker-7",
+            "COZY_WORKER_INTERNAL_PORT": "18443",
+            "COZY_MEDIA_INTERNAL_PORT": "18444",
+            "COZY_WORKER_LEASE_EXPIRY_UNIX": str(int(time.time()) + 600),
+            "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
+                {
+                    "control_public_key_ed25519_b64url": base64.urlsafe_b64encode(public)
+                    .rstrip(b"=")
+                    .decode(),
+                    "media_token_sha256": ["1" * 64],
+                }
+            ),
+            "TENSORHUB_ORIGIN": origin,
+            "SSL_CERT_FILE": "/run/cozy/tensorhub-ca.pem",
+        }
+    )
+    assert host_config.tensorhub_origin.value == origin
+    assert dict(host_config.child_base_env)["SSL_CERT_FILE"] == "/run/cozy/tensorhub-ca.pem"
     tls_digest = "sha256:" + hashlib.sha256(b"worker leaf DER").hexdigest()
     claim = pb.Claim(record_owner_epoch=7, worker_boot_id="boot-7", worker_id="worker-7")
     claim.proof = private.sign(
@@ -61,7 +94,7 @@ def main() -> int:
             )
         )
     )
-    artifact_access.verify_claim_proof(
+    downloads.verify_claim_proof(
         claim,
         public,
         worker_id="worker-7",
@@ -72,28 +105,28 @@ def main() -> int:
     planted.CopyFrom(claim)
     planted.record_owner_epoch += 1
     try:
-        artifact_access.verify_claim_proof(
+        downloads.verify_claim_proof(
             planted,
             public,
             worker_id="worker-7",
             worker_boot_id="boot-7",
             worker_tls_certificate_digest=tls_digest,
         )
-    except artifact_access.ArtifactAccessRefusal as exc:
+    except downloads.DownloadRefusal as exc:
         assert exc.code == "claim_proof_signature_invalid"
     else:
         raise AssertionError("changed ClaimProof retained authority")
 
     now = int(time.time())
-    artifact_digest = "sha256:" + "1" * 64
+    file_digest = "sha256:" + "1" * 64
     connection = Connection(
         Response(
             200,
             {
-                "artifacts": [
+                "files": [
                     {
-                        "digest": artifact_digest,
-                        "kind": "access-only",
+                        "digest": file_digest,
+                        "kind": "package",
                         "length": 12,
                         "url": "https://r2.example.invalid/object",
                     }
@@ -104,19 +137,19 @@ def main() -> int:
         )
     )
     set_digest = hashlib.sha256(b"exact PlacementSet/1").digest()
-    with tempfile.TemporaryDirectory(prefix="cozy-artifact-access-") as raw:
+    with tempfile.TemporaryDirectory(prefix="cozy-worker-downloads-") as raw:
         root = Path(raw)
-        client = artifact_access.ArtifactClient(
+        client = downloads.DownloadClient(
             root / "tls.crt",
             root / "tls.key",
-            parse_worker_artifact_origin("https://worker.tensorhub.com:18443"),
+            parse_tensorhub_origin("https://tensorhub.example:18443"),
             connection=lambda _timeout: connection,
         )
         plan = client.resolve(set_digest)
-    assert list(plan.artifacts) == [artifact_digest]
+    assert list(plan.files) == [file_digest]
     assert connection.closed and connection.request_value is not None
     method, request_path, request_raw, headers = connection.request_value
-    assert (method, request_path) == ("POST", "/v1/worker/artifacts/resolve")
+    assert (method, request_path) == ("POST", "/v1/worker/downloads/resolve")
     assert headers == {"Accept": "application/json", "Content-Type": "application/json"}
     assert json.loads(request_raw) == {"placement_set_digest": documents.spell(set_digest)}
     assert set(json.loads(request_raw)) == {"placement_set_digest"}
@@ -126,23 +159,23 @@ def main() -> int:
             409,
             {
                 "error": {
-                    "code": "worker_artifacts.placement_set_mismatch",
+                    "code": "worker_downloads.placement_set_mismatch",
                     "message": "digest is not the accepted set",
                 },
                 "server_time_unix": now,
             },
         )
     )
-    client = artifact_access.ArtifactClient(
+    client = downloads.DownloadClient(
         Path("unused.crt"),
         Path("unused.key"),
-        parse_worker_artifact_origin("https://worker.tensorhub.com"),
+        parse_tensorhub_origin("https://tensorhub.example"),
         connection=lambda _timeout: refused,
     )
     try:
         client.resolve(set_digest)
-    except artifact_access.ArtifactAccessRefusal as exc:
-        assert exc.code == "worker_artifacts.placement_set_mismatch"
+    except downloads.DownloadRefusal as exc:
+        assert exc.code == "worker_downloads.placement_set_mismatch"
         assert exc.kind == pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED
     else:
         raise AssertionError("foreign PlacementSet was authorized")
@@ -155,7 +188,7 @@ def main() -> int:
         path = cache / digest[7:]
         path.write_bytes(body)
         acquirer = acquire.Acquirer(
-            artifact_access.ArtifactPlan(),
+            downloads.DownloadPlan(),
             cache_root=cache,
             environment_root=Path(raw) / "environment",
             selection_root=Path(raw) / "selection",
@@ -167,7 +200,7 @@ def main() -> int:
         assert acquirer.verified_bytes == len(body) and acquirer.fetched_bytes == 0
 
     print(
-        "artifact access: ClaimProof, one-field PlacementSet resolve, foreign-set refusal, "
+        "worker downloads: ClaimProof, one-field PlacementSet resolve, foreign-set refusal, "
         "and verified local reuse passed"
     )
     return 0

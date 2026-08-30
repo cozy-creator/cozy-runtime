@@ -54,7 +54,7 @@ Product hosts run `cozy-runtime-worker`, a private no-argument entrypoint that c
 the worker core directly. On a base worker image it starts as root, consumes the six-value
 owner-neutral host handoff, proves the worker and media TLS listeners, publishes readiness,
 then opens Claim admission. The fixed handoff also carries the operator-owned direct Tensorhub
-worker API origin as canonical `https://host[:port]`. Package executors alone drop to UID/GID
+API origin as canonical `TENSORHUB_ORIGIN=https://host[:port]`. Package executors alone drop to UID/GID
 65533. The removed
 wrapper executable has no compatibility alias; placement acquisition now lives in
 `internal/placement_materialization.py`.
@@ -62,10 +62,12 @@ wrapper executable has no compatibility alias; placement acquisition now lives i
 The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record containing the rental's
 Ed25519 control public key and the media bearer's sorted hashes. Claim authenticates the
 RecordOwner; media hashes open only media HTTP. Neither reaches an executor. The exact
-PlacementSet is the sole artifact intent. Runtime names only its digest to the code-owned HTTPS
-authority over its existing per-boot mTLS leaf, then downloads the complete returned R2 plan
-directly. No delegation document, CA bypass, proxy certificate header, or authentication fallback
-exists.
+PlacementSet is the sole package/model selection. Runtime names only its digest to
+`POST /v1/worker/downloads/resolve` over its existing per-boot mTLS leaf, then downloads the
+returned package wheels and model-weight files directly from their short-lived R2 GET URLs.
+The supervisor may project its decoded private CA as `SSL_CERT_FILE`; Runtime accepts no CA
+payload environment variable, delegation document, certificate bypass, proxy certificate
+header, or authentication fallback.
 
 | module | role |
 |---|---|
@@ -74,7 +76,7 @@ exists.
 | `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
 | `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
-| `internal/worker/artifact_access.py` | canonical Claim/delegation verification and direct Tensorhub mTLS resolve |
+| `internal/worker/downloads.py` | canonical Claim verification and direct Tensorhub package/model download resolve |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
 | `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |

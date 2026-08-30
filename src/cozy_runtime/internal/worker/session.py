@@ -61,7 +61,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.journal import Journal, JournalError
-from cozy_runtime.internal.worker import acquire, artifact_access, child, grants, observe, triage
+from cozy_runtime.internal.worker import acquire, child, downloads, grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -201,7 +201,7 @@ class WorkerOptions:
     makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
-    artifact_client: artifact_access.ArtifactClient | None = None
+    download_client: downloads.DownloadClient | None = None
     development_project: Path | None = None
     """Source-checkout-only model-free execution; product local venvs leave this absent."""
     development_package: str = ""
@@ -846,8 +846,8 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
-        self.artifact_plan = artifact_access.ArtifactPlan()
-        self.artifact_resolutions: queue.Queue[bytes | None] = queue.Queue()
+        self.download_plan = downloads.DownloadPlan()
+        self.download_resolutions: queue.Queue[bytes | None] = queue.Queue()
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
@@ -1208,14 +1208,14 @@ class Worker:
         # and neither ever renders what it holds into a refusal.
         if self.config.record_owner_public_key:
             try:
-                artifact_access.verify_claim_proof(
+                downloads.verify_claim_proof(
                     claim,
                     self.config.record_owner_public_key,
                     worker_id=self.options.worker_id,
                     worker_boot_id=self.fence.worker_boot_id,
                     worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
                 )
-            except artifact_access.ArtifactAccessRefusal as exc:
+            except downloads.DownloadRefusal as exc:
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                     exc.detail,
@@ -1859,44 +1859,44 @@ class Worker:
         if (
             not candidate.environment_receipt_digest
             or self.options.development_project is not None
-            or self.artifact_plan.authorized()
-            or (self.options.artifact_client is None and self.options.artifact_cache is not None)
+            or self.download_plan.authorized()
+            or (self.options.download_client is None and self.options.artifact_cache is not None)
             or (local_receipt is not None and local_receipt.is_file())
         ):
             self.schedule_convergence(desired.revision)
         else:
             self.note(
                 "materialization",
-                f"revision {desired.revision} waits for direct artifact resolution",
+                f"revision {desired.revision} waits for package/model download resolution",
             )
-            self.artifact_resolutions.put(desired_set.placement_set_digest)
+            self.download_resolutions.put(desired_set.placement_set_digest)
 
     def schedule_convergence(self, revision: int) -> None:
         self.convergences.put(revision)
 
-    def artifact_resolution_lane(self) -> None:
+    def download_resolution_lane(self) -> None:
         """Resolve the accepted PlacementSet digest without blocking WorkerControl."""
 
-        while (set_digest := self.artifact_resolutions.get()) is not None:
+        while (set_digest := self.download_resolutions.get()) is not None:
             if (
                 set_digest != self.accepted.accepted_placement_set_digest
-                or self.options.artifact_client is None
+                or self.options.download_client is None
             ):
                 continue
             try:
-                plan = self.options.artifact_client.resolve(set_digest)
-            except artifact_access.ArtifactAccessRefusal as exc:
+                plan = self.options.download_client.resolve(set_digest)
+            except downloads.DownloadRefusal as exc:
                 if set_digest != self.accepted.accepted_placement_set_digest:
                     continue
-                if exc.code == "worker_artifacts.worker_inactive":
-                    self.note("artifacts", "resolve waiting for RecordOwner acceptance relay")
+                if exc.code == "worker_downloads.worker_inactive":
+                    self.note("downloads", "resolve waiting for RecordOwner acceptance relay")
                     if (
                         not self.stop.wait(1)
                         and set_digest == self.accepted.accepted_placement_set_digest
                     ):
-                        self.artifact_resolutions.put(set_digest)
+                        self.download_resolutions.put(set_digest)
                     continue
-                self.note("artifacts", f"resolve REFUSED: {exc.code}")
+                self.note("downloads", f"resolve REFUSED: {exc.code}")
                 self.engine.fault(
                     pb.Fault(
                         kind=exc.kind,
@@ -1913,15 +1913,10 @@ class Worker:
                 continue
             if set_digest != self.accepted.accepted_placement_set_digest:
                 continue
-            self.artifact_plan = plan
-            self.engine.faults[:] = [
-                fault
-                for fault in self.engine.faults
-                if fault.reason != "artifact_authorization_absent"
-            ]
+            self.download_plan = plan
             self.note(
-                "artifacts",
-                f"resolved {len(plan.artifacts)} exact object(s) for PlacementSet "
+                "downloads",
+                f"resolved {len(plan.files)} exact package/model file(s) for PlacementSet "
                 f"{documents.spell(set_digest)[:23]}…, expiring {plan.expires_at_unix}",
             )
             revision = self.accepted.accepted_desired_state_revision
@@ -2144,7 +2139,7 @@ class Worker:
             return None
         try:
             acquirer = acquire.Acquirer(
-                self.artifact_plan,
+                self.download_plan,
                 cache_root=self.options.artifact_cache,
                 environment_root=self.options.environment_root,
                 selection_root=self.options.environment_root / "selections",
@@ -3566,9 +3561,9 @@ class Worker:
                 target=self.convergence_lane, daemon=True, name="convergence-lane"
             ).start()
             threading.Thread(
-                target=self.artifact_resolution_lane,
+                target=self.download_resolution_lane,
                 daemon=True,
-                name="artifact-resolution-lane",
+                name="download-resolution-lane",
             ).start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
@@ -3587,7 +3582,7 @@ class Worker:
         self.stop.set()
         self.work.put(None)
         self.convergences.put(None)
-        self.artifact_resolutions.put(None)
+        self.download_resolutions.put(None)
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
