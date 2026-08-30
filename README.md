@@ -51,9 +51,11 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
     an in-memory RecordOwner ───┘        cozy.worker.v1, either way
 
 Product hosts run `cozy-runtime-worker`, a private no-argument entrypoint that constructs
-the worker core directly. On a base worker image it starts as root, consumes the five-value
+the worker core directly. On a base worker image it starts as root, consumes the six-value
 owner-neutral host handoff, proves the worker and media TLS listeners, publishes readiness,
-then opens Claim admission. Package executors alone drop to UID/GID 65533. The removed
+then opens Claim admission. The fixed handoff also carries the operator-owned direct Tensorhub
+worker API origin as canonical `https://host[:port]`. Package executors alone drop to UID/GID
+65533. The removed
 wrapper executable has no compatibility alias; placement acquisition now lives in
 `internal/placement_materialization.py`.
 
@@ -61,8 +63,8 @@ The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record contain
 Ed25519 control public key and the media bearer's sorted hashes. Claim and `EnsureArtifacts`
 signatures open only WorkerControl; media hashes open only media HTTP. Neither reaches an
 executor. Runtime redeems package/model intent at the code-owned
-`https://worker.tensorhub.com/v1/worker/artifacts/resolve` authority with its existing per-boot
-TLS leaf, then downloads the returned exact R2 plan directly.
+configured HTTPS authority with its existing per-boot TLS leaf, then downloads the returned exact
+R2 plan directly. No CA bypass, proxy certificate header, or endpoint-authentication fallback exists.
 
 | module | role |
 |---|---|

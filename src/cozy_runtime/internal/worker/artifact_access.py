@@ -18,10 +18,10 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from cozy_runtime.internal import pull
+from cozy_runtime.internal.config import WorkerArtifactOrigin
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-WORKER_TENSORHUB_HOST = "worker.tensorhub.com"
 WORKER_TENSORHUB_PATH = "/v1/worker/artifacts/resolve"
 MAX_REQUEST_BYTES = 128 << 10
 MAX_RESPONSE_BYTES = 8 << 20
@@ -275,11 +275,13 @@ class ArtifactClient:
         self,
         certificate: Path,
         private_key: Path,
+        origin: WorkerArtifactOrigin,
         *,
         connection: Callable[[float], _Connection] | None = None,
     ) -> None:
         self.certificate = certificate
         self.private_key = private_key
+        self.origin = origin
         self.connection = connection
 
     def resolve(
@@ -363,7 +365,7 @@ class ArtifactClient:
         return _plan(
             value,
             intent,
-            allow_local=pull.local_hub(f"https://{WORKER_TENSORHUB_HOST}"),
+            allow_local=pull.local_hub(self.origin.value),
         )
 
     def _connection(self, timeout: float) -> _Connection:
@@ -372,8 +374,8 @@ class ArtifactClient:
         context = ssl.create_default_context()
         context.load_cert_chain(self.certificate, self.private_key)
         return http.client.HTTPSConnection(
-            WORKER_TENSORHUB_HOST,
-            443,
+            self.origin.host,
+            self.origin.port,
             timeout=timeout,
             context=context,
         )

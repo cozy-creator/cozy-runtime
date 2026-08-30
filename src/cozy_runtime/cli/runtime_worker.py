@@ -205,6 +205,7 @@ def _worker_options(
         artifact_client=ArtifactClient(
             host_paths.TLS_CERTIFICATE,
             host_paths.TLS_PRIVATE_KEY,
+            config.artifact_origin,
         ),
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         no_warm=True,
