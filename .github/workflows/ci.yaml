@@ -10,9 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.14+gil"
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.14
       - run: uv sync
       - run: >-
           uv run python -c "import sys, sysconfig;
@@ -95,7 +94,7 @@ jobs:
           ref: ${{ env.TENSORFS_SHA }}
           path: .tensorfs
           token: ${{ secrets.TENSORFS_TOKEN }}
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - uses: dtolnay/rust-toolchain@1.91.1
       - run: uv sync
       - run: uv pip install .tensorfs
@@ -145,7 +144,7 @@ jobs:
           path: .worker-protocol
           token: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
       - if: steps.credential.outputs.present == 'yes'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
       - if: steps.credential.outputs.present == 'yes'
         uses: actions/setup-go@v5
         with:

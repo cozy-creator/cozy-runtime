@@ -98,8 +98,8 @@ def fence_python_abi() -> list[str]:
         bad.append("pyproject.toml: mypy must check the Python 3.14 language surface")
 
     pin = ROOT / ".python-version"
-    if not pin.is_file() or pin.read_text() != "3.14+gil\n":
-        bad.append(".python-version: must pin uv to the standard 3.14+gil interpreter")
+    if not pin.is_file() or pin.read_text() != "3.14\n":
+        bad.append(".python-version: must pin uv to CPython 3.14")
 
     bundled = sorted((ROOT / "examples").rglob("pyproject.toml"))
     bundled += sorted((ROOT / "proofs" / "fixtures").rglob("pyproject.toml"))
