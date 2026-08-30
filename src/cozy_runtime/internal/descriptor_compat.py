@@ -14,6 +14,7 @@ from cozy_runtime.internal.canonical import Json
 
 Compatibility = Literal["patch", "minor", "major"]
 MAX_REASONS = 16
+REASON_MAX_CHARS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +176,11 @@ def _request_additions(previous: Json, candidate: Json, path: str) -> tuple[list
 
 
 def _bounded(reasons: list[str]) -> tuple[str, ...]:
-    if len(reasons) <= MAX_REASONS:
-        return tuple(reasons)
-    omitted = len(reasons) - MAX_REASONS + 1
-    return (*reasons[: MAX_REASONS - 1], f"{omitted} more changes")
+    limited = reasons
+    if len(reasons) > MAX_REASONS:
+        omitted = len(reasons) - MAX_REASONS + 1
+        limited = [*reasons[: MAX_REASONS - 1], f"{omitted} more changes"]
+    return tuple(
+        reason if len(reason) <= REASON_MAX_CHARS else reason[: REASON_MAX_CHARS - 1] + "…"
+        for reason in limited
+    )

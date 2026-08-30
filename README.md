@@ -196,6 +196,7 @@ project wheel and compares it. `package_descriptor_digest` is SHA-256 over those
 Runtime also owns the descriptor's semantic-version comparison. Tensorhub invokes the narrow
 process boundary below with two exact descriptors; it prints one compact JSON result whose
 classification is `patch`, `minor`, or `major`. It imports no package code and authors no document.
+Runtime classifies interface change only; Tensorhub retains package-version and v0 policy.
 
     python -m cozy_runtime.cli.descriptor_compat previous.json candidate.json
 
