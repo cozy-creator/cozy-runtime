@@ -71,7 +71,7 @@ _OBSERVATION_FIELDS = frozenset(
         "invocation_spec",
         "installed_environment_receipt",
         "input_root",
-        "observed_placement_spec_digest",
+        "observed_placement_set_digest",
         "placement_set",
         "resolved_wheel_set",
         "wheelhouse_manifest",
@@ -160,19 +160,19 @@ def execution_observation(raw: bytes) -> bytes:
         entrypoint,
         input_root,
     )
-    placement_id, placement_spec_digest = _placement(
+    placement_id, placement_set_digest = _placement(
         documents_by_name,
         binding_release,
         package_release_id,
         selected.entrypoint_binding_plan_id,
     )
-    observed_spec = _digest(
-        request["observed_placement_spec_digest"], "observed_placement_spec_digest"
+    observed_set = _digest(
+        request["observed_placement_set_digest"], "observed_placement_set_digest"
     )
-    if observed_spec != placement_spec_digest:
+    if observed_set != placement_set_digest:
         raise AcceptanceRefusal(
             "acceptance_placement_observation_mismatch",
-            f"worker observed {observed_spec}, exact PlacementSpec is {placement_spec_digest}",
+            f"worker observed {observed_set}, exact PlacementSet is {placement_set_digest}",
         )
 
     fixture = documents_by_name["fixture_payload"]
@@ -261,7 +261,7 @@ def execution_observation(raw: bytes) -> bytes:
         "output_manifest": output_manifest,
         "overlay_content_digest": environment.installed.content_digest,
         "payload_digest": str(invocation["payload_digest"]),
-        "placement_spec_digest": placement_spec_digest,
+        "placement_set_digest": placement_set_digest,
         "result_digest": result_digest,
         "result_schema_digest": result_schema_digest,
         "status": int(outcome.get("status", 0)),
@@ -621,9 +621,8 @@ def _placement(
         raise AcceptanceRefusal("acceptance_placement_invalid", f"{len(rows)} placements")
     row = rows[0]
     placement_id = row.get("placement_id")
-    spec = row.get("spec")
-    if not isinstance(placement_id, str) or not placement_id or not isinstance(spec, dict):
-        raise AcceptanceRefusal("acceptance_placement_invalid", "placement id or spec")
+    if not isinstance(placement_id, str) or not placement_id:
+        raise AcceptanceRefusal("acceptance_placement_invalid", "placement id")
     expected = {
         "package_release_id": package_release_id,
         "environment_spec_digest": docs["package_environment_spec"].digest,
@@ -633,9 +632,9 @@ def _placement(
         "package_descriptor_digest": docs["package_descriptor"].digest,
     }
     for field, wanted in expected.items():
-        if spec.get(field) != wanted:
+        if row.get(field) != wanted:
             raise AcceptanceRefusal("acceptance_placement_invalid", field)
-    object_set = spec.get("model_object_set")
+    object_set = row.get("model_object_set")
     if not isinstance(object_set, dict) or set(object_set) != {
         "digest",
         "kind",
@@ -650,7 +649,7 @@ def _placement(
         or object_set.get("length") != docs["artifact_object_set"].length
     ):
         raise AcceptanceRefusal("acceptance_placement_invalid", "model_object_set identity")
-    plans = spec.get("binding_plans")
+    plans = row.get("binding_plans")
     if not isinstance(plans, list):
         raise AcceptanceRefusal("acceptance_placement_invalid", "binding plans")
     release_documents = release.get("documents")
@@ -677,10 +676,7 @@ def _placement(
         placed_plans[digest] = length
     if placed_plans != release_plans or binding_plan_digest not in placed_plans:
         raise AcceptanceRefusal("acceptance_placement_invalid", "binding plan set")
-    digest = documents.spell(
-        documents.embedded_document_digest(spec, "cozy.worker.v1.PlacementSpec")
-    )
-    return placement_id, digest
+    return placement_id, docs["placement_set"].digest
 
 
 def _invocation(

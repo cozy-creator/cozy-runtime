@@ -7,7 +7,7 @@ missing door.
 
 **The set is the authority on WHAT; the plan is access only.** The walk never reads the plan's
 artifact `kind` to decide what a digest means — it
-starts at the two digests the `PlacementSpec` names (`environment_spec_digest`,
+starts at the two digests the Placement names (`environment_spec_digest`,
 `installed_environment_receipt_digest`) plus the spec's binding-plan subjects, and every
 further digest is REACHED from a document already fetched and verified:
 
@@ -330,7 +330,7 @@ class Acquirer:
         *,
         on_package_ready: Callable[[overlay.InstalledOverlay], None] | None = None,
     ) -> AcquiredPlacement:
-        """Fetch, build, and stage everything one PlacementSpec reaches. Fail closed."""
+        """Fetch, build, and stage everything one Placement reaches. Fail closed."""
 
         # The package closure and model-object closure are the two observed legs. They
         # start together. Binding/model documents are small package control bytes and ride
@@ -383,7 +383,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "model_object_set_absent",
-                "PlacementSpec/2 names one exact model_object_set subject",
+                "PlacementSet/2 names one exact model_object_set subject",
             )
         raw = self.fetch(digest, length, observe=False).read_bytes()
         self.object_sets_root.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -450,7 +450,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "environment_identity_absent",
-                "a PlacementSpec names its environment and its expected receipt, or it is "
+                "a Placement names its environment and its expected receipt, or it is "
                 "not one this worker can materialize",
             )
         spec_length = self._authorized_length(spec_digest, "environment_spec")

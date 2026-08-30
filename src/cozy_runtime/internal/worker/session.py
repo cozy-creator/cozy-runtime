@@ -225,13 +225,12 @@ class Placement:
     """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
     RecordOwner-minted routing + journal key; it is never invocation identity.
 
-    `spec_digest` is the placement's IDENTITY (§1): sha256 of the `PlacementSpec/2` document
-    nested in the accepted set bytes. A single-placement replace is this SAME `placement_id`
-    carrying a NEW spec digest, which is why routing survives an in-place release rollout.
+    `placement_set_digest` plus `placement_id` is the placement's identity. A single-placement
+    replace is this SAME `placement_id` in a new set, which is why routing survives rollout.
     """
 
     placement_id: str
-    spec_digest: bytes
+    placement_set_digest: bytes
     package_release_id: str
     environment_spec_digest: bytes
     installed_environment_receipt_digest: bytes
@@ -245,12 +244,12 @@ class Placement:
         default_factory=pb.PlacementAcquisitionObservation
     )
     #: TWO INDEPENDENT AXES (§8, #473/#482), because one enum cannot say "staged on disk and
-    #: offline" — the exact state an outgoing spec holds under fallback-retention.
+    #: offline" — the exact state an outgoing placement holds under fallback-retention.
     materialization: pb.MaterializationState = pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
     serving: pb.ServingState = pb.ServingState.SERVING_STATE_OFFLINE
     #: #474/#485c: the predecessor kept for restore. EMPTY means replacement is PAUSED —
     #: fallback capability is a PRECONDITION of replacement, not a nicety.
-    retained_fallback_spec_digest: bytes = b""
+    retained_fallback_placement_set_digest: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,8 +363,7 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
     field. The frozen wire "digest-addressed" the set by an ECHOED claim, which is a
     statement the sender makes about bytes it also sent; this is a fence the receiver
     computes. Only on a match is the document parsed, under unknown-field REFUSAL — at every
-    depth, because a `PlacementSpec` with an unknown key is a `PlacementSpec/2` and there is
-    no additive versioning inside a digest-fenced document.
+    depth. There is no additive versioning inside a digest-fenced document.
 
     Raises `documents.DocumentError`; the caller turns that into the typed fault and leaves
     the previous set serving.
@@ -383,7 +381,6 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
     if not isinstance(placements, list):
         raise documents.DocumentError("wrong_type", "`placements` is a list of Placement")
     known_placement = {f.name for f in pb.Placement.DESCRIPTOR.fields}
-    known_spec = {f.name for f in pb.PlacementSpec.DESCRIPTOR.fields}
     known_subject = {f.name for f in pb.ArtifactSubject.DESCRIPTOR.fields}
     for entry in placements:
         if not isinstance(entry, dict):
@@ -391,16 +388,8 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
         for key in entry:
             if key not in known_placement:
                 raise documents.DocumentError("unknown_field", f"Placement: unknown key {key!r}")
-        spec = entry.get("spec", {})
-        if not isinstance(spec, dict):
-            raise documents.DocumentError("wrong_type", "`spec` is a PlacementSpec object")
-        for key in spec:
-            if key not in known_spec:
-                raise documents.DocumentError(
-                    "unknown_field", f"PlacementSpec: unknown key {key!r} (a new key is /2)"
-                )
         prior_subject = ""
-        for subject in spec.get("binding_plans", []):
+        for subject in entry.get("binding_plans", []):
             if not isinstance(subject, dict):
                 raise documents.DocumentError("wrong_type", "an ArtifactSubject is an object")
             for key in subject:
@@ -626,7 +615,7 @@ class Worker:
         `IntakeState` is retired with both of its uses (#482/#510b). What it conflated was
         machine lifecycle (now `worker_phase`), what is on disk (now the MATERIALIZATION
         axis) and what a placement will take (this one) — and a single enum could not say
-        "staged on disk but offline", which is exactly the state an outgoing spec holds under
+        "staged on disk but offline", which is exactly the state an outgoing placement holds under
         fallback-retention.
 
         ADMISSION MEANING MOVES WITH IT, so `admission_generation` bumps here (§6): an offer
@@ -710,7 +699,7 @@ class Worker:
     def latch(self, fault: pb.Fault) -> None:
         """An activation failure LATCHES for this desired revision (§8): the worker does not
         evict-and-retry forever, `converged_revision` stays behind, and the fault is typed on
-        the placement. The previous spec keeps serving (fallback-retention, #474)."""
+        the placement. The previous set keeps serving (fallback-retention, #474)."""
         self.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
         self.engine.fault(fault)
         self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "activation failed; LATCHED")
@@ -1566,26 +1555,23 @@ class Worker:
         # every materialization failure free.
         entry = placements[0]
         placement_id = str(entry.get("placement_id", ""))
-        spec = dict(entry.get("spec", {}))
-        subjects = [dict(row) for row in spec.get("binding_plans", [])]
+        subjects = [dict(row) for row in entry.get("binding_plans", [])]
         plan_ids = tuple(
             str(row.get("subject_id", "")) for row in subjects if row.get("subject_id")
         )
         plan_refs = {
             str(row["subject_id"]): (str(row["digest"]), int(row["length"])) for row in subjects
         }
-        model_object_set = dict(spec.get("model_object_set", {}))
+        model_object_set = dict(entry.get("model_object_set", {}))
         candidate = Placement(
             placement_id=placement_id,
-            # THE PLACEMENT'S IDENTITY (§1): the digest of the nested PlacementSpec document,
-            # reconstructed with its own format tag (#510g) from the bytes already held.
-            spec_digest=documents.embedded_document_digest(spec, "cozy.worker.v1.PlacementSpec"),
-            package_release_id=str(spec.get("package_release_id", "")),
-            environment_spec_digest=_digest_field(spec.get("environment_spec_digest")),
+            placement_set_digest=desired_set.placement_set_digest,
+            package_release_id=str(entry.get("package_release_id", "")),
+            environment_spec_digest=_digest_field(entry.get("environment_spec_digest")),
             installed_environment_receipt_digest=_digest_field(
-                spec.get("installed_environment_receipt_digest")
+                entry.get("installed_environment_receipt_digest")
             ),
-            package_descriptor_digest=_digest_field(spec.get("package_descriptor_digest")),
+            package_descriptor_digest=_digest_field(entry.get("package_descriptor_digest")),
             model_object_set=(
                 str(model_object_set.get("digest", "")),
                 int(model_object_set.get("length", 0)),
@@ -1593,11 +1579,11 @@ class Worker:
             plan_ids=plan_ids,
             plan_refs=plan_refs,
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
-            # placement_id, new spec digest) retains the outgoing spec as the pin; a fresh
+            # placement_id, new set digest) retains the outgoing set as the pin; a fresh
             # placement has none, and an empty pin means replacement is PAUSED — which is
             # why the pin is set from the PREVIOUS spec and never invented.
-            retained_fallback_spec_digest=(
-                previous.spec_digest
+            retained_fallback_placement_set_digest=(
+                previous.placement_set_digest
                 if previous is not None and previous.placement_id == placement_id
                 else b""
             ),
@@ -1605,7 +1591,7 @@ class Worker:
         replacement = (
             previous is not None
             and previous.placement_id == candidate.placement_id
-            and previous.spec_digest != candidate.spec_digest
+            and previous.placement_set_digest != candidate.placement_set_digest
         )
         if replacement:
             assert previous is not None
@@ -1625,7 +1611,7 @@ class Worker:
                         kind=pb.FaultKind.FAULT_KIND_FALLBACK_PIN_MISSING,
                         subject=previous.placement_id,
                         reason="rollback_pin_absent",
-                        detail="the outgoing spec is "
+                        detail="the outgoing placement is "
                         f"{pb.MaterializationState.Name(previous.materialization)}, so it "
                         "cannot restore this placement if the incoming activation fails; "
                         "replacement is PAUSED until the pin re-materializes (#485c)",
@@ -1636,8 +1622,8 @@ class Worker:
         self.note(
             "desired_state",
             f"revision {desired.revision} accepted: staging placement "
-            f"{candidate.placement_id or '(unnamed)'} at spec "
-            f"{documents.spell(candidate.spec_digest)[:23]}…"
+            f"{candidate.placement_id or '(unnamed)'} in set "
+            f"{documents.spell(candidate.placement_set_digest)[:23]}…"
             + (
                 f" while {previous.placement_id or '(unnamed)'} keeps serving"
                 if replacement and previous is not None
@@ -1766,8 +1752,8 @@ class Worker:
             self.placement = candidate
             self.pending = None
             self.bump_admission(
-                f"placement {candidate.placement_id or '(unnamed)'} at spec "
-                f"{documents.spell(candidate.spec_digest)[:23]}… is materializing"
+                f"placement {candidate.placement_id or '(unnamed)'} in set "
+                f"{documents.spell(candidate.placement_set_digest)[:23]}… is materializing"
             )
 
         installed = (
@@ -1808,7 +1794,7 @@ class Worker:
         if outgoing is not None:
             self.note(
                 "materialization",
-                f"incoming spec {documents.spell(candidate.spec_digest)[:23]}… is STAGED; "
+                f"incoming set {documents.spell(candidate.placement_set_digest)[:23]}… is STAGED; "
                 f"draining {outgoing.placement_id or '(unnamed)'} and handing off the device",
             )
             self.await_drained()
@@ -1819,14 +1805,14 @@ class Worker:
         self.engine.bindings = self.bindings
         self.engine.prepared_models = {}
         self.bump_admission(
-            f"placement {candidate.placement_id or '(unnamed)'} moved to spec "
-            f"{documents.spell(candidate.spec_digest)[:23]}…"
+            f"placement {candidate.placement_id or '(unnamed)'} moved to set "
+            f"{documents.spell(candidate.placement_set_digest)[:23]}…"
         )
         self.note(
             "desired_state",
             f"revision {revision} STAGED: placement "
-            f"{candidate.placement_id or '(unnamed)'} at spec "
-            f"{documents.spell(candidate.spec_digest)[:23]}… with {len(self.bindings)} of "
+            f"{candidate.placement_id or '(unnamed)'} in set "
+            f"{documents.spell(candidate.placement_set_digest)[:23]}… with {len(self.bindings)} of "
             f"{len(candidate.plan_ids)} binding plan(s) resolved, "
             f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
@@ -1885,7 +1871,7 @@ class Worker:
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     subject=placement.placement_id,
                     reason="environment_receipt_absent_from_spec",
-                    detail="a PlacementSpec names the receipt a completed materialization "
+                    detail="a Placement names the receipt a completed materialization "
                     "must measure to; a spec without one is unmaterializable",
                 ),
                 terminal=True,
@@ -2182,7 +2168,7 @@ class Worker:
 
         `terminal` is the ABSENT/FAILED distinction (§8): a fault about the ARTIFACTS —
         a wrong digest, a receipt that did not match — is a `FAILED(cause)` verdict about
-        this spec; a fault about ACCESS or about a missing local input is `ABSENT`, because
+        this placement; a fault about ACCESS or a missing local input is `ABSENT`, because
         a grant refresh or a provisioner repair can still clear it.
         """
         placement.materialization = (
@@ -2191,18 +2177,18 @@ class Worker:
             else pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
         )
         if self.placement is placement:
-            # No outgoing spec exists to keep serving: latch on this placement, which moves
+            # No outgoing placement exists to keep serving: latch on this placement, which moves
             # its serving axis OFFLINE and leaves `converged_revision` behind, typed.
             self.latch(fault)
             return
         # FALLBACK-RETENTION (#474 clauses 1, 4 and 5): the outgoing placement never stopped
-        # serving, the failure is typed against the incoming spec, and it LATCHES for this
+        # serving, the failure is typed against the incoming set, and it LATCHES for this
         # desired revision. Retry is a RecordOwner act — a NEW revision, or a grant refresh.
         self.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
         self.engine.fault(fault)
         self.note(
             "materialization",
-            f"incoming spec REFUSED ({fault.reason}); "
+            f"incoming set REFUSED ({fault.reason}); "
             f"{self.placement.placement_id if self.placement else '(none)'} keeps serving and "
             "the failure LATCHES for this desired revision",
         )
@@ -3372,10 +3358,12 @@ class Worker:
         materializable = sorted(set(self.placement.plan_ids) - set(dispatchable))
         status = pb.PlacementStatus(
             placement_id=self.placement.placement_id,
-            placement_spec_digest=self.placement.spec_digest,
+            placement_set_digest=self.placement.placement_set_digest,
             materialization=self.placement.materialization,
             serving=self.placement.serving,
-            retained_fallback_spec_digest=self.placement.retained_fallback_spec_digest,
+            retained_fallback_placement_set_digest=(
+                self.placement.retained_fallback_placement_set_digest
+            ),
             executor_generation=self.supervision.incarnation,
             dispatchable_plan_ids=dispatchable,
             materializable_plan_ids=materializable,

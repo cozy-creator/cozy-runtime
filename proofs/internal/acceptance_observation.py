@@ -292,7 +292,7 @@ def _run(root: Path) -> None:
         "input_root": str(inputs),
         "installed_environment_receipt": _local_ref(inputs / "installed-environment-receipt.json"),
         "invocation_spec": _local_ref(invocation_path),
-        "observed_placement_spec_digest": outcome.placement_spec_digest,
+        "observed_placement_set_digest": outcome.placement_set_digest,
         "placement_set": _local_ref(placement_path),
         "resolved_wheel_set": _local_ref(inputs / "resolved-wheel-set.json"),
         "wheelhouse_manifest": _local_ref(inputs / "wheelhouse-manifest.json"),

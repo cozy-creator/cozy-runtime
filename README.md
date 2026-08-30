@@ -296,7 +296,7 @@ never enter an overlay receipt/content identity, and are never published as rele
 placement consumes this same overlay path; OCI provenance belongs to Tensorhub qualification
 evidence, while the portable receipt remains the exact WheelhouseManifest/project/custom-wheel join.
 
-On a remote placement, `PlacementSpec/2` names one exact
+On a remote placement, `PlacementSet/2` names one exact
 `model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
 exact digest/length/HTTPS locations directly from Tensorhub over mTLS. The non-control
 convergence lane starts package and model acquisition together. As soon as package overlay and

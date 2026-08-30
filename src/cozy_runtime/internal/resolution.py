@@ -1,4 +1,4 @@
-"""#549.1 — the ResolvedExecutionPlan: ONE object, ONE decision, and a label that derives.
+"""#549.1 — the ResolvedModelPlan: ONE object, ONE decision, and a label that derives.
 
 **The defect this closes.** Two choosers ran in parallel and neither could see the other.
 `encoding.Selector` picked a provider PER TENSOR — correctly, from that tensor's own spec
@@ -12,7 +12,7 @@ anything — which made it exactly the kind of field that is wrong without being
 Worse, the rung was hashed into the generation's identity, so two materially different fills
 could share a constructed digest and one materially identical fill could differ.
 
-**What replaces it.** One immutable `ResolvedExecutionPlan`, resolved once, before a
+**What replaces it.** One immutable `ResolvedModelPlan`, resolved once, before a
 destination is reserved:
 
 * the EXACT snapshot map (component -> snapshot digest), not a variant NAME;
@@ -47,6 +47,7 @@ the two-chooser split could not do without an artifact-wide rung to fall back to
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -259,7 +260,7 @@ class TensorResolution:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedExecutionPlan:
+class ResolvedModelPlan:
     """The one immutable object a generation is. Resolved once, before anything is reserved.
 
     Its `digest()` enters generation identity and its `label()` derives from what it actually
@@ -413,7 +414,6 @@ class ResolvedExecutionPlan:
 
     def identity(self) -> dict[str, Any]:
         return {
-            "format": "cozy.runtime.ResolvedExecutionPlan/1",
             "store": self.store,
             "snapshots": dict(sorted(self.snapshots.items())),
             "tensors": [row.identity() for row in sorted(self.tensors, key=lambda r: r.key)],
@@ -446,7 +446,10 @@ class ResolvedExecutionPlan:
           candidates by digest rather than by policy name;
         * CONSENT — it decides which plans get BUILT, never what a built plan does.
         """
-        return canonical.digest(self.identity())
+        encoded = canonical.write(self.identity())
+        return (
+            "sha256:" + hashlib.sha256(b"cozy.runtime.resolved-model-plan\0" + encoded).hexdigest()
+        )
 
     def seam_document(self) -> dict[str, Any]:
         """The plan as ONE CONTROL FRAME — everything but the per-destination census.
@@ -515,7 +518,7 @@ class ResolvedExecutionPlan:
 # --------------------------------------------------------------------------- scoring
 
 
-def score(plan: ResolvedExecutionPlan, objective: str) -> tuple[float, str]:
+def score(plan: ResolvedModelPlan, objective: str) -> tuple[float, str]:
     """Lower is better. Returns `(score, provenance)`; `(-1.0, why)` means UNSCORABLE.
 
     Provenance is returned WITH the number because the two are not separable: a footprint
@@ -597,7 +600,7 @@ def resolve(
     encoded_leaves: str = "refuse",
     steps_basis: int = 20,
     dtype_name: Any,
-) -> ResolvedExecutionPlan:
+) -> ResolvedModelPlan:
     """Offered variants + header rows + capability records + banked facts -> ONE plan.
 
     `rows_for` is variant name -> that variant's header rows (`fill.PlanRow`-shaped:
@@ -631,8 +634,8 @@ def resolve(
         )
 
     walk: list[dict[str, Any]] = []
-    candidates: list[tuple[ResolvedExecutionPlan, float, str]] = []
-    floors: dict[str, ResolvedExecutionPlan] = {}
+    candidates: list[tuple[ResolvedModelPlan, float, str]] = []
+    floors: dict[str, ResolvedModelPlan] = {}
 
     for variant in variants:
         rows = list(rows_for.get(variant.name, ()))
@@ -803,7 +806,7 @@ def script_plan(
     objective: str = "latency",
     placement: str = "all_resident",
     encoded_leaves: str = "accept",
-) -> ResolvedExecutionPlan:
+) -> ResolvedModelPlan:
     """MODEL-LESS resolution for a driver script: one reference variant, these header rows.
 
     cr-025's one-selection-authority law says the fill plane executes a resolved plan and
@@ -862,7 +865,7 @@ def _build(
     encoded_leaves: str,
     steps_basis: int,
     dtype_name: Any,
-) -> ResolvedExecutionPlan:
+) -> ResolvedModelPlan:
     """One (variant, policy) -> its plan. Pure: no I/O, no device, no allocation."""
     tensors: list[TensorResolution] = []
     for row, found in resolved:
@@ -891,7 +894,7 @@ def _build(
                 reason=_reason(selection, found, policy),
             )
         )
-    return ResolvedExecutionPlan(
+    return ResolvedModelPlan(
         variant=variant.name,
         store=variant.store,
         snapshots=dict(
@@ -942,12 +945,12 @@ def _reason(selection: Selection, found: Any, policy: str) -> str:
     return "; ".join(p for p in parts if p)
 
 
-def _with_facts(plan: ResolvedExecutionPlan, facts: PlanFacts) -> ResolvedExecutionPlan:
+def _with_facts(plan: ResolvedModelPlan, facts: PlanFacts) -> ResolvedModelPlan:
     fact = facts.get(plan.digest())
     return _replace(plan, measurements=fact if fact.samples else None)
 
 
-def _replace(plan: ResolvedExecutionPlan, **changes: Any) -> ResolvedExecutionPlan:
+def _replace(plan: ResolvedModelPlan, **changes: Any) -> ResolvedModelPlan:
     import dataclasses
 
     return dataclasses.replace(plan, **changes)

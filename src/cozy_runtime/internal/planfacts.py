@@ -14,7 +14,7 @@ envelope by `(variant, rung)`. Neither half of that key binds the thing the numb
   is a different resident footprint.
 
 So a reused label reused timings from unrelated bytes. The key here is the resolved plan's
-own digest, which binds all five by construction (`resolution.py`'s `ResolvedExecutionPlan`
+own digest, which binds all five by construction (`resolution.py`'s `ResolvedModelPlan`
 hashes the snapshot map, the per-tensor implementation digests, the runtime identity, the
 device identity, the construction facts and the config digest).
 

@@ -134,7 +134,7 @@ def policy_worker(
     worker.bindings = {"plan-live": cast(Any, SimpleNamespace(entrypoint="probe"))}
     worker.placement = Placement(
         placement_id="placement-live",
-        spec_digest=b"s" * 32,
+        placement_set_digest=b"s" * 32,
         package_release_id="cozy/probe@live",
         environment_spec_digest=b"e" * 32,
         installed_environment_receipt_digest=b"i" * 32,

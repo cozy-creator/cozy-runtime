@@ -89,7 +89,7 @@ def author(
     python: Path,
     base_manifest: Path,
 ) -> Release:
-    """Author the whole closure a `PlacementSpec` reaches, and measure its receipt."""
+    """Author the whole closure a Placement reaches, and measure its receipt."""
 
     release = Release()
     project = release.add_wheel(project_wheel)

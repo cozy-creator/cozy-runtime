@@ -78,7 +78,7 @@ from cozy_runtime.internal.encoding import (
     measure_device,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
-from cozy_runtime.internal.resolution import PlanRefusal, ResolvedExecutionPlan, TensorResolution
+from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
 
 # ------------------------------------------------------------------------- refusals
 
@@ -582,9 +582,7 @@ class Servability:
             raise _refuse(self.code, self.refusal)
 
 
-def servability(
-    rows: Sequence[PlanRow], answer: ResolvedExecutionPlan | PlanRefusal
-) -> Servability:
+def servability(rows: Sequence[PlanRow], answer: ResolvedModelPlan | PlanRefusal) -> Servability:
     """The honesty answer, DERIVED from plan resolution — never from a second selector.
 
     `answer` is what `resolution.resolve()` (or `script_plan()`) produced for these rows: a
@@ -597,7 +595,7 @@ def servability(
     by_alias: dict[str, int] = {}
     for row in rows:
         by_alias[row.encoded.alias] = by_alias.get(row.encoded.alias, 0) + 1
-    if isinstance(answer, ResolvedExecutionPlan):
+    if isinstance(answer, ResolvedModelPlan):
         return Servability(True, by_alias, answer.route_census(), "", "")
     summary = {"no_rows", "unconsented", "unscored", "eligible", "chosen", "chosen_uncalibrated"}
     for step in answer.walk:
@@ -634,7 +632,7 @@ def servability_for_script(
     from cozy_runtime.internal.resolution import script_plan
 
     try:
-        answer: ResolvedExecutionPlan | PlanRefusal = script_plan(
+        answer: ResolvedModelPlan | PlanRefusal = script_plan(
             rows=rows,
             components=sorted({row.component for row in rows}),
             release=release,
@@ -856,7 +854,7 @@ class StreamingFillBackend:
         checkpoint: Checkpoint | Mapping[str, Checkpoint],
         rows: Sequence[PlanRow],
         *,
-        plan: ResolvedExecutionPlan,
+        plan: ResolvedModelPlan,
         device: str = "cuda",
         window_bytes: int = 16 << 20,
         slots: int = 16,

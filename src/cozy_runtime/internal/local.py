@@ -91,7 +91,7 @@ class StagedWeightlessRelease:
 class LocalPlacementFacts:
     """Exact qualified release facts for a production-shaped local protocol run.
 
-    This changes only what the local RecordOwner puts in the ordinary PlacementSpec and
+    This changes only what the local RecordOwner puts in the ordinary Placement and
     InvocationSpec.  The same worker convergence, executor and attempt path consume it.
     """
 
@@ -198,7 +198,6 @@ class SliceOutcome:
     terminal_canonical_bytes: bytes = b""
     placement_set_digest: str = ""
     placement_set_canonical_bytes: bytes = b""
-    placement_spec_digest: str = ""
     worker_resources: dict[str, Any] = field(default_factory=dict)
     accelerator_qualification: dict[str, Any] = field(default_factory=dict)
     ledger: dict[str, Any] = field(default_factory=dict)
@@ -631,39 +630,37 @@ class LocalRecordOwner:
             placements=[
                 pb.Placement(
                     placement_id=LOCAL_PLACEMENT,
-                    spec=pb.PlacementSpec(
-                        # PROVENANCE only — the worker never resolves it (§1).
-                        package_release_id=self.release_id,
-                        environment_spec_digest=(
-                            documents.raw(self.placement_facts.environment_spec_digest)
-                            if self.placement_facts is not None
-                            else b""
-                        ),
-                        installed_environment_receipt_digest=(
-                            documents.raw(self.placement_facts.installed_environment_receipt_digest)
-                            if self.placement_facts is not None
-                            else b""
-                        ),
-                        package_descriptor_digest=(
-                            documents.raw(self.placement_facts.package_descriptor_digest)
-                            if self.placement_facts is not None
-                            else b""
-                        ),
-                        binding_plans=[
-                            pb.ArtifactSubject(
-                                subject_id=plan_id,
-                                kind="plan",
-                                digest=documents.raw(self.plan_refs[plan_id][0]),
-                                length=self.plan_refs[plan_id][1],
-                            )
-                            for plan_id in sorted(set(self.bindings.values()))
-                        ],
-                        model_object_set=pb.ArtifactSubject(
-                            subject_id=object_set_digest,
-                            kind="model_object_set",
-                            digest=documents.raw(object_set_digest),
-                            length=len(self.model_object_set),
-                        ),
+                    # PROVENANCE only — the worker never resolves it (§1).
+                    package_release_id=self.release_id,
+                    environment_spec_digest=(
+                        documents.raw(self.placement_facts.environment_spec_digest)
+                        if self.placement_facts is not None
+                        else b""
+                    ),
+                    installed_environment_receipt_digest=(
+                        documents.raw(self.placement_facts.installed_environment_receipt_digest)
+                        if self.placement_facts is not None
+                        else b""
+                    ),
+                    package_descriptor_digest=(
+                        documents.raw(self.placement_facts.package_descriptor_digest)
+                        if self.placement_facts is not None
+                        else b""
+                    ),
+                    binding_plans=[
+                        pb.ArtifactSubject(
+                            subject_id=plan_id,
+                            kind="plan",
+                            digest=documents.raw(self.plan_refs[plan_id][0]),
+                            length=self.plan_refs[plan_id][1],
+                        )
+                        for plan_id in sorted(set(self.bindings.values()))
+                    ],
+                    model_object_set=pb.ArtifactSubject(
+                        subject_id=object_set_digest,
+                        kind="model_object_set",
+                        digest=documents.raw(object_set_digest),
+                        length=len(self.model_object_set),
                     ),
                 )
             ]
@@ -1286,7 +1283,6 @@ def _collect(
         None,
     )
     if placement is not None:
-        outcome.placement_spec_digest = _spell(placement.placement_spec_digest)
         outcome.accelerator_qualification = documents.body(placement.accelerator)
 
     marks = record_owner.marks
