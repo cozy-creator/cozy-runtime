@@ -81,11 +81,13 @@ class ProcessTreeScope:
     """One first-party executor family in a positively proven container.
 
     ``token`` is non-secret process identity.  It is one complete inherited environment
-    entry, never a substring marker. This is lifecycle containment for our own executor,
-    not a hostile-code sandbox: code can evade it by scrubbing the token and escaping both
-    ancestry and process group, or cause collateral by replaying the token. Unlike cgroup
-    v2, it provides no resource control and its repeated SIGSTOP census is convergent rather
-    than kernel-atomic.
+    entry, never a substring marker. In a same-UID seat this is lifecycle containment for
+    our own executor, not a hostile-code sandbox: code can evade it by scrubbing the token
+    and escaping both ancestry and process group, or cause collateral by replaying the
+    token. The pod seat instead gives the executor a dedicated UID, so the census owns that
+    whole UID domain even after token scrubbing. Unlike a delegated child cgroup, its
+    repeated SIGSTOP census is convergent rather than kernel-atomic; resource limits come
+    from the positively verified read-only provider cgroup.
     """
 
     token: str
@@ -355,12 +357,18 @@ def _effective_writable(path: Path) -> bool:
         raise ContainmentUnavailable(f"cannot check effective write authority for {path}") from exc
 
 
-def _require_cgroup_lineage_unwritable(mount_target: Path, resolved: Path) -> None:
+def _require_cgroup_controls_unwritable(
+    mount_target: Path,
+    resolved: Path,
+    *,
+    version: str,
+    controls: tuple[str, ...],
+) -> None:
     try:
         suffix = resolved.relative_to(mount_target)
     except ValueError as exc:
         raise ContainmentUnavailable(
-            f"cgroup-v1 membership {resolved} is outside mount {mount_target}"
+            f"{version} membership {resolved} is outside mount {mount_target}"
         ) from exc
     lineage = [mount_target]
     for part in suffix.parts:
@@ -368,28 +376,37 @@ def _require_cgroup_lineage_unwritable(mount_target: Path, resolved: Path) -> No
     for directory in lineage:
         try:
             if not stat.S_ISDIR(directory.stat().st_mode):
-                raise ContainmentUnavailable(f"cgroup-v1 lineage {directory} is not a directory")
+                raise ContainmentUnavailable(f"{version} lineage {directory} is not a directory")
         except OSError as exc:
-            raise ContainmentUnavailable(f"cannot inspect cgroup-v1 lineage {directory}") from exc
+            raise ContainmentUnavailable(f"cannot inspect {version} lineage {directory}") from exc
         if _effective_writable(directory):
             raise ContainmentUnavailable(
-                f"worker credentials can write cgroup-v1 directory {directory}"
+                f"worker credentials can write {version} directory {directory}"
             )
-        for name in ("tasks", "cgroup.procs"):
+        for name in controls:
             control = directory / name
             try:
                 if not stat.S_ISREG(control.stat().st_mode):
                     raise ContainmentUnavailable(
-                        f"cgroup-v1 migration control {control} is not a regular file"
+                        f"{version} migration control {control} is not a regular file"
                     )
             except OSError as exc:
                 raise ContainmentUnavailable(
-                    f"cannot inspect cgroup-v1 migration control {control}"
+                    f"cannot inspect {version} migration control {control}"
                 ) from exc
             if _effective_writable(control):
                 raise ContainmentUnavailable(
-                    f"worker credentials can write cgroup-v1 migration control {control}"
+                    f"worker credentials can write {version} migration control {control}"
                 )
+
+
+def _require_cgroup_lineage_unwritable(mount_target: Path, resolved: Path) -> None:
+    _require_cgroup_controls_unwritable(
+        mount_target,
+        resolved,
+        version="cgroup-v1",
+        controls=("tasks", "cgroup.procs"),
+    )
 
 
 def _prove_unwritable_container_cgroup_v1(process_uid: int) -> None:
@@ -459,22 +476,95 @@ def _prove_unwritable_container_cgroup_v1(process_uid: int) -> None:
         raise ContainmentUnavailable("pidfd open/send proof failed") from exc
 
 
+def _bounded_cgroup_limit(path: Path, name: str) -> int:
+    """Read one inherited container limit, refusing an absent or unbounded value."""
+
+    try:
+        value = (path / name).read_text().strip()
+        limit = int(value)
+    except (OSError, ValueError) as exc:
+        raise ContainmentUnavailable(
+            f"read-only cgroup-v2 container has no finite {name} limit"
+        ) from exc
+    if limit <= 0:
+        raise ContainmentUnavailable(
+            f"read-only cgroup-v2 container has invalid {name} limit {limit}"
+        )
+    return limit
+
+
+def _prove_unwritable_container_cgroup_v2(process_uid: int) -> None:
+    """Qualify the exact uid-split, read-only unified container topology.
+
+    A read-only cgroup mount cannot provide a child cgroup, but it also prevents the
+    executor from migrating out of the provider-owned container scope. The process-tree
+    backend is admitted only when that inherited scope has finite memory and process limits
+    and the executor owns a UID which the root worker uses for nothing else.
+    """
+
+    root = _cgroup_root()
+    euid = os.geteuid()
+    if euid != 0 or process_uid <= 0 or process_uid == euid:
+        raise ContainmentUnavailable(
+            "read-only cgroup-v2 containment requires a root worker and a distinct "
+            f"non-root executor uid; euid={euid}, executor_uid={process_uid}"
+        )
+    if not _root_owned_container_marker():
+        raise ContainmentUnavailable(
+            "process-tree backend found no regular uid-0 non-writable container marker"
+        )
+    try:
+        read_only = bool(os.statvfs(root).f_flag & os.ST_RDONLY)
+    except OSError as exc:
+        raise ContainmentUnavailable("cannot inspect the cgroup-v2 mount flags") from exc
+    if not read_only:
+        raise ContainmentUnavailable("cgroup-v2 mount is not read-only")
+
+    current = root / _own_cgroup_relative().lstrip("/")
+    _require_cgroup_controls_unwritable(
+        root,
+        current,
+        version="cgroup-v2",
+        controls=("cgroup.procs", "cgroup.threads", "cgroup.subtree_control"),
+    )
+
+    _bounded_cgroup_limit(current, "memory.max")
+    _bounded_cgroup_limit(current, "pids.max")
+    if not _full_proc_visibility(process_uid, require_environment=False):
+        raise ContainmentUnavailable("full target-UID /proc visibility is unavailable")
+    try:
+        signal_process(process_identity(os.getpid()), 0)
+    except (OSError, ProcessLookupError) as exc:
+        raise ContainmentUnavailable("pidfd open/send proof failed") from exc
+
+
 def validate_process_tree_host(process_uid: int | None = None) -> None:
     """Revalidate every point-in-time fact required by the process-tree backend."""
     _linux_only("validate_process_tree_host")
+    uid = os.geteuid() if process_uid is None else process_uid
     if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
-        raise ContainmentUnavailable("process-tree backend is forbidden on cgroup v2")
-    _prove_unwritable_container_cgroup_v1(os.geteuid() if process_uid is None else process_uid)
+        _prove_unwritable_container_cgroup_v2(uid)
+    else:
+        _prove_unwritable_container_cgroup_v1(uid)
 
 
 def create_executor_scope(namespace: str, process_uid: int | None = None) -> ExecutorScope:
     """Select and create the strongest proven executor scope on this Linux host."""
     _linux_only("create_executor_scope")
-    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
-        # Unified v2 always keeps the kernel scope path. A read-only or undelegated v2
-        # hierarchy refuses in create_executor_cgroup; it never silently falls back.
-        return create_executor_cgroup(namespace)
     uid = os.geteuid() if process_uid is None else process_uid
+    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+        # A read-only cgroup2 mount is a positive container topology, not a fallback after
+        # arbitrary cgroup creation failure. Writable unified hosts keep the stronger kernel
+        # child scope and still fail closed when that delegation is incomplete.
+        root = _cgroup_root()
+        try:
+            read_only = bool(os.statvfs(root).f_flag & os.ST_RDONLY)
+        except OSError as exc:
+            raise ContainmentUnavailable("cannot inspect the cgroup-v2 mount flags") from exc
+        if not read_only:
+            return create_executor_cgroup(namespace)
+        validate_process_tree_host(uid)
+        return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES), uid)
     validate_process_tree_host(uid)
     return ProcessTreeScope(secrets.token_hex(_PROCESS_SCOPE_TOKEN_BYTES), uid)
 

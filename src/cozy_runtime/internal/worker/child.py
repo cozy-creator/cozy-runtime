@@ -14,8 +14,8 @@ nobody could reconcile against the other one.
 Cancellation is cooperative then forceful and the WORKER owns both clocks: the grace
 budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
 `CancelAttempt.grace_ms`, and never an author knob. Writable cgroup v2 remains the kernel
-boundary; a strictly proven credential-unwritable cgroup-v1 container uses the narrower
-first-party process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
+boundary; a strictly proven credential-unwritable container uses the narrower first-party
+process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
 """
 
 from __future__ import annotations
@@ -1114,7 +1114,7 @@ class ExecutorSupervision:
             return []
         if isinstance(owner.scope, proctree.ProcessTreeScope):
             try:
-                proctree.validate_process_tree_host()
+                proctree.validate_process_tree_host(owner.scope.uid)
             except (proctree.ContainmentUnavailable, proctree.ProcessTreeUnsupported) as exc:
                 raise ExecutorGone(
                     f"cannot recover process-tree executor ownership on this host: {exc}; "

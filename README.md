@@ -260,6 +260,15 @@ lane. Base bytecode is baked in the image and package bytecode is compiled once 
 identity. The executor starts with image Python and appends the exact content import root after
 image-owned paths.
 
+A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
+RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its
+existing process-tree boundary there only after positively proving the root-worker/dedicated-UID
+split, root-owned container marker, read-only cgroup lineage and migration controls, finite inherited
+`memory.max` and `pids.max`, full target-UID `/proc` visibility, and pidfds. Reclaim owns the entire
+uid-65533 domain, not merely an environment token or process group, so token scrubbing, `setsid`,
+double-fork, worker restart, and PID reuse do not leave an old executor alive. A writable but
+undelegated cgroup-v2 host and an unbounded read-only container still refuse before package import.
+
 An overlay contains exactly one project wheel and at most 127 custom wheels. The Runtime bound is
 128 total package-owned wheels, counting the project; 128 custom rows plus the project refuses
 before any grant or ZIP is opened.

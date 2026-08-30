@@ -121,7 +121,7 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         EXECUTOR_SCOPE_ENV,
         "worker.process_tree_scope",
         "non-secret exact process identity inherited by first-party descendants when a "
-        "credential-unwritable cgroup-v1 container cannot supply a kernel subtree",
+        "credential-unwritable container cgroup cannot supply a delegated child subtree",
     ),
     ProjectedVar(
         FILL_FORENSICS_DIR,
