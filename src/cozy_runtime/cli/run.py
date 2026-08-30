@@ -197,14 +197,7 @@ def run(
             "job lane is the next increment; today, run model-bound work as an entrypoint",
             Exit.structural,
         )
-    if slots:
-        raise CliError(
-            "structural",
-            f"{function} declares {len(slots)} model binding path(s), but flat local binding "
-            "records were removed",
-            "run through Tensorhub's selected canonical Plan/RMB/MCC provision closure",
-            Exit.structural,
-        )
+    overrides = _overrides(flags.get("--model") or [], slots)
 
     doc = _doc_for(body, function, kind)
     request_schema = doc["request"]
@@ -271,6 +264,7 @@ def run(
             package_descriptor=body if kind == "entrypoint" else None,
             found=found,
             development_artifact_store=config.cozy_home / "cas",
+            development_binding_overrides=overrides,
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=package_revision_digest,

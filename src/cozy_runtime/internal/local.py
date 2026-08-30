@@ -901,6 +901,7 @@ def stage_development_placement(
     source_digest: str,
     found: Any = None,
     artifact_store: Path | None = None,
+    binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
     """Stage one exact PlacementSet/1 plus its launch-local descriptor/config bytes."""
 
@@ -918,6 +919,7 @@ def stage_development_placement(
         cozy_home=home,
         artifact_store=selected_store,
         artifact_cache=cache,
+        binding_overrides=binding_overrides,
     )
     _stage_exact(cache, documents_.descriptor)
     bindings = {
@@ -943,6 +945,7 @@ def development_placement_documents(
     cozy_home: Path | None = None,
     artifact_store: Path | None = None,
     artifact_cache: Path | None = None,
+    binding_overrides: Mapping[str, str] | None = None,
 ) -> DevelopmentPlacementDocuments:
     """Construct exact source and local-TensorFS selection facts through existing owners."""
 
@@ -978,7 +981,7 @@ def development_placement_documents(
                 "development_model_resolution_absent: modeled development requires the "
                 "discovered package, COZY_HOME, and local TensorFS store"
             )
-        resolved_models = _resolve_development_models(found, artifact_store)
+        resolved_models = _resolve_development_models(found, artifact_store, binding_overrides)
         if sorted(resolved_models) != modeled_paths:
             raise RuntimeError("development_model_mismatch: resolved binding paths changed")
 
@@ -1112,7 +1115,9 @@ def development_placement_documents(
 
 
 def _resolve_development_models(
-    found: Any, artifact_store: Path
+    found: Any,
+    artifact_store: Path,
+    binding_overrides: Mapping[str, str] | None = None,
 ) -> Mapping[str, _DevelopmentModel]:
     slots = [
         slot
@@ -1121,7 +1126,7 @@ def _resolve_development_models(
         for slot in surface.model_bindings
     ]
     try:
-        chosen = binding_table.resolve(slots, found.bindings)
+        chosen = binding_table.resolve(slots, found.bindings, overrides=binding_overrides)
     except Exception as exc:
         raise RuntimeError(f"development_model_binding_invalid: {exc}") from exc
     try:
@@ -1211,18 +1216,19 @@ def _resolve_development_models(
         assets_value = header.get("assets", {})
         if not isinstance(assets_value, Mapping):
             raise RuntimeError(f"development_model_assets_invalid: {binding.ref}")
+        if assets_value:
+            raise RuntimeError(
+                "development_model_assets_unsupported: local modeled development does not "
+                f"yet stream TensorFS logical assets for {binding.ref}"
+            )
         selected_assets: dict[str, Mapping[str, Any]] = {}
-        for asset_name, asset in assets_value.items():
-            if not isinstance(asset, Mapping):
-                raise RuntimeError(f"development_model_assets_invalid: {binding.ref}")
-            selected_assets[str(asset_name)] = {
-                "digest": "sha256:" + str(asset.get("logical_sha256", "")),
-                "length": int(asset.get("logical_length", 0)),
-            }
         actual_stamps: dict[str, tuple[str, ...]] = {}
-        for key, value in slot.stamps.items():
-            if value not in actual_stamps.get(key, ()):
-                raise RuntimeError(f"development_model_stamp_missing: {binding.ref}: {key}={value}")
+        if slot.stamps:
+            required = ", ".join(f"{key}={value}" for key, value in sorted(slot.stamps.items()))
+            raise RuntimeError(
+                "development_model_stamps_unavailable: local TensorFS Repository releases "
+                f"carry no uploader/catalog stamp set for {binding.ref}: {required}"
+            )
         try:
             model_weight_bytes = sum(int(row["length"]) for row in store.walk(manifest_digest))
         except Exception as exc:
@@ -1354,6 +1360,7 @@ def run_slice(
     package_descriptor: Mapping[str, Any] | None = None,
     found: Any = None,
     development_artifact_store: Path | None = None,
+    development_binding_overrides: Mapping[str, str] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
@@ -1385,6 +1392,7 @@ def run_slice(
             source_digest=source_digest,
             found=found,
             artifact_store=development_artifact_store,
+            binding_overrides=development_binding_overrides,
         )
         bindings.update(staged.bindings)
     stage_job_plans(config.cozy_home, job_records or [])

@@ -1,10 +1,2 @@
 [application]
 object = "proof_package:app"
-
-# The one stamp-free local model used by the modeled DevelopmentPackage proof. TensorFS's
-# Repository is the authority for the exact release/lane -> Manifest join; this source table
-# states only the authored default selection.
-[bindings."ToyModel"]
-model = "proof/tiny-core"
-release = "1.0.0"
-lane = "cpu"
