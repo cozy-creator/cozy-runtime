@@ -181,7 +181,7 @@ def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
     if (
         value.strip() != value
         or len(value.encode()) > 512
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(ord(character) <= 32 or ord(character) == 127 for character in value)
     ):
         raise ConfigError(
             "worker_host_config",
