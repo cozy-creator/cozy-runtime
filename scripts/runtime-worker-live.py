@@ -515,6 +515,7 @@ def main() -> int:
             "COZY_WORKER_ID": "worker-live",
             "COZY_WORKER_INTERNAL_PORT": "43100",
             "COZY_MEDIA_INTERNAL_PORT": "43101",
+            "COZY_WORKER_ARTIFACT_ORIGIN": "https://worker.tensorhub.com",
             "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
                 {
                     "control_public_key_ed25519_b64url": control_key,
@@ -559,6 +560,7 @@ def main() -> int:
             "COZY_WORKER_INTERNAL_PORT",
             "COZY_MEDIA_INTERNAL_PORT",
             "COZY_RECORD_OWNER_AUTH_JSON",
+            "COZY_WORKER_ARTIFACT_ORIGIN",
             "COZY_WORKER_LEASE_EXPIRY_UNIX",
         ):
             try:
@@ -573,9 +575,27 @@ def main() -> int:
             assert exc.name == "worker_host_config"
         else:
             raise AssertionError("an untrimmed worker id was accepted")
+        for bad_origin in (
+            "http://worker.tensorhub.com",
+            "https://worker.tensorhub.com/",
+            "https://WORKER.tensorhub.com",
+            "https://worker.tensorhub.com/path",
+            "https://user@worker.tensorhub.com",
+            "https://worker.tensorhub.com?",
+            "https://worker.tensorhub.com#",
+        ):
+            try:
+                read_worker_host_config({**env, "COZY_WORKER_ARTIFACT_ORIGIN": bad_origin})
+            except ConfigError as exc:
+                assert exc.name == "worker_host_config"
+            else:
+                raise AssertionError(f"invalid worker artifact origin was accepted: {bad_origin}")
         config = read_worker_host_config(env)
         assert dict(config.child_base_env) == {"LANG": "C.UTF-8"}
         assert config.worker_id == "worker-live"
+        assert config.artifact_origin.value == "https://worker.tensorhub.com"
+        assert config.artifact_origin.host == "worker.tensorhub.com"
+        assert config.artifact_origin.port == 443
         worker_options = _worker_options(
             config,
             PreparedBoot(root / "store", root / "object-set.json", root / "cache"),

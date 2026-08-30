@@ -24,6 +24,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.exits import Exit
@@ -101,7 +102,7 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
-    """The fixed five-value host handoff to ``cozy-runtime-worker``.
+    """The fixed product-host handoff to ``cozy-runtime-worker``.
 
     Paths are image-contract constants from ``runtime-worker-host-paths.json`` rather than
     environment configuration. The readiness HMAC remains supervisor-only. Desired placements,
@@ -115,7 +116,17 @@ class WorkerHostConfig:
     control_public_key_ed25519_b64url: str
     media_token_sha256: tuple[str, ...]
     lease_expiry_unix: int
+    artifact_origin: WorkerArtifactOrigin
     child_base_env: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerArtifactOrigin:
+    """One operator-owned HTTPS authority; TLS always terminates in Tensorhub."""
+
+    value: str
+    host: str
+    port: int
 
 
 # The CLOSED non-HMAC child projection of PodEnvironmentContract/1. Unknown COZY_* names refuse;
@@ -125,6 +136,7 @@ WORKER_HOST_ENV = {
     "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WORKER_LEASE_EXPIRY_UNIX",
     "COZY_RECORD_OWNER_AUTH_JSON",
+    "COZY_WORKER_ARTIFACT_ORIGIN",
     "COZY_WORKER_INTERNAL_PORT",
 }
 
@@ -161,6 +173,44 @@ _worker_host_read: bool = False
 
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 _ED25519_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def parse_worker_artifact_origin(value: str) -> WorkerArtifactOrigin:
+    """Refuse anything except canonical ``https://host[:port]``."""
+
+    if value.strip() != value or len(value.encode()) > 512:
+        raise ConfigError(
+            "worker_host_config",
+            "COZY_WORKER_ARTIFACT_ORIGIN is not one bounded HTTPS origin",
+            "set the operator-owned Tensorhub worker API origin",
+        )
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ConfigError(
+            "worker_host_config",
+            "COZY_WORKER_ARTIFACT_ORIGIN has an invalid port",
+            "set the operator-owned Tensorhub worker API origin",
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc != parsed.netloc.lower()
+        or value != f"https://{parsed.netloc}"
+        or not 1 <= port <= 65535
+    ):
+        raise ConfigError(
+            "worker_host_config",
+            "COZY_WORKER_ARTIFACT_ORIGIN is not canonical https://host[:port]",
+            "set the operator-owned Tensorhub worker API origin",
+        )
+    return WorkerArtifactOrigin(value=value, host=parsed.hostname, port=port)
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -233,7 +283,7 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         raise ConfigError(
             "worker_host_config",
             f"unknown worker environment variable {unknown[0]}",
-            "use the closed five-value worker handoff",
+            "use the closed six-value worker handoff",
         )
 
     def required(name: str) -> str:
@@ -325,6 +375,7 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
+        artifact_origin=parse_worker_artifact_origin(required("COZY_WORKER_ARTIFACT_ORIGIN")),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV

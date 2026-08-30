@@ -14,6 +14,7 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cozy_runtime.internal.config import parse_worker_artifact_origin
 from cozy_runtime.internal.worker import acquire, artifact_access
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -158,6 +159,7 @@ def main() -> int:
         client = artifact_access.ArtifactClient(
             certificate,
             private_key,
+            parse_worker_artifact_origin("https://worker.tensorhub.com:18443"),
             connection=lambda _timeout: connection,
         )
         plan = client.resolve(
@@ -201,6 +203,7 @@ def main() -> int:
     expired_client = artifact_access.ArtifactClient(
         Path("unused.crt"),
         Path("unused.key"),
+        parse_worker_artifact_origin("https://worker.tensorhub.com"),
         connection=lambda _timeout: expired_connection,
     )
     try:

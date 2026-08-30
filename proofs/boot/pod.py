@@ -9,7 +9,7 @@ RecordOwner's Claim.
 
 What it proves, and every line of it is measured rather than asserted by construction:
 
-  * the worker boots on five owner-neutral environment names and reads no document at all;
+  * the worker boots on six owner-neutral environment names and reads no document at all;
   * the worker id is spent on the wire, not echoed through the receipt;
   * the pod does not re-measure image-resident Runtime/base bytes;
   * the old closure and identity-echo fields are GONE from the receipt;
@@ -616,6 +616,7 @@ def main() -> int:
         "SSL_CERT_FILE": str(origin_certificate),
         "COZY_WORKER_ID": "ra-cr048bootproof",
         "COZY_WORKER_INTERNAL_PORT": str(WORKER_PORT),
+        "COZY_WORKER_ARTIFACT_ORIGIN": "https://worker.tensorhub.com",
         "COZY_MEDIA_INTERNAL_PORT": str(MEDIA_PORT),
         "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
             {
@@ -627,7 +628,7 @@ def main() -> int:
         ),
         "COZY_WORKER_LEASE_EXPIRY_UNIX": str(DEADLINE),
     }
-    note("handing the worker five owner-neutral COZY_* names and no document")
+    note("handing the worker six owner-neutral COZY_* names and no document")
 
     worker = subprocess.Popen(
         [str(Path(sys.executable).parent / "cozy-runtime-worker")],
