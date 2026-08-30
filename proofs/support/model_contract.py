@@ -156,6 +156,8 @@ def _prepare(args: argparse.Namespace) -> None:
         {
             "dependency_wheels": [],
             "format": "cozy.package.release/1",
+            "package": "proof/proof-package",
+            "package_descriptor": _ref(descriptor_bytes),
             "project_wheel": {
                 "ref": {"digest": project_row["digest"], "length": project_row["length"]},
                 "distribution": project_row["distribution"],
@@ -166,7 +168,8 @@ def _prepare(args: argparse.Namespace) -> None:
             },
             "requires_python": ">=3.11",
             "requirements": [],
-            "source_manifest": _ref(b'{"entries":[]}'),
+            "release": "1.0.0",
+            "source_files": [],
         }
     )
     environment = pb.Environment(

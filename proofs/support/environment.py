@@ -391,10 +391,13 @@ def _release(
         {
             "dependency_wheels": selected_rows,
             "format": "cozy.package.release/1",
+            "package": "proof/proof-package",
+            "package_descriptor": _ref(b'{"descriptor":true}'),
             "project_wheel": project_fact,
             "requires_python": ">=3.11",
             "requirements": [],
-            "source_manifest": _ref(b'{"entries":[]}'),
+            "release": "1.0.0",
+            "source_files": [],
         }
     )
     environment = pb.Environment(
