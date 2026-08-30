@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, descriptor
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.descriptor_compat import Result, classify_bytes
 
@@ -23,6 +23,22 @@ def _base() -> dict[str, Json]:
             {
                 "name": "options",
                 "type": {"fields": [{"name": "seed", "type": "int"}]},
+                "wire": "optional",
+            },
+            {
+                "name": "batch",
+                "type": {"list": {"fields": [{"name": "item", "type": "str"}]}},
+                "wire": "optional",
+            },
+            {
+                "name": "choice",
+                "type": {
+                    "union": [
+                        {"fields": [{"name": "text", "type": "str"}], "tag": "text"},
+                        {"fields": [{"name": "count", "type": "int"}], "tag": "count"},
+                    ],
+                    "tag_field": "kind",
+                },
                 "wire": "optional",
             },
         ]
@@ -180,6 +196,26 @@ def main() -> int:
 
     check("nested optional request field", "minor", add_nested_optional, "temperature")
 
+    def add_list_item_optional(doc: dict[str, Json]) -> None:
+        batch = _fields(_entrypoint(doc))[2]
+        assert isinstance(batch, dict) and isinstance(batch["type"], dict)
+        item = batch["type"]["list"]
+        assert isinstance(item, dict) and isinstance(item["fields"], list)
+        item["fields"].append({"name": "label", "type": "str", "wire": "optional"})
+
+    check("list item optional request field", "minor", add_list_item_optional, "label")
+
+    def add_union_member_optional(doc: dict[str, Json]) -> None:
+        choice = _fields(_entrypoint(doc))[3]
+        assert isinstance(choice, dict) and isinstance(choice["type"], dict)
+        branches = choice["type"]["union"]
+        assert isinstance(branches, list) and isinstance(branches[0], dict)
+        fields = branches[0]["fields"]
+        assert isinstance(fields, list)
+        fields.append({"name": "language", "type": "str", "wire": "omissible"})
+
+    check("union member optional request field", "minor", add_union_member_optional, "language")
+
     check(
         "application changed",
         "major",
@@ -273,6 +309,13 @@ def main() -> int:
 
     check("other request schema change", "major", add_union_branch, "options schema changed")
 
+    def change_union_tag(doc: dict[str, Json]) -> None:
+        choice = _fields(_entrypoint(doc))[3]
+        assert isinstance(choice, dict) and isinstance(choice["type"], dict)
+        choice["type"]["tag_field"] = "type"
+
+    check("union metadata changed", "major", change_union_tag, "choice schema changed")
+
     def mixed(doc: dict[str, Json]) -> None:
         add_entrypoint(doc)
         _fields(_entrypoint(doc), "result").append({"name": "detail", "type": "str"})
@@ -301,6 +344,25 @@ def main() -> int:
     rows.append(added)
     result = classify_bytes(canonical.write(before), canonical.write(huge))
     assert result.classification == "minor" and len(result.reasons[0]) == 256
+    cases += 1
+
+    ambiguous = _base()
+    jobs = ambiguous["jobs"]
+    assert isinstance(jobs, list)
+    jobs.append(
+        {
+            "name": "generate",
+            "request": {"fields": []},
+            "result": {"fields": []},
+            "publishes": False,
+        }
+    )
+    try:
+        classify_bytes(canonical.write(before), canonical.write(ambiguous))
+    except descriptor.StalePackageDescriptor as exc:
+        assert "both an entrypoint and a job" in str(exc)
+    else:
+        raise AssertionError("cross-kind duplicate callable name was accepted")
     cases += 1
 
     with tempfile.TemporaryDirectory(prefix="cozy-descriptor-compat-") as raw:
