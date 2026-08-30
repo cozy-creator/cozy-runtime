@@ -33,9 +33,11 @@ That choice belongs to whoever owns the CI budget and is NAMED here rather than 
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -514,7 +516,7 @@ def objective() -> None:
 
 
 def cache() -> None:
-    head("cache — #549.2: facts keyed by plan digest, in immutable per-run files")
+    head("cache — #549.2: facts keyed by plan digest, in immutable SQLite rows")
 
     with tempfile.TemporaryDirectory() as tmp:
         facts = PlanFacts(tmp)
@@ -553,7 +555,7 @@ def cache() -> None:
             )
         folded = facts.get(a.digest())
         check(
-            "three immutable files FOLD to a median and an HONEST sample count",
+            "three immutable rows FOLD to a median and an HONEST sample count",
             folded.samples == 3 and folded.fill_ms == 120 and abs(folded.step_ms - 11.0) < 1e-9,
             f"fill {folded.fill_ms} ms, step {folded.step_ms} ms over {folded.samples} runs — "
             "the old shape incremented a `samples` integer nobody could audit",
@@ -585,7 +587,7 @@ def cache() -> None:
             "whichever runs actually measured it",
         )
         check(
-            "an O_EXCL collision leaves the winner's bytes ALONE",
+            "a duplicate run id leaves the winner's row ALONE",
             facts.bank(
                 RunFact(plan_digest=digest, run_id=f"{run_id(digest, 'dev', RUNTIME.release)}-x")
             )
@@ -607,6 +609,26 @@ def cache() -> None:
             "the numbers in it cannot be attributed to a plan after the fact — that is "
             "exactly what they failed to record — so a first prepare re-mints",
         )
+        concurrent_digest = b.digest()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(
+                pool.map(
+                    facts.bank,
+                    (
+                        RunFact(concurrent_digest, f"concurrent-{index}", fill_ms=index)
+                        for index in range(32)
+                    ),
+                )
+            )
+        database = sqlite3.connect(Path(tmp) / "runtime.sqlite3")
+        check(
+            "concurrent writers retain every row in one healthy versioned SQLite cache",
+            facts.get(concurrent_digest).samples == 32
+            and database.execute("PRAGMA user_version").fetchone()[0] == 1
+            and database.execute("PRAGMA integrity_check").fetchone()[0] == "ok",
+            "32/32 rows, schema version 1, integrity_check=ok",
+        )
+        database.close()
 
 
 def specs() -> None:

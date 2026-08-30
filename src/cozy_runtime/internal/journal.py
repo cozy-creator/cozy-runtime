@@ -45,7 +45,7 @@ KINDS = (
     "epoch",  # executor incarnation movement
     "warm",  # one boot warm-pass outcome
     "ledger",  # one attempt's byte-class reconciliation at close (cr-008a)
-    "triage",  # one WorkerTriageBundle write receipt (cr-011): subject, digest, length
+    "triage",  # one triage write row (cr-011): subject, digest, length
     "job_checkpoint",  # one DURABLE job checkpoint identity + receipt (cr-009)
     "publication",  # ONE canonical bundle snapshot per publication (cr-009)
 )

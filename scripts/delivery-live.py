@@ -450,28 +450,9 @@ def plan_for(name: str, objective: str = "latency") -> Any:
 
 
 def banked_plans() -> dict[str, Any]:
-    """Every plan digest this rig has banked a fact for, folded. One directory per plan."""
+    """Every plan digest this rig has banked a fact for, folded."""
     store = plan_facts()
-    root = HOME / "probe" / "plan-facts"
-    out: dict[str, Any] = {}
-    if not root.is_dir():
-        return out
-    for folder in sorted(root.iterdir()):
-        runs = [r for path in folder.glob("*.json") for r in _read_run(path)]
-        if runs:
-            out[runs[0].plan_digest] = store.get(runs[0].plan_digest)
-    return out
-
-
-def _read_run(path: Path) -> list[Any]:
-    from cozy_runtime.internal.planfacts import RunFact
-
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return []
-    record = RunFact.read(data) if isinstance(data, dict) else None
-    return [record] if record is not None else []
+    return {digest: store.get(digest) for digest in store.digests()}
 
 
 def calibrate() -> None:

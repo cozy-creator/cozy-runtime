@@ -28,6 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cozy_runtime.internal import cache
 from cozy_runtime.internal.exits import Exit
 
 
@@ -42,8 +43,6 @@ class ArtifactRefError(ValueError):
         self.exit_code = exit_code
 
 
-SCHEMA = "cozy.runtime.LocalArtifact/1"
-DIRECTORY = "artifacts"
 #: `org/model`, optionally `@release`. A bare ref resolves on tensorhub only (never a foreign
 #: fallback), which is a `pull` concern; here it is only the index key's grammar.
 REF = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$")
@@ -94,9 +93,10 @@ class Artifact:
         """The snapshot a single-component reader falls back to. Deterministic by order."""
         return self.snapshots[self.components[0]]
 
-    def document(self) -> dict[str, object]:
+    def view(self) -> dict[str, object]:
+        """Human/CLI projection of this row; never stored or used as identity."""
+
         return {
-            "schema": SCHEMA,
             "ref": self.ref,
             "store": self.store,
             "config": self.config,
@@ -108,62 +108,116 @@ class Artifact:
             "custody": self.custody,
             "vram_floor_bytes": self.vram_floor_bytes,
             "extra_key_markers": list(self.extra_key_markers),
-            "stamps": {k: list(v) for k, v in sorted(self.stamps.items())},
+            "stamps": {key: list(values) for key, values in sorted(self.stamps.items())},
         }
 
 
-def _slug(ref: str) -> str:
-    return ref.replace("/", "__").replace("@", "--")
-
-
-def directory(cozy_home: Path) -> Path:
-    return cozy_home / DIRECTORY
-
-
 def install(cozy_home: Path, artifact: Artifact) -> Path:
-    """Record one installed artifact. Idempotent: identical facts rewrite the same bytes."""
+    """Record one installed artifact as a typed local row."""
     if not REF.match(artifact.ref):
         raise ArtifactRefError(
             f"{artifact.ref!r} is not a model ref: org/model[@release]",
             "model refs are org/model with an optional @release; a filesystem path is admitted "
             "through `cozy-runtime ingest` first",
         )
-    target = directory(cozy_home)
-    target.mkdir(parents=True, exist_ok=True)
-    path = target / f"{_slug(artifact.ref)}.json"
-    path.write_text(json.dumps(artifact.document(), indent=2, sort_keys=True))
-    return path
+    with cache.connect(cozy_home) as database:
+        database.execute(
+            """
+            INSERT INTO artifacts (
+                ref, store_root, config, snapshots_json, lane, stored_bytes, tensors,
+                variant, custody, vram_floor_bytes, extra_key_markers_json, stamps_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ref) DO UPDATE SET
+                store_root=excluded.store_root,
+                config=excluded.config,
+                snapshots_json=excluded.snapshots_json,
+                lane=excluded.lane,
+                stored_bytes=excluded.stored_bytes,
+                tensors=excluded.tensors,
+                variant=excluded.variant,
+                custody=excluded.custody,
+                vram_floor_bytes=excluded.vram_floor_bytes,
+                extra_key_markers_json=excluded.extra_key_markers_json,
+                stamps_json=excluded.stamps_json
+            """,
+            (
+                artifact.ref,
+                artifact.store,
+                artifact.config,
+                json.dumps(dict(sorted(artifact.snapshots.items())), separators=(",", ":")),
+                artifact.lane,
+                artifact.bytes,
+                artifact.tensors,
+                artifact.variant,
+                artifact.custody,
+                artifact.vram_floor_bytes,
+                json.dumps(list(artifact.extra_key_markers), separators=(",", ":")),
+                json.dumps(
+                    {key: list(values) for key, values in sorted(artifact.stamps.items())},
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        database.commit()
+    return cozy_home / cache.FILENAME
 
 
 def rows(cozy_home: Path, prefix: str = "") -> list[Artifact]:
-    target = directory(cozy_home)
-    if not target.is_dir():
-        return []
     out: list[Artifact] = []
-    for path in sorted(target.glob("*.json")):
-        doc = json.loads(path.read_text())
-        if doc.get("schema") != SCHEMA:
-            continue
-        if prefix and not str(doc["ref"]).startswith(prefix):
-            continue
-        out.append(
-            Artifact(
-                ref=str(doc["ref"]),
-                store=str(doc["store"]),
-                config=str(doc["config"]),
-                snapshots=dict(doc["snapshots"]),
-                lane=str(doc.get("lane", "plain")),
-                bytes=int(doc.get("bytes", 0)),
-                tensors=int(doc.get("tensors", 0)),
-                variant=str(doc.get("variant", "sm89")),
-                custody=str(doc.get("custody", "canonical")),
-                vram_floor_bytes=int(doc.get("vram_floor_bytes", 0)),
-                extra_key_markers=tuple(doc.get("extra_key_markers", ())),
-                stamps={
-                    str(k): tuple(str(x) for x in v) for k, v in (doc.get("stamps") or {}).items()
-                },
-            )
+    with cache.connect(cozy_home) as database:
+        selected = database.execute(
+            """
+            SELECT ref, store_root, config, snapshots_json, lane, stored_bytes, tensors,
+                   variant, custody, vram_floor_bytes, extra_key_markers_json, stamps_json
+            FROM artifacts
+            ORDER BY ref
+            """,
         )
+        for row in selected:
+            ref = str(row["ref"])
+            if prefix and not ref.startswith(prefix):
+                continue
+            try:
+                snapshots = json.loads(str(row["snapshots_json"]))
+                markers = json.loads(str(row["extra_key_markers_json"]))
+                stamps = json.loads(str(row["stamps_json"]))
+            except ValueError as exc:
+                raise cache.CacheError(
+                    f"{cozy_home / cache.FILENAME}: malformed artifact row"
+                ) from exc
+            if (
+                not isinstance(snapshots, dict)
+                or not isinstance(markers, list)
+                or not isinstance(stamps, dict)
+                or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in snapshots.items()
+                )
+                or not all(isinstance(value, str) for value in markers)
+                or not all(
+                    isinstance(key, str)
+                    and isinstance(values, list)
+                    and all(isinstance(value, str) for value in values)
+                    for key, values in stamps.items()
+                )
+            ):
+                raise cache.CacheError(f"{cozy_home / cache.FILENAME}: malformed artifact row")
+            out.append(
+                Artifact(
+                    ref=ref,
+                    store=str(row["store_root"]),
+                    config=str(row["config"]),
+                    snapshots=snapshots,
+                    lane=str(row["lane"]),
+                    bytes=int(row["stored_bytes"]),
+                    tensors=int(row["tensors"]),
+                    variant=str(row["variant"]),
+                    custody=str(row["custody"]),
+                    vram_floor_bytes=int(row["vram_floor_bytes"]),
+                    extra_key_markers=tuple(markers),
+                    stamps={key: tuple(values) for key, values in stamps.items()},
+                )
+            )
     return out
 
 
@@ -182,8 +236,7 @@ def find(cozy_home: Path, ref: str) -> Artifact | None:
 
 def remove(cozy_home: Path, ref: str) -> bool:
     """Drop the index row. Returns whether anything was there — an absent ref is a 0."""
-    path = directory(cozy_home) / f"{_slug(ref)}.json"
-    if not path.is_file():
-        return False
-    path.unlink()
-    return True
+    with cache.connect(cozy_home) as database:
+        removed = database.execute("DELETE FROM artifacts WHERE ref = ?", (ref,)).rowcount
+        database.commit()
+    return bool(removed)

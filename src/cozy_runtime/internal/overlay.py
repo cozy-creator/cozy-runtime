@@ -44,8 +44,7 @@ from cozy_runtime.internal import canonical, native_wheel
 RECEIPT_FORMAT = "cozy.runtime.PackageOverlayReceipt/1"
 CONTENT_FORMAT = "cozy.runtime.PackageOverlayContent/1"
 CONTENT_IDENTITY_NAME = "package-overlay-content.json"
-WHEEL_EXTRACTION_FORMAT = "cozy.runtime.PackageWheelExtraction/1"
-WHEEL_EXTRACTION_IDENTITY_NAME = "package-wheel-extraction.json"
+WHEEL_EXTRACTION_COMPLETE = ".complete"
 OVERLAY_DIR = "site-packages"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/3"
@@ -1130,28 +1129,38 @@ def _extract(wheels: Sequence[_Inspected], site: Path) -> None:
                 target.chmod(0o500 if target.suffix in {".so", ".pyd", ".dll"} else 0o400)
 
 
-def _wheel_pool_identity(base_family_digest: str, wheel_digest: str) -> dict[str, str]:
-    return {
-        "base_family_digest": base_family_digest,
-        "format": WHEEL_EXTRACTION_FORMAT,
-        "wheel_digest": wheel_digest,
-    }
+def _wheel_pool_digest(base_family_digest: str, wheel_digest: str) -> str:
+    """Name a private extraction cache without inventing a portable document format."""
+
+    preimage = (
+        b"cozy.runtime.wheel-extraction\0"
+        + base_family_digest.encode("ascii")
+        + b"\0"
+        + wheel_digest.encode("ascii")
+    )
+    return _sha(preimage)
 
 
 def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspected) -> Path:
     """Extract one verified wheel once under the image/runtime extraction semantics."""
 
-    identity_bytes = canonical.write(
-        _wheel_pool_identity(base_family_digest, inspected.wheel.digest)
-    )
-    pool_digest = _sha(identity_bytes)
+    pool_digest = _wheel_pool_digest(base_family_digest, inspected.wheel.digest)
     final = pools / pool_digest.removeprefix("sha256:")
     if final.exists():
+        marker = final / WHEEL_EXTRACTION_COMPLETE
         try:
-            existing = (final / WHEEL_EXTRACTION_IDENTITY_NAME).read_bytes()
+            marker_info = marker.lstat()
+            complete = marker.read_bytes()
         except OSError as exc:
             raise OverlayRefusal("overlay_wheel_pool_invalid", str(exc)) from exc
-        if existing != identity_bytes or final.stat().st_uid != os.geteuid():
+        if (
+            complete
+            or not stat.S_ISREG(marker_info.st_mode)
+            or marker_info.st_uid != os.geteuid()
+            or marker_info.st_mode & 0o222
+            or final.stat().st_uid != os.geteuid()
+            or not (final / "tree").is_dir()
+        ):
             raise OverlayRefusal("overlay_wheel_pool_invalid", str(final))
         return final / "tree"
     staging = pools.parent / f".wheel-staging-{os.getpid()}-{uuid.uuid4().hex}"
@@ -1164,7 +1173,7 @@ def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspec
                 native_wheel.inspect_tree(tree, inspected.native_members)
             except native_wheel.NativeWheelRefusal as exc:
                 raise OverlayRefusal(exc.code, exc.detail) from exc
-        _write_once(staging / WHEEL_EXTRACTION_IDENTITY_NAME, identity_bytes)
+        _write_once(staging / WHEEL_EXTRACTION_COMPLETE, b"")
         _make_read_only(staging)
         _fsync_dir(staging)
         try:

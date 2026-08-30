@@ -1159,16 +1159,12 @@ DOCUMENT_KINDS = {
     "cozy.pod-readiness/1": "internal/readiness.py",
     "cozy.runtime.AttemptPlan/1": "internal/worker/plan.py",
     "cozy.runtime.AcceptanceFixtureRequest/1": "internal/acceptance.py",
-    "cozy.runtime.ConstructedGeneration/2": "internal/executor.py",
     "cozy.runtime.PackageOverlayContent/1": "internal/overlay.py",
     "cozy.runtime.PackageOverlayReceipt/1": "internal/overlay.py",
-    "cozy.runtime.PackageWheelExtraction/1": "internal/overlay.py",
     "cozy.runtime.EnvironmentProofRequest/1": "cli/environment_proof.py",
     "cozy.runtime.ExecutionObservation/1": "internal/acceptance.py",
     "cozy.runtime.ExecutionObservationRequest/1": "internal/acceptance.py",
     "cozy.runtime.JobDescriptor/1": "internal/descriptor.py",
-    "cozy.runtime.Ledger/0": "internal/worker/ledger.py",
-    "cozy.runtime.LocalArtifact/1": "internal/artifacts.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
     "cozy.runtime.ModelConstructionProof/1": "cli/model_contract_proof.py",
     "cozy.runtime.ModelConstructionProofRequest/1": "cli/model_contract_proof.py",
@@ -1177,13 +1173,7 @@ DOCUMENT_KINDS = {
     "cozy.runtime.NativeWheelProofRequest/1": "cli/native_wheel_proof.py",
     "cozy.runtime.NativeWheelQualification/1": "cli/native_wheel_proof.py",
     "cozy.runtime.NativeWheelInspection/1": "internal/native_wheel.py",
-    "cozy.runtime.plan-fact/1": "internal/planfacts.py",
-    "cozy.runtime.probe/1": "internal/probe.py",
     "cozy.runtime.PublicationReceipt/1": "internal/worker/grants.py",
-    "cozy.runtime.TriageWriteReceipt/1": "internal/worker/triage.py",
-    "cozy.runtime.WitnessBoot/1": "internal/witness.py",
-    "cozy.runtime.WitnessDeath/1": "internal/witness.py",
-    "cozy.runtime.WorkerTriageBundle/1": "internal/worker/triage.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
@@ -1192,7 +1182,6 @@ FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytens
 #: second DECLARATION is the drift this fence exists for).
 KIND_READERS = {
     "cozy.package.EntrypointBindingPlan/1": {"internal/local.py"},
-    "cozy.runtime.Ledger/0": {"internal/local.py"},
     "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
 }
 _VERSIONED_LITERAL_PATTERN = (

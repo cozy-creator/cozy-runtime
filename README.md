@@ -78,7 +78,7 @@ R2 plan directly. No CA bypass, proxy certificate header, or endpoint-authentica
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
 | `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
-| `internal/worker/triage.py` | the `WorkerTriageBundle` schema, its assembler, and the journal-backed store |
+| `internal/worker/triage.py` | bounded triage assembly and its journal-backed store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
 | `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
@@ -117,7 +117,7 @@ redacted downstream — where `token` and `signature`, which are also ordinary t
 are credential-shaped only bare or directly qualified (`access_token`), so `tokens_per_second`
 and `output_tokens` are admitted.
 
-**Every terminal attempt commits one `WorkerTriageBundle`** — identity, applied posture,
+**Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
 written and fsynced BEFORE its write receipt is journaled and before the terminal that names
 it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A

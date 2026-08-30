@@ -8,8 +8,8 @@ attempt to close it from inside the dying process failed for the same reason —
 is SIGKILL and SIGKILL runs no handler.
 
 So a WITNESS parent execs the worker and outlives it. It is deliberately tiny: no torch,
-no protocol, no journal writes, no threads. It writes a BOOT record before the child starts,
-waits, and writes a DEATH record naming what it saw from outside:
+no protocol, no journal writes, no threads. It appends a boot event before the child starts,
+waits, and appends a death event naming what it saw from outside:
 
     exit status, and the SIGNAL when there was one
     whether the kernel OOM-killed it — read from the cgroup's own `memory.events` counter,
@@ -36,12 +36,35 @@ import time
 from pathlib import Path
 from typing import Any
 
-BOOT_FORMAT = "cozy.runtime.WitnessBoot/1"
-DEATH_FORMAT = "cozy.runtime.WitnessDeath/1"
-
 #: `statfs.f_type` values for memory-backed filesystems. A boot record on one of these dies
 #: with the machine event it exists to explain.
 TMPFS_MAGIC = frozenset({0x01021994, 0x858458F6, 0x9041934})  # tmpfs, ramfs, older ramfs
+
+_EVENT_FIELDS = {
+    "boot": {
+        "event",
+        "witness_pid",
+        "child_pid",
+        "argv",
+        "started_unix_ms",
+        "record_filesystem",
+        "cgroup_oom_kill_at_boot",
+    },
+    "death": {
+        "event",
+        "child_pid",
+        "ran_ms",
+        "ended_unix_ms",
+        "how",
+        "exit_code",
+        "signal",
+        "signal_name",
+        "oom_killed",
+        "cgroup_oom_kill_before",
+        "cgroup_oom_kill_after",
+        "method",
+    },
+}
 
 
 class WitnessRefusal(Exception):
@@ -109,11 +132,11 @@ def oom_kills() -> int:
     return -1
 
 
-def _write(path: Path, document: dict[str, Any]) -> None:
+def _write(path: Path, event: dict[str, Any]) -> None:
     """Write and fsync — a witness record that is only in the page cache witnessed nothing."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(document, indent=2, sort_keys=True).encode() + b"\n"
-    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    data = json.dumps(event, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(handle, data)
         os.fsync(handle)
@@ -170,9 +193,9 @@ def witness(root: Path, argv: list[str]) -> int:
         os.execv(argv[0], argv)
         os._exit(127)
     _write(
-        directory / "boot.json",
+        directory / "events.jsonl",
         {
-            "format": BOOT_FORMAT,
+            "event": "boot",
             "witness_pid": os.getpid(),
             "child_pid": child,
             "argv": argv,
@@ -184,23 +207,46 @@ def witness(root: Path, argv: list[str]) -> int:
     _, status = os.waitpid(child, 0)
     death = name_death(status, before, oom_kills())
     death.update(
-        format=DEATH_FORMAT,
+        event="death",
         child_pid=child,
         ran_ms=round((time.time() - started) * 1000, 1),
         ended_unix_ms=int(time.time() * 1000),
     )
-    _write(directory / "death.json", death)
+    _write(directory / "events.jsonl", death)
     print(f"[witness] {death['how']} (oom_killed={death['oom_killed']})", flush=True)
     return death["exit_code"] if death["exit_code"] >= 0 else 128 + int(death["signal"])
 
 
-def read_death(root: Path) -> dict[str, Any]:
-    """The surviving record, read from disk with no live process anywhere."""
-    path = root / "witness" / "death.json"
+def read_events(root: Path) -> list[dict[str, Any]]:
+    """Read and validate the surviving event rows with no live process anywhere."""
+
+    path = root / "witness" / "events.jsonl"
     if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        try:
+            event = json.loads(line)
+        except ValueError as exc:
+            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: invalid event") from exc
+        kind = event.get("event") if isinstance(event, dict) else None
+        if not isinstance(kind, str) or kind not in _EVENT_FIELDS:
+            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: unknown witness event")
+        if set(event) != _EVENT_FIELDS[kind]:
+            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: wrong event fields")
+        events.append(event)
+    return events
+
+
+def read_death(root: Path) -> dict[str, Any]:
+    """Return the last durable death event."""
+
+    death = next(
+        (event for event in reversed(read_events(root)) if event["event"] == "death"), None
+    )
+    if death is None:
         raise WitnessRefusal("death_unrecorded", f"no witness death record under {root}")
-    document: dict[str, Any] = json.loads(path.read_text())
-    return document
+    return death
 
 
 def main(argv: list[str] | None = None) -> int:

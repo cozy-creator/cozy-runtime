@@ -1188,9 +1188,9 @@ def _collect(
     # now the process that owned them is gone — true, and useless. The reconciliation record
     # is the measurement; this is only where it is published.
     outcome.ledger = (
-        {"format": "cozy.runtime.Ledger/0", "classes": outcome.reconciliation["classes"]}
+        {"classes": outcome.reconciliation["classes"]}
         if outcome.reconciliation
-        else worker.ledger.document()
+        else worker.ledger.measurement()
     )
     outcome.warm = list(worker.warm)
     outcome.faults = [
