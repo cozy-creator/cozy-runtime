@@ -19,11 +19,11 @@ minted for one invocation and spent here, so nothing the package produced — an
 request body can influence — chooses where bytes land: a destination the table has no row
 for refuses typed, and `scripts/worker-live.py grants` plants
 `https://exfiltrate.example/upload` for the `hub_call_unauthorized` SECURITY EVENT. Every
-row is `file://` TODAY, resolved by `_local` inside the declared grant roots.
-`OutputAccess.url`'s "presigned upload URL" (`worker.proto`) is the PLANNED public route —
-tensorhub mints it, R2 sits behind it, the worker never holds the credential — so that row
-is a completion, and whoever lands it lands HOST VALIDATION of the minted URL with it. That
-is what keeps the property; a `file://`-only table never did — `scripts/lifecycle-live.py
+input row is `file://` today. The output row also admits the exact `https://` presigned URL
+already carried by `OutputAccess.url`: Tensorhub mints it, R2 sits behind it, and the worker
+never holds bucket credentials. `internal.egress` validates every resolved address and refuses
+a redirect-selected destination. That is what keeps the property; a `file://`-only table never
+did — `scripts/lifecycle-live.py
 --only egress` watches a `ctypes` connect(2) LAND from inside the serving executor, so a
 hostile package already holds a socket. The rung is the fence's own, below: a careless
 package and a malicious GRANT, never a malicious package.
@@ -90,11 +90,10 @@ class HubCall:
 #: The COMPLETE set of calls this worker may make. Read it as the security boundary it
 #: is: anything not spelled here cannot be dialled, whoever asks.
 #:
-#: Every row is `file://` TODAY. The `https://` output row `OutputAccess.url` reserves
-#: ("presigned upload URL") is PLANNED, not forbidden — land it WITH host validation of the
-#: control-plane-minted URL, because what this table holds is that a destination is minted
-#: for the invocation and never named by request content, not that bytes stay off the
-#: network (cr-042). Armed by `scripts/worker-live.py grants`.
+#: Input rows remain `file://`. The output row admits either the local path or the exact HTTPS
+#: capability the control plane minted. The path/query never appears in a refusal event because a
+#: presigned query is structurally secret. Armed by `scripts/worker-live.py grants` and
+#: `scripts/assets-live.py egress`.
 HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_input_read",
@@ -113,7 +112,7 @@ HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_output_write",
         "PUT",
-        r"^file://(?P<path>/[\w./-]+)$",
+        r"^(?:file:///[\w./-]+|https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[^\s#]+)$",
         ("output_id", "length"),
         "write one granted output destination under an exact output grant",
     ),
@@ -154,7 +153,7 @@ class Authorizer:
         if method != row.method:
             self._refuse(name, method, url, f"{name} is {row.method}, not {method}")
         if re.match(row.path, url) is None:
-            self._refuse(name, method, url, f"{url!r} does not match {row.path}")
+            self._refuse(name, method, url, f"{_safe_url(url)!r} does not match {row.path}")
         extra = sorted(set(params) - set(row.params))
         if extra:
             self._refuse(name, method, url, f"unenumerated params {', '.join(extra)}")
@@ -181,13 +180,32 @@ class Authorizer:
         )
 
     def _refuse(self, name: str, method: str, url: str, why: str) -> None:
-        event = {"call": name, "method": method, "url": url[:200], "why": why}
+        safe_url = _safe_url(url)
+        event = {"call": name, "method": method, "url": safe_url, "why": why}
         self.refusals.append(event)
         raise GrantRefusal(
             "hub_call_unauthorized",
-            f"SECURITY EVENT — {method} {url[:120]} as {name!r}: {why}. The worker's "
+            f"SECURITY EVENT — {method} {safe_url} as {name!r}: {why}. The worker's "
             "hub-call table is closed; a refusal is not a 404",
         )
+
+
+def _safe_url(url: str) -> str:
+    """One credential-free URL spelling for faults and events."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "<malformed-url>"
+    if parsed.scheme not in ("http", "https"):
+        return url[:200]
+    host = parsed.hostname or "<missing-host>"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "<malformed-url>"
+    if port is not None:
+        host += f":{port}"
+    return f"{parsed.scheme}://{host}{parsed.path[:120]}"
 
 
 # --------------------------------------------------------------------------- the join
@@ -739,6 +757,8 @@ def write_output(
     manifest entry and NOTHING else — the runtime may write under an exact output grant and
     cannot authorize readers, publish media, or decide a winning attempt.
     """
+    from cozy_runtime.internal import egress
+
     if expired(grant):
         raise GrantRefusal("grant_expired", "the output grant expired before the write")
     destination = grant.outputs.get(output_id)
@@ -769,12 +789,42 @@ def write_output(
             "output_too_large",
             f"{output_id}: {length} B over the granted {destination.max_bytes} B",
         )
+    parsed = _parse_grant_url(url)
+    if parsed.scheme == "https":
+        host = parsed.hostname or ""
+        try:
+            with source.open("rb") as opened:
+                if not stat.S_ISREG(os.fstat(opened.fileno()).st_mode):
+                    raise GrantRefusal(
+                        "output_spool_io", f"{output_id}: output spool is not a regular file"
+                    )
+                receipt = egress.put_from(
+                    url,
+                    egress.EgressPolicy(allowed_hosts=(host,)),
+                    opened,
+                    expected_length=length,
+                    media_type=media_type,
+                    what=f"output {output_id!r}",
+                )
+        except egress.EgressRefusal as exc:
+            raise GrantRefusal(exc.code, exc.detail) from exc
+        except GrantRefusal:
+            raise
+        except OSError as exc:
+            raise GrantRefusal(
+                "output_spool_io", f"{output_id}: streaming publication failed ({exc})"
+            ) from exc
+        return pb.OutputEntry(
+            output_id=output_id,
+            digest=receipt.sha256,
+            length=receipt.length,
+            mime_type=media_type or "application/octet-stream",
+        )
+
     path = _local(destination.url, grant.file_base_url)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        from cozy_runtime.internal import egress
-
         with (
             source.open("rb") as opened,
             tempfile.NamedTemporaryFile(
