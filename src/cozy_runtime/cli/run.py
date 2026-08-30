@@ -1,9 +1,10 @@
 """`cozy-runtime run` and `cozy-runtime job` — the git-clone contract's load-bearing verbs.
 
 One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` uses.
-Weightless entrypoints and jobs remain local. Model-bound entrypoints require Tensorhub's
-canonical selected provision closure; this verb refuses rather than minting a second flat
-binding contract.
+Weightless entrypoints and jobs remain local. Model-bound entrypoints use the explicit
+DevelopmentPackage lane: the existing package.toml resolver selects a local TensorFS Repository
+release and the worker independently re-derives that exact selection before STAGED. No flat
+binding record or published Qualification is minted.
 
 What this module DOES NOT do is decide anything the runtime decides. The plan, the ladder,
 the confession and the shortfall all arrive on the outcome; this renders them.
@@ -197,14 +198,7 @@ def run(
             "job lane is the next increment; today, run model-bound work as an entrypoint",
             Exit.structural,
         )
-    if slots:
-        raise CliError(
-            "structural",
-            f"{function} declares {len(slots)} model binding path(s), but flat local binding "
-            "records were removed",
-            "run through Tensorhub's selected canonical Plan/RMB/MCC provision closure",
-            Exit.structural,
-        )
+    overrides = _overrides(flags.get("--model") or [], slots)
 
     doc = _doc_for(body, function, kind)
     request_schema = doc["request"]
@@ -269,6 +263,9 @@ def run(
             workspace=workspace,
             package_revision_digest=package_revision_digest,
             package_descriptor=body if kind == "entrypoint" else None,
+            found=found,
+            development_artifact_store=config.cozy_home / "cas",
+            development_binding_overrides=overrides,
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=package_revision_digest,

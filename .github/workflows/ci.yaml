@@ -71,7 +71,7 @@ jobs:
     if: needs.tensorfs-credential.outputs.present == 'yes'
     runs-on: ubuntu-latest
     env:
-      TENSORFS_SHA: c6c598baca3799508f64b4ef02af542c9181dc27
+      TENSORFS_SHA: f645ee6a777cd32dca22144985099faa2276af4b
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -101,7 +101,7 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     env:
-      WORKER_PROTOCOL_SHA: ec39ea28ddebd22ab7124e47132b1fb015b2a6fd
+      WORKER_PROTOCOL_SHA: 8e0176983ac3d7f42c19e0659dbd435ebc18666e
     steps:
       - uses: actions/checkout@v4
       # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and

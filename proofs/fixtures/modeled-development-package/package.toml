@@ -1,0 +1,7 @@
+[application]
+object = "modeled_development_package:app"
+
+[bindings."TinyModel"]
+model = "proof/tiny-core"
+release = "1.0.0"
+lane = "cpu"

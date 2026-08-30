@@ -275,8 +275,15 @@ Source-checkout development is an explicit, same-user lane rather than a partial
 published package. Creator privately asks Runtime to author a `Placement.development` carrying
 package, semantic release, and source digest, then launches Runtime with the matching local path
 and facts. No project wheel, release.json, Environment, receipt, or Qualification is invented.
-This increment remains model-free and refuses modeled development as
-`development_modeled_unsupported`; Creator replaces the whole worker generation after edits.
+For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
+joins the exact release/lane through the explicitly granted local TensorFS Repository. The
+Placement carries the ordinary exact Manifest/config/component facts but no MCC; at acquisition
+the launch Runtime re-reads the source descriptor and TensorFS Manifest/header/config, derives the
+same binding locally, and compares every accepted fact before STAGED. Creator owns the source-file
+digest and closes its scan race before replacing the whole worker generation after edits; Runtime
+does not invent a second source hash. TensorFS logical assets and uploader/catalog stamps refuse
+typed in this first lane because the local Repository exposes neither as a directly usable
+selection authority.
 
 A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
 RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its
@@ -469,11 +476,13 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
     corpus/.venv/bin/python scripts/leaf-live.py all         # cr-006: the native-encoded rung — leaf replacement and the ranked chooser
 
-There is deliberately no model-bound `cozy-runtime run` GPU qualification. Flat local model
-bindings were removed; that command now exits 6 and requires Tensorhub's selected
-Plan/RMB/MCC provision closure. `scripts/pipeline-live.py image/arms` retain the real SDXL
-output and floor evidence, while `qualification/gpu/README.md` records why the obsolete
-CLI-versus-private comparison was retired instead of rebuilding deleted authority.
+Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
+`--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
+and the normal worker/attempt kernel applies the host's real GPU qualification. It never authors a
+flat binding record or pretends the local selection is a Hub Qualification. The focused
+`proofs/internal/modeled_development_acceptance.py` proof builds a tiny local release and checks
+selection/acquisition plus drift refusals without claiming GPU execution; the existing
+`scripts/pipeline-live.py image/arms` runs remain the real-GPU output and floor evidence.
 
 `scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
 735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.

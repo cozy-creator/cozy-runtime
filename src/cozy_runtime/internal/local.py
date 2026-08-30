@@ -46,12 +46,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from cozy_runtime.internal import canonical, descriptor
+from cozy_runtime.internal import bindings as binding_table
+from cozy_runtime.internal import canonical, descriptor, fill
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -79,12 +81,13 @@ class LocalBindingError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class StagedDevelopmentPlacement:
-    """One exact model-free PlacementSet selection for source-checkout development."""
+    """One exact PlacementSet selection for source-checkout development."""
 
     bindings: Mapping[str, str]
     placement: pb.Placement
     artifact_store: Path
     artifact_cache: Path
+    declared_bindings: Mapping[str, DeclaredBinding] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +96,7 @@ class DevelopmentPlacementDocuments:
 
     descriptor: bytes
     placement: pb.Placement
+    bindings: Mapping[str, DeclaredBinding] = field(default_factory=dict)
 
     def subjects(self) -> tuple[dict[str, Any], ...]:
         return tuple(
@@ -102,6 +106,27 @@ class DevelopmentPlacementDocuments:
             }
             for entrypoint in self.placement.entrypoints
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _DevelopmentModel:
+    slot: Any
+    repo: str
+    name: str
+    version: str
+    lane: str
+    manifest_digest: str
+    manifest_length: int
+    config_digest: str
+    config_bytes: bytes
+    components: tuple[str, ...]
+    assets: Mapping[str, Mapping[str, Any]]
+    stamps: Mapping[str, tuple[str, ...]]
+    store: Path
+    variant: str
+    custody: str
+    model_weight_bytes: int
+    vram_floor_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,9 +445,19 @@ class LocalRecordOwner:
                 raise RuntimeError(
                     f"accepted placement {accepted.placement_id!r}, offered {LOCAL_PLACEMENT!r}"
                 )
-            if construction:
+            modeled = bool(
+                self.placement is not None
+                and any(
+                    entrypoint.name == self.request.entrypoint and entrypoint.slots
+                    for entrypoint in self.placement.entrypoints
+                )
+            )
+            if modeled:
+                if len(construction) != hashlib.sha256().digest_size:
+                    raise RuntimeError("a local modeled acceptance lacks its construction identity")
+            elif construction:
                 raise RuntimeError("a local weightless acceptance invents model construction")
-            if (
+            elif (
                 accepted.plan.delivery != "native"
                 or accepted.plan.materialization
                 or accepted.plan.placement != "all_resident"
@@ -526,6 +561,31 @@ class LocalRecordOwner:
                 and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
                 and binding_digest in status.dispatchable_binding_digests
             )
+            if status is not None and not self.dispatched and not ready:
+                selected_fault = next(
+                    (
+                        fault
+                        for fault in report.faults
+                        if fault.subject in {LOCAL_PLACEMENT, self._binding_digest()}
+                        and fault.kind
+                        in {
+                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                        }
+                    ),
+                    None,
+                )
+                if selected_fault is not None:
+                    self.marks.setdefault("ready", time.perf_counter())
+                    self.ended = "worker_error"
+                    self.error = (
+                        f"placement activation refused: {selected_fault.reason}: "
+                        f"{selected_fault.detail}"
+                    )[:400]
+                    self.done.set()
+                    self.host.close()
+                    return
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
             self.dispatched = True
@@ -874,22 +934,40 @@ def stage_development_placement(
     package: str,
     release: str,
     source_digest: str,
+    found: Any = None,
+    artifact_store: Path | None = None,
+    binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
-    """Stage one exact model-free PlacementSet/1 for source-checkout development."""
+    """Stage one exact PlacementSet/1 plus its launch-local descriptor/config bytes."""
 
-    documents_ = development_placement_documents(
-        package_descriptor, package=package, release=release, source_digest=source_digest
-    )
     home = cozy_home.resolve()
     cache = home / "artifact-cache"
-    artifact_store = home / "store"
-    artifact_store.mkdir(parents=True, exist_ok=True)
+    selected_store = (artifact_store or home / "store").resolve()
+    if artifact_store is None:
+        selected_store.mkdir(parents=True, exist_ok=True)
+    documents_ = development_placement_documents(
+        package_descriptor,
+        package=package,
+        release=release,
+        source_digest=source_digest,
+        found=found,
+        cozy_home=home,
+        artifact_store=selected_store,
+        artifact_cache=cache,
+        binding_overrides=binding_overrides,
+    )
     _stage_exact(cache, documents_.descriptor)
     bindings = {
         entrypoint.name: documents.spell(entrypoint.entrypoint_binding_digest)
         for entrypoint in documents_.placement.entrypoints
     }
-    return StagedDevelopmentPlacement(bindings, documents_.placement, artifact_store, cache)
+    return StagedDevelopmentPlacement(
+        bindings,
+        documents_.placement,
+        selected_store,
+        cache,
+        documents_.bindings,
+    )
 
 
 def development_placement_documents(
@@ -898,8 +976,13 @@ def development_placement_documents(
     package: str,
     release: str,
     source_digest: str,
+    found: Any = None,
+    cozy_home: Path | None = None,
+    artifact_store: Path | None = None,
+    artifact_cache: Path | None = None,
+    binding_overrides: Mapping[str, str] | None = None,
 ) -> DevelopmentPlacementDocuments:
-    """Construct the exact local model-free selection without choosing storage paths."""
+    """Construct exact source and local-TensorFS selection facts through existing owners."""
 
     entries = package_descriptor.get("entrypoints")
     if not isinstance(entries, list):
@@ -907,12 +990,6 @@ def development_placement_documents(
     visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
-    modeled = sorted(str(entry.get("name", "")) for entry in visible if entry.get("models"))
-    if modeled:
-        raise RuntimeError(
-            "development_modeled_unsupported: source-checkout serving currently supports "
-            "model-free entrypoints only; modeled: " + ", ".join(modeled)
-        )
     if package.count("/") != 1 or not all(package.split("/")) or not release:
         raise RuntimeError("development package identity or release is invalid")
     try:
@@ -922,14 +999,139 @@ def development_placement_documents(
 
     descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
     descriptor_ref = _exact_ref(descriptor_bytes)
+    descriptor_path = ""
+    if artifact_cache is not None:
+        _, staged_descriptor = _stage_exact(artifact_cache, descriptor_bytes)
+        descriptor_path = str(staged_descriptor)
+    modeled_paths = sorted(
+        str(model.get("path", ""))
+        for entry in visible
+        for model in entry.get("models", [])
+        if isinstance(model, Mapping)
+    )
+    resolved_models: Mapping[str, _DevelopmentModel] = {}
+    if modeled_paths:
+        if found is None or cozy_home is None or artifact_store is None:
+            raise RuntimeError(
+                "development_model_resolution_absent: modeled development requires the "
+                "discovered package, COZY_HOME, and local TensorFS store"
+            )
+        resolved_models = _resolve_development_models(found, artifact_store, binding_overrides)
+        if sorted(resolved_models) != modeled_paths:
+            raise RuntimeError("development_model_mismatch: resolved binding paths changed")
+
+    model_ids = {path: f"model-{index:04d}" for index, path in enumerate(modeled_paths)}
+    models = [
+        pb.Model(
+            id=model_ids[path],
+            repo=f"{selected.repo}/{selected.name}",
+            version=selected.version,
+            lane=selected.lane,
+            manifest=pb.Ref(
+                digest=documents.raw(selected.manifest_digest),
+                length=selected.manifest_length,
+            ),
+        )
+        for path, selected in sorted(resolved_models.items())
+    ]
     entrypoints: list[pb.Entrypoint] = []
+    declared_bindings: dict[str, DeclaredBinding] = {}
     for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
         name = str(entry["name"])
-        binding_digest = hashlib.sha256(canonical.write({"name": name, "slots": []})).digest()
-        entrypoints.append(pb.Entrypoint(name=name, entrypoint_binding_digest=binding_digest))
+        selected_paths = sorted(
+            str(model.get("path", ""))
+            for model in entry.get("models", [])
+            if isinstance(model, Mapping)
+        )
+        if len(selected_paths) > 1:
+            raise RuntimeError(
+                f"development_multiple_models_unsupported: {name} declares "
+                f"{len(selected_paths)} model slots; this Runtime currently prepares one"
+            )
+        slots: list[pb.Slot] = []
+        selected = resolved_models[selected_paths[0]] if selected_paths else None
+        if selected is not None:
+            model_id = model_ids[selected.slot.path]
+            first_component = selected.components[0]
+            assets = [
+                pb.Asset(
+                    name=asset_name,
+                    model_id=model_id,
+                    ref=pb.Ref(
+                        digest=documents.raw(str(asset["digest"])),
+                        length=int(asset["length"]),
+                    ),
+                )
+                for asset_name, asset in sorted(selected.assets.items())
+            ]
+            stamps = [
+                pb.Stamp(component=first_component, key=key, values=list(values))
+                for key, values in sorted(selected.stamps.items())
+            ]
+            slots.append(
+                pb.Slot(
+                    slot=selected.slot.param,
+                    reference_model_id=model_id,
+                    config=pb.Config(
+                        document=pb.Ref(
+                            digest=documents.raw(selected.config_digest),
+                            length=len(selected.config_bytes),
+                        ),
+                        assets=assets,
+                    ),
+                    components=[
+                        pb.Component(component=component, model_id=model_id)
+                        for component in selected.components
+                    ],
+                    stamps=stamps,
+                )
+            )
+        entrypoint = pb.Entrypoint(name=name, slots=slots)
+        entrypoint.entrypoint_binding_digest = hashlib.sha256(
+            canonical.write({"name": name, "slots": [documents.body(slot) for slot in slots]})
+        ).digest()
+        entrypoints.append(entrypoint)
+
+        config_path = ""
+        if selected is not None and artifact_cache is not None:
+            _, staged_config = _stage_exact(artifact_cache, selected.config_bytes)
+            config_path = str(staged_config)
+        digest = documents.spell(entrypoint.entrypoint_binding_digest)
+        declared_bindings[digest] = DeclaredBinding(
+            entrypoint_binding_digest=digest,
+            entrypoint=name,
+            model_class=selected.slot.class_key if selected is not None else "",
+            model_binding_path=selected.slot.path if selected is not None else "",
+            model_parameter_name=selected.slot.param if selected is not None else "",
+            release=source_digest,
+            application=str(package_descriptor.get("application", "")),
+            descriptor_path=descriptor_path,
+            development_project=str(found.project) if found is not None else "",
+            store=str(selected.store) if selected is not None else "",
+            config=config_path,
+            variant=selected.variant if selected is not None else "",
+            reference_snapshot=selected.manifest_digest if selected is not None else "",
+            components=selected.components if selected is not None else (),
+            snapshots=(
+                {component: selected.manifest_digest for component in selected.components}
+                if selected is not None
+                else {}
+            ),
+            stamps=selected.stamps if selected is not None else {},
+            package_revision_digest=source_digest,
+            development=True,
+            model_weight_bytes=selected.model_weight_bytes if selected is not None else 0,
+            vram_floor_bytes=selected.vram_floor_bytes if selected is not None else 0,
+            custody=selected.custody if selected is not None else "canonical",
+        )
     entrypoint_bodies = [documents.body(entrypoint) for entrypoint in entrypoints]
     bindings_digest = hashlib.sha256(
-        canonical.write({"entrypoints": entrypoint_bodies, "models": []})
+        canonical.write(
+            {
+                "entrypoints": entrypoint_bodies,
+                "models": [documents.body(model) for model in models],
+            }
+        )
     ).digest()
     placement = pb.Placement(
         placement_id=LOCAL_PLACEMENT,
@@ -942,9 +1144,177 @@ def development_placement_documents(
             digest=documents.raw(str(descriptor_ref["digest"])), length=len(descriptor_bytes)
         ),
         bindings_digest=bindings_digest,
+        models=models,
         entrypoints=entrypoints,
     )
-    return DevelopmentPlacementDocuments(descriptor_bytes, placement)
+    return DevelopmentPlacementDocuments(descriptor_bytes, placement, declared_bindings)
+
+
+def _resolve_development_models(
+    found: Any,
+    artifact_store: Path,
+    binding_overrides: Mapping[str, str] | None = None,
+) -> Mapping[str, _DevelopmentModel]:
+    slots = [
+        slot
+        for surface in found.surfaces
+        if surface.kind == "entrypoint" and not surface.hidden
+        for slot in surface.model_bindings
+    ]
+    try:
+        chosen = binding_table.resolve(slots, found.bindings, overrides=binding_overrides)
+    except Exception as exc:
+        raise RuntimeError(f"development_model_binding_invalid: {exc}") from exc
+    try:
+        tensorfs = fill.tensorfs_module()
+    except fill.FillRefusal as exc:
+        raise RuntimeError(f"development_tensorfs_unavailable: {exc}") from exc
+
+    resolved: dict[str, _DevelopmentModel] = {}
+    store_root = artifact_store.resolve()
+    try:
+        if not store_root.is_dir():
+            raise FileNotFoundError(store_root)
+        store = tensorfs.Store.open(str(store_root))
+    except Exception as exc:
+        raise RuntimeError(
+            f"development_model_store_absent: {store_root}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not hasattr(store, "resolve_release"):
+        raise RuntimeError(
+            "development_tensorfs_resolver_unavailable: install TensorFS with Store.resolve_release"
+        )
+    for slot in sorted(slots, key=lambda item: item.path):
+        binding = chosen[slot.path]
+        repo, name, version = _exact_model_ref(binding.ref)
+        lane = binding.lane or ""
+        if not lane:
+            raise RuntimeError(
+                f"development_model_lane_missing: {binding.ref}: package.toml must select a lane"
+            )
+        try:
+            release = store.resolve_release(repo, name, version, lane)
+        except Exception as exc:
+            code = str(getattr(exc, "code", "MODEL_RELEASE_ABSENT")).lower()
+            raise RuntimeError(
+                f"development_model_missing: {binding.ref} lane={lane}: {code}"
+            ) from exc
+        manifest_digest = str(release["manifest_digest"])
+        manifest_length = int(release["manifest_length"])
+        try:
+            manifest = store.manifest(manifest_digest)
+            manifest_bytes = bytes(manifest["manifest"])
+            header = tensorfs.parse_header(bytes(manifest["header"]))
+        except Exception as exc:
+            raise RuntimeError(
+                f"development_model_manifest_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
+            ) from exc
+        measured_manifest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+        if measured_manifest != manifest_digest or (
+            manifest_length and manifest_length != len(manifest_bytes)
+        ):
+            raise RuntimeError(
+                f"development_model_manifest_mismatch: {binding.ref}: expected "
+                f"{manifest_digest}/{manifest_length}, measured "
+                f"{measured_manifest}/{len(manifest_bytes)}"
+            )
+        manifest_length = len(manifest_bytes)
+        configs = header.get("configs")
+        if not isinstance(configs, Mapping) or len(configs) != 1:
+            raise RuntimeError(
+                f"development_model_config_ambiguous: {binding.ref}: expected one config, "
+                f"found {len(configs) if isinstance(configs, Mapping) else 'invalid'}"
+            )
+        _, config = next(iter(configs.items()))
+        if not isinstance(config, Mapping):
+            raise RuntimeError(f"development_model_config_invalid: {binding.ref}")
+        config_digest = "sha256:" + str(config.get("sha256", ""))
+        config_length = int(config.get("length", 0))
+        try:
+            verdict = store.verify(config_digest)
+            config_bytes = bytes(store.document(config_digest))
+        except Exception as exc:
+            raise RuntimeError(
+                f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
+            ) from exc
+        measured_config = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+        if (
+            verdict.get("verdict") != "verified"
+            or measured_config != config_digest
+            or len(config_bytes) != config_length
+        ):
+            raise RuntimeError(
+                f"development_model_config_mismatch: {binding.ref}: expected "
+                f"{config_digest}/{config_length}, measured {measured_config}/{len(config_bytes)}"
+            )
+        components_value = header.get("components")
+        if not isinstance(components_value, Mapping) or not components_value:
+            raise RuntimeError(f"development_model_components_absent: {binding.ref}")
+        components = tuple(sorted(str(component) for component in components_value))
+        selected_assets = _development_assets(binding.ref, header.get("assets", {}))
+        actual_stamps = _development_stamps(binding.ref, slot.stamps)
+        try:
+            model_weight_bytes = sum(int(row["length"]) for row in store.walk(manifest_digest))
+        except Exception as exc:
+            raise RuntimeError(
+                f"development_model_inventory_invalid: {binding.ref}: {exc}"
+            ) from exc
+        resolved[slot.path] = _DevelopmentModel(
+            slot=slot,
+            repo=repo,
+            name=name,
+            version=version,
+            lane=lane,
+            manifest_digest=manifest_digest,
+            manifest_length=manifest_length,
+            config_digest=config_digest,
+            config_bytes=config_bytes,
+            components=components,
+            assets=selected_assets,
+            stamps=actual_stamps,
+            store=store_root,
+            # Repository lane and accelerator hardware are independent facts. Development
+            # carries no caller-authored hardware variant; the executor derives smNN from
+            # the measured device after it initializes the accelerator.
+            variant="",
+            custody="canonical",
+            model_weight_bytes=model_weight_bytes,
+            vram_floor_bytes=0,
+        )
+    return resolved
+
+
+def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"development_model_assets_invalid: {binding_ref}")
+    if value:
+        raise RuntimeError(
+            "development_model_assets_unsupported: local modeled development does not "
+            f"yet stream TensorFS logical assets for {binding_ref}"
+        )
+    return {}
+
+
+def _development_stamps(
+    binding_ref: str, required_stamps: Mapping[str, str]
+) -> Mapping[str, tuple[str, ...]]:
+    if required_stamps:
+        required = ", ".join(f"{key}={value}" for key, value in sorted(required_stamps.items()))
+        raise RuntimeError(
+            "development_model_stamps_unavailable: local TensorFS Repository releases "
+            f"carry no uploader/catalog stamp set for {binding_ref}: {required}"
+        )
+    return {}
+
+
+def _exact_model_ref(value: str) -> tuple[str, str, str]:
+    model, separator, version = value.partition("@")
+    parts = model.split("/")
+    if not separator or len(parts) != 2 or not all((*parts, version)):
+        raise RuntimeError(
+            f"development_model_ref_inexact: {value!r} must be exact org/name@release"
+        )
+    return parts[0], parts[1], version
 
 
 def _exact_ref(raw: bytes) -> dict[str, Any]:
@@ -1038,6 +1408,9 @@ def run_slice(
     workspace: Path,
     package_revision_digest: str,
     package_descriptor: Mapping[str, Any] | None = None,
+    found: Any = None,
+    development_artifact_store: Path | None = None,
+    development_binding_overrides: Mapping[str, str] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
     delete_journal: bool = True,
@@ -1067,6 +1440,9 @@ def run_slice(
             package="local/development-package",
             release="0.0.0",
             source_digest=source_digest,
+            found=found,
+            artifact_store=development_artifact_store,
+            binding_overrides=development_binding_overrides,
         )
         bindings.update(staged.bindings)
     stage_job_plans(config.cozy_home, job_records or [])
@@ -1094,6 +1470,7 @@ def run_slice(
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
             development_source_digest=documents.spell(staged.placement.development.source_digest),
+            development_binding_overrides=dict(development_binding_overrides or {}),
         )
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")

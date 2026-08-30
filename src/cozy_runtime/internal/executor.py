@@ -54,7 +54,7 @@ from cozy_runtime.author._invoke import (
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover_installed
+from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 
@@ -300,12 +300,34 @@ class Executor:
         # Every candidate is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
         # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so offering
         # four variants costs four header reads and no load.
+        # Development has no Hub MCC from which to inherit a hardware variant. Derive it
+        # from the executor's own selected device; Repository lane is never a substitute.
+        device_index = int(binding.get("device_index") or 0)
+        device_facts = measure_device(torch, device_index)
+        hardware_variant = str(binding.get("variant") or "")
+        if not hardware_variant:
+            if not binding.get("development"):
+                self.poisoned = "published hardware variant absent"
+                return {
+                    "ok": False,
+                    "code": "hardware_variant_absent",
+                    "detail": "a published binding must carry its qualified hardware variant",
+                }
+            if device_facts.kind != "cuda" or device_facts.sm <= 0:
+                self.poisoned = "development modeled accelerator unavailable"
+                return {
+                    "ok": False,
+                    "code": "development_modeled_accelerator_unavailable",
+                    "detail": "modeled source-checkout execution requires a measured CUDA "
+                    "device; no caller-authored hardware variant is accepted",
+                }
+            hardware_variant = f"sm{device_facts.sm}"
         offered = [
             v if isinstance(v, Variant) else Variant.read(v)
             for v in (binding.get("variants") or ())
         ] or [
             Variant(
-                name=str(binding.get("variant") or "default"),
+                name=hardware_variant,
                 store=binding["store"],
                 snapshot=binding["snapshot"],
                 snapshots=dict(per_component),
@@ -322,8 +344,6 @@ class Executor:
         # THE SELECTED DEVICE, not card zero (#549.9). `device_index` is the binding's, and
         # NVML is queried with it — a multi-GPU pod used to mint every record against GPU 0's
         # power cap and MIG profile whatever card the fill was about to use.
-        device_index = int(binding.get("device_index") or 0)
-        device_facts = measure_device(torch, device_index)
         runtime_identity = measure_runtime(torch, binding["release"])
         providers = launch_providers()
         qualified = qualify(
@@ -550,7 +570,7 @@ class Executor:
         registry = ModelRegistry(
             release=binding["release"],
             backend=backend,
-            substrate=lambda: serving_substrate(binding["variant"], seen),
+            substrate=lambda: serving_substrate(hardware_variant, seen),
         )
         try:
             # `expect` is INSIDE the handler because it now takes the verified read lease:
@@ -638,7 +658,7 @@ class Executor:
                 # ModelConstructionContract destination sets are canonicalized by component.
                 # Construction traversal order is not identity and cannot change this fence.
                 "components": sorted(record.components),
-                "variant": binding["variant"],
+                "variant": hardware_variant,
             }
         )
         # The CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
@@ -765,13 +785,18 @@ class Executor:
         }
 
     def _discover_provisioned(self, binding: Mapping[str, Any]) -> None:
-        """Import only the installed application and bind it to the exact descriptor."""
+        """Import the installed release or explicit development source and bind its descriptor."""
 
         application = str(binding.get("application") or "")
         descriptor_path = str(binding.get("package_descriptor") or "")
         if not application or not descriptor_path:
             raise RuntimeError("executor requires the canonical installed release identity")
-        discovered = discover_installed(application)
+        development_project = str(binding.get("development_project") or "")
+        discovered = (
+            discover(Path(development_project))
+            if development_project
+            else discover_installed(application)
+        )
         published = descriptor.read_bytes(Path(descriptor_path).read_bytes(), descriptor_path)
         descriptor.compare(
             published,

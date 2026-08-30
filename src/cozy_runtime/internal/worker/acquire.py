@@ -150,20 +150,84 @@ class AcquiredPlacement:
     trusted_reuse_bytes: int
 
 
-def preinstalled_development(placement: Any, cache_root: Path) -> AcquiredPlacement:
-    """Resolve a source-checkout development placement without inventing an install overlay.
+def preinstalled_development(
+    placement: Any,
+    cache_root: Path,
+    expected_placement: Any,
+    bindings: Mapping[str, DeclaredBinding],
+) -> AcquiredPlacement:
+    """Admit one independently re-derived source-checkout selection.
 
-    Published execution uses :class:`Acquirer` and an exact qualified EnvironmentReceipt. This
-    explicit same-user lane executes its launch-local source and trusts no invented release,
-    project wheel, environment, or qualification document.
+    The launch Runtime has re-read package.toml and the exact local TensorFS Repository,
+    Manifest, header and config.  This function compares that derivation with every accepted
+    Placement fact before handing the normal attempt kernel its local resolution paths.  No
+    PackageRelease, Qualification or Environment is invented for this same-user lane.
     """
 
-    if placement.models or any(entrypoint.get("slots") for entrypoint in placement.entrypoints):
+    actual = placement.document
+    expected = documents.body(expected_placement)
+    if actual.get("package_descriptor") != expected.get("package_descriptor"):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "development_placement_not_weightless",
-            "source-checkout execution supports only model-free entrypoints",
+            "development_source_changed",
+            "the current checkout derives a different PackageDescriptor",
         )
+    if actual.get("models", []) != expected.get("models", []):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+            "development_model_manifest_changed",
+            "the local TensorFS Repository now resolves different exact model Manifests",
+        )
+    actual_entries = {str(row.get("name", "")): row for row in actual.get("entrypoints", [])}
+    expected_entries = {str(row.get("name", "")): row for row in expected.get("entrypoints", [])}
+    if set(actual_entries) != set(expected_entries):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "development_entrypoint_set_changed",
+            "the current checkout exposes a different entrypoint set",
+        )
+    for name, selected in expected_entries.items():
+        accepted = actual_entries[name]
+        selected_slots = selected.get("slots", [])
+        accepted_slots = accepted.get("slots", [])
+        if len(selected_slots) != len(accepted_slots):
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "development_model_slot_changed",
+                name,
+            )
+        for selected_slot, accepted_slot in zip(selected_slots, accepted_slots, strict=True):
+            if selected_slot.get("config") != accepted_slot.get("config"):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
+                    "development_model_config_changed",
+                    name,
+                )
+            if selected_slot.get("components", []) != accepted_slot.get("components", []):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "development_model_components_changed",
+                    name,
+                )
+            if selected_slot.get("stamps", []) != accepted_slot.get("stamps", []):
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "development_model_stamps_changed",
+                    name,
+                )
+            if selected_slot != accepted_slot:
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    "development_model_slot_changed",
+                    name,
+                )
+    if actual != expected:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "development_placement_changed",
+            "the accepted Placement does not equal the launch Runtime's local derivation",
+        )
+
     descriptor_digest, descriptor_length = placement.package_descriptor
     descriptor_path = cache_root / descriptor_digest.removeprefix("sha256:")
     _verify_file(descriptor_path, descriptor_digest, descriptor_length)
@@ -176,31 +240,42 @@ def preinstalled_development(placement: Any, cache_root: Path) -> AcquiredPlacem
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
         ) from exc
     visible = _visible_entrypoints(descriptor)
-    selected = {str(row["name"]): row for row in placement.entrypoints}
-    if set(visible) != set(selected):
+    if set(visible) != set(expected_entries):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "binding_entrypoint_set_mismatch",
             "PlacementSet/1 does not cover every descriptor entrypoint",
         )
-    source_digest = str(placement.development["source_digest"])
-    bindings = {
-        str(row["entrypoint_binding_digest"]): DeclaredBinding(
-            entrypoint_binding_digest=str(row["entrypoint_binding_digest"]),
-            entrypoint=name,
-            package_revision_digest=source_digest,
-            release=source_digest,
-            environment_digest="",
-            development=True,
-            model_class="",
-            model_binding_path="",
-            model_parameter_name="",
-            application=str(descriptor.get("application", "")),
-            descriptor_path=str(descriptor_path),
-        )
-        for name, row in selected.items()
+    selected_digests = {
+        str(row["entrypoint_binding_digest"]): row for row in expected_entries.values()
     }
-    return AcquiredPlacement(None, bindings, 0, 1, 0, 0, descriptor_length, 0)
+    if set(bindings) != set(selected_digests):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "development_binding_set_changed",
+            "the locally derived bindings do not cover the exact selected entrypoints",
+        )
+    verified = descriptor_length
+    documents_count = 1
+    for digest, binding in bindings.items():
+        selected = selected_digests[digest]
+        slots = selected.get("slots", [])
+        if not slots:
+            continue
+        config = slots[0]["config"]["document"]
+        _verify_file(Path(binding.config), str(config["digest"]), int(config["length"]))
+        verified += int(config["length"])
+        documents_count += 1
+    return AcquiredPlacement(
+        None,
+        bindings,
+        len(placement.models),
+        documents_count,
+        0,
+        0,
+        verified,
+        0,
+    )
 
 
 class Acquirer:
