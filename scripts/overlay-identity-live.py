@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from cozy_runtime.internal import canonical, child_env, jit_cache, native_wheel, overlay
+from cozy_runtime import qualification
+from cozy_runtime.internal import (
+    canonical,
+    child_env,
+    jit_cache,
+    native_wheel,
+    overlay,
+)
 from cozy_runtime.internal.worker import acquire, artifact_access, child
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -663,24 +670,43 @@ def main() -> int:
         else:
             raise AssertionError("no-kernel-image operator failure was admitted")
 
-        proof_python = Path(sys.prefix) / "bin" / "python"
-        assert proof_python.is_file()
-        request_path = root / "native-request-wrong-python.json"
-        evidence_path = root / "native-evidence-wrong-python.json"
-        request_path.write_bytes(
-            canonical.write(
+        native_payload = canonical.write(
+            qualification.document(
+                "native-wheel",
                 {
-                    "device_index": None,
-                    "package_environment_spec_digest": digest(b"native-custom"),
-                    "environment_root": str(root / "native-custom-installed"),
-                    "expected_result_digest": canonical.digest({"value": 3}),
-                    "fixture": "proof_native_custom.fixture:run",
+                    "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
+                    "host_capability": {"gpu": None, "seat": measured_seat},
+                    "host_qualification": native_host,
                     "installed_environment_receipt_digest": native_installed.receipt_digest,
-                    "python": str(proof_python),
-                    "wheelhouse_manifest": str(manifest),
-                }
+                    "operator_observation": operator_evidence,
+                    "overlay_content_digest": native_installed.content_digest,
+                    "package_environment_spec_digest": digest(b"native-custom"),
+                    "static_inspection": native_inspection.document(),
+                    "wheelhouse_manifest_digest": family,
+                },
             )
         )
+        kind, native_evidence = qualification.read(native_payload)
+        assert kind == "native-wheel"
+        assert native_evidence["installed_environment_receipt_digest"] == (
+            native_installed.receipt_digest
+        )
+
+        proof_python = Path(sys.prefix) / "bin" / "python"
+        assert proof_python.is_file()
+        native_request = {
+            "device_index": None,
+            "package_environment_spec_digest": digest(b"native-custom"),
+            "environment_root": str(root / "native-custom-installed"),
+            "expected_result_digest": canonical.digest({"value": 3}),
+            "fixture": "proof_native_custom.fixture:run",
+            "installed_environment_receipt_digest": native_installed.receipt_digest,
+            "python": str(proof_python),
+            "wheelhouse_manifest": str(manifest),
+        }
+        request_path = root / "native-request-wrong-python.json"
+        evidence_path = root / "native-evidence-wrong-python.json"
+        request_path.write_bytes(canonical.write(native_request))
         cli_result = subprocess.run(
             [
                 sys.executable,

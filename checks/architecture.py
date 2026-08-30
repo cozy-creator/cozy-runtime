@@ -5,7 +5,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   forbidden-dependency · canonical-numbers · artifact-object-sets · torch-free-import
   package-imports · author-import-boundary · prelaunch-version
   env-authority · single-config · no-interactive · excluded-keywords
-  document-kinds · implementation-ids · report-format-tags
+  document-kinds · qualification-kinds · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
@@ -1156,7 +1156,7 @@ DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
     "cozy.runtime.EnvironmentReceipt/1": "internal/overlay.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
-    "cozy.runtime.Qualification/1": "internal/qualification.py",
+    "cozy.runtime.Qualification/1": "qualification.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
@@ -1210,6 +1210,17 @@ def versioned_literals() -> Iterator[tuple[pathlib.Path, str, int, str]]:
 def fence_document_kinds() -> list[str]:
     """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
     bad: list[str] = []
+    expected = {
+        "cozy.package.descriptor/1",
+        "cozy.runtime.EnvironmentReceipt/1",
+        "cozy.runtime.ModelConstructionContract/1",
+        "cozy.runtime.Qualification/1",
+    }
+    if set(DOCUMENT_KINDS) != expected:
+        bad.append(
+            "Runtime document survivors differ from the proto-007 hardcut: "
+            f"got={sorted(DOCUMENT_KINDS)} expected={sorted(expected)}"
+        )
     for path, rel, lineno, kind in versioned_literals():
         if (
             kind.startswith(FOREIGN_KIND_PREFIXES)
@@ -1229,6 +1240,53 @@ def fence_document_kinds() -> list[str]:
                 f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
                 f"{owner} — a second declaration of one kind"
             )
+    return bad
+
+
+def fence_qualification_kinds() -> list[str]:
+    """Every retained Qualification arm has one real producer, reader, and durable writer."""
+
+    roles = {
+        "execution": (
+            SRC / "internal" / "acceptance.py",
+            ROOT / "proofs" / "internal" / "acceptance_observation.py",
+            SRC / "cli" / "acceptance_proof.py",
+            "handle.write(body)",
+        ),
+        "model": (
+            SRC / "cli" / "model_contract_proof.py",
+            ROOT / "proofs" / "support" / "model_contract.py",
+            SRC / "cli" / "model_contract_proof.py",
+            "temporary / INDEX_NAME",
+        ),
+        "native-wheel": (
+            SRC / "cli" / "native_wheel_proof.py",
+            ROOT / "scripts" / "overlay-identity-live.py",
+            SRC / "cli" / "native_wheel_proof.py",
+            "_publish(evidence_path, payload)",
+        ),
+    }
+    bad: list[str] = []
+    qualification = (SRC / "qualification.py").read_text()
+    for kind, (producer, reader, storage, storage_marker) in roles.items():
+        if f'"{kind}": frozenset(' not in qualification:
+            bad.append(f"Qualification kind {kind!r} has no closed evidence field set")
+        if (
+            re.search(rf'qualification\.document\(\s*"{re.escape(kind)}"', producer.read_text())
+            is None
+        ):
+            bad.append(f"{producer.relative_to(ROOT)}: does not produce Qualification {kind!r}")
+        reader_source = reader.read_text()
+        if ".read(" not in reader_source or (
+            f'kind != "{kind}"' not in reader_source and f'kind == "{kind}"' not in reader_source
+        ):
+            bad.append(f"{reader.relative_to(ROOT)}: does not read Qualification {kind!r}")
+        if storage_marker not in storage.read_text():
+            bad.append(
+                f"{storage.relative_to(ROOT)}: does not durably publish Qualification {kind!r}"
+            )
+    if '"environment": frozenset(' in qualification:
+        bad.append("Qualification retains dead environment arm; EnvironmentReceipt is the proof")
     return bad
 
 
@@ -1547,6 +1605,7 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
+    "qualification-kinds": fence_qualification_kinds,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,
     "construction-fill-order": fence_construction_fill_order,

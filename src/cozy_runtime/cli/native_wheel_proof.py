@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from cozy_runtime import qualification
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
     canonical,
@@ -20,7 +21,6 @@ from cozy_runtime.internal import (
     jit_cache,
     native_wheel,
     overlay,
-    qualification,
     spawn,
 )
 from cozy_runtime.internal.exits import Exit

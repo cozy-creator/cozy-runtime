@@ -214,26 +214,24 @@ def author(
     placements = [
         {
             "placement_id": PLACEMENT_ID,
-            "spec": {
-                "binding_plans": [
-                    {
-                        "digest": plan_digest,
-                        "kind": "plan",
-                        "length": length,
-                        "subject_id": plan_digest,
-                    }
-                    for plan_digest, length in release.plan_refs
-                ],
-                "package_descriptor_digest": digest(descriptor_bytes),
-                "package_release_id": PACKAGE_RELEASE,
-                "environment_spec_digest": digest(spec),
-                "installed_environment_receipt_digest": digest(installed.receipt_bytes),
-                "model_object_set": {
-                    "digest": digest(model_object_set),
-                    "kind": "model_object_set",
-                    "length": len(model_object_set),
-                    "subject_id": digest(model_object_set),
-                },
+            "binding_plans": [
+                {
+                    "digest": plan_digest,
+                    "kind": "plan",
+                    "length": length,
+                    "subject_id": plan_digest,
+                }
+                for plan_digest, length in release.plan_refs
+            ],
+            "package_descriptor_digest": digest(descriptor_bytes),
+            "package_release_id": PACKAGE_RELEASE,
+            "environment_spec_digest": digest(spec),
+            "installed_environment_receipt_digest": digest(installed.receipt_bytes),
+            "model_object_set": {
+                "digest": digest(model_object_set),
+                "kind": "model_object_set",
+                "length": len(model_object_set),
+                "subject_id": digest(model_object_set),
             },
         }
     ]

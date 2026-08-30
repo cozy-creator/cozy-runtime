@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime import qualification
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, contract, overlay, qualification, sandbox
+from cozy_runtime.internal import canonical, contract, overlay, sandbox
 from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StalePackageDescriptor

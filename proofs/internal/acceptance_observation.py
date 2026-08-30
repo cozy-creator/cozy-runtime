@@ -20,7 +20,8 @@ from typing import Any, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
 from proof_data import installed_base_ownership, inventory, pack_installed, wheel
 
-from cozy_runtime.internal import canonical, descriptor, local, overlay, qualification
+from cozy_runtime import qualification
+from cozy_runtime.internal import canonical, descriptor, local, overlay
 from cozy_runtime.internal.config import read_config
 from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.worker.session import WorkerOptions

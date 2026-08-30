@@ -4,6 +4,10 @@ The command that produced a qualification supplies the context and request versi
 successful, independently retained evidence needs a portable discriminator.  Environment, model,
 native-wheel, and execution qualification therefore share this one closed envelope instead of
 each growing request, result, inspection, and observation formats of its own.
+
+Environment qualification does not get an arm here: the EnvironmentReceipt is already the exact
+measured proof-seat observation.  Wrapping it would create the second environment document this
+collapse is meant to remove.
 """
 
 from __future__ import annotations
@@ -14,12 +18,9 @@ from typing import Any, Literal, cast
 from cozy_runtime.internal import canonical
 
 FORMAT = "cozy.runtime.Qualification/1"
-Kind = Literal["environment", "execution", "model", "native-wheel"]
-KINDS = frozenset({"environment", "execution", "model", "native-wheel"})
+Kind = Literal["execution", "model", "native-wheel"]
+KINDS = frozenset({"execution", "model", "native-wheel"})
 EVIDENCE_FIELDS = {
-    # Environment qualification never repeats the measured environment.  It identifies the one
-    # EnvironmentReceipt that passed the proof seat; those receipt bytes remain the observation.
-    "environment": frozenset({"environment_receipt"}),
     "execution": frozenset(
         {
             "accelerator_qualification",

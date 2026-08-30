@@ -28,7 +28,7 @@ from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
 
-from cozy_runtime.internal import qualification as runtime_qualification
+from cozy_runtime import qualification as runtime_qualification
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 

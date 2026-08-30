@@ -25,7 +25,8 @@ from typing import Any, cast
 
 from google.protobuf.json_format import ParseDict, ParseError
 
-from cozy_runtime.internal import canonical, descriptor, overlay, provisioned, qualification, warm
+from cozy_runtime import qualification
+from cozy_runtime.internal import canonical, descriptor, overlay, provisioned, warm
 from cozy_runtime.internal.placement_materialization import package_overlay_input
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.plan import PlanRefusal
