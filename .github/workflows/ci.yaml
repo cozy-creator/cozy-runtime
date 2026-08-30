@@ -10,8 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.14
       - run: uv sync
+      - run: >-
+          uv run python -c "import sys, sysconfig;
+          assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 14)
+          and sysconfig.get_config_var('Py_GIL_DISABLED') == 0"
+      - name: Refuse the free-threaded CPython ABI
+        run: |
+          if uv run --isolated --no-project --python 3.14t python -c \
+            "import sys; sys.path.insert(0, 'src'); import cozy_runtime" 2>cp314t.err; then
+            echo "cozy-runtime admitted cp314t" >&2
+            exit 1
+          fi
+          grep -F "cozy-runtime requires standard CPython 3.14 (cp314, not cp314t)" cp314t.err
       - run: uv run ruff check .
       # Formatting is a DETERMINISM check like the others here: one canonical rendering of
       # the tree, so a diff is only ever a change of meaning. The generated `worker_pb2*`
@@ -71,7 +84,8 @@ jobs:
     if: needs.tensorfs-credential.outputs.present == 'yes'
     runs-on: ubuntu-latest
     env:
-      TENSORFS_SHA: f645ee6a777cd32dca22144985099faa2276af4b
+      TENSORFS_SHA: 1e6f5e6d1d9846836161939e0e687dea12ad8d4a
+      TENSORFS_VERSION: 0.0.2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -80,10 +94,14 @@ jobs:
           ref: ${{ env.TENSORFS_SHA }}
           path: .tensorfs
           token: ${{ secrets.TENSORFS_TOKEN }}
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - uses: dtolnay/rust-toolchain@1.91.1
       - run: uv sync
       - run: uv pip install .tensorfs
+      - run: >-
+          test "$(uv run python -c
+          'import importlib.metadata; print(importlib.metadata.version("tensorfs"))')"
+          = "$TENSORFS_VERSION"
       - run: uv run python checks/architecture.py --only reviewed-specs-exist
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
@@ -126,7 +144,7 @@ jobs:
           path: .worker-protocol
           token: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
       - if: steps.credential.outputs.present == 'yes'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
       - if: steps.credential.outputs.present == 'yes'
         uses: actions/setup-go@v5
         with:

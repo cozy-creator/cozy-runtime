@@ -206,7 +206,7 @@ def local_hub(base: str) -> bool:
     host = urllib.parse.urlsplit(base).hostname or ""
     try:
         answers = egress.resolve(host)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return False
     return bool(answers) and all("loopback" in egress.blocked(a) for a in answers)
 

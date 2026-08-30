@@ -204,6 +204,11 @@ STATIC_ARMS = (
 
 OMISSION_ARMS = (
     OmissionArm(
+        "python-abi",
+        SRC / "_interpreter.py",
+        '    or sysconfig.get_config_var("Py_GIL_DISABLED") == 1\n',
+    ),
+    OmissionArm(
         "dynamic-pods-skip-boot-warm",
         SRC / "cli" / "runtime_worker.py",
         "        no_warm=True,\n",

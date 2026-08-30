@@ -11,6 +11,10 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
+Runtime `0.0.7` targets the standard CPython 3.14 ABI only. Project tooling pins `3.14`;
+the separate free-threaded `cp314t` ABI is deliberately refused until Runtime, Torch, TensorFS
+and the complete native dependency set have an independently qualified free-threaded seat.
+
 Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
 baseline recorded. From v1 onward the distribution major is the Python compatibility major:
 minor releases are additive, breaking author changes require a new major, and candidate base

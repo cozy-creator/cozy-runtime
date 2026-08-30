@@ -88,7 +88,7 @@ def _cancelled(root: Path, request_id: str) -> bool:
     """Whether the worker's one cooperative marker names this exact attempt."""
     try:
         return (root / "executor.cancel").read_text() == request_id
-    except (OSError, UnicodeError):
+    except OSError, UnicodeError:
         return False
 
 

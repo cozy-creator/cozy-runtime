@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Generic, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
 from cozy_runtime.author._assets import (
@@ -782,7 +782,7 @@ class Egress(_Bound):
         return result
 
 
-class Settings(Generic[T]):
+class Settings[T]:
     """Typed deployment settings. The author declares the strict schema; the VALUES are
     owned by the deployment config plane, validated against it and digest-pinned into the
     execution spec. No ambient environment variable ever carries configuration (§3.5)."""
@@ -793,7 +793,7 @@ class Settings(Generic[T]):
         self.value = value
 
 
-class Secrets(Generic[S]):
+class Secrets[S]:
     """Granted secrets against a strict named schema — a bare unbounded bag is invalid.
     Never raw getenv; injectable only when the capability is declared."""
 

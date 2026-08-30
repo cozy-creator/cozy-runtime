@@ -867,7 +867,7 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
             try:
                 terminal_for(hub, request, args.observe, since)
                 delivered += 1
-            except (TimeoutError, RuntimeError):
+            except TimeoutError, RuntimeError:
                 print(f"  ... round {round_no}: {request} produced no terminal on its stream")
         wl.check(
             "every round's terminal is delivered on the stream that dispatched it",

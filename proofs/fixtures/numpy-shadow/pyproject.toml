@@ -2,7 +2,7 @@
 name = "proof-numpy-shadow"
 version = "1.0.0"
 description = "Repository-only base import-root collision fixture"
-requires-python = ">=3.11"
+requires-python = ">=3.14,<3.15"
 dependencies = []
 
 [build-system]

@@ -108,7 +108,7 @@ def _cgroup_path() -> Path | None:
     """This process's cgroup v2 directory, or None when it cannot be resolved."""
     try:
         line = Path("/proc/self/cgroup").read_text().strip().splitlines()[0]
-    except (OSError, IndexError):
+    except OSError, IndexError:
         return None
     _, _, relative = line.partition("::")
     if not relative:
@@ -127,7 +127,7 @@ def oom_kills() -> int:
             key, _, value = line.partition(" ")
             if key == "oom_kill":
                 return int(value)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return -1
     return -1
 

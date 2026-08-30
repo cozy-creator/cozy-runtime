@@ -394,7 +394,7 @@ def _release(
             "package": "proof/proof-package",
             "package_descriptor": _ref(b'{"descriptor":true}'),
             "project_wheel": project_fact,
-            "requires_python": ">=3.11",
+            "requires_python": ">=3.14,<3.15",
             "requirements": [],
             "release": "1.0.0",
             "source_files": [],

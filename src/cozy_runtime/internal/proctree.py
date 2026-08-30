@@ -321,7 +321,7 @@ def _full_proc_visibility(process_uid: int, *, require_environment: bool) -> boo
                 (entry / "environ").read_bytes()
         except FileNotFoundError:
             continue  # one birth ended during the census
-        except (OSError, StopIteration, ValueError):
+        except OSError, StopIteration, ValueError:
             return False
     return True
 
@@ -885,7 +885,7 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
                 process_group=int(fields[2]),
                 scope_token=expected in environment,
             )
-        except (FileNotFoundError, ProcessLookupError):
+        except FileNotFoundError, ProcessLookupError:
             continue
         except (OSError, StopIteration, IndexError, ValueError) as exc:
             observed = (
@@ -1113,7 +1113,7 @@ def process_state(process: ProcessIdentity) -> str | None:
         if int(fields[19]) != process.started_ticks:
             return None
         return fields[0]
-    except (ProcessLookupError, IndexError, ValueError):
+    except ProcessLookupError, IndexError, ValueError:
         return None
 
 
@@ -1140,7 +1140,7 @@ def progress_burn(pid: int) -> int:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
         ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
-    except (OSError, IndexError, ValueError):
+    except OSError, IndexError, ValueError:
         return -1
     burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
     try:
@@ -1148,7 +1148,7 @@ def progress_burn(pid: int) -> int:
             line.split(": ", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines() if line
         )
         return burned + int(io["read_bytes"])
-    except (OSError, KeyError, ValueError):
+    except OSError, KeyError, ValueError:
         return burned  # no `io` for this process; the CPU hand still decides
 
 
@@ -1185,7 +1185,7 @@ def available_host_bytes() -> int:
             if v2_limit != "max":
                 current = int((cgroup / "memory.current").read_text().strip())
                 return max(int(v2_limit) - current, 0)
-        except (OSError, StopIteration, ValueError):
+        except OSError, StopIteration, ValueError:
             pass
     else:
         try:
@@ -1195,12 +1195,12 @@ def available_host_bytes() -> int:
             # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
             if 0 < v1_limit < (1 << 60):
                 return max(v1_limit - current, 0)
-        except (ContainmentUnavailable, OSError, ValueError):
+        except ContainmentUnavailable, OSError, ValueError:
             pass
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
+    except OSError, IndexError, ValueError:
         return -1
     return -1

@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Concatenate,
-    Generic,
     NoReturn,
     ParamSpec,
     Protocol,
@@ -274,7 +273,7 @@ def _is_async(fn: Callable[..., object]) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
 
-def _sync_wrapper(
+def _sync_wrapper[M: _ScopedModel, **P, R](
     fn: Callable[Concatenate[M, P], R], components: tuple[str, ...]
 ) -> Callable[Concatenate[M, P], R]:
     @functools.wraps(fn)
@@ -287,7 +286,7 @@ def _sync_wrapper(
     return wrapper
 
 
-def _async_wrapper(
+def _async_wrapper[M: _ScopedModel, **P, R](
     fn: Callable[Concatenate[M, P], R], components: tuple[str, ...]
 ) -> Callable[Concatenate[M, P], R]:
     """The scope stays active THROUGH `await` — the lease is the method's, not the step's."""
@@ -325,7 +324,7 @@ def _refuse_lazy(method: str, result: object) -> None:
 # --------------------------------------------------------------------------- model
 
 
-class Model(Generic[PipelineT]):
+class Model[PipelineT]:
     """Base of a package's reusable model class — the ONE long-lived model boundary.
 
     The author owns WHAT the model is (`load`/`unload`, declared persistent state, the
