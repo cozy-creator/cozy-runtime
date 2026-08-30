@@ -294,7 +294,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         ),
         [spec["binding"]],
         workspace=workspace,
-        release_id=RELEASE,
+        package_revision_digest=RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=RELEASE, no_warm=True),
         delete_journal=False,
     )

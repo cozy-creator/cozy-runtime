@@ -276,7 +276,7 @@ def run_job(
         [],
         job_records=[record],
         workspace=workspace,
-        release_id=record["build_id"],
+        package_revision_digest=record["build_id"],
         options=WorkerOptions(
             root=workspace / "worker", release_id=record["build_id"], no_warm=True
         ),
@@ -624,7 +624,7 @@ def _oversize_arm() -> None:
         [],
         job_records=[record],
         workspace=workspace,
-        release_id=record["build_id"],
+        package_revision_digest=record["build_id"],
         options=WorkerOptions(
             root=workspace / "worker", release_id=record["build_id"], no_warm=True
         ),

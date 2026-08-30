@@ -775,10 +775,14 @@ def start_worker(
     project = weightless_project or Path(
         str((overrides or {}).get("project") or ROOT / "corpus" / "package")
     )
+    development_args: tuple[str, ...] = ()
     if weightless_project is not None:
         from cozy_runtime.internal import descriptor
         from cozy_runtime.internal.discovery import discover
-        from cozy_runtime.internal.local import stage_weightless_release
+        from cozy_runtime.internal.local import (
+            development_source_digest,
+            stage_development_placement,
+        )
 
         # The device child intentionally erases PYTHONPATH. Build a harness-owned ordinary
         # environment so the arm crosses the same installed-package boundary as a
@@ -799,11 +803,27 @@ def start_worker(
                 ],
                 check=True,
             )
-        staged = stage_weightless_release(home, descriptor.build(discover(project)))
+        staged = stage_development_placement(
+            home,
+            descriptor.build(discover(project)),
+            package="local/development-package",
+            release="0.0.0",
+            source_digest=development_source_digest(project),
+        )
         ids = dict(staged.bindings)
         placement = staged.placement
         artifact_store = staged.artifact_store
         artifact_cache = staged.artifact_cache
+        development_args = (
+            "--development-project",
+            str(project),
+            "--development-package",
+            staged.placement.development.package,
+            "--development-release",
+            staged.placement.development.release,
+            "--development-source-digest",
+            documents.spell(staged.placement.development.source_digest),
+        )
     else:
         executor_python = Path(sys.executable)
         ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
@@ -820,7 +840,19 @@ def start_worker(
             entries.append(pb.Entrypoint(name=name, entrypoint_binding_digest=binding_digest))
         placement = pb.Placement(
             placement_id=PLACEMENT,
-            package_release=pb.Ref(digest=b"r" * 32, length=1),
+            package=pb.PackageSelection(
+                package="cozy/sdxl-package",
+                release="1.0.0",
+                release_digest=hashlib.sha256(release.encode()).digest(),
+                project_wheel=pb.WheelFact(
+                    ref=pb.Ref(digest=b"r" * 32, length=1),
+                    distribution="sdxl-package",
+                    version="1.0.0",
+                    filename="sdxl_package-1.0.0-py3-none-any.whl",
+                    import_roots=["sdxl_gpu"],
+                    tags=["py3-none-any"],
+                ),
+            ),
             environment_digest=documents.embedded_document_digest(
                 documents.body(selected_environment), "cozy.worker.v1.Environment"
             ),
@@ -875,7 +907,7 @@ def start_worker(
         str(artifact_store),
         "--artifact-cache",
         str(artifact_cache),
-        *(("--development-project", str(project)) if weightless_project is not None else ()),
+        *development_args,
         *(("--no-warm",) if no_warm else ()),
         *extra,
     ]
@@ -956,7 +988,7 @@ def make_spec(
     else:
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
     spec = pb.InvocationSpec(
-        package_release_id=release,
+        package_revision_digest="sha256:" + hashlib.sha256(release.encode()).hexdigest(),
         environment_digest="sha256:" + "11" * 32,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
@@ -2617,7 +2649,7 @@ def section_results(args: argparse.Namespace) -> None:
         pair_payload = {"steps": 1, "latent": 48}
         body_bytes, payload_path = stage_payload(tmp, "req-pair", pair_payload)
         spec = pb.InvocationSpec(
-            package_release_id=RELEASE,
+            package_revision_digest="sha256:" + hashlib.sha256(RELEASE.encode()).hexdigest(),
             environment_digest="sha256:" + "11" * 32,
             config_digest="sha256:" + "22" * 32,
             payload_digest="sha256:" + hashlib.sha256(body_bytes).hexdigest(),

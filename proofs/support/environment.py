@@ -405,7 +405,12 @@ def _release(
         wheels=[_proto_wheel(row) for row in selected_rows],
     )
     return {
-        "package_release": _write(root / "package-release.json", package_release),
+        "package": {
+            "package": f"proof/{project_fact['distribution']}",
+            "project_wheel": project_fact,
+            "release": project_fact["version"],
+            "release_digest": _digest(package_release),
+        },
         "environment": _write(
             root / "environment.json",
             _canonical({**documents.body(environment), "wheels": selected_rows}),

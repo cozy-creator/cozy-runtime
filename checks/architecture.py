@@ -26,7 +26,9 @@ import json
 import pathlib
 import re
 import sys
+import tempfile
 import tomllib
+import types
 from collections.abc import Iterator
 
 from packaging.version import InvalidVersion, Version
@@ -786,9 +788,15 @@ def fence_tensorhub_package_release() -> list[str]:
         str(project_ref.get("digest")): root / "wheels" / "proof_package-1.0.0-py3-none-any.whl",
         str(dependency_ref.get("digest")): root / "wheels" / "proof_custom-1.0.0-py3-none-any.whl",
     }
+    package = {
+        "package": release.get("package"),
+        "project_wheel": project,
+        "release": release.get("release"),
+        "release_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+    }
     try:
         joined = package_overlay_input(
-            package_release_bytes=raw,
+            package=package,
             environment=environment,
             environment_digest=environment_digest,
             wheelhouse_manifest_bytes=manifest,
@@ -805,7 +813,7 @@ def fence_tensorhub_package_release() -> list[str]:
     flat.pop("ref", None)
     try:
         package_overlay_input(
-            package_release_bytes=canonical.write({**release, "project_wheel": flat}),
+            package={**package, "project_wheel": flat},
             environment=environment,
             environment_digest=environment_digest,
             wheelhouse_manifest_bytes=manifest,
@@ -1163,13 +1171,26 @@ def fence_qualification_selection() -> list[str]:
     from cozy_runtime.internal import canonical
 
     ref = {"digest": "sha256:" + "1" * 64, "length": 1}
+    package = {
+        "package": "proof/proof-package",
+        "project_wheel": {
+            "distribution": "proof-package",
+            "filename": "proof_package-1.0.0-py3-none-any.whl",
+            "import_roots": ["proof_package"],
+            "ref": ref,
+            "tags": ["py3-none-any"],
+            "version": "1.0.0",
+        },
+        "release": "1.0.0",
+        "release_digest": "sha256:" + "5" * 64,
+    }
     try:
         selected = qualification.selection_digest(
             bindings_digest="sha256:" + "2" * 64,
             environment_digest="sha256:" + "3" * 64,
             environment_receipt=ref,
             package_descriptor=ref,
-            package_release=ref,
+            package=package,
         )
         raw = canonical.write(qualification.document(selected))
         if qualification.read(raw) != selected:
@@ -1179,12 +1200,88 @@ def fence_qualification_selection() -> list[str]:
             environment_digest="sha256:" + "3" * 64,
             environment_receipt=ref,
             package_descriptor=ref,
-            package_release=ref,
+            package=package,
         )
         if changed == selected:
             return ["Qualification selection ignores bindings_digest"]
     except qualification.QualificationError as exc:
         return [f"Qualification selection refused its own closed tuple: {exc}"]
+    return []
+
+
+def fence_development_placement() -> list[str]:
+    """Development is explicit and never aliases source identity to an Environment."""
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cozy_runtime.internal import canonical, descriptor, local
+    from cozy_runtime.internal.discovery import discover
+    from cozy_runtime.internal.worker import acquire, session
+    from cozy_runtime.protocol import documents
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    source_digest = "sha256:" + "7" * 64
+    built = local.development_placement_documents(
+        descriptor.build(discover(ROOT / "examples" / "marco-polo")),
+        package="paul/marco-polo-package",
+        release="1.0.3",
+        source_digest=source_digest,
+    )
+    placement_set = pb.PlacementSet(placements=[built.placement])
+    positive = documents.canonical_bytes(placement_set)
+    desired = pb.DesiredPlacementSet(
+        placement_set_digest=documents.digest_of(positive),
+        placement_set_canonical_bytes=positive,
+    )
+    try:
+        parsed = session.read_placement_set(desired)[0]
+    except documents.DocumentError as exc:
+        return [f"development Placement refused: {exc}"]
+    forbidden = {
+        "environment", "environment_digest", "environment_receipt_digest", "qualification"
+    } & set(parsed)
+    if forbidden:
+        return [f"development Placement carries published field {sorted(forbidden)[0]}"]
+
+    mutant = documents.document(placement_set)
+    placement = mutant["placements"][0]
+    assert isinstance(placement, dict)
+    placement["environment_digest"] = source_digest
+    mutant_bytes = canonical.write(mutant)
+    try:
+        session.read_placement_set(
+            pb.DesiredPlacementSet(
+                placement_set_digest=documents.digest_of(mutant_bytes),
+                placement_set_canonical_bytes=mutant_bytes,
+            )
+        )
+    except documents.DocumentError as exc:
+        if exc.code != "development_fields_invalid":
+            return [f"development environment alias refused as {exc.code}"]
+    else:
+        return ["development Placement admitted source_digest as environment_digest"]
+
+    descriptor_digest = documents.spell(built.placement.package_descriptor.digest)
+    with tempfile.TemporaryDirectory() as directory:
+        cache = pathlib.Path(directory)
+        (cache / descriptor_digest.removeprefix("sha256:")).write_bytes(built.descriptor)
+        acquired = acquire.preinstalled_development(
+            types.SimpleNamespace(
+                models=(),
+                entrypoints=tuple(documents.body(row) for row in built.placement.entrypoints),
+                package_descriptor=(descriptor_digest, len(built.descriptor)),
+                development={
+                    "package": "paul/marco-polo-package",
+                    "release": "1.0.3",
+                    "source_digest": source_digest,
+                },
+            ),
+            cache,
+        )
+    if any(
+        binding.environment_digest or not binding.development
+        for binding in acquired.bindings.values()
+    ):
+        return ["development binding invented an Environment identity"]
     return []
 
 
@@ -1504,6 +1601,7 @@ FENCES = {
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
     "qualification-selection": fence_qualification_selection,
+    "development-placement": fence_development_placement,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,
     "construction-fill-order": fence_construction_fill_order,

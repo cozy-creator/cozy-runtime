@@ -270,7 +270,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         request,
         None if project is not None else [binding_record(spec["entrypoint"])],
         workspace=workspace,
-        release_id=RELEASE,
+        package_revision_digest=RELEASE,
         package_descriptor=package_descriptor,
         options=options,
         delete_journal=bool(spec.get("delete_journal", True)),

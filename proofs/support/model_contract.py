@@ -23,7 +23,6 @@ from proof_data import pack_installed as _pack_installed
 from proof_data import parse_canonical as _parse_canonical
 from proof_data import parse_json as _parse_json
 from proof_data import read_json as _read_json
-from proof_data import ref as _ref
 from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
@@ -39,9 +38,7 @@ _STATE_FIELDS = {
     "environment_digest",
     "package_descriptor",
     "package_descriptor_digest",
-    "package_release",
-    "package_release_digest",
-    "package_release_length",
+    "package",
     "wheelhouse_manifest",
 }
 
@@ -152,26 +149,19 @@ def _prepare(args: argparse.Namespace) -> None:
         "the descriptor still carries the retired hidden field",
     )
     project_row = _wheel(project, import_roots=True)
-    package_release = _canonical(
-        {
-            "dependency_wheels": [],
-            "format": "cozy.package.release/1",
-            "package": "proof/proof-package",
-            "package_descriptor": _ref(descriptor_bytes),
-            "project_wheel": {
+    package = {
+        "package": "proof/proof-package",
+        "project_wheel": {
                 "ref": {"digest": project_row["digest"], "length": project_row["length"]},
                 "distribution": project_row["distribution"],
                 "filename": project_row["filename"],
                 "import_roots": project_row["import_roots"],
                 "tags": project_row["tags"],
                 "version": project_row["version"],
-            },
-            "requires_python": ">=3.11",
-            "requirements": [],
-            "release": "1.0.0",
-            "source_files": [],
-        }
-    )
+        },
+        "release": "1.0.0",
+        "release_digest": _digest(b"proof release.json provenance"),
+    }
     environment = pb.Environment(
         wheelhouse_manifest=pb.Ref(digest=documents.digest_of(wheelhouse), length=len(wheelhouse))
     )
@@ -180,7 +170,6 @@ def _prepare(args: argparse.Namespace) -> None:
         _canonical({**environment_body, "format": "cozy.worker.v1.Environment/1"})
     )
     paths = {
-        "package_release": _write(inputs / "package-release.json", package_release),
         "environment": _write(
             inputs / "environment.json",
             _canonical(environment_body),
@@ -191,6 +180,7 @@ def _prepare(args: argparse.Namespace) -> None:
     wheel_files = {project.digest: str(package_path)}
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
+        "package": package,
         "python": str(args.python.resolve()),
         "wheel_files": wheel_files,
     }
@@ -209,9 +199,7 @@ def _prepare(args: argparse.Namespace) -> None:
             "package_descriptor_digest": _digest(descriptor_bytes),
             "descriptor_length": len(descriptor_bytes),
             "environment_digest": documents.spell(environment_digest),
-            "package_release": str(paths["package_release"]),
-            "package_release_digest": _digest(package_release),
-            "package_release_length": len(package_release),
+            "package": package,
             "wheelhouse_manifest": str(paths["wheelhouse_manifest"]),
         },
     )
@@ -241,11 +229,7 @@ def _write_model_request(root: Path, name: str) -> None:
                 "length": state["descriptor_length"],
                 "path": state["package_descriptor"],
             },
-            "package_release": {
-                "digest": state["package_release_digest"],
-                "length": state["package_release_length"],
-                "path": state["package_release"],
-            },
+            "package": state["package"],
             "environment_generation": environment["generation"],
             "environment_digest": state["environment_digest"],
             "installed_environment_receipt": {

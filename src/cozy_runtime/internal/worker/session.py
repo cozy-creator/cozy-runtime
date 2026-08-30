@@ -204,6 +204,10 @@ class WorkerOptions:
     artifact_client: artifact_access.ArtifactClient | None = None
     development_project: Path | None = None
     """Source-checkout-only model-free execution; product local venvs leave this absent."""
+    development_package: str = ""
+    development_release: str = ""
+    development_source_digest: str = ""
+    """Exact launch facts the development Placement must echo."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -229,7 +233,8 @@ class Placement:
 
     placement_id: str
     placement_set_digest: bytes
-    package_release: tuple[str, int]
+    package: dict[str, Any]
+    development: dict[str, Any]
     environment_digest: bytes
     environment_receipt_digest: bytes
     package_descriptor: tuple[str, int]
@@ -248,6 +253,14 @@ class Placement:
     #: #474/#485c: the predecessor kept for restore. EMPTY means replacement is PAUSED —
     #: fallback capability is a PRECONDITION of replacement, not a nicety.
     retained_fallback_placement_set_digest: bytes = b""
+
+    @property
+    def execution_digest(self) -> str:
+        """Published release.json provenance or explicit development source identity."""
+
+        return str(
+            self.package.get("release_digest") or self.development.get("source_digest") or ""
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,6 +399,11 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
 
 
 HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
+SEMVER = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 
 def _closed_document(value: object, fields: set[str], name: str) -> dict[str, Any]:
@@ -452,10 +470,50 @@ def _wheel_fact(value: object, name: str) -> dict[str, Any]:
     return row
 
 
+def _package_selection(value: object) -> dict[str, Any]:
+    row = _closed_document(
+        value, {"package", "release", "release_digest", "project_wheel"}, "PackageSelection"
+    )
+    _required(row, {"package", "release", "release_digest", "project_wheel"}, "PackageSelection")
+    package = _identifier(row["package"], "PackageSelection.package")
+    release = _identifier(row["release"], "PackageSelection.release")
+    if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
+        raise documents.DocumentError("package_invalid", "package identity or release is invalid")
+    if (
+        not isinstance(row["release_digest"], str)
+        or HASH_ENTRY.fullmatch(row["release_digest"]) is None
+    ):
+        raise documents.DocumentError("package_invalid", "release_digest is malformed")
+    project = _wheel_fact(row["project_wheel"], "PackageSelection.project_wheel")
+    if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
+        raise documents.DocumentError("project_wheel_mismatch", package)
+    return row
+
+
+def _development_package(value: object) -> dict[str, Any]:
+    row = _closed_document(
+        value, {"package", "release", "source_digest"}, "DevelopmentPackage"
+    )
+    _required(row, {"package", "release", "source_digest"}, "DevelopmentPackage")
+    package = _identifier(row["package"], "DevelopmentPackage.package")
+    release = _identifier(row["release"], "DevelopmentPackage.release")
+    if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
+        raise documents.DocumentError(
+            "development_invalid", "package identity or release is invalid"
+        )
+    if (
+        not isinstance(row["source_digest"], str)
+        or HASH_ENTRY.fullmatch(row["source_digest"]) is None
+    ):
+        raise documents.DocumentError("development_invalid", "source_digest is malformed")
+    return row
+
+
 def _placement_profile(entry: dict[str, Any]) -> None:
     fields = {
         "placement_id",
-        "package_release",
+        "package",
+        "development",
         "environment_digest",
         "environment_receipt_digest",
         "package_descriptor",
@@ -468,38 +526,65 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     _closed_document(entry, fields, "Placement")
     _required(
         entry,
-        fields - {"models"},
+        {"placement_id", "package_descriptor", "bindings_digest", "entrypoints"},
         "Placement",
     )
     _identifier(entry["placement_id"], "Placement.placement_id")
-    for name in ("package_release", "package_descriptor", "qualification"):
-        _exact_ref(entry[name], f"Placement.{name}")
-    for name in ("environment_digest", "environment_receipt_digest", "bindings_digest"):
-        if not isinstance(entry[name], str) or HASH_ENTRY.fullmatch(entry[name]) is None:
-            raise documents.DocumentError("malformed_digest", f"Placement.{name}")
-
-    environment = _closed_document(
-        entry["environment"], {"wheelhouse_manifest", "wheels"}, "Environment"
-    )
-    _required(environment, {"wheelhouse_manifest"}, "Environment")
-    _exact_ref(environment["wheelhouse_manifest"], "Environment.wheelhouse_manifest")
-    wheels = environment.get("wheels", [])
-    if not isinstance(wheels, list):
-        raise documents.DocumentError("wrong_type", "Environment.wheels")
-    wheel_rows = [
-        _wheel_fact(row, f"Environment.wheels[{index}]") for index, row in enumerate(wheels)
-    ]
-    names = [str(row["distribution"]) for row in wheel_rows]
-    if names != sorted(set(names)):
-        raise documents.DocumentError("sort_order", "Environment.wheels")
-    measured_environment = documents.spell(
-        documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
-    )
-    if measured_environment != entry["environment_digest"]:
-        raise documents.DocumentError(
-            "environment_digest_mismatch",
-            f"measured {measured_environment}, expected {entry['environment_digest']}",
+    _exact_ref(entry["package_descriptor"], "Placement.package_descriptor")
+    if (
+        not isinstance(entry["bindings_digest"], str)
+        or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None
+    ):
+        raise documents.DocumentError("malformed_digest", "Placement.bindings_digest")
+    published = "package" in entry
+    development = "development" in entry
+    if published == development:
+        raise documents.DocumentError("package_mode_invalid", "select exactly one package mode")
+    if published:
+        package = _package_selection(entry["package"])
+        _required(
+            entry,
+            {"environment_digest", "environment_receipt_digest", "qualification", "environment"},
+            "Placement",
         )
+        _exact_ref(entry["qualification"], "Placement.qualification")
+        for name in ("environment_digest", "environment_receipt_digest"):
+            if not isinstance(entry[name], str) or HASH_ENTRY.fullmatch(entry[name]) is None:
+                raise documents.DocumentError("malformed_digest", f"Placement.{name}")
+        environment = _closed_document(
+            entry["environment"], {"wheelhouse_manifest", "wheels"}, "Environment"
+        )
+        _required(environment, {"wheelhouse_manifest"}, "Environment")
+        _exact_ref(environment["wheelhouse_manifest"], "Environment.wheelhouse_manifest")
+        wheels = environment.get("wheels", [])
+        if not isinstance(wheels, list):
+            raise documents.DocumentError("wrong_type", "Environment.wheels")
+        wheel_rows = [
+            _wheel_fact(row, f"Environment.wheels[{index}]")
+            for index, row in enumerate(wheels)
+        ]
+        names = [str(row["distribution"]) for row in wheel_rows]
+        if names != sorted(set(names)):
+            raise documents.DocumentError("sort_order", "Environment.wheels")
+        if package["project_wheel"]["distribution"] in names:
+            raise documents.DocumentError("project_wheel_mismatch", "project wheel is in overlay")
+        measured_environment = documents.spell(
+            documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
+        )
+        if measured_environment != entry["environment_digest"]:
+            raise documents.DocumentError(
+                "environment_digest_mismatch",
+                f"measured {measured_environment}, expected {entry['environment_digest']}",
+            )
+    else:
+        _development_package(entry["development"])
+        forbidden = {
+            "environment_digest", "environment_receipt_digest", "qualification", "environment"
+        } & set(entry)
+        if forbidden:
+            raise documents.DocumentError(
+                "development_fields_invalid", f"development carries {sorted(forbidden)[0]}"
+            )
 
     models = entry.get("models", [])
     if not isinstance(models, list):
@@ -612,6 +697,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
             )
     if entrypoint_names != sorted(set(entrypoint_names)):
         raise documents.DocumentError("sort_order", "Placement.entrypoints")
+    if development and (models or any(entrypoint.get("slots") for entrypoint in entrypoints)):
+        raise documents.DocumentError(
+            "development_modeled_unsupported",
+            "source-checkout serving currently supports model-free entrypoints only",
+        )
     expected_bindings = (
         "sha256:"
         + hashlib.sha256(
@@ -1681,16 +1771,15 @@ class Worker:
         # every materialization failure free.
         entry = placements[0]
         placement_id = str(entry.get("placement_id", ""))
-        package_release = dict(entry.get("package_release", {}))
+        package = dict(entry.get("package", {}))
+        development = dict(entry.get("development", {}))
         package_descriptor = dict(entry.get("package_descriptor", {}))
         qualification = dict(entry.get("qualification", {}))
         candidate = Placement(
             placement_id=placement_id,
             placement_set_digest=desired_set.placement_set_digest,
-            package_release=(
-                str(package_release.get("digest", "")),
-                int(package_release.get("length", 0)),
-            ),
+            package=package,
+            development=development,
             environment_digest=_digest_field(entry.get("environment_digest")),
             environment_receipt_digest=_digest_field(entry.get("environment_receipt_digest")),
             package_descriptor=(
@@ -1954,21 +2043,25 @@ class Worker:
         Returns the installed generation, or None having already typed the fault and left the
         outgoing placement serving.
         """
-        expected = documents.spell(placement.environment_receipt_digest)
-        if not expected:
-            self._materialization_failed(
-                placement,
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=placement.placement_id,
-                    reason="environment_receipt_absent_from_spec",
-                    detail="a Placement names the receipt a completed materialization "
-                    "must measure to; a spec without one is unmaterializable",
-                ),
-                terminal=True,
-            )
-            return None
         if self.options.development_project is not None:
+            expected_development = {
+                "package": self.options.development_package,
+                "release": self.options.development_release,
+                "source_digest": self.options.development_source_digest,
+            }
+            if placement.development != expected_development or placement.package:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        subject=placement.placement_id,
+                        reason="development_launch_mismatch",
+                        detail="the development Placement does not equal this process's exact "
+                        "package, release, and source digest",
+                    ),
+                    terminal=True,
+                )
+                return None
             if self.options.artifact_cache is None:
                 self._materialization_failed(
                     placement,
@@ -1982,7 +2075,7 @@ class Worker:
                 )
                 return None
             try:
-                return acquire.preinstalled_weightless(placement, self.options.artifact_cache)
+                return acquire.preinstalled_development(placement, self.options.artifact_cache)
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,
@@ -1995,6 +2088,33 @@ class Worker:
                     terminal=True,
                 )
                 return None
+        if placement.development:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=placement.placement_id,
+                    reason="development_project_absent",
+                    detail="a development Placement requires an explicit same-user "
+                    "--development-project launch",
+                ),
+                terminal=True,
+            )
+            return None
+        expected = documents.spell(placement.environment_receipt_digest)
+        if not expected:
+            self._materialization_failed(
+                placement,
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=placement.placement_id,
+                    reason="environment_receipt_absent_from_spec",
+                    detail="a published Placement names the receipt a completed materialization "
+                    "must measure to; a spec without one is unmaterializable",
+                ),
+                terminal=True,
+            )
+            return None
         if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
@@ -3584,6 +3704,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="verified TensorFS store populated from selected model Manifests",
     )
     parser.add_argument("--development-project", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--development-package", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--development-release", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--development-source-digest", default="", help=argparse.SUPPRESS)
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -3620,6 +3743,31 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             flush=True,
         )
         return int(Exit.structural)
+    development_values = (
+        args.development_project,
+        args.development_package,
+        args.development_release,
+        args.development_source_digest,
+    )
+    if any(development_values) and not all(development_values):
+        print(
+            "[worker] development project, package, release, and source digest come together",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
+    if all(development_values) and (
+        args.development_package.count("/") != 1
+        or not all(args.development_package.split("/"))
+        or SEMVER.fullmatch(args.development_release) is None
+        or HASH_ENTRY.fullmatch(args.development_source_digest) is None
+    ):
+        print(
+            "[worker] development package identity, semantic release, or source digest is invalid",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
     options = WorkerOptions(
         root=Path(args.root),
         worker_id=args.worker_id,
@@ -3638,6 +3786,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         development_project=(
             Path(args.development_project).resolve() if args.development_project else None
         ),
+        development_package=args.development_package,
+        development_release=args.development_release,
+        development_source_digest=args.development_source_digest,
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

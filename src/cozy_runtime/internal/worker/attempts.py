@@ -877,14 +877,22 @@ class AttemptEngine:
                 f"no entrypoint binding {plan_id[:24]}… is selected on this worker",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        package_release_id = declared.package_release
-        if attempt.spec.get("package_release_id") != package_release_id:
+        package_revision_digest = declared.package_revision_digest
+        if attempt.spec.get("package_revision_digest") != package_revision_digest:
             raise AttemptRefusal(
-                "package_release_mismatch",
-                "InvocationSpec does not name the selected PackageRelease",
+                "package_revision_mismatch",
+                "InvocationSpec does not name the selected package revision digest",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        if attempt.spec.get("environment_digest") != declared.environment_digest:
+        if declared.development and attempt.spec.get("environment_digest"):
+            raise AttemptRefusal(
+                "development_environment_present",
+                "development execution has no published Environment identity",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        if not declared.development and (
+            attempt.spec.get("environment_digest") != declared.environment_digest
+        ):
             raise AttemptRefusal(
                 "environment_mismatch",
                 "InvocationSpec does not name the selected Environment",

@@ -44,7 +44,7 @@ _VARIANT = re.compile(r"^sm[0-9]{2,}$")
 REQUEST_FIELDS = {
     "bindings",
     "package_descriptor",
-    "package_release",
+    "package",
     "environment_generation",
     "environment_digest",
     "installed_environment_receipt",
@@ -91,7 +91,7 @@ class ProofRequest:
     environment_generation: Path
     environment_digest: str
     installed_environment_receipt: DocumentRef
-    package_release: LocalDocumentRef
+    package: Mapping[str, Any]
     package_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
     wheelhouse_manifest: Path
@@ -213,7 +213,7 @@ def _read_request(path: Path) -> ProofRequest:
         installed_environment_receipt=_ref(
             value["installed_environment_receipt"], "installed_environment_receipt"
         ),
-        package_release=_local_ref(value["package_release"], "package_release"),
+        package=_package(value["package"]),
         package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
         bindings=bindings,
         wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
@@ -243,6 +243,32 @@ def _binding(value: object, index: int) -> BindingRequest:
         config=_local_ref(value["config"], f"{name}.config"),
         hardware_variants=tuple(variants),
     )
+
+
+def _package(value: object) -> Mapping[str, Any]:
+    fields = {"package", "project_wheel", "release", "release_digest"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _request_error("package is not one closed PackageSelection")
+    identity = value.get("package")
+    release = value.get("release")
+    release_digest = value.get("release_digest")
+    wheel = value.get("project_wheel")
+    if (
+        not isinstance(identity, str)
+        or identity.count("/") != 1
+        or not all(identity.split("/"))
+        or not isinstance(release, str)
+        or not release
+        or not isinstance(release_digest, str)
+        or canonical.DIGEST_RE.fullmatch(release_digest) is None
+        or not isinstance(wheel, dict)
+        or not isinstance(wheel.get("ref"), dict)
+    ):
+        raise _request_error("package identity, release, provenance, or project wheel is invalid")
+    _ref(wheel["ref"], "package.project_wheel.ref")
+    if wheel.get("distribution") != identity.split("/", 1)[1] or wheel.get("version") != release:
+        raise _request_error("project wheel does not match package release")
+    return value
 
 
 def _ref(value: object, name: str) -> DocumentRef:
@@ -369,8 +395,7 @@ def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOver
             "verified receipt length differs from the request",
         )
     receipt = canonical.parse_canonical(installed.receipt_bytes)
-    release = canonical.parse_canonical(_read_exact(request.package_release, "package_release"))
-    project_wheel = release.get("project_wheel") if isinstance(release, dict) else None
+    project_wheel = request.package.get("project_wheel")
     project_ref = project_wheel.get("ref") if isinstance(project_wheel, dict) else None
     project_digest = project_ref.get("digest") if isinstance(project_ref, dict) else None
     if not isinstance(receipt, dict) or receipt.get("project_wheel_digest") != project_digest:
@@ -562,7 +587,7 @@ def _derive_all(
                         binding,
                         source,
                         config,
-                        release=request.package_release.digest,
+                        release=str(request.package["release_digest"]),
                         application=found.application,
                         variant=variant,
                     )
@@ -709,7 +734,7 @@ def _decode_child(
         if len(raw) != length or _sha(raw) != digest:
             raise ProofRefusal("model_contract_child_invalid", "contract stored-byte identity")
         parsed = contract.read_contract(raw)
-        if parsed.candidate.release != request.package_release.digest:
+        if parsed.candidate.release != request.package["release_digest"]:
             raise ProofRefusal("model_contract_child_invalid", "contract release identity")
         documents[digest] = raw
     functions = response["functions"]
@@ -720,9 +745,7 @@ def _decode_child(
         "package_descriptor": DocumentRef(
             request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
-        "package_release": DocumentRef(
-            request.package_release.digest, request.package_release.length
-        ).render(),
+        "package": dict(request.package),
         "environment_digest": request.environment_digest,
         "functions": functions,
         "installed_environment_receipt": request.installed_environment_receipt.render(),

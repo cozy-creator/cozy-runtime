@@ -147,14 +147,20 @@ def write_weightless_project(project: Path) -> None:
     (project / "package.toml").write_text(PACKAGE_TOML)
 
 
-def stage_weightless(home: Path, project: Path) -> Any:
-    """Stage this fixture through the production local weightless constructor."""
+def stage_development(home: Path, project: Path) -> Any:
+    """Stage this fixture through the production local development constructor."""
     from cozy_runtime.internal import descriptor, local
     from cozy_runtime.internal.discovery import discover
 
     write_weightless_project(project)
     found = discover(project)
-    return local.stage_weightless_release(home, descriptor.build(found))
+    return local.stage_development_placement(
+        home,
+        descriptor.build(found),
+        package="local/development-package",
+        release="0.0.0",
+        source_digest=local.development_source_digest(project),
+    )
 
 
 def start_weightless(
@@ -188,6 +194,9 @@ def start_weightless(
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     write_weightless_project(project)
+    from cozy_runtime.internal.local import development_source_digest
+
+    source_digest = development_source_digest(project)
     socket_path = str(tmp / f"control-{len(os.listdir(tmp))}.sock")
     env = {
         "PATH": os.environ["PATH"],
@@ -235,8 +244,14 @@ def start_weightless(
         socket_path,
         "--out",
         str(root),
-        "--weightless-package",
+        "--development-project",
         str(project),
+        "--development-package",
+        "local/development-package",
+        "--development-release",
+        "0.0.0",
+        "--development-source-digest",
+        source_digest,
         *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
         RELEASE,
@@ -1206,7 +1221,7 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True)
     root.mkdir(parents=True)
-    staged = stage_weightless(home, project)
+    staged = stage_development(home, project)
     detached_file = tmp / "detached.pid"
     package = project / "lifecycle_package.py"
     package.write_text(

@@ -227,7 +227,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         ),
         [spec["binding"]],
         workspace=workspace,
-        release_id=S.RELEASE,
+        package_revision_digest=S.RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=S.RELEASE, no_warm=True),
         delete_journal=False,
         record_owner_hook=hook,

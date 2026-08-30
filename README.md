@@ -244,7 +244,8 @@ canonical ownership document for that image: its existing platform target and ex
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
 sorted unique import roots: the image rows in `WheelhouseManifest/1`, the project row in
-`PackageRelease/1`, and each selected overlay row embedded in `PlacementSet/1`. Runtime strictly parses those exact bytes, rejects
+`Placement.package.project_wheel`, and each selected overlay row embedded in `PlacementSet/1`.
+Runtime strictly parses those exact facts, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
 roots, requires custom declarations to equal the measurement, and rejects a root collision with
 the manifest's providers or a duplicate project/custom root before extraction or publication.
@@ -267,6 +268,13 @@ the identity split refuses before binding. Native/local development keeps its ex
 lane. Base bytecode is baked in the image and package bytecode is compiled once per content
 identity. The executor starts with image Python and appends the exact content import root after
 image-owned paths.
+
+Source-checkout development is an explicit, same-user lane rather than a partially qualified
+published package. Creator privately asks Runtime to author a `Placement.development` carrying
+package, semantic release, and source digest, then launches Runtime with the matching local path
+and facts. No project wheel, release.json, Environment, receipt, or Qualification is invented.
+This increment remains model-free and refuses modeled development as
+`development_modeled_unsupported`; Creator replaces the whole worker generation after edits.
 
 A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
 RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its
@@ -332,7 +340,7 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-The CLI proof builds and installs the current wheel plus an ordinary weightless package
+The CLI proof builds and installs the current wheel plus an ordinary model-free source package
 fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
 `cozy-runtime` command. It proves the current process exit matrix, read-only and exact-byte
 Descriptor/1 behavior, canonical/local/strict key classification through a real job, typed
@@ -343,7 +351,7 @@ private hooks are not presented as CLI evidence. The full scenario census and re
 are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
-Its closed local request names the exact PackageRelease, selected Environment and base
+Its closed local request names the direct PackageSelection, selected Environment and base
 WheelhouseManifest, plus every overlay wheel file by digest,
 the installed-base Python, a fresh overlay root, and a fresh receipt output. `wheel_files`
 contains only the project and optional custom wheels; base wheel bytes do not travel. It
@@ -357,7 +365,12 @@ set is closed; every path value is a normalized absolute local path:
 
 ```json
 {
-  "package_release": "/proof/package-release.json",
+  "package": {
+    "package": "org/package",
+    "release": "1.0.0",
+    "release_digest": "sha256:<64 lowercase hex>",
+    "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}
+  },
   "environment": "/proof/environment.json",
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
@@ -412,11 +425,7 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
   "environment_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
   "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
-  "package_release": {
-    "path": "/proof/package-release.json",
-    "digest": "sha256:<64 lowercase hex>",
-    "length": 3456
-  },
+  "package": {"package": "org/package", "release": "1.0.0", "release_digest": "sha256:<64 lowercase hex>", "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}},
   "package_descriptor": {
     "path": "/proof/package.descriptor.json",
     "digest": "sha256:<64 lowercase hex>",

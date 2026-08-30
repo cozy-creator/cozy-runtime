@@ -293,11 +293,10 @@ class DeclaredBinding:
     """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
     empty after `resolve` — a record naming none offers exactly the bytes the ref resolved
     to, and that one IS the reference because there is nothing to compare it against."""
-    package_release: str = ""
-    """WHICH package release this binding belongs to — `project`'s PATH-FREE counterpart
-    (#506a), and the reason a weightless construction key never has to name a directory.
-    Empty falls back to `release`, which is what a record that names no package release
-    already carried for a weightless binding."""
+    package_revision_digest: str = ""
+    """Published release.json provenance or explicit development source identity."""
+    development: bool = False
+    """True only for explicit same-user source-checkout execution with no Environment."""
     objective: str = "latency"
     """The MEASURED axis the delivery ladder is ordered on (`latency | footprint |
     fidelity`). A deployment property, not a request knob: delivery decides which bytes are
@@ -382,7 +381,7 @@ class DeclaredBinding:
                 {
                     "weightless": True,
                     "release": self.release,
-                    "package_release": self.package_release or self.release,
+                    "package_revision_digest": self.package_revision_digest or self.release,
                 }
             )
         return canonical.digest(

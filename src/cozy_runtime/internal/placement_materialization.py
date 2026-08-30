@@ -35,7 +35,6 @@ from cozy_runtime.internal import canonical, host_paths, overlay, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
-PACKAGE_RELEASE_FORMAT = "cozy.package.release/1"
 ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
 MAX_OVERLAY_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
@@ -308,80 +307,31 @@ def control_runtime_digest(
 
 def package_overlay_input(
     *,
-    package_release_bytes: bytes,
+    package: Mapping[str, Any],
     environment: Mapping[str, Any],
     environment_digest: str,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
     verified_wheels: Mapping[str, overlay.VerifiedFile] | None = None,
 ) -> overlay.Input:
-    """Join one PackageRelease with the selected inline Environment.
+    """Join direct executable package facts with the selected inline Environment."""
 
-    PackageRelease is environment-independent. The Placement selects a WheelhouseManifest and
-    exact non-base overlay wheels directly, so there is no bundle, resolution lock, resolved
-    wheel set, or independent environment-specification document to reconcile.
-    """
-
-    release = _document(package_release_bytes, "package_release")
     _closed(
-        release,
-        {
-            "dependency_wheels",
-            "format",
-            "package",
-            "package_descriptor",
-            "project_wheel",
-            "release",
-            "requires_python",
-            "requirements",
-            "source_files",
-        },
-        "package_release",
+        package,
+        {"package", "project_wheel", "release", "release_digest"},
+        "package",
     )
-    if release["format"] != PACKAGE_RELEASE_FORMAT:
-        raise LaunchRefusal("package_release_format", str(release["format"]))
-    package = release["package"]
-    version = release["release"]
+    identity = package["package"]
+    version = package["release"]
     if (
-        not isinstance(package, str)
-        or package.count("/") != 1
-        or not all(package.split("/"))
+        not isinstance(identity, str)
+        or identity.count("/") != 1
+        or not all(identity.split("/"))
         or not isinstance(version, str)
         or not version
     ):
-        raise LaunchRefusal("package_release_invalid", "package or release identity is invalid")
-    _ref(release["package_descriptor"], "package_descriptor")
-    source_files = release["source_files"]
-    if not isinstance(source_files, list):
-        raise LaunchRefusal("package_release_invalid", "source_files is not an array")
-    prior_path = ""
-    for source in source_files:
-        _closed(source, {"digest", "length", "path"}, "source_file")
-        source_path = source["path"]
-        if (
-            not isinstance(source["digest"], str)
-            or not source["digest"].startswith("sha256:")
-            or not isinstance(source["length"], int)
-            or source["length"] < 0
-            or not isinstance(source_path, str)
-            or not source_path
-            or source_path <= prior_path
-        ):
-            raise LaunchRefusal("package_release_invalid", "source_files is invalid or unsorted")
-        prior_path = source_path
-    requires_python = release["requires_python"]
-    requirements = release["requirements"]
-    if not isinstance(requires_python, str) or not requires_python:
-        raise LaunchRefusal("package_release_invalid", "requires_python is empty")
-    if (
-        not isinstance(requirements, list)
-        or any(not isinstance(item, str) or not item for item in requirements)
-        or requirements != sorted(set(requirements))
-    ):
-        raise LaunchRefusal("package_release_invalid", "requirements are not sorted unique")
-    published_dependencies = _wheels(
-        release["dependency_wheels"], "package_release", import_roots=True, nested_ref=True
-    )
+        raise LaunchRefusal("package_invalid", "package or release identity is invalid")
+    _require_digest(package["release_digest"], "package.release_digest")
 
     _closed(environment, {"wheelhouse_manifest", "wheels"}, "environment")
     wheelhouse_ref = _ref(environment["wheelhouse_manifest"], "wheelhouse_manifest")
@@ -400,21 +350,15 @@ def package_overlay_input(
     except overlay.OverlayRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
 
-    project = _wheel(release["project_wheel"], "project", import_roots=True, nested_ref=True)
+    project = _wheel(package["project_wheel"], "project", import_roots=True, nested_ref=True)
+    if project.distribution != identity.split("/", 1)[1] or project.version != version:
+        raise LaunchRefusal("project_wheel_mismatch", "project wheel differs from package release")
     if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
         raise LaunchRefusal("project_wheel_not_pure", "project wheel must be exactly py3-none-any")
     wheels = [project]
     custom_wheels = _wheels(
         environment.get("wheels", []), "environment", import_roots=True, nested_ref=True
     )
-    published_by_distribution = {wheel.distribution: wheel for wheel in published_dependencies}
-    for selected in custom_wheels:
-        published = published_by_distribution.get(selected.distribution)
-        if published is not None and selected != published:
-            raise LaunchRefusal(
-                "package_dependency_selection_mismatch",
-                f"selected dependency {selected.distribution} contradicts its published wheel",
-            )
     measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
     if project.length > MAX_OVERLAY_BYTES - measured_custom_bytes:
         raise LaunchRefusal(
@@ -449,18 +393,6 @@ def package_overlay_input(
             for wheel in wheels
         ),
     )
-
-
-def _document(raw: bytes, name: str) -> dict[str, Any]:
-    try:
-        value = canonical.parse_canonical(raw)
-    except canonical.CanonicalError as exc:
-        raise LaunchRefusal(f"{name}_invalid", str(exc)) from exc
-    if not isinstance(value, dict):
-        raise LaunchRefusal(f"{name}_invalid", "document is not an object")
-    return value
-
-
 def _closed(value: object, keys: set[str], name: str) -> None:
     if not isinstance(value, dict) or set(value) != keys:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__
@@ -572,7 +504,6 @@ def _wheel(
         tags=tuple(tags),
         owner={
             "project": "project",
-            "package_release": "custom",
             "environment": "custom",
         }[owner],
         import_roots=tuple(roots),

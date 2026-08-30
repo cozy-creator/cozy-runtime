@@ -34,6 +34,7 @@ BUILT = (
     "pull",
     "version",
 )
+PRIVATE = ("development-placement",)
 #: `ingest` PARSES and refuses typed: it is a thin invocation of TensorFS's one INGEST
 #: implementation — the carrier decode, classification and semantic converters — and that
 #: half of the border is not a dependency of this build yet (tfs-003). It is a verb, not an
@@ -82,8 +83,7 @@ pull flags:
   --dry-run             the plan — what would move — without moving it
 
 serve modes (exactly one):
-  --weightless-package <dir>                 stage a local model-free package
-  --artifact-store <dir>                       serve selected model Manifests
+  --artifact-store <dir>                     serve selected published model Manifests
 
 global flags:
   --json           the full typed result as one JSON document
@@ -98,7 +98,16 @@ global flags:
 _VALUE_FLAGS = ("--fields", "--dir", "--descriptor")
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
-_OWNS_ARGS = ("run", "job", "fit", "serve", "rm", "pull", "ingest")
+_OWNS_ARGS = (
+    "run",
+    "job",
+    "fit",
+    "serve",
+    "rm",
+    "pull",
+    "ingest",
+    "development-placement",
+)
 
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
@@ -195,6 +204,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return host_verbs.bindings(config, opts)
+    if verb == "development-placement":
+        return host_verbs.development_placement(config, args, opts)
     if verb == "pull":
         return pull_verb.run(args, opts, config)
     if verb == "fit":

@@ -109,7 +109,7 @@ def _input_slice(
             }
         ],
         workspace=workspace,
-        release_id=release_id,
+        package_revision_digest=release_id,
         options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         record_owner_hook=plant,
     )
@@ -150,7 +150,7 @@ def _serving_slice(
             inputs=inputs,
         ),
         workspace=workspace,
-        release_id=release_id,
+        package_revision_digest=release_id,
         package_descriptor=body,
         options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
         record_owner_hook=plant if accepted_mutation is not None else None,
