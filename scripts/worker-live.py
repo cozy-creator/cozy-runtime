@@ -172,6 +172,8 @@ class Hub:
     call: Any = None
     root_cert: bytes | None = None
     token: str = ""
+    package_revision_digest: str = ""
+    development: bool = False
     connected: threading.Event = field(default_factory=threading.Event)
 
     # ------------------------------------------------------------ dialing
@@ -776,6 +778,7 @@ def start_worker(
         str((overrides or {}).get("project") or ROOT / "corpus" / "package")
     )
     development_args: tuple[str, ...] = ()
+    package_revision_digest = "sha256:" + hashlib.sha256(release.encode()).hexdigest()
     if weightless_project is not None:
         from cozy_runtime.internal import descriptor
         from cozy_runtime.internal.discovery import discover
@@ -824,6 +827,7 @@ def start_worker(
             "--development-source-digest",
             documents.spell(staged.placement.development.source_digest),
         )
+        package_revision_digest = documents.spell(staged.placement.development.source_digest)
     else:
         executor_python = Path(sys.executable)
         ids = stage(home, entrypoints, store=store, overrides=overrides, release=release)
@@ -868,6 +872,8 @@ def start_worker(
             environment=selected_environment,
         )
     hub = hub or Hub()
+    hub.package_revision_digest = package_revision_digest
+    hub.development = weightless_project is not None
     hub.directive = serving_directive(placement, posture)
     hub.revision = 1
     # EVERY worker start waits for a quiet card. Without it a 4.78 GiB fill started while a
@@ -979,6 +985,7 @@ def make_spec(
     outputs: int = 1,
     output_id: str = "image",
     max_bytes: int = 8 * MIB,
+    environment_digest: str = "sha256:" + "11" * 32,
 ) -> tuple[bytes, bytes]:
     """The InvocationSpec document: input identities, output contracts and the deadline all
     INSIDE the digest (#439). Defaults mirror `dispatch`'s so a spec built here and a grant
@@ -987,9 +994,14 @@ def make_spec(
         body = payload_raw
     else:
         body = json.dumps(payload or DEFAULT_PAYLOAD).encode()
+    revision_digest = (
+        release
+        if release.startswith("sha256:") and len(release) == 71
+        else "sha256:" + hashlib.sha256(release.encode()).hexdigest()
+    )
     spec = pb.InvocationSpec(
-        package_revision_digest="sha256:" + hashlib.sha256(release.encode()).hexdigest(),
-        environment_digest="sha256:" + "11" * 32,
+        package_revision_digest=revision_digest,
+        environment_digest=environment_digest,
         config_digest="sha256:" + "22" * 32,
         payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
         inputs=[
@@ -1041,6 +1053,8 @@ def dispatch(
     placement_id: str = PLACEMENT,
     admission_generation: int = -1,
 ) -> tuple[bytes, bytes]:
+    if hub.package_revision_digest and (hub.development or release == RELEASE):
+        release = hub.package_revision_digest
     canonical_bytes, digest = spec_override or make_spec(
         plan_id,
         deadline_ms=deadline_ms,
@@ -1050,6 +1064,7 @@ def dispatch(
         outputs=outputs,
         output_id=output_id,
         max_bytes=max_bytes,
+        environment_digest="" if hub.development else "sha256:" + "11" * 32,
     )
     body, path = stage_payload(tmp, request_id, payload or DEFAULT_PAYLOAD)
     del body

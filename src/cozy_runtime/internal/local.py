@@ -682,7 +682,10 @@ class LocalRecordOwner:
         spec = pb.InvocationSpec(
             package_revision_digest=self.package_revision_digest,
             environment_digest=(
-                documents.spell(self.placement.environment_digest)
+                ""
+                if self.placement is not None
+                and self.placement.WhichOneof("package_mode") == "development"
+                else documents.spell(self.placement.environment_digest)
                 if self.placement is not None
                 else ""
             ),

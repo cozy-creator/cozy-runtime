@@ -20,7 +20,6 @@ lets it run on a hosted macOS or Windows runner where worker-live.py structurall
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -154,13 +153,15 @@ def stage_development(home: Path, project: Path) -> Any:
 
     write_weightless_project(project)
     found = discover(project)
-    return local.stage_development_placement(
+    staged = local.stage_development_placement(
         home,
         descriptor.build(found),
         package="local/development-package",
         release="0.0.0",
         source_digest=local.development_source_digest(project),
     )
+    staged.placement.placement_id = wl.PLACEMENT
+    return staged
 
 
 def start_weightless(
@@ -227,8 +228,13 @@ def start_weightless(
     subjects = binding_result.get("weightless_plans", [])
     if binding_result.get("bindings") != [] or not subjects:
         raise SystemExit(f"weightless binding resolution returned {binding_result!r}")
-    ids = {str(row["entrypoint"]): str(row["subject_id"]) for row in subjects}
+    ids = {str(row["entrypoint"]): str(row["digest"]) for row in subjects}
+    staged = stage_development(home, project)
+    if ids != dict(staged.bindings):
+        raise SystemExit(f"bindings output differs from development Placement: {ids!r}")
     hub = hub or wl.Hub()
+    hub.package_revision_digest = source_digest
+    hub.development = True
     hub.revision = 1
     log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     (root / "control.addr").unlink(missing_ok=True)
@@ -275,31 +281,9 @@ def start_weightless(
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
     addr = wl.read_addr(root, process)
-    plan_root = home / "binding-plans"
-    expected_files = {f"{str(row['digest']).removeprefix('sha256:')}.json" for row in subjects}
-    actual_files = {path.name for path in plan_root.glob("*.json")}
-    if actual_files != expected_files:
-        raise SystemExit(
-            "bindings-reported subjects differ from serve-staged plans: "
-            f"reported={sorted(expected_files)} staged={sorted(actual_files)}"
-        )
-    for row in subjects:
-        subject_id = str(row["subject_id"])
-        digest = str(row["digest"])
-        raw = (plan_root / f"{digest.removeprefix('sha256:')}.json").read_bytes()
-        measured = "sha256:" + hashlib.sha256(raw).hexdigest()
-        if (
-            row.get("kind") != "plan"
-            or subject_id != digest
-            or measured != digest
-            or len(raw) != int(row["length"])
-        ):
-            raise SystemExit(f"bindings-reported subject differs from serve-staged bytes: {row!r}")
     hub.directive = wl.serving_directive(
-        RELEASE,
-        sorted(ids.values()),
+        staged.placement,
         posture or pb.Posture.POSTURE_ACCEPTING,
-        plan_root,
     )
     if rlimit_fsize:
         # The plant targets the journal append, not local release construction. Apply it
@@ -311,7 +295,7 @@ def start_weightless(
         )
     if connect:
         hub.connect(addr)
-    worker = wl.Worker(home, root, process, hub, log)
+    worker = wl.Worker(home, root, process, hub, log, ids)
     return worker, ids
 
 
@@ -429,10 +413,8 @@ def section_reconnect(args: argparse.Namespace, base: str) -> None:
         # RED: same revision, genuinely different desired state (a posture flip).
         since = hub.mark()
         changed = wl.serving_directive(
-            RELEASE,
-            sorted(ids.values()),
+            stage_development(worker.home, Path(base + "-reconnect") / "project").placement,
             pb.Posture.POSTURE_DRAINING,
-            worker.home / "binding-plans",
         )
         hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
         hub.wait(
@@ -692,7 +674,7 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
         worker.process.send_signal(signal.SIGKILL)
         worker.process.wait(timeout=args.observe)
         hub.close()
-    worker2, ids2 = start_weightless(tmp, instance_id="ins-owner", fresh=False, connect=False)
+    worker2, _ids2 = start_weightless(tmp, instance_id="ins-owner", fresh=False, connect=False)
     addr = wl.read_addr(worker2.root, worker2.process)
     try:
         for epoch, controller, expect in (
@@ -719,10 +701,8 @@ def section_ownership(args: argparse.Namespace, base: str) -> None:
         keeper.epoch, keeper.record_owner_id = 5, "hub-authority"
         keeper.process, keeper.log = worker2.process, worker2.log
         keeper.directive = wl.serving_directive(
-            RELEASE,
-            sorted(ids2.values()),
+            stage_development(worker2.home, Path(base + "-ownership") / "project").placement,
             pb.Posture.POSTURE_ACCEPTING,
-            worker2.home / "binding-plans",
         )
         keeper.connect(addr)
         ack = keeper.wait(
@@ -1123,7 +1103,7 @@ def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
                 and m.observed_state.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
                 and hub.deployment(m.observed_state).serving
                 == pb.ServingState.SERVING_STATE_ACTIVATING
-                and not hub.deployment(m.observed_state).dispatchable_plan_ids
+                and not hub.deployment(m.observed_state).dispatchable_binding_digests
                 else None
             ),
             args.observe,
@@ -1727,7 +1707,8 @@ def main() -> int:
         boot_ms = (time.perf_counter() - t0) * 1000
         wl.check(
             "worker DISPATCHABLE with both weightless plans",
-            set(hub.deployment(report).dispatchable_plan_ids) >= set(ids.values()),
+            set(hub.deployment(report).dispatchable_binding_digests)
+            >= {wl.documents.raw(value) for value in ids.values()},
             f"{boot_ms:.0f} ms to DISPATCHABLE; executor pid {worker.executor_pid()}",
         )
         owner = json.loads((worker.root / "executor.owner").read_text())
