@@ -1791,11 +1791,9 @@ class AttemptEngine:
                         output_id,
                         blob,
                         self.authorizer,
-                        # The AUTHOR's declared media type, carried through instead of
-                        # replaced by `application/octet-stream`. cl-010 measured the cost
-                        # of dropping it: the product wrote `image` and not `image.png`,
-                        # and the client correctly refuses to sniff, so the only place that
-                        # could fix it is the place that already knows.
+                        # The AUTHOR's observed media type. write_output joins it to the
+                        # invocation's bound type before spending the destination; when the
+                        # invocation leaves MIME open, this remains the honest carried fact.
                         media_type=str(row.get("media_type") or ""),
                     )
                 )
