@@ -54,7 +54,7 @@ from cozy_runtime.author._invoke import (
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover, discover_installed
+from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 
@@ -1049,14 +1049,18 @@ class Executor:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if self.discovered is None:
             try:
-                self.discovered = discover(Path(command["project"]))
+                self._discover_provisioned(
+                    {
+                        "application": command["application"],
+                        "package_descriptor": command["package_descriptor"],
+                    }
+                )
             except Exception as exc:
                 return {
                     "ok": False,
                     "code": "job_release_undiscoverable",
                     "detail": f"{type(exc).__name__}: {exc}"[:1024],
                 }
-            self.surface_names = {s.name: s for s in self.discovered.surfaces}
         name = command["job"]
         surface = self.surface_names.get(name)
         if surface is None or surface.kind != "job":

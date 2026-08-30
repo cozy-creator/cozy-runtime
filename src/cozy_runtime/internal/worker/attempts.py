@@ -1370,7 +1370,8 @@ class AttemptEngine:
             return {
                 "cmd": "run_job",
                 "request_id": key,
-                "project": attempt.job.project,
+                "application": attempt.job.application,
+                "package_descriptor": attempt.job.package_descriptor,
                 "job": attempt.job.job,
                 "payload": attempt.payload,
                 "deadline_s": seconds,

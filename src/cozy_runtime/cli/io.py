@@ -17,6 +17,7 @@ class Options:
     full: bool = False
     fields: tuple[str, ...] = ()
     dir: str = "."
+    descriptor: str = ""
 
 
 @dataclass(frozen=True, slots=True)

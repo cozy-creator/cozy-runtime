@@ -24,8 +24,19 @@ from cozy_runtime.internal.exits import Exit
 def run(function: str | None, opts: Options) -> Result:
     project = Path(opts.dir).expanduser()
     try:
-        found = discover(project)
-        body = desc.build(found)
+        if opts.descriptor:
+            descriptor = Path(opts.descriptor).expanduser()
+            try:
+                raw = descriptor.read_bytes()
+            except OSError as exc:
+                raise ConformanceError(
+                    f"cannot read exact package descriptor {descriptor}: {exc}",
+                    code="package_descriptor_unreadable",
+                ) from exc
+            body = desc.read_bytes(raw, str(descriptor))
+        else:
+            found = discover(project)
+            body = desc.build(found)
     except ConformanceError as exc:
         raise CliError(
             "validation",

@@ -90,10 +90,12 @@ global flags:
   --full           widen output, lift truncation
   --fields a,b,c   pick columns
   --dir <path>     package project root (default: cwd)
+  --descriptor <path>
+                   exact PackageDescriptor input for describe (no package import)
   -h, --help       this text
 """
 
-_VALUE_FLAGS = ("--fields", "--dir")
+_VALUE_FLAGS = ("--fields", "--dir", "--descriptor")
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = ("run", "job", "fit", "serve", "rm", "pull", "ingest")
@@ -104,6 +106,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     as_json = full = want_help = False
     fields: tuple[str, ...] = ()
     directory = "."
+    descriptor = ""
     verb: str | None = None
     args: list[str] = []
     unknown: list[str] = []
@@ -131,8 +134,10 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
                 inline = rest.pop(0)
             if flag == "--fields":
                 fields = tuple(f.strip() for f in inline.split(",") if f.strip())
-            else:
+            elif flag == "--dir":
                 directory = inline
+            else:
+                descriptor = inline
         elif item.startswith("-") and item != "-":
             unknown.append(item)
         elif verb is None:
@@ -147,16 +152,23 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             Exit.usage,
             next=("cozy-runtime --help",),
         )
-    return verb, args, Options(as_json, full, fields, directory), want_help
+    return verb, args, Options(as_json, full, fields, directory, descriptor), want_help
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
+    if opts.descriptor and verb != "describe":
+        raise CliError(
+            "usage",
+            "--descriptor belongs only to describe",
+            "use --descriptor <exact-package-descriptor> with cozy-runtime describe",
+            Exit.usage,
+        )
     if verb == "describe":
         if len(args) > 1:
             raise CliError(
                 "usage",
                 f"describe takes at most one function name, got {len(args)}",
-                "cozy-runtime [--json] [--dir <path>] describe [<function>]",
+                "cozy-runtime [--json] [--dir <path>] [--descriptor <path>] describe [<function>]",
                 Exit.usage,
             )
         return describe_verb.run(args[0] if args else None, opts)
