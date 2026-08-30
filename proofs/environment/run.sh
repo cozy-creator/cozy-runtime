@@ -116,10 +116,11 @@ run_refusal() {
 }
 
 run_refusal missing 6 wheel_grant_set_mismatch no
+run_refusal conflicting-dependency 6 package_dependency_selection_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
 run_refusal corrupt 6 overlay_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
-run_refusal oversized-fact 6 environment_wheel_invalid no
+run_refusal oversized-fact 6 package_release_wheel_invalid no
 run_refusal duplicate 6 overlay_wheel_member_invalid no
 run_refusal expanded 6 overlay_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no

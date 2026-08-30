@@ -348,7 +348,9 @@ def package_overlay_input(
         or requirements != sorted(set(requirements))
     ):
         raise LaunchRefusal("package_release_invalid", "requirements are not sorted unique")
-    _wheels(release["dependency_wheels"], "package_release", import_roots=True, nested_ref=True)
+    published_dependencies = _wheels(
+        release["dependency_wheels"], "package_release", import_roots=True, nested_ref=True
+    )
 
     _closed(environment, {"wheelhouse_manifest", "wheels"}, "environment")
     wheelhouse_ref = _ref(environment["wheelhouse_manifest"], "wheelhouse_manifest")
@@ -374,6 +376,14 @@ def package_overlay_input(
     custom_wheels = _wheels(
         environment.get("wheels", []), "environment", import_roots=True, nested_ref=True
     )
+    published_by_distribution = {wheel.distribution: wheel for wheel in published_dependencies}
+    for selected in custom_wheels:
+        published = published_by_distribution.get(selected.distribution)
+        if published is not None and selected != published:
+            raise LaunchRefusal(
+                "package_dependency_selection_mismatch",
+                f"selected dependency {selected.distribution} contradicts its published wheel",
+            )
     measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
     if project.length > MAX_OVERLAY_BYTES - measured_custom_bytes:
         raise LaunchRefusal(
@@ -529,7 +539,11 @@ def _wheel(
         digest=str(digest),
         length=length,
         tags=tuple(tags),
-        owner={"project": "project", "environment": "custom"}[owner],
+        owner={
+            "project": "project",
+            "package_release": "custom",
+            "environment": "custom",
+        }[owner],
         import_roots=tuple(roots),
     )
 
