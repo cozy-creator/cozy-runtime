@@ -290,10 +290,9 @@ within that pod can retain its warm compiler cache; the whole pod scope is delet
 shutdown has proven the executor tree gone. Tensorhub's public placement law supplies one public
 trust domain per pod. Private renter cross-org stacking retains its explicitly documented same-UID
 risk—Runtime does not relabel worker boot identity as tenant isolation. Cache bytes stay node-local,
-never enter an overlay receipt/content identity, and are never published as release artifacts. OCI and
-managed-local realizations consume this same overlay path; their distinct realization provenance
-belongs to Tensorhub/Creator qualification evidence, while the portable receipt remains the exact
-WheelhouseManifest/project/custom-wheel join.
+never enter an overlay receipt/content identity, and are never published as release artifacts. Every
+placement consumes this same overlay path; OCI provenance belongs to Tensorhub qualification
+evidence, while the portable receipt remains the exact WheelhouseManifest/project/custom-wheel join.
 
 On a remote placement, `PlacementSpec/2` names one exact
 `model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
@@ -351,9 +350,8 @@ set is closed; every path value is a normalized absolute local path:
 
 An overlay containing native custom-wheel bytes must additionally pass
 `cozy-native-wheel-proof REQUEST.json EVIDENCE.json` on every claimed hardware class. The request
-does not carry a caller-asserted OCI or managed-local realization identity: Runtime cannot measure
-an OCI manifest, and echoing one is not proof. Tensorhub joins Runtime's measured evidence to
-provider OCI readback; Creator independently validates and hash-binds its ManagedBaseReceipt.
+does not carry a caller-asserted OCI realization identity: Runtime cannot measure an OCI manifest,
+and echoing one is not proof. Tensorhub joins Runtime's measured evidence to provider OCI readback.
 
 ```json
 {
