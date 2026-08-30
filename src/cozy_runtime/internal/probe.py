@@ -627,27 +627,22 @@ def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
     this is what the qualification suite decodes. `plain/1` has no entry: its route decodes
     nothing and its evidence is the fill plane's byte-identity proof.
 
-    **The residual gap, stated rather than hidden.** The tensorfs Python facade exposes
-    `seed_digests()` and no way to read a seed's `vectors` ObjectRef, so this build PINS the
-    document by digest-to-filename and cannot yet PROVE, from Python, that the vendored bytes
-    are the ones the spec object references. `tensorfs.seed_vectors(digest) -> bytes` is the
-    one facade addition that would close it, and it is named as a cross-repo follow-up. What
-    IS proved today is stronger than what preceded it, which proved nothing: the exact
-    producer-mined cases now run through the exact provider.
+    The reviewed table pins both the nested spec digest and its vector-byte digest. A copied
+    fixture that drifts therefore stops before JSON parsing or provider execution.
     """
-    name = SPEC_VECTORS.get(spec_digest)
-    if name is None:
+    pinned = SPEC_VECTORS.get(spec_digest)
+    if pinned is None:
         return None
+    name, expected_digest = pinned
     path = VECTOR_ROOT / name
     try:
-        data = json.loads(path.read_text())
+        raw = path.read_bytes()
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
+            return None
+        data = json.loads(raw)
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) and data.get("format") == VECTOR_FORMAT else None
-
-
-#: The vendored documents' own format id, checked rather than assumed.
-VECTOR_FORMAT = "tensorfs.encoding_vectors/1"
+    return data if isinstance(data, dict) and set(data) == {"cases"} else None
 
 
 def _spec_vectors(
@@ -726,9 +721,12 @@ def _spec_vectors(
             "note": f"the vendored document carries no {dtype_name} case",
             "passed": True,
         }
+    vector_ref = SPEC_VECTORS.get(str(provider.encoding))
     return {
         "kind": "spec-vectors",
-        "document": SPEC_VECTORS.get(str(provider.encoding), ""),
+        "document": (
+            {"filename": vector_ref[0], "sha256": vector_ref[1]} if vector_ref else None
+        ),
         "cases": cases,
         "passed": all(c["passed"] for c in cases),
     }

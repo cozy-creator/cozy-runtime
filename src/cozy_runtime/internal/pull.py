@@ -399,7 +399,7 @@ def reads(base: str, at: Resolved, deadline: Deadline, *, token: str = "") -> li
     return out
 
 
-def manifest(base: str, at: Resolved, deadline: Deadline) -> bytes:
+def manifest(base: str, at: Resolved, deadline: Deadline, max_bytes: int) -> bytes:
     """The manifest's exact bytes, served verbatim by the hub.
 
     Deliberately read whole: a manifest is a bounded canonical DOCUMENT, not the artifact.
@@ -409,9 +409,35 @@ def manifest(base: str, at: Resolved, deadline: Deadline) -> bytes:
     """
     url = base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/manifests/{at.manifest_ref}"
     guard(url, allow_local=local_hub(base))
+    if max_bytes < 1:
+        raise PullRefusal(
+            "border_refused",
+            "TensorFS reported no positive Manifest byte cap",
+            "install a coherent TensorFS/Runtime build",
+        )
     try:
         with _open(urllib.request.Request(url), deadline) as resp:
-            return bytes(resp.read())
+            claimed = resp.headers.get("Content-Length")
+            if claimed is not None:
+                try:
+                    claimed_bytes = int(claimed)
+                except ValueError:
+                    claimed_bytes = -1
+                if claimed_bytes < 0 or claimed_bytes > max_bytes:
+                    raise PullRefusal(
+                        "artifact_incomplete",
+                        f"the hub declared a {claimed!r}-byte Manifest; the TensorFS cap is "
+                        f"{max_bytes}",
+                        "repair the released Manifest; model metadata is bounded",
+                    )
+            body = bytes(resp.read(max_bytes + 1))
+            if len(body) > max_bytes:
+                raise PullRefusal(
+                    "artifact_incomplete",
+                    f"the hub served a Manifest larger than the TensorFS cap of {max_bytes} bytes",
+                    "repair the released Manifest; model metadata is bounded",
+                )
+            return body
     except urllib.error.HTTPError as exc:
         raise _hub_error(exc, "manifest") from exc
     except urllib.error.URLError as exc:
@@ -517,7 +543,7 @@ def pull(
     deadline = Deadline.after(timeout)
     at = resolve(base, ref, deadline, lane=lane, token=token)
     declared = reads(base, at, deadline, token=token)
-    doc = manifest(base, at, deadline)
+    doc = manifest(base, at, deadline, int(tensorfs.manifest_max_bytes()))
 
     session = session or ("pull-" + at.manifest_id[:12])
     plan = _plan(

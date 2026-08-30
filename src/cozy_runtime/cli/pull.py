@@ -289,7 +289,7 @@ def _preview(
     try:
         at = transport.resolve(hub, ref, deadline, lane=flags.get("--lane", ""), token=token)
         declared = transport.reads(hub, at, deadline, token=token)
-        doc = transport.manifest(hub, at, deadline)
+        doc = transport.manifest(hub, at, deadline, int(tensorfs.manifest_max_bytes()))
         plan = tensorfs.fetch_plan(
             store,
             "dry-" + at.manifest_id[:12],
