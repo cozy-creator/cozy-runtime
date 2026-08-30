@@ -1266,12 +1266,20 @@ def fence_development_placement() -> list[str]:
     descriptor_digest = documents.spell(built.placement.package_descriptor.digest)
     with tempfile.TemporaryDirectory() as directory:
         cache = pathlib.Path(directory)
-        (cache / descriptor_digest.removeprefix("sha256:")).write_bytes(built.descriptor)
+        staged = local.development_placement_documents(
+            descriptor.build(discover(ROOT / "examples" / "marco-polo")),
+            package="paul/marco-polo-package",
+            release="1.0.3",
+            source_digest=source_digest,
+            artifact_cache=cache,
+        )
+        document = documents.body(staged.placement)
         acquired = acquire.preinstalled_development(
             types.SimpleNamespace(
                 models=(),
-                entrypoints=tuple(documents.body(row) for row in built.placement.entrypoints),
-                package_descriptor=(descriptor_digest, len(built.descriptor)),
+                document=document,
+                entrypoints=tuple(document["entrypoints"]),
+                package_descriptor=(descriptor_digest, len(staged.descriptor)),
                 development={
                     "package": "paul/marco-polo-package",
                     "release": "1.0.3",
@@ -1279,6 +1287,8 @@ def fence_development_placement() -> list[str]:
                 },
             ),
             cache,
+            staged.placement,
+            staged.bindings,
         )
     if any(
         binding.environment_digest or not binding.development

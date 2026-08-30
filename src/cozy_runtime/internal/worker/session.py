@@ -243,6 +243,7 @@ class Placement:
     entrypoints: tuple[dict[str, Any], ...]
     qualification: tuple[str, int]
     environment: dict[str, Any]
+    document: dict[str, Any]
     acquisition: pb.PlacementAcquisitionObservation = field(
         default_factory=pb.PlacementAcquisitionObservation
     )
@@ -630,11 +631,15 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 },
                 "Slot",
             )
-            _required(
-                slot,
-                {"slot", "reference_model_id", "config", "model_construction_contract"},
-                "Slot",
-            )
+            required_slot = {"slot", "reference_model_id", "config"}
+            if published:
+                required_slot.add("model_construction_contract")
+            _required(slot, required_slot, "Slot")
+            if development and "model_construction_contract" in slot:
+                raise documents.DocumentError(
+                    "development_fields_invalid",
+                    "development derives model_construction_contract locally",
+                )
             slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
             if slot["reference_model_id"] not in known_models:
                 raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
@@ -666,7 +671,8 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
-            _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
+            if published:
+                _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
             stamps = slot.get("stamps", [])
             if not isinstance(stamps, list):
                 raise documents.DocumentError("wrong_type", "Slot.stamps")
@@ -697,11 +703,6 @@ def _placement_profile(entry: dict[str, Any]) -> None:
             )
     if entrypoint_names != sorted(set(entrypoint_names)):
         raise documents.DocumentError("sort_order", "Placement.entrypoints")
-    if development and (models or any(entrypoint.get("slots") for entrypoint in entrypoints)):
-        raise documents.DocumentError(
-            "development_modeled_unsupported",
-            "source-checkout serving currently supports model-free entrypoints only",
-        )
     expected_bindings = (
         "sha256:"
         + hashlib.sha256(
@@ -1794,6 +1795,7 @@ class Worker:
                 int(qualification.get("length", 0)),
             ),
             environment=dict(entry.get("environment", {})),
+            document=dict(entry),
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
             # placement_id, new set digest) retains the outgoing set as the pin; a fresh
             # placement has none, and an empty pin means replacement is PAUSED — which is
@@ -2075,7 +2077,26 @@ class Worker:
                 )
                 return None
             try:
-                return acquire.preinstalled_development(placement, self.options.artifact_cache)
+                from cozy_runtime.internal import descriptor as development_descriptor
+                from cozy_runtime.internal import local as development_local
+                from cozy_runtime.internal.discovery import discover
+
+                found = discover(self.options.development_project)
+                staged = development_local.stage_development_placement(
+                    self.config.cozy_home,
+                    development_descriptor.build(found),
+                    package=self.options.development_package,
+                    release=self.options.development_release,
+                    source_digest=self.options.development_source_digest,
+                    found=found,
+                    artifact_store=self.options.artifact_store,
+                )
+                return acquire.preinstalled_development(
+                    placement,
+                    self.options.artifact_cache,
+                    staged.placement,
+                    staged.declared_bindings,
+                )
             except acquire.AcquisitionRefusal as exc:
                 self._materialization_failed(
                     placement,
@@ -2084,6 +2105,22 @@ class Worker:
                         subject=placement.placement_id,
                         reason=exc.code,
                         detail=safe(exc.detail),
+                    ),
+                    terminal=True,
+                )
+                return None
+            except Exception as exc:
+                code, separator, detail = str(exc).partition(": ")
+                if not code.startswith("development_"):
+                    code = "development_source_invalid"
+                    detail = str(exc)
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        subject=placement.placement_id,
+                        reason=code,
+                        detail=safe(detail if separator else str(exc)),
                     ),
                     terminal=True,
                 )

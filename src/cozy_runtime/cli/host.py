@@ -243,12 +243,15 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     artifact_flags = ("--artifact-store",)
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
-    if all(development.values()) and supplied_artifacts:
+    forbidden_development = [
+        flag for flag in ("--environment-root", "--artifact-cache") if flag in values
+    ]
+    if all(development.values()) and forbidden_development:
         raise CliError(
             "usage",
-            f"--development-project cannot be combined with {', '.join(supplied_artifacts)}",
-            "choose one launch mode: the explicit local source checkout, or the exact "
-            "provisioned artifact store",
+            f"--development-project cannot be combined with {', '.join(forbidden_development)}",
+            "a source checkout has no published Environment; Creator supplies only the local "
+            "TensorFS --artifact-store when the package binds models",
             Exit.usage,
         )
     if all(development.values()):
@@ -265,6 +268,12 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
                 package=development["--development-package"],
                 release=development["--development-release"],
                 source_digest=development["--development-source-digest"],
+                found=found,
+                artifact_store=(
+                    Path(values["--artifact-store"]).expanduser().resolve()
+                    if "--artifact-store" in values
+                    else None
+                ),
             )
         except ConformanceError as exc:
             raise CliError(
@@ -276,9 +285,9 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         except RuntimeError as exc:
             code, separator, detail = str(exc).partition(": ")
             raise CliError(
-                code if code == "development_modeled_unsupported" else "structural",
+                code if code.startswith("development_") else "structural",
                 detail if separator else str(exc),
-                "published execution is required for model-bearing packages in this increment",
+                "repair the local source selection or download its exact model release",
                 Exit.structural,
             ) from exc
         argv += [
@@ -306,6 +315,12 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             Exit.usage,
         )
     for flag, worker_flag in _SERVE_FLAGS.items():
+        if all(development.values()) and flag in {
+            "--artifact-store",
+            "--artifact-cache",
+            "--environment-root",
+        }:
+            continue
         if flag in values:
             argv += [worker_flag, values[flag]]
     argv += switches
@@ -314,7 +329,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     return serve_worker(config, argv)
 
 
-def development_placement(_config: RuntimeConfig, args: list[str], opts: Options) -> Result:
+def development_placement(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
     """Internal Creator plumbing for one honest source-checkout PlacementSet."""
 
     from cozy_runtime.author import ConformanceError
@@ -326,18 +341,20 @@ def development_placement(_config: RuntimeConfig, args: list[str], opts: Options
 
     values: dict[str, str] = {}
     rest = list(args)
-    allowed = {"--package", "--release", "--source-digest"}
+    required = {"--package", "--release", "--source-digest"}
+    allowed = {*required, "--artifact-store"}
     while rest:
         flag = rest.pop(0)
         if flag not in allowed or not rest:
             raise CliError(
                 "usage",
                 f"development-placement received invalid argument {flag!r}",
-                "pass --package <org/name> --release <semver> --source-digest sha256:<hex>",
+                "pass --package <org/name> --release <semver> --source-digest sha256:<hex> "
+                "[--artifact-store <TensorFS root>]",
                 Exit.usage,
             )
         values[flag] = rest.pop(0)
-    missing = sorted(allowed - set(values))
+    missing = sorted(required - set(values))
     if missing:
         raise CliError(
             "usage",
@@ -364,11 +381,19 @@ def development_placement(_config: RuntimeConfig, args: list[str], opts: Options
         )
     project = Path(opts.dir).expanduser().resolve()
     try:
+        found = discover(project)
         development = local.development_placement_documents(
-            descriptor.build(discover(project)),
+            descriptor.build(found),
             package=package,
             release=release,
             source_digest=source_digest,
+            found=found,
+            cozy_home=config.cozy_home,
+            artifact_store=(
+                Path(values["--artifact-store"]).expanduser().resolve()
+                if "--artifact-store" in values
+                else None
+            ),
         )
     except ConformanceError as exc:
         raise CliError(
@@ -377,9 +402,9 @@ def development_placement(_config: RuntimeConfig, args: list[str], opts: Options
     except RuntimeError as exc:
         code, separator, detail = str(exc).partition(": ")
         raise CliError(
-            code if code == "development_modeled_unsupported" else "structural",
+            code if code.startswith("development_") else "structural",
             detail if separator else str(exc),
-            "published execution is required for model-bearing packages in this increment",
+            "repair the local source selection or download its exact model release",
             Exit.structural,
         ) from exc
     placement_bytes = documents.canonical_bytes(pb.PlacementSet(placements=[development.placement]))

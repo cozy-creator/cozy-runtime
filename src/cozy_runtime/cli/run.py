@@ -269,6 +269,8 @@ def run(
             workspace=workspace,
             package_revision_digest=package_revision_digest,
             package_descriptor=body if kind == "entrypoint" else None,
+            found=found,
+            development_artifact_store=config.cozy_home / "cas",
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=package_revision_digest,
