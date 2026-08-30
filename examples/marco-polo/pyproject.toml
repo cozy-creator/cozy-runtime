@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "marco-polo-package"
-version = "1.0.1"
+version = "1.0.2"
 description = "Weightless Marco/Polo example for Tensorhub publication and worker placement"
 requires-python = ">=3.11"
 dependencies = [
