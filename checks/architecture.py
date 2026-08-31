@@ -721,17 +721,10 @@ def fence_base_ownership_vectors() -> list[str]:
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
     mirror_specs = (
         (
-            "base-worker-image-wheelhouse-cpu.json",
-            24_668,
-            "sha256:f1027c384b2ab34ecada82bf494bfaab92d019907005128aa9c78b2d4d3c392a",
-            (26, 323, 25),
-            ("none", "none"),
-        ),
-        (
             "base-worker-image-wheelhouse-cu130.json",
-            25_636,
-            "sha256:5437560d941af71770c9625f8b15a9b2d4618432215432652e6120e164995f6c",
-            (86, 363, 10),
+            25_305,
+            "sha256:73738b08458a6c83cae1b97a9675f775d27b616e08a7d034b85a481e63b1b2da",
+            (86, 363, 9),
             ("cuda", "cu130"),
         ),
     )
@@ -762,7 +755,7 @@ def fence_base_ownership_vectors() -> list[str]:
         target = dict(manifest.platform_target)
         expected_target = {
             "os_arch": "linux/amd64",
-            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
+            "libc": "glibc2.39",
             "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],
@@ -774,14 +767,14 @@ def fence_base_ownership_vectors() -> list[str]:
             "cozy-runtime": (
                 "0.0.11",
                 "cozy_runtime-0.0.11-py3-none-any.whl",
-                "sha256:032f372a77290160ca118adfae0a6928540d0e837975366032fa2d4e37161ce1",
-                690_458,
+                "sha256:9ad5642698d4879d4982152c5f88d0599a2b2c2f418f20c38bbb7d7fc5760334",
+                705_603,
             ),
             "tensorfs": (
-                "0.0.3.dev0",
-                "tensorfs-0.0.3.dev0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-                "sha256:894e14456673adfe569a8f5c368ba96df878f2d75799c7058fd45d509068efa3",
-                2_093_057,
+                "0.0.3",
+                "tensorfs-0.0.3-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                "sha256:55db3ee75eda51e77ef9c821d5a7b62294036b67c893bccb1bab910b783f9269",
+                2_092_918,
             ),
         }
         wheels = {wheel.distribution: wheel for wheel in manifest.wheels}

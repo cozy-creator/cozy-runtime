@@ -13,11 +13,10 @@ wheel facts, joins them with an inline PlacementSet/1 Environment, and proves th
 WheelFact shape refuses. The two small wheel files are retained from the earlier Tensorhub vector
 solely to exercise the complete Runtime join.
 
-`base-worker-image-wheelhouse-cpu.json` and `base-worker-image-wheelhouse-cu130.json` are copied
-byte-for-byte from the same Tensorhub commit's CPython 3.12 producer. They are the CPU and official PyTorch
-CUDA 13.0 base worker image manifests containing the same Runtime `0.0.11` wheel
-(`sha256:032f372a77290160ca118adfae0a6928540d0e837975366032fa2d4e37161ce1`) and TensorFS
-`0.0.3.dev0` wheel (`sha256:894e14456673adfe569a8f5c368ba96df878f2d75799c7058fd45d509068efa3`).
-Runtime CI checks these local producer bytes only: CPU is 24,668 bytes with SHA-256
-`f1027c384b2ab34ecada82bf494bfaab92d019907005128aa9c78b2d4d3c392a`; CUDA is 25,636 bytes
-with SHA-256 `5437560d941af71770c9625f8b15a9b2d4618432215432652e6120e164995f6c`.
+`base-worker-image-wheelhouse-cu130.json` is copied byte-for-byte from Tensorhub commit
+`8b8d50cf41db5dbf05f0563012fd354b765f5b27`, its single approved CPython 3.12 / official PyTorch
+CUDA 13.0 producer. It contains the Runtime `0.0.11` wheel
+(`sha256:9ad5642698d4879d4982152c5f88d0599a2b2c2f418f20c38bbb7d7fc5760334`) and TensorFS
+`0.0.3` wheel (`sha256:55db3ee75eda51e77ef9c821d5a7b62294036b67c893bccb1bab910b783f9269`).
+Runtime CI checks these local producer bytes only: 25,305 bytes with SHA-256
+`73738b08458a6c83cae1b97a9675f775d27b616e08a7d034b85a481e63b1b2da`.
