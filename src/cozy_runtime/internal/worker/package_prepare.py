@@ -11,7 +11,6 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime import qualification
 from cozy_runtime.internal import canonical, descriptor, overlay, placement_materialization
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents
@@ -119,10 +118,7 @@ def prepare_package_set(
         (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
         key=lambda wheel: wheel.distribution,
     )
-    environment = pb.Environment(
-        wheelhouse_manifest=pb.Ref(digest=documents.raw(base_digest), length=len(base_raw)),
-        wheels=[_wheel_fact(wheel) for wheel in dependency_facts],
-    )
+    environment = pb.Environment(wheels=[_wheel_fact(wheel) for wheel in dependency_facts])
     environment_body = documents.body(environment)
     environment_body.setdefault("wheels", [])
     environment_digest = documents.spell(
@@ -172,31 +168,16 @@ def prepare_package_set(
     bindings_digest = documents.digest_of(
         canonical.write({"entrypoints": entrypoint_bodies, "models": []})
     )
-    receipt_ref = {"digest": installed.receipt_digest, "length": len(installed.receipt_bytes)}
-    descriptor_value = {"digest": descriptor_ref[0], "length": descriptor_ref[1]}
-    selection = qualification.selection_digest(
-        bindings_digest=documents.spell(bindings_digest),
-        environment_digest=environment_digest,
-        environment_receipt=receipt_ref,
-        package_descriptor=descriptor_value,
-        package=documents.body(package),
-    )
-    qualification_raw = canonical.write(qualification.document(selection))
-    qualification_ref = _stage(artifact_cache, qualification_raw)
     placement = pb.Placement(
         placement_id="private-" + hashlib.sha256(request.download_delegation).hexdigest()[:24],
         package=package,
         environment_digest=documents.raw(environment_digest),
-        environment_receipt_digest=documents.raw(installed.receipt_digest),
         package_descriptor=pb.Ref(
             digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
         ),
         bindings_digest=bindings_digest,
         models=[],
         entrypoints=entrypoints,
-        qualification=pb.Ref(
-            digest=documents.raw(qualification_ref[0]), length=qualification_ref[1]
-        ),
         environment=environment,
     )
     placement_body = documents.body(placement)

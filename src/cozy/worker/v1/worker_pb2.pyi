@@ -141,7 +141,6 @@ class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FAULT_KIND_UNKNOWN_PLACEMENT: _ClassVar[FaultKind]
     FAULT_KIND_PLACEMENT_SET_UNSUPPORTED: _ClassVar[FaultKind]
     FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH: _ClassVar[FaultKind]
-    FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_FALLBACK_PIN_MISSING: _ClassVar[FaultKind]
 
@@ -331,7 +330,6 @@ FAULT_KIND_CONFIG_REFUSED: FaultKind
 FAULT_KIND_UNKNOWN_PLACEMENT: FaultKind
 FAULT_KIND_PLACEMENT_SET_UNSUPPORTED: FaultKind
 FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH: FaultKind
-FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: FaultKind
 FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: FaultKind
 FAULT_KIND_FALLBACK_PIN_MISSING: FaultKind
 BOOT_FAILURE_REASON_UNSPECIFIED: BootFailureReason
@@ -708,30 +706,26 @@ class DownloadPackageRef(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
-    __slots__ = ("placement_id", "package", "development", "environment_digest", "environment_receipt_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "qualification", "environment")
+    __slots__ = ("placement_id", "package", "development", "environment_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "environment")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     DEVELOPMENT_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_DESCRIPTOR_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MODELS_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINTS_FIELD_NUMBER: _ClassVar[int]
-    QUALIFICATION_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     package: PackageSelection
     development: DevelopmentPackage
     environment_digest: bytes
-    environment_receipt_digest: bytes
     package_descriptor: Ref
     bindings_digest: bytes
     models: _containers.RepeatedCompositeFieldContainer[Model]
     entrypoints: _containers.RepeatedCompositeFieldContainer[Entrypoint]
-    qualification: Ref
     environment: Environment
-    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., environment_receipt_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., qualification: _Optional[_Union[Ref, _Mapping]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
+    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
 
 class Ref(_message.Message):
     __slots__ = ("digest", "length")
@@ -780,12 +774,10 @@ class DevelopmentPackage(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ...) -> None: ...
 
 class Environment(_message.Message):
-    __slots__ = ("wheelhouse_manifest", "wheels")
-    WHEELHOUSE_MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("wheels",)
     WHEELS_FIELD_NUMBER: _ClassVar[int]
-    wheelhouse_manifest: Ref
     wheels: _containers.RepeatedCompositeFieldContainer[WheelFact]
-    def __init__(self, wheelhouse_manifest: _Optional[_Union[Ref, _Mapping]] = ..., wheels: _Optional[_Iterable[_Union[WheelFact, _Mapping]]] = ...) -> None: ...
+    def __init__(self, wheels: _Optional[_Iterable[_Union[WheelFact, _Mapping]]] = ...) -> None: ...
 
 class Model(_message.Message):
     __slots__ = ("id", "repo", "version", "lane", "manifest")

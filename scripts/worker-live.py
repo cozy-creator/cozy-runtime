@@ -786,9 +786,7 @@ def start_worker(
         artifact_store = Path(store or working_store(WORK / "store"))
         artifact_cache = home / "artifact-cache"
         artifact_cache.mkdir()
-        selected_environment = pb.Environment(
-            wheelhouse_manifest=pb.Ref(digest=b"w" * 32, length=1)
-        )
+        selected_environment = pb.Environment()
         entries = []
         for name in sorted(ids):
             binding_digest = hashlib.sha256(canonical.write({"name": name, "slots": []})).digest()
@@ -812,7 +810,6 @@ def start_worker(
             environment_digest=documents.embedded_document_digest(
                 documents.body(selected_environment), "cozy.worker.v1.Environment"
             ),
-            environment_receipt_digest=b"i" * 32,
             package_descriptor=pb.Ref(digest=b"d" * 32, length=1),
             bindings_digest=hashlib.sha256(
                 canonical.write(
@@ -820,7 +817,6 @@ def start_worker(
                 )
             ).digest(),
             entrypoints=entries,
-            qualification=pb.Ref(digest=b"q" * 32, length=1),
             environment=selected_environment,
         )
     hub = hub or Hub()
