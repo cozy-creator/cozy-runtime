@@ -176,23 +176,23 @@ def main() -> int:
         f"{dur.ignored_extras == ()}"
     )
 
-    head("baked vs full — the modulation source is a CONSTRUCTION fact, not a mode")
-    baked = ModelRegistry(release=RELEASE, backend=StagedBackend())
-    baked_model = baked.acquire(
-        "generate.models.model", h3.Fl2VAModel, art.h3(task="fl2va", baked=True)
+    head("pruned vs full — the modulation source is a CONSTRUCTION fact, not a mode")
+    pruned = ModelRegistry(release=RELEASE, backend=StagedBackend())
+    pruned_model = pruned.acquire(
+        "generate.models.model", h3.Fl2VAModel, art.h3(task="fl2va", pruned=True)
     )
-    br = baked.generations()[0].record
+    br = pruned.generations()[0].record
     print(
         f"  full  topology: {len(record.destinations)} destinations, "
         f"modulation={type(model.modulation).__name__}"
     )
     print(
-        f"  baked topology: {len(br.destinations)} destinations, "
-        f"modulation={type(baked_model.modulation).__name__}"
+        f"  pruned topology: {len(br.destinations)} destinations, "
+        f"modulation={type(pruned_model.modulation).__name__}"
     )
     leaves = {d.key.split(".")[-1] for d in br.destinations}
     print(
-        "  baked OMITS the AdaLN projections and CARRIES exact tables: "
+        "  pruned OMITS the AdaLN projections and CARRIES exact tables: "
         f"{sorted(leaves - {d.key.split('.')[-1] for d in record.destinations})}"
     )
 
@@ -362,7 +362,7 @@ def main() -> int:
     fake_pipe = cast("MiniMaxH3ModularPipeline", FakeH3Pipeline())
     tested = h3.Fl2VAModel.for_test(
         pipe=fake_pipe,
-        modulation=h3.BakedModulationTables(fake_pipe),
+        modulation=h3.PrunedDiTModulationTables(fake_pipe),
         checkpoint_ref="test://h3-fl2va",
     )
     faked = invoke_with_fakes(
@@ -734,7 +734,7 @@ def descriptor_sections() -> None:
     head("two artifact configs later — the descriptor is byte-UNCHANGED (cr-004's clock)")
     before_bindings = descriptor.canonical_bytes(bodies["tiny_h3"])
     registry = ModelRegistry(release=RELEASE, backend=StagedBackend())
-    configs = (("full", art.h3(task="fl2va")), ("baked", art.h3(task="fl2va", baked=True)))
+    configs = (("full", art.h3(task="fl2va")), ("pruned", art.h3(task="fl2va", pruned=True)))
     for label, artifact in configs:
         model = registry.acquire("generate.models.model", h3.Fl2VAModel, artifact)
         record = registry.record_for(model) if hasattr(registry, "record_for") else None
@@ -854,7 +854,7 @@ class FakeH3Pipeline:
             "audio_scheduler": TinyScheduler("flow_match_audio"),
         }
         self.blocks = self
-        self.topology = _Baked()
+        self.topology = _PrunedDiT()
 
     def build_presentation(self, prompt: str, refs: object, keys: object) -> str:
         return f"fake:{prompt}"
@@ -871,7 +871,7 @@ class FakeH3Pipeline:
     def prepare_latents(self, *, frames: int, generator: object) -> int:
         return frames
 
-    def baked_tables(self, plan: object) -> tuple[int, ...]:
+    def timestep_tables(self, plan: object) -> tuple[int, ...]:
         return (1, 2, 3, 4)
 
     def step(self, *args: object) -> int:
@@ -884,8 +884,8 @@ class FakeH3Pipeline:
         return (66, 48_000)
 
 
-class _Baked:
-    baked = True
+class _PrunedDiT:
+    pruned = True
 
 
 if __name__ == "__main__":

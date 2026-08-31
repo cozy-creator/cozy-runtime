@@ -161,7 +161,7 @@ def section_determinism() -> None:
     head("double-derive determinism, per exact candidate")
     for name, cfg in (
         ("full", config()),
-        ("baked", config(structure="baked")),
+        ("pruned", config(structure="pruned")),
         ("curve", config(structure="curve")),
     ):
         first = run(h3.Fl2VAModel, cfg)
@@ -408,10 +408,10 @@ def allowed_plus() -> frozenset[str]:
 
 
 def section_h3_structures() -> None:
-    head("H3 structural derivation: full / curve / baked, on BOTH task partitions")
+    head("H3 structural derivation: full / curve / pruned, on BOTH task partitions")
     table: dict[tuple[str, str], Any] = {}
     for task, model in (("fl2va", h3.Fl2VAModel), ("ref2va", h3.Ref2VAModel)):
-        for structure in ("full", "curve", "baked"):
+        for structure in ("full", "curve", "pruned"):
             result = run(model, config(structure=structure))
             table[(task, structure)] = result
             keys = [t.key for t in result.contract.logical_tensors]
@@ -436,17 +436,18 @@ def section_h3_structures() -> None:
     for task in ("fl2va", "ref2va"):
         sets = {
             s: {t.key for t in table[(task, s)].contract.logical_tensors}
-            for s in ("full", "curve", "baked")
+            for s in ("full", "curve", "pruned")
         }
         check(
-            f"{task}: baked OMITS the AdaLN projections full carries",
-            not any("adaln_proj" in k for k in sets["baked"])
+            f"{task}: pruned OMITS the AdaLN projections full carries",
+            not any("adaln_proj" in k for k in sets["pruned"])
             and any("adaln_proj" in k for k in sets["full"]),
-            f"full has {sum('adaln_proj' in k for k in sets['full'])} projection rows, baked has 0",
+            f"full has {sum('adaln_proj' in k for k in sets['full'])} projection rows, "
+            "pruned has 0",
         )
         check(
-            f"{task}: baked CARRIES modulation tables neither other structure has",
-            any("modulation_table" in k for k in sets["baked"])
+            f"{task}: pruned CARRIES modulation tables neither other structure has",
+            any("modulation_table" in k for k in sets["pruned"])
             and not any("modulation_table" in k for k in sets["curve"]),
             "the table is checkpoint data, never the DerivedCache",
         )
@@ -459,25 +460,25 @@ def section_h3_structures() -> None:
         check(
             f"{task}: the three destination sets are pairwise different",
             len({frozenset(v) for v in sets.values()}) == 3,
-            f"full {len(sets['full'])}, curve {len(sets['curve'])}, baked {len(sets['baked'])}",
+            f"full {len(sets['full'])}, curve {len(sets['curve'])}, pruned {len(sets['pruned'])}",
         )
 
     print("  — red arms: the structures cannot be interchanged")
-    baked_table = topology_of(table[("fl2va", "baked")])
+    pruned_table = topology_of(table[("fl2va", "pruned")])
     red(
-        "a curve construction cannot satisfy the exact BAKED contract by name",
-        lambda: run(h3.Fl2VAModel, config(structure="curve"), topology=baked_table),
+        "a curve construction cannot satisfy the exact PRUNED contract by name",
+        lambda: run(h3.Fl2VAModel, config(structure="curve"), topology=pruned_table),
         code="topology_missing_keys",
     )
     full_table = topology_of(table[("fl2va", "full")])
     red(
-        "a baked construction cannot claim the FULL contract's omitted projections",
-        lambda: run(h3.Fl2VAModel, config(structure="baked"), topology=full_table),
+        "a pruned construction cannot claim the FULL contract's omitted projections",
+        lambda: run(h3.Fl2VAModel, config(structure="pruned"), topology=full_table),
         code="topology_missing_keys",
     )
     check(
-        "same step count is insufficient to match a baked table",
-        table[("fl2va", "baked")].contract.digest != table[("fl2va", "full")].contract.digest,
+        "same step count is insufficient to match a pruned table",
+        table[("fl2va", "pruned")].contract.digest != table[("fl2va", "full")].contract.digest,
         "the structures differ by CONSTRUCTION, never by a request mode",
     )
 
@@ -489,16 +490,16 @@ def section_h3_structures() -> None:
         f"{len(narrow.contract.destination_sets)} components, no ref2va row",
     )
 
-    print("  — the DerivedCache is a CONSTRUCTION fact, and baked never declares one")
+    print("  — the DerivedCache is a CONSTRUCTION fact, and pruned never declares one")
     check(
         "full declares the adaln modulation cache",
         [c.name for c in table[("fl2va", "full")].contract.caches] == ["adaln_modulation_tables"],
         "memory-only, declared-bounded",
     )
     check(
-        "baked declares NO cache",
-        table[("fl2va", "baked")].contract.caches == (),
-        "a baked construction selects the artifact tables and never touches the cache",
+        "pruned declares NO cache",
+        table[("fl2va", "pruned")].contract.caches == (),
+        "a pruned construction selects the artifact tables and never touches the cache",
     )
 
 
@@ -776,7 +777,7 @@ def section_sensitivity() -> None:
     head("sensitivity: what moves the contract, and what must not")
     base = run(h3.Fl2VAModel, config())
     moves = {
-        "structure (full -> baked)": config(structure="baked"),
+        "structure (full -> pruned)": config(structure="pruned"),
         "component graph (blocks 2 -> 3)": config(blocks=3),
         "an artifact config value (width)": config(width=64),
         "the encoding-aware module choice (dtype island widened)": config(width=33),
@@ -1099,13 +1100,13 @@ def section_benchmarks() -> None:
     rows = []
     fixtures = (
         ("H3 full (2 blocks, width 32)", config()),
-        ("H3 baked (2 blocks)", config(structure="baked")),
+        ("H3 pruned (2 blocks)", config(structure="pruned")),
         # production scale: meta parameters cost nothing, so the only thing that grows is
         # the census and the document. That is the claim worth measuring.
         ("H3-scale full (48 blocks, width 3072)", config(width=3072, blocks=48)),
         (
-            "H3-scale baked (48 blocks, width 3072)",
-            config(width=3072, blocks=48, structure="baked"),
+            "H3-scale pruned (48 blocks, width 3072)",
+            config(width=3072, blocks=48, structure="pruned"),
         ),
     )
     sdxl_cfg = Config({"width": 320, "layers": 12, "blocks": 4})

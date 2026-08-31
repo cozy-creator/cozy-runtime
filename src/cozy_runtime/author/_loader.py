@@ -411,7 +411,7 @@ class DerivedCache:
 
     MEMORY-ONLY and declared-bounded: entries die with the generation, `get` is legal only
     inside an active component-use scope, and there is no persistence surface to declare
-    (durable derived tables are baked artifacts produced by jobs, §1.3). cr-008b owns the
+    (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). cr-008b owns the
     ledger accounting and lease mechanics.
     """
 

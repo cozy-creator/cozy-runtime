@@ -14,7 +14,7 @@ What this fixture proves that SDXL does not:
   · granular `@uses_components` per semantic operation, and a private helper inheriting its
     caller's active scope;
   · a declared `DerivedCache` whose entries are built INSIDE the transformer's scope, on a
-    full topology only — a baked construction reads checkpoint components instead;
+    full topology only — a pruned construction reads checkpoint components instead;
   · fresh per-request video and audio schedulers from `view.make_scheduler`.
 
 Video/audio ENCODING is cr-017's: `out.save_video` exists and refuses typed, so this
@@ -236,7 +236,7 @@ class H3Latents:
     audio: int
 
 
-_TABLE_FORMAT = "adaln-tables/1"  # table-format + baker-numerics version
+_TABLE_FORMAT = "adaln-tables/1"  # table-format + table-generator-numerics version
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,17 +429,17 @@ class LiveAdaLN:
 
 
 @dataclass(frozen=True, slots=True)
-class BakedModulationTables:
-    """Baked topology: the tables are ordinary checkpoint components and coverage was proven
+class PrunedDiTModulationTables:
+    """Pruned topology: the tables are ordinary checkpoint components and coverage was proven
     at admission — never through the cache."""
 
     pipe: MiniMaxH3ModularPipeline
 
     def for_run(self, run: H3Run) -> tuple[int, ...]:
-        return self.pipe.blocks.baked_tables(run.timestep_plan.digest)
+        return self.pipe.blocks.timestep_tables(run.timestep_plan.digest)
 
 
-ModulationSource: TypeAlias = LiveAdaLN | BakedModulationTables
+ModulationSource: TypeAlias = LiveAdaLN | PrunedDiTModulationTables
 
 
 # ------------------------------------------------------------------ the model boundary
@@ -459,8 +459,8 @@ class _H3Base(Model[MiniMaxH3ModularPipeline]):
             factory=lambda config: build_h3_pipeline(config, task=task),
         )
         self.modulation = (
-            BakedModulationTables(self.pipe)
-            if self.pipe.topology.baked
+            PrunedDiTModulationTables(self.pipe)
+            if self.pipe.topology.pruned
             else LiveAdaLN(loader.cache("adaln_modulation_tables"), self.pipe)
         )
 
@@ -504,7 +504,7 @@ class _H3Base(Model[MiniMaxH3ModularPipeline]):
         """A private helper: it INHERITS its caller's active scope (§1.1)."""
         latents = self.pipe.blocks.prepare_latents(frames=frames, generator=run.view.generator)
         # Exactly one source exists per construction: LiveAdaLN builds under THIS
-        # transformer lease; BakedModulationTables reads checkpoint components.
+        # transformer lease; PrunedDiTModulationTables reads checkpoint components.
         mod = self.modulation.for_run(run)
         for i, (t_v, t_a) in enumerate(run.timestep_plan.steps):
             latents = self.pipe.blocks.step(

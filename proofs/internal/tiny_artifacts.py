@@ -18,8 +18,8 @@ from tiny_diffusers import build_h3_pipeline as _build_h3
 from cozy_runtime.author import Artifact, Config, TensorSpec
 from cozy_runtime.author._loader import topology_of
 
-H3_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": False}
-BAKED_CONFIG: Mapping[str, object] = {"hidden_size": 32, "baked": True}
+H3_CONFIG: Mapping[str, object] = {"hidden_size": 32, "pruned": False}
+PRUNED_CONFIG: Mapping[str, object] = {"hidden_size": 32, "pruned": True}
 SDXL_CONFIG: Mapping[str, object] = {"hidden_size": 32}
 
 
@@ -33,7 +33,7 @@ def sdxl(snapshot: str = "cozy/tiny-sdxl@v1#a1b2", **config: object) -> Artifact
 
 
 def h3(
-    *, task: Task, snapshot: str | None = None, baked: bool = False, dual: bool = False
+    *, task: Task, snapshot: str | None = None, pruned: bool = False, dual: bool = False
 ) -> Artifact:
     """A narrow role artifact, or the DUAL package carrying both transformer roles.
 
@@ -48,14 +48,14 @@ def h3(
     of a dual one. Two slots on the dual artifact share a snapshot and config yet keep
     distinct construction identities, because identity includes the model class (§1.1).
     """
-    data = dict(BAKED_CONFIG if baked else H3_CONFIG)
+    data = dict(PRUNED_CONFIG if pruned else H3_CONFIG)
     config = Config(data)
     topology: dict[str, TensorSpec] = {}
     roles: tuple[Task, ...] = ("fl2va", "ref2va") if dual else (task,)
     for role in roles:
         topology.update(topology_of(_build_h3(config, task=role)))
     label = "h3-dual" if dual else f"h3-{task}"
-    lane = "adaln-baked" if baked else "full"
+    lane = "adaln-pruned" if pruned else "full"
     return Artifact(
         snapshot=snapshot or f"cozy/{label}@v1/{lane}#c3d4",
         topology=topology,
