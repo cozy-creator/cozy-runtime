@@ -31,6 +31,9 @@ version = "0.1.0"
 requires-python = ">=3.14,<3.15"
 dependencies = ["cozy-runtime>={__version__},<0.1"]
 
+[project.entry-points."cozy.application"]
+default = "{pkg}:app"
+
 [project.optional-dependencies]
 # CUDA-extras torch convention: hosts install the one admitted CUDA generation.
 cu130 = ["torch>=2.13,<3"]

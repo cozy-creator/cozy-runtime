@@ -12,6 +12,9 @@ dependencies = [
     "msgspec>=0.19",
 ]
 
+[project.entry-points."cozy.application"]
+default = "marco_polo_package:app"
+
 [tool.cozy]
 organization = "paul"
 

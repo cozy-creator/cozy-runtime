@@ -15,6 +15,7 @@ on author top-level code — and the refusal set around the one import.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import signal
 import sys
 import threading
@@ -98,6 +99,25 @@ def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> 
     """
 
     return _discover(application, Path("/"), {}, seconds=seconds, add=None)
+
+
+def discover_distribution(distribution: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
+    """Discover one installed wheel through its single standard ``cozy.application`` entry."""
+
+    try:
+        entries = tuple(importlib.metadata.distribution(distribution).entry_points)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise DiscoveryError(
+            f"installed distribution {distribution!r} is absent", code="missing_distribution"
+        ) from exc
+    applications = [entry.value for entry in entries if entry.group == "cozy.application"]
+    if len(applications) != 1:
+        raise DiscoveryError(
+            f"{distribution!r} exposes {len(applications)} cozy.application entries; exactly one "
+            "is required",
+            code="application_entrypoint_count",
+        )
+    return _discover(applications[0], Path("/"), {}, seconds=seconds, add=None)
 
 
 def _discover(

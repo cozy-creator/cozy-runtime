@@ -227,6 +227,34 @@ class _Inspected:
     native_members: tuple[str, ...]
 
 
+def measure_wheel(path: Path, owner: str, base: BaseManifest) -> tuple[Wheel, VerifiedFile]:
+    """Derive one local wheel fact, then run the ordinary full wheel inspection once."""
+
+    if owner not in {"project", "custom"} or not path.is_absolute():
+        raise OverlayRefusal("overlay_wheel_invalid", str(path))
+    try:
+        info = path.lstat()
+        distribution, version, _build, tags = parse_wheel_filename(path.name)
+        with zipfile.ZipFile(path) as archive:
+            roots = _import_roots({member.filename for member in archive.infolist()})
+    except (OSError, InvalidWheelFilename, zipfile.BadZipFile) as exc:
+        raise OverlayRefusal("overlay_wheel_invalid", path.name) from exc
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_WHEEL_BYTES:
+        raise OverlayRefusal("overlay_wheel_invalid", path.name)
+    wheel = Wheel(
+        distribution=_name(str(distribution)),
+        version=str(version),
+        filename=path.name,
+        digest=_hash_file(path),
+        length=info.st_size,
+        tags=tuple(sorted(str(tag) for tag in tags)),
+        owner=owner,
+        import_roots=tuple(sorted(roots)),
+    )
+    inspected = _inspect(wheel, path, base)
+    return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
+
+
 def expected_receipt_bytes(source: Input) -> bytes:
     """Canonical receipt implied by already-joined release documents.
 

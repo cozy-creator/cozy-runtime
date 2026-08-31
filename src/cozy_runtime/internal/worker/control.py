@@ -120,12 +120,14 @@ class GrpcControlHost:
         tls_cert: Path | None = None,
         tls_key: Path | None = None,
         on_bound: Callable[[str], None] | None = None,
+        preparer: Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult] | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
         self.tls_cert = tls_cert
         self.tls_key = tls_key
         self.on_bound = on_bound
+        self.preparer = preparer
         self.server: Any = None
         self.stopped = threading.Event()
 
@@ -138,6 +140,10 @@ class GrpcControlHost:
 
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
+        if self.preparer is not None:
+            pb_grpc.add_RuntimePreparationServicer_to_server(
+                _PreparationServicer(self.preparer), self.server
+            )
         if self.listen.startswith("unix:"):
             self.server.add_insecure_port(self.listen)
             address = self.listen
@@ -172,6 +178,21 @@ class GrpcControlHost:
             # conversation; what remains is transport teardown, which has no work to drain.
             self.server.stop(grace=0)
         self.stopped.set()
+
+
+class _PreparationServicer:
+    def __init__(
+        self, handler: Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult]
+    ) -> None:
+        self.handler = handler
+
+    def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
+        try:
+            return self.handler(request)
+        except Exception as exc:
+            import grpc
+
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
 
 
 # --------------------------------------------------------------------------- in-memory

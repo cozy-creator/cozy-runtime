@@ -1119,6 +1119,9 @@ def development_placement_documents(
             ),
             stamps=selected.stamps if selected is not None else {},
             package_revision_digest=source_digest,
+            config_digest=(
+                selected.config_digest if selected is not None else canonical.digest({})
+            ),
             development=True,
             model_weight_bytes=selected.model_weight_bytes if selected is not None else 0,
             vram_floor_bytes=selected.vram_floor_bytes if selected is not None else 0,

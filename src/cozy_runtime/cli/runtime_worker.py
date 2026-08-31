@@ -106,12 +106,13 @@ def _run(config: WorkerHostConfig) -> int:
     host_paths.WORKER_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     host_paths.WORKER_CONTROL_ADDRESS.unlink(missing_ok=True)
     host = GrpcControlHost(
-        f"0.0.0.0:{config.worker_internal_port}",
+        f"127.0.0.1:{config.worker_internal_port}",
         host_paths.WORKER_CONTROL_ADDRESS,
         tls_cert=host_paths.TLS_CERTIFICATE,
         tls_key=host_paths.TLS_PRIVATE_KEY,
     )
     worker = Worker(runtime_config, options, host)
+    host.preparer = worker.prepare_package_set
 
     def ready(_address: str) -> None:
         if worker.stop.is_set():
