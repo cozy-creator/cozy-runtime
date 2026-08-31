@@ -15,6 +15,7 @@ from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
+    base_observation,
     canonical,
     config,
     jit_cache,
@@ -32,7 +33,6 @@ REQUEST_FIELDS = {
     "fixture",
     "installed_environment_receipt_digest",
     "python",
-    "wheelhouse_manifest",
 }
 
 
@@ -45,7 +45,6 @@ class Request:
     fixture: str
     installed_receipt_digest: str
     python: Path
-    wheelhouse_manifest: Path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -57,14 +56,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         request_path = _existing_file(_absolute(args[0], "request"), "request")
         evidence_path = _fresh_output(_absolute(args[1], "evidence"))
         request = _request(request_path)
-        base_raw = _bounded_bytes(request.wheelhouse_manifest, "wheelhouse_manifest")
-        base_digest = _digest(base_raw)
-        base = package_environment.parse_base_manifest(base_raw, base_digest)
+        base = package_environment.observe_base(request.python)
         installed = package_environment.open_generation(
             request.environment_root,
             receipt_digest=request.installed_receipt_digest,
             environment_digest=request.environment_digest,
-            base_manifest=request.wheelhouse_manifest,
             python=request.python,
         )
         inspection = native_wheel.inspect_installed(installed.site_packages)
@@ -130,7 +126,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "operator_observation": operator,
             "package_environment_content_digest": installed.content_digest,
             "static_inspection": inspection.document(),
-            "wheelhouse_manifest_digest": base_digest,
         }
         payload = canonical.write(evidence)
         _publish(evidence_path, payload)
@@ -202,19 +197,11 @@ def _request(path: Path) -> Request:
         fixture,
         str(value["installed_environment_receipt_digest"]),
         _existing_executable(_absolute(value["python"], "python")),
-        _existing_file(
-            _absolute(value["wheelhouse_manifest"], "wheelhouse_manifest"),
-            "wheelhouse_manifest",
-        ),
     )
 
 
-def _profile_id(base: package_environment.BaseManifest) -> str:
-    profile = dict(base.compatibility_profile)
-    return (
-        f"torch{profile['torch_release']}-{profile['accelerator_build']}-"
-        f"{profile['python_abi']}-{profile['os_cpu']}"
-    )
+def _profile_id(base: base_observation.Observation) -> str:
+    return f"torch{base.torch_release}-{base.accelerator_build}-{base.python_abi}-linux-x86"
 
 
 def _absolute(value: object, name: str) -> Path:

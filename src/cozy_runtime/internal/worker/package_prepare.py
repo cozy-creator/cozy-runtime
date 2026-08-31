@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import (
+    base_observation,
     canonical,
     descriptor,
     fill,
@@ -50,7 +51,7 @@ def prepare_package_set(
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
-    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
+    base: base_observation.Observation | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse one signed delegation, then use the shared package preparation path."""
 
@@ -99,7 +100,7 @@ def prepare_package_set(
         describe=describe,
         verified=verified,
         job_plan_root=job_plan_root,
-        base_manifest=base_manifest,
+        base=base,
     )
 
 
@@ -112,7 +113,7 @@ def prepare_private_package(
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
-    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
+    base: base_observation.Observation | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact private wheel revision without inventing Hub provenance."""
 
@@ -155,7 +156,7 @@ def prepare_private_package(
         describe=describe,
         verified=verified,
         job_plan_root=job_plan_root,
-        base_manifest=base_manifest,
+        base=base,
         development=package,
     )
 
@@ -282,7 +283,7 @@ def prepare_package(
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
-    base_manifest: Path,
+    base: base_observation.Observation | None = None,
     models: Sequence[Any] = (),
     artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
@@ -301,10 +302,8 @@ def prepare_package(
     except (documents.DocumentError, ValueError) as exc:
         raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
 
-    base_raw = _read_file(base_manifest, 64 << 20)
-    base_digest = "sha256:" + hashlib.sha256(base_raw).hexdigest()
     try:
-        base = package_environment.parse_base_manifest(base_raw, base_digest)
+        observed_base = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
 
@@ -347,7 +346,7 @@ def prepare_package(
             wheel, receipt = package_environment.measure_wheel(
                 path,
                 owner,
-                base,
+                observed_base,
                 allow_native_custom=allow_native_custom,
                 allow_base_owned=installed_environment is not None or owner == "custom",
             )
@@ -358,7 +357,7 @@ def prepare_package(
         if (
             installed_environment is None
             and owner == "custom"
-            and package_environment.base_owned_wheel(wheel, base)
+            and package_environment.base_owned_wheel(wheel, observed_base)
         ):
             verified(digest, row.length, path)
             continue
@@ -396,7 +395,6 @@ def prepare_package(
             package=documents.body(package),
             environment=environment_body,
             environment_digest=environment_digest,
-            wheelhouse_manifest_bytes=base_raw,
             wheel_paths=wheel_paths,
             verified_wheels=receipts,
         )
@@ -405,13 +403,13 @@ def prepare_package(
                 source,
                 environment_root,
                 python=python,
-                base_manifest=base_manifest,
+                base=observed_base,
                 allow_native_custom=allow_native_custom,
             )
         else:
             package_environment.verify_existing_environment(
                 source,
-                base_manifest=base_manifest,
+                base=observed_base,
                 allow_native_custom=allow_native_custom,
             )
             installed = installed_environment

@@ -265,54 +265,11 @@ def _fsync(path: Path) -> None:
         os.close(descriptor)
 
 
-def baked_base_manifest(
-    manifest_path: Path = package_environment.DEFAULT_BASE_MANIFEST,
-) -> package_environment.BaseManifest:
-    """Read the trusted image-owned base profile before any hardware probe."""
-
-    try:
-        raw = manifest_path.read_bytes()
-    except OSError as exc:
-        raise LaunchRefusal("control_runtime_manifest_unreadable", str(exc)) from exc
-    manifest_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    try:
-        return package_environment.parse_base_manifest(raw, manifest_digest)
-    except package_environment.EnvironmentRefusal as exc:
-        raise LaunchRefusal(exc.code, exc.detail) from exc
-
-
-def control_runtime_digest(
-    manifest_path: Path = package_environment.DEFAULT_BASE_MANIFEST,
-    *,
-    manifest: package_environment.BaseManifest | None = None,
-) -> str:
-    """Read the exact image-owned control Runtime wheel identity.
-
-    This is not the OCI manifest digest and it is not accepted from provider environment.
-    The registered base worker image bakes the complete wheelhouse manifest; Runtime
-    validates those exact canonical bytes and reports its one ``cozy-runtime`` wheel fact
-    so the hub can compare it with the selected image record.
-    """
-
-    if manifest is None:
-        manifest = baked_base_manifest(manifest_path)
-    if manifest.ownership != "image":
-        raise LaunchRefusal("control_runtime_manifest_ownership_invalid", manifest.ownership)
-    matches = [wheel.digest for wheel in manifest.wheels if wheel.distribution == "cozy-runtime"]
-    if len(matches) != 1:
-        raise LaunchRefusal(
-            "control_runtime_identity_invalid",
-            f"base manifest names {len(matches)} cozy-runtime wheels",
-        )
-    return matches[0]
-
-
 def package_environment_input(
     *,
     package: Mapping[str, Any],
     environment: Mapping[str, Any],
     environment_digest: str,
-    wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
     verified_wheels: Mapping[str, package_environment.VerifiedFile] | None = None,
 ) -> package_environment.Input:
@@ -354,12 +311,6 @@ def package_environment_input(
             "environment_digest_mismatch",
             f"measured {measured_environment}, expected {environment_digest}",
         )
-    base_digest = _digest(wheelhouse_manifest_bytes)
-    try:
-        package_environment.parse_base_manifest(wheelhouse_manifest_bytes, base_digest)
-    except package_environment.EnvironmentRefusal as exc:
-        raise LaunchRefusal(exc.code, exc.detail) from exc
-
     project = _wheel(package["project_wheel"], "project", import_roots=True, nested_ref=True)
     if project.distribution != identity.split("/", 1)[1] or project.version != version:
         raise LaunchRefusal("project_wheel_mismatch", "project wheel differs from package release")
@@ -390,7 +341,6 @@ def package_environment_input(
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
     return package_environment.Input(
         environment_digest=environment_digest,
-        base_family_digest=base_digest,
         project_wheel_digest=project.digest,
         wheels=tuple(wheels),
         grants=tuple(

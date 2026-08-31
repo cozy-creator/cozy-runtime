@@ -8,7 +8,8 @@ resolves dependencies, copies a base package, or re-hashes the base environment'
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
 after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
-and atomically published. Reuse reads the small receipt and image base-family manifest; it
+and atomically published. Reuse reads only the small receipt; actual base compatibility is
+re-observed before admission and
 does not walk or hash the installed tree again.
 """
 
@@ -40,12 +41,10 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import base_observation, canonical
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 CONTENT_IDENTITY_NAME = "package-environment-content.json"
-DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
-WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
@@ -109,6 +108,13 @@ class EnvironmentRefusal(Exception):
         self.detail = detail
 
 
+def observe_base(python: Path = Path(sys.executable)) -> base_observation.Observation:
+    try:
+        return base_observation.from_python(python)
+    except base_observation.ObservationRefusal as exc:
+        raise EnvironmentRefusal("package_environment_base_invalid", str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Wheel:
     distribution: str
@@ -120,28 +126,6 @@ class Wheel:
     owner: str
     """Exactly ``project``, ``custom``, or image-owned ``base``."""
     import_roots: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class BaseManifest:
-    """The complete immutable Python ownership of one base worker image."""
-
-    platform_target: tuple[tuple[str, str], ...]
-    compatibility_profile: tuple[tuple[str, str], ...]
-    minimum_cuda_version: str
-    minimum_driver_version: str
-    wheels: tuple[Wheel, ...]
-    base_distributions: tuple[tuple[str, str], ...]
-    base_import_roots: tuple[tuple[str, tuple[str, ...]], ...]
-    ownership: str = "image"
-
-    @property
-    def distribution_versions(self) -> dict[str, str]:
-        return dict(self.base_distributions)
-
-    @property
-    def root_providers(self) -> dict[str, tuple[str, ...]]:
-        return dict(self.base_import_roots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +184,6 @@ class VerifiedFile:
 @dataclass(frozen=True, slots=True)
 class Input:
     environment_digest: str
-    base_family_digest: str
     project_wheel_digest: str
     wheels: tuple[Wheel, ...]
     grants: tuple[BlobGrant, ...]
@@ -231,7 +214,7 @@ class _Inspected:
 def measure_wheel(
     path: Path,
     owner: str,
-    base: BaseManifest,
+    base: base_observation.Observation,
     *,
     allow_native_custom: bool = False,
     allow_base_owned: bool = False,
@@ -277,12 +260,11 @@ def measure_wheel(
 def preflight_environment(
     project: Path,
     dependencies: Sequence[Path],
-    base_raw: bytes,
-) -> tuple[BaseManifest, tuple[Wheel, ...], tuple[Wheel, ...]]:
+    base: base_observation.Observation | None = None,
+) -> tuple[base_observation.Observation, tuple[Wheel, ...], tuple[Wheel, ...]]:
     """Apply rental package admission without installing or executing code."""
 
-    base_digest = _sha(base_raw)
-    base = parse_base_manifest(base_raw, base_digest)
+    base = base or base_observation.current()
     project_row = measure_wheel(project, "project", base)
     observed = [project_row[0]]
     measured = [(project_row[0], project_row[1], project)]
@@ -294,7 +276,6 @@ def preflight_environment(
     wheels = tuple(row[0] for row in measured)
     source = Input(
         environment_digest=_sha(canonical.write({"wheels": [wheel.digest for wheel in wheels]})),
-        base_family_digest=base_digest,
         project_wheel_digest=project_row[0].digest,
         wheels=wheels,
         grants=tuple(
@@ -307,7 +288,7 @@ def preflight_environment(
     return base, ordered, tuple(observed)
 
 
-def base_owned_wheel(wheel: Wheel, base: BaseManifest) -> bool:
+def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
     """Normalize an exact redundant carrier to the base or refuse a conflicting shadow."""
 
     version = base.distribution_versions.get(wheel.distribution)
@@ -334,60 +315,54 @@ def materialize(
     root: Path,
     *,
     python: Path = Path(sys.executable),
-    base_manifest: Path = DEFAULT_BASE_MANIFEST,
-    expected_receipt_digest: str = "",
+    base: base_observation.Observation | None = None,
     allow_native_custom: bool = False,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
     Content identity is the interpreter ABI/platform, uv version, and sorted package-owned
-    wheel digests. The placement receipt still binds the current base manifest, so a compatible
-    Runtime patch reuses the venv while an actual Python/platform or requirement conflict refuses.
+    wheel digests. The actual base is re-observed for admission and is not part of that identity.
 
     ``allow_native_custom`` belongs to the local same-user lane. Its default is the rented-pod
     boundary, where native dependency wheels require separate hardware-class proof.
     """
 
     _require_digest(source.environment_digest, "environment_digest")
-    _require_digest(source.base_family_digest, "base_family_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
-    if expected_receipt_digest:
-        _require_digest(expected_receipt_digest, "expected_receipt_digest")
-
-    base = _read_base_manifest(base_manifest, source.base_family_digest)
-    wheels = _verify_inventory(source, base)
+    observed = base or observe_base(python)
+    wheels = _verify_inventory(source, observed)
     uv = _uv_binary()
-    uv_version = _uv_version(uv, base)
-    interpreter = _interpreter_identity(python, base)
-    content_bytes = canonical.write(_content_identity(wheels, interpreter, uv_version))
+    current_uv = _observed_uv_version(uv)
+    if current_uv != observed.uv_version:
+        raise EnvironmentRefusal(
+            "package_environment_uv_changed",
+            f"observed={observed.uv_version} current={current_uv}",
+        )
+    content_bytes = canonical.write(
+        _content_identity(wheels, observed.interpreter_identity, observed.uv_version)
+    )
     content_digest = _sha(content_bytes)
     receipt_bytes = canonical.write(_receipt(source, wheels, content_digest))
     receipt_digest = _sha(receipt_bytes)
-    if expected_receipt_digest and receipt_digest != expected_receipt_digest:
-        raise EnvironmentRefusal(
-            "package_environment_receipt_mismatch",
-            f"derived {receipt_digest}, expected {expected_receipt_digest}",
-        )
     contents = root / "contents"
     receipts = root / "receipts"
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
+    inspected = _verify_grants(
+        source,
+        wheels,
+        observed,
+        allow_native_custom=allow_native_custom,
+    )
     if receipt_path.exists():
         return open_generation(
             root,
             receipt_digest=receipt_digest,
             environment_digest=source.environment_digest,
-            base_manifest=base_manifest,
             reused=True,
             python=python,
         )
     reused = final.exists()
-    inspected = _verify_grants(
-        source,
-        wheels,
-        base,
-        allow_native_custom=allow_native_custom,
-    )
     _require_owned_root(root)
     _remove_dead_staging(root)
     contents.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -421,7 +396,6 @@ def materialize(
         root,
         receipt_digest=receipt_digest,
         environment_digest=source.environment_digest,
-        base_manifest=base_manifest,
         reused=reused,
         python=python,
     )
@@ -430,12 +404,11 @@ def materialize(
 def verify_existing_environment(
     source: Input,
     *,
-    base_manifest: Path,
+    base: base_observation.Observation,
     allow_native_custom: bool,
 ) -> None:
     """Verify exact wheel facts against an already-complete local uv environment."""
 
-    base = _read_base_manifest(base_manifest, source.base_family_digest)
     wheels = _verify_inventory(source, base, allow_base_owned=True)
     _verify_grants(
         source,
@@ -505,16 +478,13 @@ def open_generation(
     *,
     receipt_digest: str,
     environment_digest: str,
-    base_manifest: Path = DEFAULT_BASE_MANIFEST,
     reused: bool = True,
     python: Path = Path(sys.executable),
 ) -> InstalledEnvironment:
     """Open immutable content through one exact placement receipt without tree hashes.
 
-    The receipt and base-family manifest are small identity documents. The package wheel
-    bytes were hashed before atomic publication; the official image's OCI digest already
-    protects its base environment. Re-reading every installed file would add startup cost
-    without adding an independent trust boundary.
+    The package wheel bytes were hashed before atomic publication. Re-reading every installed
+    file would add startup cost without adding an independent trust boundary.
     """
 
     _require_digest(receipt_digest, "receipt_digest")
@@ -531,12 +501,6 @@ def open_generation(
         raise EnvironmentRefusal(
             "package_environment_receipt_wrong_environment", environment_digest
         )
-    base_digest = value.get("base_family_digest")
-    if not isinstance(base_digest, str):
-        raise EnvironmentRefusal(
-            "package_environment_receipt_invalid", "base family is not a digest"
-        )
-    _read_base_manifest(base_manifest, base_digest)
     content_digest = value.get("content_digest")
     if not isinstance(content_digest, str):
         raise EnvironmentRefusal("package_environment_receipt_invalid", "content digest is absent")
@@ -554,7 +518,17 @@ def open_generation(
         raise EnvironmentRefusal("package_environment_content_identity_invalid", str(exc)) from exc
     if not _content_matches_receipt(identity, value):
         raise EnvironmentRefusal("package_environment_content_identity_mismatch", str(generation))
-    major, minor = _target_python(_read_base_manifest(base_manifest, base_digest))
+    if not isinstance(identity, dict) or not isinstance(identity.get("interpreter"), dict):
+        raise EnvironmentRefusal(
+            "package_environment_content_identity_invalid", "interpreter identity is absent"
+        )
+    python_abi = identity["interpreter"].get("python_abi")
+    match = re.fullmatch(r"cp([0-9])([0-9]{2})", str(python_abi))
+    if match is None:
+        raise EnvironmentRefusal(
+            "package_environment_content_identity_invalid", "python ABI is invalid"
+        )
+    major, minor = int(match.group(1)), int(match.group(2))
     site_packages = generation / "lib" / f"python{major}.{minor}" / "site-packages"
     environment_python = generation / "bin" / "python"
     if not site_packages.is_dir() or not environment_python.is_file():
@@ -592,7 +566,6 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
     except canonical.CanonicalError as exc:
         raise EnvironmentRefusal("package_environment_receipt_invalid", str(exc)) from exc
     fields = {
-        "base_family_digest",
         "content_digest",
         "environment_digest",
         "format",
@@ -602,7 +575,6 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields or value.get("format") != RECEIPT_FORMAT:
         raise EnvironmentRefusal("package_environment_receipt_invalid", "wrong fields or format")
     for field in (
-        "base_family_digest",
         "content_digest",
         "environment_digest",
         "project_wheel_digest",
@@ -664,268 +636,8 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def _read_base_manifest(path: Path, expected_digest: str) -> BaseManifest:
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise EnvironmentRefusal("base_family_manifest_unreadable", str(exc)) from exc
-    return parse_base_manifest(raw, expected_digest)
-
-
-def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
-    """Strictly parse one canonical complete base-worker-image ownership manifest."""
-
-    _require_digest(expected_digest, "base_family_digest")
-    if _sha(raw) != expected_digest:
-        raise EnvironmentRefusal(
-            "base_family_mismatch", f"manifest does not name {expected_digest}"
-        )
-    try:
-        value = canonical.parse_canonical(raw)
-    except canonical.CanonicalError as exc:
-        raise EnvironmentRefusal("base_family_manifest_invalid", str(exc)) from exc
-    fields = {
-        "base_distributions",
-        "base_import_roots",
-        "compatibility_profile",
-        "format",
-        "minimum_cuda_version",
-        "minimum_driver_version",
-        "platform_target",
-        "wheels",
-    }
-    shapes = {frozenset(fields), frozenset({*fields, "ownership"})}
-    if not isinstance(value, dict) or set(value) not in shapes:
-        raise EnvironmentRefusal("base_family_manifest_invalid", "wrong fields")
-    ownership = value.get("ownership", "image")
-    if ownership not in {"image", "observed-local"}:
-        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid ownership")
-    if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
-        raise EnvironmentRefusal("base_family_manifest_invalid", "wrong format")
-    platform = value["platform_target"]
-    if (
-        not isinstance(platform, dict)
-        or set(platform) != _PLATFORM_TARGET_FIELDS
-        or not all(isinstance(item, str) and item for item in platform.values())
-        or platform["python_abi"] != "cp312"
-        or platform["os_arch"] != "linux/amd64"
-        or re.fullmatch(r"glibc[0-9]+\.[0-9]+", platform["libc"]) is None
-        or platform["accelerator_backend"] not in {"none", "cuda"}
-    ):
-        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid platform_target")
-    profile = value["compatibility_profile"]
-    if (
-        not isinstance(profile, dict)
-        or set(profile) != _COMPATIBILITY_PROFILE_FIELDS
-        or not all(isinstance(item, str) and item for item in profile.values())
-        or profile["python_abi"] != platform["python_abi"]
-        or profile["os_cpu"] != "linux-x86"
-    ):
-        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
-    minimum_cuda = value["minimum_cuda_version"]
-    minimum_driver = value["minimum_driver_version"]
-    distributions = _base_distribution_rows(value["base_distributions"])
-    roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
-    _validate_base_profile(platform, profile, minimum_cuda, minimum_driver, distributions, roots)
-    wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
-    return BaseManifest(
-        platform_target=tuple(sorted(platform.items())),
-        compatibility_profile=tuple(sorted(profile.items())),
-        minimum_cuda_version=minimum_cuda,
-        minimum_driver_version=minimum_driver,
-        wheels=wheels,
-        base_distributions=distributions,
-        base_import_roots=roots,
-        ownership=ownership,
-    )
-
-
-def _validate_base_profile(
-    platform: dict[str, object],
-    profile: dict[str, object],
-    minimum_cuda: object,
-    minimum_driver: object,
-    distributions: tuple[tuple[str, str], ...],
-    roots: tuple[tuple[str, tuple[str, ...]], ...],
-) -> None:
-    backend = platform["accelerator_backend"]
-    abi = platform["accelerator_abi"]
-    build = profile["accelerator_build"]
-    cpu = backend == "none" and abi == "none" and build == "cpu"
-    cuda = (
-        backend == "cuda"
-        and isinstance(abi, str)
-        and re.fullmatch(r"cu[0-9]+", abi) is not None
-        and build == abi
-    )
-    floors = (
-        minimum_cuda == "none" and minimum_driver == "none"
-        if cpu
-        else isinstance(minimum_cuda, str)
-        and re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is not None
-        and isinstance(minimum_driver, str)
-        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is not None
-    )
-    if not (cpu or cuda) or not floors:
-        raise EnvironmentRefusal(
-            "base_family_manifest_invalid", "contradictory accelerator profile"
-        )
-
-    installed = dict(distributions)
-    providers = dict(roots)
-    release = profile["torch_release"]
-    torch_version = installed.get("torch")
-    if torch_version is None:
-        if release != "none" or "torch" in providers:
-            raise EnvironmentRefusal("base_family_manifest_invalid", "contradictory Torch profile")
-        return
-
-    try:
-        installed_torch = Version(torch_version)
-        declared_torch = Version(str(release))
-    except InvalidVersion:
-        raise EnvironmentRefusal(
-            "base_family_manifest_invalid", "contradictory Torch profile"
-        ) from None
-    release_matches = installed_torch.release[:3] == declared_torch.release[:3]
-    if release == "none" or not release_matches or "torch" not in providers.get("torch", ()):
-        raise EnvironmentRefusal("base_family_manifest_invalid", "contradictory Torch profile")
-
-
-def _base_distribution_rows(value: object) -> tuple[tuple[str, str], ...]:
-    if not isinstance(value, list) or not value:
-        raise EnvironmentRefusal("base_family_manifest_invalid", "base_distributions is not a list")
-    rows: list[tuple[str, str]] = []
-    for item in value:
-        if not isinstance(item, dict) or set(item) != {"distribution", "version"}:
-            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid distribution row")
-        distribution = item["distribution"]
-        version = item["version"]
-        if (
-            not isinstance(distribution, str)
-            or not normalized_distribution(distribution)
-            or distribution == "python-stdlib"
-            or not isinstance(version, str)
-            or not valid_wheel_version(version)
-        ):
-            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid distribution row")
-        rows.append((distribution, version))
-    if rows != sorted(rows) or len({name for name, _ in rows}) != len(rows):
-        raise EnvironmentRefusal(
-            "base_family_manifest_invalid", "base_distributions is not sorted unique"
-        )
-    return tuple(rows)
-
-
-def _base_import_root_rows(
-    value: object, distributions: dict[str, str]
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    if not isinstance(value, list) or not value:
-        raise EnvironmentRefusal("base_family_manifest_invalid", "base_import_roots is not a list")
-    rows: list[tuple[str, tuple[str, ...]]] = []
-    for item in value:
-        if not isinstance(item, dict) or set(item) != {"providers", "root"}:
-            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid import-root row")
-        root = item["root"]
-        providers = item["providers"]
-        if (
-            not isinstance(root, str)
-            or not valid_import_root(root)
-            or not isinstance(providers, list)
-            or not providers
-            or not all(
-                isinstance(provider, str)
-                and (provider == "python-stdlib" or normalized_distribution(provider))
-                and (provider == "python-stdlib" or provider in distributions)
-                for provider in providers
-            )
-            or providers != sorted(set(providers))
-        ):
-            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid import-root row")
-        rows.append((root, tuple(providers)))
-    if rows != sorted(rows) or len({root for root, _ in rows}) != len(rows):
-        raise EnvironmentRefusal(
-            "base_family_manifest_invalid", "base_import_roots is not sorted unique"
-        )
-    return tuple(rows)
-
-
-def _base_wheel_rows(
-    value: object,
-    distributions: dict[str, str],
-    root_providers: dict[str, tuple[str, ...]],
-) -> tuple[Wheel, ...]:
-    if not isinstance(value, list):
-        raise EnvironmentRefusal("base_family_manifest_invalid", "wheels is not a list")
-    wheels: list[Wheel] = []
-    for item in value:
-        keys = {
-            "digest",
-            "distribution",
-            "filename",
-            "import_roots",
-            "length",
-            "tags",
-            "version",
-        }
-        if not isinstance(item, dict) or set(item) != keys:
-            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid wheel row")
-        distribution = item["distribution"]
-        version = item["version"]
-        digest = item["digest"]
-        filename = item["filename"]
-        length = item["length"]
-        tags = item["tags"]
-        import_roots = item["import_roots"]
-        if (
-            not isinstance(distribution, str)
-            or not normalized_distribution(distribution)
-            or not isinstance(version, str)
-            or not valid_wheel_version(version)
-            or distributions.get(distribution) != version
-            or not isinstance(digest, str)
-            or _DIGEST.fullmatch(digest) is None
-            or not isinstance(filename, str)
-            or not valid_wheel_filename(filename)
-            or not isinstance(length, int)
-            or isinstance(length, bool)
-            or length <= 0
-            or length > MAX_WHEEL_BYTES
-            or not isinstance(tags, list)
-            or not tags
-            or not all(isinstance(tag, str) and valid_wheel_tag(tag) for tag in tags)
-            or tags != sorted(set(tags))
-            or not isinstance(import_roots, list)
-            or not all(isinstance(root, str) and valid_import_root(root) for root in import_roots)
-            or import_roots != sorted(set(import_roots))
-            or any(distribution not in root_providers.get(root, ()) for root in import_roots)
-        ):
-            raise EnvironmentRefusal(
-                "base_family_manifest_invalid",
-                f"invalid wheel row: distribution={distribution!r} version={version!r} "
-                f"filename={filename!r}",
-            )
-        wheels.append(
-            Wheel(
-                distribution,
-                version,
-                filename,
-                digest,
-                length,
-                tuple(tags),
-                "base",
-                tuple(import_roots),
-            )
-        )
-    if [wheel.distribution for wheel in wheels] != sorted(
-        wheel.distribution for wheel in wheels
-    ) or len({wheel.distribution for wheel in wheels}) != len(wheels):
-        raise EnvironmentRefusal("base_family_manifest_invalid", "wheels is not sorted unique")
-    return tuple(wheels)
-
-
 def _verify_inventory(
-    source: Input, base: BaseManifest, *, allow_base_owned: bool = False
+    source: Input, base: base_observation.Observation, *, allow_base_owned: bool = False
 ) -> tuple[Wheel, ...]:
     if not source.wheels or len(source.wheels) > MAX_PACKAGE_WHEELS:
         raise EnvironmentRefusal("package_environment_wheel_set_invalid", str(len(source.wheels)))
@@ -987,7 +699,7 @@ def _verify_inventory(
 def _verify_grants(
     source: Input,
     wheels: Sequence[Wheel],
-    base: BaseManifest,
+    base: base_observation.Observation,
     *,
     allow_native_custom: bool,
     allow_base_owned: bool = False,
@@ -1050,7 +762,7 @@ def _verify_grants(
 def _inspect(
     wheel: Wheel,
     path: Path,
-    base: BaseManifest,
+    base: base_observation.Observation,
     *,
     allow_native_custom: bool = False,
     allow_base_owned: bool = False,
@@ -1175,11 +887,7 @@ def _inspect(
                     "package_environment_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
-            if (
-                wheel.owner == "custom"
-                and native_members
-                and (not allow_native_custom or base.ownership != "observed-local")
-            ):
+            if wheel.owner == "custom" and native_members and not allow_native_custom:
                 raise EnvironmentRefusal(
                     "package_environment_custom_wheel_native_unsupported",
                     f"{wheel.filename}: custom native wheels are not admitted yet",
@@ -1302,20 +1010,18 @@ def _base_import_collision(
     )
 
 
-def _target_python(base: BaseManifest) -> tuple[int, int]:
-    target = dict(base.platform_target)
-    match = re.fullmatch(r"cp([0-9])([0-9]{2})", target.get("python_abi", ""))
+def _target_python(base: base_observation.Observation) -> tuple[int, int]:
+    match = re.fullmatch(r"cp([0-9])([0-9]{2})", base.python_abi)
     if match is None:
         raise EnvironmentRefusal(
-            "base_family_manifest_invalid", "python_abi is not the cpNNN profile spelling"
+            "package_environment_base_invalid", "Python ABI is not the cpNNN spelling"
         )
     return int(match.group(1)), int(match.group(2))
 
 
-def _target_platforms(base: BaseManifest) -> frozenset[str]:
-    target = dict(base.platform_target)
-    os_arch = target.get("os_arch")
-    libc = target.get("libc")
+def _target_platforms(base: base_observation.Observation) -> frozenset[str]:
+    os_arch = base.os_arch
+    libc = base.libc
     if os_arch != "linux/amd64":
         raise EnvironmentRefusal(
             "package_environment_platform_unsupported",
@@ -1324,7 +1030,7 @@ def _target_platforms(base: BaseManifest) -> frozenset[str]:
     match = re.fullmatch(r"glibc([0-9]+)\.([0-9]+)", libc or "")
     if match is None or int(match.group(1)) != 2:
         raise EnvironmentRefusal(
-            "base_family_manifest_invalid", f"linux/x86 base has unsupported libc {libc!r}"
+            "package_environment_base_invalid", f"Linux/x86 base has unsupported libc {libc!r}"
         )
     minor = int(match.group(2))
     platforms = {"any", "linux_x86_64"}
@@ -1338,7 +1044,7 @@ def _target_platforms(base: BaseManifest) -> frozenset[str]:
     return frozenset(platforms)
 
 
-def _compatible_tags(base: BaseManifest) -> frozenset[Tag]:
+def _compatible_tags(base: base_observation.Observation) -> frozenset[Tag]:
     major, minor = _target_python(base)
     interpreter = f"cp{major}{minor}"
     platforms = _target_platforms(base)
@@ -1353,7 +1059,7 @@ def _compatible_tags(base: BaseManifest) -> frozenset[Tag]:
     return frozenset(tags)
 
 
-def _require_compatible_tags(wheel: Wheel, base: BaseManifest) -> None:
+def _require_compatible_tags(wheel: Wheel, base: base_observation.Observation) -> None:
     declared: set[Tag] = set()
     try:
         for value in wheel.tags:
@@ -1364,11 +1070,11 @@ def _require_compatible_tags(wheel: Wheel, base: BaseManifest) -> None:
         raise EnvironmentRefusal(
             "package_environment_wheel_platform_incompatible",
             f"distribution={wheel.distribution} tags={','.join(wheel.tags)} "
-            f"target={dict(base.platform_target)}",
+            f"target={base.interpreter_identity}",
         )
 
 
-def _marker_environment(base: BaseManifest) -> dict[str, str]:
+def _marker_environment(base: base_observation.Observation) -> dict[str, str]:
     major, minor = _target_python(base)
     environment = cast(dict[str, str], default_environment())
     environment.update(
@@ -1386,7 +1092,9 @@ def _marker_environment(base: BaseManifest) -> dict[str, str]:
     return environment
 
 
-def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManifest) -> None:
+def _verify_python_requirements(
+    inspected: Sequence[_Inspected], base: base_observation.Observation
+) -> None:
     environment = _marker_environment(base)
     python = Version(environment["python_full_version"])
     versions = base.distribution_versions
@@ -1423,7 +1131,8 @@ def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManif
                 )
             except InvalidVersion as exc:
                 raise EnvironmentRefusal(
-                    "base_family_manifest_invalid", f"{name} has invalid version {installed!r}"
+                    "package_environment_base_invalid",
+                    f"{name} has invalid version {installed!r}",
                 ) from exc
             if not accepted:
                 raise EnvironmentRefusal(
@@ -1455,7 +1164,7 @@ def _uv_binary() -> Path:
     return path
 
 
-def _uv_version(uv: Path, base: BaseManifest) -> str:
+def _observed_uv_version(uv: Path) -> str:
     result = subprocess.run(
         [str(uv), "--version"],
         stdin=subprocess.DEVNULL,
@@ -1472,65 +1181,7 @@ def _uv_version(uv: Path, base: BaseManifest) -> str:
             "package_environment_uv_invalid",
             result.stderr.strip()[-1000:] or f"uv exited {result.returncode}",
         )
-    expected = base.distribution_versions.get("uv")
-    observed = version.split()[1]
-    if expected is None or Version(observed) != Version(expected):
-        raise EnvironmentRefusal(
-            "package_environment_uv_version_mismatch",
-            f"executable={observed} base_manifest={expected or 'absent'}",
-        )
-    return version
-
-
-def _interpreter_identity(python: Path, base: BaseManifest) -> dict[str, str]:
-    if not python.is_absolute() or not python.is_file():
-        raise EnvironmentRefusal("package_environment_base_python_absent", str(python))
-    result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            "import json,platform,sys; print(json.dumps({"
-            "'cache_tag':sys.implementation.cache_tag,"
-            "'implementation':sys.implementation.name,"
-            "'machine':platform.machine(),"
-            "'platform':sys.platform,"
-            "'version':[sys.version_info.major,sys.version_info.minor]},"
-            "sort_keys=True,separators=(',',':')))",
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        observed = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise EnvironmentRefusal(
-            "package_environment_interpreter_invalid",
-            result.stderr.strip()[-1000:] or "interpreter probe returned invalid JSON",
-        ) from exc
-    target = dict(base.platform_target)
-    major, minor = _target_python(base)
-    if (
-        result.returncode != 0
-        or not isinstance(observed, dict)
-        or observed.get("implementation") != "cpython"
-        or observed.get("cache_tag") != f"cpython-{major}{minor}"
-        or observed.get("version") != [major, minor]
-        or observed.get("platform") != "linux"
-        or observed.get("machine") not in {"x86_64", "amd64"}
-        or target.get("os_arch") != "linux/amd64"
-    ):
-        raise EnvironmentRefusal(
-            "package_environment_interpreter_incompatible",
-            f"observed={observed!r} target={target!r}",
-        )
-    return {
-        "libc": target["libc"],
-        "os_arch": target["os_arch"],
-        "python_abi": target["python_abi"],
-    }
+    return version.split()[1]
 
 
 def _install_with_uv(
@@ -1586,7 +1237,6 @@ def _install_with_uv(
 
 def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:
     return {
-        "base_family_digest": source.base_family_digest,
         "content_digest": content_digest,
         "environment_digest": source.environment_digest,
         "format": RECEIPT_FORMAT,

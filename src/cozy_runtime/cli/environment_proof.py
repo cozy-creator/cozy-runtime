@@ -24,7 +24,6 @@ REQUEST_FIELDS = {
     "package",
     "python",
     "wheel_files",
-    "wheelhouse_manifest",
 }
 
 
@@ -32,7 +31,6 @@ REQUEST_FIELDS = {
 class ProofRequest:
     package: Mapping[str, object]
     environment_path: Path
-    wheelhouse_manifest: Path
     wheel_files: Mapping[str, Path]
     python: Path
     environment_root: Path
@@ -74,17 +72,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             package=request.package,
             environment=request.environment,
             environment_digest=request.environment_digest,
-            wheelhouse_manifest_bytes=_document_bytes(
-                request.wheelhouse_manifest, "wheelhouse_manifest"
-            ),
             wheel_paths=request.wheel_files,
         )
         installed = package_environment.materialize(
             source,
             request.environment_root,
             python=request.python,
-            base_manifest=request.wheelhouse_manifest,
-            expected_receipt_digest="",
         )
         _publish_receipt(receipt_path, installed.receipt_bytes)
         print(
@@ -176,7 +169,6 @@ def _read_request(path: Path) -> ProofRequest:
     return ProofRequest(
         package=_package(value["package"]),
         environment_path=environment_path,
-        wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
         wheel_files=wheel_files,
         python=_existing_executable(value["python"]),
         environment_root=environment_root,

@@ -199,7 +199,6 @@ class WorkerOptions:
     #: owner reading an empty `release_id` learns the truth, and an owner reading a plausible
     #: lie learns nothing it can act on.
     release_id: str = ""
-    control_runtime_digest: str = ""
     git_commit: str = ""
     python: str = ""
     accelerator_backend: str = ""
@@ -218,8 +217,6 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
-    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST
-    """Exact base-worker-image WheelhouseManifest path; fixed default in production."""
     artifact_store: Path | None = None
     """The verified TensorFS store populated from the canonical model-root closure."""
     artifact_cache: Path | None = None
@@ -859,6 +856,9 @@ class Worker:
         self.host = host
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.base = package_environment.observe_base(
+            options.environment_python or Path(options.python or sys.executable)
+        )
         if options.executor_uid >= 0:
             # Set before any package child exists and before the worker starts serving.
             # The uid split closes ordinary ptrace; non-dumpable is the explicit second belt.
@@ -1122,6 +1122,7 @@ class Worker:
                     describe=describe,
                     verified=mark_verified,
                     job_plan_root=self.config.cozy_home / "job-plans",
+                    base=self.base,
                 )
                 prepared = read_placement_set(result.placement_set)
                 if len(prepared) != 1 or not prepared[0].get("development"):
@@ -1166,6 +1167,7 @@ class Worker:
                 describe=describe,
                 verified=mark_verified,
                 job_plan_root=self.config.cozy_home / "job-plans",
+                base=self.base,
             )
 
     def prepare_model_source(
@@ -1647,9 +1649,8 @@ class Worker:
     ) -> None:
         """ClaimAck + the convergence snapshot, for a claim this worker can actually serve.
 
-        `control_runtime_digest` is the exact image-owned cozy-runtime wheel fact from
-        WheelhouseManifest/1. OCI identity remains the provider-readback axis; neither is
-        substituted for the other.
+        Exact control-wheel digest remains Hub-owned image provenance. Installed files cannot
+        rederive a wheel archive digest, so the protocol's transitional field stays empty.
         """
         ack = pb.ClaimAck(
             accepted=True,
@@ -1657,7 +1658,7 @@ class Worker:
             worker_id=self.options.worker_id,
             worker_instance_id=self.options.instance_id,
             worker_release_id=self.options.release_id,
-            control_runtime_digest=self.options.control_runtime_digest,
+            control_runtime_digest="",
             git_commit=self.options.git_commit,
             resources=self.resources(),
         )
@@ -2444,7 +2445,7 @@ class Worker:
                 selection_root=self.options.artifact_cache / "selections",
                 artifact_store=self.options.artifact_store,
                 python=self.options.environment_python or Path(sys.executable),
-                base_manifest=self.options.base_manifest,
+                base=self.base,
                 installed_environment=installed_environment,
                 verified_cache=self.verified_artifacts,
                 on_observation=lambda value: self._observe_acquisition(placement, value),
@@ -3749,7 +3750,7 @@ class Worker:
             detail=f"{detail} | disk invoice: {json.dumps(invoice, sort_keys=True)}"[:1024],
             resources=self.resources(),
             worker_release_id=self.options.release_id,
-            control_runtime_digest=self.options.control_runtime_digest,
+            control_runtime_digest="",
         )
 
     def run(self) -> int:
@@ -3849,9 +3850,6 @@ class Worker:
         )
 
 
-#: A provenance digest is `sha256:` plus 64 lowercase hex, or it is not one.
-_CONTROL_RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-
 #: The loopback names a worker may serve plaintext, and without a bootstrap credential.
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
 
@@ -3870,12 +3868,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--worker-id", default="wrk-local")
     parser.add_argument("--release-id", default="")
-    parser.add_argument(
-        "--control-runtime-digest",
-        default="",
-        help="the exact image-owned cozy-runtime wheel digest from WheelhouseManifest/1; "
-        "absent for native workers",
-    )
     parser.add_argument("--git-commit", default="")
     parser.add_argument("--python", default="")
     parser.add_argument("--accelerator-backend", choices=("", "cuda", "none"), default="")
@@ -3900,11 +3892,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         default="",
         help="where the dynamic acquisition lane writes the exact bytes a placement reaches "
         "(cr-049); content-addressed, so a replay re-fetches only what is missing",
-    )
-    parser.add_argument(
-        "--base-manifest",
-        default=str(package_environment.DEFAULT_BASE_MANIFEST),
-        help="exact base worker image WheelhouseManifest used for package ownership",
     )
     parser.add_argument(
         "--artifact-store",
@@ -3935,16 +3922,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         )
         return int(Exit.structural)
 
-    if args.control_runtime_digest and not _CONTROL_RUNTIME_DIGEST.fullmatch(
-        args.control_runtime_digest
-    ):
-        print(
-            f"[worker] --control-runtime-digest {args.control_runtime_digest!r} is not "
-            "`sha256:<64 hex>`: the image-owned Runtime wheel digest is measured or absent",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
     isolated = args.executor_uid >= 0 or args.executor_gid >= 0
     if isolated and (
         args.executor_uid <= 0
@@ -3989,7 +3966,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         worker_id=args.worker_id,
         instance_id=f"ins-{uuid.uuid4().hex[:16]}",
         release_id=args.release_id,
-        control_runtime_digest=args.control_runtime_digest,
         git_commit=args.git_commit,
         python=args.python,
         accelerator_backend=args.accelerator_backend,
@@ -4002,7 +3978,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             if args.environment_python
             else None
         ),
-        base_manifest=Path(args.base_manifest).resolve(),
         artifact_store=Path(args.artifact_store).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
         development_project=(

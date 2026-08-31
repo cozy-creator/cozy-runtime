@@ -27,11 +27,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import TypedDict
 
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import base_observation, canonical
 
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
@@ -84,23 +84,6 @@ class GPUObservation(TypedDict):
     driver_version: str
     name: str
     sm: int
-
-
-class BaseSeat(Protocol):
-    @property
-    def compatibility_profile(self) -> tuple[tuple[str, str], ...]: ...
-
-    @property
-    def platform_target(self) -> tuple[tuple[str, str], ...]: ...
-
-    @property
-    def base_distributions(self) -> tuple[tuple[str, str], ...]: ...
-
-    @property
-    def minimum_cuda_version(self) -> str: ...
-
-    @property
-    def minimum_driver_version(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,36 +555,35 @@ def observe_seat(python: Path, environment: Mapping[str, str]) -> dict[str, obje
 
 
 def verify_seat(
-    base: BaseSeat,
+    base: base_observation.Observation,
     observation: Mapping[str, object],
     *,
     gpu: GPUObservation | None,
 ) -> dict[str, object]:
-    """Verify measured interpreter/OS/libc/Torch/CUDA/driver facts against one WHM."""
+    """Verify a native proof process still matches its observed package base."""
 
-    profile = dict(base.compatibility_profile)
-    target = dict(base.platform_target)
-    if observation.get("implementation") != "cpython" or observation.get(
-        "python_abi"
-    ) != target.get("python_abi"):
+    if (
+        observation.get("implementation") != "cpython"
+        or observation.get("python_abi") != base.python_abi
+    ):
         raise NativeWheelRefusal(
             "package_environment_native_python_abi_mismatch",
             f"measured={observation.get('implementation')}:{observation.get('python_abi')} "
-            f"required=cpython:{target.get('python_abi')}",
+            f"required=cpython:{base.python_abi}",
         )
     machine = observation.get("machine")
     measured_arch = "linux/amd64" if machine in {"amd64", "x86_64"} else ""
-    if observation.get("system") != "linux" or measured_arch != target.get("os_arch"):
+    if observation.get("system") != "linux" or measured_arch != base.os_arch:
         raise NativeWheelRefusal(
             "package_environment_native_os_cpu_mismatch",
-            f"measured={observation.get('system')}/{machine} required={target.get('os_arch')}",
+            f"measured={observation.get('system')}/{machine} required={base.os_arch}",
         )
-    libc_match = re.fullmatch(r"glibc([0-9]+\.[0-9]+)", str(target.get("libc", "")))
+    libc_match = re.fullmatch(r"glibc([0-9]+\.[0-9]+)", base.libc)
     if observation.get("libc_name") != "glibc" or libc_match is None:
         raise NativeWheelRefusal(
             "package_environment_native_libc_mismatch",
             f"measured={observation.get('libc_name')}{observation.get('libc_version')} "
-            f"required={target.get('libc')}",
+            f"required={base.libc}",
         )
     try:
         libc_ok = Version(str(observation.get("libc_version", ""))) >= Version(libc_match.group(1))
@@ -610,7 +592,7 @@ def verify_seat(
     if not libc_ok:
         raise NativeWheelRefusal(
             "package_environment_native_libc_mismatch",
-            f"measured=glibc{observation.get('libc_version')} minimum={target.get('libc')}",
+            f"measured=glibc{observation.get('libc_version')} minimum={base.libc}",
         )
     rows = observation.get("distributions")
     measured_distributions: list[tuple[str, str]] = []
@@ -628,28 +610,31 @@ def verify_seat(
                     "invalid measured distribution",
                 )
             measured_distributions.append((name, version))
-    if tuple(measured_distributions) != base.base_distributions:
+    measured_versions = dict(measured_distributions)
+    if any(measured_versions.get(name) != version for name, version in base.distributions):
         raise NativeWheelRefusal(
             "package_environment_native_base_inventory_mismatch",
-            f"measured={len(measured_distributions)} required={len(base.base_distributions)}",
+            f"measured={len(measured_distributions)} protected={len(base.distributions)}",
         )
     torch_version = str(observation.get("torch_version", ""))
-    try:
-        torch_release_ok = (
-            Version(torch_version).release[:3] == Version(profile["torch_release"]).release[:3]
-        )
-    except InvalidVersion as exc:
-        raise NativeWheelRefusal(
-            "package_environment_native_torch_mismatch", torch_version
-        ) from exc
+    if base.torch_release == "none":
+        torch_release_ok = not torch_version
+    else:
+        try:
+            torch_release_ok = (
+                Version(torch_version).release[:3] == Version(base.torch_release).release[:3]
+            )
+        except InvalidVersion as exc:
+            raise NativeWheelRefusal(
+                "package_environment_native_torch_mismatch", torch_version
+            ) from exc
     if not torch_release_ok:
         raise NativeWheelRefusal(
             "package_environment_native_torch_mismatch",
-            f"measured={torch_version} required={profile['torch_release']}",
+            f"measured={torch_version} required={base.torch_release}",
         )
-    build = profile["accelerator_build"]
     torch_cuda = str(observation.get("torch_cuda", ""))
-    if build == "cpu":
+    if base.accelerator_backend == "none":
         if torch_cuda or bool(observation.get("cuda_available")) or gpu is not None:
             raise NativeWheelRefusal(
                 "package_environment_native_accelerator_mismatch",
@@ -657,9 +642,7 @@ def verify_seat(
                 f"{observation.get('cuda_available')} gpu={gpu is not None}",
             )
     else:
-        required_cuda = {"cu130": "13.0"}.get(build)
-        if required_cuda is None:
-            raise NativeWheelRefusal("package_environment_native_accelerator_mismatch", build)
+        required_cuda = base.cuda_version
         if (
             torch_cuda != required_cuda
             or not bool(observation.get("cuda_available"))
@@ -670,16 +653,6 @@ def verify_seat(
                 f"measured torch_cuda={torch_cuda!r} available="
                 f"{observation.get('cuda_available')} gpu={gpu is not None}; "
                 f"required={required_cuda}",
-            )
-        if Version(torch_cuda) < Version(base.minimum_cuda_version):
-            raise NativeWheelRefusal(
-                "package_environment_native_cuda_minimum_mismatch",
-                f"measured={torch_cuda} minimum={base.minimum_cuda_version}",
-            )
-        if Version(gpu["driver_version"]) < Version(base.minimum_driver_version):
-            raise NativeWheelRefusal(
-                "package_environment_native_driver_minimum_mismatch",
-                f"measured={gpu['driver_version']} minimum={base.minimum_driver_version}",
             )
     return dict(observation)
 
