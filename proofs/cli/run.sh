@@ -96,30 +96,15 @@ expect_exit 4 "no registered entrypoint named 'nosuchfn'" cli run nosuchfn
 expect_exit 3 "declares no field(s) colour" cli run echo text=hello colour=blue
 expect_exit 3 "declares count as int" cli run echo text=hello count=many
 expect_exit 6 "flat local binding records were removed" cli run modeled text=hello
-expect_exit 7 "rerun with --yes" cli rm proof/absent@v1
-expect_exit 2 "--hub is required" cli pull proof/absent@v1
+expect_exit 2 "unknown verb 'pull'" cli pull proof/absent@v1
+expect_exit 2 "unknown verb 'list'" cli list
+expect_exit 2 "unknown verb 'rm'" cli rm proof/absent@v1
 expect_exit 9 "'ingest' invokes TensorFS" cli ingest proof/absent@v1
 expect_exit 4 "no registered callable named 'nosuchfn'" cli describe nosuchfn
-expect_exit 2 "not a duration" cli pull proof/absent@v1 --hub http://127.0.0.1:1 --timeout nope
-
-rm -f "$proof_root/network-attempted"
-set +e
-cut_cli pull proof/absent@v1 --hub http://127.0.0.1:1 \
-    >"$proof_root/pull.stdout" 2>"$proof_root/pull.stderr"
-pull_status=$?
-set -e
-test "$pull_status" -eq 9
-grep -F -q "error(unavailable): the TensorFS reader is unavailable" "$proof_root/pull.stderr"
-grep -F -q "remedy: install the TensorFS Python facade" "$proof_root/pull.stderr"
-test ! -e "$proof_root/network-attempted"
 
 cli --help >"$proof_root/help.stdout"
 test "$(wc -c <"$proof_root/help.stdout")" -lt 3000
-cli list >"$proof_root/list.stdout"
-grep -F -q "0 artifacts" "$proof_root/list.stdout"
 cli doctor >"$proof_root/doctor.stdout"
-cli rm proof/absent@v1 --yes >"$proof_root/rm.stdout"
-grep -F -q "not present" "$proof_root/rm.stdout"
 cli fit echo text=hello >"$proof_root/fit.stdout"
 grep -F -q "echo:" "$proof_root/fit.stdout"
 
@@ -151,4 +136,5 @@ if ! (cd / && env -u PYTHONPATH "$driver_python" \
     exit 1
 fi
 tail -n 1 "$proof_root/private-input.stdout"
-echo "CLI proof: installed-wheel exits, AXI, exact Descriptor/1 bytes, public key tiers, mixed-media invocation identity, network-cut offline execution, and typed TensorFS-reader refusal passed"
+test ! -e "$proof_root/home/runtime.sqlite3"
+echo "CLI proof: installed-wheel exits, AXI, exact Descriptor/1 bytes, public key tiers, mixed-media invocation identity, network-cut offline execution, no Runtime database, and typed TensorFS-reader refusal passed"

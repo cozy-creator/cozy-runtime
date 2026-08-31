@@ -39,7 +39,6 @@ TFS = Path("/home/fidika/cozy_v2/tensorfs")
 WORK = Path("/tmp/cozy-cr006")
 STORE = WORK / "store"
 CARRIER = WORK / "unet_fp8_scaled.safetensors"
-PROBE = WORK / "probe"
 #: The plain fp16 SDXL store cr-008b built. Read-only here: it is the BASELINE arm.
 PLAIN_STORE = Path("/tmp/cozy-sdxl4/store")
 PLAIN_SNAPSHOTS = Path("/tmp/cozy-sdxl4/snapshots.json")
@@ -376,7 +375,6 @@ def _fill(store: str, snap: str, *, scratch: int = 512 * MIB) -> tuple[Any, Any,
         slots=16,
         readers=16,
         inflight=8,
-        probe_cache=PROBE,
         decode_scratch_bytes=scratch,
         release="cozy/sdxl-unet@cr-006",
     )
@@ -585,24 +583,6 @@ def binding_record(unet: str) -> dict[str, Any]:
     }
 
 
-def install_row(home: Path, unet: str) -> None:
-    """The artifact index row the record's ref resolves against (#567e). The fp16/fp8 arms
-    differ in the SNAPSHOT MAP this row carries, which is where an encoding choice has
-    always lived — a fact about the artifact, resolved where the artifact is."""
-    from cozy_runtime.internal import artifacts
-
-    artifacts.install(
-        home,
-        artifacts.Artifact(
-            ref=RELEASE,
-            store=str(PLAIN_STORE),
-            config=str(PIPE_CONFIG),
-            snapshots=dict(sorted(pipeline_snapshots(unet).items())),
-            vram_floor_bytes=1 * GIB,
-        ),
-    )
-
-
 def install_into(root: Path) -> str:
     """Put the fp8 UNet in the four-component store, through the real border again.
 
@@ -652,7 +632,6 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     workspace = Path(spec["workspace"])
     home = workspace / "home"
     home.mkdir(parents=True, exist_ok=True)
-    install_row(home, spec["unet"])
     config = read_config(
         {
             "PATH": os.environ["PATH"],
@@ -1122,9 +1101,7 @@ def arms() -> None:
     # --- the RUNTIME's arms: selection on the real card ----------------------------
     device = measure_device(torch)
     providers = launch_providers()
-    capabilities, probe = qualify(
-        torch, providers, device, ["float16"], release="cozy/arms@cr-006", cache=None
-    )
+    capabilities, probe = qualify(torch, providers, device, ["float16"], release="cozy/arms@cr-006")
     selector = Selector(providers, capabilities, device)
     parts = (
         RolePart("data", "f8_e4m3fn", (64, 32), 2048),
@@ -1200,7 +1177,6 @@ def arms() -> None:
         device,
         ["float16"],
         release="cozy/arms@cr-006",
-        cache=None,
     )
     numerics = evidence["observations"][0]["evidence"]["numerics"]
     check(

@@ -491,7 +491,6 @@ def mixed() -> None:
         device,
         ["bfloat16"],
         release=RELEASE,
-        cache=None,
     )
     selector = Selector(table, caps, device, "footprint")
     plain, rowwise, mx = (
@@ -571,7 +570,6 @@ def mixed() -> None:
         providers=table,
         capabilities=caps,
         device=device,
-        facts_dir=str(WORK / "plan-facts"),
     )
     print(f"  survey     {answer.routes}  refusal={answer.refusal or 'none'}")
     print(f"  servable   {answer.line()}")
@@ -761,7 +759,6 @@ def _backend(objective: str, **kwargs: Any) -> Any:
         slots=4,
         readers=4,
         inflight=2,
-        probe_cache=WORK / "probe",
         decode_scratch_bytes=1 << 20,
         release=RELEASE,
         objective=objective,
@@ -813,7 +810,7 @@ def qualify() -> None:
     subject = {d: table[d] for d in (*digests_of("fp8-rowwise/1"), *digests_of("mxfp8/1"))}
     names = {implementation_digest(p): p.name for group in subject.values() for p in group}
     started = time.perf_counter()
-    caps, evidence = run_suite(torch, subject, device, ["bfloat16"], release=RELEASE, cache=None)
+    caps, evidence = run_suite(torch, subject, device, ["bfloat16"], release=RELEASE)
     took = time.perf_counter() - started
     minted = {names[r.implementation_digest] for r in caps.records}
     for observation in evidence["observations"]:

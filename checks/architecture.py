@@ -330,6 +330,22 @@ def fence_single_config() -> list[str]:
     return bad
 
 
+def fence_no_runtime_database() -> list[str]:
+    """Runtime may use process memory and worker-scoped files, but owns no database."""
+
+    bad: list[str] = []
+    database_modules = ("sqlite3", "sqlalchemy", "libsql", "turso")
+    for path in py_files():
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for name in imports(tree):
+            if any(name == module or name.startswith(module + ".") for module in database_modules):
+                bad.append(f"{path.relative_to(ROOT)} imports database module {name}")
+    for retired in (SRC / "internal" / "cache.py", SRC / "internal" / "artifacts.py"):
+        if retired.exists():
+            bad.append(f"{retired.relative_to(ROOT)} restores retired Runtime-owned state")
+    return bad
+
+
 def fence_no_interactive() -> list[str]:
     bad: list[str] = []
     for path in py_files():
@@ -1674,6 +1690,7 @@ FENCES = {
     "author-import-boundary": fence_author_import_boundary,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,
+    "no-runtime-database": fence_no_runtime_database,
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,
     "no-identifiers-in-package-code": fence_no_identifiers,

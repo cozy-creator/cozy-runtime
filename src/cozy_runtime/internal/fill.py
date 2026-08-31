@@ -608,7 +608,6 @@ def servability_for_script(
     providers: Mapping[str, Any],
     capabilities: Capabilities,
     device: DeviceFacts,
-    facts_dir: str,
     store: str = "synthetic",
     snapshot: str = "synthetic",
     objective: str = "latency",
@@ -635,7 +634,7 @@ def servability_for_script(
             capabilities=capabilities,
             device=device,
             runtime=measure_runtime(torch_module(), release),
-            facts=PlanFacts(facts_dir),
+            facts=PlanFacts(),
             objective=objective,
             encoded_leaves=encoded_leaves,
             dtype_name=dtype_name,
@@ -855,7 +854,6 @@ class StreamingFillBackend:
         inflight: int = 8,
         fence: bool = True,
         on_position: Callable[[int], None] | None = None,
-        probe_cache: str | Path | None = None,
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
@@ -950,10 +948,8 @@ class StreamingFillBackend:
             f"fill-{os.getpid()}-{int(time.time())}",
             forensics_dir,
         )
-        # cr-006. The device is measured once and the qualification suite runs once per
-        # tuple (persisted, first-writer-wins), both at PREPARE time — §3.2's cost
-        # placement: the request path runs neither. Selection itself is an O(1) dict
-        # lookup per key inside `fill`.
+        # cr-006. The device is measured and the qualification suite runs at PREPARE time;
+        # the request path runs neither. Selection is an O(1) lookup per key inside `fill`.
         from cozy_runtime.internal.probe import qualify
 
         self.device_facts: DeviceFacts = measure_device(self.torch, self.device.index or 0)
@@ -972,7 +968,6 @@ class StreamingFillBackend:
                 self.device_facts,
                 sorted({dtype_name(row.dtype) for row in rows}),
                 release=release,
-                cache=Path(probe_cache) if probe_cache else None,
             )
         #: THE RESOLVED PLAN IS THE EXECUTABLE AUTHORITY (cr-025). Every route, provider and
         #: geometry this plane will execute is read from it by contract key; nothing below
@@ -1114,7 +1109,6 @@ class StreamingFillBackend:
         objective: str = "latency",
         placement: str = "all_resident",
         encoded_leaves: str = "accept",
-        probe_cache: str | Path | None = None,
         device: str = "cuda",
         **kwargs: Any,
     ) -> StreamingFillBackend:
@@ -1142,7 +1136,6 @@ class StreamingFillBackend:
             facts,
             sorted({dtype_name(row.dtype) for row in rows}),
             release=release,
-            cache=Path(probe_cache) if probe_cache else None,
         )
         components = sorted({row.component for row in rows})
         plan = script_plan(
@@ -1160,7 +1153,7 @@ class StreamingFillBackend:
             capabilities=qualified[0],
             device=facts,
             runtime=measure_runtime(torch, release),
-            facts=PlanFacts(str(probe_cache) if probe_cache else "."),
+            facts=PlanFacts(),
             objective=objective,
             placement=placement,
             encoded_leaves=encoded_leaves,
@@ -1171,7 +1164,6 @@ class StreamingFillBackend:
             rows,
             plan=plan,
             device=device,
-            probe_cache=probe_cache,
             release=release,
             qualified=qualified,
             **kwargs,

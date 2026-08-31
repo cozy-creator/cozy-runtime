@@ -260,9 +260,7 @@ def probe() -> None:
     table = launch_providers()
     subject = {d: table[d] for a in ("fp8-rowwise/1", "mxfp8/1") for d in digests_of(a)}
     names = {implementation_digest(p): p.name for g in subject.values() for p in g}
-    caps, evidence = qualify(
-        torch, subject, device, ["bfloat16"], release=RELEASE, cache=ROOT / "probe"
-    )
+    caps, evidence = qualify(torch, subject, device, ["bfloat16"], release=RELEASE)
     for o in evidence["observations"]:
         axes = o["evidence"].get("route_axes", {})
         print(
@@ -347,7 +345,6 @@ def fill_arm(arm: str, objective: str) -> tuple[Any, Any]:
         slots=16,
         readers=16,
         inflight=8,
-        probe_cache=ROOT / "probe",
         decode_scratch_bytes=256 * MIB,
         release=RELEASE,
         objective=objective,
@@ -546,7 +543,7 @@ def choose() -> None:
     head("choose — the leaf on the MEASURED device, the floor on an unmeasured one")
     device = measure_device(torch)
     table = launch_providers()
-    caps, _ = qualify(torch, table, device, ["bfloat16"], release=RELEASE, cache=ROOT / "probe")
+    caps, _ = qualify(torch, table, device, ["bfloat16"], release=RELEASE)
     rows = Checkpoint(str(STORE), (ROOT / "snapshot-rowwise.txt").read_text().strip()).rows("block")
     subject = next(r for r in rows if r.encoded.alias == "fp8-rowwise/1")
     for objective in ("footprint", "kernel_numeric_error"):

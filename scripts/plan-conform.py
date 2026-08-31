@@ -32,8 +32,6 @@ That choice belongs to whoever owns the CI budget and is NAMED here rather than 
 
 from __future__ import annotations
 
-import json
-import sqlite3
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -278,7 +276,7 @@ def plan_over(
         device=DEVICE,
         runtime=RUNTIME,
         construction=CONSTRUCTION,
-        facts=facts or PlanFacts(None),
+        facts=facts or PlanFacts(),
         objective=objective,
         encoded_leaves=consent,
         dtype_name=dtype_name,
@@ -402,7 +400,7 @@ def plan() -> None:
             device=DEVICE,
             runtime=RuntimeIdentity(RUNTIME.release, "sha256:" + "cc" * 32, RUNTIME.torch_build),
             construction=CONSTRUCTION,
-            facts=PlanFacts(None),
+            facts=PlanFacts(),
             objective="footprint",
             dtype_name=dtype_name,
         ).digest()
@@ -461,8 +459,8 @@ def objective() -> None:
     )
 
     # With a measurement, latency scores and the encoded plan can win.
-    with tempfile.TemporaryDirectory() as tmp:
-        facts = PlanFacts(tmp)
+    with tempfile.TemporaryDirectory():
+        facts = PlanFacts()
         encoded = plan_over(MIXED, objective="footprint")
         floor = plan_over(MIXED, objective="latency")
         for target, fill_ms, step_ms in ((encoded, 2000, 80.0), (floor, 3500, 128.0)):
@@ -516,10 +514,10 @@ def objective() -> None:
 
 
 def cache() -> None:
-    head("cache — #549.2: facts keyed by plan digest, in immutable SQLite rows")
+    head("cache — #549.2: facts keyed by plan digest, in process memory")
 
     with tempfile.TemporaryDirectory() as tmp:
-        facts = PlanFacts(tmp)
+        facts = PlanFacts()
         a = plan_over(MIXED, objective="footprint")
         b = plan_over(MIXED, objective="latency")
         check(
@@ -586,28 +584,25 @@ def cache() -> None:
             "no read-modify-write, no `.partial`, no lost update — each field comes from "
             "whichever runs actually measured it",
         )
+        duplicate = f"{run_id(digest, 'dev', RUNTIME.release)}-x"
+        facts.bank(RunFact(plan_digest=digest, run_id=duplicate, fill_ms=7))
+        facts.bank(RunFact(plan_digest=digest, run_id=duplicate, fill_ms=999))
         check(
-            "a duplicate run id leaves the winner's row ALONE",
-            facts.bank(
-                RunFact(plan_digest=digest, run_id=f"{run_id(digest, 'dev', RUNTIME.release)}-x")
-            )
-            is not None
-            and facts.get(digest).samples == 5,
-            "a collision means the same run wrote twice, which is a caller bug, not a race",
+            "a duplicate run id leaves the first observation alone",
+            len([row for row in facts.runs(digest) if row.run_id == duplicate]) == 1
+            and next(row for row in facts.runs(digest) if row.run_id == duplicate).fill_ms == 7,
+            "a collision means the same process tried to bank one run twice",
         )
         check(
             "a fold of ZERO runs is zero samples, not a plausible-looking record",
             fold("sha256:none", []).samples == 0 and fold("sha256:none", []).fill_ms == -1,
             "an absent measurement is absent",
         )
-        # The old artifact is not read.
-        legacy = Path(tmp) / "delivery-deadbeef.json"
-        legacy.write_text(json.dumps({"format": "cozy.runtime.delivery-table/1", "rows": []}))
+        # Measurements are deliberately process-local: banking them creates no file.
         check(
-            "an OLD label-keyed table on disk is INVALID and is never read",
-            facts.get(b.digest()).samples == 0,
-            "the numbers in it cannot be attributed to a plan after the fact — that is "
-            "exactly what they failed to record — so a first prepare re-mints",
+            "banking plan facts creates no Runtime database or measurement file",
+            not any(Path(tmp).iterdir()),
+            "the next Runtime process measures again",
         )
         concurrent_digest = b.digest()
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -620,15 +615,11 @@ def cache() -> None:
                     ),
                 )
             )
-        database = sqlite3.connect(Path(tmp) / "runtime.sqlite3")
         check(
-            "concurrent writers retain every row in one healthy versioned SQLite cache",
-            facts.get(concurrent_digest).samples == 32
-            and database.execute("PRAGMA user_version").fetchone()[0] == 1
-            and database.execute("PRAGMA integrity_check").fetchone()[0] == "ok",
-            "32/32 rows, schema version 1, integrity_check=ok",
+            "concurrent threads retain every row in one process-local fact set",
+            facts.get(concurrent_digest).samples == 32,
+            "32/32 rows; no database and no cross-process authority",
         )
-        database.close()
 
 
 def specs() -> None:

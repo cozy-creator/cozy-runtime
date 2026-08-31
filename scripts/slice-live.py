@@ -109,27 +109,6 @@ def plan_id_for(entrypoint: str) -> str:
     return "sha256:" + hashlib.sha256(f"ebp/{RELEASE}/{entrypoint}".encode()).hexdigest()
 
 
-def install_row(home: Path, store: str = "") -> None:
-    """Put this bench artifact in the run's OWN artifact index (#567e).
-
-    The record names a ref and the worker resolves it against this machine's index, so a
-    harness that hands the worker a store root without an index row is handing it a fact
-    the product path never carries. Installing the row is what makes these arms run the
-    shape production runs: pull writes a row, and the binding names what the row is called.
-    """
-    from cozy_runtime.internal import artifacts
-
-    artifacts.install(
-        home,
-        artifacts.Artifact(
-            ref=RELEASE,
-            store=store or working_store(Path(WORK) / "store"),
-            config=str(CONFIG),
-            snapshots={COMPONENT: snapshot()},
-        ),
-    )
-
-
 def binding_record(entrypoint: str) -> dict[str, Any]:
     return {
         "entrypoint_binding_plan_id": plan_id_for(entrypoint),
@@ -204,9 +183,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     project = Path(spec["weightless_project"]) if spec.get("weightless_project") else None
     package_descriptor = None
     executor_python = ""
-    if project is None:
-        install_row(home, spec.get("store", ""))
-    else:
+    if project is not None:
         package_descriptor = descriptor.build(discover(project))
         environment = workspace / "environment"
         subprocess.run(["uv", "venv", str(environment)], check=True)

@@ -2511,14 +2511,6 @@ class Worker:
 
         for group in by_construction.values():
             first = group[0]
-            generation_probe = (
-                self.supervision.generation_scratch(executor.incarnation) / "probe"
-                if getattr(self.supervision, "isolated", False)
-                else self.config.cozy_home / "probe"
-            )
-            generation_probe.mkdir(parents=True, exist_ok=True)
-            if getattr(self.supervision, "isolated", False):
-                self.supervision.grant_directory(generation_probe, executor.incarnation)
             started = time.perf_counter()
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
@@ -2550,11 +2542,9 @@ class Worker:
                             "stamps": {k: list(v) for k, v in first.stamps.items()},
                             "custody": first.custody,
                             "strict_keys": first.strict_keys,
-                            "probe_cache": str(generation_probe),
                             "variants": [dataclasses.asdict(offer) for offer in first.offered],
                             "objective": first.objective,
                             "steps_basis": first.steps_basis,
-                            "delivery_cache": str(generation_probe),
                         },
                         "budgets": {
                             # cr-037/law 19: a prediction BASIS, not a budget — the wire

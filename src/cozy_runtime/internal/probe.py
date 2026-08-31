@@ -35,13 +35,8 @@ because "mxfp8 works here" is not a fact — "this implementation of mxfp8 works
    an objective with numbers on both sides rather than a ladder position.
 4. **record** — the tfs-013 key with the evidence digest of exactly this observation.
 
-The suite QUALIFIES a fixed kernel set; it does not search one. Its seconds are an
-acceptance fact and are returned so the caller can bank them (cr-006's checklist): any
-growth toward per-shape search is out of scope by construction, because there is no
-shape loop here to grow.
-
-First-writer-wins persistence is one SQLite row keyed by the exact probe inputs. A loser
-reads the winner's row rather than overwriting it.
+The suite QUALIFIES a fixed kernel set; it does not search one. Its seconds are returned as
+an observation. A new Runtime process probes again; Runtime owns no durable fact database.
 """
 
 from __future__ import annotations
@@ -55,7 +50,6 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel, canonical
-from cozy_runtime.internal import cache as runtime_cache
 from cozy_runtime.internal.encoding import (
     SPEC_VECTORS,
     TORCH_DTYPES,
@@ -834,10 +828,9 @@ def qualify(
     output_dtypes: Sequence[str],
     *,
     release: str,
-    cache: Path | str | None = None,
     runtime: RuntimeIdentity | None = None,
 ) -> tuple[Capabilities, dict[str, Any]]:
-    """Run the suite (or read the persisted fact) and return the admission table.
+    """Run the suite and return this process's admission table.
 
     The evidence for a route that decodes nothing (`plain/1`) is the fill plane's own
     byte-identity proof, so its record carries the trivial observation rather than a
@@ -852,12 +845,9 @@ def qualify(
     manifest has been believed.
 
     `runtime` is #549.9's other half. A capability record is a claim about an IMPLEMENTATION
-    on a device, and only the device half used to have an identity: two runtime builds with
-    different arithmetic in `encoding/` minted records that were indistinguishable and
-    therefore interchangeable. The runtime's source digest and torch build now key the cache
-    and ride every record, so an edit to a decode invalidates the records that measured the
-    old one instead of inheriting them. Defaulted rather than required so a caller that has
-    torch and a release can still probe; the default MEASURES, it does not fabricate.
+    on a device, and only the device half used to have an identity. The runtime's source
+    digest and torch build ride every record. Defaulted rather than required so a caller that
+    has torch and a release can still probe; the default MEASURES, it does not fabricate.
     """
     accel.qualification_gate(device.kind)
     if runtime is None:
@@ -866,30 +856,6 @@ def qualify(
         digest: (tuple(value) if isinstance(value, tuple | list) else (value,))
         for digest, value in providers.items()
     }
-    key_preimage = canonical.write(
-        {
-            "tuple": device.tuple_key(),
-            "release": release,
-            # #549.9: the BUILD, not just its version string. `runtime_source_digest` is over
-            # the modules whose bytes decide what a record MEANS, so a rewritten decode gets
-            # a new key and a re-probe rather than the old decode's persisted verdict.
-            "runtime": runtime.document(),
-            # The IMPLEMENTATIONS, not just the encodings. A build that grows a second
-            # provider for an encoding it already served has the same digest set and a
-            # different capability answer, so an encoding-keyed cache would serve the old
-            # table forever — the exact staleness a first-writer-wins file makes permanent.
-            "encodings": {
-                digest: sorted(implementation_digest(p) for p in group)
-                for digest, group in sorted(candidates.items())
-            },
-            "dtypes": sorted(output_dtypes),
-        }
-    )
-    key = "sha256:" + hashlib.sha256(b"cozy.runtime.probe\0" + key_preimage).hexdigest()
-    cached = _read(cache, key)
-    if cached is not None:
-        return _table(cached), cached
-
     started = time.perf_counter_ns()
     observations: list[dict[str, Any]] = []
     for encoding, group in sorted(candidates.items()):
@@ -991,7 +957,6 @@ def qualify(
         "suite_ms": (time.perf_counter_ns() - started) // 1_000_000,
         "observations": observations,
     }
-    _write(cache, key, result)
     return _table(result), result
 
 
@@ -1033,42 +998,3 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
             )
         )
     return caps
-
-
-def _read(root: Path | str | None, key: str) -> dict[str, Any] | None:
-    if root is None:
-        return None
-    with runtime_cache.connect(root) as database:
-        row = database.execute(
-            "SELECT result_json FROM probe_results WHERE cache_key = ?", (key,)
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        data = json.loads(str(row["result_json"]))
-    except ValueError as exc:
-        raise runtime_cache.CacheError(f"probe row {key} is not JSON") from exc
-    required = {
-        "tuple",
-        "device",
-        "device_predicate",
-        "runtime_release",
-        "runtime",
-        "suite_ms",
-        "observations",
-    }
-    if not isinstance(data, dict) or set(data) != required:
-        raise runtime_cache.CacheError(f"probe row {key} has the wrong fields")
-    return data
-
-
-def _write(root: Path | str | None, key: str, result: Mapping[str, Any]) -> None:
-    """FIRST WRITER WINS. A loser leaves the winner's bytes alone and moves on."""
-    if root is None:
-        return
-    with runtime_cache.connect(root) as database:
-        database.execute(
-            "INSERT OR IGNORE INTO probe_results (cache_key, result_json) VALUES (?, ?)",
-            (key, json.dumps(result, sort_keys=True, separators=(",", ":"))),
-        )
-        database.commit()
