@@ -8,6 +8,7 @@ Nothing durable lives here — no journal, no credential, no monotone wire count
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
+    describe_installed  derive one installed package descriptor into brokered scratch
     prepare   construct + fill one binding; report the construction digest and ready facts
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               the worker prices a plan against the record the handler will actually run
@@ -54,7 +55,7 @@ from cozy_runtime.author._invoke import (
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover, discover_installed
+from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 
@@ -189,6 +190,30 @@ class Executor:
         self._exchange = 0
 
     # ------------------------------------------------------------------ prepare
+
+    def describe_installed(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Import one installed package and write its descriptor to brokered scratch."""
+
+        distribution = str(command.get("distribution", ""))
+        output = Path(str(command.get("output", "")))
+        if not distribution or not output.is_absolute():
+            return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
+        discovered = discover_distribution(distribution)
+        body = descriptor.build(discovered)
+        raw = descriptor.canonical_bytes(body)
+        with output.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        output.chmod(0o400)
+        self.discovered = discovered
+        self.surface_names = {surface.name: surface for surface in discovered.surfaces}
+        return {
+            "ok": True,
+            "application": discovered.application,
+            "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "length": len(raw),
+        }
 
     def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
         """Consume this incarnation's one construction attempt.
@@ -1582,6 +1607,8 @@ def main(argv: list[str] | None = None) -> int:
                     "torch_loaded": "torch" in sys.modules,
                     "rss_bytes": _rss(),
                 }
+            elif name == "describe_installed":
+                reply = executor.describe_installed(command)
             elif name == "prepare":
                 reply = executor.prepare(command)
             elif name == "prepare_request":

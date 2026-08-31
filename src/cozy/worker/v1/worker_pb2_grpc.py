@@ -150,3 +150,84 @@ class WorkerControl(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class RuntimePreparationStub(object):
+    """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
+    service on its external listener. Runtime receives verified local files and logical refs only:
+    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.PreparePackageSet = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/PreparePackageSet',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
+                _registered_method=True)
+
+
+class RuntimePreparationServicer(object):
+    """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
+    service on its external listener. Runtime receives verified local files and logical refs only:
+    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    """
+
+    def PreparePackageSet(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_RuntimePreparationServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'PreparePackageSet': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreparePackageSet,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'cozy.worker.v1.RuntimePreparation', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('cozy.worker.v1.RuntimePreparation', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class RuntimePreparation(object):
+    """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
+    service on its external listener. Runtime receives verified local files and logical refs only:
+    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    """
+
+    @staticmethod
+    def PreparePackageSet(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/PreparePackageSet',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

@@ -7,6 +7,14 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class LocalDownloadKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    LOCAL_DOWNLOAD_KIND_UNSPECIFIED: _ClassVar[LocalDownloadKind]
+    LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL: _ClassVar[LocalDownloadKind]
+    LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL: _ClassVar[LocalDownloadKind]
+    LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST: _ClassVar[LocalDownloadKind]
+    LOCAL_DOWNLOAD_KIND_MODEL_OBJECT: _ClassVar[LocalDownloadKind]
+
 class Posture(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     POSTURE_UNSPECIFIED: _ClassVar[Posture]
@@ -176,6 +184,11 @@ class ArtifactFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper)
     ARTIFACT_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[ArtifactFinalizeOutcome]
     ARTIFACT_FINALIZE_OUTCOME_ADOPTED: _ClassVar[ArtifactFinalizeOutcome]
     ARTIFACT_FINALIZE_OUTCOME_ABANDONED: _ClassVar[ArtifactFinalizeOutcome]
+LOCAL_DOWNLOAD_KIND_UNSPECIFIED: LocalDownloadKind
+LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL: LocalDownloadKind
+LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL: LocalDownloadKind
+LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST: LocalDownloadKind
+LOCAL_DOWNLOAD_KIND_MODEL_OBJECT: LocalDownloadKind
 POSTURE_UNSPECIFIED: Posture
 POSTURE_ACCEPTING: Posture
 POSTURE_DRAINING: Posture
@@ -292,6 +305,36 @@ ARTIFACT_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED: ArtifactFinalizeDisposition
 ARTIFACT_FINALIZE_OUTCOME_UNSPECIFIED: ArtifactFinalizeOutcome
 ARTIFACT_FINALIZE_OUTCOME_ADOPTED: ArtifactFinalizeOutcome
 ARTIFACT_FINALIZE_OUTCOME_ABANDONED: ArtifactFinalizeOutcome
+
+class PreparePackageSetRequest(_message.Message):
+    __slots__ = ("download_delegation", "files", "environment_root")
+    DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    ENVIRONMENT_ROOT_FIELD_NUMBER: _ClassVar[int]
+    download_delegation: bytes
+    files: _containers.RepeatedCompositeFieldContainer[LocalDownloadFile]
+    environment_root: str
+    def __init__(self, download_delegation: _Optional[bytes] = ..., files: _Optional[_Iterable[_Union[LocalDownloadFile, _Mapping]]] = ..., environment_root: _Optional[str] = ...) -> None: ...
+
+class LocalDownloadFile(_message.Message):
+    __slots__ = ("digest", "filename", "kind", "length", "path")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    FILENAME_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    LENGTH_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    digest: bytes
+    filename: str
+    kind: LocalDownloadKind
+    length: int
+    path: str
+    def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., kind: _Optional[_Union[LocalDownloadKind, str]] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
+
+class PreparePackageSetResult(_message.Message):
+    __slots__ = ("placement_set",)
+    PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    placement_set: DesiredPlacementSet
+    def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
     __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request")
@@ -538,22 +581,28 @@ class DownloadDelegation(_message.Message):
     def __init__(self, expires_at_unix: _Optional[int] = ..., models: _Optional[_Iterable[_Union[DownloadModelRef, _Mapping]]] = ..., packages: _Optional[_Iterable[_Union[DownloadPackageRef, _Mapping]]] = ..., rental_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
 
 class DownloadModelRef(_message.Message):
-    __slots__ = ("manifest", "model", "release")
+    __slots__ = ("manifest", "model", "release", "package", "slot")
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
     manifest: str
     model: str
     release: str
-    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
+    package: str
+    slot: str
+    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ...) -> None: ...
 
 class DownloadPackageRef(_message.Message):
-    __slots__ = ("package", "release")
+    __slots__ = ("package", "release", "release_digest")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
+    release_digest: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
     __slots__ = ("placement_id", "package", "development", "environment_digest", "environment_receipt_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "qualification", "environment")
@@ -764,7 +813,7 @@ class ObservedWorkerState(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_generation: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_generation", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition")
+    __slots__ = ("placement_id", "executor_generation", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "package_revision_digest", "environment_digest", "config_digest")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_GENERATION_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
@@ -776,6 +825,9 @@ class PlacementStatus(_message.Message):
     SERVING_FIELD_NUMBER: _ClassVar[int]
     RETAINED_FALLBACK_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ACQUISITION_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CONFIG_DIGEST_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     executor_generation: int
     dispatchable_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
@@ -787,7 +839,10 @@ class PlacementStatus(_message.Message):
     serving: ServingState
     retained_fallback_placement_set_digest: bytes
     acquisition: PlacementAcquisitionObservation
-    def __init__(self, placement_id: _Optional[str] = ..., executor_generation: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ...) -> None: ...
+    package_revision_digest: str
+    environment_digest: str
+    config_digest: str
+    def __init__(self, placement_id: _Optional[str] = ..., executor_generation: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., package_revision_digest: _Optional[str] = ..., environment_digest: _Optional[str] = ..., config_digest: _Optional[str] = ...) -> None: ...
 
 class PlacementAcquisitionObservation(_message.Message):
     __slots__ = ("package", "model")

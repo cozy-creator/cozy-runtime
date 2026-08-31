@@ -270,6 +270,8 @@ class DeclaredBinding:
     release: str
     environment_digest: str = ""
     """The exact inline Environment selected beside this binding."""
+    config_digest: str = ""
+    """The exact selected model config, or sha256(canonical {}) when weightless."""
     application: str = ""
     """The exact PackageDescriptor application imported from the installed venv."""
     descriptor_path: str = ""

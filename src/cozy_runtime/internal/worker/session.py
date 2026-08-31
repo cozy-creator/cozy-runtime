@@ -264,6 +264,17 @@ class Placement:
             self.package.get("release_digest") or self.development.get("source_digest") or ""
         )
 
+    @property
+    def config_digest(self) -> str:
+        selected = {
+            str(slot["config"]["document"]["digest"])
+            for entrypoint in self.entrypoints
+            for slot in entrypoint.get("slots", [])
+        }
+        if not selected:
+            return canonical.digest({})
+        return next(iter(selected)) if len(selected) == 1 else ""
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutorDeath:
@@ -772,6 +783,7 @@ class Worker:
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
         # from the superseded stream cannot finish under its successor's generation.
         self.control_lock = threading.RLock()
+        self.package_prepare_lock = threading.Lock()
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
@@ -855,6 +867,74 @@ class Worker:
         self.claim_lock = threading.Lock()
 
     # ------------------------------------------------------------------ plumbing
+
+    def prepare_package_set(
+        self, request: pb.PreparePackageSetRequest
+    ) -> pb.PreparePackageSetResult:
+        """Derive one local PlacementSet while package imports stay in the isolated executor."""
+
+        from cozy_runtime.internal.worker import package_prepare
+
+        with self.package_prepare_lock:
+            if self.placement is not None or self.pending is not None or self.bindings:
+                raise package_prepare.PreparationRefusal(
+                    "package_prepare_worker_busy",
+                    "replace the active package through desired state",
+                )
+
+            def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
+                changed = self.supervision.use_overlay(
+                    str(installed.python), str(installed.import_root), installed.content_digest
+                )
+                executor = self.supervision.current
+                try:
+                    if executor is None:
+                        executor = self.supervision.spawn(imposed=self.imposed())
+                    elif changed or not executor.alive():
+                        executor = self.supervision.replace(
+                            executor, imposed=self.imposed(), why="prepared package changed"
+                        )
+                    scratch = self.supervision.generation_scratch(executor.incarnation)
+                    output = scratch / f"package-descriptor-{uuid.uuid4().hex}.json"
+                    reply = executor.call(
+                        {
+                            "cmd": "describe_installed",
+                            "distribution": distribution,
+                            "output": str(output),
+                        },
+                        timeout=1.0,
+                        total_timeout=65.0,
+                    )
+                except ExecutorGone as exc:
+                    raise package_prepare.PreparationRefusal(
+                        "package_prepare_executor_failed", exc.detail
+                    ) from exc
+                try:
+                    raw = output.read_bytes()
+                finally:
+                    output.unlink(missing_ok=True)
+                digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+                if (
+                    not reply.get("ok")
+                    or reply.get("digest") != digest
+                    or reply.get("length") != len(raw)
+                ):
+                    raise package_prepare.PreparationRefusal(
+                        "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))
+                    )
+                return raw
+
+            def mark_verified(digest: str, length: int, path: Path) -> None:
+                self.verified_artifacts.record(digest, length, path)
+
+            return package_prepare.prepare_package_set(
+                request,
+                artifact_cache=Path(self.options.artifact_cache or ""),
+                environment_root=Path(self.options.environment_root or ""),
+                python=Path(self.options.python or sys.executable),
+                describe=describe,
+                verified=mark_verified,
+            )
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
@@ -3387,6 +3467,26 @@ class Worker:
                 )
             ],
         )
+        if (
+            self.placement.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+        ):
+            status.package_revision_digest = self.placement.execution_digest
+            status.environment_digest = (
+                documents.spell(self.placement.environment_digest)
+                if self.placement.environment_digest
+                else canonical.digest({})
+            )
+            status.config_digest = self.placement.config_digest
+            if not all(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                for value in (
+                    status.package_revision_digest,
+                    status.environment_digest,
+                    status.config_digest,
+                )
+            ):
+                raise RuntimeError("dispatchable placement has incomplete invocation identity")
         if self.placement.acquisition.ListFields():
             status.acquisition.CopyFrom(self.placement.acquisition)
         return status
