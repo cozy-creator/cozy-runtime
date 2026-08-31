@@ -116,7 +116,6 @@ class WorkerHostConfig:
     control_public_key_ed25519_b64url: str
     media_token_sha256: tuple[str, ...]
     lease_expiry_unix: int
-    tensorhub_origin: TensorhubOrigin
     child_base_env: tuple[tuple[str, str], ...]
 
 
@@ -136,7 +135,6 @@ WORKER_HOST_ENV = {
     "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WORKER_LEASE_EXPIRY_UNIX",
     "COZY_RECORD_OWNER_AUTH_JSON",
-    "TENSORHUB_ORIGIN",
     "COZY_WORKER_INTERNAL_PORT",
 }
 
@@ -301,7 +299,7 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         raise ConfigError(
             "worker_host_config",
             f"unknown worker environment variable {unknown[0]}",
-            "use the closed six-value worker handoff",
+            "use the closed five-value worker handoff",
         )
 
     def required(name: str) -> str:
@@ -393,7 +391,6 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
-        tensorhub_origin=parse_tensorhub_origin(required("TENSORHUB_ORIGIN")),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV

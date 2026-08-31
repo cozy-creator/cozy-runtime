@@ -201,7 +201,6 @@ class WorkerOptions:
     makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
-    download_client: downloads.DownloadClient | None = None
     development_project: Path | None = None
     """Explicit same-user source-checkout execution; product published venvs leave absent."""
     development_package: str = ""
@@ -849,8 +848,6 @@ class Worker:
         #: the value never appears in a log. Where no launcher minted one (a hand-started
         #: serve), the fence is the socket's own filesystem authority and it is absent.
         self.bootstrap = config.bootstrap_credential
-        self.download_plan = downloads.DownloadPlan()
-        self.download_resolutions: queue.Queue[bytes | None] = queue.Queue()
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
@@ -1850,91 +1847,10 @@ class Worker:
                 else " from a standing start"
             ),
         )
-        expected = (
-            documents.spell(candidate.environment_receipt_digest)
-            if candidate.environment_receipt_digest
-            else ""
-        )
-        local_receipt = (
-            self.options.environment_root / "receipts" / f"{expected[7:]}.json"
-            if self.options.environment_root is not None and expected
-            else None
-        )
-        if (
-            not candidate.environment_receipt_digest
-            or self.options.development_project is not None
-            or self.download_plan.authorized()
-            or (self.options.download_client is None and self.options.artifact_cache is not None)
-            or (local_receipt is not None and local_receipt.is_file())
-        ):
-            self.schedule_convergence(desired.revision)
-        else:
-            self.note(
-                "materialization",
-                f"revision {desired.revision} waits for package/model download resolution",
-            )
-            self.download_resolutions.put(desired_set.placement_set_digest)
+        self.schedule_convergence(desired.revision)
 
     def schedule_convergence(self, revision: int) -> None:
         self.convergences.put(revision)
-
-    def download_resolution_lane(self) -> None:
-        """Resolve the accepted PlacementSet digest without blocking WorkerControl."""
-
-        while (set_digest := self.download_resolutions.get()) is not None:
-            if (
-                set_digest != self.accepted.accepted_placement_set_digest
-                or self.options.download_client is None
-            ):
-                continue
-            try:
-                plan = self.options.download_client.resolve(set_digest)
-            except downloads.DownloadRefusal as exc:
-                if set_digest != self.accepted.accepted_placement_set_digest:
-                    continue
-                if exc.code == "worker_downloads.worker_inactive":
-                    self.note("downloads", "resolve waiting for RecordOwner acceptance relay")
-                    if (
-                        not self.stop.wait(1)
-                        and set_digest == self.accepted.accepted_placement_set_digest
-                    ):
-                        self.download_resolutions.put(set_digest)
-                    continue
-                self.note("downloads", f"resolve REFUSED: {exc.code}")
-                self.engine.fault(
-                    pb.Fault(
-                        kind=exc.kind,
-                        subject=documents.spell(set_digest),
-                        reason=exc.code,
-                        detail=safe(
-                            exc.detail
-                            + (f"; server_time_unix={exc.server_time}" if exc.server_time else "")
-                        ),
-                    )
-                )
-                if self.connected.is_set():
-                    self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-                continue
-            if set_digest != self.accepted.accepted_placement_set_digest:
-                continue
-            self.download_plan = plan
-            self.note(
-                "downloads",
-                f"resolved {len(plan.files)} exact package/model file(s) for PlacementSet "
-                f"{documents.spell(set_digest)[:23]}…, expiring {plan.expires_at_unix}",
-            )
-            revision = self.accepted.accepted_desired_state_revision
-            candidate = self.pending or self.placement
-            if (
-                candidate is not None
-                and self.accepted.converged_revision < revision
-                and candidate.materialization
-                != pb.MaterializationState.MATERIALIZATION_STATE_FAILED
-            ):
-                self.latched = ""
-                self.schedule_convergence(revision)
-            if self.connected.is_set():
-                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def convergence_lane(self) -> None:
         """One non-control lane for slow, generation-fenced placement convergence."""
@@ -2179,7 +2095,7 @@ class Worker:
             return None
         try:
             acquirer = acquire.Acquirer(
-                self.download_plan,
+                downloads.DownloadPlan(),
                 cache_root=self.options.artifact_cache,
                 environment_root=self.options.environment_root,
                 selection_root=self.options.environment_root / "selections",
@@ -3600,11 +3516,6 @@ class Worker:
             threading.Thread(
                 target=self.convergence_lane, daemon=True, name="convergence-lane"
             ).start()
-            threading.Thread(
-                target=self.download_resolution_lane,
-                daemon=True,
-                name="download-resolution-lane",
-            ).start()
             threading.Thread(target=self.reporter, daemon=True, name="report").start()
             threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
         try:
@@ -3622,7 +3533,6 @@ class Worker:
         self.stop.set()
         self.work.put(None)
         self.convergences.put(None)
-        self.download_resolutions.put(None)
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()

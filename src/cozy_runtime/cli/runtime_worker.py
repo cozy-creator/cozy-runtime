@@ -28,7 +28,7 @@ from cozy_runtime.internal.placement_materialization import (
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import GrpcControlHost
-from cozy_runtime.internal.worker.downloads import DownloadClient, tls_certificate_digest
+from cozy_runtime.internal.worker.downloads import tls_certificate_digest
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
 POD_EXECUTOR_UID = 65533
@@ -201,11 +201,6 @@ def _worker_options(
         environment_root=host_paths.ENVIRONMENT_ROOT,
         artifact_cache=prepared.artifact_cache,
         artifact_store=prepared.artifact_store,
-        download_client=DownloadClient(
-            host_paths.TLS_CERTIFICATE,
-            host_paths.TLS_PRIVATE_KEY,
-            config.tensorhub_origin,
-        ),
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         no_warm=True,
         claim_ready=False,

@@ -474,7 +474,7 @@ class SnapshotAck(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ...) -> None: ...
 
 class DesiredWorkerState(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -484,6 +484,7 @@ class DesiredWorkerState(_message.Message):
     DRAIN_GRACE_MS_FIELD_NUMBER: _ClassVar[int]
     JOB_FIELD_NUMBER: _ClassVar[int]
     PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -493,7 +494,16 @@ class DesiredWorkerState(_message.Message):
     drain_grace_ms: int
     job: JobDirective
     placement_set: DesiredPlacementSet
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
+    package_set: DesiredPackageSet
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ...) -> None: ...
+
+class DesiredPackageSet(_message.Message):
+    __slots__ = ("download_delegation", "download_delegation_signature")
+    DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    download_delegation: bytes
+    download_delegation_signature: bytes
+    def __init__(self, download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
     __slots__ = ("placement_set_digest", "placement_set_canonical_bytes")
@@ -508,6 +518,42 @@ class PlacementSet(_message.Message):
     PLACEMENTS_FIELD_NUMBER: _ClassVar[int]
     placements: _containers.RepeatedCompositeFieldContainer[Placement]
     def __init__(self, placements: _Optional[_Iterable[_Union[Placement, _Mapping]]] = ...) -> None: ...
+
+class DownloadDelegation(_message.Message):
+    __slots__ = ("expires_at_unix", "models", "packages", "rental_id", "worker_boot_id", "worker_id", "worker_tls_certificate_digest")
+    EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
+    MODELS_FIELD_NUMBER: _ClassVar[int]
+    PACKAGES_FIELD_NUMBER: _ClassVar[int]
+    RENTAL_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    expires_at_unix: int
+    models: _containers.RepeatedCompositeFieldContainer[DownloadModelRef]
+    packages: _containers.RepeatedCompositeFieldContainer[DownloadPackageRef]
+    rental_id: str
+    worker_boot_id: str
+    worker_id: str
+    worker_tls_certificate_digest: bytes
+    def __init__(self, expires_at_unix: _Optional[int] = ..., models: _Optional[_Iterable[_Union[DownloadModelRef, _Mapping]]] = ..., packages: _Optional[_Iterable[_Union[DownloadPackageRef, _Mapping]]] = ..., rental_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
+
+class DownloadModelRef(_message.Message):
+    __slots__ = ("manifest", "model", "release")
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    manifest: str
+    model: str
+    release: str
+    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
+
+class DownloadPackageRef(_message.Message):
+    __slots__ = ("package", "release")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    package: str
+    release: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
     __slots__ = ("placement_id", "package", "development", "environment_digest", "environment_receipt_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "qualification", "environment")
