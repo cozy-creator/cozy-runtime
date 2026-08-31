@@ -165,9 +165,7 @@ def _read_request(path: Path) -> ProofRequest:
         environment = canonical.parse_canonical(_document_bytes(environment_path, "environment"))
     except canonical.CanonicalError as err:
         raise _request_error(f"environment: {err}") from err
-    if not isinstance(environment, dict) or not set(environment).issubset(
-        {"wheelhouse_manifest", "wheels"}
-    ):
+    if not isinstance(environment, dict) or set(environment) not in (set(), {"wheels"}):
         raise _request_error("environment is not one closed nested Environment object")
     environment_digest = (
         "sha256:"

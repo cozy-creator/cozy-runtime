@@ -70,6 +70,12 @@ class GrantRefusal(Exception):
 #: the job's typed field names, so the mapping from field value to grant is the ref itself.
 TREE_PREFIX = "tree:"
 
+#: A job Model parameter is one exact TensorFS Manifest identity. Its grant access is an
+#: opaque host-local capability, never a filesystem path or URL the executor can spend.
+MODEL_PREFIX = "model:"
+MODEL_MIME = "application/vnd.cozy.model-manifest"
+_MODEL_PARAM = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
 #: The one input_id that is not an asset: the request DOCUMENT itself rides the grant as an
 #: input, which is why the payload and the assets share one authorization table and reader.
 PAYLOAD_INPUT = "payload"
@@ -289,8 +295,15 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
     )
     for input_id, row in spec_inputs.items():
         spelled = str(row.get("digest", ""))
-        carried_order = int(row.get("order", 0))
+        try:
+            carried_order = int(row.get("order", 0))
+            carried_length = int(row.get("length", 0))
+        except (TypeError, ValueError) as exc:
+            raise GrantRefusal(
+                "grant_input_identity", f"input {input_id!r} has malformed numeric facts"
+            ) from exc
         is_tree = input_id.startswith(TREE_PREFIX)
+        is_model = input_id.startswith(MODEL_PREFIX)
         if not is_tree and (
             not spelled.startswith("sha256:")
             or len(spelled) != len("sha256:") + hashlib.sha256().digest_size * 2
@@ -299,7 +312,7 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
                 "grant_input_identity",
                 f"input {input_id!r} does not carry one exact sha256 identity",
             )
-        if not is_tree and int(row.get("length", 0)) < 0:
+        if not is_tree and carried_length < 0:
             raise GrantRefusal(
                 "grant_input_identity",
                 f"input {input_id!r} does not carry one exact nonnegative length",
@@ -310,11 +323,30 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             raise GrantRefusal(
                 "grant_input_identity", f"input {input_id!r} has a malformed sha256 digest"
             ) from exc
+        if is_model:
+            parameter = input_id[len(MODEL_PREFIX) :]
+            if spec.get("job") is None:
+                raise GrantRefusal(
+                    "grant_model_serving_refused",
+                    f"serving InvocationSpec cannot carry job Model input {input_id!r}",
+                )
+            if (
+                _MODEL_PARAM.fullmatch(parameter) is None
+                or str(row.get("kind_mime", "")) != MODEL_MIME
+                or carried_order != 0
+                or carried_length <= 0
+                or spelled != "sha256:" + digest.hex()
+                or grant_inputs[input_id] != f"model://{spelled}"
+            ):
+                raise GrantRefusal(
+                    "grant_model_identity",
+                    f"input {input_id!r} is not one exact host-local Model Manifest capability",
+                )
         bound.inputs[input_id] = BoundInput(
             input_id=input_id,
             url=grant_inputs[input_id],
             digest=digest,
-            length=int(row.get("length", 0)),
+            length=carried_length,
             kind_mime=str(row.get("kind_mime", "")),
             order=carried_order,
         )
@@ -326,6 +358,15 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             mime_type=str(row.get("mime_type", "")),
         )
     return bound
+
+
+def model_inputs(grant: BoundGrant) -> dict[str, BoundInput]:
+    """Descriptor parameter -> exact Manifest identity, with no access address exposed."""
+    return {
+        input_id[len(MODEL_PREFIX) :]: entry
+        for input_id, entry in grant.inputs.items()
+        if input_id.startswith(MODEL_PREFIX)
+    }
 
 
 def _index_spec_bindings(rows: Any, field_name: str, what: str) -> dict[str, Mapping[str, Any]]:
@@ -555,7 +596,9 @@ def hydrate_inputs(
     entries = [
         e
         for e in sorted(grant.inputs.values(), key=lambda e: (e.order, e.input_id))
-        if e.input_id != PAYLOAD_INPUT and not e.input_id.startswith(TREE_PREFIX)
+        if e.input_id != PAYLOAD_INPUT
+        and not e.input_id.startswith(TREE_PREFIX)
+        and not e.input_id.startswith(MODEL_PREFIX)
     ]
     declared_total = sum(int(e.length) for e in entries)
     if declared_total > max_total_bytes:

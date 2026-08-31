@@ -156,9 +156,9 @@ def preinstalled_development(
     """Admit one independently re-derived source-checkout selection.
 
     The launch Runtime has re-read package.toml and the exact local TensorFS Repository,
-    Manifest, header and config.  This function compares that derivation with every accepted
-    Placement fact before handing the normal attempt kernel its local resolution paths.  No
-    PackageRelease, Qualification or Environment is invented for this same-user lane.
+    Manifest, header and config. This function compares that derivation with every accepted
+    Placement fact before handing the normal attempt kernel its local resolution paths. No
+    PackageRelease or Environment is invented for this same-user lane.
     """
 
     actual = placement.document
@@ -417,7 +417,7 @@ class Acquirer:
         self.observation.start("package")
         try:
             installed = self._environment(placement)
-            bindings, count = self._bindings(placement, installed)
+            bindings, count = self._bindings(placement)
             return installed, bindings, count
         finally:
             self.observation.finish("package")
@@ -541,9 +541,7 @@ class Acquirer:
                 f"{type(exc).__name__}: {exc}",
             ) from exc
 
-    def _bindings(
-        self, placement: Any, installed: overlay.InstalledOverlay
-    ) -> tuple[Mapping[str, DeclaredBinding], int]:
+    def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
         descriptor_digest, descriptor_length = placement.package_descriptor
         descriptor_path = self._stage(
             descriptor_digest, self.fetch(descriptor_digest, descriptor_length).read_bytes()

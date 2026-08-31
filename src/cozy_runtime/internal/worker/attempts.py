@@ -42,7 +42,8 @@ from typing import Any, cast
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import artifact_sink as artifact_bridge
-from cozy_runtime.internal import canonical, seam
+from cozy_runtime.internal import canonical, fill, seam
+from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.artifacts import ArtifactExchange
@@ -201,6 +202,16 @@ class AttemptRefusal(Exception):
         self.origin = origin
 
 
+@dataclass(frozen=True, slots=True)
+class JobModel:
+    """One descriptor parameter joined to one held TensorFS Manifest for this attempt."""
+
+    parameter: str
+    class_name: str
+    manifest: str
+    length: int
+
+
 @dataclass(slots=True)
 class AttemptRecord:
     """ONE attempt, as this worker holds it. Named for what it is: the worker's RECORD
@@ -293,6 +304,8 @@ class AttemptRecord:
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: Host-ACKed ArtifactReceipt/1 refs, one per descriptor-declared output slot.
     artifact_receipts: dict[str, pb.ArtifactReceiptRef] = dataclasses_field(default_factory=dict)
+    job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
+    model_leases: list[Any] = dataclasses_field(default_factory=list)
 
     def begin_reclaim(self) -> bool:
         """Win the completion race, or report that natural finalization won first."""
@@ -348,6 +361,8 @@ class AttemptRecord:
         self.residency = {}
         self.publication = {}
         self.artifact_receipts = {}
+        self.job_models = {}
+        self.model_leases = []
 
     def confess(self, kind: str, quantified: str, *, benchmark: bool = False) -> None:
         """Say out loud that this request was not served by its plain reading (§3.6)."""
@@ -740,6 +755,127 @@ class AttemptEngine:
                 origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_WORKER,
             ) from exc
 
+    def _job_model_declarations(self, binding: JobBinding, descriptor_id: str) -> dict[str, str]:
+        """Read the exact installed descriptor without importing package code."""
+        try:
+            descriptor_path = Path(binding.package_descriptor)
+            descriptor_stat = descriptor_path.lstat()
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or not 0 < descriptor_stat.st_size <= canonical.DOC_MAX_BYTES
+            ):
+                raise ValueError("installed descriptor is not one bounded regular file")
+            raw = descriptor_path.read_bytes()
+            body = package_descriptor.read_bytes(raw, "installed job PackageDescriptor")
+            if package_descriptor.job_descriptor_id(body, binding.job) != descriptor_id:
+                raise ValueError("job_descriptor_id does not bind the installed callable")
+            if str(body.get("application", "")) != binding.application:
+                raise ValueError("installed descriptor application changed")
+            jobs = body.get("jobs")
+            rows = (
+                [row for row in jobs if isinstance(row, Mapping) and row.get("name") == binding.job]
+                if isinstance(jobs, list)
+                else []
+            )
+            if len(rows) != 1:
+                raise ValueError("installed descriptor has no unique selected job")
+            models = rows[0].get("models", [])
+            if not isinstance(models, list):
+                raise ValueError("selected job models are not an array")
+            declared: dict[str, str] = {}
+            prefix = f"{binding.job}.models."
+            for row in models:
+                if not isinstance(row, Mapping):
+                    raise ValueError("selected job model row is not an object")
+                model_path = str(row.get("path", ""))
+                parameter = model_path.removeprefix(prefix)
+                class_name = str(row.get("class", ""))
+                if (
+                    not model_path.startswith(prefix)
+                    or not parameter.isidentifier()
+                    or parameter in declared
+                    or not class_name
+                ):
+                    raise ValueError("selected job model parameter/class is malformed")
+                declared[parameter] = class_name
+            return declared
+        except AttemptRefusal:
+            raise
+        except Exception as exc:
+            raise AttemptRefusal(
+                "job_model_descriptor_invalid",
+                f"the installed job descriptor cannot bind Model parameters ({type(exc).__name__})",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            ) from exc
+
+    def _hold_job_models(
+        self, attempt: AttemptRecord, binding: JobBinding, descriptor_id: str
+    ) -> None:
+        """Join descriptor params to exact grant rows and hold every Manifest until terminal."""
+        declared = self._job_model_declarations(binding, descriptor_id)
+        selected = grants.model_inputs(attempt.grant)
+        if set(selected) != set(declared):
+            raise AttemptRefusal(
+                "job_model_binding_mismatch",
+                f"job descriptor declares Model parameters {sorted(declared) or 'none'} and "
+                f"InvocationSpec carries {sorted(selected) or 'none'}; the sets must match exactly",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        if not declared:
+            return
+        if self.artifact_store is None or not self.artifact_store.is_dir():
+            raise AttemptRefusal(
+                "job_model_store_unavailable",
+                "this job declares Model parameters and the worker has no existing TensorFS store",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        leases: dict[str, Any] = {}
+        models: dict[str, JobModel] = {}
+        try:
+            tensorfs = fill.tensorfs_module()
+            store = tensorfs.Store.open(str(self.artifact_store))
+            for parameter in sorted(declared):
+                entry = selected[parameter]
+                manifest = documents.spell(entry.digest)
+                held = store.manifest(manifest)
+                manifest_bytes = bytes(held["manifest"])
+                if len(manifest_bytes) != entry.length:
+                    raise ValueError(
+                        f"Model parameter {parameter!r} declares {entry.length} B but the "
+                        f"local Manifest is {len(manifest_bytes)} B"
+                    )
+                if manifest not in leases:
+                    leases[manifest] = store.acquire_manifest(manifest)
+                models[parameter] = JobModel(
+                    parameter=parameter,
+                    class_name=declared[parameter],
+                    manifest=manifest,
+                    length=entry.length,
+                )
+        except Exception as exc:
+            for lease in leases.values():
+                lease.release()
+            raise AttemptRefusal(
+                "job_model_manifest_unavailable",
+                "a selected job Model Manifest is absent, stale, or invalid "
+                f"({type(exc).__name__})",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            ) from exc
+        attempt.job_models = models
+        attempt.model_leases = list(leases.values())
+
+    def _release_job_models(self, attempt: AttemptRecord) -> None:
+        leases, attempt.model_leases = attempt.model_leases, []
+        for lease in leases:
+            try:
+                lease.release()
+            except Exception as exc:
+                attempt.ring.emit(
+                    "fault",
+                    "job Model Manifest lease release failed",
+                    type(exc).__name__,
+                )
+
     def _accept_job(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
 
@@ -819,7 +955,9 @@ class AttemptEngine:
         if getattr(self.supervision, "isolated", False):
             self.supervision.grant_directory(attempt.scratch, attempt.executor_generation)
 
-        attempt.opened = self.ledger.snapshot()
+        opened = self.ledger.snapshot()
+        self._hold_job_models(attempt, binding, descriptor_id)
+        attempt.opened = opened
         try:
             self.ledger.grant(
                 f"{attempt.request_id}#{attempt.attempt}",
@@ -828,6 +966,7 @@ class AttemptEngine:
                 f"job {binding.job} {attempt.request_id}#{attempt.attempt}",
             )
         except LedgerRefusal as exc:
+            self._release_job_models(attempt)
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
@@ -862,6 +1001,7 @@ class AttemptEngine:
                 )
         except Exception:
             self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
+            self._release_job_models(attempt)
             raise
         return self._accepted(attempt)
 
@@ -1449,6 +1589,14 @@ class AttemptEngine:
                 "scratch": str(attempt.scratch) if attempt.scratch else "",
                 "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
                 "inputs": inputs,
+                "models": {
+                    parameter: {
+                        "class": model.class_name,
+                        "manifest": model.manifest,
+                        "length": model.length,
+                    }
+                    for parameter, model in sorted(attempt.job_models.items())
+                },
                 "max_input_bytes": 64 << 20,
                 "artifact_store": str(self.artifact_store) if self.artifact_store else "",
                 "artifact_owner_scope": self.owner_scope(),
@@ -2001,6 +2149,7 @@ class AttemptEngine:
             },
         )
         attempt.state = "outcome"
+        self._release_job_models(attempt)
         return self.wrap(attempt)
 
     # ------------------------------------------------------------------ triage
@@ -2391,6 +2540,7 @@ class AttemptEngine:
             },
         )
         attempt.state = "outcome"
+        self._release_job_models(attempt)
         return self.wrap(attempt)
 
     def abandon(self, attempt: AttemptRecord, why: str) -> pb.AttemptOutcome:

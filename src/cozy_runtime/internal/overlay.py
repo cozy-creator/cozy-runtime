@@ -259,8 +259,8 @@ def measure_wheel(path: Path, owner: str, base: BaseManifest) -> tuple[Wheel, Ve
 def expected_receipt_bytes(source: Input) -> bytes:
     """Canonical receipt implied by already-joined release documents.
 
-    Qualification has already hashed and installed the wheel bytes.  The acceptance observer
-    needs only to prove that the small receipt it names is exactly the one those same
+    The verified-file intake already hashed and installed the wheel bytes. The acceptance
+    observer needs only to prove that the small receipt it names is exactly the one those same
     EES/Bundle/RWS/WHM facts imply; it must not reopen or re-hash the wheels to do that.
     """
 

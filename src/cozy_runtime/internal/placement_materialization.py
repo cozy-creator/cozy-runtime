@@ -402,23 +402,6 @@ def _closed(value: object, keys: set[str], name: str) -> None:
         raise LaunchRefusal(f"{name}_invalid", f"fields={fields} expected={sorted(keys)}")
 
 
-def _ref_matches(value: object, raw: bytes, name: str, *, allow_extra: bool = False) -> None:
-    if (
-        not isinstance(value, dict)
-        or not {"digest", "length"}.issubset(value)
-        or (not allow_extra and set(value) != {"digest", "length"})
-    ):
-        raise LaunchRefusal(f"{name}_ref_invalid", "reference is not {digest,length}")
-    digest = value.get("digest")
-    length = value.get("length")
-    _require_digest(digest, f"{name}.digest")
-    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
-        raise LaunchRefusal(f"{name}_ref_invalid", "length is not positive")
-    if length != len(raw):
-        raise LaunchRefusal(f"{name}_length_mismatch", f"measured {len(raw)}, expected {length}")
-    _matches(raw, str(digest), name)
-
-
 def _matches(raw: bytes, digest: str, name: str) -> None:
     if _digest(raw) != digest:
         raise LaunchRefusal(

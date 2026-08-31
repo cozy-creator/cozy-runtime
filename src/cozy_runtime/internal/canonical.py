@@ -2,7 +2,7 @@
 
 tensorfs-v2 owns the writer RULES (tfs-013, `crates/tensorfs-core/src/canon.rs`); this is
 the same profile in Python for the documents cozy-runtime authors — PackageDescriptor,
-EnvironmentReceipt, ModelConstructionContract, and Qualification. Shared core: sorted object keys
+EnvironmentReceipt, and ModelConstructionContract. Shared core: sorted object keys
 (UTF-16 code-unit order), no insignificant whitespace, shortest round-trip numbers,
 duplicate-key refusal, lowercase `sha256:` digests, and STORED bytes are canonical bytes.
 

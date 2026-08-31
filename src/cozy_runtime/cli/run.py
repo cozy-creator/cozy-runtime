@@ -4,7 +4,7 @@ One-shot UX over an EPHEMERAL LOCAL WORKER and the same attempt kernel `serve` u
 Weightless entrypoints and jobs remain local. Model-bound entrypoints use the explicit
 DevelopmentPackage lane: the existing package.toml resolver selects a local TensorFS Repository
 release and the worker independently re-derives that exact selection before STAGED. No flat
-binding record or published Qualification is minted.
+binding record or Tensorhub hardware-evidence claim is minted.
 
 What this module DOES NOT do is decide anything the runtime decides. The plan, the ladder,
 the confession and the shortfall all arrive on the outcome; this renders them.
@@ -190,11 +190,10 @@ def run(
     if slots and kind == "job":
         raise CliError(
             "structural",
-            f"{function} declares {len(slots)} read-only Model param(s); this build's local "
-            "job lane runs the torch-free job attempt only",
-            "a job's read-only Model params construct for THAT attempt through the ordinary "
-            "Loader path (cr-002b) and are never retained — wiring that construction into the "
-            "job lane is the next increment; today, run model-bound work as an entrypoint",
+            f"{function} declares {len(slots)} derive-only Model param(s), but the local CLI "
+            "has not resolved source/profile outputs into exact Manifest rows",
+            "publish or prepare the source Manifests first; the worker accepts only exact "
+            "model:<parameter> bindings and never guesses a local model or loads one",
             Exit.structural,
         )
     overrides = _overrides(flags.get("--model") or [], slots)
