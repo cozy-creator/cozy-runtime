@@ -1,10 +1,9 @@
-"""Runtime host facts, development placement, serving, and typed unavailable verbs.
+"""Runtime host facts, development placement, and serving.
 
 `doctor` reports THIS host's facts and derives no fit verdict (cozy-runtime-cli.md): device,
 driver and CUDA as tri-state facts and per-source credential presence.
 cozy-creator renders these unmodified; nothing here is a policy read.
 
-`ingest` is a typed unavailable verb until TensorFS's ingest border is a dependency.
 """
 
 from __future__ import annotations
@@ -63,18 +62,6 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
         rows=rows,
         document=document if opts.json else None,
         next=("cozy-runtime fit <function> — this host's verdicts for a function",),
-    )
-
-
-def unavailable(verb: str) -> Result:
-    """The typed refusal `ingest` is, until TensorFS's border is a dependency."""
-    raise CliError(
-        "unavailable",
-        f"{verb!r} invokes TensorFS's one fetch+ingest implementation, which this runtime "
-        "build does not depend on yet",
-        "the carrier decode, classification and semantic converters are tfs-002/tfs-003's "
-        "border; a second converter here would be the duplication the CLI reference forbids",
-        Exit.unavailable,
     )
 
 
