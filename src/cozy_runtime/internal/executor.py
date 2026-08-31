@@ -44,7 +44,7 @@ from typing import Any
 
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._context import Device
-from cozy_runtime.author._errors import Outcome, classify
+from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
@@ -58,6 +58,7 @@ from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
+from cozy_runtime.protocol import documents
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -1093,6 +1094,98 @@ class Executor:
         if scratch is not None:
             scratch.mkdir(parents=True, exist_ok=True)
 
+        artifact_open = None
+        if surface.artifact_outputs:
+            from cozy_runtime.internal import artifact_sink, fill, pull
+
+            store_value = str(command.get("artifact_store", ""))
+            if not store_value:
+                return {
+                    "ok": False,
+                    "code": "artifact_store_unavailable",
+                    "detail": "this artifact-producing job has no verified TensorFS store",
+                }
+            store = pull.open_store(fill.tensorfs_module(), Path(store_value))
+            allowed_sources: dict[str, int] = {}
+            for model in self.models.values():
+                manifest = store.manifest(model.checkpoint_ref)
+                allowed_sources[model.checkpoint_ref] = len(manifest["manifest"])
+
+            owner_scope = str(command.get("artifact_owner_scope", ""))
+            artifact_request_id = str(command.get("artifact_request_id", ""))
+            invocation_spec_digest = str(command.get("invocation_spec_digest", ""))
+
+            def bind_intent(
+                output_slot: str, declaration_digest: bytes, declaration: bytes
+            ) -> artifact_sink.ArtifactHostBinding:
+                artifact_sink.write_exchange_file(
+                    spool, output_slot, "declaration", declaration
+                )
+                answer = self._durable(
+                    "artifact_intent",
+                    {
+                        "output_slot": output_slot,
+                        "tensorfs_declaration_digest": documents.spell(declaration_digest),
+                        "tensorfs_declaration_length": len(declaration),
+                        "requested_writer_generation": 0,
+                    },
+                )
+                if not answer.get("ok"):
+                    raise CapabilityError(
+                        str(answer.get("detail", "the artifact host refused intent")),
+                        code=str(answer.get("code", "artifact_host_refused")),
+                    )
+                receipt_digest = str(answer.get("artifact_receipt_digest", ""))
+                return artifact_sink.ArtifactHostBinding(
+                    transaction_id=str(answer.get("artifact_transaction_id", "")),
+                    writer_generation=int(answer.get("writer_generation", 0)),
+                    artifact_receipt_digest=(
+                        documents.raw(receipt_digest) if receipt_digest else b""
+                    ),
+                )
+
+            def record_receipt(receipt: Any) -> None:
+                _, canonical_receipt, receipt_digest = artifact_sink.protocol_receipt(
+                    receipt,
+                    owner_scope=owner_scope,
+                    request_id=artifact_request_id,
+                    invocation_spec_digest=invocation_spec_digest,
+                )
+                artifact_sink.write_exchange_file(
+                    spool, receipt.output_slot, "receipt", canonical_receipt
+                )
+                answer = self._durable(
+                    "artifact_receipt",
+                    {
+                        "output_slot": receipt.output_slot,
+                        "artifact_transaction_id": receipt.artifact_transaction_id,
+                        "artifact_receipt_digest": documents.spell(receipt_digest),
+                        "artifact_receipt_length": len(canonical_receipt),
+                    },
+                )
+                if not answer.get("ok") or answer.get(
+                    "artifact_receipt_digest"
+                ) != documents.spell(receipt_digest):
+                    raise CapabilityError(
+                        str(answer.get("detail", "the artifact host refused receipt")),
+                        code=str(answer.get("code", "artifact_host_refused")),
+                    )
+
+            artifact_host = artifact_sink.ArtifactTransactionHost(
+                store=store,
+                owner_scope=owner_scope,
+                request_id=artifact_request_id,
+                invocation_spec_digest=invocation_spec_digest,
+                writer_session_id=1,
+                allowed_sources=allowed_sources,
+                output_bounds={
+                    output.name: output.max_new_bytes for output in surface.artifact_outputs
+                },
+                bind_intent=bind_intent,
+                record_receipt=record_receipt,
+            )
+            artifact_open = artifact_host.open
+
         from cozy_runtime.author._services import (
             BudgetFacts,
             CheckpointDeclaration,
@@ -1155,6 +1248,7 @@ class Executor:
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
+                artifacts=artifact_open,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),

@@ -28,6 +28,7 @@ import base64
 import hashlib
 import json
 import re
+import stat
 import threading
 import time
 import uuid
@@ -37,8 +38,10 @@ from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any, cast
 
+from cozy.worker.v1 import artifact_limits
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
+from cozy_runtime.internal import artifact_sink as artifact_bridge
 from cozy_runtime.internal import canonical, seam
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -96,6 +99,27 @@ PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 #: terminal that carries them, sorted, because a claim printed as a measurement is worse
 #: than no number.
 UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_device_memory_bytes")
+
+
+def artifact_exchange_bytes(
+    spool: Path, output_slot: str, kind: str, expected_length: int
+) -> bytes:
+    """Read one worker-chosen immutable spool file; the child never supplies a path."""
+    cap = (
+        artifact_limits.MAX_ARTIFACT_DECLARATION_BYTES
+        if kind == "declaration"
+        else artifact_limits.MAX_ARTIFACT_RECEIPT_BYTES
+    )
+    if not 0 < expected_length <= cap:
+        raise ValueError(f"artifact {kind} length is outside 1..={cap}")
+    path = artifact_bridge.exchange_file(spool, output_slot, kind)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size != expected_length:
+        raise ValueError(f"artifact {kind} spool file is not an exact regular file")
+    raw = path.read_bytes()
+    if len(raw) != expected_length or path.lstat().st_size != expected_length:
+        raise ValueError(f"artifact {kind} spool file changed while being read")
+    return raw
 
 #: The fault tail this worker keeps. Every reader takes the last 8.
 FAULTS_HELD = 64
@@ -247,6 +271,8 @@ class AttemptRecord:
     prepared: PreparedRequest | None = None
     #: cr-009's typed publication record, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: Host-ACKed ArtifactReceipt/1 refs, one per descriptor-declared output slot.
+    artifact_receipts: dict[str, pb.ArtifactReceiptRef] = dataclasses_field(default_factory=dict)
 
     def begin_reclaim(self) -> bool:
         """Win the completion race, or report that natural finalization won first."""
@@ -301,6 +327,7 @@ class AttemptRecord:
         self.caps = {}
         self.residency = {}
         self.publication = {}
+        self.artifact_receipts = {}
 
     def confess(self, kind: str, quantified: str, *, benchmark: bool = False) -> None:
         """Say out loud that this request was not served by its plain reading (§3.6)."""
@@ -342,6 +369,9 @@ class AttemptEngine:
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
         device_process: Callable[[], int],
+        artifacts: Any = None,
+        owner_scope: Callable[[], str] = lambda: "",
+        artifact_store: Path | None = None,
     ) -> None:
         self.records = records
         self.ledger = ledger
@@ -376,6 +406,9 @@ class AttemptEngine:
         self.posture = posture
         #: the NVML per-process reader, so the out-of-allocator meter has a real producer
         self.device_process = device_process
+        self.artifacts = artifacts
+        self.owner_scope = owner_scope
+        self.artifact_store = artifact_store
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -1205,6 +1238,61 @@ class AttemptEngine:
         )
         return {"ok": True, "receipt_id": receipt_id, "replayed": False}
 
+    def durable_exchange(
+        self, attempt: AttemptRecord, frame: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Dispatch the existing executor control request lane by typed operation."""
+        kind = str(frame.get("kind", ""))
+        if kind == "checkpoint":
+            return self.checkpoint_exchange(attempt, frame)
+        if self.artifacts is None or attempt.spool is None:
+            return {
+                "ok": False,
+                "code": "artifact_host_unavailable",
+                "detail": "this worker has no ArtifactSink host",
+            }
+        try:
+            output_slot = str(frame.get("output_slot", ""))
+            if kind == "artifact_intent":
+                length = int(frame.get("tensorfs_declaration_length", 0))
+                raw = artifact_exchange_bytes(
+                    attempt.spool, output_slot, "declaration", length
+                )
+                return self.artifacts.intent(
+                    attempt,
+                    output_slot=output_slot,
+                    declaration_digest=documents.raw(
+                        str(frame.get("tensorfs_declaration_digest", ""))
+                    ),
+                    declaration=raw,
+                    requested_writer_generation=int(
+                        frame.get("requested_writer_generation", 0)
+                    ),
+                )
+            if kind == "artifact_receipt":
+                length = int(frame.get("artifact_receipt_length", 0))
+                raw = artifact_exchange_bytes(attempt.spool, output_slot, "receipt", length)
+                return self.artifacts.receipt(
+                    attempt,
+                    output_slot=output_slot,
+                    transaction_id=str(frame.get("artifact_transaction_id", "")),
+                    receipt_digest=documents.raw(
+                        str(frame.get("artifact_receipt_digest", ""))
+                    ),
+                    canonical_receipt=raw,
+                )
+            return {
+                "ok": False,
+                "code": "unknown_durable_request",
+                "detail": f"{kind!r} is not a durable exchange this worker answers",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "code": str(getattr(exc, "code", "artifact_host_refused")),
+                "detail": str(getattr(exc, "detail", exc))[:1024],
+            }
+
     def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
         """Record the RecordOwner's verdict on a checkpoint this worker already recorded.
 
@@ -1284,7 +1372,7 @@ class AttemptEngine:
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=(lambda frame: self.checkpoint_exchange(attempt, frame))
+                on_request=(lambda frame: self.durable_exchange(attempt, frame))
                 if job
                 else None,
             )
@@ -1352,6 +1440,10 @@ class AttemptEngine:
                 "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
                 "inputs": inputs,
                 "max_input_bytes": 64 << 20,
+                "artifact_store": str(self.artifact_store) if self.artifact_store else "",
+                "artifact_owner_scope": self.owner_scope(),
+                "artifact_request_id": attempt.request_id,
+                "invocation_spec_digest": documents.spell(attempt.digest),
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
                     "gpu_count": attempt.job.gpu_count,
@@ -1868,6 +1960,8 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
+        for output_slot in sorted(attempt.artifact_receipts):
+            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)
         if receipt is not None:
             body.triage_bundle.CopyFrom(
@@ -2266,6 +2360,8 @@ class AttemptEngine:
             ),
             execution_started=attempt.executions > 0,
         )
+        for output_slot in sorted(attempt.artifact_receipts):
+            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
         canonical_bytes, digest = documents.identity(body)
         attempt.outcome_id = f"out-{uuid.uuid4().hex[:24]}"
         attempt.outcome_digest = digest
