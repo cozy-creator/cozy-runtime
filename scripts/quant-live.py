@@ -39,7 +39,6 @@ TFS = Path("/home/fidika/cozy_v2/tensorfs")
 WORK = Path("/tmp/cozy-cr006")
 STORE = WORK / "store"
 CARRIER = WORK / "unet_fp8_scaled.safetensors"
-PROBE = WORK / "probe"
 #: The plain fp16 SDXL store cr-008b built. Read-only here: it is the BASELINE arm.
 PLAIN_STORE = Path("/tmp/cozy-sdxl4/store")
 PLAIN_SNAPSHOTS = Path("/tmp/cozy-sdxl4/snapshots.json")

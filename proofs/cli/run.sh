@@ -136,4 +136,5 @@ if ! (cd / && env -u PYTHONPATH "$driver_python" \
     exit 1
 fi
 tail -n 1 "$proof_root/private-input.stdout"
-echo "CLI proof: installed-wheel exits, AXI, exact Descriptor/1 bytes, public key tiers, mixed-media invocation identity, network-cut offline execution, and typed TensorFS-reader refusal passed"
+test ! -e "$proof_root/home/runtime.sqlite3"
+echo "CLI proof: installed-wheel exits, AXI, exact Descriptor/1 bytes, public key tiers, mixed-media invocation identity, network-cut offline execution, no Runtime database, and typed TensorFS-reader refusal passed"
