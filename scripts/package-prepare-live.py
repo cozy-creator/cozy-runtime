@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             wheels = args.wheel_dir
-        wheel = next(wheels.glob("marco_polo-*.whl"))
+        wheel = next(wheels.glob("marco_polo_package-*.whl"))
         digest = hashlib.sha256(wheel.read_bytes()).digest()
         cache = root / "artifacts"
         view = cache / "sets" / "marco"
@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
                 "models": [],
                 "packages": [
                     {
-                        "package": "paul/marco-polo",
+                        "package": "paul/marco-polo-package",
                         "release": "1.0.3",
                         "release_digest": release_digest,
                     }

@@ -3,7 +3,7 @@ requires = ["uv_build>=0.12.7,<0.13"]
 build-backend = "uv_build"
 
 [project]
-name = "marco-polo"
+name = "marco-polo-package"
 version = "1.0.3"
 description = "Weightless Marco/Polo example for Tensorhub publication and worker placement"
 requires-python = ">=3.12,<3.13"

@@ -13,7 +13,7 @@ The sole public entrypoint has this closed contract:
 returns:
 
 ```json
-{"message":"polo2222"}
+{"message":"polo"}
 ```
 
 Set `[tool.cozy] organization` in `pyproject.toml` to an organization you can publish, then run
@@ -23,11 +23,11 @@ Cozy from this directory:
 cozy package publish
 ```
 
-The default metadata publishes `paul/marco-polo@1.0.3`. Cozy derives the name and version
+The default metadata publishes `paul/marco-polo-package@1.0.3`. Cozy derives the name and version
 from the built wheel and never adds a `v` prefix.
 
 Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module
-name and root explicitly. The published distribution is `marco-polo`; the existing Python import
+name and root explicitly. The published distribution is `marco-polo-package`; the Python import
 remains `marco_polo_package`. The backend produces a deterministic `py3-none-any` wheel without
 writing build output into the source tree. The `[tool.uv.sources]` entry is only a
 local-development override: it is not embedded in the project wheel. The base worker image supplies
@@ -37,8 +37,8 @@ Arbitrary local or editable dependencies are not bundled by publication.
 `pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor, and the project wheel are
 the exact publication inputs. The
 descriptor is sent directly to Tensorhub and is not committed here. There is no release manifest
-and no author-selected worker profile: Tensorhub derives compatible base worker images from the
-wheel-declared Python/package requirements and its exact base inventory. The current remote contract
+and no author-selected worker profile. Publication is independent of worker images; the selected
+worker validates the wheel against its actual Python and base-package inventory at install time. The current remote contract
 admits one placement per worker, so publishing this fixture under two package repositories can prove
 sequential same-pod replacement with `cozy rent revise`; it does not prove simultaneous stacking.
 
