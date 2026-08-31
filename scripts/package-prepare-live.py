@@ -109,8 +109,8 @@ def main(argv: list[str] | None = None) -> int:
                 "models": [],
                 "packages": [
                     {
-                        "package": "paul/marco-polo-package",
-                        "release": "1.0.3",
+                        "package": "paul/marco-polo",
+                        "release": "1.0.4",
                         "release_digest": release_digest,
                     }
                 ],
