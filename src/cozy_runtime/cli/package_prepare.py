@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import shutil
 import sys
 import tempfile
@@ -46,6 +47,7 @@ def write_local_base(args: list[str], _opts: Options) -> Result:
 def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options) -> Result:
     required = {
         "--artifact-cache",
+        "--artifact-store",
         "--base-manifest",
         "--environment-root",
         "--package",
@@ -53,8 +55,9 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         "--release",
         "--release-digest",
     }
-    values = _values(args, required, {"--dependency-wheel"})
+    values = _values(args, required, {"--dependency-wheel", "--model"})
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
+    artifact_store = Path(values["--artifact-store"][0]).resolve()
     environment_root = Path(values["--environment-root"][0]).resolve()
     base_manifest = Path(values["--base-manifest"][0]).resolve()
     wheel_paths = [
@@ -89,6 +92,34 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     package = values["--package"][0]
     release = values["--release"][0]
     release_digest = values["--release-digest"][0]
+    models: list[dict[str, object]] = []
+    for raw in values.get("--model", []):
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CliError(
+                "usage",
+                "invalid modeled-package selection",
+                "Creator supplies exact JSON",
+                Exit.usage,
+            ) from exc
+        required_model = {
+            "package",
+            "slot",
+            "model",
+            "release",
+            "lane",
+            "manifest",
+            "manifest_length",
+        }
+        if not isinstance(row, dict) or set(row) != required_model:
+            raise CliError(
+                "usage",
+                "invalid modeled-package selection",
+                "Creator supplies exact JSON",
+                Exit.usage,
+            )
+        models.append(row)
     seed = canonical.write(
         {"package": package, "release": release, "release_digest": release_digest}
     )
@@ -143,6 +174,8 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             describe=describe,
             verified=lambda _digest, _length, _path: None,
             base_manifest=base_manifest,
+            artifact_store=artifact_store,
+            models=models,
             allow_native_custom=True,
         )
     except (PreparationRefusal, ExecutorGone, OSError) as exc:

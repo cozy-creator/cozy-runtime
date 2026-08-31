@@ -18,8 +18,20 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
-from cozy_runtime.author import ConformanceError, ModelBinding
+from cozy_runtime.author import ConformanceError
+
+
+class BindingSlot(Protocol):
+    @property
+    def path(self) -> str: ...
+
+    @property
+    def param(self) -> str: ...
+
+    @property
+    def class_key(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +61,7 @@ def read_table(package_toml: Path) -> Mapping[str, Mapping[str, object]]:
 
 
 def resolve(
-    slots: Sequence[ModelBinding],
+    slots: Sequence[BindingSlot],
     table: Mapping[str, Mapping[str, object]],
     *,
     overrides: Mapping[str, str] | None = None,
