@@ -38,8 +38,9 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
-          uv venv .venv
-          uv pip install --python .venv/bin/python torch
+          uv python install 3.14
+          uv venv --python 3.14 .venv
+          uv pip install --python .venv/bin/python 'torch>=2.13,<3'
           .venv/bin/python -c 'import torch; print(torch.__version__)'
 
       - name: mps probe
@@ -119,7 +120,8 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
-          uv sync
+          uv python install 3.14
+          uv sync --python 3.14
 
       - name: weightless lifecycle
         run: |
