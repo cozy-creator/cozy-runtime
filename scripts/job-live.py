@@ -323,7 +323,7 @@ def section_e2e() -> None:
         len(outcome.checkpoints) == 1 and outcome.checkpoints[0]["outcome"] == "RECORDED",
         json.dumps(outcome.checkpoints)[:220],
     )
-    journal_kinds = [row.get("kind") for row in outcome.journal]
+    journal_kinds = [row.get("kind") for row in outcome.attempt_records]
     check(
         "the journal carries accepted -> job_checkpoint -> terminal -> closed, in that order",
         journal_kinds.count("accepted") == 1
@@ -642,8 +642,8 @@ def _oversize_arm() -> None:
     )
     check(
         "the refusal is journaled and nothing was ACCEPTED",
-        not any(row.get("kind") == "accepted" for row in outcome.journal),
-        " ".join(str(row.get("kind")) for row in outcome.journal),
+        not any(row.get("kind") == "accepted" for row in outcome.attempt_records),
+        " ".join(str(row.get("kind")) for row in outcome.attempt_records),
     )
 
 

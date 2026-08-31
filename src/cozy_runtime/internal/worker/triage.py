@@ -26,10 +26,9 @@ the bundle is addressable by path, and the RecordOwner's own opaque attempt key
 (`records.AttemptByKey`, cl-001) maps to it through the terminal — so a triage read is a key
 lookup on both sides, never a filesystem walk.
 
-**Durable before it is claimed.** The bytes are written and fsynced, then a WRITE RECEIPT is
-appended to the control journal, and only then may a terminal reference them. A terminal
-naming a bundle that is not on disk would be exactly the fabrication class the runtime
-exists to prevent, so the order is not negotiable.
+**Written before it is claimed.** The bytes are written and fsynced before their digest and
+length enter the terminal. A terminal naming bytes that are not on disk would be exactly the
+fabrication class the runtime exists to prevent, so the order is not negotiable.
 
 **Observation only.** Nothing here can replace or override a terminal field
 (worker-protocol/01, `TriageBundleRef`). A log cannot declare success.
@@ -45,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.journal import Journal
+from cozy_runtime.internal.worker.records import WorkerRecords
 
 #: `TriageBundleRef.length` is bounded at 1 MiB by the protocol. The assembler trims to it.
 MAX_BUNDLE_BYTES = 1 << 20
@@ -89,7 +88,7 @@ class Receipt:
     subject_id: str
     bundle_digest: str
     length: int
-    journal_seq: int
+    record_seq: int
 
 
 @dataclass(slots=True)
@@ -158,17 +157,16 @@ class Assembly:
 
 
 class BundleStore:
-    """Bundle bytes on disk plus a journaled write receipt. Survives the executor's death,
-    and — because the receipt is in the control journal — the worker's own."""
+    """Bundle bytes on disk plus a same-process write receipt."""
 
-    def __init__(self, root: Path, journal: Journal) -> None:
+    def __init__(self, root: Path, records: WorkerRecords) -> None:
         self.root = root
-        self.journal = journal
+        self.records = records
         self.written = 0
         self.bytes = 0
 
     def commit(self, assembly: Assembly) -> Receipt:
-        """Write, fsync, journal the receipt. In THAT order, and never any other."""
+        """Write, fsync, then record the receipt."""
         self.root.mkdir(parents=True, exist_ok=True)
         _, data = assembly.build()
         path = self.root / f"{assembly.subject_id}.json"
@@ -185,7 +183,7 @@ class BundleStore:
         # A failed append raises and the caller ships no reference: the bytes stay on disk
         # unreferenced, which is the SAFE half of the failure. A terminal must never name a
         # bundle whose durability was not recorded.
-        journaled = self.journal.append(
+        recorded = self.records.append(
             "triage",
             {
                 "subject_id": assembly.subject_id,
@@ -195,59 +193,27 @@ class BundleStore:
         )
         self.written += 1
         self.bytes += len(data)
-        return Receipt(assembly.subject_id, digest, len(data), journaled.seq)
+        return Receipt(assembly.subject_id, digest, len(data), recorded.seq)
 
     # ------------------------------------------------------------------ reading
 
     @staticmethod
-    def receipts(source: Journal | Path) -> dict[str, dict[str, Any]]:
-        """Every write receipt by subject, from process memory or an explicit proof log."""
-        found: dict[str, dict[str, Any]] = {}
-        if isinstance(source, Journal):
-            for record in source.of_kind("triage"):
-                found[str(record.body["subject_id"])] = record.body
-            return found
-        journal_path = source
-        if not journal_path.is_file():
-            return found
-        for line in journal_path.read_bytes().split(b"\n"):
-            _, _, rest = line.partition(b" ")
-            if not rest:
-                continue
-            try:
-                row = canonical.parse_canonical(rest)
-            except canonical.CanonicalError:
-                continue
-            if not isinstance(row, dict) or row.get("kind") != "triage":
-                continue
-            body = row.get("body")
-            if not isinstance(body, dict) or set(body) != {
-                "subject_id",
-                "bundle_digest",
-                "length",
-            }:
-                continue
-            subject = body.get("subject_id")
-            digest = body.get("bundle_digest")
-            length = body.get("length")
-            if (
-                not isinstance(subject, str)
-                or not isinstance(digest, str)
-                or not isinstance(length, int)
-            ):
-                continue
-            found[subject] = body
-        return found
+    def receipts(source: WorkerRecords) -> dict[str, dict[str, Any]]:
+        """Every same-process write receipt by subject."""
+        return {
+            str(record.body["subject_id"]): record.body
+            for record in source.of_kind("triage")
+        }
 
     @staticmethod
     def read(
-        root: Path, subject_id: str, receipt_source: Journal | Path | None = None
+        root: Path, subject_id: str, receipt_source: WorkerRecords | None = None
     ) -> dict[str, Any]:
-        """Read ONE bundle by its opaque subject, verified against its journaled receipt.
+        """Read one bundle by opaque subject, optionally checked against its live receipt.
 
         This is the whole triage path: a directory, a key, and a digest. No process, no SSH,
-        no socket. When the journal is present the digest is CHECKED against it, so a bundle
-        edited after the fact is a detected corruption rather than a plausible story.
+        no socket. The terminal digest is the offline verifier; same-process readers may
+        additionally supply the worker records.
         """
         path = root / f"{subject_id}.json"
         if not path.is_file():
@@ -261,15 +227,14 @@ class BundleStore:
             if receipt is None:
                 raise TriageError(
                     "receipt_absent",
-                    f"{subject_id}: bytes exist but no write receipt is journaled - the "
-                    "bundle was never durably claimed and is not evidence",
+                    f"{subject_id}: bytes exist but no write receipt was recorded",
                 )
             digest = "sha256:" + hashlib.sha256(data).hexdigest()
             if digest != receipt["bundle_digest"] or len(data) != receipt["length"]:
                 raise TriageError(
                     "bundle_corrupt",
                     f"{subject_id}: {len(data)} B hashing to {digest[:23]} does not match "
-                    f"the journaled receipt ({receipt['length']} B, "
+                    f"the recorded receipt ({receipt['length']} B, "
                     f"{str(receipt['bundle_digest'])[:23]})",
                 )
         return document

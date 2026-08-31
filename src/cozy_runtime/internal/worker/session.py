@@ -59,7 +59,6 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.worker import acquire, child, downloads, grants, observe, triage
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
@@ -68,7 +67,6 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptEngine,
     AttemptRecord,
     AttemptRefusal,
-    UndurableOutcome,
     safe,
 )
 from cozy_runtime.internal.worker.child import (
@@ -89,6 +87,7 @@ from cozy_runtime.internal.worker.plan import (
     PlanChooser,
     PreparedModel,
 )
+from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -225,7 +224,7 @@ class WorkerOptions:
 @dataclass(slots=True)
 class Placement:
     """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
-    RecordOwner-minted routing + journal key; it is never invocation identity.
+    RecordOwner-minted routing + record log key; it is never invocation identity.
 
     `placement_set_digest` plus `placement_id` is the placement's identity. A single-placement
     replace is this SAME `placement_id` in a new set, which is why routing survives rollout.
@@ -756,7 +755,7 @@ class Worker:
         self.admission_generation = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
-        self.journal = Journal()
+        self.records = WorkerRecords()
         self.ledger = Ledger(
             host_budget=options.host_budget,
             pinned_budget=options.pinned_budget,
@@ -801,9 +800,9 @@ class Worker:
         self.latched = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
-        self.bundles = triage.BundleStore(self.root / "triage", self.journal)
+        self.bundles = triage.BundleStore(self.root / "triage", self.records)
         self.engine = AttemptEngine(
-            journal=self.journal,
+            records=self.records,
             ledger=self.ledger,
             chooser=self.chooser,
             supervision=self.supervision,
@@ -828,7 +827,7 @@ class Worker:
         #: for the live stream. A single process-wide queue made that theft routine: the dead
         #: generation's pump sits in `get(timeout=REPORT_SECONDS)`, and for up to that long
         #: after a reconnect it woke on the NEXT frame — a live AttemptTerminal — saw the
-        #: generation had moved, and dropped it. The terminal was journaled, so it replayed on
+        #: generation had moved, and dropped it. The terminal was recorded, so it replayed on
         #: the following claim and the replay law held; live delivery on the stream that
         #: dispatched it did not.
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
@@ -1064,7 +1063,7 @@ class Worker:
         self._settle()
 
     def fail_machine(self, why: str) -> None:
-        """A MACHINE-scope failure: this worker can no longer honour journal-before-send.
+        """A MACHINE-scope failure: this worker can no longer honour record log-before-send.
 
         `WORKER_PHASE_FAILED` is where that fact lives now (#482) — machine lifecycle is out
         of the placement enum, because "the placement cannot serve" and "the worker cannot
@@ -1337,12 +1336,7 @@ class Worker:
                 )
             # RECORD BEFORE ACKNOWLEDGING so a reconnect to this process cannot race the
             # ownership fence. The caller owns recovery across worker processes.
-            if not self.record_ownership(claim):
-                return reject(
-                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
-                    "the accepted ownership record could not be journaled, so this worker "
-                    "cannot honour journal-before-send and must not accept the stream",
-                )
+            self.record_ownership(claim)
             superseded = self.fence.control_stream_generation
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
@@ -1371,27 +1365,20 @@ class Worker:
 
         self.claim_ready.set()
 
-    def record_ownership(self, claim: pb.Claim) -> bool:
+    def record_ownership(self, claim: pb.Claim) -> None:
         """Record the authority this claim carries before ClaimAck.
 
-        Called with `claim_lock` held. The pathless log can fail only on a structural record
-        defect; in that case the claim is refused rather than accepted.
+        Called with `claim_lock` held so reconnects cannot race the in-process fence.
         """
-        try:
-            self.journal.append(
-                "ownership",
-                {
-                    "worker_boot_id": self.fence.worker_boot_id,
-                    "instance_id": self.options.instance_id,
-                    "record_owner_epoch": int(claim.record_owner_epoch),
-                    "record_owner_id": claim.record_owner_id,
-                },
-            )
-        except JournalError as exc:
-            self.exit_code = int(Exit.internal)
-            self.note("claim", f"REFUSED: ownership could not be recorded ({exc.code})")
-            return False
-        return True
+        self.records.append(
+            "ownership",
+            {
+                "worker_boot_id": self.fence.worker_boot_id,
+                "instance_id": self.options.instance_id,
+                "record_owner_epoch": int(claim.record_owner_epoch),
+                "record_owner_id": claim.record_owner_id,
+            },
+        )
 
     def _send_claim_ack(
         self, claim: pb.Claim, generation: int, send: Callable[[pb.WorkerFrame], None]
@@ -1433,7 +1420,7 @@ class Worker:
         body = pb.WorkerSnapshotBody(
             accepted_desired_state_revision=self.accepted.accepted_desired_state_revision,
             accepted_placement_set_digest=self.accepted.accepted_placement_set_digest,
-            journal_highwater=self.journal.appends,
+            journal_highwater=self.records.appends,
             worker_phase=self.phase,
             converged_revision=self.converged_revision(),
             admission_generation=self.admission_generation,
@@ -1563,7 +1550,7 @@ class Worker:
             for attempt in self.engine.pending_outcomes():
                 self.note(
                     "outcome",
-                    f"replaying the journaled outcome for {attempt.request_id}#"
+                    f"replaying the recorded outcome for {attempt.request_id}#"
                     f"{attempt.attempt} in a fresh envelope ({attempt.outcome_id})",
                 )
                 self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
@@ -1572,7 +1559,7 @@ class Worker:
         if kind == "desired_state":
             try:
                 self._apply_desired_state(inner)
-            except (ExecutorGone, JournalError) as exc:
+            except ExecutorGone as exc:
                 self.note("desired_state", f"apply failed: {exc}")
                 self.latch(
                     pb.Fault(
@@ -1652,7 +1639,7 @@ class Worker:
         ORDER, and none of it is negotiable:
 
             recompute the set digest over the canonical bytes -> the launch clamp ->
-            revision arithmetic -> JOURNAL the exact accepted bytes -> parse -> converge
+            revision arithmetic -> RECORD the exact accepted bytes -> parse -> converge
 
         The BYTE FENCE runs before the clamp counts anything, because counting placements
         means parsing, and §4 forbids parsing a single field of a set whose bytes do not hash
@@ -1767,11 +1754,11 @@ class Worker:
             return
 
         desired_set = desired.placement_set
-        # JOURNAL THE EXACT ACCEPTED BYTES (§4) — never a re-serialization, never a
+        # RECORD THE EXACT ACCEPTED BYTES (§4) — never a re-serialization, never a
         # structured projection. Recovery, status attribution and the snapshot all quote
         # these, which is what makes "the set this worker accepted" a byte fact rather than
         # a reconstruction that is free to disagree with itself.
-        self.journal.append(
+        self.records.append(
             "placement_set",
             {
                 "worker_boot_id": self.fence.worker_boot_id,
@@ -2764,7 +2751,7 @@ class Worker:
                 benchmark_override=True,
                 reason=str(outcome["reason"])[:200],
             )
-            self.journal.append("warm", dict(outcome))
+            self.records.append("warm", dict(outcome))
             self.warm.append(outcome)
             self.note(
                 "warm",
@@ -2820,8 +2807,8 @@ class Worker:
 
         EVERY OFFER GETS A JOURNALED OUTCOME (§7). The outcome-less third state is closed:
         an `AttemptOffer` receives either `AttemptAccepted` or a JOURNALED
-        `AttemptOutcome(REFUSED)` — never silence, never an unjournaled soft decline. An
-        unjournaled refusal is unreconcilable after a crash, because the RecordOwner cannot
+        `AttemptOutcome(REFUSED)` — never silence, never an unrecorded soft decline. An
+        unrecorded refusal is unreconcilable after a crash, because the RecordOwner cannot
         then distinguish "never landed" from "refused", which is precisely the distinction
         02 §6 is built on.
 
@@ -2893,7 +2880,7 @@ class Worker:
             self.note(
                 "attempt",
                 f"duplicate AttemptOffer for {offered.request_id}#{offered.attempt_ordinal}: "
-                f"replaying the journaled outcome, executing NOTHING "
+                f"replaying the recorded outcome, executing NOTHING "
                 f"(executions={attempt.executions})",
             )
             self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
@@ -2994,7 +2981,7 @@ class Worker:
         cause: pb.CauseCode,
         origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
     ) -> None:
-        """A typed refusal is an OUTCOME: journaled before send, like any other (§7).
+        """A typed refusal is an outcome recorded before send, like any other (§7).
 
         `execution_started` is FALSE here by construction — nothing ran — which is the
         BILLING FACT stated structurally rather than inferred from a cause-code allowlist
@@ -3010,19 +2997,13 @@ class Worker:
             digest=offered.invocation_spec_digest,
             spec={},
         )
-        try:
-            outcome = self.engine.outcome(
-                attempt,
-                STATUS.OUTCOME_STATUS_REFUSED,
-                cause,
-                origin,
-                f"{code}: {detail}",
-            )
-        except JournalError as exc:
-            # ACK-AFTER-JOURNAL HAS NO EXCEPTION FOR A REFUSAL (#494b). An outcome nobody
-            # wrote down cannot be replayed and cannot be acked, so it is not sent.
-            self.note("journal", f"cannot journal a refusal ({exc.code}); sending nothing")
-            return
+        outcome = self.engine.outcome(
+            attempt,
+            STATUS.OUTCOME_STATUS_REFUSED,
+            cause,
+            origin,
+            f"{code}: {detail}",
+        )
         self.engine.history[attempt.key()] = attempt
         self.send(pb.WorkerFrame(attempt_outcome=outcome))
 
@@ -3050,7 +3031,7 @@ class Worker:
         self.await_settled(attempt)
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance
-        # journal: a queued offer cannot be accepted on the far side of a placement or
+        # record log: a queued offer cannot be accepted on the far side of a placement or
         # admission-generation change merely because it passed `on_offer()` earlier.
         with self.control_lock:
             if attempt.canceling:
@@ -3123,21 +3104,6 @@ class Worker:
                     attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
                 )
                 return False
-            except JournalError as exc:
-                self.note(
-                    "journal",
-                    f"{exc.code}: acknowledging nothing and executing nothing for {key}",
-                )
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                        subject=key,
-                        reason=exc.code,
-                        detail=exc.detail[:1024],
-                    )
-                )
-                self.fail_machine(exc.code)  # fault first, then the edge
-                return False
         self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
@@ -3145,11 +3111,6 @@ class Worker:
         """RUN -> OUTCOME -> RECONCILE. The ledger closes inside `outcome()`."""
         try:
             outcome = self.engine.execute(attempt)
-        except JournalError as exc:
-            self.note("journal", f"{exc.code}: only a last-resort outcome can be claimed")
-            self.fail_machine(exc.code)
-            self.terminate(attempt, self.engine.last_resort, f"{exc.code}: {exc.detail}")
-            return
         except Exception as exc:
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
@@ -3166,31 +3127,16 @@ class Worker:
     def terminate(
         self, attempt: AttemptRecord, build: Callable[..., pb.AttemptOutcome], *args: Any
     ) -> None:
-        """Journal ONE outcome for a held attempt and send it.
-
-        ACK-AFTER-JOURNAL IS THE LAW, INCLUDING HERE (#494b). An outcome that could not be
-        journaled is never sent: the attempt stays HELD, and rev-2 gives that hold its own
-        wire state — `ATTEMPT_STATE_HELD_UNDURABLE` (#507d/#510d) — instead of the frozen
-        wire's RUNNING-plus-a-LOCAL_SAFETY-fault compound. The worker takes the fault, goes
-        `WORKER_PHASE_FAILED`, and the RecordOwner reads a worker that stopped rather than an
-        outcome it can never close.
-        """
+        """Build one outcome for a held attempt, record it, and send it."""
         why = ""
         try:
             self.send(pb.WorkerFrame(attempt_outcome=build(attempt, *args)))
-            return
-        except UndurableOutcome as exc:
-            self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
-            self.fail_machine("outcome_undurable")
             return
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
             self.note("attempt", f"the outcome could not be built ({why}); last resort")
         try:
             self.send(pb.WorkerFrame(attempt_outcome=self.engine.last_resort(attempt, why)))
-        except UndurableOutcome as exc:
-            self.note("journal", f"HOLDING {attempt.request_id}#{attempt.attempt}: {exc}")
-            self.fail_machine("outcome_undurable")
         except Exception as inner:
             self.note("attempt", f"even the last-resort outcome failed: {inner}")
             self.fail_machine("last_resort_failed")
@@ -3529,20 +3475,13 @@ class Worker:
         # Executor grandchildren orphan here, so retirement can reap every group member
         # and prove its exact PID absent before publishing a successor.
         proctree.arm_subreaper()
-        try:
-            self.journal.append(
-                "session",
-                {
-                    "worker_boot_id": self.fence.worker_boot_id,
-                    "instance_id": self.options.instance_id,
-                },
-            )
-        except JournalError as exc:
-            self.boot_fatal = self.boot_failure(
-                pb.BootFailureReason.BOOT_FAILURE_REASON_DISK_SHAPE, exc.detail
-            )
-            self.exit_code = int(Exit.internal)
-            self.note("boot", f"BOOT FAILURE (disk shape): {self.boot_fatal.detail}")
+        self.records.append(
+            "session",
+            {
+                "worker_boot_id": self.fence.worker_boot_id,
+                "instance_id": self.options.instance_id,
+            },
+        )
         if self.boot_fatal is None:
             unbindable = socket_path_refusal(self.supervision.socket_path)
             if unbindable:
@@ -3593,8 +3532,6 @@ class Worker:
         except ExecutorGone as exc:
             self.exit_code = int(Exit.internal)
             self.note("shutdown", f"executor reclaim failed: {exc}")
-        finally:
-            self.journal.close()
         print(
             "[worker] summary "
             + json.dumps(
@@ -3604,8 +3541,7 @@ class Worker:
                     "executor_generations": self.supervision.spawns,
                     "admission_generation": self.admission_generation,
                     "executed": self.engine.executed,
-                    "journal_appends": self.journal.appends,
-                    "journal_fsync_ms": round(self.journal.fsync_ns / 1e6, 2),
+                    "record_count": self.records.appends,
                     "progress_sent": self.watches.sent,
                     "progress_shed": self.watches.shed,
                     "hub_calls_allowed": self.authorizer.allowed,
@@ -3640,7 +3576,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", required=True)
     parser.add_argument("--worker-id", default="wrk-local")
-    parser.add_argument("--instance-id", default="")
     parser.add_argument("--release-id", default="")
     parser.add_argument(
         "--control-runtime-digest",
@@ -3746,7 +3681,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     options = WorkerOptions(
         root=Path(args.root),
         worker_id=args.worker_id,
-        instance_id=args.instance_id or f"ins-{uuid.uuid4().hex[:16]}",
+        instance_id=f"ins-{uuid.uuid4().hex[:16]}",
         release_id=args.release_id,
         control_runtime_digest=args.control_runtime_digest,
         git_commit=args.git_commit,
@@ -3817,11 +3752,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    try:
-        return worker.run()
-    except JournalError as exc:
-        print(f"[worker] {exc}", file=sys.stderr, flush=True)
-        return int(Exit.internal)
+    return worker.run()
 
 
 def main(argv: list[str] | None = None) -> int:

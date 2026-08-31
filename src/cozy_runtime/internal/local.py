@@ -48,12 +48,12 @@ from typing import Any, TypeVar
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import canonical, descriptor, fill
 from cozy_runtime.internal.config import RuntimeConfig
-from cozy_runtime.internal.journal import Journal
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -193,7 +193,7 @@ class SliceOutcome:
     accepted: dict[str, Any] = field(default_factory=dict)
     manifest: list[dict[str, Any]] = field(default_factory=list)
     #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
-    #: journaled before the terminal named it. `manifest_id` on the terminal IS its digest.
+    #: recorded before the terminal named it. `manifest_id` on the terminal IS its digest.
     publication: dict[str, Any] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     terminal_digest: str = ""
@@ -204,7 +204,7 @@ class SliceOutcome:
     accelerator_qualification: dict[str, Any] = field(default_factory=dict)
     ledger: dict[str, Any] = field(default_factory=dict)
     reconciliation: dict[str, Any] = field(default_factory=dict)
-    journal: list[dict[str, Any]] = field(default_factory=list)
+    attempt_records: list[dict[str, Any]] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
     warm: list[dict[str, Any]] = field(default_factory=list)
     faults: list[dict[str, str]] = field(default_factory=list)
@@ -216,7 +216,7 @@ class SliceOutcome:
     triage: dict[str, Any] = field(default_factory=dict)
     triage_explained: list[str] = field(default_factory=list)
     exit_code: int = 0
-    journal_deleted: bool = False
+    workspace_deleted: bool = False
     #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
     #: the scratch model its outputs were rewritten into.
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
@@ -1416,7 +1416,7 @@ def run_slice(
     development_binding_overrides: Mapping[str, str] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
-    delete_journal: bool = True,
+    delete_workspace: bool = True,
     auto_ack: bool = True,
     record_owner_hook: Any = None,
 ) -> SliceOutcome:
@@ -1483,7 +1483,7 @@ def run_slice(
         record_owner_hook(record_owner, worker)
     started = time.perf_counter()
     exit_code = worker.run()
-    return _collect(record_owner, worker, started, exit_code, delete_journal)
+    return _collect(record_owner, worker, started, exit_code, delete_workspace)
 
 
 def _collect(
@@ -1491,10 +1491,10 @@ def _collect(
     worker: Worker,
     started: float,
     exit_code: int,
-    delete_journal: bool,
+    delete_workspace: bool,
 ) -> SliceOutcome:
     outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
-    outcome.journal = _journal_rows(worker.journal)
+    outcome.attempt_records = _record_rows(worker.records)
     outcome.reconciliation = (
         worker.ledger.reconciliations[-1] if worker.ledger.reconciliations else {}
     )
@@ -1559,7 +1559,7 @@ def _collect(
                 outcome.triage = triage.BundleStore.read(
                     worker.root / "triage",
                     outcome.triage_subject,
-                    worker.journal,
+                    worker.records,
                 )
                 outcome.triage_explained = triage.explain(outcome.triage)
         outcome.status = pb.OutcomeStatus.Name(
@@ -1578,7 +1578,12 @@ def _collect(
         manifest = body.get("output_manifest") or {}
         outcome.manifest = list(manifest.get("outputs", ()))
         outcome.publication = next(
-            (row["body"] for row in outcome.journal if row.get("kind") == "publication"), {}
+            (
+                row["body"]
+                for row in outcome.attempt_records
+                if row.get("kind") == "publication"
+            ),
+            {},
         )
         for row in outcome.manifest:
             path = record_owner.destination(str(row.get("output_id", "")))
@@ -1615,10 +1620,10 @@ def _collect(
     outcome.timings["wall_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
     # A closed one-shot run has no remaining reader for its disposable workspace.
-    closed = any(row.get("kind") == "closed" for row in outcome.journal)
-    if delete_journal and closed:
+    closed = any(row.get("kind") == "closed" for row in outcome.attempt_records)
+    if delete_workspace and closed:
         shutil.rmtree(worker.root, ignore_errors=True)
-        outcome.journal_deleted = True
+        outcome.workspace_deleted = True
     return outcome
 
 
@@ -1633,25 +1638,9 @@ def _b64(text: str) -> bytes:
     return base64.b64decode(text)
 
 
-def _journal_rows(source: Journal | Path) -> list[dict[str, Any]]:
-    """Project same-process records, or read an explicit durable proof log."""
-    if isinstance(source, Journal):
-        return [
-            {"seq": row.seq, "kind": row.kind, "at_unix_ms": row.at_unix_ms, "body": row.body}
-            for row in source.records
-        ]
-    path = source
-    if not path.is_file():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_bytes().split(b"\n"):
-        _, _, rest = line.partition(b" ")
-        if not rest:
-            continue
-        try:
-            row = canonical.parse_canonical(rest)
-        except canonical.CanonicalError:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
+def _record_rows(source: WorkerRecords) -> list[dict[str, Any]]:
+    """Project the current process's ordered worker facts."""
+    return [
+        {"seq": row.seq, "kind": row.kind, "at_unix_ms": row.at_unix_ms, "body": row.body}
+        for row in source.records
+    ]

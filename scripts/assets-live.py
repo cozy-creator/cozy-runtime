@@ -229,7 +229,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         workspace=workspace,
         package_revision_digest=S.RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=S.RELEASE, no_warm=True),
-        delete_journal=False,
+        delete_workspace=False,
         record_owner_hook=hook,
     )
     out_path.write_text(json.dumps(dataclasses.asdict(outcome), default=str))
@@ -362,7 +362,7 @@ def kill() -> None:
         else "the handler won the race this time and produced a real terminal; the "
         "property under test is convergence, and a run that hung would fail either way",
     )
-    rows = [r.get("kind") for r in outcome.get("journal") or ()]
+    rows = [r.get("kind") for r in outcome.get("attempt_records") or ()]
     check(
         "the journal carries the whole acceptance/terminal narrative",
         "accepted" in rows and any(r in rows for r in ("outcome", "closed")),
@@ -400,7 +400,7 @@ def arms() -> None:
         and outcome.get("status") != "OUTCOME_STATUS_SUCCEEDED",
         refusal_of(outcome)[:220],
     )
-    accepted = [r for r in outcome.get("journal") or () if r.get("event") == "accepted"]
+    accepted = [r for r in outcome.get("attempt_records") or () if r.get("event") == "accepted"]
     check(
         "and NOTHING was accepted — the refusal is before the journal",
         not accepted,
