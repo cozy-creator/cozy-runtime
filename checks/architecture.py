@@ -704,15 +704,15 @@ def fence_base_ownership_vectors() -> list[str]:
     mirror_specs = (
         (
             "base-worker-image-wheelhouse-cpu.json",
-            24_683,
-            "sha256:0332d1afd11b222df7ef411ef6567cbe12af7ec8edf0309c5ccd846bcbf35406",
+            24_668,
+            "sha256:f1027c384b2ab34ecada82bf494bfaab92d019907005128aa9c78b2d4d3c392a",
             (26, 323, 25),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
-            25_651,
-            "sha256:6614fddec7ab1ecf634293c4ff6c254f4fb2ed143d96022fbe9f6169deeede50",
+            25_636,
+            "sha256:5437560d941af71770c9625f8b15a9b2d4618432215432652e6120e164995f6c",
             (86, 363, 10),
             ("cuda", "cu130"),
         ),
@@ -754,10 +754,10 @@ def fence_base_ownership_vectors() -> list[str]:
         versions = manifest.distribution_versions
         expected_wheels = {
             "cozy-runtime": (
-                "0.0.11.dev0",
-                "cozy_runtime-0.0.11.dev0-py3-none-any.whl",
-                "sha256:c633b3e5d1b1aa81249cc61c63d1aadb6347a534935191a52cc553cabba34448",
-                690_512,
+                "0.0.11",
+                "cozy_runtime-0.0.11-py3-none-any.whl",
+                "sha256:032f372a77290160ca118adfae0a6928540d0e837975366032fa2d4e37161ce1",
+                690_458,
             ),
             "tensorfs": (
                 "0.0.3.dev0",

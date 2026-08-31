@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -338,7 +338,7 @@ def snapshot() -> str:
     import tensorfs
 
     store = tensorfs.Store.open(str(STORE))
-    installed = getattr(store, "resolve_local")("cr006")
+    installed = cast(Any, store).resolve_local("cr006")  # native extension stub lags
     if installed is None:
         raise SystemExit("nothing installed in the cr-006 store — run `ingest` first")
     return str(installed)
