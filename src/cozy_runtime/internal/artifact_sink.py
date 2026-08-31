@@ -21,6 +21,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from cozy.worker.v1 import artifact_limits
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifact import (
     ArtifactBytes,
@@ -355,6 +356,15 @@ class ArtifactTransactionHost:
                 "TensorFS receipt declaration differs from the locked artifact request",
                 code="artifact_receipt_mismatch",
             )
+        evidence = value.get("release_evidence_canonical_bytes")
+        if (
+            not isinstance(evidence, bytes)
+            or not 0 < len(evidence) <= artifact_limits.MAX_RELEASE_EVIDENCE_BYTES
+        ):
+            raise CapabilityError(
+                "TensorFS receipt carries no bounded ReleaseEvidence",
+                code="artifact_receipt_mismatch",
+            )
         return value
 
     @staticmethod
@@ -365,12 +375,23 @@ class ArtifactTransactionHost:
         *,
         replayed: bool,
     ) -> ArtifactReceipt:
-        raw = canonical_json.encode(facts)
+        evidence = facts["release_evidence_canonical_bytes"]
+        assert isinstance(evidence, bytes)
+        serializable = dict(facts)
+        try:
+            serializable["release_evidence_canonical_bytes"] = evidence.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CapabilityError(
+                "TensorFS ReleaseEvidence is not canonical UTF-8",
+                code="artifact_receipt_mismatch",
+            ) from exc
+        raw = canonical_json.encode(serializable)
         return ArtifactReceipt(
             output_slot=output_slot,
             artifact_transaction_id=transaction_id,
             tensorfs_receipt_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
             tensorfs_receipt=raw,
+            release_evidence_canonical_bytes=evidence,
             replayed=replayed,
         )
 
@@ -493,6 +514,7 @@ def protocol_receipt(
         artifact_transaction_id=receipt.artifact_transaction_id,
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
+        release_evidence_canonical_bytes=receipt.release_evidence_canonical_bytes,
     )
     canonical_bytes, digest = documents.identity(body)
     return (

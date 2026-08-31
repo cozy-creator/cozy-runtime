@@ -1715,14 +1715,14 @@ def run_retired_descriptor_shapes() -> list[str]:
         },
     )
 
-    structure_escape = clone()
-    structure_escape["model_productions"][0]["outputs"][0]["required_contract"]["structure"] = (
-        "../h3"
-    )
+    topology_escape = clone()
+    topology_escape["model_productions"][0]["outputs"][0]["required_contract"][
+        "topology_digest"
+    ] = "not-a-digest"
 
     encoding_escape = clone()
     encoding_escape["model_productions"][0]["outputs"][0]["required_contract"]["encodings"] = [
-        "mxfp8//1"
+        "plain/1"
     ]
 
     source_profile_escape = clone()
@@ -1733,8 +1733,8 @@ def run_retired_descriptor_shapes() -> list[str]:
         refused("param", param),
         refused("required-wire", required_wire),
         refused("repeated-tag-field", old_tag),
-        refused("production-structure-escape", structure_escape),
-        refused("production-encoding-empty-segment", encoding_escape),
+        refused("production-topology-invalid", topology_escape),
+        refused("production-encoding-alias", encoding_escape),
         refused("production-source-profile-escape", source_profile_escape),
     ]
 

@@ -152,7 +152,6 @@ def _production_node(node: ProductionNode) -> dict[str, Json]:
         "callable": node.callable,
         "models": dict(sorted(node.models.items())),
         "outputs": sorted(node.outputs),
-        "assets": dict(sorted(node.assets.items())),
     }
     if node.resources is not None:
         doc["resources"] = _resources(node.resources)
@@ -161,10 +160,8 @@ def _production_node(node: ProductionNode) -> dict[str, Json]:
 
 def _production_contract(contract: ProductionContract) -> dict[str, Json]:
     return {
-        "tasks": sorted(contract.tasks),
-        "structure": contract.structure,
+        "topology_digest": contract.topology_digest,
         "encodings": sorted(contract.encodings),
-        "stamps": dict(sorted(contract.stamps.items())),
     }
 
 
@@ -173,6 +170,7 @@ def _production_contract(contract: ProductionContract) -> dict[str, Json]:
 _MACHINE_PATH = re.compile(r"(^/|^[A-Za-z]:[\\/]|/home/|\\Users\\|site-packages|\.venv/)")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
 _DIGEST = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 
 #: Keys that can only carry a fact from a LATER clock: a binding, a candidate, a build.
 _FORBIDDEN_KEYS = frozenset(
@@ -493,7 +491,7 @@ def _productions(value: Json, source: str) -> None:
             node_path = f"{path}.nodes[{node_index}]"
             node = _closed(
                 node_raw,
-                {"name", "callable", "models", "outputs", "assets"},
+                {"name", "callable", "models", "outputs"},
                 {"resources"},
                 source,
                 node_path,
@@ -510,7 +508,6 @@ def _productions(value: Json, source: str) -> None:
             models = _string_map_value(node["models"], source, f"{node_path}.models", 16)
             if not models:
                 _invalid(source, f"{node_path}.models", "must not be empty")
-            _string_map_value(node["assets"], source, f"{node_path}.assets", 16)
             if "resources" in node:
                 _production_resources(node["resources"], source, f"{node_path}.resources")
 
@@ -611,17 +608,6 @@ def _portable_names(value: Json, source: str, path: str, cap: int) -> list[str]:
     return out
 
 
-def _contract_values(value: Json, source: str, path: str, cap: int) -> list[str]:
-    if not isinstance(value, list) or not 1 <= len(value) <= cap:
-        _invalid(source, path, f"must contain 1 through {cap} contract values")
-    if not all(isinstance(item, str) and _CONTRACT_VALUE.fullmatch(item) for item in value):
-        _invalid(source, path, "contains a malformed contract value")
-    out = cast(list[str], value)
-    if len(set(out)) != len(out):
-        _invalid(source, path, "must be unique")
-    return out
-
-
 def _contract_value(value: Json, source: str, path: str) -> str:
     if not isinstance(value, str) or _CONTRACT_VALUE.fullmatch(value) is None:
         _invalid(source, path, "is not a bounded contract token")
@@ -657,11 +643,20 @@ def _production_resources(value: Json, source: str, path: str) -> None:
 
 
 def _production_contract_value(value: Json, source: str, path: str) -> None:
-    contract = _closed(value, {"tasks", "structure", "encodings", "stamps"}, set(), source, path)
-    _portable_names(contract["tasks"], source, f"{path}.tasks", 32)
-    _contract_value(contract["structure"], source, f"{path}.structure")
-    _contract_values(contract["encodings"], source, f"{path}.encodings", 32)
-    _string_map_value(contract["stamps"], source, f"{path}.stamps", 32)
+    contract = _closed(value, {"topology_digest", "encodings"}, set(), source, path)
+    topology = contract["topology_digest"]
+    encodings = contract["encodings"]
+    if not isinstance(topology, str) or _SHA256.fullmatch(topology) is None:
+        _invalid(source, f"{path}.topology_digest", "must be an exact sha256 digest")
+    if (
+        not isinstance(encodings, list)
+        or not 1 <= len(encodings) <= 32
+        or encodings != sorted(set(encodings))
+        or any(
+            not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in encodings
+        )
+    ):
+        _invalid(source, f"{path}.encodings", "must be sorted unique exact sha256 digests")
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:

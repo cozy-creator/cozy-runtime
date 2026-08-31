@@ -65,6 +65,7 @@ from cozy_runtime.internal.worker import (
     child,
     downloads,
     grants,
+    model_source_prepare,
     observe,
     triage,
 )
@@ -775,7 +776,8 @@ class Worker:
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
         # from the superseded stream cannot finish under its successor's generation.
         self.control_lock = threading.RLock()
-        self.package_prepare_lock = threading.Lock()
+        self.preparation_lock = threading.Lock()
+        self.model_source_operations: set[str] = set()
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
@@ -876,7 +878,7 @@ class Worker:
 
         from cozy_runtime.internal.worker import package_prepare
 
-        with self.package_prepare_lock:
+        with self.preparation_lock:
             if self.placement is not None or self.pending is not None or self.bindings:
                 raise package_prepare.PreparationRefusal(
                     "package_prepare_worker_busy",
@@ -938,6 +940,32 @@ class Worker:
                 verified=mark_verified,
                 job_plan_root=self.config.cozy_home / "job-plans",
             )
+
+    def prepare_model_source(
+        self, request: pb.PrepareModelSourceRequest
+    ) -> pb.PrepareModelSourceResult:
+        """Hand exact supervisor-verified source facts to the shared TensorFS core."""
+
+        with self.preparation_lock:
+            result = model_source_prepare.prepare_model_source(
+                request, artifact_store=Path(self.options.artifact_store or "")
+            )
+            if result.outcome in {
+                pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED,
+                pb.MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED,
+            }:
+                self.model_source_operations.add(request.operation_id)
+            return result
+
+    def release_model_source(self, operation_id: str) -> None:
+        """Explicit cooperative cleanup; pod teardown remains the remote durability boundary."""
+
+        with self.preparation_lock:
+            model_source_prepare.release_model_source(
+                artifact_store=Path(self.options.artifact_store or ""),
+                operation_id=operation_id,
+            )
+            self.model_source_operations.discard(operation_id)
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
@@ -3536,6 +3564,14 @@ class Worker:
         self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
+        for operation_id in sorted(self.model_source_operations):
+            try:
+                self.release_model_source(operation_id)
+            except Exception as exc:
+                self.note(
+                    "shutdown",
+                    f"model source cleanup {operation_id} failed: {type(exc).__name__}",
+                )
         try:
             self.supervision.close()
         except ExecutorGone as exc:
