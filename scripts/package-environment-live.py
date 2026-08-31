@@ -22,7 +22,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     jit_cache,
-    overlay,
+    package_environment,
 )
 from cozy_runtime.internal.worker import acquire, child, downloads
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -44,7 +44,7 @@ def build_wheel(
     requires_dist: tuple[str, ...] = (),
     root_is_pure: bool = True,
     extra_entries: dict[str, bytes] | None = None,
-) -> tuple[overlay.Wheel, Path]:
+) -> tuple[package_environment.Wheel, Path]:
     filename = f"{distribution.replace('-', '_')}-1.0.0-{tag}.whl"
     wheel_root = root / f"{distribution}-{value}-{tag.replace('.', '_')}"
     wheel_root.mkdir()
@@ -73,7 +73,7 @@ def build_wheel(
             archive.writestr(name, raw)
     raw = path.read_bytes()
     return (
-        overlay.Wheel(
+        package_environment.Wheel(
             distribution=distribution,
             version="1.0.0",
             filename=filename,
@@ -103,7 +103,7 @@ def compile_shared(root: Path, name: str, source: str, *linker_flags: str) -> by
     return library_path.read_bytes()
 
 
-def base_manifest(path: Path, runtime_version: str = "0.0.20") -> str:
+def base_manifest(path: Path, runtime_version: str = "0.0.20", uv_version: str = "0.12.7") -> str:
     raw = canonical.write(
         {
             "base_distributions": [
@@ -111,12 +111,14 @@ def base_manifest(path: Path, runtime_version: str = "0.0.20") -> str:
                 {"distribution": "cozy-runtime", "version": runtime_version},
                 {"distribution": "numpy", "version": "2.0.0"},
                 {"distribution": "torch", "version": "2.13.0+cpu"},
+                {"distribution": "uv", "version": uv_version},
             ],
             "base_import_roots": [
                 {"providers": ["base-control"], "root": "base_control"},
                 {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
                 {"providers": ["numpy"], "root": "numpy"},
                 {"providers": ["torch"], "root": "torch"},
+                {"providers": ["uv"], "root": "uv"},
             ],
             "compatibility_profile": {
                 "accelerator_build": "cpu",
@@ -159,11 +161,13 @@ def local_base_manifest(path: Path) -> str:
                 {"distribution": "base-control", "version": "1.0.0"},
                 {"distribution": "cozy-runtime", "version": "0.0.20"},
                 {"distribution": "numpy", "version": "2.0.0"},
+                {"distribution": "uv", "version": "0.12.7"},
             ],
             "base_import_roots": [
                 {"providers": ["base-control"], "root": "base_control"},
                 {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
                 {"providers": ["numpy"], "root": "numpy"},
+                {"providers": ["uv"], "root": "uv"},
             ],
             "compatibility_profile": {
                 "accelerator_build": "cpu",
@@ -193,23 +197,25 @@ def local_base_manifest(path: Path) -> str:
 def source(
     spec: str,
     family: str,
-    project: tuple[overlay.Wheel, Path],
-    custom: tuple[overlay.Wheel, Path],
+    project: tuple[package_environment.Wheel, Path],
+    custom: tuple[package_environment.Wheel, Path],
     *,
     verified: bool = True,
-) -> overlay.Input:
+) -> package_environment.Input:
     rows = (project, custom)
-    return overlay.Input(
+    return package_environment.Input(
         environment_digest=digest(spec.encode()),
         base_family_digest=family,
         project_wheel_digest=project[0].digest,
         wheels=tuple(row[0] for row in rows),
         grants=tuple(
-            overlay.BlobGrant(
+            package_environment.BlobGrant(
                 wheel.digest,
                 wheel.length,
                 path,
-                overlay.VerifiedFile.record(path, wheel.digest, wheel.length) if verified else None,
+                package_environment.VerifiedFile.record(path, wheel.digest, wheel.length)
+                if verified
+                else None,
             )
             for wheel, path in rows
         ),
@@ -233,7 +239,7 @@ def acquirer(
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="cozy-overlay-identity-") as raw:
+    with tempfile.TemporaryDirectory(prefix="cozy-package-environment-") as raw:
         root = Path(raw)
         wheels = root / "wheels"
         wheels.mkdir()
@@ -251,11 +257,13 @@ def main() -> int:
         custom_two = build_wheel(wheels, "proof-custom", "proof_custom", "two", owner="custom")
         environment = root / "installed"
 
-        # Every arriving wheel already has fetch_exact's verified-file receipt. Overlay
-        # inspection must not hash it again, even while extracting a new wheel pool.
-        with patch.object(overlay, "_hash_file", side_effect=AssertionError("double hash")):
+        # Every arriving wheel already has fetch_exact's verified-file receipt. Admission
+        # must not hash it again before uv installs the exact wheel set.
+        with patch.object(
+            package_environment, "_hash_file", side_effect=AssertionError("double hash")
+        ):
             cold_started = time.perf_counter_ns()
-            cold = overlay.materialize(
+            cold = package_environment.materialize(
                 source("spec-one", family, project, custom_one),
                 environment,
                 python=Path(sys.executable),
@@ -263,14 +271,14 @@ def main() -> int:
             )
             cold_ns = time.perf_counter_ns() - cold_started
             warm_started = time.perf_counter_ns()
-            warm = overlay.materialize(
+            warm = package_environment.materialize(
                 source("spec-two", family, project, custom_one),
                 environment,
                 python=Path(sys.executable),
                 base_manifest=manifest,
             )
             warm_ns = time.perf_counter_ns() - warm_started
-            changed = overlay.materialize(
+            changed = package_environment.materialize(
                 source("spec-three", family, project, custom_two),
                 environment,
                 python=Path(sys.executable),
@@ -286,10 +294,27 @@ def main() -> int:
         assert (cold.site_packages / "proof_custom" / "__init__.py").read_bytes() != (
             changed.site_packages / "proof_custom" / "__init__.py"
         ).read_bytes()
+        opened = package_environment.open_existing_environment(cold.python, "sha256:" + "f" * 64)
+        assert opened.python == cold.python
+        assert opened.generation == cold.generation
+
+        interrupted = environment / ".environment-staging-2147483647-interrupted"
+        interrupted.mkdir()
+        (interrupted / "partial").write_text("not a selectable venv")
+        recovered = package_environment.materialize(
+            source("spec-after-interruption", family, project, custom_two),
+            environment,
+            python=Path(sys.executable),
+            base_manifest=manifest,
+        )
+        assert recovered.reused and recovered.generation == changed.generation
+        assert not interrupted.exists()
+        assert not list(environment.glob(".environment-staging-*"))
+        assert recovered.generation.stat().st_mode & 0o222 == 0
 
         patch_manifest = root / "WheelhouseManifest.patch.json"
         patch_family = base_manifest(patch_manifest, "0.0.21")
-        compatible_patch = overlay.materialize(
+        compatible_patch = package_environment.materialize(
             source("spec-runtime-patch", patch_family, project, custom_one),
             environment,
             python=Path(sys.executable),
@@ -301,17 +326,32 @@ def main() -> int:
         incompatible_manifest = root / "WheelhouseManifest.incompatible.json"
         incompatible_family = base_manifest(incompatible_manifest, "1.0.0")
         try:
-            overlay.materialize(
+            package_environment.materialize(
                 source("spec-runtime-major", incompatible_family, project, custom_one),
                 environment,
                 python=Path(sys.executable),
                 base_manifest=incompatible_manifest,
             )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_dependency_base_conflict"
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_dependency_base_conflict"
             assert "cozy-runtime<1.0.0,>=0.0.19" in exc.detail
         else:
             raise AssertionError("an incompatible Runtime major reused the package environment")
+
+        wrong_uv_manifest = root / "WheelhouseManifest.wrong-uv.json"
+        wrong_uv_family = base_manifest(wrong_uv_manifest, uv_version="0.12.6")
+        try:
+            package_environment.materialize(
+                source("spec-wrong-uv", wrong_uv_family, project, custom_one),
+                environment,
+                python=Path(sys.executable),
+                base_manifest=wrong_uv_manifest,
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_uv_version_mismatch"
+            assert "executable=0.12.7 base_manifest=0.12.6" in exc.detail
+        else:
+            raise AssertionError("an unpinned uv executable materialized a package environment")
 
         corrupt_path = root / "corrupt.whl"
         corrupt = bytearray(custom_one[1].read_bytes())
@@ -326,14 +366,14 @@ def main() -> int:
             ),
         )
         try:
-            overlay.materialize(
+            package_environment.materialize(
                 corrupt_source,
                 root / "corrupt-installed",
                 python=Path(sys.executable),
                 base_manifest=manifest,
             )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_wheel_digest_mismatch"
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_wheel_digest_mismatch"
         else:
             raise AssertionError("corrupt first arrival was admitted")
 
@@ -347,7 +387,7 @@ def main() -> int:
             requires_python=">=3.10",
             root_is_pure=False,
         )
-        abi3 = overlay.materialize(
+        abi3 = package_environment.materialize(
             source("abi3", family, project, abi3_custom),
             root / "abi3-installed",
             python=Path(sys.executable),
@@ -356,7 +396,7 @@ def main() -> int:
         assert (abi3.site_packages / "proof_abi3" / "__init__.py").is_file()
 
         incompatible_cases = {
-            "overlay_wheel_platform_incompatible": build_wheel(
+            "package_environment_wheel_platform_incompatible": build_wheel(
                 wheels,
                 "proof-new-manylinux",
                 "proof_new_manylinux",
@@ -365,7 +405,7 @@ def main() -> int:
                 tag="cp312-cp312-manylinux_2_40_x86_64",
                 root_is_pure=False,
             ),
-            "overlay_python_incompatible": build_wheel(
+            "package_environment_python_incompatible": build_wheel(
                 wheels,
                 "proof-new-python",
                 "proof_new_python",
@@ -373,7 +413,7 @@ def main() -> int:
                 owner="project",
                 requires_python=">=3.15",
             ),
-            "overlay_dependency_base_conflict": build_wheel(
+            "package_environment_dependency_base_conflict": build_wheel(
                 wheels,
                 "proof-numpy-pin",
                 "proof_numpy_pin",
@@ -381,7 +421,7 @@ def main() -> int:
                 owner="project",
                 requires_dist=("numpy==1.0.0",),
             ),
-            "overlay_dependency_missing": build_wheel(
+            "package_environment_dependency_missing": build_wheel(
                 wheels,
                 "proof-marker",
                 "proof_marker",
@@ -394,13 +434,13 @@ def main() -> int:
             bad_project = bad_wheel if bad_wheel[0].owner == "project" else project
             bad_custom = bad_wheel if bad_wheel[0].owner == "custom" else custom_one
             try:
-                overlay.materialize(
+                package_environment.materialize(
                     source(code, family, bad_project, bad_custom),
                     root / f"red-{code}",
                     python=Path(sys.executable),
                     base_manifest=manifest,
                 )
-            except overlay.OverlayRefusal as exc:
+            except package_environment.EnvironmentRefusal as exc:
                 assert exc.code == code, (exc.code, code)
             else:
                 raise AssertionError(f"{code} was admitted")
@@ -422,18 +462,18 @@ def main() -> int:
             extra_entries={"proof_source_custom/kernels/op.cu": b"// source must not ship\n"},
         )
         native_reds = {
-            "overlay_project_wheel_native": (native_project, custom_one),
-            "overlay_native_build_input_forbidden": (project, build_input_custom),
+            "package_environment_project_wheel_native": (native_project, custom_one),
+            "package_environment_native_build_input_forbidden": (project, build_input_custom),
         }
         for code, (bad_project, bad_custom) in native_reds.items():
             try:
-                overlay.materialize(
+                package_environment.materialize(
                     source(code, family, bad_project, bad_custom),
                     root / f"red-{code}",
                     python=Path(sys.executable),
                     base_manifest=manifest,
                 )
-            except overlay.OverlayRefusal as exc:
+            except package_environment.EnvironmentRefusal as exc:
                 assert exc.code == code, (exc.code, code)
             else:
                 raise AssertionError(f"{code} was admitted")
@@ -444,15 +484,15 @@ def main() -> int:
             tags=("cp312-cp312-manylinux_2_17_x86_64",),
         )
         try:
-            overlay._verify_inventory(
+            package_environment._verify_inventory(
                 replace(
                     source("tagged-project", family, project, custom_one),
                     wheels=(tagged_project, custom_one[0]),
                 ),
-                overlay._read_base_manifest(manifest, family),
+                package_environment._read_base_manifest(manifest, family),
             )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_project_wheel_not_pure", exc.code
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_project_wheel_not_pure", exc.code
         else:
             raise AssertionError("platform-specific project wheel was admitted")
 
@@ -472,31 +512,31 @@ def main() -> int:
             extra_entries={"proof_native_custom/_native.so": native_bytes},
         )
         try:
-            overlay.materialize(
+            package_environment.materialize(
                 source("native-custom", family, project, native_custom),
                 root / "native-custom-refused",
                 base_manifest=manifest,
             )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_custom_wheel_native_unsupported", exc.code
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_custom_wheel_native_unsupported", exc.code
         else:
             raise AssertionError("custom native wheel was admitted")
 
         try:
-            overlay.materialize(
+            package_environment.materialize(
                 source("native-custom-image-opt-in", family, project, native_custom),
                 root / "native-custom-image-opt-in",
                 base_manifest=manifest,
                 allow_native_custom=True,
             )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_custom_wheel_native_unsupported", exc.code
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_custom_wheel_native_unsupported", exc.code
         else:
             raise AssertionError("image-owned base admitted a custom native wheel")
 
         local_manifest = root / "LocalBaseManifest.json"
         local_family = local_base_manifest(local_manifest)
-        native_local = overlay.materialize(
+        native_local = package_environment.materialize(
             source("native-custom-local", local_family, project, native_custom),
             root / "native-custom-local",
             base_manifest=local_manifest,
@@ -517,7 +557,7 @@ def main() -> int:
             owner="project",
             requires_dist=("missing-package; python_version < '3.12'",),
         )
-        overlay.materialize(
+        package_environment.materialize(
             source("false-marker", family, false_marker, custom_one),
             root / "false-marker-installed",
             python=Path(sys.executable),
@@ -637,9 +677,12 @@ def main() -> int:
                     "verified_bytes": first.verified_bytes,
                     "trusted_reuse_bytes": second.trusted_reuse_bytes,
                     "same_wheels_different_spec_one_content": True,
+                    "existing_uv_venv_opened_without_install": True,
                     "compatible_runtime_patch_reused": True,
                     "incompatible_runtime_major_refused": True,
+                    "wrong_uv_version_refused": True,
                     "one_changed_wheel_has_distinct_environment": True,
+                    "interrupted_staging_removed_before_reuse": True,
                     "changed_stat_rehashed": True,
                     "restart_rehashed": True,
                     "corrupt_first_arrival_refused": True,
@@ -656,13 +699,9 @@ def main() -> int:
                     "jit_cache_worker_shutdown_removed": True,
                     "jit_cache_pod_scopes_separated": True,
                     "jit_cache_warm_reuse_within_pod": True,
-                    "jit_cache_defaults_never_used": True,
                     "custom_native_wheel_refused": True,
                     "custom_native_wheel_image_opt_in_refused": True,
                     "custom_native_wheel_local_loaded": True,
-                    "mutable_local_base_refused": True,
-                    "source_path_injection_erased": True,
-                    "killed_materialization_retry_atomic": True,
                     "base_version_conflict_refused": True,
                 },
                 sort_keys=True,

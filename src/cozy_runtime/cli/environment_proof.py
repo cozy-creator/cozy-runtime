@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, overlay
+from cozy_runtime.internal import canonical, package_environment
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.placement_materialization import package_overlay_input
+from cozy_runtime.internal.placement_materialization import package_environment_input
 from cozy_runtime.internal.refusal import LaunchRefusal
 
 REQUEST_FIELDS = {
@@ -70,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "choose a separate absolute receipt path owned by the build seat",
                 Exit.validation,
             )
-        source = package_overlay_input(
+        source = package_environment_input(
             package=request.package,
             environment=request.environment,
             environment_digest=request.environment_digest,
@@ -79,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             wheel_paths=request.wheel_files,
         )
-        installed = overlay.materialize(
+        installed = package_environment.materialize(
             source,
             request.environment_root,
             python=request.python,
@@ -103,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CliError as err:
         emit_error(err, opts)
         return int(err.code)
-    except (LaunchRefusal, overlay.OverlayRefusal) as err:
+    except (LaunchRefusal, package_environment.EnvironmentRefusal) as err:
         emit_error(
             CliError(
                 err.code,

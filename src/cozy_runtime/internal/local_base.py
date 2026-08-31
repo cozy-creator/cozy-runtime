@@ -14,7 +14,7 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import canonical, overlay
+from cozy_runtime.internal import canonical, package_environment
 
 _NAME_RUNS = re.compile(r"[-_.]+")
 _ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -51,11 +51,11 @@ def manifest_bytes() -> bytes:
             "platform_target": {**platform_target, "libc": "glibc" + libc_version},
             # Installed environments do not retain original wheel bytes. Claiming their
             # digests here would be fabricated; distribution/import ownership is what the
-            # overlay collision and requirement checks consume.
+            # package_environment collision and requirement checks consume.
             "wheels": [],
         }
     )
-    overlay.parse_base_manifest(raw, _digest(raw))
+    package_environment.parse_base_manifest(raw, _digest(raw))
     return raw
 
 

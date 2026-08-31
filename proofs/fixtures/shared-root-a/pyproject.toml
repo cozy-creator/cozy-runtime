@@ -1,7 +1,7 @@
 [project]
 name = "proof-shared-root-a"
 version = "1.0.0"
-description = "Repository-only duplicate overlay root fixture A"
+description = "Repository-only duplicate package root fixture A"
 requires-python = ">=3.12,<3.13"
 dependencies = []
 

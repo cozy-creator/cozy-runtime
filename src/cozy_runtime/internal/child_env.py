@@ -66,6 +66,7 @@ FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
 EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
 JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
     ("CUDA_CACHE_PATH", "cuda"),
+    ("PYTHONPYCACHEPREFIX", "bytecode"),
     ("TORCH_EXTENSIONS_DIR", "extensions"),
     ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
     ("TRITON_CACHE_DIR", "triton"),

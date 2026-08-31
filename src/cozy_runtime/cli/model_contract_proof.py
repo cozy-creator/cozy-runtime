@@ -1,7 +1,7 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
-The command runs from base worker image Python plus a receipt-selected content overlay.
-It verifies that small overlay receipt and base-family join, then delegates package import and
+The command runs from a receipt-selected package venv over the base worker image.
+It verifies the package-environment receipt and base-family join, then delegates package import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
 digest-addressed result directory by atomic rename.
@@ -26,7 +26,7 @@ from typing import Any
 
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, contract, overlay, sandbox
+from cozy_runtime.internal import canonical, contract, package_environment, sandbox
 from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StalePackageDescriptor
@@ -155,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             opts,
         )
         return int(Exit.structural)
-    except overlay.OverlayRefusal as err:
+    except package_environment.EnvironmentRefusal as err:
         emit_error(
             CliError(
                 err.code,
@@ -371,13 +371,13 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledEnvironment:
+def _verify_installed_generation(request: ProofRequest) -> package_environment.InstalledEnvironment:
     if request.environment_generation.parent.name != "contents":
         raise ProofRefusal(
             "model_contract_environment_generation_invalid",
             "installed content is not below the environment root's contents directory",
         )
-    installed = overlay.open_generation(
+    installed = package_environment.open_generation(
         request.environment_generation.parent.parent,
         receipt_digest=request.installed_environment_receipt.digest,
         environment_digest=request.environment_digest,
@@ -491,7 +491,7 @@ def _child_entry(args: Sequence[str]) -> int:
     except ProofRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
-    except overlay.OverlayRefusal as err:
+    except package_environment.EnvironmentRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
     except (ConformanceError, StalePackageDescriptor, contract.ContractError) as err:

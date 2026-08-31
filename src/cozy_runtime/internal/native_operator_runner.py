@@ -11,17 +11,13 @@ from cozy_runtime.internal import canonical
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 5:
+    if len(args) != 4:
         print(
-            "native fixture runner requires OVERLAY MODULE:CALLABLE "
-            "CPU_SECONDS AS_BYTES OUTPUT_BYTES",
+            "native fixture runner requires MODULE:CALLABLE CPU_SECONDS AS_BYTES OUTPUT_BYTES",
             file=sys.stderr,
         )
         return 2
-    overlay, fixture, cpu_raw, address_raw, output_raw = args
-    if "\0" in overlay or not overlay:
-        print("invalid overlay path", file=sys.stderr)
-        return 2
+    fixture, cpu_raw, address_raw, output_raw = args
     module_name, separator, callable_name = fixture.partition(":")
     if not separator or not module_name or not callable_name or "." in callable_name:
         print("invalid native fixture name", file=sys.stderr)
@@ -44,9 +40,6 @@ def main(argv: list[str] | None = None) -> int:
     _cap(resource.RLIMIT_AS, address_bytes)
     _cap(resource.RLIMIT_FSIZE, output_bytes)
     _cap(resource.RLIMIT_NOFILE, 256)
-    # Base paths stay first. The exact package overlay is one appended root, identical to the
-    # serving executor's import order; a custom wheel cannot win a base import by path order.
-    sys.path.append(overlay)
     try:
         candidate = getattr(importlib.import_module(module_name), callable_name)
         if not callable(candidate):

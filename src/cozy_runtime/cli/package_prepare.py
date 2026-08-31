@@ -1,4 +1,4 @@
-"""Private Creator plumbing for one observed local base and package overlay."""
+"""Private Creator plumbing for one observed local base and package environment."""
 
 from __future__ import annotations
 
@@ -6,12 +6,11 @@ import base64
 import hashlib
 import json
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, local_base, overlay
+from cozy_runtime.internal import canonical, local_base, package_environment
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -49,7 +48,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         "--artifact-cache",
         "--artifact-store",
         "--base-manifest",
-        "--environment-root",
+        "--environment-python",
         "--package",
         "--project-wheel",
         "--release",
@@ -58,7 +57,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     values = _values(args, required, {"--dependency-wheel", "--model"})
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
     artifact_store = Path(values["--artifact-store"][0]).resolve()
-    environment_root = Path(values["--environment-root"][0]).resolve()
+    environment_python = _venv_python(values["--environment-python"][0])
     base_manifest = Path(values["--base-manifest"][0]).resolve()
     wheel_paths = [
         (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, Path(values["--project-wheel"][0]).resolve()),
@@ -92,6 +91,17 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     package = values["--package"][0]
     release = values["--release"][0]
     release_digest = values["--release-digest"][0]
+    try:
+        installed_environment = package_environment.open_existing_environment(
+            environment_python, release_digest
+        )
+    except package_environment.EnvironmentRefusal as exc:
+        raise CliError(
+            exc.code,
+            exc.detail,
+            "recreate the package's uv environment from its exact lock",
+            Exit.validation,
+        ) from exc
     models: list[dict[str, object]] = []
     for raw in values.get("--model", []):
         try:
@@ -129,14 +139,14 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     scratch = Path(tempfile.mkdtemp(prefix="cozy-prepare-"))
     supervisor = ExecutorSupervision(
         root=scratch / "worker",
-        python=sys.executable,
+        python=str(environment_python),
         base_env=config.child_base_env,
         cozy_home=config.cozy_home,
         scratch_root=scratch / "executor",
     )
     (scratch / "executor").mkdir(parents=True)
 
-    def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+    def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
         supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
         output = scratch / "executor" / "descriptor.json"
@@ -167,14 +177,15 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             files=rows,
             placement_seed=seed,
             artifact_cache=artifact_cache,
-            environment_root=environment_root,
-            python=Path(sys.executable),
+            environment_root=installed_environment.generation,
+            python=environment_python,
             describe=describe,
             verified=lambda _digest, _length, _path: None,
             base_manifest=base_manifest,
             artifact_store=artifact_store,
             models=models,
             allow_native_custom=True,
+            installed_environment=installed_environment,
         )
     except (PreparationRefusal, ExecutorGone, OSError) as exc:
         name = getattr(exc, "code", "package_prepare_failed")
@@ -228,6 +239,13 @@ def _values(args: list[str], required: set[str], repeatable: set[str]) -> dict[s
             Exit.usage,
         )
     return values
+
+
+def _venv_python(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.parent.resolve() / path.name
 
 
 def _exact(raw: bytes) -> dict[str, object]:

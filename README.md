@@ -276,40 +276,41 @@ loading, or output quality.
 The environment proof likewise builds and installs the exact Runtime wheel before invoking its
 public command from `/` with `PYTHONPATH` unset. Its base packages are installed once in the
 driver, matching the base worker image. The command hashes and inspects only the project/custom
-wheels, extracts them into private staging, precompiles that small overlay, and atomically
-publishes it. Cold and independent rebuilds produce the same compact receipt.
+wheels, asks uv to create an ordinary venv in private staging, installs the exact wheels offline,
+and atomically publishes it. Cold and independent rebuilds produce the same compact receipt.
 
-### Installed base plus package overlay
+### Per-package uv environments
 
-`internal/overlay.py` is the serving materializer. The image already contains Python,
+`internal/package_environment.py` is the rental materializer. The image already contains Python,
 cozy-runtime, TensorFS, and its complete declared base-family inventory. Accelerator profiles also
 contain Torch/CUDA; a generic CPU image may instead declare `torch_release=none` only when both
 accelerator coordinates are `none`, `accelerator_build=cpu`, and its distribution/import-root
-inventory proves that no Torch family, Triton, or NVIDIA fact exists. A placement therefore
-installs only its deterministic project wheel and optional exact custom wheels. It never creates a
-venv, copies Torch, reads an index, resolves a dependency, or retains wheel archives after
-extraction.
+inventory proves that no Torch family, Triton, or NVIDIA fact exists. Each placement gets one uv
+venv created from that exact base interpreter with system site packages visible. uv installs only
+the deterministic project wheel and exact package dependency wheels with offline, no-index,
+no-dependency, and no-build semantics. Python, Torch/CUDA, cozy-runtime, and TensorFS are never
+installed a second time inside a rental.
 
 The image's OCI digest owns image-resident integrity. `WheelhouseManifest/1` is the complete
 canonical ownership document for that image: its existing platform target and exact control-wheel
 rows travel with every installed normalized distribution/version and every top-level import root's
 sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
 sorted unique import roots: the image rows in `WheelhouseManifest/1`, the project row in
-`Placement.package.project_wheel`, and each selected overlay row embedded in `PlacementSet/1`.
+`Placement.package.project_wheel`, and each selected dependency row embedded in `PlacementSet/1`.
 Runtime strictly parses those exact facts, rejects
 a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
-roots, requires custom declarations to equal the measurement, and rejects a root collision with
-the manifest's providers or a duplicate project/custom root before extraction or publication.
+roots, requires declarations to equal the measurement, and rejects a root collision with
+the manifest's providers or a duplicate package root before uv runs.
 There is no version-compatibility reader and no hardcoded protected-root list.
 
 Runtime hashes each arriving package wheel once. A worker-boot-local verified-file receipt binds
 its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
-stat change or worker restart re-hashes before trust. Overlay admission consumes the receipt instead
-of hashing the same wheel again. Each verified wheel is extracted once into a root-owned immutable
-pool keyed below the base family and extraction format. Installed content is keyed by
-`(base_family_digest, sorted wheel digests)` and composed with collision-checked hardlinks, so a
-metadata-only environment-spec change shares one compiled content tree and a one-wheel change
-shares every unchanged installed inode. The spec-specific receipt remains a separate exact join.
+stat change or worker restart re-hashes before trust. Package admission consumes the receipt instead
+of hashing the same wheel again. A venv content identity contains the interpreter ABI/platform,
+exact uv version, and sorted package-owned wheel digests. It deliberately excludes the exact base
+manifest digest: a compatible Runtime patch rechecks declared requirements and reuses the venv,
+while a real requirement or ABI conflict refuses. Creation is stage-then-rename and no partial venv
+is selectable.
 
 The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
 and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
@@ -317,8 +318,16 @@ pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and 
 remain root-only. Content is root-owned/read-only, and executor scratch/probe state is private to
 one incarnation and deleted before the fixed uid is reused. A worker that cannot perform the
 identity split refuses before binding. Native/local development keeps its explicit same-user lane.
-Base bytecode is baked in the image and package bytecode is compiled once per content identity. The
-executor starts with image Python and appends the exact content import root after image-owned paths.
+Base bytecode is baked in the image and uv compiles package bytecode during installation. Any later
+bytecode is directed to the worker-boot/content cache outside the read-only venv. The executor starts
+with the venv's own Python; it receives no package `PYTHONPATH` or appended import directory.
+
+Local installed packages use the same ordinary venv boundary but not the rental base policy.
+Creator resolves the full lock with uv, so two local packages may carry different Python or Torch
+families. `prepare-package --environment-python <venv>/bin/python` validates that existing venv and
+authors the descriptor and PlacementSet without installing another environment. Local `serve`
+receives the same `--environment-python`; `--environment-root` is reserved for rental
+materialization and the two flags are mutually exclusive.
 
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying
@@ -343,7 +352,7 @@ uid-65533 domain, not merely an environment token or process group, so token scr
 double-fork, worker restart, and PID reuse do not leave an old executor alive. A writable but
 undelegated cgroup-v2 host and an unbounded read-only container still refuse before package import.
 
-An overlay contains exactly one project wheel and at most 128 custom wheels. The Runtime bound is
+Each package environment contains exactly one project wheel and at most 128 dependency wheels. The Runtime bound is
 129 total package-owned wheels, counting the project; 129 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
@@ -355,30 +364,32 @@ headers/objects/static archives, and wheel install schemes that would inject scr
 never invokes pip, a resolver, PEP 517, or a compiler.
 
 The ordinary package lane admits only pure dependency wheels. A dependency wheel containing ELF,
-`.so`, `.pyd`, or another native member refuses as `overlay_custom_wheel_native_unsupported` before
+`.so`, `.pyd`, or another native member refuses as
+`package_environment_custom_wheel_native_unsupported` before
 installation. Shared native libraries belong in the base worker image. A package-specific native
 wheel lane remains absent until a real package requires it and can justify actual loader, SM/PTX,
 operator, and isolation checks; the dormant inspection helpers are not publication authority.
 
 PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation, but those
 keys are never treated as a same-UID security boundary. Runtime scopes cache reuse by unpredictable
-worker boot plus exact overlay content, then imposes `TORCHINDUCTOR_CACHE_DIR`,
+worker boot plus exact package content, then imposes `PYTHONPYCACHEPREFIX`,
+`TORCHINDUCTOR_CACHE_DIR`,
 `TRITON_CACHE_DIR`, `TORCH_EXTENSIONS_DIR`, and `CUDA_CACHE_PATH` before executor import. A respawn
 within that pod can retain its warm compiler cache; the whole pod scope is deleted after worker
 shutdown has proven the executor tree gone. Tensorhub's public placement law supplies one public
 trust domain per pod. Private renter cross-org stacking retains its explicitly documented same-UID
 risk—Runtime does not relabel worker boot identity as tenant isolation. Cache bytes stay node-local,
-never enter an overlay receipt/content identity, and are never published as release artifacts. Every
-placement consumes this same overlay path; OCI provenance belongs to Tensorhub qualification
+never enter a package receipt/content identity, and are never published as release artifacts. Every
+placement consumes this same venv path; OCI provenance belongs to Tensorhub qualification
 evidence, while the portable receipt remains the exact WheelhouseManifest/project/custom-wheel join.
 
 On a remote placement, `PlacementSet/1` names one exact
 `model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
 exact digest/length/HTTPS locations directly from Tensorhub over mTLS. The non-control
-convergence lane starts package and model acquisition together. As soon as package overlay and
+convergence lane starts package and model acquisition together. As soon as the package venv and
 binding documents are admitted from a standing start, Runtime spawns the executor so interpreter
 and Torch import overlap continued TensorFS hydration; model preparation/fill still waits for the
-exact model closure. READY remains the join of overlay, TensorFS closure, binding resolution and
+exact model closure. READY remains the join of package environment, TensorFS closure, binding resolution and
 device construction. An outgoing placement is never disturbed by this optimization. Same-revision
 delegation renewal changes only access; verified complete objects survive and only missing objects
 move after renewal.
@@ -403,10 +414,10 @@ are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the direct PackageSelection, selected Environment and base
-WheelhouseManifest, plus every overlay wheel file by digest,
-the installed-base Python, a fresh overlay root, and a fresh receipt output. `wheel_files`
+WheelhouseManifest, plus every package wheel file by digest,
+the installed-base Python, a fresh environment root, and a fresh receipt output. `wheel_files`
 contains only the project and optional custom wheels; base wheel bytes do not travel. It
-atomically publishes the overlay receipt bytes and prints their compact
+atomically publishes the package-environment receipt bytes and prints their compact
 digest/length/generation reference. It
 does not accept an expected receipt, author release documents, fetch, resolve, or import package
 code.
@@ -430,7 +441,7 @@ set is closed; every path value is a normalized absolute local path:
 }
 ```
 
-An overlay containing native custom-wheel bytes must additionally pass
+A package environment containing native custom-wheel bytes must additionally pass
 `cozy-native-wheel-proof REQUEST.json EVIDENCE.json` on every claimed hardware class. The request
 does not carry a caller-asserted OCI realization identity: Runtime cannot measure an OCI manifest,
 and echoing one is not proof. Tensorhub joins Runtime's measured evidence to provider OCI readback.
@@ -457,9 +468,9 @@ command emits a bounded result DTO containing those measured facts. Tensorhub no
 result into its own rows and alone decides whether the measured evidence qualifies the package
 for that hardware class. Runtime authors no second qualification document.
 
-The receipt-selected, content-keyed overlay then exposes
+The receipt-selected package environment then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
-it verifies the overlay/base-family join, compares the exact descriptor with the
+it verifies the environment/base-family join, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
 offline construction sandbox. The fresh output directory appears atomically and contains the
 result in `result.json` plus exact digest-named files under `contracts/`. Tensorhub
@@ -529,7 +540,7 @@ selection/acquisition plus drift refusals without claiming GPU execution; the ex
 On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
 WorkerControl chunks into local files. The loopback-only
-`RuntimePreparation.PreparePrivatePackage` method then calls the same wheel/base/overlay/descriptor/
+`RuntimePreparation.PreparePrivatePackage` method then calls the same wheel/base/venv/descriptor/
 job-plan implementation as a published package. Its resulting Placement uses
 `DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
 masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog

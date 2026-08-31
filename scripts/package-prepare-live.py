@@ -20,7 +20,7 @@ from typing import Any, cast
 
 from cozy_runtime.cli import private_preflight
 from cozy_runtime.cli.io import CliError, Options
-from cozy_runtime.internal import canonical, descriptor, discovery, overlay
+from cozy_runtime.internal import canonical, descriptor, discovery, package_environment
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
 from cozy_runtime.internal.worker.session import Worker, read_placement_set
@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _describe_with_environment(
-    installed: overlay.InstalledEnvironment, distribution: str
+    installed: package_environment.InstalledEnvironment, distribution: str
 ) -> bytes:
     code = (
         "import sys; sys.path.extend(sys.argv[2:]); "
@@ -165,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
             files=files,
         )
 
-        def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+        def describe(
+            installed: package_environment.InstalledEnvironment, distribution: str
+        ) -> bytes:
             return _describe_with_environment(installed, distribution)
 
         result = package_prepare.prepare_package_set(
@@ -434,10 +436,10 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         }
     )
     base_with_helper["base_import_roots"].sort(key=lambda row: row["root"])
-    _base, carried, _observed = overlay.preflight_overlay(
+    _base, carried, _observed = package_environment.preflight_environment(
         local_wheel, (helper_wheel.resolve(),), base_without_helper
     )
-    _base, reused, _observed = overlay.preflight_overlay(
+    _base, reused, _observed = package_environment.preflight_environment(
         local_wheel, (helper_wheel.resolve(),), canonical.write(base_with_helper)
     )
     assert len(carried) == 2 and len(reused) == 1
@@ -517,7 +519,7 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     def mark(digest: str, length: int, path: Path) -> None:
         verified.record(digest, length, path)
 
-    def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+    def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
         return _describe_with_environment(installed, distribution)
 
     target_store = root / "modeled-target"
@@ -972,7 +974,7 @@ def _expect_modeled_refusal(
     base: Path,
     cache: Path,
     artifact_store: Path,
-    describe: Callable[[overlay.InstalledEnvironment, str], bytes],
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     delegation: dict[str, Any],
     files: list[pb.LocalDownloadFile],
     want: str,

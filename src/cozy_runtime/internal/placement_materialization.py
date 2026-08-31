@@ -1,7 +1,7 @@
-"""Exact artifact intake and package-overlay document join.
+"""Exact artifact intake and package-environment document join.
 
 Tensorhub owns the document schemas and delivery grants.  This module owns the one Runtime
-join from their already-fetched exact bytes to :class:`overlay.Input`. Local paths are
+join from their already-fetched exact bytes to :class:`package_environment.Input`. Local paths are
 deliberately function arguments: they never enter a canonical release document.
 
 cr-048 RETIRED THE BOOT CLOSURE. ``tensorhub.rental_provision_spec/1`` and
@@ -13,7 +13,7 @@ ready-but-EMPTY: GPU inventory measured, listeners proven, receipt
 published, zero placements. What survives here is the DISCIPLINE, not the vehicle:
 ``fetch_exact`` (one bounded exact-digest HTTPS grant) and ``materialize_objects`` (exact CAS
 admission) are the primitives the dynamic grant lane fetches through, and
-``package_overlay_input`` is the small source/custom-wheel join a placement converges to.
+``package_environment_input`` is the small source/dependency-wheel join a placement converges to.
 Only the boot-only bundling retired.
 """
 
@@ -31,12 +31,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, host_paths, overlay, pull
+from cozy_runtime.internal import canonical, host_paths, package_environment, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
 ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
-MAX_OVERLAY_BYTES = 4 << 30
+MAX_PACKAGE_ENVIRONMENT_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
 ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
 LOCAL_ARTIFACT_STORE_ROOT = host_paths.ARTIFACT_STORE
@@ -266,8 +266,8 @@ def _fsync(path: Path) -> None:
 
 
 def baked_base_manifest(
-    manifest_path: Path = overlay.DEFAULT_BASE_MANIFEST,
-) -> overlay.BaseManifest:
+    manifest_path: Path = package_environment.DEFAULT_BASE_MANIFEST,
+) -> package_environment.BaseManifest:
     """Read the trusted image-owned base profile before any hardware probe."""
 
     try:
@@ -276,15 +276,15 @@ def baked_base_manifest(
         raise LaunchRefusal("control_runtime_manifest_unreadable", str(exc)) from exc
     manifest_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     try:
-        return overlay.parse_base_manifest(raw, manifest_digest)
-    except overlay.OverlayRefusal as exc:
+        return package_environment.parse_base_manifest(raw, manifest_digest)
+    except package_environment.EnvironmentRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
 
 
 def control_runtime_digest(
-    manifest_path: Path = overlay.DEFAULT_BASE_MANIFEST,
+    manifest_path: Path = package_environment.DEFAULT_BASE_MANIFEST,
     *,
-    manifest: overlay.BaseManifest | None = None,
+    manifest: package_environment.BaseManifest | None = None,
 ) -> str:
     """Read the exact image-owned control Runtime wheel identity.
 
@@ -307,15 +307,15 @@ def control_runtime_digest(
     return matches[0]
 
 
-def package_overlay_input(
+def package_environment_input(
     *,
     package: Mapping[str, Any],
     environment: Mapping[str, Any],
     environment_digest: str,
     wheelhouse_manifest_bytes: bytes,
     wheel_paths: Mapping[str, Path],
-    verified_wheels: Mapping[str, overlay.VerifiedFile] | None = None,
-) -> overlay.Input:
+    verified_wheels: Mapping[str, package_environment.VerifiedFile] | None = None,
+) -> package_environment.Input:
     """Join direct executable package facts with the selected inline Environment."""
 
     fields = set(package)
@@ -356,8 +356,8 @@ def package_overlay_input(
         )
     base_digest = _digest(wheelhouse_manifest_bytes)
     try:
-        overlay.parse_base_manifest(wheelhouse_manifest_bytes, base_digest)
-    except overlay.OverlayRefusal as exc:
+        package_environment.parse_base_manifest(wheelhouse_manifest_bytes, base_digest)
+    except package_environment.EnvironmentRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
 
     project = _wheel(package["project_wheel"], "project", import_roots=True, nested_ref=True)
@@ -370,11 +370,11 @@ def package_overlay_input(
         environment.get("wheels", []), "environment", import_roots=True, nested_ref=True
     )
     measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
-    if project.length > MAX_OVERLAY_BYTES - measured_custom_bytes:
+    if project.length > MAX_PACKAGE_ENVIRONMENT_BYTES - measured_custom_bytes:
         raise LaunchRefusal(
-            "overlay_byte_budget_exceeded",
+            "package_environment_byte_budget_exceeded",
             f"project_plus_custom={project.length + measured_custom_bytes} "
-            f"budget={MAX_OVERLAY_BYTES}",
+            f"budget={MAX_PACKAGE_ENVIRONMENT_BYTES}",
         )
     wheels.extend(custom_wheels)
     digests = [wheel.digest for wheel in wheels]
@@ -388,13 +388,13 @@ def package_overlay_input(
         missing = sorted(granted_digests - set(wheel_paths))
         extra = sorted(set(wheel_paths) - granted_digests)
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
-    return overlay.Input(
+    return package_environment.Input(
         environment_digest=environment_digest,
         base_family_digest=base_digest,
         project_wheel_digest=project.digest,
         wheels=tuple(wheels),
         grants=tuple(
-            overlay.BlobGrant(
+            package_environment.BlobGrant(
                 wheel.digest,
                 wheel.length,
                 wheel_paths[wheel.digest],
@@ -420,7 +420,7 @@ def _matches(raw: bytes, digest: str, name: str) -> None:
 
 def _wheels(
     value: object, owner: str, *, import_roots: bool = False, nested_ref: bool = False
-) -> list[overlay.Wheel]:
+) -> list[package_environment.Wheel]:
     if not isinstance(value, list):
         raise LaunchRefusal(f"{owner}_wheel_inventory_invalid", "wheels is not a list")
     wheels = [_wheel(row, owner, import_roots=import_roots, nested_ref=nested_ref) for row in value]
@@ -434,7 +434,7 @@ def _wheels(
 
 def _wheel(
     value: object, owner: str, *, import_roots: bool = False, nested_ref: bool = False
-) -> overlay.Wheel:
+) -> package_environment.Wheel:
     keys = (
         {"ref", "distribution", "filename", "tags", "version"}
         if nested_ref
@@ -460,9 +460,9 @@ def _wheel(
     strings = (distribution, filename, version)
     if (
         not all(isinstance(item, str) and item for item in strings)
-        or not overlay.normalized_distribution(str(distribution))
-        or not overlay.valid_wheel_filename(str(filename))
-        or not overlay.valid_wheel_version(str(version))
+        or not package_environment.normalized_distribution(str(distribution))
+        or not package_environment.valid_wheel_filename(str(filename))
+        or not package_environment.valid_wheel_version(str(version))
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "wheel strings are empty or invalid")
     length = reference["length"]
@@ -471,26 +471,30 @@ def _wheel(
         not isinstance(length, int)
         or isinstance(length, bool)
         or length <= 0
-        or length > overlay.MAX_WHEEL_BYTES
+        or length > package_environment.MAX_WHEEL_BYTES
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "length is not positive and bounded")
     if (
         not isinstance(tags, list)
         or not tags
-        or not all(isinstance(tag, str) and overlay.valid_wheel_tag(tag) for tag in tags)
+        or not all(
+            isinstance(tag, str) and package_environment.valid_wheel_tag(tag) for tag in tags
+        )
         or tags != sorted(set(tags))
     ):
         raise LaunchRefusal(f"{owner}_wheel_invalid", "tags are not non-empty sorted unique")
     roots = value.get("import_roots", [])
     if (
         not isinstance(roots, list)
-        or not all(isinstance(root, str) and overlay.valid_import_root(root) for root in roots)
+        or not all(
+            isinstance(root, str) and package_environment.valid_import_root(root) for root in roots
+        )
         or roots != sorted(set(roots))
     ):
         raise LaunchRefusal(
             f"{owner}_wheel_invalid", "import_roots are not sorted unique identifiers"
         )
-    return overlay.Wheel(
+    return package_environment.Wheel(
         distribution=value["distribution"],
         version=value["version"],
         filename=value["filename"],

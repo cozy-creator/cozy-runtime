@@ -26,7 +26,7 @@ from cozy_runtime.author import (
     Model,
 )
 from cozy_runtime.author._describe import describe
-from cozy_runtime.internal import canonical, descriptor, overlay
+from cozy_runtime.internal import canonical, descriptor, package_environment
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
@@ -400,7 +400,7 @@ def main() -> None:
             root=root / "job-plans",
             build_id=PRIVATE_REVISION,
             descriptor_path=descriptor_path,
-            installed=overlay.InstalledEnvironment(
+            installed=package_environment.InstalledEnvironment(
                 generation=root / "private-generation",
                 site_packages=root,
                 python=Path(sys.executable),

@@ -54,7 +54,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     hostfacts,
-    overlay,
+    package_environment,
     proctree,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
@@ -211,12 +211,14 @@ class WorkerOptions:
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
     environment_root: Path | None = None
-    """The materializer root whose receipt refs select content-keyed immutable overlays.
+    """The materializer root whose receipt refs select content-keyed immutable package venvs.
 
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
     """
-    base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST
+    environment_python: Path | None = None
+    """An already-complete local package venv; mutually exclusive with materialization root."""
+    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST
     """Exact base-worker-image WheelhouseManifest path; fixed default in production."""
     artifact_store: Path | None = None
     """The verified TensorFS store populated from the canonical model-root closure."""
@@ -626,7 +628,9 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         if names != sorted(set(names)):
             raise documents.DocumentError("sort_order", "Environment.wheels")
         if package["project_wheel"]["distribution"] in names:
-            raise documents.DocumentError("project_wheel_mismatch", "project wheel is in overlay")
+            raise documents.DocumentError(
+                "project_wheel_mismatch", "project wheel is in dependency wheels"
+            )
         measured_environment = documents.spell(
             documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
         )
@@ -990,7 +994,9 @@ class Worker:
                     "replace the active package through desired state",
                 )
 
-            def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+            def describe(
+                installed: package_environment.InstalledEnvironment, distribution: str
+            ) -> bytes:
                 changed = self.supervision.use_environment(
                     str(installed.python), installed.content_digest
                 )
@@ -2092,8 +2098,8 @@ class Worker:
         (fallback-retention #474 clauses 1-2), so an incoming failure costs zero intake
         interruption and LATCHES for this desired revision rather than looping (clause 5).
 
-        `MATERIALIZATION_STATE_STAGED` asserts that the exact overlay installed and imported;
-        it is unspeakable otherwise (§8).
+        `MATERIALIZATION_STATE_STAGED` asserts that the exact package environment installed
+        and imported; it is unspeakable otherwise (§8).
         """
         candidate = self.pending or self.placement
         assert candidate is not None
@@ -2122,7 +2128,7 @@ class Worker:
                 str(installed.python), installed.content_digest
             )
             if changed and self.supervision.current is not None:
-                self.supervision.current.poisoned = "package overlay generation changed"
+                self.supervision.current.poisoned = "package environment generation changed"
         bindings = dict(acquired.bindings)
         if revision != self.accepted.accepted_desired_state_revision:
             self.note("materialization", f"revision {revision} was superseded before hand-off")
@@ -2312,16 +2318,18 @@ class Worker:
                     terminal=True,
                 )
                 return None
-        if self.options.environment_root is None or self.options.artifact_store is None:
+        if (
+            self.options.environment_root is None and self.options.environment_python is None
+        ) or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
-                    detail="this worker was launched without --environment-root and "
-                    "--artifact-store; the worker will not "
-                    "guess where the worker put package overlays or TensorFS objects",
+                    detail="this worker was launched without --environment-root or "
+                    "--environment-python and --artifact-store; the worker will not "
+                    "guess where the worker put package environments or TensorFS objects",
                 ),
                 terminal=False,
             )
@@ -2340,14 +2348,33 @@ class Worker:
             )
             return None
         try:
+            installed_environment = None
+            if self.options.environment_python is not None:
+                package = placement.package or placement.development
+                release_digest = package.get("release_digest") or package.get(
+                    "private_revision_digest"
+                )
+                if not isinstance(release_digest, str):
+                    raise package_environment.EnvironmentRefusal(
+                        "package_environment_release_digest_absent",
+                        "preinstalled package selection has no immutable release digest",
+                    )
+                installed_environment = package_environment.open_existing_environment(
+                    self.options.environment_python, release_digest
+                )
+            environment_root = self.options.environment_root or (
+                installed_environment.generation if installed_environment is not None else None
+            )
+            assert environment_root is not None
             acquirer = acquire.Acquirer(
                 downloads.DownloadPlan(),
                 cache_root=self.options.artifact_cache,
-                environment_root=self.options.environment_root,
-                selection_root=self.options.environment_root / "selections",
+                environment_root=environment_root,
+                selection_root=self.options.artifact_cache / "selections",
                 artifact_store=self.options.artifact_store,
-                python=Path(sys.executable),
+                python=self.options.environment_python or Path(sys.executable),
                 base_manifest=self.options.base_manifest,
+                installed_environment=installed_environment,
                 verified_cache=self.verified_artifacts,
                 on_observation=lambda value: self._observe_acquisition(placement, value),
             )
@@ -2381,19 +2408,21 @@ class Worker:
                 terminal=exc.kind in (pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,),
             )
             return None
-        except (OSError, overlay.OverlayRefusal) as exc:
-            reason = exc.code if isinstance(exc, overlay.OverlayRefusal) else "io_error"
+        except (OSError, package_environment.EnvironmentRefusal) as exc:
+            reason = (
+                exc.code if isinstance(exc, package_environment.EnvironmentRefusal) else "io_error"
+            )
             self._materialization_failed(
                 placement,
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
-                    if isinstance(exc, overlay.OverlayRefusal)
+                    if isinstance(exc, package_environment.EnvironmentRefusal)
                     else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                     subject=placement.placement_id,
                     reason=reason,
                     detail=safe(str(exc)),
                 ),
-                terminal=isinstance(exc, overlay.OverlayRefusal),
+                terminal=isinstance(exc, package_environment.EnvironmentRefusal),
             )
             return None
 
@@ -2498,9 +2527,7 @@ class Worker:
             )
             self.latched = "job_plan_mismatch"
             return
-        self.supervision.use_environment(
-            binding.python, binding.environment_content_digest
-        )
+        self.supervision.use_environment(binding.python, binding.environment_content_digest)
         self.jobs[job.job_descriptor_id] = binding
         self.engine.jobs = self.jobs
         self.job_caps = job.resource_caps
@@ -3830,7 +3857,12 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-root",
         default="",
-        help="package-overlay root containing exact receipts and content-keyed generations",
+        help="package-environment root containing exact receipts and content-keyed generations",
+    )
+    parser.add_argument(
+        "--environment-python",
+        default="",
+        help="Python from one already-complete local package venv",
     )
     parser.add_argument(
         "--artifact-cache",
@@ -3840,8 +3872,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--base-manifest",
-        default=str(overlay.DEFAULT_BASE_MANIFEST),
-        help="exact base worker image WheelhouseManifest used for overlay ownership",
+        default=str(package_environment.DEFAULT_BASE_MANIFEST),
+        help="exact base worker image WheelhouseManifest used for package ownership",
     )
     parser.add_argument(
         "--artifact-store",
@@ -3863,6 +3895,14 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
+
+    if args.environment_root and args.environment_python:
+        print(
+            "[worker] --environment-root and --environment-python are mutually exclusive",
+            file=sys.stderr,
+            flush=True,
+        )
+        return int(Exit.structural)
 
     if args.control_runtime_digest and not _CONTROL_RUNTIME_DIGEST.fullmatch(
         args.control_runtime_digest
@@ -3925,6 +3965,12 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
         environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
+        environment_python=(
+            Path(args.environment_python).expanduser().parent.resolve()
+            / Path(args.environment_python).name
+            if args.environment_python
+            else None
+        ),
         base_manifest=Path(args.base_manifest).resolve(),
         artifact_store=Path(args.artifact_store).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,

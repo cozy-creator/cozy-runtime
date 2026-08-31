@@ -684,7 +684,7 @@ def fence_base_ownership_vectors() -> list[str]:
     import hashlib
 
     sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical, overlay
+    from cozy_runtime.internal import canonical, package_environment
     from cozy_runtime.internal.placement_materialization import control_runtime_digest
     from cozy_runtime.internal.refusal import LaunchRefusal
 
@@ -712,9 +712,9 @@ def fence_base_ownership_vectors() -> list[str]:
         raw = canonical.write(document)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         try:
-            manifest = overlay.parse_base_manifest(raw, digest)
+            manifest = package_environment.parse_base_manifest(raw, digest)
             got = "ok"
-        except overlay.OverlayRefusal as exc:
+        except package_environment.EnvironmentRefusal as exc:
             got = exc.code
         if got != expected:
             bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
@@ -761,7 +761,7 @@ def fence_base_ownership_vectors() -> list[str]:
             ("cuda", "cu130"),
         ),
     )
-    manifests: dict[str, overlay.BaseManifest] = {}
+    manifests: dict[str, package_environment.BaseManifest] = {}
     manifest_digests: dict[str, str] = {}
     for filename, length, expected_digest, expected_census, accelerator in mirror_specs:
         cross = root / filename
@@ -772,8 +772,8 @@ def fence_base_ownership_vectors() -> list[str]:
                 f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
             )
         try:
-            manifest = overlay.parse_base_manifest(raw, digest)
-        except overlay.OverlayRefusal as exc:
+            manifest = package_environment.parse_base_manifest(raw, digest)
+        except package_environment.EnvironmentRefusal as exc:
             bad.append(f"{cross}: Runtime refused Tensorhub bytes: {exc.code}: {exc.detail}")
             continue
         manifests[filename] = manifest
@@ -837,10 +837,10 @@ def fence_base_ownership_vectors() -> list[str]:
     if cu130_manifest is not None:
         base_family_digest = manifest_digests["base-worker-image-wheelhouse-cu130.json"]
 
-        def counted_wheel(index: int, owner: str) -> overlay.Wheel:
+        def counted_wheel(index: int, owner: str) -> package_environment.Wheel:
             label = "project" if owner == "project" else f"custom-{index:03d}"
             distribution = f"cr027-{label}"
-            return overlay.Wheel(
+            return package_environment.Wheel(
                 distribution=distribution,
                 version="1.0.0",
                 filename=f"{distribution}-1.0.0-py3-none-any.whl",
@@ -853,12 +853,12 @@ def fence_base_ownership_vectors() -> list[str]:
 
         project = counted_wheel(0, "project")
 
-        def counted_input(custom_count: int) -> overlay.Input:
+        def counted_input(custom_count: int) -> package_environment.Input:
             wheels = (
                 project,
                 *(counted_wheel(index, "custom") for index in range(custom_count)),
             )
-            return overlay.Input(
+            return package_environment.Input(
                 environment_digest="sha256:" + "1" * 64,
                 base_family_digest=base_family_digest,
                 project_wheel_digest=project.digest,
@@ -866,19 +866,19 @@ def fence_base_ownership_vectors() -> list[str]:
                 grants=(),
             )
 
-        admitted = overlay._verify_inventory(counted_input(128), cu130_manifest)
-        if len(admitted) != overlay.MAX_PACKAGE_WHEELS:
+        admitted = package_environment._verify_inventory(counted_input(128), cu130_manifest)
+        if len(admitted) != package_environment.MAX_PACKAGE_WHEELS:
             bad.append(
                 f"cr-027 wheel-count boundary admitted {len(admitted)} rows, "
-                f"want {overlay.MAX_PACKAGE_WHEELS}"
+                f"want {package_environment.MAX_PACKAGE_WHEELS}"
             )
         try:
-            overlay._verify_inventory(counted_input(129), cu130_manifest)
-        except overlay.OverlayRefusal as exc:
-            if exc.code != "overlay_wheel_set_invalid" or exc.detail != "130":
+            package_environment._verify_inventory(counted_input(129), cu130_manifest)
+        except package_environment.EnvironmentRefusal as exc:
+            if exc.code != "package_environment_wheel_set_invalid" or exc.detail != "130":
                 bad.append(
                     "cr-027 129-custom refusal was "
-                    f"{exc.code}:{exc.detail}, want overlay_wheel_set_invalid:130"
+                    f"{exc.code}:{exc.detail}, want package_environment_wheel_set_invalid:130"
                 )
         else:
             bad.append("cr-027 admitted 129 custom wheels plus the project wheel")
@@ -911,7 +911,7 @@ def fence_tensorhub_package_release() -> list[str]:
 
     sys.path.insert(0, str(ROOT / "src"))
     from cozy_runtime.internal import canonical
-    from cozy_runtime.internal.placement_materialization import package_overlay_input
+    from cozy_runtime.internal.placement_materialization import package_environment_input
     from cozy_runtime.internal.refusal import LaunchRefusal
 
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
@@ -976,7 +976,7 @@ def fence_tensorhub_package_release() -> list[str]:
         "release_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
     }
     try:
-        joined = package_overlay_input(
+        joined = package_environment_input(
             package=package,
             environment=environment,
             environment_digest=environment_digest,
@@ -993,7 +993,7 @@ def fence_tensorhub_package_release() -> list[str]:
     flat.update(project_ref)
     flat.pop("ref", None)
     try:
-        package_overlay_input(
+        package_environment_input(
             package={**package, "project_wheel": flat},
             environment=environment,
             environment_digest=environment_digest,
@@ -1258,7 +1258,8 @@ def fence_descriptor_minimality() -> list[str]:
 #: they enter implementation/plan digests but are not documents.
 DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
-    "cozy.runtime.EnvironmentReceipt/1": "internal/overlay.py",
+    "cozy.runtime.EnvironmentReceipt/1": "internal/package_environment.py",
+    "cozy.runtime.PackageEnvironment/1": "internal/package_environment.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
@@ -1315,6 +1316,7 @@ def fence_document_kinds() -> list[str]:
     expected = {
         "cozy.package.descriptor/1",
         "cozy.runtime.EnvironmentReceipt/1",
+        "cozy.runtime.PackageEnvironment/1",
         "cozy.runtime.ModelConstructionContract/1",
     }
     if set(DOCUMENT_KINDS) != expected:

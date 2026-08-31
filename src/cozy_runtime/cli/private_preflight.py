@@ -1,4 +1,4 @@
-"""Portable private-package admission over Runtime's one overlay policy."""
+"""Portable private-package admission over Runtime's package-environment policy."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from packaging.utils import canonicalize_name
 
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import descriptor as package_descriptor
-from cozy_runtime.internal import overlay
+from cozy_runtime.internal import package_environment
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -124,7 +124,7 @@ def run(args: list[str], _opts: Options) -> Result:
 
     compatible: list[dict[str, object]] = []
     refused: list[dict[str, str]] = []
-    measured_wheels: tuple[overlay.Wheel, ...] | None = None
+    measured_wheels: tuple[package_environment.Wheel, ...] | None = None
     seen_bases: set[tuple[Path, str]] = set()
     bases: list[tuple[Path, str, bytes]] = []
     for value in base_values:
@@ -149,8 +149,10 @@ def run(args: list[str], _opts: Options) -> Result:
 
     for base_path, base_digest, base_raw in bases:
         try:
-            base, wheels, observed = overlay.preflight_overlay(project_path, dependencies, base_raw)
-        except overlay.OverlayRefusal as exc:
+            base, wheels, observed = package_environment.preflight_environment(
+                project_path, dependencies, base_raw
+            )
+        except package_environment.EnvironmentRefusal as exc:
             refused.append({"base": base_digest, "code": exc.code, "detail": exc.detail})
             continue
         facts = {wheel.filename: wheel for wheel in observed}
