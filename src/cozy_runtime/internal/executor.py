@@ -52,6 +52,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
+from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
 from cozy_runtime.internal.config import seal_snapshot
@@ -1040,6 +1041,60 @@ class Executor:
 
     # ------------------------------------------------------------------ job
 
+    def _job_models(self, surface: Any, command: Mapping[str, Any], store: Any) -> dict[str, Any]:
+        """Create typed Manifest-only Model instances; construct/load no package state."""
+        declared = {binding.param: binding for binding in surface.model_bindings}
+        rows = command.get("models")
+        if rows is None:
+            rows = {}
+        if not isinstance(rows, Mapping) or set(rows) != set(declared):
+            carried = sorted(str(key) for key in rows) if isinstance(rows, Mapping) else []
+            raise CapabilityError(
+                f"job declares Model parameters {sorted(declared) or 'none'} and the worker "
+                f"passed {carried if isinstance(rows, Mapping) else 'a non-object'}",
+                code="job_model_binding_mismatch",
+            )
+        models: dict[str, Any] = {}
+        for parameter in sorted(declared):
+            row = rows[parameter]
+            binding = declared[parameter]
+            if not isinstance(row, Mapping) or row.get("class") != binding.class_key:
+                raise CapabilityError(
+                    f"job Model parameter {parameter!r} changed its descriptor class",
+                    code="job_model_class_mismatch",
+                )
+            manifest = str(row.get("manifest", ""))
+            try:
+                length = int(row.get("length", 0))
+            except (TypeError, ValueError) as exc:
+                raise CapabilityError(
+                    f"job Model parameter {parameter!r} has a malformed Manifest length",
+                    code="job_model_manifest_invalid",
+                ) from exc
+            try:
+                digest = documents.raw(manifest)
+            except (documents.DocumentError, ValueError) as exc:
+                raise CapabilityError(
+                    f"job Model parameter {parameter!r} has a malformed Manifest identity",
+                    code="job_model_manifest_invalid",
+                ) from exc
+            if manifest != documents.spell(digest) or length <= 0:
+                raise CapabilityError(
+                    f"job Model parameter {parameter!r} has a noncanonical Manifest ref",
+                    code="job_model_manifest_invalid",
+                )
+            try:
+                held = store.manifest(manifest)
+                if len(bytes(held["manifest"])) != length:
+                    raise ValueError("Manifest length changed")
+            except Exception as exc:
+                raise CapabilityError(
+                    f"job Model parameter {parameter!r} is absent or stale in TensorFS",
+                    code="job_model_manifest_unavailable",
+                ) from exc
+            models[parameter] = _derive_model(binding.model_class, manifest)
+        return models
+
     def run_job(self, command: dict[str, Any]) -> dict[str, Any]:
         """ONE `@app.job`, run to completion through the SAME invocation kernel (cr-009).
 
@@ -1049,8 +1104,8 @@ class Executor:
 
         1. **No prepared generation is required.** A job with no Model parameter never
            imports torch in this process at all — a CPU-class conversion job pays no CUDA
-           init and holds no device. A job that DOES declare a Model was prepared exactly
-           like a serving attempt and reuses that construction for its one attempt.
+           init and holds no device. A job Model is a typed, derive-only exact Manifest
+           capability: no Loader construction, component state, or serving residency exists.
         2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
            durable checkpoint exchange, and the typed budget facts.
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
@@ -1087,9 +1142,28 @@ class Executor:
         if scratch is not None:
             scratch.mkdir(parents=True, exist_ok=True)
 
-        artifact_open = None
-        if surface.artifact_outputs:
-            from cozy_runtime.internal import artifact_sink, fill, pull
+        job_models: dict[str, Any] = {}
+        store = None
+        if surface.model_bindings:
+            from cozy_runtime.internal import fill
+
+            store_value = str(command.get("artifact_store", ""))
+            if not store_value or not Path(store_value).is_dir():
+                return {
+                    "ok": False,
+                    "code": "job_model_store_unavailable",
+                    "detail": "this model-bound job has no existing TensorFS store",
+                }
+            try:
+                store = fill.tensorfs_module().Store.open(store_value)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "code": "job_model_store_unavailable",
+                    "detail": f"TensorFS store refused ({type(exc).__name__})",
+                }
+        elif surface.artifact_outputs:
+            from cozy_runtime.internal import fill, pull
 
             store_value = str(command.get("artifact_store", ""))
             if not store_value:
@@ -1098,11 +1172,29 @@ class Executor:
                     "code": "artifact_store_unavailable",
                     "detail": "this artifact-producing job has no verified TensorFS store",
                 }
-            store = pull.open_store(fill.tensorfs_module(), Path(store_value))
-            allowed_sources: dict[str, int] = {}
-            for model in self.models.values():
-                manifest = store.manifest(model.checkpoint_ref)
-                allowed_sources[model.checkpoint_ref] = len(manifest["manifest"])
+            try:
+                store = pull.open_store(fill.tensorfs_module(), Path(store_value))
+            except pull.PullRefusal as exc:
+                return {"ok": False, "code": "artifact_store_unavailable", "detail": exc.message}
+        try:
+            job_models = self._job_models(surface, command, store)
+        except CapabilityError as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
+
+        artifact_open = None
+        if surface.artifact_outputs:
+            from cozy_runtime.internal import artifact_sink
+
+            if store is None:
+                return {
+                    "ok": False,
+                    "code": "artifact_store_unavailable",
+                    "detail": "this artifact-producing job has no verified TensorFS store",
+                }
+            allowed_sources = {
+                model.checkpoint_ref: int(command["models"][parameter]["length"])
+                for parameter, model in job_models.items()
+            }
 
             owner_scope = str(command.get("artifact_owner_scope", ""))
             artifact_request_id = str(command.get("artifact_request_id", ""))
@@ -1230,7 +1322,7 @@ class Executor:
                 deadline=_deadline(command["deadline_s"]),
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
-                models=self.models,
+                models=job_models,
                 trees={
                     ref: (Path(root), digest)
                     for ref, (root, digest) in (command.get("trees") or {}).items()

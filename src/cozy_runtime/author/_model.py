@@ -357,6 +357,7 @@ class Model[PipelineT]:
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_residency: Residency | None = None
+    _cozy_derive_only = False
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
 
@@ -410,6 +411,25 @@ class Model[PipelineT]:
                 )
 
     # ----------------------------------------------------------------- lifecycle
+
+    def __getattribute__(self, name: str) -> object:
+        derive_only = bool(object.__getattribute__(self, "_cozy_derive_only"))
+        if derive_only:
+            if name in {"load", "unload", "for_request", "_cozy_scope"}:
+                raise CapabilityError(
+                    f"{type(self).__name__}.{name}: this job Model is an exact Manifest "
+                    "capability for ArtifactSink derivation, not a loadable generation",
+                    code="derive_model_read_only",
+                    fields=[name],
+                )
+            if name in _declared_state(type(self)):
+                raise CapabilityError(
+                    f"{type(self).__name__}.{name}: derive-only job Models expose no "
+                    "constructed component state",
+                    code="derive_model_component_unavailable",
+                    fields=[name],
+                )
+        return object.__getattribute__(self, name)
 
     def load(self, loader: Loader) -> None:
         """Construct this model from the bound artifact. The runtime owns WHEN it runs."""
@@ -602,6 +622,31 @@ def _declared_state(cls: type) -> tuple[str, ...]:
             if not name.startswith("_") and name not in names:
                 names.append(name)
     return tuple(names)
+
+
+def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
+    """Construct no package state: bind one typed Model instance to one exact Manifest."""
+    if not checkpoint_ref.startswith("sha256:") or len(checkpoint_ref) != 71:
+        raise ConformanceError(
+            "derive-only Model requires one lowercase sha256 Manifest identity",
+            code="derive_model_manifest_invalid",
+        )
+    try:
+        raw = bytes.fromhex(checkpoint_ref[7:])
+    except ValueError as exc:
+        raise ConformanceError(
+            "derive-only Model Manifest identity is malformed",
+            code="derive_model_manifest_invalid",
+        ) from exc
+    if len(raw) != 32 or checkpoint_ref != "sha256:" + raw.hex():
+        raise ConformanceError(
+            "derive-only Model Manifest identity is not canonical",
+            code="derive_model_manifest_invalid",
+        )
+    model = object.__new__(cls)
+    object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
+    object.__setattr__(model, "_cozy_derive_only", True)
+    return model
 
 
 @final

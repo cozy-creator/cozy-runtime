@@ -173,6 +173,9 @@ class LocalRequest:
     #: position. The worker still verifies every byte and sniffs its type. Ordered,
     #: identified subjects — never a digest-sorted anonymous list (worker-protocol/01).
     inputs: Mapping[str, LocalInput] = field(default_factory=dict)
+    #: JOB mode only: descriptor parameter -> exact Manifest (digest, length). The local
+    #: harness stands in for a RecordOwner that already completed model-source preparation.
+    models: Mapping[str, tuple[str, int]] = field(default_factory=dict)
     org: str = "local"
     """The publishing org. A job's outputs are hub-rewritten into the scratch model
     `<org>/_job-<request-id>` — the underscore is deliberately outside the public model
@@ -724,6 +727,17 @@ class LocalRecordOwner:
                     order=local_input.order,
                 )
             )
+        if self.request.kind == "job":
+            for parameter, (manifest, length) in sorted(self.request.models.items()):
+                rows.append(
+                    pb.InputBinding(
+                        input_id=f"{grants_module.MODEL_PREFIX}{parameter}",
+                        digest=manifest,
+                        length=length,
+                        kind_mime=grants_module.MODEL_MIME,
+                        order=0,
+                    )
+                )
         return rows
 
     def _output_bindings(self) -> list[pb.OutputBinding]:
@@ -820,6 +834,14 @@ class LocalRecordOwner:
             pb.InputAccess(input_id=input_id, url=f"file://{Path(item.source).resolve()}")
             for input_id, item in sorted(self.request.inputs.items())
         ]
+        if self.request.kind == "job":
+            inputs += [
+                pb.InputAccess(
+                    input_id=f"{grants_module.MODEL_PREFIX}{parameter}",
+                    url=f"model://{manifest}",
+                )
+                for parameter, (manifest, _length) in sorted(self.request.models.items())
+            ]
         return pb.DeliveryGrant(
             invocation_spec_digest=invocation_digest,
             credential=pb.DeliveryAccessCredential(

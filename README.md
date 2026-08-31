@@ -96,8 +96,8 @@ header, or authentication fallback.
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
-boundary: PackageDescriptor, EnvironmentReceipt, ModelConstructionContract, and the discriminated
-Qualification document. `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
+boundary: PackageDescriptor, EnvironmentReceipt, and ModelConstructionContract.
+`IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
 implementation, plan, and generation digests; those names are executable identity, not document
 formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
 are typed by their command/path or storage table and carry no global format tag.
@@ -283,7 +283,7 @@ executor starts with image Python and appends the exact content import root afte
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying
 package, semantic release, and source digest, then launches Runtime with the matching local path
-and facts. No project wheel, release.json, Environment, receipt, or Qualification is invented.
+and facts. No project wheel, release.json, Environment, or receipt is invented.
 For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
 joins the exact release/lane through the explicitly granted local TensorFS Repository. The
 Placement carries the ordinary exact Manifest/config/component facts but no MCC; at acquisition
@@ -414,8 +414,8 @@ build. It requires both reports to be identical and to satisfy the exact Wheelho
 minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM are measured through
 `nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
 command emits a bounded result DTO containing those measured facts. Tensorhub normalizes the
-result into its own rows and alone authors the final two-field Qualification after all required
-evidence is accepted.
+result into its own rows and alone decides whether the measured evidence qualifies the package
+for that hardware class. Runtime authors no second qualification document.
 
 The receipt-selected, content-keyed overlay then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
@@ -480,8 +480,8 @@ real CAS, so they are BUILDER-RUN and never CI steps):
 
 Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
 `--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
-and the normal worker/attempt kernel applies the host's real GPU qualification. It never authors a
-flat binding record or pretends the local selection is a Hub Qualification. The focused
+and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a
+flat binding record or pretends the local selection carries Tensorhub's hardware evidence. The focused
 `proofs/internal/modeled_development_acceptance.py` proof builds a tiny local release and checks
 selection/acquisition plus drift refusals without claiming GPU execution; the existing
 `scripts/pipeline-live.py image/arms` runs remain the real-GPU output and floor evidence.

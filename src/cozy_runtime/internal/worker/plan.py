@@ -194,8 +194,8 @@ class JobBinding:
 
     There is deliberately no residency, no component set and no construction digest here. A
     job has no model residency: no warm pool, no serving pointer, no LRU, no idle dwell and
-    no second network door (§2). A job that declares read-only Model params constructs them
-    for THAT attempt through the ordinary Loader path and never retains them.
+    no second network door (§2). A job Model parameter is a derive-only typed view of one
+    attempt-held TensorFS Manifest; package load/component access is unavailable.
     """
 
     job_descriptor_id: str
