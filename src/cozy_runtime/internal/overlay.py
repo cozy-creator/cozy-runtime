@@ -621,7 +621,10 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
     if ownership == "observed-local":
-        if value["wheels"] != [] or not cpu_profile or profile["torch_release"] != "none":
+        # A local Runtime observes either its lightweight CPU environment or the exact
+        # Torch/CUDA environment Creator uses for local GPU execution. Unlike an image,
+        # an installed environment has no retained source wheel bytes to claim here.
+        if value["wheels"] != []:
             raise OverlayRefusal("base_family_manifest_invalid", "invalid observed-local base")
         wheels: tuple[Wheel, ...] = ()
     else:
