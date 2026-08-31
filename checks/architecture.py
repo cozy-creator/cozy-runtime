@@ -11,6 +11,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   construction-fill-order
   one-address-predicate
   dynamic-pods-skip-boot-warm
+  worker-control-memory-state
   delivery-plan-observation
   pod-media-grant-root
   measured-backend-version
@@ -1539,6 +1540,36 @@ def fence_dynamic_pods_skip_boot_warm() -> list[str]:
     return []
 
 
+def fence_worker_control_memory_state() -> list[str]:
+    """Every WorkerControl server is process-local; its caller owns restart recovery."""
+
+    bad: list[str] = []
+    session = (SRC / "internal" / "worker" / "session.py").read_text()
+    if "self.journal = Journal()" not in session:
+        bad.append(
+            "src/cozy_runtime/internal/worker/session.py: memory-only worker state no longer "
+            "uses one pathless log"
+        )
+    for spelling in ("journal.log", "persistent_state", "restore_ownership(", ".recover()"):
+        if spelling in session:
+            bad.append(
+                "src/cozy_runtime/internal/worker/session.py: WorkerControl retained "
+                f"restart state through {spelling!r}"
+            )
+    if "def instance_identity(" in session or 'root / "instance-id"' in session:
+        bad.append(
+            "src/cozy_runtime/internal/worker/session.py: WorkerControl retained an "
+            "instance recovery file"
+        )
+    runtime_worker = (SRC / "cli" / "runtime_worker.py").read_text()
+    if "persistent_state" in runtime_worker:
+        bad.append(
+            "src/cozy_runtime/cli/runtime_worker.py: persistence is a launch option; all "
+            "WorkerControl children must be process-local"
+        )
+    return bad
+
+
 def fence_delivery_plan_observation() -> list[str]:
     """Delivery narration consumes the current plural kernel census, never retired keys."""
 
@@ -1705,6 +1736,7 @@ FENCES = {
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
+    "worker-control-memory-state": fence_worker_control_memory_state,
     "delivery-plan-observation": fence_delivery_plan_observation,
     "pod-media-grant-root": fence_pod_media_grant_root,
     "measured-backend-version": fence_measured_backend_version,

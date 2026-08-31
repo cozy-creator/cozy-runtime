@@ -85,11 +85,11 @@ header, or authentication fallback.
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
 | `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
-| `internal/worker/triage.py` | bounded triage assembly and its journal-backed store |
+| `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
 | `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
-| `internal/journal.py` | the durable, self-verifying attempt/terminal journal |
+| `internal/journal.py` | same-process attempt state; callers own restart recovery |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
@@ -109,7 +109,7 @@ list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
 ephemeral local worker whose RecordOwner is a pair of in-process queues, over the same
-process boundary, journal, acceptance boundary, freeze point and ledger. The rule is
+process boundary, attempt log, acceptance boundary, freeze point and ledger. The rule is
 structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
 exactly one caller (the device executor) and the attempt engine exactly one constructor (the
 worker session), so a direct-call runner beside them cannot be written without turning
@@ -267,13 +267,13 @@ metadata-only environment-spec change shares one compiled content tree and a one
 shares every unchanged installed inode. The spec-specific receipt remains a separate exact join.
 
 The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
-and drops package execution to uid/gid 65533. Receipts, acquisition cache, journal and worker
-credentials remain root-only. Content is root-owned/read-only, and executor scratch/probe state is
-private to one incarnation and deleted before the fixed uid is reused. A worker that cannot perform
-the identity split refuses before binding. Native/local development keeps its explicit same-user
-lane. Base bytecode is baked in the image and package bytecode is compiled once per content
-identity. The executor starts with image Python and appends the exact content import root after
-image-owned paths.
+and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
+pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and worker credentials
+remain root-only. Content is root-owned/read-only, and executor scratch/probe state is private to
+one incarnation and deleted before the fixed uid is reused. A worker that cannot perform the
+identity split refuses before binding. Native/local development keeps its explicit same-user lane.
+Base bytecode is baked in the image and package bytecode is compiled once per content identity. The
+executor starts with image Python and appends the exact content import root after image-owned paths.
 
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying

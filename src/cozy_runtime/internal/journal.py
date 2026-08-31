@@ -1,16 +1,15 @@
-"""The durable attempt/outcome journal — the worker's at-most-once evidence.
+"""The worker's same-process attempt/outcome record.
 
-Journal-before-send is the non-negotiable order (worker-protocol/02 §2): acceptance persists
-before AttemptAccepted, the outcome persists before AttemptOutcome, closure records only on
-AttemptOutcomeAck. Everything the worker may later CLAIM about an attempt is a line in this
-file, and a line is written with `fsync` before the claim leaves the process.
+WorkerControl always supplies no path: it retains reconnect state only for this process while
+its caller records exact control frames before exposing them. Explicit proof tooling may supply
+a path when testing the old disk-failure boundary; product workers never do.
 
 Journal honesty (§4): ENOSPC, corruption or I/O uncertainty means NO acknowledgement, NO
 execution, and no further acceptance — at-most-once is never claimed from memory. The
 mechanism is `stopped`: the first failed append latches it, and the worker's admission
 path reads it before anything else.
 
-Line format is `<sha256 hex> <canonical json>`: the digest is over exactly the canonical
+The durable line format is `<sha256 hex> <canonical json>`: the digest is over canonical
 bytes that follow, so a flipped byte anywhere in the record is a detected corruption rather
 than a plausible different record, and a re-emitted (pretty-printed, reordered) line refuses
 under the re-emit law. Recovery reads forward and stops at the first unreadable line — a
@@ -34,9 +33,9 @@ from cozy_runtime.internal import canonical
 #: Record kinds. Closed on purpose: a new kind is a schema change, not a new string.
 KINDS = (
     "session",  # a new session minted (control-parent boot)
-    "ownership",  # an ACCEPTED (record_owner_epoch, id), journaled before ClaimAck (#494e)
+    "ownership",  # an ACCEPTED (record_owner_epoch, id), recorded before ClaimAck
     # THE EXACT ACCEPTED SET BYTES (rev-2 §4). Never a re-serialization and never a
-    # structured projection: recovery, status attribution and the snapshot all quote these,
+    # structured projection: status attribution and the snapshot both quote these,
     # which is what makes "the set this worker accepted" a byte fact.
     "placement_set",
     "accepted",  # PREPARED acceptance: spec + plan + model-construction digests
@@ -70,9 +69,9 @@ class Record:
 
 @dataclass(slots=True)
 class Journal:
-    """An append-only, fsynced, self-verifying record log."""
+    """An append-only record log, fsynced when a path is supplied."""
 
-    path: Path
+    path: Path | None = None
     _fd: int = -1
     seq: int = 0
     stopped: str = ""
@@ -82,6 +81,8 @@ class Journal:
     records: list[Record] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.path is None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.records = list(self._load())
         self.seq = self.records[-1].seq if self.records else 0
@@ -90,6 +91,8 @@ class Journal:
     # ------------------------------------------------------------------ read
 
     def _load(self) -> Iterator[Record]:
+        if self.path is None:
+            return
         if not self.path.exists():
             return
         raw = self.path.read_bytes()
@@ -114,6 +117,7 @@ class Journal:
 
     def _tear(self, index: int, line: bytes, why: str) -> None:
         """A torn tail is a crash mid-append: admissible ONLY as the last line."""
+        assert self.path is not None
         if index != len(self.path.read_bytes().split(b"\n")) - 2:
             raise JournalError("journal_corrupt", f"{self.path}:{index + 1}: {why}")
         self.torn_tail = True
@@ -127,6 +131,11 @@ class Journal:
         if self.stopped:
             raise JournalError("journal_stopped", self.stopped)
         record = Record(self.seq + 1, kind, int(time.time() * 1000), body)
+        if self.path is None:
+            self.seq = record.seq
+            self.appends += 1
+            self.records.append(record)
+            return record
         data = canonical.write(
             {"seq": record.seq, "kind": kind, "at_unix_ms": record.at_unix_ms, "body": body}
         )

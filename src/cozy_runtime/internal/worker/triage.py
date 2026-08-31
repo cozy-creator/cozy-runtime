@@ -200,9 +200,14 @@ class BundleStore:
     # ------------------------------------------------------------------ reading
 
     @staticmethod
-    def receipts(journal_path: Path) -> dict[str, dict[str, Any]]:
-        """Every journaled write receipt, by subject — read from the FILE, no live process."""
+    def receipts(source: Journal | Path) -> dict[str, dict[str, Any]]:
+        """Every write receipt by subject, from process memory or an explicit proof log."""
         found: dict[str, dict[str, Any]] = {}
+        if isinstance(source, Journal):
+            for record in source.of_kind("triage"):
+                found[str(record.body["subject_id"])] = record.body
+            return found
+        journal_path = source
         if not journal_path.is_file():
             return found
         for line in journal_path.read_bytes().split(b"\n"):
@@ -235,7 +240,9 @@ class BundleStore:
         return found
 
     @staticmethod
-    def read(root: Path, subject_id: str, journal_path: Path | None = None) -> dict[str, Any]:
+    def read(
+        root: Path, subject_id: str, receipt_source: Journal | Path | None = None
+    ) -> dict[str, Any]:
         """Read ONE bundle by its opaque subject, verified against its journaled receipt.
 
         This is the whole triage path: a directory, a key, and a digest. No process, no SSH,
@@ -249,8 +256,8 @@ class BundleStore:
         document = canonical.parse_canonical(data)
         if not isinstance(document, dict) or set(document) != set(SECTIONS):
             raise TriageError("bundle_malformed", f"{subject_id}: wrong triage fields")
-        if journal_path is not None:
-            receipt = BundleStore.receipts(journal_path).get(subject_id)
+        if receipt_source is not None:
+            receipt = BundleStore.receipts(receipt_source).get(subject_id)
             if receipt is None:
                 raise TriageError(
                     "receipt_absent",

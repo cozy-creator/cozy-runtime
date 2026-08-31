@@ -387,7 +387,6 @@ class AttemptEngine:
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], AttemptRecord] = {}
         self.boot_id = ""
-        self.recovered: list[pb.HeldAttempt] = []
         self.executed = 0
         #: the worker's fault tail. BOUNDED: the Report and the triage bundle each read the
         #: last 8, and an unbounded list of the other 65,528 is memory nobody reads.
@@ -2412,88 +2411,6 @@ class AttemptEngine:
             self.live.pop(attempt.request_id, None)
         attempt.compact()
         return "closed"
-
-    # ------------------------------------------------------------------ recovery
-
-    def recover(self) -> list[pb.HeldAttempt]:
-        """Replay the journal into `recovered_attempts` for the new session's Register.
-
-        Two states survive a restart and each becomes a DURABLE, REPLAYABLE TERMINAL here —
-        never a half-built live attempt:
-
-        * a journaled TERMINAL replays verbatim, if and only if the three-authorization rule
-          admits it (persisted assignment, stable `instance_id`, matching execution digest);
-        * an ACCEPTED row with no terminal is accepted-but-incomplete. Its execution context
-          died with the process, so recovery MINTS `ABANDONED/EXECUTOR_INVALIDATED`,
-          journals it, and reports it as terminal-pending-ack. It is never re-executed and
-          it never re-enters `live` as an attempt with no plan and no grant — an attempt
-          object that cannot answer "what would you run" has no business being dispatchable.
-
-        The identity a recovered ABANDONED terminal needs — request id, ordinal, execution
-        digest, instance — is journaled at ACCEPTANCE, before the attempt can start, which
-        is what makes this reconstruction possible without guessing.
-
-        A row belonging to ANOTHER instance is not replayable — its terminal was authorized
-        under an identity this process is not — but it is not nothing either. It becomes a
-        freshly minted, freshly journaled TYPED LOSS (#494d): ABANDONED / EXECUTOR_INVALIDATED
-        naming the foreign instance, so the owner learns those attempts existed and died. The
-        old behaviour was `continue`, and a RecordOwner holding a dispatched attempt learned
-        nothing at all about it — the worker simply never mentioned it again.
-        """
-        recovered: list[pb.HeldAttempt] = []
-        for (request_id, number), row in self.journal.attempts().items():
-            if row["state"] == "closed":
-                continue
-            digest = documents.raw(row["invocation_spec_digest"])
-            if row.get("invocation_spec_digest") != documents.spell(digest):
-                continue  # the row cannot even name its own subject
-            foreign = str(row.get("instance_id", ""))
-            attempt = AttemptRecord(
-                request_id=request_id,
-                attempt=number,
-                digest=digest,
-                spec={},
-                state="outcome",
-                kind=str(row.get("attempt_kind", "serving")),
-                executor_generation=int(row.get("executor_generation", 0)),
-                executor_pid=int(row.get("executor_pid", 0)),
-                placement_id=str(row.get("placement_id", "")),
-            )
-            if foreign != self.instance_id:
-                self.outcome(
-                    attempt,
-                    STATUS.OUTCOME_STATUS_ABANDONED,
-                    CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_WORKER,
-                    f"foreign_instance_identity: this journal row was authorized under "
-                    f"instance {safe(foreign, 64) or '(unnamed)'} and this worker is "
-                    f"{safe(self.instance_id, 64) or '(unnamed)'}, so its journaled outcome "
-                    "is not replayable here; the attempt existed, it is over, and this is "
-                    "the loss said out loud rather than a row dropped in silence",
-                )
-                self.history[attempt.key()] = attempt
-                recovered.append(self._active_row(attempt, row))
-                continue
-            if row["state"] == "outcome":
-                attempt.outcome_id = row["outcome_id"]
-                attempt.outcome_digest = documents.raw(row["outcome_digest"])
-                attempt.outcome_bytes = base64.b64decode(row["outcome_canonical_b64"])
-            elif row["state"] == "accepted":
-                self.outcome(
-                    attempt,
-                    STATUS.OUTCOME_STATUS_ABANDONED,
-                    CAUSE.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                    ORIGIN.CAUSE_ORIGIN_WORKER,
-                    "accepted-but-incomplete across a control-parent restart: the execution "
-                    "context is gone, so this attempt reports ABANDONED and is never "
-                    "re-executed",
-                )
-            else:
-                continue
-            self.history[attempt.key()] = attempt
-            recovered.append(self._active_row(attempt, row))
-        self.recovered = recovered
-        return recovered
 
     def _active_row(
         self, attempt: AttemptRecord, journal_row: Mapping[str, Any] | None = None
