@@ -166,8 +166,11 @@ def prepare_package_set(
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
     _stage(artifact_cache, base_raw)
     entrypoints = _entrypoints(descriptor_body)
+    entrypoint_bodies = [documents.body(row) for row in entrypoints]
+    for entrypoint_body in entrypoint_bodies:
+        entrypoint_body.setdefault("slots", [])
     bindings_digest = documents.digest_of(
-        canonical.write({"entrypoints": [documents.body(row) for row in entrypoints], "models": []})
+        canonical.write({"entrypoints": entrypoint_bodies, "models": []})
     )
     receipt_ref = {"digest": installed.receipt_digest, "length": len(installed.receipt_bytes)}
     descriptor_value = {"digest": descriptor_ref[0], "length": descriptor_ref[1]}
@@ -198,6 +201,7 @@ def prepare_package_set(
     )
     placement_body = documents.body(placement)
     placement_body.setdefault("models", [])
+    placement_body["environment"].setdefault("wheels", [])
     for entrypoint_body in placement_body["entrypoints"]:
         entrypoint_body.setdefault("slots", [])
     placement_bytes = canonical.write(
