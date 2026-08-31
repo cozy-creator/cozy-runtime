@@ -12,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from packaging.version import InvalidVersion, Version
@@ -32,6 +32,16 @@ _PROTECTED = frozenset(
         "triton",
     }
 )
+_PROTECTED_IMPORT_ROOTS = {
+    "cozy-runtime": ("cozy", "cozy_runtime"),
+    "cozy-runtime-cuda-kernels": ("cozy_runtime_cuda_kernels",),
+    "msgspec": ("msgspec",),
+    "tensorfs": ("tensorfs",),
+    "torch": ("torch",),
+    "torchaudio": ("torchaudio",),
+    "torchvision": ("torchvision",),
+    "triton": ("triton",),
+}
 
 
 class ObservationRefusal(Exception):
@@ -181,19 +191,10 @@ def _ownership() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[st
         ):
             raise ObservationRefusal(f"protected distribution {name} has conflicting versions")
         versions[name] = selected.version
-        for root in _distribution_roots(selected):
+        for root in _distribution_roots(name):
             providers.setdefault(root, set()).add(name)
-    for root, names in importlib.metadata.packages_distributions().items():
-        for raw_name in names:
-            name = _normalize(raw_name)
-            if name in versions and _ROOT.fullmatch(root):
-                providers.setdefault(root, set()).add(name)
     for root in sys.stdlib_module_names:
-        try:
-            present = importlib.util.find_spec(root) is not None
-        except (ImportError, AttributeError, ValueError):
-            present = False
-        if present and _ROOT.fullmatch(root):
+        if _ROOT.fullmatch(root):
             providers.setdefault(root, set()).add("python-stdlib")
     return (
         tuple((name, versions[name]) for name in sorted(versions)),
@@ -201,43 +202,26 @@ def _ownership() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[st
     )
 
 
-def _distribution_roots(distribution: importlib.metadata.Distribution) -> set[str]:
-    roots: set[str] = set()
-    for entry in distribution.files or ():
-        parts = PurePosixPath(str(entry)).parts
-        if not parts:
-            continue
-        first = parts[0]
-        if len(parts) == 1 and first.endswith(".pth"):
-            try:
-                lines = Path(str(distribution.locate_file(entry))).read_text().splitlines()
-            except OSError:
-                continue
-            for line in lines:
-                path = Path(line.strip())
-                if not path.is_absolute() or not path.is_dir():
-                    continue
-                for child in path.iterdir():
-                    name = child.stem if child.is_file() and child.suffix == ".py" else child.name
-                    if _ROOT.fullmatch(name) and (
-                        child.is_dir() or (child.is_file() and child.suffix == ".py")
-                    ):
-                        roots.add(name)
-            continue
-        if first.endswith((".dist-info", ".egg-info")):
-            continue
-        if first.endswith(".data"):
-            if len(parts) < 3 or parts[1] not in {"purelib", "platlib"}:
-                continue
-            first = parts[2]
-        if first == "__pycache__" or first.endswith(".libs"):
-            continue
-        if first.endswith((".py", ".pyi")):
-            first = first.rsplit(".", 1)[0]
-        elif "." in first:
-            first = first.split(".", 1)[0]
-        if _ROOT.fullmatch(first):
-            roots.add(first)
+def _distribution_roots(distribution: str) -> tuple[str, ...]:
+    roots = _PROTECTED_IMPORT_ROOTS.get(distribution)
+    if roots is None:
+        if distribution.startswith("cuda-"):
+            roots = ("cuda",)
+        elif distribution.startswith("nvidia-"):
+            roots = ("nvidia",)
+        else:  # pragma: no cover - every admitted name is closed above
+            raise ObservationRefusal(f"protected distribution {distribution} has no root contract")
+    for root in roots:
+        try:
+            present = importlib.util.find_spec(root) is not None
+        except (ImportError, AttributeError, ValueError) as exc:
+            raise ObservationRefusal(
+                f"protected distribution {distribution} root {root} is invalid: {exc}"
+            ) from exc
+        if not present:
+            raise ObservationRefusal(
+                f"protected distribution {distribution} does not provide required root {root}"
+            )
     return roots
 
 

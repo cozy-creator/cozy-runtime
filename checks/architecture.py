@@ -15,6 +15,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   delivery-plan-observation
   pod-media-grant-root
   measured-backend-version
+  no-installed-file-inventory
   typed-model-binding
 """
 
@@ -674,6 +675,29 @@ def fence_torch_free_import() -> list[str]:
                     f"{module_of(path)}:{node.lineno} imports torch at module scope — the "
                     "harness imports it inside a function so the base package stays torch-free"
                 )
+    return bad
+
+
+def fence_no_installed_file_inventory() -> list[str]:
+    """Keep boot observation and proofs off installed RECORD/file inventories."""
+
+    bad: list[str] = []
+    paths = (
+        ROOT / "src" / "cozy_runtime" / "internal" / "base_observation.py",
+        ROOT / "proofs" / "support" / "proof_data.py",
+    )
+    forbidden = (
+        "packages_distributions(",
+        "distribution.files",
+        "installed.files",
+        "installed_base_ownership",
+        "pack_installed",
+    )
+    for path in paths:
+        source = path.read_text()
+        for spelling in forbidden:
+            if spelling in source:
+                bad.append(f"{path}: retired installed-file inventory remains: {spelling}")
     return bad
 
 
@@ -1599,6 +1623,7 @@ FENCES = {
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "tensorhub-package-release": fence_tensorhub_package_release,
+    "no-installed-file-inventory": fence_no_installed_file_inventory,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
     "author-import-boundary": fence_author_import_boundary,
