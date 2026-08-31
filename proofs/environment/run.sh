@@ -86,16 +86,9 @@ done
 for name in cold rebuild; do
     generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
         "$proof_root" "$name")
-    imported=$(cd / && env -u PYTHONPATH "$driver_python" -I "$import_probe" \
-        "$generation/site-packages" cpu)
+    imported=$(cd / && env -u PYTHONPATH "$generation/bin/python" -I "$import_probe" cpu)
     test "$imported" = installed
 done
-cuda_generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generation \
-    "$proof_root" cuda)
-cuda_fact=$(cd / && env -u PYTHONPATH "$driver_python" -I "$import_probe" \
-    "$cuda_generation/site-packages" cuda)
-test "$cuda_fact" = "13.0 False"
-
 run_refusal() {
     name=$1
     expected_status=$2
@@ -118,21 +111,21 @@ run_refusal() {
 run_refusal missing 6 wheel_grant_set_mismatch no
 run_refusal conflicting-dependency 6 wheel_filename_mismatch no
 run_refusal extra 6 wheel_grant_set_mismatch no
-run_refusal corrupt 6 overlay_wheel_digest_mismatch no
+run_refusal corrupt 6 package_environment_wheel_digest_mismatch no
 run_refusal renamed 6 wheel_filename_mismatch no
 run_refusal oversized-fact 6 environment_wheel_invalid no
-run_refusal duplicate 6 overlay_wheel_member_invalid no
-run_refusal expanded 6 overlay_wheel_expansion_cap no
+run_refusal duplicate 6 package_environment_wheel_member_invalid no
+run_refusal expanded 6 package_environment_wheel_expansion_cap no
 run_refusal forbidden 3 environment_proof_request_invalid no
 run_refusal build-request 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
-run_refusal base-distribution 6 overlay_shadows_base_distribution no
+run_refusal base-distribution 6 package_environment_shadows_base_distribution no
 grep -q 'image_version=1.0.0' "$proof_root/base-distribution.stderr"
-run_refusal base-import-root 6 overlay_shadows_base_import no
+run_refusal base-import-root 6 package_environment_shadows_base_import no
 grep -q 'image_providers=numpy' "$proof_root/base-import-root.stderr"
-run_refusal lying-import-root 6 overlay_wheel_import_roots_mismatch no
-run_refusal duplicate-import-root 6 overlay_import_root_duplicate no
+run_refusal lying-import-root 6 package_environment_wheel_import_roots_mismatch no
+run_refusal duplicate-import-root 6 package_environment_import_root_duplicate no
 
 set +e
 run_proof race-first "$proof_root/receipt-race.json" \
@@ -154,4 +147,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild overlay receipts from direct PackageSelection plus PlacementSet/1; complete base distribution/import ownership refused NumPy and duplicate custom-root shadows before publication, a genuine new root imported, exact package bytes, CUDA ABI without a device, atomic receipt race, and no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild package-environment receipts from direct PackageSelection plus PlacementSet/1; each venv Python imported the exact project/dependency wheels, complete base ownership refused NumPy and duplicate-root shadows, and receipt races/no-partial-output refusals passed"

@@ -1,1 +1,1 @@
-VALUE = "forbidden-overlay-shadow"
+VALUE = "forbidden-package-shadow"

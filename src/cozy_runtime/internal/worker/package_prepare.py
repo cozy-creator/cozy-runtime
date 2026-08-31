@@ -18,7 +18,7 @@ from cozy_runtime.internal import (
     descriptor,
     fill,
     model_config,
-    overlay,
+    package_environment,
     placement_materialization,
     pull,
 )
@@ -47,10 +47,10 @@ def prepare_package_set(
     artifact_store: Path,
     environment_root: Path,
     python: Path,
-    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
-    base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
+    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
 ) -> pb.PreparePackageSetResult:
     """Parse one signed delegation, then use the shared package preparation path."""
 
@@ -109,10 +109,10 @@ def prepare_private_package(
     artifact_cache: Path,
     environment_root: Path,
     python: Path,
-    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
-    base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
+    base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact private wheel revision without inventing Hub provenance."""
 
@@ -280,13 +280,14 @@ def prepare_package(
     artifact_cache: Path,
     environment_root: Path,
     python: Path,
-    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     base_manifest: Path,
     models: Sequence[Any] = (),
     artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
     allow_native_custom: bool = False,
+    installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
@@ -303,14 +304,14 @@ def prepare_package(
     base_raw = _read_file(base_manifest, 64 << 20)
     base_digest = "sha256:" + hashlib.sha256(base_raw).hexdigest()
     try:
-        base = overlay.parse_base_manifest(base_raw, base_digest)
-    except overlay.OverlayRefusal as exc:
+        base = package_environment.parse_base_manifest(base_raw, base_digest)
+    except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
 
     rows = list(files)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
-    facts: list[tuple[overlay.Wheel, Path, overlay.VerifiedFile]] = []
+    facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
     model_files: dict[str, tuple[int, int, Path]] = {}
     prior = b""
     parents: set[Path] = set()
@@ -343,18 +344,22 @@ def prepare_package(
             continue
         owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
         try:
-            wheel, receipt = overlay.measure_wheel(
+            wheel, receipt = package_environment.measure_wheel(
                 path,
                 owner,
                 base,
                 allow_native_custom=allow_native_custom,
-                allow_base_owned=owner == "custom",
+                allow_base_owned=installed_environment is not None or owner == "custom",
             )
-        except overlay.OverlayRefusal as exc:
+        except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
         if wheel.digest != digest or wheel.length != row.length:
             raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
-        if owner == "custom" and overlay.base_owned_wheel(wheel, base):
+        if (
+            installed_environment is None
+            and owner == "custom"
+            and package_environment.base_owned_wheel(wheel, base)
+        ):
             verified(digest, row.length, path)
             continue
         facts.append((wheel, path, receipt))
@@ -387,7 +392,7 @@ def prepare_package(
     wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
     receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
     try:
-        source = placement_materialization.package_overlay_input(
+        source = placement_materialization.package_environment_input(
             package=documents.body(package),
             environment=environment_body,
             environment_digest=environment_digest,
@@ -395,15 +400,23 @@ def prepare_package(
             wheel_paths=wheel_paths,
             verified_wheels=receipts,
         )
-        installed = overlay.materialize(
-            source,
-            environment_root,
-            python=python,
-            base_manifest=base_manifest,
-            allow_native_custom=allow_native_custom,
-        )
-    except (overlay.OverlayRefusal, LaunchRefusal) as exc:
-        code = getattr(exc, "code", "package_prepare_overlay_failed")
+        if installed_environment is None:
+            installed = package_environment.materialize(
+                source,
+                environment_root,
+                python=python,
+                base_manifest=base_manifest,
+                allow_native_custom=allow_native_custom,
+            )
+        else:
+            package_environment.verify_existing_environment(
+                source,
+                base_manifest=base_manifest,
+                allow_native_custom=allow_native_custom,
+            )
+            installed = installed_environment
+    except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
+        code = getattr(exc, "code", "package_environment_install_failed")
         detail = getattr(exc, "detail", type(exc).__name__)
         raise PreparationRefusal(str(code), str(detail)) from exc
     for wheel, path, _receipt in facts:
@@ -415,7 +428,6 @@ def prepare_package(
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
-    _stage(artifact_cache, base_raw)
     if development is not None:
         _verify_private_revision(development, descriptor_ref, rows)
     jobs = _stage_job_plans(
@@ -506,7 +518,7 @@ def prepare_package(
     )
 
 
-def _wheel_fact(wheel: overlay.Wheel) -> pb.WheelFact:
+def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
     return pb.WheelFact(
         ref=pb.Ref(digest=documents.raw(wheel.digest), length=wheel.length),
         distribution=wheel.distribution,
@@ -655,7 +667,7 @@ def _stage_job_plans(
     root: Path | None,
     build_id: str,
     descriptor_path: Path,
-    installed: overlay.InstalledOverlay,
+    installed: package_environment.InstalledEnvironment,
     include_modeled: bool = False,
 ) -> set[str]:
     rows = body.get("jobs")
@@ -682,8 +694,8 @@ def _stage_job_plans(
             "build_id": build_id,
             "application": application,
             "package_descriptor": str(descriptor_path),
-            "overlay": str(installed.import_root),
-            "overlay_content_digest": installed.content_digest,
+            "python": str(installed.python),
+            "environment_content_digest": installed.content_digest,
             "job": name,
             "gpu_count": int(resources.get("gpu_count", 0)),
             "publishes": bool(row.get("publishes", False)),

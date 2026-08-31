@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -69,7 +70,6 @@ def _input_slice(
     workspace.mkdir(parents=True, exist_ok=True)
     descriptor_path = workspace / "package-descriptor.json"
     descriptor_path.write_bytes(descriptor.canonical_bytes(body))
-    overlay_root = project / "src"
 
     def plant(owner: Any, worker: Any) -> None:
         del worker
@@ -113,8 +113,8 @@ def _input_slice(
                 "build_id": release_id,
                 "application": str(body["application"]),
                 "package_descriptor": str(descriptor_path),
-                "overlay": str(overlay_root if overlay_root.is_dir() else project),
-                "overlay_content_digest": release_id,
+                "python": sys.executable,
+                "environment_content_digest": release_id,
                 "job": "inspect",
                 "gpu_count": 0,
                 "publishes": False,

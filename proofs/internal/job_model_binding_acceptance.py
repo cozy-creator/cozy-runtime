@@ -26,7 +26,7 @@ from cozy_runtime.author import (
     Model,
 )
 from cozy_runtime.author._describe import describe
-from cozy_runtime.internal import canonical, descriptor, overlay
+from cozy_runtime.internal import canonical, descriptor, package_environment
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
@@ -171,8 +171,8 @@ def binding(descriptor_id: str, descriptor_path: Path) -> JobBinding:
         build_id=PRIVATE_REVISION,
         application="job_model_binding_acceptance:app",
         package_descriptor=str(descriptor_path),
-        overlay="",
-        overlay_content_digest="",
+        python=sys.executable,
+        environment_content_digest="sha256:" + "a" * 64,
         job="join",
     )
 
@@ -400,9 +400,9 @@ def main() -> None:
             root=root / "job-plans",
             build_id=PRIVATE_REVISION,
             descriptor_path=descriptor_path,
-            installed=overlay.InstalledOverlay(
+            installed=package_environment.InstalledEnvironment(
                 generation=root / "private-generation",
-                import_root=root,
+                site_packages=root,
                 python=Path(sys.executable),
                 receipt_bytes=b"{}",
                 receipt_digest="sha256:" + "b" * 64,

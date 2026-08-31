@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from typing import Any, cast
 
 from cozy_runtime.cli import private_preflight
 from cozy_runtime.cli.io import CliError, Options
-from cozy_runtime.internal import canonical, descriptor, discovery, overlay
+from cozy_runtime.internal import canonical, descriptor, discovery, package_environment
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
 from cozy_runtime.internal.worker.session import Worker, read_placement_set
@@ -27,6 +28,34 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _describe_with_environment(
+    installed: package_environment.InstalledEnvironment, distribution: str
+) -> bytes:
+    code = (
+        "import sys; sys.path.extend(sys.argv[2:]); "
+        "from cozy_runtime.internal import descriptor,discovery; "
+        "sys.stdout.buffer.write(descriptor.canonical_bytes("
+        "descriptor.build(discovery.discover_distribution(sys.argv[1]))))"
+    )
+    result = subprocess.run(
+        [
+            str(installed.python),
+            "-I",
+            "-c",
+            code,
+            distribution,
+            str(ROOT / "src"),
+            sysconfig.get_path("purelib"),
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace")[-2000:])
+    return result.stdout
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -136,15 +165,10 @@ def main(argv: list[str] | None = None) -> int:
             files=files,
         )
 
-        def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
-            import_root = installed.import_root
-            sys.path.append(str(import_root))
-            try:
-                return descriptor.canonical_bytes(
-                    descriptor.build(discovery.discover_distribution(distribution))
-                )
-            finally:
-                sys.path.remove(str(import_root))
+        def describe(
+            installed: package_environment.InstalledEnvironment, distribution: str
+        ) -> bytes:
+            return _describe_with_environment(installed, distribution)
 
         result = package_prepare.prepare_package_set(
             request,
@@ -175,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         assert job.job == "marco_job"
         assert job.build_id == release_digest
-        assert Path(job.overlay).is_dir()
+        assert Path(job.python).is_file()
         assert Path(job.package_descriptor) == descriptor_path
         assert job.reclaim_on_terminal
         assert result.placement_set.placement_set_digest == documents.digest_of(
@@ -412,10 +436,10 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         }
     )
     base_with_helper["base_import_roots"].sort(key=lambda row: row["root"])
-    _base, carried, _observed = overlay.preflight_overlay(
+    _base, carried, _observed = package_environment.preflight_environment(
         local_wheel, (helper_wheel.resolve(),), base_without_helper
     )
-    _base, reused, _observed = overlay.preflight_overlay(
+    _base, reused, _observed = package_environment.preflight_environment(
         local_wheel, (helper_wheel.resolve(),), canonical.write(base_with_helper)
     )
     assert len(carried) == 2 and len(reused) == 1
@@ -495,14 +519,8 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     def mark(digest: str, length: int, path: Path) -> None:
         verified.record(digest, length, path)
 
-    def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
-        sys.path.append(str(installed.import_root))
-        try:
-            return descriptor.canonical_bytes(
-                descriptor.build(discovery.discover_distribution(distribution))
-            )
-        finally:
-            sys.path.remove(str(installed.import_root))
+    def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
+        return _describe_with_environment(installed, distribution)
 
     target_store = root / "modeled-target"
     result = package_prepare.prepare_package_set(
@@ -886,7 +904,6 @@ def _execute_modeled(
 
     installed = acquired.installed
     assert installed is not None
-    sys.path.append(str(installed.import_root))
     try:
         runtime_executor._capture_seal()
         executor = runtime_executor.Executor(Sink(), root / "direct-executor")  # type: ignore[arg-type]
@@ -949,7 +966,7 @@ def _execute_modeled(
         assert outcome["outcome"]["terminal"] == "succeeded", outcome
         assert runtime_executor._read_result(spool) == {"value": 42}
     finally:
-        sys.path.remove(str(installed.import_root))
+        pass
 
 
 def _expect_modeled_refusal(
@@ -957,7 +974,7 @@ def _expect_modeled_refusal(
     base: Path,
     cache: Path,
     artifact_store: Path,
-    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     delegation: dict[str, Any],
     files: list[pb.LocalDownloadFile],
     want: str,

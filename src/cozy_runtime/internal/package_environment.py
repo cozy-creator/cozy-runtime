@@ -1,13 +1,13 @@
-"""Small package overlays over the immutable base-worker-image Python environment.
+"""Per-package uv environments over the immutable base-worker-image Python environment.
 
 The base worker image already owns Python, cozy-runtime, TensorFS, and its complete declared
 distribution/import-root inventory. Accelerator profiles also own Torch/CUDA; a generic CPU image
-may explicitly prove that it owns neither. A placement therefore materializes only the package
-project wheel and optional package-owned custom wheels. It never creates a venv, resolves a
-dependency, copies a base package, or re-hashes the base environment's RECORD tree.
+may explicitly prove that it owns neither. A placement therefore creates one ordinary uv venv
+containing only the package project wheel and optional package-owned dependency wheels. It never
+resolves dependencies, copies a base package, or re-hashes the base environment's RECORD tree.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
-after boot: exact wheel grants are hashed once, inspected, extracted into private staging,
+after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
 and atomically published. Reuse reads the small receipt and image base-family manifest; it
 does not walk or hash the installed tree again.
 """
@@ -15,15 +15,15 @@ does not walk or hash the installed tree again.
 from __future__ import annotations
 
 import base64
-import compileall
 import csv
 import errno
 import hashlib
+import json
 import os
-import py_compile
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import uuid
 import zipfile
@@ -40,12 +40,10 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import canonical, native_wheel
+from cozy_runtime.internal import canonical
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
-CONTENT_IDENTITY_NAME = "package-overlay-content.json"
-WHEEL_EXTRACTION_COMPLETE = ".complete"
-OVERLAY_DIR = "site-packages"
+CONTENT_IDENTITY_NAME = "package-environment-content.json"
 DEFAULT_BASE_MANIFEST = Path("/opt/cozy/base-runtime/WheelhouseManifest.json")
 WHEELHOUSE_MANIFEST_FORMAT = "WheelhouseManifest/1"
 MAX_WHEEL_BYTES = 2 << 30
@@ -102,8 +100,8 @@ _COMPATIBILITY_PROFILE_FIELDS = frozenset(
 )
 
 
-class OverlayRefusal(Exception):
-    """A fail-closed package-overlay verdict with a stable code."""
+class EnvironmentRefusal(Exception):
+    """A fail-closed package-environment verdict with a stable code."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(f"{code}: {detail}")
@@ -170,9 +168,9 @@ class VerifiedFile:
         try:
             info = path.lstat()
         except OSError as exc:
-            raise OverlayRefusal("overlay_wheel_unreadable", str(path)) from exc
+            raise EnvironmentRefusal("package_environment_wheel_unreadable", str(path)) from exc
         if not stat.S_ISREG(info.st_mode) or info.st_size != length:
-            raise OverlayRefusal("overlay_wheel_identity_changed", str(path))
+            raise EnvironmentRefusal("package_environment_wheel_identity_changed", str(path))
         return cls(
             digest=digest,
             length=length,
@@ -209,9 +207,9 @@ class Input:
 
 
 @dataclass(frozen=True, slots=True)
-class InstalledOverlay:
+class InstalledEnvironment:
     generation: Path
-    import_root: Path
+    site_packages: Path
     python: Path
     receipt_bytes: bytes
     receipt_digest: str
@@ -246,16 +244,16 @@ def measure_wheel(
     """
 
     if owner not in {"project", "custom"} or not path.is_absolute():
-        raise OverlayRefusal("overlay_wheel_invalid", str(path))
+        raise EnvironmentRefusal("package_environment_wheel_invalid", str(path))
     try:
         info = path.lstat()
         distribution, version, _build, tags = parse_wheel_filename(path.name)
         with zipfile.ZipFile(path) as archive:
             roots = _import_roots({member.filename for member in archive.infolist()})
     except (OSError, InvalidWheelFilename, zipfile.BadZipFile) as exc:
-        raise OverlayRefusal("overlay_wheel_invalid", path.name) from exc
+        raise EnvironmentRefusal("package_environment_wheel_invalid", path.name) from exc
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_WHEEL_BYTES:
-        raise OverlayRefusal("overlay_wheel_invalid", path.name)
+        raise EnvironmentRefusal("package_environment_wheel_invalid", path.name)
     wheel = Wheel(
         distribution=_name(str(distribution)),
         version=str(version),
@@ -276,12 +274,12 @@ def measure_wheel(
     return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
 
 
-def preflight_overlay(
+def preflight_environment(
     project: Path,
     dependencies: Sequence[Path],
     base_raw: bytes,
 ) -> tuple[BaseManifest, tuple[Wheel, ...], tuple[Wheel, ...]]:
-    """Apply the rented-overlay admission policy without installing or executing code."""
+    """Apply rental package admission without installing or executing code."""
 
     base_digest = _sha(base_raw)
     base = parse_base_manifest(base_raw, base_digest)
@@ -323,23 +321,12 @@ def base_owned_wheel(wheel: Wheel, base: BaseManifest) -> bool:
         )
     )
     if Version(version) != Version(wheel.version) or roots != wheel.import_roots:
-        raise OverlayRefusal(
-            "overlay_base_distribution_conflict",
+        raise EnvironmentRefusal(
+            "package_environment_base_distribution_conflict",
             f"distribution={wheel.distribution} carrier={wheel.version}/{wheel.import_roots} "
             f"base={version}/{roots}",
         )
     return True
-
-
-def expected_receipt_bytes(source: Input) -> bytes:
-    """Canonical receipt implied by already-joined release documents.
-
-    The verified-file intake already hashed and installed the wheel bytes. The acceptance
-    observer needs only to prove that the small receipt it names is exactly the one those same
-    EES/Bundle/RWS/WHM facts imply; it must not reopen or re-hash the wheels to do that.
-    """
-
-    return canonical.write(_receipt(source, source.wheels))
 
 
 def materialize(
@@ -350,12 +337,12 @@ def materialize(
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     expected_receipt_digest: str = "",
     allow_native_custom: bool = False,
-) -> InstalledOverlay:
-    """Verify and atomically publish package content plus a placement receipt.
+) -> InstalledEnvironment:
+    """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
-    Installed bytes are keyed only by the base family and sorted wheel digests.  The
-    environment spec remains in the small placement receipt, so two specs with identical
-    wheels join the same compiled content without weakening the receipt join.
+    Content identity is the interpreter ABI/platform, uv version, and sorted package-owned
+    wheel digests. The placement receipt still binds the current base manifest, so a compatible
+    Runtime patch reuses the venv while an actual Python/platform or requirement conflict refuses.
 
     ``allow_native_custom`` belongs to the local same-user lane. Its default is the rented-pod
     boundary, where native dependency wheels require separate hardware-class proof.
@@ -369,17 +356,19 @@ def materialize(
 
     base = _read_base_manifest(base_manifest, source.base_family_digest)
     wheels = _verify_inventory(source, base)
-    receipt_bytes = canonical.write(_receipt(source, wheels))
+    uv = _uv_binary()
+    uv_version = _uv_version(uv, base)
+    interpreter = _interpreter_identity(python, base)
+    content_bytes = canonical.write(_content_identity(wheels, interpreter, uv_version))
+    content_digest = _sha(content_bytes)
+    receipt_bytes = canonical.write(_receipt(source, wheels, content_digest))
     receipt_digest = _sha(receipt_bytes)
     if expected_receipt_digest and receipt_digest != expected_receipt_digest:
-        raise OverlayRefusal(
-            "overlay_receipt_mismatch",
+        raise EnvironmentRefusal(
+            "package_environment_receipt_mismatch",
             f"derived {receipt_digest}, expected {expected_receipt_digest}",
         )
-    content_bytes = canonical.write(_content_identity(source, wheels))
-    content_digest = _sha(content_bytes)
     contents = root / "contents"
-    wheel_pools = root / "wheel-pools"
     receipts = root / "receipts"
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
@@ -393,49 +382,24 @@ def materialize(
             python=python,
         )
     reused = final.exists()
-    inspected = (
-        None
-        if reused
-        else _verify_grants(
-            source,
-            wheels,
-            base,
-            allow_native_custom=allow_native_custom,
-        )
+    inspected = _verify_grants(
+        source,
+        wheels,
+        base,
+        allow_native_custom=allow_native_custom,
     )
     _require_owned_root(root)
     _remove_dead_staging(root)
     contents.mkdir(parents=True, exist_ok=True, mode=0o700)
-    wheel_pools.mkdir(parents=True, exist_ok=True, mode=0o700)
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # The executor receives one exact import-root path. Search without directory listing is
+    # The executor receives only the venv interpreter. Search without directory listing is
     # sufficient to reach it; write remains root-only and receipts remain fully private.
     contents.chmod(0o711)
-    wheel_pools.chmod(0o700)
     receipts.chmod(0o700)
     if not reused:
-        assert inspected is not None
-        pools = {
-            item.wheel.digest: _publish_wheel_pool(wheel_pools, source.base_family_digest, item)
-            for item in inspected
-        }
-        staging = root / f".overlay-staging-{os.getpid()}-{uuid.uuid4().hex}"
+        staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            site = staging / OVERLAY_DIR
-            site.mkdir(parents=True, mode=0o700)
-            _compose_wheel_pools(pools, wheels, site)
-            # Package code is small, but it should still pay compilation once at intake
-            # rather than once per executor. Base bytecode is already baked in the image.
-            if not compileall.compile_dir(
-                site,
-                quiet=1,
-                force=True,
-                workers=1,
-                invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
-                stripdir=str(site),
-                prependdir=str(final / OVERLAY_DIR),
-            ):
-                raise OverlayRefusal("overlay_bytecode_failed", str(site))
+            _install_with_uv(uv, python, staging, inspected)
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
             _fsync_dir(staging)
@@ -463,6 +427,79 @@ def materialize(
     )
 
 
+def verify_existing_environment(
+    source: Input,
+    *,
+    base_manifest: Path,
+    allow_native_custom: bool,
+) -> None:
+    """Verify exact wheel facts against an already-complete local uv environment."""
+
+    base = _read_base_manifest(base_manifest, source.base_family_digest)
+    wheels = _verify_inventory(source, base, allow_base_owned=True)
+    _verify_grants(
+        source,
+        wheels,
+        base,
+        allow_native_custom=allow_native_custom,
+        allow_base_owned=True,
+    )
+
+
+def open_existing_environment(python: Path, content_digest: str) -> InstalledEnvironment:
+    """Open one ordinary local venv without installing or changing it."""
+
+    _require_digest(content_digest, "content_digest")
+    if not python.is_absolute() or python.parent.name != "bin" or not python.is_file():
+        raise EnvironmentRefusal("package_environment_python_invalid", str(python))
+    generation = python.parent.parent
+    if not (generation / "pyvenv.cfg").is_file():
+        raise EnvironmentRefusal("package_environment_venv_invalid", str(generation))
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import json,sys,sysconfig; print(json.dumps({"
+            "'base_prefix':sys.base_prefix,'prefix':sys.prefix,"
+            "'purelib':sysconfig.get_path('purelib')},sort_keys=True,separators=(',',':')))",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise EnvironmentRefusal(
+            "package_environment_venv_invalid",
+            result.stderr.strip()[-1000:] or "venv probe returned invalid JSON",
+        ) from exc
+    site = Path(str(observed.get("purelib", ""))) if isinstance(observed, dict) else Path()
+    if (
+        result.returncode != 0
+        or not isinstance(observed, dict)
+        or observed.get("prefix") != str(generation)
+        or observed.get("base_prefix") == str(generation)
+        or not site.is_absolute()
+        or not site.is_relative_to(generation)
+        or not site.is_dir()
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_venv_invalid", f"python={python} observed={observed!r}"
+        )
+    return InstalledEnvironment(
+        generation=generation,
+        site_packages=site,
+        python=python,
+        receipt_bytes=b"",
+        receipt_digest="",
+        content_digest=content_digest,
+        reused=True,
+    )
+
+
 def open_generation(
     root: Path,
     *,
@@ -471,7 +508,7 @@ def open_generation(
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     reused: bool = True,
     python: Path = Path(sys.executable),
-) -> InstalledOverlay:
+) -> InstalledEnvironment:
     """Open immutable content through one exact placement receipt without tree hashes.
 
     The receipt and base-family manifest are small identity documents. The package wheel
@@ -486,51 +523,60 @@ def open_generation(
     try:
         receipt_bytes = receipt_path.read_bytes()
     except OSError as exc:
-        raise OverlayRefusal("overlay_receipt_absent", str(exc)) from exc
+        raise EnvironmentRefusal("package_environment_receipt_absent", str(exc)) from exc
     if _sha(receipt_bytes) != receipt_digest:
-        raise OverlayRefusal("overlay_receipt_corrupt", str(receipt_path))
+        raise EnvironmentRefusal("package_environment_receipt_corrupt", str(receipt_path))
     value = parse_environment_receipt(receipt_bytes)
     if value.get("environment_digest") != environment_digest:
-        raise OverlayRefusal("overlay_receipt_wrong_environment", environment_digest)
+        raise EnvironmentRefusal(
+            "package_environment_receipt_wrong_environment", environment_digest
+        )
     base_digest = value.get("base_family_digest")
     if not isinstance(base_digest, str):
-        raise OverlayRefusal("overlay_receipt_invalid", "base family is not a digest")
+        raise EnvironmentRefusal(
+            "package_environment_receipt_invalid", "base family is not a digest"
+        )
     _read_base_manifest(base_manifest, base_digest)
-    content_digest = _content_digest_from_receipt(value)
+    content_digest = value.get("content_digest")
+    if not isinstance(content_digest, str):
+        raise EnvironmentRefusal("package_environment_receipt_invalid", "content digest is absent")
+    _require_digest(content_digest, "content_digest")
     generation = root / "contents" / content_digest.removeprefix("sha256:")
     try:
         identity_bytes = (generation / CONTENT_IDENTITY_NAME).read_bytes()
     except OSError as exc:
-        raise OverlayRefusal("overlay_content_absent", str(exc)) from exc
+        raise EnvironmentRefusal("package_environment_content_absent", str(exc)) from exc
     if _sha(identity_bytes) != content_digest:
-        raise OverlayRefusal("overlay_content_identity_corrupt", str(generation))
+        raise EnvironmentRefusal("package_environment_content_identity_corrupt", str(generation))
     try:
         identity = canonical.parse_canonical(identity_bytes)
     except canonical.CanonicalError as exc:
-        raise OverlayRefusal("overlay_content_identity_invalid", str(exc)) from exc
-    if identity != _content_identity_from_receipt(value):
-        raise OverlayRefusal("overlay_content_identity_mismatch", str(generation))
-    import_root = generation / OVERLAY_DIR
-    if not import_root.is_dir():
-        raise OverlayRefusal("overlay_import_root_absent", str(import_root))
+        raise EnvironmentRefusal("package_environment_content_identity_invalid", str(exc)) from exc
+    if not _content_matches_receipt(identity, value):
+        raise EnvironmentRefusal("package_environment_content_identity_mismatch", str(generation))
+    major, minor = _target_python(_read_base_manifest(base_manifest, base_digest))
+    site_packages = generation / "lib" / f"python{major}.{minor}" / "site-packages"
+    environment_python = generation / "bin" / "python"
+    if not site_packages.is_dir() or not environment_python.is_file():
+        raise EnvironmentRefusal("package_environment_incomplete", str(generation))
     owner = os.geteuid()
     boundaries = (root, root / "contents", root / "receipts")
     if (
         any(path.stat().st_uid != owner or path.stat().st_mode & 0o022 for path in boundaries)
         or generation.stat().st_uid != owner
-        or import_root.stat().st_uid != owner
+        or site_packages.stat().st_uid != owner
         or receipt_path.stat().st_uid != owner
         or generation.stat().st_mode & 0o222
-        or import_root.stat().st_mode & 0o222
+        or site_packages.stat().st_mode & 0o222
         or receipt_path.stat().st_mode & 0o222
     ):
-        raise OverlayRefusal("overlay_generation_mutable", str(generation))
+        raise EnvironmentRefusal("package_environment_generation_mutable", str(generation))
     if not python.is_file():
-        raise OverlayRefusal("overlay_python_absent", str(python))
-    return InstalledOverlay(
+        raise EnvironmentRefusal("package_environment_base_python_absent", str(python))
+    return InstalledEnvironment(
         generation=generation,
-        import_root=import_root,
-        python=python,
+        site_packages=site_packages,
+        python=environment_python,
         receipt_bytes=receipt_bytes,
         receipt_digest=receipt_digest,
         content_digest=content_digest,
@@ -544,24 +590,34 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
     try:
         value = canonical.parse_canonical(raw)
     except canonical.CanonicalError as exc:
-        raise OverlayRefusal("overlay_receipt_invalid", str(exc)) from exc
+        raise EnvironmentRefusal("package_environment_receipt_invalid", str(exc)) from exc
     fields = {
         "base_family_digest",
+        "content_digest",
         "environment_digest",
         "format",
-        "overlay_wheels",
+        "package_wheels",
         "project_wheel_digest",
     }
     if not isinstance(value, dict) or set(value) != fields or value.get("format") != RECEIPT_FORMAT:
-        raise OverlayRefusal("overlay_receipt_invalid", "wrong fields or format")
-    for field in ("base_family_digest", "environment_digest", "project_wheel_digest"):
+        raise EnvironmentRefusal("package_environment_receipt_invalid", "wrong fields or format")
+    for field in (
+        "base_family_digest",
+        "content_digest",
+        "environment_digest",
+        "project_wheel_digest",
+    ):
         item = value.get(field)
         if not isinstance(item, str):
-            raise OverlayRefusal("overlay_receipt_invalid", f"{field} is not a digest")
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", f"{field} is not a digest"
+            )
         _require_digest(item, field)
-    rows = value.get("overlay_wheels")
+    rows = value.get("package_wheels")
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_PACKAGE_WHEELS:
-        raise OverlayRefusal("overlay_receipt_invalid", "overlay_wheels is empty or oversized")
+        raise EnvironmentRefusal(
+            "package_environment_receipt_invalid", "package_wheels is empty or oversized"
+        )
     distributions: list[str] = []
     digests: set[str] = set()
     projects = 0
@@ -572,7 +628,9 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
             "owner",
             "version",
         }:
-            raise OverlayRefusal("overlay_receipt_invalid", f"overlay_wheels[{index}] fields")
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", f"package_wheels[{index}] fields"
+            )
         digest = row.get("digest")
         distribution = row.get("distribution")
         owner = row.get("owner")
@@ -587,17 +645,22 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
             or not valid_wheel_version(version)
             or owner not in {"custom", "project"}
         ):
-            raise OverlayRefusal("overlay_receipt_invalid", f"overlay_wheels[{index}] values")
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", f"package_wheels[{index}] values"
+            )
         digests.add(digest)
         distributions.append(distribution)
         projects += owner == "project"
     if distributions != sorted(set(distributions)) or projects != 1:
-        raise OverlayRefusal(
-            "overlay_receipt_invalid", "overlay wheels are not sorted unique with one project"
+        raise EnvironmentRefusal(
+            "package_environment_receipt_invalid",
+            "package wheels are not sorted unique with one project",
         )
     project_digest = value["project_wheel_digest"]
     if not any(row["owner"] == "project" and row["digest"] == project_digest for row in rows):
-        raise OverlayRefusal("overlay_receipt_invalid", "project wheel digest is not the project")
+        raise EnvironmentRefusal(
+            "package_environment_receipt_invalid", "project wheel digest is not the project"
+        )
     return value
 
 
@@ -605,7 +668,7 @@ def _read_base_manifest(path: Path, expected_digest: str) -> BaseManifest:
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise OverlayRefusal("base_family_manifest_unreadable", str(exc)) from exc
+        raise EnvironmentRefusal("base_family_manifest_unreadable", str(exc)) from exc
     return parse_base_manifest(raw, expected_digest)
 
 
@@ -614,11 +677,13 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
 
     _require_digest(expected_digest, "base_family_digest")
     if _sha(raw) != expected_digest:
-        raise OverlayRefusal("base_family_mismatch", f"manifest does not name {expected_digest}")
+        raise EnvironmentRefusal(
+            "base_family_mismatch", f"manifest does not name {expected_digest}"
+        )
     try:
         value = canonical.parse_canonical(raw)
     except canonical.CanonicalError as exc:
-        raise OverlayRefusal("base_family_manifest_invalid", str(exc)) from exc
+        raise EnvironmentRefusal("base_family_manifest_invalid", str(exc)) from exc
     fields = {
         "base_distributions",
         "base_import_roots",
@@ -631,12 +696,12 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     }
     shapes = {frozenset(fields), frozenset({*fields, "ownership"})}
     if not isinstance(value, dict) or set(value) not in shapes:
-        raise OverlayRefusal("base_family_manifest_invalid", "wrong fields")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "wrong fields")
     ownership = value.get("ownership", "image")
     if ownership not in {"image", "observed-local"}:
-        raise OverlayRefusal("base_family_manifest_invalid", "invalid ownership")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid ownership")
     if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
-        raise OverlayRefusal("base_family_manifest_invalid", "wrong format")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "wrong format")
     platform = value["platform_target"]
     if (
         not isinstance(platform, dict)
@@ -647,7 +712,7 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         or re.fullmatch(r"glibc[0-9]+\.[0-9]+", platform["libc"]) is None
         or platform["accelerator_backend"] not in {"none", "cuda"}
     ):
-        raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid platform_target")
     profile = value["compatibility_profile"]
     if (
         not isinstance(profile, dict)
@@ -656,7 +721,7 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         or profile["python_abi"] != platform["python_abi"]
         or profile["os_cpu"] != "linux-x86"
     ):
-        raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
     minimum_cuda = value["minimum_cuda_version"]
     minimum_driver = value["minimum_driver_version"]
     distributions = _base_distribution_rows(value["base_distributions"])
@@ -702,7 +767,9 @@ def _validate_base_profile(
         and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is not None
     )
     if not (cpu or cuda) or not floors:
-        raise OverlayRefusal("base_family_manifest_invalid", "contradictory accelerator profile")
+        raise EnvironmentRefusal(
+            "base_family_manifest_invalid", "contradictory accelerator profile"
+        )
 
     installed = dict(distributions)
     providers = dict(roots)
@@ -710,28 +777,28 @@ def _validate_base_profile(
     torch_version = installed.get("torch")
     if torch_version is None:
         if release != "none" or "torch" in providers:
-            raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "contradictory Torch profile")
         return
 
     try:
         installed_torch = Version(torch_version)
         declared_torch = Version(str(release))
     except InvalidVersion:
-        raise OverlayRefusal(
+        raise EnvironmentRefusal(
             "base_family_manifest_invalid", "contradictory Torch profile"
         ) from None
     release_matches = installed_torch.release[:3] == declared_torch.release[:3]
     if release == "none" or not release_matches or "torch" not in providers.get("torch", ()):
-        raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "contradictory Torch profile")
 
 
 def _base_distribution_rows(value: object) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, list) or not value:
-        raise OverlayRefusal("base_family_manifest_invalid", "base_distributions is not a list")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "base_distributions is not a list")
     rows: list[tuple[str, str]] = []
     for item in value:
         if not isinstance(item, dict) or set(item) != {"distribution", "version"}:
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid distribution row")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid distribution row")
         distribution = item["distribution"]
         version = item["version"]
         if (
@@ -741,10 +808,10 @@ def _base_distribution_rows(value: object) -> tuple[tuple[str, str], ...]:
             or not isinstance(version, str)
             or not valid_wheel_version(version)
         ):
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid distribution row")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid distribution row")
         rows.append((distribution, version))
     if rows != sorted(rows) or len({name for name, _ in rows}) != len(rows):
-        raise OverlayRefusal(
+        raise EnvironmentRefusal(
             "base_family_manifest_invalid", "base_distributions is not sorted unique"
         )
     return tuple(rows)
@@ -754,11 +821,11 @@ def _base_import_root_rows(
     value: object, distributions: dict[str, str]
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     if not isinstance(value, list) or not value:
-        raise OverlayRefusal("base_family_manifest_invalid", "base_import_roots is not a list")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "base_import_roots is not a list")
     rows: list[tuple[str, tuple[str, ...]]] = []
     for item in value:
         if not isinstance(item, dict) or set(item) != {"providers", "root"}:
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid import-root row")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid import-root row")
         root = item["root"]
         providers = item["providers"]
         if (
@@ -774,10 +841,10 @@ def _base_import_root_rows(
             )
             or providers != sorted(set(providers))
         ):
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid import-root row")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid import-root row")
         rows.append((root, tuple(providers)))
     if rows != sorted(rows) or len({root for root, _ in rows}) != len(rows):
-        raise OverlayRefusal(
+        raise EnvironmentRefusal(
             "base_family_manifest_invalid", "base_import_roots is not sorted unique"
         )
     return tuple(rows)
@@ -789,7 +856,7 @@ def _base_wheel_rows(
     root_providers: dict[str, tuple[str, ...]],
 ) -> tuple[Wheel, ...]:
     if not isinstance(value, list):
-        raise OverlayRefusal("base_family_manifest_invalid", "wheels is not a list")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "wheels is not a list")
     wheels: list[Wheel] = []
     for item in value:
         keys = {
@@ -802,7 +869,7 @@ def _base_wheel_rows(
             "version",
         }
         if not isinstance(item, dict) or set(item) != keys:
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid wheel row")
+            raise EnvironmentRefusal("base_family_manifest_invalid", "invalid wheel row")
         distribution = item["distribution"]
         version = item["version"]
         digest = item["digest"]
@@ -833,7 +900,7 @@ def _base_wheel_rows(
             or import_roots != sorted(set(import_roots))
             or any(distribution not in root_providers.get(root, ()) for root in import_roots)
         ):
-            raise OverlayRefusal(
+            raise EnvironmentRefusal(
                 "base_family_manifest_invalid",
                 f"invalid wheel row: distribution={distribution!r} version={version!r} "
                 f"filename={filename!r}",
@@ -853,13 +920,15 @@ def _base_wheel_rows(
     if [wheel.distribution for wheel in wheels] != sorted(
         wheel.distribution for wheel in wheels
     ) or len({wheel.distribution for wheel in wheels}) != len(wheels):
-        raise OverlayRefusal("base_family_manifest_invalid", "wheels is not sorted unique")
+        raise EnvironmentRefusal("base_family_manifest_invalid", "wheels is not sorted unique")
     return tuple(wheels)
 
 
-def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
+def _verify_inventory(
+    source: Input, base: BaseManifest, *, allow_base_owned: bool = False
+) -> tuple[Wheel, ...]:
     if not source.wheels or len(source.wheels) > MAX_PACKAGE_WHEELS:
-        raise OverlayRefusal("overlay_wheel_set_invalid", str(len(source.wheels)))
+        raise EnvironmentRefusal("package_environment_wheel_set_invalid", str(len(source.wheels)))
     names: set[str] = set()
     digests: set[str] = set()
     projects = 0
@@ -879,29 +948,29 @@ def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
             or tuple(sorted(set(wheel.tags))) != wheel.tags
             or wheel.owner not in {"project", "custom"}
         ):
-            raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
+            raise EnvironmentRefusal("package_environment_wheel_invalid", wheel.filename)
         if wheel.owner == "project" and wheel.tags != ("py3-none-any",):
-            raise OverlayRefusal(
-                "overlay_project_wheel_not_pure",
+            raise EnvironmentRefusal(
+                "package_environment_project_wheel_not_pure",
                 f"{wheel.filename} tags={','.join(wheel.tags)}; project must be py3-none-any",
             )
         base_version = base.distribution_versions.get(name)
-        if base_version is not None:
-            raise OverlayRefusal(
-                "overlay_shadows_base_distribution",
-                f"distribution={name} overlay_version={wheel.version} image_version={base_version}",
+        if base_version is not None and not (allow_base_owned and base_owned_wheel(wheel, base)):
+            raise EnvironmentRefusal(
+                "package_environment_shadows_base_distribution",
+                f"distribution={name} package_version={wheel.version} image_version={base_version}",
             )
         if wheel.import_roots != tuple(sorted(set(wheel.import_roots))) or not all(
             valid_import_root(root) for root in wheel.import_roots
         ):
-            raise OverlayRefusal("overlay_wheel_invalid", wheel.filename)
+            raise EnvironmentRefusal("package_environment_wheel_invalid", wheel.filename)
         _require_compatible_tags(wheel, base)
         for root in wheel.import_roots:
             providers = base.root_providers.get(root)
-            if providers is not None:
+            if providers is not None and not (allow_base_owned and wheel.distribution in providers):
                 raise _base_import_collision(wheel, root, providers)
         if name in names or wheel.digest in digests:
-            raise OverlayRefusal("overlay_wheel_duplicate", name)
+            raise EnvironmentRefusal("package_environment_wheel_duplicate", name)
         names.add(name)
         digests.add(wheel.digest)
         projects += wheel.owner == "project"
@@ -909,7 +978,9 @@ def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
     if projects != 1 or source.project_wheel_digest not in {
         row.digest for row in ordered if row.owner == "project"
     }:
-        raise OverlayRefusal("overlay_project_wheel_mismatch", source.project_wheel_digest)
+        raise EnvironmentRefusal(
+            "package_environment_project_wheel_mismatch", source.project_wheel_digest
+        )
     return tuple(sorted(ordered, key=lambda row: row.distribution))
 
 
@@ -919,23 +990,26 @@ def _verify_grants(
     base: BaseManifest,
     *,
     allow_native_custom: bool,
+    allow_base_owned: bool = False,
 ) -> tuple[_Inspected, ...]:
     grants = {grant.digest: grant for grant in source.grants}
     expected = {wheel.digest for wheel in wheels}
     if len(grants) != len(source.grants) or set(grants) != expected:
-        raise OverlayRefusal(
-            "overlay_grant_set_mismatch",
+        raise EnvironmentRefusal(
+            "package_environment_grant_set_mismatch",
             f"missing={sorted(expected - set(grants))} extra={sorted(set(grants) - expected)}",
         )
     inspected: list[_Inspected] = []
     for wheel in wheels:
         grant = grants[wheel.digest]
         if grant.length != wheel.length:
-            raise OverlayRefusal("overlay_grant_length_mismatch", wheel.digest)
+            raise EnvironmentRefusal("package_environment_grant_length_mismatch", wheel.digest)
         try:
             info = grant.path.lstat()
         except OSError as exc:
-            raise OverlayRefusal("overlay_wheel_unreadable", str(grant.path)) from exc
+            raise EnvironmentRefusal(
+                "package_environment_wheel_unreadable", str(grant.path)
+            ) from exc
         verified = grant.verified
         if (
             not stat.S_ISREG(info.st_mode)
@@ -947,15 +1021,16 @@ def _verify_grants(
             # Production acquisition always supplies one and therefore never hashes a wheel
             # a second time after fetch_exact already admitted it.
             if info.st_size != wheel.length or _hash_file(grant.path) != wheel.digest:
-                raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
+                raise EnvironmentRefusal("package_environment_wheel_digest_mismatch", wheel.digest)
         elif verified.digest != wheel.digest:
-            raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
+            raise EnvironmentRefusal("package_environment_wheel_digest_mismatch", wheel.digest)
         inspected.append(
             _inspect(
                 wheel,
                 grant.path,
                 base,
                 allow_native_custom=allow_native_custom,
+                allow_base_owned=allow_base_owned,
             )
         )
     root_owners: dict[str, str] = {}
@@ -963,8 +1038,8 @@ def _verify_grants(
         for root in item.import_roots:
             prior = root_owners.get(root)
             if prior is not None:
-                raise OverlayRefusal(
-                    "overlay_import_root_duplicate",
+                raise EnvironmentRefusal(
+                    "package_environment_import_root_duplicate",
                     f"root={root} distributions={prior},{item.wheel.distribution}",
                 )
             root_owners[root] = item.wheel.distribution
@@ -985,7 +1060,7 @@ def _inspect(
             wheel.filename
         )
     except InvalidWheelFilename as exc:
-        raise OverlayRefusal("wheel_filename_mismatch", wheel.filename) from exc
+        raise EnvironmentRefusal("wheel_filename_mismatch", wheel.filename) from exc
     declared_tags: set[Tag] = set()
     for tag in wheel.tags:
         declared_tags.update(parse_tag(tag))
@@ -994,12 +1069,12 @@ def _inspect(
         or filename_version != Version(wheel.version)
         or filename_tags != declared_tags
     ):
-        raise OverlayRefusal("wheel_filename_mismatch", wheel.filename)
+        raise EnvironmentRefusal("wheel_filename_mismatch", wheel.filename)
     try:
         with zipfile.ZipFile(path) as archive:
             members = tuple(archive.infolist())
             if not members or len(members) > MAX_WHEEL_MEMBERS:
-                raise OverlayRefusal("overlay_wheel_member_count", wheel.filename)
+                raise EnvironmentRefusal("package_environment_wheel_member_count", wheel.filename)
             names: set[str] = set()
             native_members: list[str] = []
             expanded = 0
@@ -1013,7 +1088,7 @@ def _inspect(
                     or ".." in posix.parts
                     or name in names
                 ):
-                    raise OverlayRefusal("overlay_wheel_member_invalid", name)
+                    raise EnvironmentRefusal("package_environment_wheel_member_invalid", name)
                 names.add(name)
                 expanded += member.file_size
                 if (
@@ -1024,17 +1099,21 @@ def _inspect(
                         and member.file_size > member.compress_size * MAX_WHEEL_EXPANSION
                     )
                 ):
-                    raise OverlayRefusal("overlay_wheel_expansion_cap", wheel.filename)
+                    raise EnvironmentRefusal(
+                        "package_environment_wheel_expansion_cap", wheel.filename
+                    )
                 mode = member.external_attr >> 16
                 if stat.S_ISLNK(mode):
-                    raise OverlayRefusal("overlay_wheel_symlink", name)
+                    raise EnvironmentRefusal("package_environment_wheel_symlink", name)
                 if not member.is_dir() and PurePosixPath(name).suffix == ".pth":
-                    raise OverlayRefusal("overlay_pth_forbidden", name)
+                    raise EnvironmentRefusal("package_environment_pth_forbidden", name)
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
                 if installed is None and ".data/" in name:
-                    raise OverlayRefusal("overlay_wheel_install_scheme_forbidden", name)
+                    raise EnvironmentRefusal(
+                        "package_environment_wheel_install_scheme_forbidden", name
+                    )
                 basename = posix.name.lower()
                 suffix = posix.suffix.lower()
                 project_metadata = (
@@ -1045,11 +1124,13 @@ def _inspect(
                 if (
                     basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES
                 ) and not project_metadata:
-                    raise OverlayRefusal("overlay_native_build_input_forbidden", name)
+                    raise EnvironmentRefusal(
+                        "package_environment_native_build_input_forbidden", name
+                    )
                 magic = archive.open(member).read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
                 if wheel.owner == "project" and native:
-                    raise OverlayRefusal("overlay_project_wheel_native", name)
+                    raise EnvironmentRefusal("package_environment_project_wheel_native", name)
                 if native:
                     assert installed is not None
                     native_members.append(installed.as_posix())
@@ -1059,15 +1140,21 @@ def _inspect(
                 if name.count("/") == 1 and name.endswith(".dist-info/METADATA")
             )
             if len(dist_infos) != 1:
-                raise OverlayRefusal("overlay_wheel_metadata_missing", wheel.filename)
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_metadata_missing", wheel.filename
+                )
             wheel_infos = sorted(
                 name for name in names if name.count("/") == 1 and name.endswith(".dist-info/WHEEL")
             )
             if len(wheel_infos) != 1:
-                raise OverlayRefusal("overlay_wheel_metadata_missing", wheel.filename)
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_metadata_missing", wheel.filename
+                )
             metadata = archive.read(dist_infos[0])
             if len(metadata) > MAX_METADATA_BYTES:
-                raise OverlayRefusal("overlay_wheel_metadata_oversized", wheel.filename)
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_metadata_oversized", wheel.filename
+                )
             parsed = BytesParser().parsebytes(metadata)
             parsed_wheel = BytesParser().parsebytes(archive.read(wheel_infos[0]))
             if (
@@ -1075,15 +1162,17 @@ def _inspect(
                 or parsed.get("Version") != wheel.version
                 or tuple(sorted(parsed_wheel.get_all("Tag", []))) != wheel.tags
             ):
-                raise OverlayRefusal("overlay_wheel_metadata_mismatch", wheel.filename)
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_metadata_mismatch", wheel.filename
+                )
             root_is_pure = parsed_wheel.get("Root-Is-Purelib", "").strip().lower()
             if wheel.owner == "project" and root_is_pure != "true":
-                raise OverlayRefusal(
-                    "overlay_project_wheel_not_pure", "Root-Is-Purelib is not true"
+                raise EnvironmentRefusal(
+                    "package_environment_project_wheel_not_pure", "Root-Is-Purelib is not true"
                 )
             if native_members and root_is_pure != "false":
-                raise OverlayRefusal(
-                    "overlay_native_wheel_metadata_invalid",
+                raise EnvironmentRefusal(
+                    "package_environment_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
             if (
@@ -1091,35 +1180,35 @@ def _inspect(
                 and native_members
                 and (not allow_native_custom or base.ownership != "observed-local")
             ):
-                raise OverlayRefusal(
-                    "overlay_custom_wheel_native_unsupported",
+                raise EnvironmentRefusal(
+                    "package_environment_custom_wheel_native_unsupported",
                     f"{wheel.filename}: custom native wheels are not admitted yet",
                 )
             if native_members and any(
                 tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
                 for tag in declared_tags
             ):
-                raise OverlayRefusal(
-                    "overlay_native_wheel_tag_not_concrete",
+                raise EnvironmentRefusal(
+                    "package_environment_native_wheel_tag_not_concrete",
                     f"{wheel.filename}: native custom wheels require concrete CPython ABI and "
                     "platform tags",
                 )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:
-                raise OverlayRefusal("overlay_wheel_record_missing", wheel.filename)
+                raise EnvironmentRefusal("package_environment_wheel_record_missing", wheel.filename)
             _verify_record(archive, record_name, names)
             roots = _import_roots(names)
             measured_roots = tuple(sorted(roots))
             if wheel.import_roots != measured_roots:
-                raise OverlayRefusal(
-                    "overlay_wheel_import_roots_mismatch",
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_import_roots_mismatch",
                     f"distribution={wheel.distribution} declared={list(wheel.import_roots)} "
                     f"measured={list(measured_roots)}",
                 )
             for root in measured_roots:
                 providers = base.root_providers.get(root)
                 if providers is not None and not (
-                    allow_base_owned and wheel.owner == "custom" and wheel.distribution in providers
+                    allow_base_owned and wheel.distribution in providers
                 ):
                     raise _base_import_collision(wheel, root, providers)
             requires_python = parsed.get("Requires-Python")
@@ -1128,8 +1217,8 @@ def _inspect(
                 for value in parsed.get_all("Requires-Dist", []):
                     requirements.append(Requirement(value))
             except InvalidRequirement as exc:
-                raise OverlayRefusal(
-                    "overlay_requirement_invalid", f"{wheel.distribution}: {exc}"
+                raise EnvironmentRefusal(
+                    "package_environment_requirement_invalid", f"{wheel.distribution}: {exc}"
                 ) from exc
             return _Inspected(
                 wheel,
@@ -1140,10 +1229,10 @@ def _inspect(
                 tuple(requirements),
                 tuple(sorted(native_members)),
             )
-    except OverlayRefusal:
+    except EnvironmentRefusal:
         raise
     except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
-        raise OverlayRefusal("overlay_wheel_invalid", wheel.filename) from exc
+        raise EnvironmentRefusal("package_environment_wheel_invalid", wheel.filename) from exc
 
 
 def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) -> None:
@@ -1151,26 +1240,26 @@ def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) 
     try:
         rows = list(csv.reader(raw.decode("utf-8").splitlines()))
     except (UnicodeError, csv.Error) as exc:
-        raise OverlayRefusal("overlay_wheel_record_invalid", record_name) from exc
+        raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name) from exc
     recorded: set[str] = set()
     for row in rows:
         if len(row) != 3 or not row[0] or row[0] in recorded or row[0] not in names:
-            raise OverlayRefusal("overlay_wheel_record_invalid", record_name)
+            raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name)
         recorded.add(row[0])
         if row[0] == record_name:
             if row[1] or row[2]:
-                raise OverlayRefusal("overlay_wheel_record_invalid", record_name)
+                raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name)
             continue
         if not row[1] or not row[2].isdigit():
-            raise OverlayRefusal("overlay_wheel_record_unhashed", row[0])
+            raise EnvironmentRefusal("package_environment_wheel_record_unhashed", row[0])
         algorithm, separator, encoded = row[1].partition("=")
         payload = archive.read(row[0])
         got = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
         if algorithm != "sha256" or not separator or encoded != got or int(row[2]) != len(payload):
-            raise OverlayRefusal("overlay_wheel_record_mismatch", row[0])
+            raise EnvironmentRefusal("package_environment_wheel_record_mismatch", row[0])
     files = {name for name in names if not name.endswith("/")}
     if recorded != files:
-        raise OverlayRefusal("overlay_wheel_record_incomplete", record_name)
+        raise EnvironmentRefusal("package_environment_wheel_record_incomplete", record_name)
 
 
 def _import_roots(names: set[str]) -> frozenset[str]:
@@ -1203,10 +1292,12 @@ def _import_roots(names: set[str]) -> frozenset[str]:
     return frozenset(roots)
 
 
-def _base_import_collision(wheel: Wheel, root: str, providers: tuple[str, ...]) -> OverlayRefusal:
-    return OverlayRefusal(
-        "overlay_shadows_base_import",
-        f"root={root} overlay_distribution={wheel.distribution} "
+def _base_import_collision(
+    wheel: Wheel, root: str, providers: tuple[str, ...]
+) -> EnvironmentRefusal:
+    return EnvironmentRefusal(
+        "package_environment_shadows_base_import",
+        f"root={root} package_distribution={wheel.distribution} "
         f"image_providers={','.join(providers)}",
     )
 
@@ -1215,7 +1306,7 @@ def _target_python(base: BaseManifest) -> tuple[int, int]:
     target = dict(base.platform_target)
     match = re.fullmatch(r"cp([0-9])([0-9]{2})", target.get("python_abi", ""))
     if match is None:
-        raise OverlayRefusal(
+        raise EnvironmentRefusal(
             "base_family_manifest_invalid", "python_abi is not the cpNNN profile spelling"
         )
     return int(match.group(1)), int(match.group(2))
@@ -1226,12 +1317,13 @@ def _target_platforms(base: BaseManifest) -> frozenset[str]:
     os_arch = target.get("os_arch")
     libc = target.get("libc")
     if os_arch != "linux/amd64":
-        raise OverlayRefusal(
-            "overlay_platform_unsupported", f"semantic wheel admission has no seat for {os_arch}"
+        raise EnvironmentRefusal(
+            "package_environment_platform_unsupported",
+            f"semantic wheel admission has no seat for {os_arch}",
         )
     match = re.fullmatch(r"glibc([0-9]+)\.([0-9]+)", libc or "")
     if match is None or int(match.group(1)) != 2:
-        raise OverlayRefusal(
+        raise EnvironmentRefusal(
             "base_family_manifest_invalid", f"linux/x86 base has unsupported libc {libc!r}"
         )
     minor = int(match.group(2))
@@ -1267,10 +1359,10 @@ def _require_compatible_tags(wheel: Wheel, base: BaseManifest) -> None:
         for value in wheel.tags:
             declared.update(parse_tag(value))
     except ValueError as exc:
-        raise OverlayRefusal("overlay_wheel_tag_invalid", wheel.filename) from exc
+        raise EnvironmentRefusal("package_environment_wheel_tag_invalid", wheel.filename) from exc
     if declared.isdisjoint(_compatible_tags(base)):
-        raise OverlayRefusal(
-            "overlay_wheel_platform_incompatible",
+        raise EnvironmentRefusal(
+            "package_environment_wheel_platform_incompatible",
             f"distribution={wheel.distribution} tags={','.join(wheel.tags)} "
             f"target={dict(base.platform_target)}",
         )
@@ -1304,13 +1396,13 @@ def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManif
             try:
                 supported = SpecifierSet(item.requires_python).contains(python, prereleases=True)
             except InvalidSpecifier as exc:
-                raise OverlayRefusal(
-                    "overlay_requires_python_invalid",
+                raise EnvironmentRefusal(
+                    "package_environment_requires_python_invalid",
                     f"{item.wheel.distribution}: {item.requires_python}",
                 ) from exc
             if not supported:
-                raise OverlayRefusal(
-                    "overlay_python_incompatible",
+                raise EnvironmentRefusal(
+                    "package_environment_python_incompatible",
                     f"distribution={item.wheel.distribution} "
                     f"requires_python={item.requires_python} "
                     f"target={python}",
@@ -1321,8 +1413,8 @@ def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManif
             name = _name(requirement.name)
             installed = versions.get(name)
             if installed is None:
-                raise OverlayRefusal(
-                    "overlay_dependency_missing",
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_missing",
                     f"distribution={item.wheel.distribution} requirement={requirement}",
                 )
             try:
@@ -1330,121 +1422,15 @@ def _verify_python_requirements(inspected: Sequence[_Inspected], base: BaseManif
                     Version(installed), prereleases=True
                 )
             except InvalidVersion as exc:
-                raise OverlayRefusal(
+                raise EnvironmentRefusal(
                     "base_family_manifest_invalid", f"{name} has invalid version {installed!r}"
                 ) from exc
             if not accepted:
-                raise OverlayRefusal(
-                    "overlay_dependency_base_conflict",
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_base_conflict",
                     f"distribution={item.wheel.distribution} requirement={requirement} "
-                    f"base_or_overlay_version={installed}",
+                    f"available_version={installed}",
                 )
-
-
-def _extract(wheels: Sequence[_Inspected], site: Path) -> None:
-    written: set[Path] = set()
-    for inspected in wheels:
-        with zipfile.ZipFile(inspected.path) as archive:
-            for member in inspected.members:
-                if member.is_dir():
-                    continue
-                relative = _install_path(member.filename)
-                if relative is None:
-                    continue
-                target = site / relative
-                if target in written:
-                    raise OverlayRefusal("overlay_install_path_collision", relative.as_posix())
-                written.add(target)
-                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                with archive.open(member) as source, target.open("xb") as destination:
-                    shutil.copyfileobj(source, destination, length=1 << 20)
-                target.chmod(0o500 if target.suffix in {".so", ".pyd", ".dll"} else 0o400)
-
-
-def _wheel_pool_digest(base_family_digest: str, wheel_digest: str) -> str:
-    """Name a private extraction cache without inventing a portable document format."""
-
-    preimage = (
-        b"cozy.runtime.wheel-extraction\0"
-        + base_family_digest.encode("ascii")
-        + b"\0"
-        + wheel_digest.encode("ascii")
-    )
-    return _sha(preimage)
-
-
-def _publish_wheel_pool(pools: Path, base_family_digest: str, inspected: _Inspected) -> Path:
-    """Extract one verified wheel once under the image/runtime extraction semantics."""
-
-    pool_digest = _wheel_pool_digest(base_family_digest, inspected.wheel.digest)
-    final = pools / pool_digest.removeprefix("sha256:")
-    if final.exists():
-        marker = final / WHEEL_EXTRACTION_COMPLETE
-        try:
-            marker_info = marker.lstat()
-            complete = marker.read_bytes()
-        except OSError as exc:
-            raise OverlayRefusal("overlay_wheel_pool_invalid", str(exc)) from exc
-        if (
-            complete
-            or not stat.S_ISREG(marker_info.st_mode)
-            or marker_info.st_uid != os.geteuid()
-            or marker_info.st_mode & 0o222
-            or final.stat().st_uid != os.geteuid()
-            or not (final / "tree").is_dir()
-        ):
-            raise OverlayRefusal("overlay_wheel_pool_invalid", str(final))
-        return final / "tree"
-    staging = pools.parent / f".wheel-staging-{os.getpid()}-{uuid.uuid4().hex}"
-    try:
-        tree = staging / "tree"
-        tree.mkdir(parents=True, mode=0o700)
-        _extract((inspected,), tree)
-        if inspected.native_members:
-            try:
-                native_wheel.inspect_tree(tree, inspected.native_members)
-            except native_wheel.NativeWheelRefusal as exc:
-                raise OverlayRefusal(exc.code, exc.detail) from exc
-        _write_once(staging / WHEEL_EXTRACTION_COMPLETE, b"")
-        _make_read_only(staging)
-        _fsync_dir(staging)
-        try:
-            os.rename(staging, final)
-        except OSError as exc:
-            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                raise
-            _remove_tree(staging)
-        _fsync_dir(pools)
-    except Exception:
-        if staging.exists():
-            _remove_tree(staging)
-        raise
-    return final / "tree"
-
-
-def _compose_wheel_pools(pools: Mapping[str, Path], wheels: Sequence[Wheel], site: Path) -> None:
-    """Compose one content generation with hardlinks to immutable per-wheel trees."""
-
-    written: set[Path] = set()
-    for wheel in sorted(wheels, key=lambda item: item.digest):
-        pool = pools[wheel.digest]
-        if not pool.is_dir():
-            raise OverlayRefusal("overlay_wheel_pool_invalid", str(pool))
-        for source in sorted(pool.rglob("*")):
-            relative = source.relative_to(pool)
-            target = site / relative
-            if source.is_symlink():
-                raise OverlayRefusal("overlay_wheel_pool_invalid", str(source))
-            if source.is_dir():
-                if target.exists() and not target.is_dir():
-                    raise OverlayRefusal("overlay_install_path_collision", relative.as_posix())
-                target.mkdir(parents=True, exist_ok=True, mode=0o700)
-                continue
-            if target in written or target.exists():
-                raise OverlayRefusal("overlay_install_path_collision", relative.as_posix())
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.link(source, target)
-            written.add(target)
 
 
 def _install_path(name: str) -> PurePosixPath | None:
@@ -1457,12 +1443,154 @@ def _install_path(name: str) -> PurePosixPath | None:
     return path
 
 
-def _receipt(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
+def _uv_binary() -> Path:
+    found = shutil.which("uv")
+    if found is None:
+        raise EnvironmentRefusal(
+            "package_environment_uv_absent", "uv is not installed in the worker base"
+        )
+    path = Path(found)
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        raise EnvironmentRefusal("package_environment_uv_invalid", str(path))
+    return path
+
+
+def _uv_version(uv: Path, base: BaseManifest) -> str:
+    result = subprocess.run(
+        [str(uv), "--version"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    version = result.stdout.strip()
+    if (
+        result.returncode != 0
+        or re.fullmatch(r"uv [0-9]+(?:\.[0-9]+){1,3}(?: \([^\n]+\))?", version) is None
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_uv_invalid",
+            result.stderr.strip()[-1000:] or f"uv exited {result.returncode}",
+        )
+    expected = base.distribution_versions.get("uv")
+    observed = version.split()[1]
+    if expected is None or Version(observed) != Version(expected):
+        raise EnvironmentRefusal(
+            "package_environment_uv_version_mismatch",
+            f"executable={observed} base_manifest={expected or 'absent'}",
+        )
+    return version
+
+
+def _interpreter_identity(python: Path, base: BaseManifest) -> dict[str, str]:
+    if not python.is_absolute() or not python.is_file():
+        raise EnvironmentRefusal("package_environment_base_python_absent", str(python))
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import json,platform,sys; print(json.dumps({"
+            "'cache_tag':sys.implementation.cache_tag,"
+            "'implementation':sys.implementation.name,"
+            "'machine':platform.machine(),"
+            "'platform':sys.platform,"
+            "'version':[sys.version_info.major,sys.version_info.minor]},"
+            "sort_keys=True,separators=(',',':')))",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise EnvironmentRefusal(
+            "package_environment_interpreter_invalid",
+            result.stderr.strip()[-1000:] or "interpreter probe returned invalid JSON",
+        ) from exc
+    target = dict(base.platform_target)
+    major, minor = _target_python(base)
+    if (
+        result.returncode != 0
+        or not isinstance(observed, dict)
+        or observed.get("implementation") != "cpython"
+        or observed.get("cache_tag") != f"cpython-{major}{minor}"
+        or observed.get("version") != [major, minor]
+        or observed.get("platform") != "linux"
+        or observed.get("machine") not in {"x86_64", "amd64"}
+        or target.get("os_arch") != "linux/amd64"
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_interpreter_incompatible",
+            f"observed={observed!r} target={target!r}",
+        )
+    return {
+        "libc": target["libc"],
+        "os_arch": target["os_arch"],
+        "python_abi": target["python_abi"],
+    }
+
+
+def _install_with_uv(
+    uv: Path, python: Path, staging: Path, inspected: Sequence[_Inspected]
+) -> None:
+    commands = (
+        [
+            str(uv),
+            "venv",
+            "--no-project",
+            "--no-config",
+            "--offline",
+            "--no-python-downloads",
+            "--link-mode",
+            "clone",
+            "--python",
+            str(python),
+            "--system-site-packages",
+            str(staging),
+        ],
+        [
+            str(uv),
+            "pip",
+            "install",
+            "--no-config",
+            "--offline",
+            "--no-index",
+            "--no-deps",
+            "--no-build",
+            "--link-mode",
+            "clone",
+            "--compile-bytecode",
+            "--python",
+            str(staging / "bin" / "python"),
+            *(str(item.path) for item in sorted(inspected, key=lambda item: item.wheel.digest)),
+        ],
+    )
+    for command in commands:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip()[-2000:] or result.stdout.strip()[-2000:]
+            raise EnvironmentRefusal(
+                "package_environment_uv_failed",
+                detail or f"uv exited {result.returncode}",
+            )
+
+
+def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:
     return {
         "base_family_digest": source.base_family_digest,
+        "content_digest": content_digest,
         "environment_digest": source.environment_digest,
         "format": RECEIPT_FORMAT,
-        "overlay_wheels": [
+        "package_wheels": [
             {
                 "digest": wheel.digest,
                 "distribution": wheel.distribution,
@@ -1475,17 +1603,21 @@ def _receipt(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
     }
 
 
-def _content_identity(source: Input, wheels: Sequence[Wheel]) -> dict[str, Any]:
+def _content_identity(
+    wheels: Sequence[Wheel], interpreter: Mapping[str, str], uv_version: str
+) -> dict[str, Any]:
     return {
-        "base_family_digest": source.base_family_digest,
+        "format": "cozy.runtime.PackageEnvironment/1",
+        "interpreter": dict(interpreter),
+        "uv_version": uv_version,
         "wheel_digests": sorted(wheel.digest for wheel in wheels),
     }
 
 
-def _content_identity_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    rows = receipt.get("overlay_wheels")
+def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bool:
+    rows = receipt.get("package_wheels")
     if not isinstance(rows, list) or not rows:
-        raise OverlayRefusal("overlay_receipt_invalid", "overlay_wheels is empty")
+        raise EnvironmentRefusal("package_environment_receipt_invalid", "package_wheels is empty")
     digests: list[str] = []
     for row in rows:
         if not isinstance(row, dict) or set(row) != {
@@ -1494,40 +1626,45 @@ def _content_identity_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]
             "owner",
             "version",
         }:
-            raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel row is not closed")
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", "package wheel row is not closed"
+            )
         digest = row.get("digest")
         if not isinstance(digest, str):
-            raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel digest is absent")
-        _require_digest(digest, "overlay_wheels.digest")
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", "package wheel digest is absent"
+            )
+        _require_digest(digest, "package_wheels.digest")
         digests.append(digest)
     if len(set(digests)) != len(digests):
-        raise OverlayRefusal("overlay_receipt_invalid", "overlay wheel digests repeat")
-    base = receipt.get("base_family_digest")
-    if not isinstance(base, str):
-        raise OverlayRefusal("overlay_receipt_invalid", "base family is absent")
-    _require_digest(base, "base_family_digest")
-    return {
-        "base_family_digest": base,
-        "wheel_digests": sorted(digests),
-    }
-
-
-def _content_digest_from_receipt(receipt: Mapping[str, Any]) -> str:
-    return _sha(canonical.write(_content_identity_from_receipt(receipt)))
+        raise EnvironmentRefusal(
+            "package_environment_receipt_invalid", "package wheel digests repeat"
+        )
+    return (
+        isinstance(identity, dict)
+        and set(identity) == {"format", "interpreter", "uv_version", "wheel_digests"}
+        and identity.get("format") == "cozy.runtime.PackageEnvironment/1"
+        and isinstance(identity.get("interpreter"), dict)
+        and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
+        and all(isinstance(value, str) and value for value in identity["interpreter"].values())
+        and isinstance(identity.get("uv_version"), str)
+        and bool(identity["uv_version"])
+        and identity.get("wheel_digests") == sorted(digests)
+    )
 
 
 def _require_owned_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = root.lstat()
     if not root.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        raise OverlayRefusal("overlay_root_owner_mismatch", str(root))
+        raise EnvironmentRefusal("package_environment_root_owner_mismatch", str(root))
     root.chmod(0o711)
 
 
 def _remove_dead_staging(root: Path) -> None:
     """Remove only staging owned by a process identity that is observably gone."""
 
-    for prefix in (".overlay-staging-", ".wheel-staging-"):
+    for prefix in (".environment-staging-",):
         for path in root.glob(prefix + "*"):
             remainder = path.name.removeprefix(prefix)
             pid_raw, separator, _nonce = remainder.partition("-")
@@ -1558,7 +1695,7 @@ def _publish_receipt(path: Path, payload: bytes, receipts: Path) -> None:
         os.link(temporary, path)
     except FileExistsError:
         if path.read_bytes() != payload:
-            raise OverlayRefusal("overlay_receipt_conflict", str(path)) from None
+            raise EnvironmentRefusal("package_environment_receipt_conflict", str(path)) from None
     finally:
         temporary.unlink(missing_ok=True)
     _fsync_dir(receipts)
@@ -1566,7 +1703,7 @@ def _publish_receipt(path: Path, payload: bytes, receipts: Path) -> None:
 
 def _require_digest(value: str, name: str) -> None:
     if not _DIGEST.fullmatch(value):
-        raise OverlayRefusal("overlay_digest_invalid", f"{name}={value!r}")
+        raise EnvironmentRefusal("package_environment_digest_invalid", f"{name}={value!r}")
 
 
 def _name(value: str) -> str:
@@ -1604,7 +1741,7 @@ def _hash_file(path: Path) -> str:
             for chunk in iter(lambda: stream.read(4 << 20), b""):
                 measured.update(chunk)
     except OSError as exc:
-        raise OverlayRefusal("overlay_wheel_unreadable", str(path)) from exc
+        raise EnvironmentRefusal("package_environment_wheel_unreadable", str(path)) from exc
     return "sha256:" + measured.hexdigest()
 
 

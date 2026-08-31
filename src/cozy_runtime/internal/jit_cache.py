@@ -2,7 +2,7 @@
 
 Upstream keys are an optimization, not a same-UID security boundary. Tensorhub guarantees one
 public trust domain per pod; private renter cross-org stacking retains its documented same-UID
-risk. Runtime scopes cache reuse to one unpredictable worker boot plus exact overlay content and
+risk. Runtime scopes cache reuse to one unpredictable worker boot plus exact package content and
 deletes the whole boot scope only after worker shutdown has reclaimed the executor tree.
 """
 

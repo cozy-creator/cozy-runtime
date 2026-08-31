@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import platform
 import shutil
+import subprocess
 import sys
 import warnings
 import zipfile
@@ -361,6 +362,17 @@ def _release(
 ) -> dict[str, object]:
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
+    if not any(row["distribution"] == "uv" for row in base_distributions):
+        uv_version = subprocess.run(
+            ["uv", "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[1]
+        base_distributions.append({"distribution": "uv", "version": uv_version})
+        base_distributions.sort(key=lambda row: str(row["distribution"]))
+        base_import_roots.append({"providers": ["uv"], "root": "uv"})
+        base_import_roots.sort(key=lambda row: str(row["root"]))
     cpu = target["accelerator_backend"] == "none"
     if not cpu:
         base_distributions = [
@@ -495,30 +507,32 @@ def _success(root: Path, name: str, receipt: bytes) -> dict[str, Any]:
     value = _parse_canonical(receipt)
     _require(isinstance(value, dict), f"{name} receipt is not an object")
     receipt_value = cast(dict[str, Any], value)
-    rows = receipt_value.get("overlay_wheels")
+    rows = receipt_value.get("package_wheels")
     _require(isinstance(rows, list), f"{name} receipt wheel rows are absent")
     wheel_rows = cast(list[dict[str, Any]], rows)
-    content = _canonical(
-        {
-            "base_family_digest": receipt_value.get("base_family_digest"),
-            "wheel_digests": sorted(str(row.get("digest")) for row in wheel_rows),
-        }
-    )
-    content_digest = _digest(content)
+    content_digest = str(receipt_value.get("content_digest"))
     _require(
         generation.name == content_digest.removeprefix("sha256:"),
-        f"{name} installed content is not keyed by base family plus wheel digests",
+        f"{name} installed content is not keyed by its package-environment digest",
     )
     _require(generation.is_dir(), f"{name} installed content is absent")
-    site = generation / "site-packages"
+    site = generation / "lib" / "python3.12" / "site-packages"
     for metadata in ("package.toml", "pyproject.toml", "uv.lock"):
         _require((site / metadata).is_file(), f"{name} omitted project metadata {metadata}")
     _require(
-        (generation / "package-overlay-content.json").read_bytes() == content,
-        f"{name} installed-content identity disagrees with its receipt",
+        _digest((generation / "package-environment-content.json").read_bytes()) == content_digest,
+        f"{name} installed-content identity digest disagrees with its receipt",
+    )
+    content = _parse_canonical((generation / "package-environment-content.json").read_bytes())
+    _require(isinstance(content, dict), f"{name} content identity is not an object")
+    content_value = cast(dict[str, Any], content)
+    _require(
+        content_value.get("wheel_digests") == sorted(str(row.get("digest")) for row in wheel_rows),
+        f"{name} content identity names different package wheels",
     )
     _require(
-        not list((root / f"environment-{name}").glob(".staging-*")), f"{name} staging survived"
+        not list((root / f"environment-{name}").glob(".environment-staging-*")),
+        f"{name} staging survived",
     )
     external = root / f"receipt-{name}.json"
     _require(external.read_bytes() == receipt, f"{name} external receipt changed while read")

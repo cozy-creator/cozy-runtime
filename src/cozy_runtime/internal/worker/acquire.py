@@ -21,7 +21,7 @@ from typing import Any, Literal
 from cozy_runtime.internal import (
     canonical,
     fill,
-    overlay,
+    package_environment,
     placement_materialization,
     pull,
 )
@@ -119,17 +119,19 @@ class VerifiedArtifactCache:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._files: dict[str, overlay.VerifiedFile] = {}
+        self._files: dict[str, package_environment.VerifiedFile] = {}
 
-    def trusted(self, digest: str, length: int, path: Path) -> overlay.VerifiedFile | None:
+    def trusted(
+        self, digest: str, length: int, path: Path
+    ) -> package_environment.VerifiedFile | None:
         with self._lock:
             receipt = self._files.get(digest)
             return (
                 receipt if receipt is not None and receipt.matches(path, digest, length) else None
             )
 
-    def record(self, digest: str, length: int, path: Path) -> overlay.VerifiedFile:
-        receipt = overlay.VerifiedFile.record(path, digest, length)
+    def record(self, digest: str, length: int, path: Path) -> package_environment.VerifiedFile:
+        receipt = package_environment.VerifiedFile.record(path, digest, length)
         with self._lock:
             self._files[digest] = receipt
         return receipt
@@ -137,7 +139,7 @@ class VerifiedArtifactCache:
 
 @dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
-    installed: overlay.InstalledOverlay | None
+    installed: package_environment.InstalledEnvironment | None
     bindings: Mapping[str, DeclaredBinding]
     model_objects: int
     documents: int
@@ -291,7 +293,8 @@ class Acquirer:
         selection_root: Path,
         artifact_store: Path,
         python: Path,
-        base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
+        base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
+        installed_environment: package_environment.InstalledEnvironment | None = None,
         verified_cache: VerifiedArtifactCache | None = None,
         on_observation: Any = None,
     ) -> None:
@@ -302,6 +305,7 @@ class Acquirer:
         self.artifact_store = artifact_store
         self.python = python
         self.base_manifest = base_manifest
+        self.installed_environment = installed_environment
         self.verified_cache = verified_cache or VerifiedArtifactCache()
         self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
         self._fetch_lock = Lock()
@@ -412,11 +416,11 @@ class Acquirer:
 
     def _run_package(
         self, placement: Any
-    ) -> tuple[overlay.InstalledOverlay, Mapping[str, DeclaredBinding], int]:
+    ) -> tuple[package_environment.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
-            installed = self._environment(placement)
+            installed = self.installed_environment or self._environment(placement)
             bindings, count = self._bindings(placement)
             return installed, bindings, count
         finally:
@@ -430,13 +434,13 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _environment(self, placement: Any) -> overlay.InstalledOverlay:
+    def _environment(self, placement: Any) -> package_environment.InstalledEnvironment:
         environment_digest = documents.spell(placement.environment_digest)
         wheelhouse_raw = self.base_manifest.read_bytes()
         package = placement.package or placement.development
         wheel_rows = [package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
-        verified: dict[str, overlay.VerifiedFile] = {}
+        verified: dict[str, package_environment.VerifiedFile] = {}
         for row in wheel_rows:
             digest, length = _ref(row["ref"], "wheel.ref")
             path = self.fetch(digest, length)
@@ -451,7 +455,7 @@ class Acquirer:
             verified[digest] = receipt
         self.wheels = len(wheel_paths)
         try:
-            source = placement_materialization.package_overlay_input(
+            source = placement_materialization.package_environment_input(
                 package=package,
                 environment=placement.environment,
                 environment_digest=environment_digest,
@@ -459,13 +463,13 @@ class Acquirer:
                 wheel_paths=wheel_paths,
                 verified_wheels=verified,
             )
-            return overlay.materialize(
+            return package_environment.materialize(
                 source,
                 self.environment_root,
                 python=self.python,
                 base_manifest=self.base_manifest,
             )
-        except (LaunchRefusal, overlay.OverlayRefusal) as exc:
+        except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
             ) from exc

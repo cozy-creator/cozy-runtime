@@ -1,4 +1,4 @@
-"""Authorized hardware proof for one already-materialized native package overlay."""
+"""Authorized hardware proof for one already-materialized native package environment."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from cozy_runtime.internal import (
     config,
     jit_cache,
     native_wheel,
-    overlay,
+    package_environment,
     spawn,
 )
 from cozy_runtime.internal.exits import Exit
@@ -59,15 +59,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         request = _request(request_path)
         base_raw = _bounded_bytes(request.wheelhouse_manifest, "wheelhouse_manifest")
         base_digest = _digest(base_raw)
-        base = overlay.parse_base_manifest(base_raw, base_digest)
-        installed = overlay.open_generation(
+        base = package_environment.parse_base_manifest(base_raw, base_digest)
+        installed = package_environment.open_generation(
             request.environment_root,
             receipt_digest=request.installed_receipt_digest,
             environment_digest=request.environment_digest,
             base_manifest=request.wheelhouse_manifest,
             python=request.python,
         )
-        inspection = native_wheel.inspect_installed(installed.import_root)
+        inspection = native_wheel.inspect_installed(installed.site_packages)
         runtime_config = config.read_config()
         base_environment = spawn.seal(runtime_config.child_base_env, {})
         selected_seat = native_wheel.observe_seat(request.python, base_environment)
@@ -82,7 +82,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         native_wheel.verify_seat(base, selected_seat, gpu=gpu)
         if canonical.digest(running_seat) != canonical.digest(selected_seat):
             raise native_wheel.NativeWheelRefusal(
-                "overlay_native_python_seat_mismatch",
+                "package_environment_native_python_seat_mismatch",
                 "proof executable and requested base Python report different seats",
             )
         host = native_wheel.qualify_host(inspection, gpu_sm=gpu_sm)
@@ -95,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except jit_cache.JITCacheRefusal as exc:
             raise native_wheel.NativeWheelRefusal(
-                "overlay_native_jit_cache_invalid", str(exc)
+                "package_environment_native_jit_cache_invalid", str(exc)
             ) from exc
         imposed = {
             **cache_scope.environment,
@@ -106,8 +106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
         try:
             operator = native_wheel.qualify_operator(
-                python=request.python,
-                overlay=installed.import_root,
+                python=installed.python,
                 fixture=request.fixture,
                 expected_result_digest=request.expected_result_digest,
                 environment=spawn.seal(runtime_config.child_base_env, imposed),
@@ -117,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 jit_cache.remove_pod(runtime_config.cozy_home, proof_pod_scope)
             except jit_cache.JITCacheRefusal as exc:
                 raise native_wheel.NativeWheelRefusal(
-                    "overlay_native_jit_cache_invalid", str(exc)
+                    "package_environment_native_jit_cache_invalid", str(exc)
                 ) from exc
         evidence = {
             "base_worker_profile": _profile_id(base),
@@ -129,7 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "host_qualification": host,
             "installed_environment_receipt_digest": request.installed_receipt_digest,
             "operator_observation": operator,
-            "overlay_content_digest": installed.content_digest,
+            "package_environment_content_digest": installed.content_digest,
             "static_inspection": inspection.document(),
             "wheelhouse_manifest_digest": base_digest,
         }
@@ -146,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CliError as exc:
         emit_error(exc, opts)
         return int(exc.code)
-    except (native_wheel.NativeWheelRefusal, overlay.OverlayRefusal) as exc:
+    except (native_wheel.NativeWheelRefusal, package_environment.EnvironmentRefusal) as exc:
         emit_error(
             CliError(
                 exc.code,
@@ -210,7 +209,7 @@ def _request(path: Path) -> Request:
     )
 
 
-def _profile_id(base: overlay.BaseManifest) -> str:
+def _profile_id(base: package_environment.BaseManifest) -> str:
     profile = dict(base.compatibility_profile)
     return (
         f"torch{profile['torch_release']}-{profile['accelerator_build']}-"
@@ -293,6 +292,6 @@ def _error(detail: str, code: Exit = Exit.validation) -> CliError:
     return CliError(
         "native_wheel_proof_request_invalid",
         detail,
-        "provide one closed cozy-native-wheel-proof request over an installed exact overlay",
+        "provide one closed cozy-native-wheel-proof request over an exact package environment",
         code,
     )

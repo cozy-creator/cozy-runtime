@@ -225,17 +225,14 @@ def run(
     if kind == "job":
         descriptor_path = workspace / "package-descriptor.json"
         descriptor_path.write_bytes(desc.canonical_bytes(body))
-        overlay_root = found.project / "src"
-        if not overlay_root.is_dir():
-            overlay_root = found.project
         job_records.append(
             {
                 "job_descriptor_id": descriptor_id,
                 "build_id": package_revision_digest,
                 "application": str(body["application"]),
                 "package_descriptor": str(descriptor_path),
-                "overlay": str(overlay_root),
-                "overlay_content_digest": package_revision_digest,
+                "python": sys.executable,
+                "environment_content_digest": package_revision_digest,
                 "job": function,
                 "gpu_count": int((surface.resources.gpu_count or 0) if surface.resources else 0),
                 "publishes": bool(surface.publishes),
