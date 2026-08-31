@@ -31,6 +31,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 MAX_FILES = 4096
 MAX_FILE_BYTES = 8 << 30
 _DISTRIBUTION = re.compile(r"[-_.]+")
+_OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 
 
 class PreparationRefusal(Exception):
@@ -103,6 +104,62 @@ def prepare_package_set(
     )
 
 
+def prepare_private_package(
+    request: pb.PreparePrivatePackageRequest,
+    *,
+    artifact_cache: Path,
+    environment_root: Path,
+    python: Path,
+    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    verified: Callable[[str, int, Path], None],
+    job_plan_root: Path | None = None,
+    base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
+) -> pb.PreparePackageSetResult:
+    """Prepare one exact private wheel revision without inventing Hub provenance."""
+
+    if (
+        Path(request.environment_root) != environment_root
+        or not environment_root.is_absolute()
+        or (job_plan_root is not None and not job_plan_root.is_absolute())
+    ):
+        raise PreparationRefusal(
+            "private_package_environment_root_invalid", request.environment_root
+        )
+    package = request.package
+    if (
+        _OPERATION_ID.fullmatch(request.operation_id) is None
+        or package.package.count("/") != 1
+        or not package.release
+        or len(package.source_digest) != 32
+        or package.HasField("project_wheel")
+    ):
+        raise PreparationRefusal("private_package_identity_invalid", request.operation_id)
+    if any(
+        row.kind
+        not in {
+            pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
+            pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+        }
+        for row in request.files
+    ):
+        raise PreparationRefusal("private_package_file_kind_invalid", request.operation_id)
+    return prepare_package(
+        package_name=package.package,
+        release=package.release,
+        release_digest=documents.spell(package.source_digest),
+        files=request.files,
+        placement_seed=(request.operation_id.encode("ascii") + package.source_digest),
+        artifact_cache=artifact_cache,
+        environment_root=environment_root,
+        python=python,
+        describe=describe,
+        verified=verified,
+        job_plan_root=job_plan_root,
+        base_manifest=base_manifest,
+        development=package,
+    )
+
+
 def prepare_package(
     *,
     package_name: str,
@@ -120,6 +177,7 @@ def prepare_package(
     artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
     allow_native_custom: bool = False,
+    development: pb.DevelopmentPackage | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
 
@@ -290,7 +348,6 @@ def prepare_package(
     )
     placement = pb.Placement(
         placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
-        package=package,
         environment_digest=documents.raw(environment_digest),
         package_descriptor=pb.Ref(
             digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
@@ -300,6 +357,17 @@ def prepare_package(
         entrypoints=entrypoints,
         environment=environment,
     )
+    if development is None:
+        placement.package.CopyFrom(package)
+    else:
+        placement.development.CopyFrom(
+            pb.DevelopmentPackage(
+                package=development.package,
+                release=development.release,
+                source_digest=development.source_digest,
+                project_wheel=_wheel_fact(project),
+            )
+        )
     placement_body = documents.body(placement)
     placement_body.setdefault("models", [])
     placement_body["environment"].setdefault("wheels", [])

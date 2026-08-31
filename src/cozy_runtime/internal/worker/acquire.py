@@ -433,7 +433,8 @@ class Acquirer:
     def _environment(self, placement: Any) -> overlay.InstalledOverlay:
         environment_digest = documents.spell(placement.environment_digest)
         wheelhouse_raw = self.base_manifest.read_bytes()
-        wheel_rows = [placement.package["project_wheel"], *placement.environment.get("wheels", [])]
+        package = placement.package or placement.development
+        wheel_rows = [package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
         verified: dict[str, overlay.VerifiedFile] = {}
         for row in wheel_rows:
@@ -451,7 +452,7 @@ class Acquirer:
         self.wheels = len(wheel_paths)
         try:
             source = placement_materialization.package_overlay_input(
-                package=placement.package,
+                package=package,
                 environment=placement.environment,
                 environment_digest=environment_digest,
                 wheelhouse_manifest_bytes=wheelhouse_raw,

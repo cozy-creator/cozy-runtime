@@ -490,6 +490,15 @@ flat binding record or pretends the local selection carries Tensorhub's hardware
 selection/acquisition plus drift refusals without claiming GPU execution; the existing
 `scripts/pipeline-live.py image/arms` runs remain the real-GPU output and floor evidence.
 
+On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
+ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
+WorkerControl chunks into local files. The loopback-only
+`RuntimePreparation.PreparePrivatePackage` method then calls the same wheel/base/overlay/descriptor/
+job-plan implementation as a published package. Its resulting Placement uses
+`DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
+masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
+authority.
+
 `scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
 735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.
 

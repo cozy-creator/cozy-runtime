@@ -505,7 +505,9 @@ def _package_selection(value: object) -> dict[str, Any]:
 
 
 def _development_package(value: object) -> dict[str, Any]:
-    row = _closed_document(value, {"package", "release", "source_digest"}, "DevelopmentPackage")
+    row = _closed_document(
+        value, {"package", "release", "source_digest", "project_wheel"}, "DevelopmentPackage"
+    )
     _required(row, {"package", "release", "source_digest"}, "DevelopmentPackage")
     package = _identifier(row["package"], "DevelopmentPackage.package")
     release = _identifier(row["release"], "DevelopmentPackage.release")
@@ -518,6 +520,10 @@ def _development_package(value: object) -> dict[str, Any]:
         or HASH_ENTRY.fullmatch(row["source_digest"]) is None
     ):
         raise documents.DocumentError("development_invalid", "source_digest is malformed")
+    if "project_wheel" in row:
+        project = _wheel_fact(row["project_wheel"], "DevelopmentPackage.project_wheel")
+        if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
+            raise documents.DocumentError("project_wheel_mismatch", package)
     return row
 
 
@@ -550,8 +556,13 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     development = "development" in entry
     if published == development:
         raise documents.DocumentError("package_mode_invalid", "select exactly one package mode")
-    if published:
-        package = _package_selection(entry["package"])
+    package = (
+        _package_selection(entry["package"])
+        if published
+        else _development_package(entry["development"])
+    )
+    remote_development = development and "project_wheel" in package
+    if published or remote_development:
         _required(
             entry,
             {"environment_digest", "environment"},
@@ -583,7 +594,6 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 f"measured {measured_environment}, expected {entry['environment_digest']}",
             )
     else:
-        _development_package(entry["development"])
         forbidden = {
             "environment_digest",
             "environment",
@@ -874,6 +884,19 @@ class Worker:
     def prepare_package_set(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:
+        return self._prepare_package(request, private=False)
+
+    def prepare_private_package(
+        self, request: pb.PreparePrivatePackageRequest
+    ) -> pb.PreparePackageSetResult:
+        return self._prepare_package(request, private=True)
+
+    def _prepare_package(
+        self,
+        request: pb.PreparePackageSetRequest | pb.PreparePrivatePackageRequest,
+        *,
+        private: bool,
+    ) -> pb.PreparePackageSetResult:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
         from cozy_runtime.internal.worker import package_prepare
@@ -930,6 +953,18 @@ class Worker:
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
 
+            if private:
+                assert isinstance(request, pb.PreparePrivatePackageRequest)
+                return package_prepare.prepare_private_package(
+                    request,
+                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    environment_root=Path(self.options.environment_root or ""),
+                    python=Path(self.options.python or sys.executable),
+                    describe=describe,
+                    verified=mark_verified,
+                    job_plan_root=self.config.cozy_home / "job-plans",
+                )
+            assert isinstance(request, pb.PreparePackageSetRequest)
             return package_prepare.prepare_package_set(
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
@@ -2109,15 +2144,15 @@ class Worker:
                     terminal=True,
                 )
                 return None
-        if placement.development:
+        if placement.development and "project_wheel" not in placement.development:
             self._materialization_failed(
                 placement,
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     subject=placement.placement_id,
                     reason="development_project_absent",
-                    detail="a development Placement requires an explicit same-user "
-                    "--development-project launch",
+                    detail="a live development Placement requires an explicit same-user "
+                    "--development-project launch; a remote snapshot must carry its exact wheel",
                 ),
                 terminal=True,
             )
