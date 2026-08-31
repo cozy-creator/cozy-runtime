@@ -1,8 +1,8 @@
 """Loopback preparation of supervisor-verified foreign model source files.
 
 Networking and credentials end in pod-supervisor. Runtime validates the small transport
-shape, then hands the exact logical rows to TensorFS 0.0.5. It neither plans model formats
-nor interprets ReleaseEvidence.
+shape, then hands the exact logical rows to TensorFS 0.0.6. It neither plans model formats
+nor interprets CheckpointEvidence.
 """
 
 from __future__ import annotations
@@ -165,7 +165,7 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
         profile = row.get("profile")
         manifest = row.get("manifest_digest")
         length = row.get("manifest_length")
-        evidence = row.get("release_evidence_canonical_bytes")
+        evidence = row.get("checkpoint_evidence_canonical_bytes")
         if (
             not isinstance(slot, str)
             or slot <= prior
@@ -176,7 +176,7 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
             or isinstance(length, bool)
             or length <= 0
             or not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= artifact_limits.MAX_RELEASE_EVIDENCE_BYTES
+            or not 0 < len(evidence) <= artifact_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
         ):
             raise ModelSourceRefusal(
                 "model_source_tensorfs_result_invalid", "TensorFS returned an invalid row"
@@ -187,7 +187,7 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
                 slot=slot,
                 profile=profile,
                 manifest=pb.Ref(digest=documents.raw(manifest), length=length),
-                release_evidence_canonical_bytes=evidence,
+                checkpoint_evidence_canonical_bytes=evidence,
             )
         )
     return pb.PrepareModelSourceResult(

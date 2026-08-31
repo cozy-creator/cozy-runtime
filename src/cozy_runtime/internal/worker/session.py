@@ -295,14 +295,25 @@ class Placement:
 
     @property
     def config_digest(self) -> str:
-        selected = {
-            str(slot["config"]["document"]["digest"])
+        selected = sorted(
+            (
+                f"{entrypoint['name']}.models.{slot['slot']}",
+                str(slot["config"]["document"]["digest"]),
+            )
             for entrypoint in self.entrypoints
             for slot in entrypoint.get("slots", [])
-        }
+        )
         if not selected:
             return canonical.digest({})
-        return next(iter(selected)) if len(selected) == 1 else ""
+        if len(selected) == 1:
+            return selected[0][1]
+        return canonical.digest(
+            {
+                "model_bindings": [
+                    {"path": path, "config_digest": digest} for path, digest in selected
+                ]
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2715,48 +2726,49 @@ class Worker:
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
             try:
+                model_commands = []
+                for index, model in enumerate(first.model_bindings()):
+                    model_commands.append(
+                        {
+                            "binding": {
+                                "application": first.application,
+                                "package_descriptor": first.descriptor_path,
+                                "development_project": first.development_project,
+                                "model_class": model.model_class,
+                                "model_binding_path": model.model_binding_path,
+                                "model_parameter_name": model.model_parameter_name,
+                                "component": model.components[0] if model.components else "",
+                                "components": list(model.components),
+                                "snapshots": dict(model.snapshots),
+                                "store": model.store,
+                                "config": model.config,
+                                "snapshot": model.reference_snapshot,
+                                "release": first.release,
+                                "variant": model.variant,
+                                "development": first.development,
+                                "stamps": {k: list(v) for k, v in model.stamps.items()},
+                                "custody": model.custody,
+                                "strict_keys": model.strict_keys,
+                                "variants": [dataclasses.asdict(offer) for offer in model.offered],
+                                "objective": model.objective,
+                                "steps_basis": model.steps_basis,
+                            },
+                            "budgets": {
+                                "declared_weight_bytes": model.model_weight_bytes,
+                                "pinned": first.pinned_bytes if index == 0 else 0,
+                                "resident": model.resident_budget_bytes,
+                                "vram_floor": model.vram_floor_bytes,
+                            },
+                            "expect_construction_digest": model.expected_logical_model_digest,
+                        }
+                    )
+                prepare_command: dict[str, Any] = {"cmd": "prepare"}
+                if len(model_commands) == 1:
+                    prepare_command.update(model_commands[0])
+                else:
+                    prepare_command["models"] = model_commands
                 reply = executor.call(
-                    {
-                        "cmd": "prepare",
-                        "binding": {
-                            "application": first.application,
-                            "package_descriptor": first.descriptor_path,
-                            "development_project": first.development_project,
-                            "model_class": first.model_class,
-                            "model_binding_path": first.model_binding_path,
-                            "model_parameter_name": first.model_parameter_name,
-                            "component": first.components[0] if first.components else "",
-                            "components": list(first.components),
-                            "snapshots": dict(first.snapshots),
-                            "store": first.store,
-                            "config": first.config,
-                            "snapshot": first.reference_snapshot,
-                            "release": first.release,
-                            "variant": first.variant,
-                            "development": first.development,
-                            # THE STAMP PLANE'S LAST HOP (#567d). The index row carries what the
-                            # hub verified at publish; the executor hands it to `Artifact`, and
-                            # a model class's keywords join it there. Dropping it here is what
-                            # made `artifact.stamps` unconditionally `{}` and refused every
-                            # stamped class on every checkpoint.
-                            "stamps": {k: list(v) for k, v in first.stamps.items()},
-                            "custody": first.custody,
-                            "strict_keys": first.strict_keys,
-                            "variants": [dataclasses.asdict(offer) for offer in first.offered],
-                            "objective": first.objective,
-                            "steps_basis": first.steps_basis,
-                        },
-                        "budgets": {
-                            # cr-037/law 19: a prediction BASIS, not a budget — the wire
-                            # field says what it carries so it cannot be read as a ceiling.
-                            "declared_weight_bytes": first.model_weight_bytes,
-                            "pinned": first.pinned_bytes,
-                            # cl-027: None means DERIVE at prepare; the floor rides with it.
-                            "resident": first.resident_budget_bytes,
-                            "vram_floor": first.vram_floor_bytes,
-                        },
-                        "expect_construction_digest": first.expected_logical_model_digest,
-                    },
+                    prepare_command,
                     timeout=None,
                     on_progress=lambda frame: self.monitor.advance(
                         f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)

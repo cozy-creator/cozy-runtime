@@ -78,6 +78,8 @@ jobs:
       # the only minor changes are new callables and optional/omissible request fields.
       - run: uv run python checks/descriptor_compatibility.py
       - run: uv run python checks/local_base.py
+      - run: uv run python checks/model_release_routes.py
+      - run: uv run python checks/multi_model_binding.py
       - run: uv run cozy-runtime version
 
   # The provider's reviewed spec digests must exist in TensorFS's exact pinned registry.
@@ -104,8 +106,8 @@ jobs:
     if: needs.tensorfs-credential.outputs.present == 'yes'
     runs-on: ubuntu-latest
     env:
-      TENSORFS_SHA: 0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6
-      TENSORFS_VERSION: 0.0.5
+      TENSORFS_SHA: 55cb1418ea4874f569893b3975b716bd1dbd5cb2
+      TENSORFS_VERSION: 0.0.6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -139,7 +141,7 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     env:
-      WORKER_PROTOCOL_SHA: f6b209098e47511e9b40b7939df18ecacaa0f108
+      WORKER_PROTOCOL_SHA: 0e2a31add831e0328a5eceee451929e2853e7978
     steps:
       - uses: actions/checkout@v4
       # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and

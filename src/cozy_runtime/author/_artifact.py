@@ -176,7 +176,7 @@ class ArtifactReceipt:
     artifact_transaction_id: str
     tensorfs_receipt_digest: str
     tensorfs_receipt: bytes
-    release_evidence_canonical_bytes: bytes
+    checkpoint_evidence_canonical_bytes: bytes
     replayed: bool = False
 
 

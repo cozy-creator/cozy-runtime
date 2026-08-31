@@ -52,7 +52,11 @@ from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    ModelBinding,
+    model_binding_set_digest,
+)
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -1063,14 +1067,10 @@ def development_placement_documents(
             for model in entry.get("models", [])
             if isinstance(model, Mapping)
         )
-        if len(selected_paths) > 1:
-            raise RuntimeError(
-                f"development_multiple_models_unsupported: {name} declares "
-                f"{len(selected_paths)} model slots; this Runtime currently prepares one"
-            )
         slots: list[pb.Slot] = []
-        selected = resolved_models[selected_paths[0]] if selected_paths else None
-        if selected is not None:
+        members: list[ModelBinding] = []
+        for selected_path in selected_paths:
+            selected = resolved_models[selected_path]
             model_id = model_ids[selected.slot.path]
             first_component = selected.components[0]
             assets = [
@@ -1106,46 +1106,65 @@ def development_placement_documents(
                     stamps=stamps,
                 )
             )
+            config_path = ""
+            if artifact_cache is not None:
+                _, staged_config = _stage_exact(artifact_cache, selected.config_bytes)
+                config_path = str(staged_config)
+            members.append(
+                ModelBinding(
+                    model_class=selected.slot.class_key,
+                    model_binding_path=selected.slot.path,
+                    model_parameter_name=selected.slot.param,
+                    config_digest=selected.config_digest,
+                    store=str(selected.store),
+                    config=config_path,
+                    variant=selected.variant,
+                    reference_snapshot=selected.manifest_digest,
+                    components=selected.components,
+                    snapshots={
+                        component: selected.manifest_digest for component in selected.components
+                    },
+                    stamps=selected.stamps,
+                    model_weight_bytes=selected.model_weight_bytes,
+                    vram_floor_bytes=selected.vram_floor_bytes,
+                    custody=selected.custody,
+                )
+            )
+        slots.sort(key=lambda row: row.slot)
+        members.sort(key=lambda row: row.model_binding_path)
         entrypoint = pb.Entrypoint(name=name, slots=slots)
         entrypoint.entrypoint_binding_digest = hashlib.sha256(
             canonical.write({"name": name, "slots": [documents.body(slot) for slot in slots]})
         ).digest()
         entrypoints.append(entrypoint)
 
-        config_path = ""
-        if selected is not None and artifact_cache is not None:
-            _, staged_config = _stage_exact(artifact_cache, selected.config_bytes)
-            config_path = str(staged_config)
         digest = documents.spell(entrypoint.entrypoint_binding_digest)
+        model_set = tuple(members)
+        first = model_set[0] if model_set else None
         declared_bindings[digest] = DeclaredBinding(
             entrypoint_binding_digest=digest,
             entrypoint=name,
-            model_class=selected.slot.class_key if selected is not None else "",
-            model_binding_path=selected.slot.path if selected is not None else "",
-            model_parameter_name=selected.slot.param if selected is not None else "",
+            model_class=first.model_class if first is not None else "",
+            model_binding_path=first.model_binding_path if first is not None else "",
+            model_parameter_name=first.model_parameter_name if first is not None else "",
             release=source_digest,
+            models=model_set,
             application=str(package_descriptor.get("application", "")),
             descriptor_path=descriptor_path,
             development_project=str(found.project) if found is not None else "",
-            store=str(selected.store) if selected is not None else "",
-            config=config_path,
-            variant=selected.variant if selected is not None else "",
-            reference_snapshot=selected.manifest_digest if selected is not None else "",
-            components=selected.components if selected is not None else (),
-            snapshots=(
-                {component: selected.manifest_digest for component in selected.components}
-                if selected is not None
-                else {}
-            ),
-            stamps=selected.stamps if selected is not None else {},
+            store=first.store if first is not None else "",
+            config=first.config if first is not None else "",
+            variant=first.variant if first is not None else "",
+            reference_snapshot=first.reference_snapshot if first is not None else "",
+            components=first.components if first is not None else (),
+            snapshots=first.snapshots if first is not None else {},
+            stamps=first.stamps if first is not None else {},
             package_revision_digest=source_digest,
-            config_digest=(
-                selected.config_digest if selected is not None else canonical.digest({})
-            ),
+            config_digest=model_binding_set_digest(model_set),
             development=True,
-            model_weight_bytes=selected.model_weight_bytes if selected is not None else 0,
-            vram_floor_bytes=selected.vram_floor_bytes if selected is not None else 0,
-            custody=selected.custody if selected is not None else "canonical",
+            model_weight_bytes=sum(model.model_weight_bytes for model in model_set),
+            vram_floor_bytes=sum(model.vram_floor_bytes for model in model_set),
+            custody=first.custody if first is not None else "canonical",
         )
     entrypoint_bodies = [documents.body(entrypoint) for entrypoint in entrypoints]
     bindings_digest = hashlib.sha256(

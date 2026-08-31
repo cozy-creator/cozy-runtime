@@ -255,6 +255,85 @@ class PreparedModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelBinding:
+    """One exact model slot inside an entrypoint's complete binding set."""
+
+    model_class: str
+    model_binding_path: str
+    model_parameter_name: str
+    config_digest: str
+    store: str
+    config: str
+    variant: str
+    reference_snapshot: str
+    components: tuple[str, ...]
+    snapshots: Mapping[str, str]
+    stamps: Mapping[str, tuple[str, ...]]
+    offered: tuple[Variant, ...] = ()
+    objective: str = "latency"
+    steps_basis: int = 20
+    model_weight_bytes: int = 0
+    vram_floor_bytes: int = 0
+    resident_budget_bytes: int | None = None
+    custody: str = "canonical"
+    strict_keys: bool = False
+    expected_logical_model_digest: str = ""
+
+    def snapshot_for(self, component: str) -> str:
+        return self.snapshots.get(component, self.reference_snapshot)
+
+    def key_document(self) -> dict[str, Any]:
+        return {
+            "store": self.store,
+            "config": self.config,
+            "config_digest": self.config_digest,
+            "snapshot": self.reference_snapshot,
+            "variant": self.variant,
+            "model_class": self.model_class,
+            "model_binding_path": self.model_binding_path,
+            "model_parameter_name": self.model_parameter_name,
+            "components": list(self.components),
+            "snapshots": dict(self.snapshots),
+            "stamps": {key: list(values) for key, values in self.stamps.items()},
+            "variants": [
+                {
+                    "name": value.name,
+                    "store": value.store,
+                    "snapshot": value.snapshot,
+                    "snapshots": dict(value.snapshots),
+                    "reference": value.reference,
+                }
+                for value in self.offered
+            ],
+            "objective": self.objective,
+            "steps_basis": self.steps_basis,
+            "model_weight_bytes": self.model_weight_bytes,
+            "vram_floor_bytes": self.vram_floor_bytes,
+            "resident_budget_bytes": self.resident_budget_bytes,
+            "custody": self.custody,
+            "strict_keys": self.strict_keys,
+            "expected_logical_model_digest": self.expected_logical_model_digest,
+        }
+
+
+def model_binding_set_digest(models: tuple[ModelBinding, ...]) -> str:
+    """Exact ordered config identity for InvocationSpec/PlacementStatus."""
+
+    if not models:
+        return canonical.digest({})
+    if len(models) == 1:
+        return models[0].config_digest
+    return canonical.digest(
+        {
+            "model_bindings": [
+                {"path": model.model_binding_path, "config_digest": model.config_digest}
+                for model in models
+            ]
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DeclaredBinding:
     """Runtime's private resolved value for one canonical Plan -> RMB -> MCC chain.
 
@@ -268,6 +347,7 @@ class DeclaredBinding:
     model_binding_path: str
     model_parameter_name: str
     release: str
+    models: tuple[ModelBinding, ...] = ()
     environment_digest: str = ""
     """The exact inline Environment selected beside this binding."""
     config_digest: str = ""
@@ -359,7 +439,37 @@ class DeclaredBinding:
         binding with nothing to fill had no way through (cl-013). Its executor imports no
         torch and touches no device.
         """
-        return not self.model_class
+        return not self.model_bindings()
+
+    def model_bindings(self) -> tuple[ModelBinding, ...]:
+        if self.models:
+            return self.models
+        if not self.model_class:
+            return ()
+        return (
+            ModelBinding(
+                model_class=self.model_class,
+                model_binding_path=self.model_binding_path,
+                model_parameter_name=self.model_parameter_name,
+                config_digest=self.config_digest,
+                store=self.store,
+                config=self.config,
+                variant=self.variant,
+                reference_snapshot=self.reference_snapshot,
+                components=self.components,
+                snapshots=self.snapshots,
+                stamps=self.stamps,
+                offered=self.offered,
+                objective=self.objective,
+                steps_basis=self.steps_basis,
+                model_weight_bytes=self.model_weight_bytes,
+                vram_floor_bytes=self.vram_floor_bytes,
+                resident_budget_bytes=self.resident_budget_bytes,
+                custody=self.custody,
+                strict_keys=self.strict_keys,
+                expected_logical_model_digest=self.expected_logical_model_digest,
+            ),
+        )
 
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
@@ -390,25 +500,8 @@ class DeclaredBinding:
             )
         return canonical.digest(
             {
-                "store": self.store,
-                "config": self.config,
-                "snapshot": self.reference_snapshot,
                 "release": self.release,
-                "variant": self.variant,
-                "model_class": self.model_class,
-                "components": list(self.components),
-                "snapshots": dict(self.snapshots),
-                "variants": [
-                    {
-                        "name": v.name,
-                        "store": v.store,
-                        "snapshot": v.snapshot,
-                        "snapshots": dict(v.snapshots),
-                        "reference": v.reference,
-                    }
-                    for v in self.offered
-                ],
-                "objective": self.objective,
+                "models": [model.key_document() for model in self.model_bindings()],
             }
         )
 

@@ -127,7 +127,7 @@ def main() -> None:
         raise RuntimeError("exact source replay changed")
 
     row = first.sources[0]
-    evidence = json.loads(row.release_evidence_canonical_bytes)
+    evidence = json.loads(row.checkpoint_evidence_canonical_bytes)
     manifest_id = documents.spell(row.manifest.digest)
     manifest = store.manifest(manifest_id)
     if (
@@ -139,7 +139,7 @@ def main() -> None:
         or evidence["ingest"]["declared_license"] != "openrail++"
         or evidence["verification"]["kind"] != "approved_producer"
     ):
-        raise RuntimeError("prepared source Manifest/ReleaseEvidence binding is incomplete")
+        raise RuntimeError("prepared source Manifest/CheckpointEvidence binding is incomplete")
 
     changed = pb.PrepareModelSourceRequest()
     changed.CopyFrom(prepared_request)

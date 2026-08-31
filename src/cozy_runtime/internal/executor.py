@@ -158,6 +158,70 @@ def residence_ceiling(
 # --------------------------------------------------------------------------- state
 
 
+class _CompositeResidency:
+    """Joint view over independently exact model-slot residencies.
+
+    Each slot may evict only its own components. A sibling model's residency is
+    never offered as capacity to another slot; sequential preparation therefore
+    admits only the conservative all-slot resident sum plus each slot's own rung.
+    """
+
+    def __init__(self, rows: Mapping[str, Any]) -> None:
+        self.rows = dict(rows)
+
+    @property
+    def poisoned(self) -> str:
+        return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
+
+    @property
+    def last_shortfall(self) -> Any:
+        return next(
+            (row.last_shortfall for row in self.rows.values() if row.last_shortfall is not None),
+            None,
+        )
+
+    def open_attempt(self, placement: str, headroom_bytes: int) -> None:
+        for row in self.rows.values():
+            row.open_attempt(placement, headroom_bytes)
+
+    def document(self) -> dict[str, Any]:
+        documents = {name: row.document() for name, row in sorted(self.rows.items())}
+        resident = {
+            f"{name}/{component}": int(size)
+            for name, document in documents.items()
+            for component, size in document.get("resident", {}).items()
+        }
+        evicted = {
+            f"{name}/{component}": int(size)
+            for name, document in documents.items()
+            for component, size in document.get("evicted", {}).items()
+        }
+        return {
+            "placement": next(
+                (document.get("placement", "") for document in documents.values()), ""
+            ),
+            "headroom_bytes": max(
+                (int(document.get("headroom_bytes", 0)) for document in documents.values()),
+                default=0,
+            ),
+            "admissions": sum(int(row.get("admissions", 0)) for row in documents.values()),
+            "stages": sum(int(row.get("stages", 0)) for row in documents.values()),
+            "evictions": sum(int(row.get("evictions", 0)) for row in documents.values()),
+            "attempt_stages": sum(int(row.get("attempt_stages", 0)) for row in documents.values()),
+            "attempt_evictions": sum(
+                int(row.get("attempt_evictions", 0)) for row in documents.values()
+            ),
+            "allocator_delta_bytes": sum(
+                int(row.get("allocator_delta_bytes", 0)) for row in documents.values()
+            ),
+            "resident": resident,
+            "evicted": evicted,
+            "poisoned": self.poisoned,
+            "cross_model_eviction": False,
+            "models": documents,
+        }
+
+
 class Executor:
     """One incarnation's mutable state. Everything here dies with the process."""
 
@@ -175,6 +239,7 @@ class Executor:
         self.registry: Any = None
         self.backend: Any = None
         self.residency: Any = None
+        self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
@@ -252,6 +317,8 @@ class Executor:
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
+        if "models" in command:
+            return self._prepare_many(command)
         binding = command["binding"]
         budgets = command["budgets"]
         started = time.perf_counter()
@@ -790,6 +857,183 @@ class Executor:
             "entrypoints": sorted(self.surface_names),
             "plan": plan.seam_document(),
             "delivery": self.facts["delivery"],
+            "facts": self.facts,
+        }
+
+    def _prepare_many(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Prepare one complete bounded multi-model callable in this device process."""
+
+        rows = command.get("models")
+        if (
+            not isinstance(rows, list)
+            or not 2 <= len(rows) <= 16
+            or any(
+                not isinstance(row, dict)
+                or set(row) != {"binding", "budgets", "expect_construction_digest"}
+                for row in rows
+            )
+        ):
+            return {
+                "ok": False,
+                "code": "model_binding_set_invalid",
+                "detail": "models must be a complete array of 2 through 16 closed binding rows",
+            }
+        paths = [str(row["binding"].get("model_binding_path", "")) for row in rows]
+        parameters = [str(row["binding"].get("model_parameter_name", "")) for row in rows]
+        if (
+            not all(paths)
+            or paths != sorted(set(paths))
+            or not all(parameters)
+            or len(parameters) != len(set(parameters))
+        ):
+            return {
+                "ok": False,
+                "code": "model_binding_set_invalid",
+                "detail": "model paths must be sorted unique and parameters must be unique",
+            }
+
+        children: list[tuple[str, Executor, dict[str, Any]]] = []
+        for row in rows:
+            binding = row["binding"]
+            parameter = str(binding["model_parameter_name"])
+            child = Executor(self.channel, self.root, self.fill_forensics_dir)
+            child.discovered = self.discovered
+            child.surface_names = dict(self.surface_names)
+            reply = child._prepare_first(row)
+            if not reply.get("ok"):
+                self.poisoned = f"model {parameter} refused: {reply.get('code', 'unknown')}"
+                return {**reply, "model_parameter": parameter}
+            self.discovered = child.discovered
+            self.surface_names = dict(child.surface_names)
+            children.append((parameter, child, reply))
+
+        self.model_executors = [child for _, child, _ in children]
+        self.torch = children[-1][1].torch
+        self.models = {}
+        for parameter, child, _ in children:
+            if set(child.models) != {parameter} or parameter in self.models:
+                self.poisoned = "model binding parameter mismatch"
+                return {
+                    "ok": False,
+                    "code": "model_binding_set_invalid",
+                    "detail": f"prepared model object did not bind parameter {parameter!r}",
+                }
+            self.models[parameter] = child.models[parameter]
+        residencies = {
+            parameter: child.residency
+            for parameter, child, _ in children
+            if child.residency is not None
+        }
+        self.residency = _CompositeResidency(residencies)
+
+        logical = [
+            {
+                "parameter": parameter,
+                "digest": str(reply["model_construction_digest"]),
+            }
+            for parameter, _, reply in children
+        ]
+        constructed = [
+            {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
+            for parameter, _, reply in children
+        ]
+        self.logical_model_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                b"cozy.runtime.model-construction-set\0" + canonical.write(logical)
+            ).hexdigest()
+        )
+        self.constructed_model_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                b"cozy.runtime.constructed-generation-set\0" + canonical.write(constructed)
+            ).hexdigest()
+        )
+
+        facts_rows = [(parameter, reply["facts"]) for parameter, _, reply in children]
+        last = facts_rows[-1][1]
+        resident = {
+            f"{parameter}/{component}": int(size)
+            for parameter, facts in facts_rows
+            for component, size in (facts.get("resident") or {}).items()
+        }
+        parked = [
+            f"{parameter}/{component}"
+            for parameter, facts in facts_rows
+            for component in facts.get("parked", [])
+        ]
+        scopes = {
+            f"{parameter}.{method}": [f"{parameter}/{component}" for component in components]
+            for parameter, facts in facts_rows
+            for method, components in (facts.get("declared_scopes") or {}).items()
+        }
+        pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
+        routes: dict[str, int] = {}
+        kernels: dict[str, int] = {}
+        for _, _, reply in children:
+            delivery = reply.get("delivery") or {}
+            for name, count in (delivery.get("routes") or {}).items():
+                routes[str(name)] = routes.get(str(name), 0) + int(count)
+            for name, count in (delivery.get("kernels") or {}).items():
+                kernels[str(name)] = kernels.get(str(name), 0) + int(count)
+        delivery = {
+            "variant": "joint",
+            "label": "joint",
+            "rung": "joint",
+            "delivery": "mixed",
+            "materialization": "joint",
+            "routes": routes,
+            "kernels": kernels,
+            "calibrated": all(
+                bool(reply.get("delivery", {}).get("calibrated")) for _, _, reply in children
+            ),
+            "objective": "joint",
+        }
+        self.facts = {
+            "cuda_init_ms": sum(float(facts.get("cuda_init_ms", 0)) for _, facts in facts_rows),
+            "prepare_ms": sum(float(facts.get("prepare_ms", 0)) for _, facts in facts_rows),
+            "fill_ms": sum(float(facts.get("fill_ms", 0)) for _, facts in facts_rows),
+            "filled": sum(int(facts.get("filled", 0)) for _, facts in facts_rows),
+            "filled_bytes": sum(int(facts.get("filled_bytes", 0)) for _, facts in facts_rows),
+            "device_free_bytes": int(last.get("device_free_bytes", -1)),
+            "device_total_bytes": int(last.get("device_total_bytes", -1)),
+            "allocator_bytes": int(last.get("allocator_bytes", -1)),
+            "reserved_bytes": int(last.get("reserved_bytes", -1)),
+            "resident": resident,
+            "parked": parked,
+            "declared_scopes": scopes,
+            "rss_bytes": max(int(facts.get("rss_bytes", 0)) for _, facts in facts_rows),
+            "pinned": {
+                "registered_bytes": sum(int(row.get("registered_bytes", 0)) for row in pinned_rows),
+                "in_flight_bytes": sum(int(row.get("in_flight_bytes", 0)) for row in pinned_rows),
+            },
+            "gpu_name": str(last.get("gpu_name", "")),
+            "torch_version": str(last.get("torch_version", "")),
+            "cuda_version": str(last.get("cuda_version", "")),
+            "custody": "joint",
+            "ignored_extra_keys": [
+                f"{parameter}/{key}"
+                for parameter, facts in facts_rows
+                for key in facts.get("ignored_extra_keys", [])
+            ],
+            "transcribed_markers": [
+                f"{parameter}/{key}"
+                for parameter, facts in facts_rows
+                for key in facts.get("transcribed_markers", [])
+            ],
+            "delivery": delivery,
+            "models": {parameter: facts for parameter, facts in facts_rows},
+            "cross_model_eviction": False,
+        }
+        self.ready = True
+        return {
+            "ok": True,
+            "ready": True,
+            "model_construction_digest": self.logical_model_digest,
+            "model_construction_digests": {row["parameter"]: row["digest"] for row in logical},
+            "constructed_model_digest": self.constructed_model_digest,
+            "entrypoints": sorted(self.surface_names),
+            "delivery": delivery,
             "facts": self.facts,
         }
 

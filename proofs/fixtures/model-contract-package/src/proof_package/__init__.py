@@ -39,6 +39,10 @@ class HiddenToyModel(ToyModel):
     pass
 
 
+class PeerModel(ToyModel):
+    pass
+
+
 app = App()
 
 
@@ -48,8 +52,9 @@ def metadata(payload: Request) -> Result:
 
 
 @app.entrypoint
-def render(payload: Request, model: ToyModel) -> Result:
+def render(payload: Request, model: ToyModel, peer: PeerModel) -> Result:
     model.touch()
+    peer.touch()
     return Result(payload.value)
 
 

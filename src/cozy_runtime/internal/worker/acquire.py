@@ -30,7 +30,11 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
-from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    ModelBinding,
+    model_binding_set_digest,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -265,10 +269,22 @@ def preinstalled_development(
         slots = selected.get("slots", [])
         if not slots:
             continue
-        config = slots[0]["config"]["document"]
-        _verify_file(Path(binding.config), str(config["digest"]), int(config["length"]))
-        verified += int(config["length"])
-        documents_count += 1
+        selected_configs = {
+            f"{selected['name']}.models.{slot['slot']}": slot["config"]["document"]
+            for slot in slots
+        }
+        members = binding.model_bindings()
+        if set(selected_configs) != {member.model_binding_path for member in members}:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "development_model_slot_changed",
+                str(selected["name"]),
+            )
+        for member in members:
+            config = selected_configs[member.model_binding_path]
+            _verify_file(Path(member.config), str(config["digest"]), int(config["length"]))
+            verified += int(config["length"])
+            documents_count += 1
     return AcquiredPlacement(
         None,
         bindings,
@@ -586,13 +602,6 @@ class Acquirer:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
-            if len(slots) > 1:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "binding_slot_count_unsupported",
-                    "this Runtime currently supports at most one selected model slot per "
-                    "entrypoint",
-                )
             application = str(descriptor.get("application", ""))
             if not slots:
                 bindings[binding_digest] = DeclaredBinding(
@@ -610,84 +619,117 @@ class Acquirer:
                     development=bool(development),
                 )
                 continue
-            slot = slots[0]
-            declared = described_models[0]
-            if (
-                not isinstance(declared, dict)
-                or declared.get("path") != f"{name}.models.{slot['slot']}"
-            ):
+            described_by_path = {
+                str(row.get("path", "")): row for row in described_models if isinstance(row, dict)
+            }
+            if len(described_by_path) != len(described_models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     "binding_package_descriptor_invalid",
-                    name,
+                    f"{name}: duplicate or malformed descriptor model slot",
                 )
-            config_ref = _ref(slot["config"]["document"], "slot.config.document")
-            config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
-            count += 1
-            reference = models[str(slot["reference_model_id"])]
-            reference_manifest = str(reference["manifest"]["digest"])
-            model_class = str(declared.get("class", ""))
-            components = tuple(str(row["component"]) for row in slot.get("components", []))
-            if not components:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "selected_binding_mismatch",
-                    f"{name}: selected model has no components",
+            members: list[ModelBinding] = []
+            for slot in slots:
+                path = f"{name}.models.{slot['slot']}"
+                declared = described_by_path.get(path)
+                if declared is None:
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        "binding_package_descriptor_invalid",
+                        path,
+                    )
+                config_ref = _ref(slot["config"]["document"], "slot.config.document")
+                config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
+                count += 1
+                reference = models[str(slot["reference_model_id"])]
+                reference_manifest = str(reference["manifest"]["digest"])
+                components = tuple(str(row["component"]) for row in slot.get("components", []))
+                if not components or len(set(components)) != len(components):
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        "selected_binding_mismatch",
+                        f"{path}: selected model has no complete unique component set",
+                    )
+                snapshots = {
+                    str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
+                    for row in slot.get("components", [])
+                }
+                stamps: dict[str, set[str]] = {}
+                for row in slot.get("stamps", []):
+                    stamps.setdefault(str(row["key"]), set()).update(
+                        str(value) for value in row["values"]
+                    )
+                descriptor_stamps = declared.get("stamps", {})
+                if not isinstance(descriptor_stamps, dict) or any(
+                    value not in stamps.get(str(key), set())
+                    for key, value in descriptor_stamps.items()
+                ):
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        "selected_binding_mismatch",
+                        f"{path}: descriptor stamps are not selected",
+                    )
+                try:
+                    store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+                    model_weight_bytes = sum(
+                        int(row["length"]) for row in store.walk(reference_manifest)
+                    )
+                except Exception as exc:
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        "selected_model_manifest_unavailable",
+                        f"{type(exc).__name__}: {exc}",
+                    ) from exc
+                members.append(
+                    ModelBinding(
+                        model_class=str(declared.get("class", "")),
+                        model_binding_path=path,
+                        model_parameter_name=str(slot["slot"]),
+                        config_digest=config_ref[0],
+                        store=str(self.artifact_store),
+                        config=str(config_path),
+                        variant="",
+                        reference_snapshot=reference_manifest,
+                        components=components,
+                        snapshots=snapshots,
+                        stamps={
+                            key: tuple(sorted(values)) for key, values in sorted(stamps.items())
+                        },
+                        model_weight_bytes=model_weight_bytes,
+                    )
                 )
-            snapshots = {
-                str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
-                for row in slot.get("components", [])
-            }
-            stamps: dict[str, set[str]] = {}
-            for row in slot.get("stamps", []):
-                stamps.setdefault(str(row["key"]), set()).update(str(v) for v in row["values"])
-            descriptor_stamps = declared.get("stamps", {})
-            if not isinstance(descriptor_stamps, dict) or any(
-                value not in stamps.get(str(key), set()) for key, value in descriptor_stamps.items()
-            ):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "selected_binding_mismatch",
-                    f"{name}: descriptor stamps are not selected",
-                )
-            try:
-                store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
-                model_weight_bytes = sum(
-                    int(row["length"]) for row in store.walk(reference_manifest)
-                )
-            except Exception as exc:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "selected_model_manifest_unavailable",
-                    f"{type(exc).__name__}: {exc}",
-                ) from exc
+                for asset in slot["config"].get("assets", []):
+                    ref = _ref(asset["ref"], "slot.config.asset")
+                    self._stage(ref[0], self.fetch(*ref).read_bytes())
+                    count += 1
+            members.sort(key=lambda member: member.model_binding_path)
+            model_set = tuple(members)
+            first = model_set[0]
             bindings[binding_digest] = DeclaredBinding(
                 entrypoint_binding_digest=binding_digest,
                 entrypoint=name,
                 package_revision_digest=release_digest,
                 release=release_digest,
+                models=model_set,
                 environment_digest=documents.spell(placement.environment_digest),
-                config_digest=config_ref[0],
-                model_class=model_class,
-                model_binding_path=str(declared["path"]),
-                model_parameter_name=str(slot["slot"]),
+                config_digest=model_binding_set_digest(model_set),
+                model_class=first.model_class,
+                model_binding_path=first.model_binding_path,
+                model_parameter_name=first.model_parameter_name,
                 application=application,
                 descriptor_path=str(descriptor_path),
-                store=str(self.artifact_store),
-                config=str(config_path),
-                variant="",
-                reference_snapshot=reference_manifest,
-                components=components,
-                snapshots=snapshots,
-                stamps={key: tuple(sorted(values)) for key, values in sorted(stamps.items())},
-                model_weight_bytes=model_weight_bytes,
+                store=first.store,
+                config=first.config,
+                variant=first.variant,
+                reference_snapshot=first.reference_snapshot,
+                components=first.components,
+                snapshots=first.snapshots,
+                stamps=first.stamps,
+                model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
+                vram_floor_bytes=sum(member.vram_floor_bytes for member in model_set),
                 expected_logical_model_digest="",
                 development=bool(development),
             )
-            for asset in slot["config"].get("assets", []):
-                ref = _ref(asset["ref"], "slot.config.asset")
-                self._stage(ref[0], self.fetch(*ref).read_bytes())
-                count += 1
         selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}
         if (development and not selected_entrypoints) or (
             not development and set(visible) != selected_entrypoints
@@ -705,8 +747,9 @@ class Acquirer:
         try:
             store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
             for binding in bindings.values():
-                for digest in {binding.reference_snapshot, *binding.snapshots.values()}:
-                    store.acquire_manifest(digest).release()
+                for model in binding.model_bindings():
+                    for digest in {model.reference_snapshot, *model.snapshots.values()}:
+                        store.acquire_manifest(digest).release()
         except Exception as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,

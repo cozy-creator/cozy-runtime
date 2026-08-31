@@ -31,10 +31,12 @@ from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StalePackageDescriptor
 from cozy_runtime.internal.discovery import discover_installed
+from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.exits import Exit
 
 INDEX_NAME = "result.json"
 CONTRACTS_DIR = "contracts"
+TOPOLOGIES_DIR = "code-topologies"
 RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
 MEMORY_CAP_BYTES = 24 << 30
 CPU_CAP_SECONDS = 600
@@ -124,14 +126,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "choose a separate fresh output directory owned by the build seat",
                 Exit.validation,
             )
-        response = _run_child(installed.python, request_path)
-        index, documents = _decode_child(response, request)
+        # Runtime/TensorFS are image-owned. The package venv carries only the
+        # release overlay, so the proof child is the current verified control
+        # Runtime with that exact venv's site-packages appended below.
+        response = _run_child(Path(sys.executable), request_path)
+        index, contracts, topologies = _decode_child(response, request)
         index_bytes = canonical.write(index)
-        _publish(output, index_bytes, documents)
+        _publish(output, index_bytes, contracts, topologies)
         print(
             json.dumps(
                 {
-                    "contracts": len(documents),
+                    "contracts": len(contracts),
+                    "code_topologies": len(topologies),
                     "digest": _sha(index_bytes),
                     "length": len(index_bytes),
                     "output": str(output),
@@ -469,12 +475,14 @@ def _child_entry(args: Sequence[str]) -> int:
     try:
         request_path = _existing_file(args[0], "request")
         request = _read_request(request_path)
-        _verify_installed_generation(request)
+        installed = _verify_installed_generation(request)
+        sys.path.append(str(installed.site_packages))
         descriptor_doc = _read_descriptor(request.package_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:
             raise ProofRefusal("model_contract_package_descriptor_invalid", "application is absent")
         _warm_torch()
+        _warm_tensorfs()
         sandbox.install(allow_write_prefixes=())
         sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
         found = discover_installed(application)
@@ -530,22 +538,47 @@ def _warm_torch() -> None:
                 raise
 
 
+def _warm_tensorfs() -> None:
+    """Load the pinned native facade before the no-write audit hook is installed."""
+
+    import tensorfs
+
+    if not hasattr(tensorfs, "CodeTensor") or not hasattr(tensorfs, "code_topology"):
+        raise ProofRefusal(
+            "model_contract_tensorfs_unavailable",
+            "the base image TensorFS lacks the reviewed CodeTopology author seam",
+        )
+
+
 def _derive_all(
     request: ProofRequest, found: Any, descriptor_doc: Mapping[str, Any]
 ) -> dict[str, Any]:
     surfaces = {surface.name: surface for surface in found.surfaces if not surface.hidden}
     requested = {row.path: row for row in request.bindings}
-    actual = {
-        binding.path: binding for surface in surfaces.values() for binding in surface.model_bindings
+    owners = {
+        binding.path: surface.name
+        for surface in surfaces.values()
+        for binding in surface.model_bindings
     }
-    if set(requested) != set(actual):
+    unknown = sorted(set(requested) - set(owners))
+    selected_names = {owners[path] for path in requested if path in owners}
+    incomplete: dict[str, dict[str, list[str]]] = {}
+    for name in selected_names:
+        complete = {binding.path for binding in surfaces[name].model_bindings}
+        supplied = set(requested) & complete
+        if supplied != complete:
+            incomplete[name] = {
+                "missing": sorted(complete - supplied),
+                "extra": sorted(supplied - complete),
+            }
+    if not requested or unknown or incomplete:
         raise ProofRefusal(
             "model_contract_binding_set_mismatch",
-            f"missing={sorted(set(actual) - set(requested))}, "
-            f"extra={sorted(set(requested) - set(actual))}",
+            f"unknown={unknown}, incomplete={incomplete}, selected={sorted(selected_names)}",
         )
 
     documents: dict[str, bytes] = {}
+    topologies: dict[str, bytes] = {}
     functions: list[dict[str, Any]] = []
     for collection in ("entrypoints", "jobs"):
         entries = descriptor_doc[collection]
@@ -565,6 +598,8 @@ def _derive_all(
                     "model_contract_package_descriptor_invalid",
                     f"{collection} surface {name!r} is absent",
                 )
+            if name not in selected_names:
+                continue
             binding_rows: list[dict[str, Any]] = []
             for binding in surface.model_bindings:
                 source = requested[binding.path]
@@ -594,8 +629,17 @@ def _derive_all(
                     previous = documents.setdefault(digest, raw)
                     if previous != raw:
                         raise ProofRefusal("model_contract_digest_collision", digest)
+                    topology = _code_topology(raw)
+                    topology_digest = _sha(topology)
+                    previous_topology = topologies.setdefault(topology_digest, topology)
+                    if previous_topology != topology:
+                        raise ProofRefusal("model_contract_digest_collision", topology_digest)
                     contracts.append(
                         {
+                            "code_topology": {
+                                "digest": topology_digest,
+                                "length": len(topology),
+                            },
                             "hardware_variant": variant,
                             "model_construction_contract": {
                                 "digest": digest,
@@ -629,6 +673,14 @@ def _derive_all(
                 "length": len(raw),
             }
             for digest, raw in sorted(documents.items())
+        ],
+        "code_topologies": [
+            {
+                "bytes": base64.b64encode(raw).decode(),
+                "digest": digest,
+                "length": len(raw),
+            }
+            for digest, raw in sorted(topologies.items())
         ],
         "functions": functions,
     }
@@ -671,6 +723,34 @@ def _derive_twice(
     return first
 
 
+def _code_topology(raw: bytes) -> bytes:
+    """Project one Runtime-owned MCC through TensorFS's existing document writer."""
+
+    parsed = contract.read_contract(raw)
+    storage_dtype = {torch: stored for stored, torch in TORCH_DTYPES.items()}
+    try:
+        import tensorfs
+
+        rows = [
+            tensorfs.CodeTensor(
+                component=tensor.component,
+                key=tensor.key,
+                dtype=storage_dtype[tensor.dtype or contract.DEFAULT_DTYPE],
+                shape=tensor.shape,
+                accepts="any",
+            )
+            for tensor in sorted(
+                parsed.logical_tensors, key=lambda tensor: (tensor.component, tensor.key)
+            )
+        ]
+        return bytes(tensorfs.code_topology(_sha(raw), rows))
+    except Exception as err:
+        raise ProofRefusal(
+            "model_contract_code_topology_refused",
+            f"TensorFS CodeTopology projection refused: {type(err).__name__}: {err}",
+        ) from err
+
+
 def _read_exact(ref: LocalDocumentRef, name: str) -> bytes:
     raw = _document_bytes(ref.path, name)
     if len(raw) != ref.length or _sha(raw) != ref.digest:
@@ -702,8 +782,8 @@ def _emit_child(value: Mapping[str, Any]) -> None:
 def _decode_child(
     response: Mapping[str, Any],
     request: ProofRequest,
-) -> tuple[dict[str, Any], dict[str, bytes]]:
-    if set(response) != {"application", "contracts", "functions"}:
+) -> tuple[dict[str, Any], dict[str, bytes], dict[str, bytes]]:
+    if set(response) != {"application", "code_topologies", "contracts", "functions"}:
         raise ProofRefusal("model_contract_child_invalid", "child result has an open field set")
     if not isinstance(response["application"], str):
         raise ProofRefusal("model_contract_child_invalid", "child result application")
@@ -736,6 +816,34 @@ def _decode_child(
         if parsed.candidate.release != request.package["release_digest"]:
             raise ProofRefusal("model_contract_child_invalid", "contract release identity")
         documents[digest] = raw
+    topology_rows = response["code_topologies"]
+    if not isinstance(topology_rows, list):
+        raise ProofRefusal("model_contract_child_invalid", "code_topologies is not an array")
+    topologies: dict[str, bytes] = {}
+    for row in topology_rows:
+        if not isinstance(row, dict) or set(row) != {"bytes", "digest", "length"}:
+            raise ProofRefusal("model_contract_child_invalid", "code topology row field set")
+        digest = row["digest"]
+        length = row["length"]
+        encoded = row["bytes"]
+        if (
+            not isinstance(digest, str)
+            or canonical.DIGEST_RE.fullmatch(digest) is None
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            or not isinstance(encoded, str)
+        ):
+            raise ProofRefusal("model_contract_child_invalid", "code topology row values")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except ValueError as err:
+            raise ProofRefusal(
+                "model_contract_child_invalid", "code topology bytes base64"
+            ) from err
+        if len(raw) != length or _sha(raw) != digest:
+            raise ProofRefusal("model_contract_child_invalid", "code topology stored-byte identity")
+        topologies[digest] = raw
     functions = response["functions"]
     if not isinstance(functions, list):
         raise ProofRefusal("model_contract_child_invalid", "functions is not an array")
@@ -749,10 +857,15 @@ def _decode_child(
         "functions": functions,
         "installed_environment_receipt": request.installed_environment_receipt.render(),
     }
-    return evidence, documents
+    return evidence, documents, topologies
 
 
-def _publish(output: Path, index: bytes, documents: Mapping[str, bytes]) -> None:
+def _publish(
+    output: Path,
+    index: bytes,
+    documents: Mapping[str, bytes],
+    topologies: Mapping[str, bytes],
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not stat.S_ISDIR(output.parent.lstat().st_mode):
         raise ProofRefusal("model_contract_output_invalid", "output parent is not a directory")
@@ -761,12 +874,18 @@ def _publish(output: Path, index: bytes, documents: Mapping[str, bytes]) -> None
         temporary.mkdir(mode=0o700)
         contracts_dir = temporary / CONTRACTS_DIR
         contracts_dir.mkdir(mode=0o700)
+        topologies_dir = temporary / TOPOLOGIES_DIR
+        topologies_dir.mkdir(mode=0o700)
         for digest, raw in sorted(documents.items()):
             _write_durable(contracts_dir / f"{digest.removeprefix('sha256:')}.json", raw)
+        for digest, raw in sorted(topologies.items()):
+            _write_durable(topologies_dir / f"{digest.removeprefix('sha256:')}.json", raw)
         _write_durable(temporary / INDEX_NAME, index)
         contracts_dir.chmod(0o500)
+        topologies_dir.chmod(0o500)
         temporary.chmod(0o500)
         _fsync_dir(contracts_dir)
+        _fsync_dir(topologies_dir)
         _fsync_dir(temporary)
         try:
             os.rename(temporary, output)

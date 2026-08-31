@@ -399,8 +399,8 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             _schema(item["request"], source, f"{path}.request")
             _schema(item["result"], source, f"{path}.result")
             models = item.get("models", [])
-            if not isinstance(models, list):
-                _invalid(source, f"{path}.models", "must be an array")
+            if not isinstance(models, list) or len(models) > 16:
+                _invalid(source, f"{path}.models", "must be an array of at most 16 slots")
             for model_index, model in enumerate(models):
                 model_path = f"{path}.models[{model_index}]"
                 slot = _closed(
