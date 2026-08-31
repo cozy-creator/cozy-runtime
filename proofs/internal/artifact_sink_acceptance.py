@@ -423,8 +423,15 @@ def main() -> None:
                 False,
             ),
             (
-                "canceled-read",
+                "oversize-buffer",
                 "9",
+                {"offset": 128, "size": (64 << 20) + 1},
+                "artifact_source_buffer",
+                False,
+            ),
+            (
+                "canceled-read",
+                "a",
                 {"offset": 128},
                 "cancelled",
                 True,
