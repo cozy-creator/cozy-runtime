@@ -120,6 +120,16 @@ STATIC_ARMS = (
         ROOT / "vectors" / "base-ownership.jsonl",
         '{"document":{},"expect":"ok","name":"planted-invalid-base"}\n',
     ),
+    Arm(
+        "base-ownership-vectors",
+        ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse-cpu.json",
+        "\n",
+    ),
+    Arm(
+        "base-ownership-vectors",
+        ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse-cu130.json",
+        "\n",
+    ),
     # The exact drift that cost a rented H200: a reviewed spec digest this build declares
     # and the installed registry does not carry. Planted as a well-formed digest of the
     # right shape, because a malformed one would be caught by looking rather than by asking.
