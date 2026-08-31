@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from cozy_runtime.internal import bindings as binding_table
-from cozy_runtime.internal import canonical, descriptor, fill
+from cozy_runtime.internal import canonical, descriptor, fill, model_config
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -1242,34 +1242,14 @@ def _resolve_development_models(
                 f"{measured_manifest}/{len(manifest_bytes)}"
             )
         manifest_length = len(manifest_bytes)
-        configs = header.get("configs")
-        if not isinstance(configs, Mapping) or len(configs) != 1:
-            raise RuntimeError(
-                f"development_model_config_ambiguous: {binding.ref}: expected one config, "
-                f"found {len(configs) if isinstance(configs, Mapping) else 'invalid'}"
-            )
-        _, config = next(iter(configs.items()))
-        if not isinstance(config, Mapping):
-            raise RuntimeError(f"development_model_config_invalid: {binding.ref}")
-        config_digest = "sha256:" + str(config.get("sha256", ""))
-        config_length = int(config.get("length", 0))
         try:
-            verdict = store.verify(config_digest)
-            config_bytes = bytes(store.document(config_digest))
-        except Exception as exc:
+            config_digest, config_bytes = model_config.construction_document(
+                store, header.get("configs")
+            )
+        except model_config.ModelConfigRefusal as exc:
             raise RuntimeError(
                 f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
             ) from exc
-        measured_config = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
-        if (
-            verdict.get("verdict") != "verified"
-            or measured_config != config_digest
-            or len(config_bytes) != config_length
-        ):
-            raise RuntimeError(
-                f"development_model_config_mismatch: {binding.ref}: expected "
-                f"{config_digest}/{config_length}, measured {measured_config}/{len(config_bytes)}"
-            )
         components_value = header.get("components")
         if not isinstance(components_value, Mapping) or not components_value:
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")

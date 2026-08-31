@@ -18,6 +18,7 @@ from cozy_runtime.internal import (
     canonical,
     descriptor,
     fill,
+    model_config,
     overlay,
     placement_materialization,
     pull,
@@ -584,25 +585,20 @@ def _selected_models(
             configs = header.get("configs")
             components = header.get("components")
             if (
-                not isinstance(configs, dict)
-                or len(configs) != 1
-                or not isinstance(components, dict)
+                not isinstance(components, dict)
                 or not components
                 or header.get("assets") not in ({}, None)
             ):
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
-                    f"{digest}: expected one config, components, and no assets",
+                    f"{digest}: expected configs, components, and no assets",
                 )
-            config = next(iter(configs.values()))
-            config_digest = "sha256:" + str(config["sha256"])
-            config_length = int(config["length"])
-            config_bytes = bytes(store.document(config_digest))
-            if (
-                len(config_bytes) != config_length
-                or "sha256:" + hashlib.sha256(config_bytes).hexdigest() != config_digest
-            ):
-                raise PreparationRefusal("package_prepare_model_config_mismatch", digest)
+            try:
+                config_digest, config_bytes = model_config.construction_document(store, configs)
+            except model_config.ModelConfigRefusal as exc:
+                raise PreparationRefusal(
+                    "package_prepare_model_config_mismatch", f"{digest}: {exc}"
+                ) from exc
             _stage(artifact_cache, config_bytes)
             for value in selected.values():
                 if value["selection"]["manifest"] == digest:
