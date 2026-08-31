@@ -22,3 +22,8 @@ class PoloResponse(msgspec.Struct):
 @app.entrypoint
 def marco(payload: MarcoRequest) -> PoloResponse:
     return PoloResponse(message="polo")
+
+
+@app.job
+def marco_job(payload: MarcoRequest) -> PoloResponse:
+    return PoloResponse(message="polo")

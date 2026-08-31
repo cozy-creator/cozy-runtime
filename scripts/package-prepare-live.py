@@ -7,6 +7,7 @@ import argparse
 import copy
 import hashlib
 import importlib.metadata
+import json
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from typing import Any
 
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
-from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
 from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -161,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             python=Path(sys.executable),
             describe=describe,
             verified=lambda digest, _length, _path: verified.append(digest),
+            job_plan_root=root / "job-plans",
             base_manifest=base,
         )
         value = documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)
@@ -171,6 +173,19 @@ def main(argv: list[str] | None = None) -> int:
         assert len(verified) == 2
         assert [row["name"] for row in placement["entrypoints"]] == ["marco"]
         assert placement["entrypoints"][0]["slots"] == []
+        descriptor_path = cache / str(placement["package_descriptor"]["digest"]).removeprefix(
+            "sha256:"
+        )
+        descriptor_body = descriptor.read_bytes(descriptor_path.read_bytes(), "Marco descriptor")
+        job_id = descriptor.job_descriptor_id(descriptor_body, "marco_job")
+        job = JobBinding.read(
+            json.loads((root / "job-plans" / f"{job_id.removeprefix('sha256:')}.json").read_text())
+        )
+        assert job.job == "marco_job"
+        assert job.build_id == release_digest
+        assert Path(job.overlay).is_dir()
+        assert Path(job.package_descriptor) == descriptor_path
+        assert job.reclaim_on_terminal
         assert result.placement_set.placement_set_digest == documents.digest_of(
             result.placement_set.placement_set_canonical_bytes
         )
