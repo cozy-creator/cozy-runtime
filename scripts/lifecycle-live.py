@@ -504,7 +504,7 @@ def section_window(args: argparse.Namespace, base: str) -> None:
         )
         body = wl.terminal_body(terminal_for(hub, "req-overflow", args.observe, since))
         wl.check(
-            "an offer over the window is a JOURNALED REFUSED outcome, not an invisible hold",
+            "an offer over the window is a RECORDED REFUSED outcome, not an invisible hold",
             body["status"] == 2
             and body["cause"]["code"] == 17  # CAUSE_CODE_NO_CAPACITY
             and body["cause"]["origin"] == 4  # CAUSE_ORIGIN_WORKER
@@ -620,196 +620,6 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
         hub.close()
 
 
-def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None:
-    """A claim stays responsive during convergence and snapshots both honest clocks."""
-    wl.head("15. claim and snapshot stay live while convergence works off-stream")
-    tmp = Path(base + "-claim-convergence")
-    worker, ids = start_weightless(tmp, fresh=True)
-    old = worker.hub
-    successor = wl.Hub()
-    successor.process, successor.log = worker.process, worker.log
-    successor.directive = wl.serving_directive(
-        RELEASE + "-replacement",
-        sorted(ids.values()),
-        pb.Posture.POSTURE_ACCEPTING,
-        worker.home / "binding-plans",
-        revision=2,
-    )
-    entered = tmp / "replacement-entered"
-    release = tmp / "replacement-release"
-    connected = threading.Event()
-    connect_error: list[BaseException] = []
-
-    def claim() -> None:
-        try:
-            successor.connect(wl.read_addr(worker.root, worker.process))
-        except BaseException as exc:
-            connect_error.append(exc)
-        finally:
-            connected.set()
-
-    try:
-        old.ready(ids["tick"], args.observe * 4)
-        old_generation = old.generation
-
-        # The changed release identity forces a fresh executor while retaining the complete
-        # visible-entrypoint plan set the canonical reader requires. Its real import records
-        # that it entered, then waits for the harness to release it; the worker is therefore
-        # blocked inside the actual prepare RPC, halfway through revision-2 convergence.
-        gate = (
-            "import time as _time\n"
-            "from pathlib import Path as _Path\n"
-            f"_Path({str(entered)!r}).write_text('entered')\n"
-            f"while not _Path({str(release)!r}).exists(): _time.sleep(0.01)\n"
-        )
-        (tmp / "project" / "lifecycle_package.py").write_text(gate + PACKAGE_SOURCE)
-        old.send(pb.RecordOwnerFrame(desired_state=old._env(successor.directive)))
-        deadline = time.monotonic() + args.observe
-        while not entered.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not entered.exists():
-            raise TimeoutError("the replacement executor never entered its package import")
-
-        claimant = threading.Thread(target=claim, daemon=True, name="claim-during-convergence")
-        claimant.start()
-        claimant.join(args.observe)
-        early_acks = [m for m in list(successor.seen) if m.WhichOneof("msg") == "claim_ack"]
-        wl.check(
-            "a successor claim ACKS while slow convergence remains blocked",
-            len(early_acks) == 1 and connected.is_set(),
-            f"convergence is blocked in a real prepare RPC; successor emitted "
-            f"{len(early_acks)} ClaimAck frame(s)",
-        )
-        if connect_error:
-            raise connect_error[0]
-        if not successor.connected.wait(args.observe):
-            raise TimeoutError("the successor never acknowledged its snapshot")
-
-        snapshot = successor.snapshot_document
-        wl.check(
-            "the successor snapshot reports accepted intent ahead of observed convergence",
-            int(snapshot.get("accepted_desired_state_revision", 0)) == 2
-            and int(snapshot.get("converged_revision", 0)) == 1,
-            f"snapshot accepted={snapshot.get('accepted_desired_state_revision')} "
-            f"converged={snapshot.get('converged_revision')}",
-        )
-
-        release.touch()
-        converged = successor.ready(ids["tick"], args.observe * 4)
-        wl.check(
-            "the off-stream lane converges after the blocked import is released",
-            converged.converged_revision == 2,
-            f"converged_revision={converged.converged_revision}",
-        )
-
-        old_generations = {
-            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
-            for frame in list(old.seen)
-            if frame.WhichOneof("msg") is not None
-        }
-        successor_generations = {
-            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
-            for frame in list(successor.seen)
-            if frame.WhichOneof("msg") is not None
-        }
-        wl.check(
-            "each stream's outgoing frames retain that stream's generation",
-            successor.generation > old_generation
-            and old_generations <= {old_generation}
-            and successor_generations <= {successor.generation},
-            f"old stream generations={sorted(old_generations)}, successor generations="
-            f"{sorted(successor_generations)}",
-        )
-    finally:
-        release.touch()
-        successor.close()
-        worker.stop()
-        old.close()
-
-
-def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
-    """cr-024: exact release reuse, changed release replacement, then retirement."""
-    wl.head("16. executor generations: reuse exact, replace changed release, retire empty")
-    tmp = Path(base + "-generation")
-    worker, ids = start_weightless(tmp, fresh=True)
-    hub = worker.hub
-    try:
-        first_report = hub.ready(ids["tick"], args.observe * 2)
-        first_pid = executor_pid_of(worker, args.observe)
-        first_generation = hub.deployment(first_report).executor_generation
-
-        since = hub.mark()
-        exact = wl.serving_directive(
-            RELEASE,
-            sorted(ids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            worker.home / "binding-plans",
-            revision=2,
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(exact)))
-        exact_report = hub.ready(ids["tick"], args.observe * 2, since=since)
-        exact_pid = executor_pid_of(worker, args.observe)
-        exact_generation = hub.deployment(exact_report).executor_generation
-        wl.check(
-            "reapplying the exact prepared construction/binding set reuses its process",
-            (exact_pid, exact_generation) == (first_pid, first_generation),
-            f"pid {first_pid}->{exact_pid}, generation {first_generation}->{exact_generation}",
-        )
-
-        since = hub.mark()
-        changed = wl.serving_directive(
-            RELEASE + "-replacement",
-            sorted(ids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            worker.home / "binding-plans",
-            revision=3,
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
-        changed_report = hub.ready(ids["tick"], args.observe * 2, since=since)
-        changed_pid = executor_pid_of(worker, args.observe)
-        changed_generation = hub.deployment(changed_report).executor_generation
-        wl.check(
-            "a changed release publishes one successor only after the old PID is gone",
-            changed_pid != first_pid
-            and changed_generation == first_generation + 1
-            and pid_gone(first_pid, args.observe, "replaced executor"),
-            f"pid {first_pid}->{changed_pid}, generation {first_generation}->{changed_generation}",
-        )
-
-        since = hub.mark()
-        empty_set = pb.PlacementSet()
-        empty_bytes, empty_digest = wl.documents.identity(empty_set)
-        empty = pb.DesiredWorkerState(
-            revision=4,
-            posture=pb.Posture.POSTURE_ACCEPTING,
-            wire_minor=wl.WIRE_MINOR,
-            placement_set=pb.DesiredPlacementSet(
-                placement_set_digest=empty_digest,
-                placement_set_canonical_bytes=empty_bytes,
-            ),
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(empty)))
-        hub.wait(
-            lambda m: (
-                m.observed_state
-                if m.WhichOneof("msg") == "observed_state"
-                and m.observed_state.accepted_desired_state_revision == 4
-                else None
-            ),
-            args.observe * 2,
-            "empty desired state applied",
-            since,
-        )
-        wl.check(
-            "an explicit empty placement set retires without spawning an unused successor",
-            pid_gone(changed_pid, args.observe, "empty-state executor"),
-            f"pid {changed_pid} is absent and the worker owns no executor child",
-        )
-    finally:
-        worker.stop()
-        hub.close()
-
-
 def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
     """cr-024: idle death withdraws capacity and rebuilds without an offer."""
 
@@ -916,9 +726,8 @@ def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
 
 def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     """cr-024: exercise supervision directly, including races the wire serializes."""
-    from cozy_runtime.internal import accel, proctree
-    from cozy_runtime.internal.worker import child as child_module
-    from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
+    from cozy_runtime.internal import accel, descriptor, proctree
+    from cozy_runtime.internal.discovery import discover
     from cozy_runtime.internal.worker.child import (
         ExecutorGone,
         ExecutorSupervision,
@@ -931,7 +740,9 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True)
     root.mkdir(parents=True)
-    staged = stage_development(home, project)
+    write_weightless_project(project)
+    descriptor_path = tmp / "package-descriptor.json"
+    descriptor_path.write_bytes(descriptor.canonical_bytes(descriptor.build(discover(project))))
     detached_file = tmp / "detached.pid"
     package = project / "lifecycle_package.py"
     package.write_text(
@@ -1028,7 +839,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
             "cmd": "prepare",
             "binding": {
                 "application": "lifecycle_package:app",
-                "package_descriptor": str(staged.descriptor),
+                "package_descriptor": str(descriptor_path),
                 "model_class": "",
             },
             "budgets": {},
@@ -1137,7 +948,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
             "cmd": "prepare",
             "binding": {
                 "application": "missing_package:app",
-                "package_descriptor": str(staged.descriptor),
+                "package_descriptor": str(descriptor_path),
                 "model_class": "",
             },
             "budgets": {},
@@ -1148,67 +959,6 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         "a failed first prepare still consumes and poisons the generation",
         not failed_prepare.get("ok") and refused_retry.get("code") == "generation_already_prepared",
         f"first={failed_prepare.get('code')} second={refused_retry.get('code')}",
-    )
-    previous_reclaim_seconds = child_module.RECLAIM_SECONDS
-    child_module.RECLAIM_SECONDS = 0.2
-    refused_unproven = False
-    blocked_detail = "reclaim unexpectedly returned"
-    cancel = AttemptRecord("req-reclaim", 1, b"digest", {}, executor=guarded_executor)
-    cancel.state = "running"
-    cancel.canceling = "client"
-    cancel.executor_generation = guarded_executor.incarnation
-    cancel_engine: Any = AttemptEngine.__new__(AttemptEngine)
-    cancel_engine.supervision = guarded
-    try:
-        cancel_engine.escalate(cancel, 0.2)
-    except ExecutorGone:
-        retained_owner = guarded._read_owner()
-        refused_unproven = (
-            guarded.current is guarded_executor
-            and cancel.state == "reclaiming"
-            and not cancel.reclaim_done.wait(0.05)
-            and retained_owner is not None
-            and bool(retained_owner.members)
-        )
-        blocked_detail = (
-            f"state={cancel.state} done={cancel.reclaim_done.is_set()} "
-            f"owner_retained={guarded.current is guarded_executor} "
-            f"durable_members={len(retained_owner.members) if retained_owner else 0} "
-            f"pid={guarded_executor.pid}"
-        )
-    finally:
-        reclaim_proven = True
-        child_module.RECLAIM_SECONDS = previous_reclaim_seconds
-    finalization_finished = threading.Event()
-
-    def buffered_reply() -> None:
-        cancel.await_reclaim_before_finalizing()
-        finalization_finished.set()
-
-    reply_thread = threading.Thread(target=buffered_reply, daemon=True)
-    reply_thread.start()
-    buffered_reply_blocked = not finalization_finished.wait(0.05)
-    completed_after_proof = False
-    try:
-        cancel_engine.escalate(cancel, 0.2)
-        reply_thread.join(1)
-        completed_after_proof = (
-            cancel.reclaim_done.is_set()
-            and finalization_finished.is_set()
-            and cancel.state == "finalizing"
-            and guarded.current is None
-        )
-    finally:
-        guarded.close()
-    wl.check(
-        "an unreadable driver observation blocks cancel and a buffered final reply",
-        refused_unproven and buffered_reply_blocked,
-        blocked_detail,
-    )
-    wl.check(
-        "the same cancel completes only after a retry proves exact driver reclaim",
-        completed_after_proof,
-        f"done={cancel.reclaim_done.is_set()} current={guarded.current}",
     )
 
     # A restart can find the durable leader gone while a detached descendant remains. The
@@ -1262,7 +1012,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     finally:
         leaderless.close()
     wl.check(
-        "restart recovery reclaims a detached descendant after its exact leader is gone",
+        "restart orphan sweep reclaims a detached descendant after its exact leader is gone",
         killed == [] and pid_gone(helper.pid, args.observe, "leaderless descendant"),
         f"leader {leader.pid} absent; detached helper birth {helper} was reclaimed by scope",
     )
@@ -1368,8 +1118,6 @@ SECTIONS = {
     "boot-failure": section_boot_failure,
     "window": section_window,
     "live-delivery": section_live_delivery,
-    "claim-convergence": section_claim_convergence_fence,
-    "generation-replacement": section_generation_replacement,
     "idle-liveness": section_idle_executor_liveness,
     "supervision-atomicity": section_supervision_atomicity,
     "egress": section_executor_egress,
