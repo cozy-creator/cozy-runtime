@@ -7,7 +7,7 @@ __version__ = "0.0.0-proof"
 
 
 class _Version:
-    cuda = "12.9"
+    cuda = "13.0"
 
 
 version = _Version()

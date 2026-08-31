@@ -37,9 +37,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         import torch
 
         fact = (torch.version.cuda, torch.cuda.is_available())
-        if fact != ("12.9", False):
+        if fact != ("13.0", False):
             raise ProbeFailure(f"unexpected installed CUDA fact: {fact!r}")
-        print("12.9 False")
+        print("13.0 False")
         return 0
     raise ProbeFailure("usage: environment_imports.py OVERLAY cpu|cuda")
 

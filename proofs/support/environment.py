@@ -268,7 +268,7 @@ def _prepare(args: argparse.Namespace) -> None:
         args.python,
     )
 
-    cuda_target = {**_target(), "accelerator_backend": "cuda", "accelerator_abi": "cu129"}
+    cuda_target = {**_target(), "accelerator_backend": "cuda", "accelerator_abi": "cu130"}
     cuda = _release(
         inputs / "cuda",
         cuda_target,
@@ -374,8 +374,8 @@ def _release(
             "base_import_roots": base_import_roots,
             "compatibility_profile": profile,
             "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none" if cpu else "12.6",
-            "minimum_driver_version": "none" if cpu else "560.28.03",
+            "minimum_cuda_version": "none" if cpu else "13.0",
+            "minimum_driver_version": "none" if cpu else "580.126.20",
             "platform_target": dict(target),
             "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
         }

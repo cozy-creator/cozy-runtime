@@ -617,7 +617,7 @@ def verify_seat(
                 f"{observation.get('cuda_available')} gpu={gpu is not None}",
             )
     else:
-        required_cuda = {"cu126": "12.6", "cu130": "13.0"}.get(build)
+        required_cuda = {"cu130": "13.0"}.get(build)
         if required_cuda is None:
             raise NativeWheelRefusal("overlay_native_accelerator_mismatch", build)
         if (

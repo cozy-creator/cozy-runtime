@@ -121,7 +121,7 @@ def base_manifest(path: Path) -> str:
             "compatibility_profile": {
                 "accelerator_build": "cpu",
                 "os_cpu": "linux-x86",
-                "python_abi": "cp312",
+                "python_abi": "cp314",
                 "torch_release": "2.13.0",
             },
             "format": "WheelhouseManifest/1",
@@ -132,7 +132,7 @@ def base_manifest(path: Path) -> str:
                 "accelerator_backend": "none",
                 "libc": "glibc2.39",
                 "os_arch": "linux/amd64",
-                "python_abi": "cp312",
+                "python_abi": "cp314",
             },
             "wheels": [
                 {
@@ -292,7 +292,7 @@ def main() -> int:
                 "proof_new_manylinux",
                 "new-manylinux",
                 owner="custom",
-                tag="cp312-cp312-manylinux_2_40_x86_64",
+                tag="cp314-cp314-manylinux_2_40_x86_64",
                 root_is_pure=False,
             ),
             "overlay_python_incompatible": build_wheel(
@@ -301,7 +301,7 @@ def main() -> int:
                 "proof_new_python",
                 "new-python",
                 owner="project",
-                requires_python=">=3.13",
+                requires_python=">=3.15",
             ),
             "overlay_dependency_base_conflict": build_wheel(
                 wheels,
@@ -370,8 +370,8 @@ def main() -> int:
 
         tagged_project = replace(
             project[0],
-            filename="proof_project-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl",
-            tags=("cp312-cp312-manylinux_2_17_x86_64",),
+            filename="proof_project-1.0.0-cp314-cp314-manylinux_2_17_x86_64.whl",
+            tags=("cp314-cp314-manylinux_2_17_x86_64",),
         )
         try:
             overlay._verify_inventory(
@@ -397,7 +397,7 @@ def main() -> int:
             "proof_native_custom",
             "native-custom",
             owner="custom",
-            tag="cp312-cp312-manylinux_2_17_x86_64",
+            tag="cp314-cp314-manylinux_2_17_x86_64",
             root_is_pure=False,
             extra_entries={
                 "proof_native_custom/_native.so": native_bytes,
@@ -448,8 +448,8 @@ def main() -> int:
         cpu_document = canonical.parse_canonical(manifest.read_bytes())
         assert isinstance(cpu_document, dict)
         for field, value in (
-            ("minimum_cuda_version", "12.6"),
-            ("minimum_driver_version", "560.28.03"),
+            ("minimum_cuda_version", "13.0"),
+            ("minimum_driver_version", "580.126.20"),
         ):
             bad_cpu = {**cpu_document, field: value}
             bad_raw = canonical.write(bad_cpu)
@@ -462,7 +462,7 @@ def main() -> int:
         wrong_cpu_target = dict(cpu_document)
         wrong_cpu_target["platform_target"] = {
             **cpu_document["platform_target"],
-            "accelerator_abi": "cu126",
+            "accelerator_abi": "cu130",
             "accelerator_backend": "cuda",
         }
         wrong_raw = canonical.write(wrong_cpu_target)
@@ -482,7 +482,7 @@ def main() -> int:
             "libc_name": "glibc",
             "libc_version": "2.39",
             "machine": "x86_64",
-            "python_abi": "cp312",
+            "python_abi": "cp314",
             "system": "linux",
             "torch_cuda": "",
             "torch_version": "2.13.0+cpu",
@@ -514,7 +514,7 @@ def main() -> int:
                 raise AssertionError(f"seat mismatch {code} was admitted")
 
         cuda_distributions = tuple(
-            (name, "2.13.0+cu126" if name == "torch" else version)
+            (name, "2.13.0+cu130" if name == "torch" else version)
             for name, version in base.base_distributions
         )
         cuda_base = replace(
@@ -522,56 +522,9 @@ def main() -> int:
             compatibility_profile=tuple(
                 sorted(
                     {
-                        "accelerator_build": "cu126",
-                        "os_cpu": "linux-x86",
-                        "python_abi": "cp312",
-                        "torch_release": "2.13.0",
-                    }.items()
-                )
-            ),
-            platform_target=tuple(
-                sorted(
-                    {
-                        "accelerator_abi": "cu126",
-                        "accelerator_backend": "cuda",
-                        "libc": "glibc2.39",
-                        "os_arch": "linux/amd64",
-                        "python_abi": "cp312",
-                    }.items()
-                )
-            ),
-            base_distributions=cuda_distributions,
-            minimum_cuda_version="12.6",
-            minimum_driver_version="560.28.03",
-        )
-        cuda_seat = {
-            **measured_seat,
-            "cuda_available": True,
-            "distributions": [
-                {"distribution": name, "version": version} for name, version in cuda_distributions
-            ],
-            "torch_cuda": "12.6",
-            "torch_version": "2.13.0+cu126",
-        }
-        cuda_gpu = native_wheel.GPUObservation(
-            device_index=0,
-            driver_version="570.124.06",
-            name="proof GPU",
-            sm=80,
-        )
-        native_wheel.verify_seat(cuda_base, cuda_seat, gpu=cuda_gpu)
-        cuda130_distributions = tuple(
-            (name, "2.13.0+cu130" if name == "torch" else version)
-            for name, version in base.base_distributions
-        )
-        cuda130_base = replace(
-            cuda_base,
-            compatibility_profile=tuple(
-                sorted(
-                    {
                         "accelerator_build": "cu130",
                         "os_cpu": "linux-x86",
-                        "python_abi": "cp312",
+                        "python_abi": "cp314",
                         "torch_release": "2.13.0",
                     }.items()
                 )
@@ -583,46 +536,54 @@ def main() -> int:
                         "accelerator_backend": "cuda",
                         "libc": "glibc2.39",
                         "os_arch": "linux/amd64",
-                        "python_abi": "cp312",
+                        "python_abi": "cp314",
                     }.items()
                 )
             ),
-            base_distributions=cuda130_distributions,
+            base_distributions=cuda_distributions,
             minimum_cuda_version="13.0",
             minimum_driver_version="580.126.20",
         )
-        cuda130_seat = {
-            **cuda_seat,
+        cuda_seat = {
+            **measured_seat,
+            "cuda_available": True,
             "distributions": [
-                {"distribution": name, "version": version}
-                for name, version in cuda130_distributions
+                {"distribution": name, "version": version} for name, version in cuda_distributions
             ],
             "torch_cuda": "13.0",
             "torch_version": "2.13.0+cu130",
         }
-        cuda130_gpu = native_wheel.GPUObservation(
+        cuda_gpu = native_wheel.GPUObservation(
             device_index=0,
             driver_version="580.126.20",
             name="proof GPU",
-            sm=90,
+            sm=80,
         )
-        native_wheel.verify_seat(cuda130_base, cuda130_seat, gpu=cuda130_gpu)
+        native_wheel.verify_seat(cuda_base, cuda_seat, gpu=cuda_gpu)
+        legacy_profile = dict(cuda_base.compatibility_profile)
+        legacy_profile["accelerator_build"] = "cu126"
         cuda_reds = (
             (
                 "overlay_native_accelerator_mismatch",
+                replace(cuda_base, compatibility_profile=tuple(sorted(legacy_profile.items()))),
+                cuda_seat,
+                cuda_gpu,
+            ),
+            (
+                "overlay_native_accelerator_mismatch",
                 cuda_base,
-                {**cuda_seat, "torch_cuda": "13.0"},
+                {**cuda_seat, "torch_cuda": "12.9"},
                 cuda_gpu,
             ),
             (
                 "overlay_native_cuda_minimum_mismatch",
-                replace(cuda_base, minimum_cuda_version="12.7"),
+                replace(cuda_base, minimum_cuda_version="13.1"),
                 cuda_seat,
                 cuda_gpu,
             ),
             (
                 "overlay_native_driver_minimum_mismatch",
-                replace(cuda_base, minimum_driver_version="580.126.20"),
+                replace(cuda_base, minimum_driver_version="580.126.21"),
                 cuda_seat,
                 cuda_gpu,
             ),
@@ -668,7 +629,7 @@ def main() -> int:
             raise AssertionError("no-kernel-image operator failure was admitted")
 
         native_evidence = {
-            "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
+            "base_worker_profile": "torch2.13.0-cpu-cp314-linux-x86",
             "environment_digest": digest(b"native-custom"),
             "host_capability": {"gpu": None, "seat": measured_seat},
             "host_qualification": native_host,
@@ -681,42 +642,6 @@ def main() -> int:
         assert native_evidence["installed_environment_receipt_digest"] == (
             native_installed.receipt_digest
         )
-
-        proof_python = Path(sys.prefix) / "bin" / "python"
-        assert proof_python.is_file()
-        native_request = {
-            "device_index": None,
-            "environment_digest": digest(b"native-custom"),
-            "environment_root": str(root / "native-custom-installed"),
-            "expected_result_digest": canonical.digest({"value": 3}),
-            "fixture": "proof_native_custom.fixture:run",
-            "installed_environment_receipt_digest": native_installed.receipt_digest,
-            "python": str(proof_python),
-            "wheelhouse_manifest": str(manifest),
-        }
-        request_path = root / "native-request-wrong-python.json"
-        evidence_path = root / "native-evidence-wrong-python.json"
-        request_path.write_bytes(canonical.write(native_request))
-        cli_result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from cozy_runtime.cli.native_wheel_proof import main; raise SystemExit(main())",
-                str(request_path),
-                str(evidence_path),
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-            timeout=60,
-            env={
-                "COZY_HOME": str(root / "node-wrong-python"),
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            },
-        )
-        assert cli_result.returncode != 0
-        assert b"overlay_native_python_abi_mismatch" in cli_result.stderr
-        assert not evidence_path.exists()
 
         mutable_manifest = root / "mutable-base.json"
         mutable_manifest.write_bytes(manifest.read_bytes() + b" ")
@@ -786,7 +711,7 @@ def main() -> int:
             "proof_hostile_rpath",
             "hostile-rpath",
             owner="custom",
-            tag="cp312-cp312-manylinux_2_17_x86_64",
+            tag="cp314-cp314-manylinux_2_17_x86_64",
             root_is_pure=False,
             extra_entries={"proof_hostile_rpath/_native.so": hostile_bytes},
         )
@@ -812,7 +737,7 @@ def main() -> int:
                         package,
                         f"library-shadow-{index}",
                         owner="custom",
-                        tag="cp312-cp312-manylinux_2_17_x86_64",
+                        tag="cp314-cp314-manylinux_2_17_x86_64",
                         root_is_pure=False,
                         extra_entries={f"{package}/{library}": native_bytes},
                     ),
@@ -1037,10 +962,11 @@ def main() -> int:
                     "native_operator_numerical_mismatch_refused": True,
                     "native_operator_no_kernel_image_refused": True,
                     "synthetic_exact_seat_admitted": True,
-                    "actual_cp313_for_cp312_refused": True,
+                    "synthetic_cp313_for_cp314_refused": True,
                     "seat_os_cpu_libc_inventory_torch_reds": True,
                     "seat_cuda_driver_minimum_reds": True,
-                    "cu126_and_cu130_spelling_verified": True,
+                    "legacy_cu126_refused": True,
+                    "cu130_spelling_verified": True,
                     "mutable_local_base_refused": True,
                     "source_path_injection_erased": True,
                     "killed_materialization_retry_atomic": True,

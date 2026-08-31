@@ -32,15 +32,15 @@ requires-python = ">=3.14,<3.15"
 dependencies = ["cozy-runtime>={__version__},<0.1"]
 
 [project.optional-dependencies]
-# CUDA-extras torch convention: hosts install the extra matching their accelerator.
-cu128 = ["torch>=2.6"]
+# CUDA-extras torch convention: hosts install the one admitted CUDA generation.
+cu130 = ["torch>=2.13,<3"]
 
 [tool.uv.sources]
-{_local_pin()}torch = [{{ index = "pytorch-cu128", extra = "cu128" }}]
+{_local_pin()}torch = [{{ index = "pytorch-cu130", extra = "cu130" }}]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [build-system]
