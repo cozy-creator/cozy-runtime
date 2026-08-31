@@ -23,11 +23,11 @@ Cozy from this directory:
 cozy package publish
 ```
 
-The default metadata publishes `paul/marco-polo-package@1.0.3`. Cozy derives the name and version
+The default metadata publishes `paul/marco-polo@1.0.4`. Cozy derives the name and version
 from the built wheel and never adds a `v` prefix.
 
 Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module
-name and root explicitly. The published distribution is `marco-polo-package`; the Python import
+name and root explicitly. The published distribution is `marco-polo`; the Python import
 remains `marco_polo_package`. The backend produces a deterministic `py3-none-any` wheel without
 writing build output into the source tree. The `[tool.uv.sources]` entry is only a
 local-development override: it is not embedded in the project wheel. The base worker image supplies
