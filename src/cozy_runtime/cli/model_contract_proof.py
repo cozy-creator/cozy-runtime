@@ -1,7 +1,7 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
 The command runs from a receipt-selected package venv over the base worker image.
-It verifies the package-environment receipt and base-family join, then delegates package import and
+It verifies the package-environment receipt, then delegates package import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
 digest-addressed result directory by atomic rename.
@@ -50,7 +50,6 @@ REQUEST_FIELDS = {
     "environment_generation",
     "environment_digest",
     "installed_environment_receipt",
-    "wheelhouse_manifest",
 }
 REF_FIELDS = {"digest", "length"}
 LOCAL_REF_FIELDS = {"digest", "length", "path"}
@@ -96,7 +95,6 @@ class ProofRequest:
     package: Mapping[str, Any]
     package_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
-    wheelhouse_manifest: Path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -222,7 +220,6 @@ def _read_request(path: Path) -> ProofRequest:
         package=_package(value["package"]),
         package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
         bindings=bindings,
-        wheelhouse_manifest=_existing_file(value["wheelhouse_manifest"], "wheelhouse_manifest"),
     )
 
 
@@ -387,7 +384,6 @@ def _verify_installed_generation(request: ProofRequest) -> package_environment.I
         request.environment_generation.parent.parent,
         receipt_digest=request.installed_environment_receipt.digest,
         environment_digest=request.environment_digest,
-        base_manifest=request.wheelhouse_manifest,
         reused=True,
     )
     if installed.generation != request.environment_generation:

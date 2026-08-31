@@ -56,7 +56,6 @@ files = [
     "proofs/support",
     "proofs/fixtures/environment-project/src",
     "proofs/fixtures/environment-resolved/src",
-    "proofs/fixtures/environment-wheelhouse/src",
     "proofs/fixtures/cli-project/src",
     "proofs/fixtures/model-contract-package/src",
     "proofs/fixtures/modeled-development-package/src",
@@ -69,7 +68,7 @@ files = [
 # byte-identical. mypy needs the source roots stated for that, or it maps
 # `src/cozy/worker/v1/wire_version.py` to bare `wire_version`.
 explicit_package_bases = true
-mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/environment-wheelhouse/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-package/src:proofs/fixtures/modeled-development-package/src:proofs/fixtures/tiny-models:examples/marco-polo"
+mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-package/src:proofs/fixtures/modeled-development-package/src:proofs/fixtures/tiny-models:examples/marco-polo"
 # The two derive-* runners live with the corpus they drive: they are torch-shaped code for
 # the corpus venv, and checking them against a torch that is not installed produces
 # confident nonsense. They are exercised by RUNNING them.

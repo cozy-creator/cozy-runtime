@@ -30,8 +30,8 @@ fi
 
 mkdir "$proof_root/build"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$repo"
-for fixture in environment-project environment-resolved environment-wheelhouse fake-torch \
-    fake-numpy numpy-shadow shared-root-a shared-root-b; do
+for fixture in environment-project environment-resolved fake-numpy numpy-shadow \
+    shared-root-a shared-root-b; do
     UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" \
         "$repo/proofs/fixtures/$fixture"
 done
@@ -41,9 +41,6 @@ project_wheel=$(find "$proof_root/build" -maxdepth 1 \
     -name 'proof_environment_project-*.whl' -print)
 resolved_wheel=$(find "$proof_root/build" -maxdepth 1 \
     -name 'proof_environment_resolved-*.whl' -print)
-wheelhouse_wheel=$(find "$proof_root/build" -maxdepth 1 \
-    -name 'proof_environment_wheelhouse-*.whl' -print)
-torch_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'torch-*.whl' -print)
 numpy_wheel=$(find "$proof_root/build" -maxdepth 1 -name 'numpy-*.whl' -print)
 numpy_shadow_wheel=$(find "$proof_root/build" -maxdepth 1 \
     -name 'proof_numpy_shadow-*.whl' -print)
@@ -52,21 +49,20 @@ shared_root_a_wheel=$(find "$proof_root/build" -maxdepth 1 \
 shared_root_b_wheel=$(find "$proof_root/build" -maxdepth 1 \
     -name 'proof_shared_root_b-*.whl' -print)
 test -n "$runtime_wheel" && test -n "$project_wheel" && test -n "$resolved_wheel"
-test -n "$wheelhouse_wheel" && test -n "$torch_wheel"
 test -n "$numpy_wheel" && test -n "$numpy_shadow_wheel"
 test -n "$shared_root_a_wheel" && test -n "$shared_root_b_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
 UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
-    "$runtime_wheel" "$wheelhouse_wheel" "$torch_wheel" "$numpy_wheel"
+    "$runtime_wheel"
 driver_python="$proof_root/driver/bin/python"
 proof="$proof_root/driver/bin/cozy-environment-proof"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
     ALL_PROXY=http://127.0.0.1:9 \
-    "$driver_python" "$support" prepare "$proof_root" "$runtime_wheel" "$project_wheel" \
-    "$resolved_wheel" "$torch_wheel" "$numpy_wheel" \
+    "$driver_python" "$support" prepare "$proof_root" "$project_wheel" \
+    "$resolved_wheel" "$numpy_wheel" \
     "$numpy_shadow_wheel" "$shared_root_a_wheel" "$shared_root_b_wheel" "$driver_python")
 
 run_proof() {
@@ -78,7 +74,7 @@ run_proof() {
         "$proof" "$proof_root/request-$name.json" "$receipt")
 }
 
-for name in cold rebuild cuda; do
+for name in cold rebuild; do
     run_proof "$name" "$proof_root/receipt-$name.json" >"$proof_root/$name.stdout"
 done
 
@@ -120,10 +116,6 @@ run_refusal forbidden 3 environment_proof_request_invalid no
 run_refusal build-request 3 environment_proof_request_invalid no
 run_refusal inside 3 environment_proof_output_invalid no
 run_refusal reuse 13 environment_root_not_fresh yes
-run_refusal base-distribution 6 package_environment_shadows_base_distribution no
-grep -q 'image_version=1.0.0' "$proof_root/base-distribution.stderr"
-run_refusal base-import-root 6 package_environment_shadows_base_import no
-grep -q 'image_providers=numpy' "$proof_root/base-import-root.stderr"
 run_refusal lying-import-root 6 package_environment_wheel_import_roots_mismatch no
 run_refusal duplicate-import-root 6 package_environment_import_root_duplicate no
 
@@ -147,4 +139,4 @@ else
     grep -q environment_proof_receipt_conflict "$proof_root/race-second.stderr"
 fi
 
-echo "environment proof: installed public CLI produced byte-identical cold/rebuild package-environment receipts from direct PackageSelection plus PlacementSet/1; each venv Python imported the exact project/dependency wheels, complete base ownership refused NumPy and duplicate-root shadows, and receipt races/no-partial-output refusals passed"
+echo "environment proof: installed public CLI produced byte-identical cold/rebuild package-environment receipts from direct PackageSelection plus PlacementSet/1; each venv Python imported the exact project/dependency wheels, duplicate package roots refused, and receipt races/no-partial-output refusals passed"

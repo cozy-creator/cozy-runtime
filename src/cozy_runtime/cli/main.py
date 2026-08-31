@@ -13,7 +13,6 @@ from cozy_runtime.cli import fit as fit_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import package_prepare as package_prepare_verbs
-from cozy_runtime.cli import private_preflight as private_preflight_verb
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
@@ -31,7 +30,7 @@ BUILT = (
     "new",
     "version",
 )
-PRIVATE = ("development-placement", "local-base", "prepare-package", "private-preflight")
+PRIVATE = ("development-placement", "prepare-package")
 HELP = """cozy-runtime — everything a single package venv can do alone
 
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
@@ -82,9 +81,7 @@ _OWNS_ARGS = (
     "fit",
     "serve",
     "development-placement",
-    "local-base",
     "prepare-package",
-    "private-preflight",
 )
 
 
@@ -184,12 +181,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return host_verbs.bindings(opts)
     if verb == "development-placement":
         return host_verbs.development_placement(config, args, opts)
-    if verb == "local-base":
-        return package_prepare_verbs.write_local_base(args, opts)
     if verb == "prepare-package":
         return package_prepare_verbs.prepare_local_package(config, args, opts)
-    if verb == "private-preflight":
-        return private_preflight_verb.run(args, opts)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
     if verb == "doctor":

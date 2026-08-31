@@ -19,6 +19,7 @@ from threading import Lock, local
 from typing import Any, Literal
 
 from cozy_runtime.internal import (
+    base_observation,
     canonical,
     fill,
     package_environment,
@@ -309,7 +310,7 @@ class Acquirer:
         selection_root: Path,
         artifact_store: Path,
         python: Path,
-        base_manifest: Path = package_environment.DEFAULT_BASE_MANIFEST,
+        base: base_observation.Observation | None = None,
         installed_environment: package_environment.InstalledEnvironment | None = None,
         verified_cache: VerifiedArtifactCache | None = None,
         on_observation: Any = None,
@@ -320,7 +321,7 @@ class Acquirer:
         self.selection_root = selection_root
         self.artifact_store = artifact_store
         self.python = python
-        self.base_manifest = base_manifest
+        self.base = base or package_environment.observe_base(python)
         self.installed_environment = installed_environment
         self.verified_cache = verified_cache or VerifiedArtifactCache()
         self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
@@ -452,7 +453,6 @@ class Acquirer:
 
     def _environment(self, placement: Any) -> package_environment.InstalledEnvironment:
         environment_digest = documents.spell(placement.environment_digest)
-        wheelhouse_raw = self.base_manifest.read_bytes()
         package = placement.package or placement.development
         wheel_rows = [package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
@@ -475,7 +475,6 @@ class Acquirer:
                 package=package,
                 environment=placement.environment,
                 environment_digest=environment_digest,
-                wheelhouse_manifest_bytes=wheelhouse_raw,
                 wheel_paths=wheel_paths,
                 verified_wheels=verified,
             )
@@ -483,7 +482,7 @@ class Acquirer:
                 source,
                 self.environment_root,
                 python=self.python,
-                base_manifest=self.base_manifest,
+                base=self.base,
             )
         except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
             raise AcquisitionRefusal(

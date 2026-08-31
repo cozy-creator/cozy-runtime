@@ -12,7 +12,7 @@ import threading
 from collections.abc import Callable, Sequence
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import host_paths, proctree, readiness
+from cozy_runtime.internal import host_paths, package_environment, proctree, readiness
 from cozy_runtime.internal.config import (
     ConfigError,
     WorkerHostConfig,
@@ -20,12 +20,7 @@ from cozy_runtime.internal.config import (
     runtime_config_from_host,
 )
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.placement_materialization import (
-    PreparedBoot,
-    baked_base_manifest,
-    control_runtime_digest,
-    prepare_boot,
-)
+from cozy_runtime.internal.placement_materialization import PreparedBoot, prepare_boot
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.downloads import tls_certificate_digest
@@ -85,8 +80,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run(config: WorkerHostConfig) -> int:
     boot_id = readiness.pod_boot_id(host_paths.BOOT_ID)
     certificate_der = readiness.certificate(host_paths.TLS_CERTIFICATE)
-    base = baked_base_manifest()
-    accelerator_backend = dict(base.platform_target)["accelerator_backend"]
+    try:
+        base = package_environment.observe_base()
+    except package_environment.EnvironmentRefusal as exc:
+        raise LaunchRefusal(exc.code, exc.detail) from exc
+    accelerator_backend = base.accelerator_backend
     gpus = readiness.runtime_gpus(
         config.child_base_env,
         deadline=config.lease_expiry_unix,
@@ -100,7 +98,6 @@ def _run(config: WorkerHostConfig) -> int:
         gpus,
         certificate_der=certificate_der,
         accelerator_backend=accelerator_backend,
-        control_runtime_digest_value=control_runtime_digest(manifest=base),
     )
     runtime_config = runtime_config_from_host(config)
     host_paths.WORKER_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -183,7 +180,6 @@ def _worker_options(
     *,
     certificate_der: bytes,
     accelerator_backend: str,
-    control_runtime_digest_value: str,
 ) -> WorkerOptions:
     """Construct the worker core directly; no public ``serve`` parser participates."""
 
@@ -198,7 +194,6 @@ def _worker_options(
         worker_id=config.worker_id,
         instance_id=boot_id,
         worker_boot_id=boot_id,
-        control_runtime_digest=control_runtime_digest_value,
         accelerator_backend=accelerator_backend,
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),

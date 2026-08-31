@@ -282,33 +282,27 @@ and atomically publishes it. Cold and independent rebuilds produce the same comp
 ### Per-package uv environments
 
 `internal/package_environment.py` is the rental materializer. The image already contains Python,
-cozy-runtime, TensorFS, and its complete declared base-family inventory. Accelerator profiles also
-contain Torch/CUDA; a generic CPU image may instead declare `torch_release=none` only when both
-accelerator coordinates are `none`, `accelerator_build=cpu`, and its distribution/import-root
-inventory proves that no Torch family, Triton, or NVIDIA fact exists. Each placement gets one uv
+cozy-runtime, TensorFS, and—on accelerator profiles—Torch/CUDA. Each placement gets one uv
 venv created from that exact base interpreter with system site packages visible. uv installs only
 the deterministic project wheel and exact package dependency wheels with offline, no-index,
 no-dependency, and no-build semantics. Python, Torch/CUDA, cozy-runtime, and TensorFS are never
 installed a second time inside a rental.
 
-The image's OCI digest owns image-resident integrity. `WheelhouseManifest/1` is the complete
-canonical ownership document for that image: its existing platform target and exact control-wheel
-rows travel with every installed normalized distribution/version and every top-level import root's
-sorted providers (`python-stdlib` or normalized distribution names). Every wheel fact records
-sorted unique import roots: the image rows in `WheelhouseManifest/1`, the project row in
-`Placement.package.project_wheel`, and each selected dependency row embedded in `PlacementSet/1`.
-Runtime strictly parses those exact facts, rejects
-a distribution collision with the image-owned version, measures every arriving wheel's real ZIP
-roots, requires declarations to equal the measurement, and rejects a root collision with
-the manifest's providers or a duplicate package root before uv runs.
-There is no version-compatibility reader and no hardcoded protected-root list.
+Runtime observes the interpreter it will actually execute once per worker boot: CPython ABI,
+Linux architecture/glibc, uv, standard-library roots, and the protected Python/Torch/Triton/
+CUDA/NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public descriptor ABI.
+Ordinary base packages
+are intentionally ignored; packages may carry their own incompatible ordinary dependencies.
+Runtime measures each arriving wheel's real ZIP roots and rejects protected distribution/root
+shadowing, duplicate package roots, incompatible tags, and unsatisfied requirements before uv
+runs. No image inventory document or caller-authored base fact participates.
 
 Runtime hashes each arriving package wheel once. A worker-boot-local verified-file receipt binds
 its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
 stat change or worker restart re-hashes before trust. Package admission consumes the receipt instead
 of hashing the same wheel again. A venv content identity contains the interpreter ABI/platform,
-exact uv version, and sorted package-owned wheel digests. It deliberately excludes the exact base
-manifest digest: a compatible Runtime patch rechecks declared requirements and reuses the venv,
+exact uv version, and sorted package-owned wheel digests. It deliberately excludes observed base
+packages: a compatible Runtime patch rechecks declared requirements and reuses the venv,
 while a real requirement or ABI conflict refuses. Creation is stage-then-rename and no partial venv
 is selectable.
 
@@ -381,7 +375,7 @@ trust domain per pod. Private renter cross-org stacking retains its explicitly d
 risk—Runtime does not relabel worker boot identity as tenant isolation. Cache bytes stay node-local,
 never enter a package receipt/content identity, and are never published as release artifacts. Every
 placement consumes this same venv path; OCI provenance belongs to Tensorhub qualification
-evidence, while the portable receipt remains the exact WheelhouseManifest/project/custom-wheel join.
+evidence, while the portable receipt names only the exact project/dependency-wheel environment.
 
 On a remote placement, `PlacementSet/1` names one exact
 `model_object_set` subject. Cozy sends signed logical package/model intent; the worker receives
@@ -413,8 +407,8 @@ private hooks are not presented as CLI evidence. The full scenario census and re
 are recorded in `PROOF-SCENARIOS.md`.
 
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
-Its closed local request names the direct PackageSelection, selected Environment and base
-WheelhouseManifest, plus every package wheel file by digest,
+Its closed local request names the direct PackageSelection, selected Environment, and every
+package wheel file by digest,
 the installed-base Python, a fresh environment root, and a fresh receipt output. `wheel_files`
 contains only the project and optional custom wheels; base wheel bytes do not travel. It
 atomically publishes the package-environment receipt bytes and prints their compact
@@ -434,7 +428,6 @@ set is closed; every path value is a normalized absolute local path:
     "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}
   },
   "environment": "/proof/environment.json",
-  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
   "python": "/opt/conda/bin/python",
   "environment_root": "/proof/fresh-environment"
@@ -452,7 +445,6 @@ and echoing one is not proof. Tensorhub joins Runtime's measured evidence to pro
   "environment_digest": "sha256:<64 lowercase hex>",
   "environment_root": "/proof/installed-environment",
   "installed_environment_receipt_digest": "sha256:<64 lowercase hex>",
-  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "python": "/opt/conda/bin/python",
   "fixture": "qualified_fixture:run",
   "expected_result_digest": "sha256:<64 lowercase hex>"
@@ -460,9 +452,8 @@ and echoing one is not proof. Tensorhub joins Runtime's measured evidence to pro
 ```
 
 Runtime asks both its running proof interpreter and the selected `python` to report the actual
-CPython ABI, OS/CPU, glibc, complete installed distribution/version set, Torch release and CUDA
-build. It requires both reports to be identical and to satisfy the exact WheelhouseManifest using
-minimum semantics for glibc, CUDA and driver versions. GPU name, driver and SM are measured through
+CPython ABI, OS/CPU, glibc, protected distribution versions, Torch release, and CUDA build. It
+requires both reports to agree with the boot observation. GPU name, driver and SM are measured through
 `nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
 command emits a bounded result DTO containing those measured facts. Tensorhub normalizes the
 result into its own rows and alone decides whether the measured evidence qualifies the package
@@ -470,7 +461,7 @@ for that hardware class. Runtime authors no second qualification document.
 
 The receipt-selected package environment then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
-it verifies the environment/base-family join, compares the exact descriptor with the
+it verifies the installed environment receipt, compares the exact descriptor with the
 installed project wheel, and double-derives every descriptor model binding under the
 offline construction sandbox. The fresh output directory appears atomically and contains the
 result in `result.json` plus exact digest-named files under `contracts/`. Tensorhub
@@ -486,7 +477,6 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
   "environment_generation": "/proof/environment/contents/<content-identity>",
   "environment_digest": "sha256:<64 lowercase hex>",
   "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
-  "wheelhouse_manifest": "/proof/wheelhouse-manifest.json",
   "package": {"package": "org/package", "release": "1.0.0", "release_digest": "sha256:<64 lowercase hex>", "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}},
   "package_descriptor": {
     "path": "/proof/package.descriptor.json",

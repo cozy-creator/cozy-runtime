@@ -77,7 +77,7 @@ jobs:
       # Runtime owns PackageDescriptor semver. This matrix is a deterministic contract fence:
       # the only minor changes are new callables and optional/omissible request fields.
       - run: uv run python checks/descriptor_compatibility.py
-      - run: uv run python checks/local_base.py
+      - run: uv run python checks/base_observation.py
       - run: uv run python checks/model_release_routes.py
       - run: uv run python checks/multi_model_binding.py
       - run: uv run cozy-runtime version

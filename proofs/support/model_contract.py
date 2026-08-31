@@ -7,9 +7,6 @@ driver owns every process transition and invokes the installed public Runtime co
 from __future__ import annotations
 
 import argparse
-import platform
-import subprocess
-import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,10 +14,8 @@ from typing import Any
 from proof_data import ProofFailure
 from proof_data import canonical as _canonical
 from proof_data import digest as _digest
-from proof_data import installed_base_ownership as _installed_base_ownership
 from proof_data import inventory as _inventory
 from proof_data import json_file as _json
-from proof_data import pack_installed as _pack_installed
 from proof_data import parse_canonical as _parse_canonical
 from proof_data import parse_json as _parse_json
 from proof_data import read_json as _read_json
@@ -40,7 +35,6 @@ _STATE_FIELDS = {
     "package_descriptor",
     "package_descriptor_digest",
     "package",
-    "wheelhouse_manifest",
 }
 
 
@@ -51,9 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare = sub.add_parser("prepare")
     prepare.add_argument("root", type=Path)
     prepare.add_argument("package_descriptor", type=Path)
-    prepare.add_argument("runtime_wheel", type=Path)
     prepare.add_argument("package_wheel", type=Path)
-    prepare.add_argument("torch_wheel", type=Path)
     prepare.add_argument("python", type=Path)
 
     model = sub.add_parser("model-request")
@@ -106,49 +98,8 @@ def _prepare(args: argparse.Namespace) -> None:
     wheels.mkdir()
     inputs.mkdir()
 
-    runtime_path = args.runtime_wheel.resolve()
     package_path = args.package_wheel.resolve()
-    dependency_paths = [
-        _pack_installed(wheels, name)
-        for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
-    ]
     project = _inventory(package_path)
-    base_pairs = sorted(
-        [(_inventory(path), path) for path in (runtime_path, *dependency_paths)],
-        key=lambda pair: pair[0].distribution,
-    )
-    _require(len(base_pairs) == 5, "proof base does not carry five control wheels")
-    target = _target()
-    profile = {
-        "accelerator_build": "cpu",
-        "os_cpu": "linux-x86",
-        "python_abi": target["python_abi"],
-        "torch_release": "2.13.0",
-    }
-    base_distributions, base_import_roots = _installed_base_ownership()
-    if not any(row["distribution"] == "uv" for row in base_distributions):
-        uv_version = subprocess.run(
-            ["uv", "--version"], check=True, capture_output=True, text=True
-        ).stdout.split()[1]
-        base_distributions.append({"distribution": "uv", "version": uv_version})
-        base_distributions.sort(key=lambda row: str(row["distribution"]))
-        base_import_roots.append({"providers": ["uv"], "root": "uv"})
-        base_import_roots.sort(key=lambda row: str(row["root"]))
-    torch_release = dict(
-        (str(row["distribution"]), str(row["version"])) for row in base_distributions
-    )["torch"].partition("+")[0]
-    wheelhouse = _canonical(
-        {
-            "base_distributions": base_distributions,
-            "base_import_roots": base_import_roots,
-            "compatibility_profile": {**profile, "torch_release": torch_release},
-            "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none",
-            "minimum_driver_version": "none",
-            "platform_target": target,
-            "wheels": [_wheel(entry, import_roots=True) for entry, _ in base_pairs],
-        }
-    )
     config = _canonical({"width": 4})
     descriptor_path = args.package_descriptor.resolve()
     descriptor_bytes = descriptor_path.read_bytes()
@@ -193,18 +144,14 @@ def _prepare(args: argparse.Namespace) -> None:
         _canonical({**environment_body, "format": "cozy.worker.v1.Environment/1"})
     )
     paths = {
-        "environment": _write(
-            inputs / "environment.json",
-            _canonical(environment_body),
-        ),
-        "wheelhouse_manifest": _write(inputs / "wheelhouse.json", wheelhouse),
+        "environment": _write(inputs / "environment.json", _canonical(environment_body)),
     }
     config_path = _write(inputs / "model-config.json", config)
     wheel_files = {project.digest: str(package_path)}
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
         "package": package,
-        "python": str(args.python.resolve()),
+        "python": str(args.python.parent.resolve() / args.python.name),
         "wheel_files": wheel_files,
     }
     for name in ("cold", "rebuild"):
@@ -223,7 +170,6 @@ def _prepare(args: argparse.Namespace) -> None:
             "descriptor_length": len(descriptor_bytes),
             "environment_digest": documents.spell(environment_digest),
             "package": package,
-            "wheelhouse_manifest": str(paths["wheelhouse_manifest"]),
         },
     )
 
@@ -269,7 +215,6 @@ def _write_model_request(root: Path, name: str) -> None:
                 "digest": _digest(receipt),
                 "length": len(receipt),
             },
-            "wheelhouse_manifest": state["wheelhouse_manifest"],
         },
     )
 
@@ -364,17 +309,6 @@ def _observation(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProofFailure(f"observation is not an object: {path}")
     return value
-
-
-def _target() -> dict[str, str]:
-    libc_name, libc_version = platform.libc_ver()
-    return {
-        "accelerator_abi": "none",
-        "accelerator_backend": "none",
-        "libc": f"{libc_name}{libc_version}",
-        "os_arch": "linux/amd64",
-        "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-    }
 
 
 def _tree(root: Path) -> dict[str, bytes]:

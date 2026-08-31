@@ -51,8 +51,7 @@ cmp "$descriptor" "$proof_root/descriptor-replay.json"
 
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     "$driver_python" "$support" prepare "$proof_root" \
-    "$descriptor" "$runtime_wheel" "$package_wheel" \
-    "$torch_wheel" "$driver_python")
+    "$descriptor" "$package_wheel" "$driver_python")
 
 for name in cold rebuild; do
     (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
-import importlib.metadata
 import json
 import subprocess
 import sys
@@ -18,8 +17,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-from cozy_runtime.cli import private_preflight
-from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.internal import canonical, descriptor, discovery, package_environment
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
@@ -85,54 +82,6 @@ def main(argv: list[str] | None = None) -> int:
         view.mkdir(parents=True)
         local_wheel = view / wheel.name
         local_wheel.write_bytes(wheel.read_bytes())
-        base = root / "WheelhouseManifest.json"
-        base.write_bytes(
-            canonical.write(
-                {
-                    "base_distributions": [
-                        {
-                            "distribution": "cozy-runtime",
-                            "version": importlib.metadata.version("cozy-runtime"),
-                        },
-                        {
-                            "distribution": "msgspec",
-                            "version": importlib.metadata.version("msgspec"),
-                        },
-                    ],
-                    "base_import_roots": [
-                        {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
-                        {"providers": ["msgspec"], "root": "msgspec"},
-                    ],
-                    "compatibility_profile": {
-                        "accelerator_build": "cpu",
-                        "os_cpu": "linux-x86",
-                        "python_abi": "cp312",
-                        "torch_release": "none",
-                    },
-                    "format": "WheelhouseManifest/1",
-                    "minimum_cuda_version": "none",
-                    "minimum_driver_version": "none",
-                    "platform_target": {
-                        "accelerator_abi": "none",
-                        "accelerator_backend": "none",
-                        "libc": "glibc2.39",
-                        "os_arch": "linux/amd64",
-                        "python_abi": "cp312",
-                    },
-                    "wheels": [
-                        {
-                            "digest": "sha256:" + "0" * 64,
-                            "distribution": "cozy-runtime",
-                            "filename": "cozy_runtime-0.0.9-py3-none-any.whl",
-                            "import_roots": ["cozy_runtime"],
-                            "length": 1,
-                            "tags": ["py3-none-any"],
-                            "version": importlib.metadata.version("cozy-runtime"),
-                        }
-                    ],
-                }
-            )
-        )
         release_digest = "sha256:" + hashlib.sha256(b"marco release").hexdigest()
         delegation = canonical.write(
             {
@@ -183,7 +132,6 @@ def main(argv: list[str] | None = None) -> int:
             describe=describe,
             verified=lambda digest, _length, _path: verified.append(digest),
             job_plan_root=root / "job-plans",
-            base_manifest=base,
         )
         value = documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)
         placement = value["placements"][0]
@@ -227,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         assert len(read_placement_set(result.placement_set)) == 1
         private_source = hashlib.sha256(b"exact editable Marco source").digest()
-        private_files = [row for row in files if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL]
+        private_files = list(files)
         private_descriptor = descriptor.canonical_bytes(
             descriptor.build(discovery.discover(ROOT / "examples" / "marco-polo"))
         )
@@ -249,68 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 for row in private_files
             ],
         )
-        _revision_raw, private_revision = documents.identity(revision)
-        revision_path = root / "private-revision.json"
-        revision_path.write_bytes(_revision_raw)
-        descriptor_path = root / "private-descriptor.json"
-        descriptor_path.write_bytes(private_descriptor)
-        preflight_request = root / "private-preflight.json"
-        preflight_request.write_text(
-            json.dumps(
-                {
-                    "base_manifests": [
-                        {
-                            "digest": "sha256:" + hashlib.sha256(base.read_bytes()).hexdigest(),
-                            "path": str(base),
-                        }
-                    ],
-                    "descriptor": str(descriptor_path),
-                    "revision": str(revision_path),
-                    "wheels": [str(local_wheel)],
-                },
-                sort_keys=True,
-            )
-        )
-        preflight = private_preflight.run([str(preflight_request)], Options())
-        assert isinstance(preflight.document, dict)
-        assert preflight.document["private_revision_digest"] == documents.spell(private_revision)
-        assert len(preflight.document["compatible"]) == 1
-        missing_source = json.loads(_revision_raw)
-        missing_source.pop("source_digest")
-        missing_source_path = root / "private-revision-missing-source.json"
-        missing_source_path.write_bytes(canonical.write(missing_source))
-        missing_request = json.loads(preflight_request.read_text())
-        missing_request["revision"] = str(missing_source_path)
-        missing_request_path = root / "private-preflight-missing-source.json"
-        missing_request_path.write_text(json.dumps(missing_request, sort_keys=True))
-        try:
-            private_preflight.run([str(missing_request_path)], Options())
-        except CliError as exc:
-            assert exc.name == "private_revision_invalid", exc
-        else:
-            raise AssertionError("private preflight admitted an absent source digest")
-
-        malformed_descriptor = b"{}"
-        malformed_descriptor_path = root / "private-descriptor-malformed.json"
-        malformed_descriptor_path.write_bytes(malformed_descriptor)
-        malformed_revision = json.loads(_revision_raw)
-        malformed_revision["package_descriptor"] = {
-            "digest": "sha256:" + hashlib.sha256(malformed_descriptor).hexdigest(),
-            "length": len(malformed_descriptor),
-        }
-        malformed_revision_path = root / "private-revision-malformed-descriptor.json"
-        malformed_revision_path.write_bytes(canonical.write(malformed_revision))
-        malformed_request = json.loads(preflight_request.read_text())
-        malformed_request["descriptor"] = str(malformed_descriptor_path)
-        malformed_request["revision"] = str(malformed_revision_path)
-        malformed_request_path = root / "private-preflight-malformed-descriptor.json"
-        malformed_request_path.write_text(json.dumps(malformed_request, sort_keys=True))
-        try:
-            private_preflight.run([str(malformed_request_path)], Options())
-        except CliError as exc:
-            assert exc.name == "private_revision_descriptor_invalid", exc
-        else:
-            raise AssertionError("private preflight admitted a malformed descriptor")
+        _, private_revision = documents.identity(revision)
         private_result = package_prepare.prepare_private_package(
             pb.PreparePrivatePackageRequest(
                 operation_id="private-marco-01",
@@ -329,7 +216,6 @@ def main(argv: list[str] | None = None) -> int:
             describe=describe,
             verified=lambda digest, _length, _path: verified.append(digest),
             job_plan_root=root / "private-job-plans",
-            base_manifest=base,
         )
         private = documents.read(
             private_result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
@@ -381,13 +267,12 @@ def main(argv: list[str] | None = None) -> int:
                 python=Path(sys.executable),
                 describe=describe,
                 verified=lambda digest, _length, _path: verified.append(digest),
-                base_manifest=base,
             )
         except package_prepare.PreparationRefusal as exc:
             assert exc.code == "private_package_revision_mismatch", exc
         else:
             raise AssertionError("changed wheel bytes under one private revision were admitted")
-        modeled(root, base, cache, args.wheel_dir)
+        modeled(root, cache, args.wheel_dir)
         _prove_preinstalled_serve_flag(root)
         print(
             "package preparation: published/private Marco and exact modeled TensorFS package passed"
@@ -431,7 +316,7 @@ def _prove_preinstalled_serve_flag(root: Path) -> None:
     assert captured[index + 1] == sys.executable
 
 
-def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None:
+def modeled(root: Path, cache: Path, wheel_dir: Path | None) -> None:
     import tensorfs
 
     proof_support = ROOT / "proofs" / "internal"
@@ -456,23 +341,9 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
             check=True,
             stdout=subprocess.DEVNULL,
         )
-        subprocess.run(
-            [
-                "uv",
-                "build",
-                "--wheel",
-                "--out-dir",
-                str(wheels),
-                "proofs/fixtures/environment-resolved",
-            ],
-            cwd=ROOT,
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
     else:
         wheels = wheel_dir
     wheel = next(wheels.glob("modeled_development_package-*.whl"))
-    helper_wheel = next(wheels.glob("proof_environment_resolved-*.whl"))
     wheel_raw = wheel.read_bytes()
     wheel_digest = hashlib.sha256(wheel_raw).digest()
     view = cache / "sets" / "modeled"
@@ -480,27 +351,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     local_wheel = view / wheel.name
     local_wheel.write_bytes(wheel_raw)
     (cache / wheel_digest.hex()).hardlink_to(local_wheel)
-    base_without_helper = base.read_bytes()
-    base_with_helper = json.loads(base_without_helper)
-    base_with_helper["base_distributions"].append(
-        {"distribution": "proof-environment-resolved", "version": "2.0.0"}
-    )
-    base_with_helper["base_distributions"].sort(key=lambda row: row["distribution"])
-    base_with_helper["base_import_roots"].append(
-        {
-            "providers": ["proof-environment-resolved"],
-            "root": "proof_environment_resolved",
-        }
-    )
-    base_with_helper["base_import_roots"].sort(key=lambda row: row["root"])
-    _base, carried, _observed = package_environment.preflight_environment(
-        local_wheel, (helper_wheel.resolve(),), base_without_helper
-    )
-    _base, reused, _observed = package_environment.preflight_environment(
-        local_wheel, (helper_wheel.resolve(),), canonical.write(base_with_helper)
-    )
-    assert len(carried) == 2 and len(reused) == 1
-
     source_root = root / "modeled-source"
     model = create(source_root, tensor=b"\x80\x3f" * 4)
     source = tensorfs.Store.open(str(source_root))
@@ -588,7 +438,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         python=Path(sys.executable),
         describe=describe,
         verified=mark,
-        base_manifest=base,
     )
     body = documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)
     value = body["placements"][0]
@@ -623,7 +472,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         selection_root=root / "environments" / "selections",
         artifact_store=target_store,
         python=Path(sys.executable),
-        base_manifest=base,
         verified_cache=verified,
     ).acquire(placement)
     binding = next(iter(acquired.bindings.values()))
@@ -682,7 +530,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         describe=describe,
         verified=mark,
         job_plan_root=root / "private-modeled-job-plans",
-        base_manifest=base,
     )
     private_body = documents.read(
         private_result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
@@ -812,7 +659,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         selection_root=root / "private-modeled-environments" / "selections",
         artifact_store=target_store,
         python=Path(sys.executable),
-        base_manifest=base,
         verified_cache=verified,
     ).acquire(private_placement)
     private_binding = next(iter(private_acquired.bindings.values()))
@@ -861,7 +707,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
             selection_root=root / "private-modeled-environments" / "selections",
             artifact_store=target_store,
             python=Path(sys.executable),
-            base_manifest=base,
             verified_cache=verified,
         ).acquire(private_namespace(wrong_selected))
     except acquire.AcquisitionRefusal as exc:
@@ -873,7 +718,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     wrong_slot["models"][0]["slot"] = "render.models.other"
     _expect_modeled_refusal(
         root,
-        base,
         cache,
         target_store,
         describe,
@@ -885,7 +729,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     wrong_manifest["models"][0]["manifest"] = "sha256:" + "1" * 64
     _expect_modeled_refusal(
         root,
-        base,
         cache,
         target_store,
         describe,
@@ -903,7 +746,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     changed_files.sort(key=lambda row: row.digest)
     _expect_modeled_refusal(
         root,
-        base,
         cache,
         root / "modeled-wrong-digest",
         describe,
@@ -928,7 +770,6 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     extra_files.sort(key=lambda row: row.digest)
     _expect_modeled_refusal(
         root,
-        base,
         cache,
         root / "modeled-cross-object",
         describe,
@@ -1028,7 +869,6 @@ def _execute_modeled(
 
 def _expect_modeled_refusal(
     root: Path,
-    base: Path,
     cache: Path,
     artifact_store: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
@@ -1050,7 +890,6 @@ def _expect_modeled_refusal(
             python=Path(sys.executable),
             describe=describe,
             verified=lambda _digest, _length, _path: None,
-            base_manifest=base,
         )
     except package_prepare.PreparationRefusal as exc:
         assert exc.code == want, (exc.code, want, exc.detail)

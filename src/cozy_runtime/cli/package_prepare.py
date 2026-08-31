@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, local_base, package_environment
+from cozy_runtime.internal import canonical, package_environment
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -19,35 +19,10 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def write_local_base(args: list[str], _opts: Options) -> Result:
-    values = _values(args, {"--out"}, set())
-    output = Path(values["--out"][0]).expanduser().resolve()
-    try:
-        digest, length, changed = local_base.write_manifest(output)
-    except local_base.LocalBaseRefusal as exc:
-        raise CliError(
-            "local_base_invalid",
-            str(exc),
-            "install the current Cozy Runtime tool under CPython 3.12; "
-            "Cozy will not resolve or replace it",
-            Exit.structural,
-        ) from exc
-    return Result(
-        rows=(("manifest", str(output)), ("digest", digest), ("changed", str(changed).lower())),
-        document={
-            "changed": changed,
-            "digest": digest,
-            "length": length,
-            "path": str(output),
-        },
-    )
-
-
 def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options) -> Result:
     required = {
         "--artifact-cache",
         "--artifact-store",
-        "--base-manifest",
         "--environment-python",
         "--package",
         "--project-wheel",
@@ -58,7 +33,6 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
     artifact_store = Path(values["--artifact-store"][0]).resolve()
     environment_python = _venv_python(values["--environment-python"][0])
-    base_manifest = Path(values["--base-manifest"][0]).resolve()
     wheel_paths = [
         (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, Path(values["--project-wheel"][0]).resolve()),
         *(
@@ -181,7 +155,6 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             python=environment_python,
             describe=describe,
             verified=lambda _digest, _length, _path: None,
-            base_manifest=base_manifest,
             artifact_store=artifact_store,
             models=models,
             allow_native_custom=True,

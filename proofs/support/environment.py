@@ -8,10 +8,7 @@ public protocol package.
 from __future__ import annotations
 
 import argparse
-import platform
 import shutil
-import subprocess
-import sys
 import warnings
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -22,10 +19,8 @@ from typing import Any, cast
 from proof_data import ProofFailure, Wheel
 from proof_data import canonical as _canonical
 from proof_data import digest as _digest
-from proof_data import installed_base_ownership as _installed_base_ownership
 from proof_data import inventory as _inventory
 from proof_data import json_file as _json
-from proof_data import pack_installed as _pack_installed
 from proof_data import parse_canonical as _parse_canonical
 from proof_data import read_json as _read_json
 from proof_data import ref as _ref
@@ -45,10 +40,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     prepare = sub.add_parser("prepare")
     prepare.add_argument("root", type=Path)
-    prepare.add_argument("runtime", type=Path)
     prepare.add_argument("project", type=Path)
     prepare.add_argument("resolved", type=Path)
-    prepare.add_argument("torch", type=Path)
     prepare.add_argument("numpy", type=Path)
     prepare.add_argument("numpy_shadow", type=Path)
     prepare.add_argument("shared_root_a", type=Path)
@@ -89,31 +82,14 @@ def _prepare(args: argparse.Namespace) -> None:
     inputs.mkdir()
     variants.mkdir()
 
-    runtime_path = args.runtime.resolve()
     project_path = args.project.resolve()
     resolved_path = args.resolved.resolve()
-    torch_path = args.torch.resolve()
-    runtime = _inventory(runtime_path)
     project = _inventory(project_path)
     resolved = _inventory(resolved_path)
-    torch = _inventory(torch_path)
     numpy = _inventory(args.numpy.resolve())
     numpy_shadow = _inventory(args.numpy_shadow.resolve())
     shared_root_a = _inventory(args.shared_root_a.resolve())
     shared_root_b = _inventory(args.shared_root_b.resolve())
-    base_wheel_root = variants / "base-wheels"
-    base_wheel_root.mkdir()
-    dependency_paths = [
-        _pack_installed(base_wheel_root, name)
-        for name in ("grpcio", "msgspec", "protobuf", "typing-extensions")
-    ]
-    base_wheels = tuple(
-        sorted(
-            (runtime, *(_inventory(path) for path in dependency_paths)),
-            key=lambda wheel: wheel.distribution,
-        )
-    )
-    _require(len(base_wheels) == 5, "proof base does not carry five control wheels")
 
     normal_paths = {
         project.digest: project_path,
@@ -121,10 +97,8 @@ def _prepare(args: argparse.Namespace) -> None:
     }
     normal = _release(
         inputs / "normal",
-        _target(),
         project,
         (resolved,),
-        base_wheels,
         normal_paths,
     )
     for name in ("cold", "rebuild", "race-first", "race-second", "inside"):
@@ -157,7 +131,10 @@ def _prepare(args: argparse.Namespace) -> None:
     )
 
     extra = dict(normal)
-    extra["wheel_files"] = {**_paths(normal["wheel_files"]), torch.digest: torch_path}
+    extra["wheel_files"] = {
+        **_paths(normal["wheel_files"]),
+        numpy.digest: args.numpy.resolve(),
+    }
     _request(root, "extra", extra, root / "environment-extra", args.python)
 
     corrupt_path = variants / "corrupt" / resolved.filename
@@ -174,20 +151,16 @@ def _prepare(args: argparse.Namespace) -> None:
 
     renamed = _release(
         inputs / "renamed",
-        _target(),
         project,
         (replace(resolved, filename="renamed-2.0.0-py3-none-any.whl"),),
-        base_wheels,
         normal_paths,
     )
     _request(root, "renamed", renamed, root / "environment-renamed", args.python)
 
     oversized_fact = _release(
         inputs / "oversized-fact",
-        _target(),
         project,
         (replace(resolved, length=(2 << 30) + 1),),
-        base_wheels,
         normal_paths,
     )
     _request(
@@ -208,10 +181,8 @@ def _prepare(args: argparse.Namespace) -> None:
     duplicate = _inventory(duplicate_path)
     duplicate_request = _release(
         inputs / "duplicate",
-        _target(),
         project,
         (duplicate,),
-        base_wheels,
         {
             project.digest: project_path,
             duplicate.digest: duplicate_path,
@@ -233,10 +204,8 @@ def _prepare(args: argparse.Namespace) -> None:
     expanded = _inventory(expanded_path)
     expanded_request = _release(
         inputs / "expanded",
-        _target(),
         project,
         (expanded,),
-        base_wheels,
         {
             project.digest: project_path,
             expanded.digest: expanded_path,
@@ -269,55 +238,10 @@ def _prepare(args: argparse.Namespace) -> None:
         args.python,
     )
 
-    cuda_target = {**_target(), "accelerator_backend": "cuda", "accelerator_abi": "cu130"}
-    cuda = _release(
-        inputs / "cuda",
-        cuda_target,
-        project,
-        (resolved,),
-        base_wheels,
-        normal_paths,
-    )
-    _request(root, "cuda", cuda, root / "environment-cuda", args.python)
-
-    base_distribution = _release(
-        inputs / "base-distribution",
-        _target(),
-        project,
-        (numpy,),
-        base_wheels,
-        {project.digest: project_path, numpy.digest: args.numpy.resolve()},
-    )
-    _request(
-        root,
-        "base-distribution",
-        base_distribution,
-        root / "environment-base-distribution",
-        args.python,
-    )
-
-    base_import_root = _release(
-        inputs / "base-import-root",
-        _target(),
-        project,
-        (numpy_shadow,),
-        base_wheels,
-        {project.digest: project_path, numpy_shadow.digest: args.numpy_shadow.resolve()},
-    )
-    _request(
-        root,
-        "base-import-root",
-        base_import_root,
-        root / "environment-base-import-root",
-        args.python,
-    )
-
     lying_import_root = _release(
         inputs / "lying-import-root",
-        _target(),
         project,
         (numpy_shadow,),
-        base_wheels,
         {project.digest: project_path, numpy_shadow.digest: args.numpy_shadow.resolve()},
         import_root_overrides={numpy_shadow.distribution: ("declared_new_root",)},
     )
@@ -331,10 +255,8 @@ def _prepare(args: argparse.Namespace) -> None:
 
     duplicate_import_root = _release(
         inputs / "duplicate-import-root",
-        _target(),
         project,
         (shared_root_a, shared_root_b),
-        base_wheels,
         {
             project.digest: project_path,
             shared_root_a.digest: args.shared_root_a.resolve(),
@@ -352,59 +274,13 @@ def _prepare(args: argparse.Namespace) -> None:
 
 def _release(
     root: Path,
-    target: Mapping[str, str],
     project: Wheel,
     resolved_wheels: Sequence[Wheel],
-    wheelhouse_wheels: Sequence[Wheel],
     wheel_paths: Mapping[str, Path],
     *,
     import_root_overrides: Mapping[str, tuple[str, ...]] | None = None,
 ) -> dict[str, object]:
     root.mkdir()
-    base_distributions, base_import_roots = _installed_base_ownership()
-    if not any(row["distribution"] == "uv" for row in base_distributions):
-        uv_version = subprocess.run(
-            ["uv", "--version"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.split()[1]
-        base_distributions.append({"distribution": "uv", "version": uv_version})
-        base_distributions.sort(key=lambda row: str(row["distribution"]))
-        base_import_roots.append({"providers": ["uv"], "root": "uv"})
-        base_import_roots.sort(key=lambda row: str(row["root"]))
-    cpu = target["accelerator_backend"] == "none"
-    if not cpu:
-        base_distributions = [
-            {
-                **row,
-                "version": str(row["version"]).partition("+")[0] + "+" + target["accelerator_abi"],
-            }
-            if row["distribution"] == "torch"
-            else row
-            for row in base_distributions
-        ]
-    torch_release = dict(
-        (str(row["distribution"]), str(row["version"])) for row in base_distributions
-    )["torch"].partition("+")[0]
-    profile = {
-        "accelerator_build": "cpu" if cpu else target["accelerator_abi"],
-        "os_cpu": "linux-x86",
-        "python_abi": target["python_abi"],
-        "torch_release": torch_release,
-    }
-    wheelhouse = _canonical(
-        {
-            "base_distributions": base_distributions,
-            "base_import_roots": base_import_roots,
-            "compatibility_profile": profile,
-            "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none" if cpu else "13.0",
-            "minimum_driver_version": "none" if cpu else "580.126.20",
-            "platform_target": dict(target),
-            "wheels": [_wheel(wheel, import_roots=True) for wheel in wheelhouse_wheels],
-        }
-    )
     selected_rows = []
     for wheel in resolved_wheels:
         row = _wheel(wheel, import_roots=True)
@@ -437,7 +313,6 @@ def _release(
             root / "environment.json",
             _canonical({**documents.body(environment), "wheels": selected_rows}),
         ),
-        "wheelhouse_manifest": _write(root / "wheelhouse.json", wheelhouse),
         "wheel_files": dict(wheel_paths),
     }
 
@@ -475,7 +350,7 @@ def _request(
     value = {
         **release,
         "environment_root": environment_root.resolve(),
-        "python": python.resolve(),
+        "python": python.parent.resolve() / python.name,
     }
     _json(root / f"request-{name}.json", value)
 
@@ -486,9 +361,6 @@ def _verify(root: Path) -> None:
     for name, raw in zip(("cold", "rebuild"), receipts, strict=True):
         observation = _success(root, name, raw)
         _require(observation["reused"] is False, f"{name} unexpectedly reported reuse")
-    cuda = _receipt(root, "cuda")
-    cuda_observation = _success(root, "cuda", cuda)
-    _require(cuda_observation["reused"] is False, "CUDA proof unexpectedly reported reuse")
     _require(not list(root.glob(".environment-receipt-*")), "temporary receipt survived")
 
 
@@ -582,26 +454,6 @@ def _observation(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProofFailure(f"observation is not an object: {path}")
     return value
-
-
-def _target() -> dict[str, str]:
-    libc_name, libc_version = platform.libc_ver()
-    return {
-        "accelerator_abi": "none",
-        "accelerator_backend": "none",
-        "libc": f"{libc_name}{libc_version}" if libc_name else "none",
-        "os_arch": f"{platform.system().lower()}/{_architecture()}",
-        "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-    }
-
-
-def _architecture() -> str:
-    machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        return "amd64"
-    if machine in {"aarch64", "arm64"}:
-        return "arm64"
-    return machine
 
 
 def _paths(value: object) -> dict[str, Path]:
