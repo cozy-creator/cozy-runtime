@@ -253,6 +253,13 @@ class PrivatePackageFileState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper)
     PRIVATE_PACKAGE_FILE_STATE_VERIFIED: _ClassVar[PrivatePackageFileState]
     PRIVATE_PACKAGE_FILE_STATE_REFUSED: _ClassVar[PrivatePackageFileState]
 
+class PrivatePackageAbortOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PRIVATE_PACKAGE_ABORT_OUTCOME_UNSPECIFIED: _ClassVar[PrivatePackageAbortOutcome]
+    PRIVATE_PACKAGE_ABORT_OUTCOME_ABANDONED: _ClassVar[PrivatePackageAbortOutcome]
+    PRIVATE_PACKAGE_ABORT_OUTCOME_REPLAYED: _ClassVar[PrivatePackageAbortOutcome]
+    PRIVATE_PACKAGE_ABORT_OUTCOME_REFUSED: _ClassVar[PrivatePackageAbortOutcome]
+
 class ArtifactFinalizeDisposition(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     ARTIFACT_FINALIZE_DISPOSITION_UNSPECIFIED: _ClassVar[ArtifactFinalizeDisposition]
@@ -427,6 +434,10 @@ PRIVATE_PACKAGE_FILE_STATE_UNSPECIFIED: PrivatePackageFileState
 PRIVATE_PACKAGE_FILE_STATE_RECEIVING: PrivatePackageFileState
 PRIVATE_PACKAGE_FILE_STATE_VERIFIED: PrivatePackageFileState
 PRIVATE_PACKAGE_FILE_STATE_REFUSED: PrivatePackageFileState
+PRIVATE_PACKAGE_ABORT_OUTCOME_UNSPECIFIED: PrivatePackageAbortOutcome
+PRIVATE_PACKAGE_ABORT_OUTCOME_ABANDONED: PrivatePackageAbortOutcome
+PRIVATE_PACKAGE_ABORT_OUTCOME_REPLAYED: PrivatePackageAbortOutcome
+PRIVATE_PACKAGE_ABORT_OUTCOME_REFUSED: PrivatePackageAbortOutcome
 ARTIFACT_FINALIZE_DISPOSITION_UNSPECIFIED: ArtifactFinalizeDisposition
 ARTIFACT_FINALIZE_DISPOSITION_ADOPT: ArtifactFinalizeDisposition
 ARTIFACT_FINALIZE_DISPOSITION_ABANDON: ArtifactFinalizeDisposition
@@ -538,7 +549,7 @@ class PrepareModelSourceResult(_message.Message):
     def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request", "artifact_host_ack", "artifact_transfer_request", "artifact_read_request", "model_source_file_request", "model_source_prepare_request", "private_package_file_chunk")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request", "artifact_host_ack", "artifact_transfer_request", "artifact_read_request", "model_source_file_request", "model_source_prepare_request", "private_package_file_chunk", "private_package_abort")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -553,6 +564,7 @@ class RecordOwnerFrame(_message.Message):
     MODEL_SOURCE_FILE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     MODEL_SOURCE_PREPARE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     PRIVATE_PACKAGE_FILE_CHUNK_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_PACKAGE_ABORT_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -567,10 +579,11 @@ class RecordOwnerFrame(_message.Message):
     model_source_file_request: ModelSourceFileRequest
     model_source_prepare_request: ModelSourcePrepareRequest
     private_package_file_chunk: PrivatePackageFileChunk
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ..., artifact_host_ack: _Optional[_Union[ArtifactHostAck, _Mapping]] = ..., artifact_transfer_request: _Optional[_Union[ArtifactTransferRequest, _Mapping]] = ..., artifact_read_request: _Optional[_Union[ArtifactReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., private_package_file_chunk: _Optional[_Union[PrivatePackageFileChunk, _Mapping]] = ...) -> None: ...
+    private_package_abort: PrivatePackageAbort
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ..., artifact_host_ack: _Optional[_Union[ArtifactHostAck, _Mapping]] = ..., artifact_transfer_request: _Optional[_Union[ArtifactTransferRequest, _Mapping]] = ..., artifact_read_request: _Optional[_Union[ArtifactReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., private_package_file_chunk: _Optional[_Union[PrivatePackageFileChunk, _Mapping]] = ..., private_package_abort: _Optional[_Union[PrivatePackageAbort, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
-    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result", "artifact_intent", "artifact_receipt", "artifact_read_result", "artifact_transfer_status", "model_source_file_status", "model_source_prepared", "private_package_file_status")
+    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result", "artifact_intent", "artifact_receipt", "artifact_read_result", "artifact_transfer_status", "model_source_file_status", "model_source_prepared", "private_package_file_status", "private_package_abort_status")
     CLAIM_ACK_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ACCEPTED_FIELD_NUMBER: _ClassVar[int]
@@ -587,6 +600,7 @@ class WorkerFrame(_message.Message):
     MODEL_SOURCE_FILE_STATUS_FIELD_NUMBER: _ClassVar[int]
     MODEL_SOURCE_PREPARED_FIELD_NUMBER: _ClassVar[int]
     PRIVATE_PACKAGE_FILE_STATUS_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_PACKAGE_ABORT_STATUS_FIELD_NUMBER: _ClassVar[int]
     claim_ack: ClaimAck
     observed_state: ObservedWorkerState
     attempt_accepted: AttemptAccepted
@@ -603,7 +617,8 @@ class WorkerFrame(_message.Message):
     model_source_file_status: ModelSourceFileStatus
     model_source_prepared: ModelSourcePrepared
     private_package_file_status: PrivatePackageFileStatus
-    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResult, _Mapping]] = ..., artifact_intent: _Optional[_Union[ArtifactIntentFrame, _Mapping]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptFrame, _Mapping]] = ..., artifact_read_result: _Optional[_Union[ArtifactReadResult, _Mapping]] = ..., artifact_transfer_status: _Optional[_Union[ArtifactTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., private_package_file_status: _Optional[_Union[PrivatePackageFileStatus, _Mapping]] = ...) -> None: ...
+    private_package_abort_status: PrivatePackageAbortStatus
+    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResult, _Mapping]] = ..., artifact_intent: _Optional[_Union[ArtifactIntentFrame, _Mapping]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptFrame, _Mapping]] = ..., artifact_read_result: _Optional[_Union[ArtifactReadResult, _Mapping]] = ..., artifact_transfer_status: _Optional[_Union[ArtifactTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., private_package_file_status: _Optional[_Union[PrivatePackageFileStatus, _Mapping]] = ..., private_package_abort_status: _Optional[_Union[PrivatePackageAbortStatus, _Mapping]] = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
@@ -1768,6 +1783,44 @@ class PrivatePackageFileStatus(_message.Message):
     safe_code: str
     safe_detail: str
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., kind: _Optional[_Union[LocalDownloadKind, str]] = ..., length: _Optional[int] = ..., state: _Optional[_Union[PrivatePackageFileState, str]] = ..., received_bytes: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class PrivatePackageAbort(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_digest", "private_revision_digest")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_digest: bytes
+    private_revision_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., private_revision_digest: _Optional[bytes] = ...) -> None: ...
+
+class PrivatePackageAbortStatus(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_digest", "private_revision_digest", "outcome", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_digest: bytes
+    private_revision_digest: bytes
+    outcome: PrivatePackageAbortOutcome
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., private_revision_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[PrivatePackageAbortOutcome, str]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class ArtifactFinalizeRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "disposition", "artifact_receipt_digest", "scratch_root_id", "owner_authority_scope")

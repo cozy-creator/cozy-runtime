@@ -571,7 +571,7 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     if not isinstance(value, dict) or set(value) not in shapes:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong fields")
     ownership = value.get("ownership", "image")
-    if not isinstance(ownership, str) or not ownership:
+    if ownership not in {"image", "observed-local"}:
         raise OverlayRefusal("base_family_manifest_invalid", "invalid ownership")
     if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong format")
@@ -644,17 +644,19 @@ def _validate_base_profile(
 
     installed = dict(distributions)
     providers = dict(roots)
-    torch_facts = {
-        name
-        for name in installed
-        if name in {"torch", "torchaudio", "torchvision", "triton", "nvidia"}
-        or name.startswith("nvidia-")
+    cuda_distributions = {
+        name for name in installed if name in {"triton", "nvidia"} or name.startswith("nvidia-")
     }
-    torch_roots = {"torch", "torchaudio", "torchvision", "triton", "nvidia"}
+    cuda_roots = {"triton", "nvidia"}.intersection(providers)
+    if cpu and (cuda_distributions or cuda_roots):
+        raise OverlayRefusal("base_family_manifest_invalid", "contradictory accelerator inventory")
+
     release = profile["torch_release"]
     torch_version = installed.get("torch")
     if torch_version is None:
-        if not cpu or release != "none" or torch_facts or torch_roots.intersection(providers):
+        orphan_companions = {"torchaudio", "torchvision"}.intersection(installed)
+        orphan_roots = {"torch", "torchaudio", "torchvision"}.intersection(providers)
+        if release != "none" or orphan_companions or orphan_roots:
             raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
         return
 

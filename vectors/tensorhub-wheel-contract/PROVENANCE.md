@@ -15,11 +15,11 @@ solely to exercise the complete Runtime join.
 
 The CPU and CUDA 13.0 wheelhouse fixtures are the exact candidate manifests for Runtime `0.0.19`.
 They carry its twice-reproduced `cozy_runtime-0.0.19-py3-none-any.whl`
-(`sha256:20ca77dac3d7196e4449f16b792e775300a3926e483956c77180696e6f327e8b`,
-740,584 bytes) and TensorFS `0.0.5`
+(`sha256:fc513bd48db8b915c695f32689606feb31d67d211ca8fc65f06c002d70586a53`,
+740,940 bytes) and TensorFS `0.0.5`
 (`sha256:a131c4688188dacd1518fbe93c417e64d6af575f65b52edac48bcb60f88d43a5`,
 2,337,278 bytes). They also record the exact Click `8.5.0` control wheel
 (`sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360`).
 Runtime CI checks the canonical producer bytes directly: the CPU fixture is 24,968 bytes with
-SHA-256 `df6f35fadeb465e78052464524b11970e5543b3b3dd17c384cbcac13a4a4633f`; the CUDA fixture is
-25,538 bytes with SHA-256 `6c2de0e589db8650cb6897ef13c5d3efa73a7a10ae121dc9836b6548b53e5d35`.
+SHA-256 `54e7a11ca862d40ec65c279bf29b4a15d076714463e6f2c7d95d481f5c78e7b2`; the CUDA fixture is
+25,538 bytes with SHA-256 `92aeecce5257a5050a8769fc380c37ddefd6346e6eb097f65dcd49ac5f57ed3c`.
