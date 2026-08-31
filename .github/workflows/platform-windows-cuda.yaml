@@ -53,8 +53,9 @@ jobs:
         run: |
           irm https://astral.sh/uv/install.ps1 | iex
           $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
-          uv venv .venv
-          uv pip install --python .venv\Scripts\python.exe torch --index-url ${{ inputs.torch_index }}
+          uv python install 3.14
+          uv venv --python 3.14 .venv
+          uv pip install --python .venv\Scripts\python.exe 'torch>=2.13,<3' --index-url ${{ inputs.torch_index }}
           .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda)"
 
       - name: cuda probe
