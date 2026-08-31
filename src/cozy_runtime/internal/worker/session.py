@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import contextlib
 import dataclasses
 import hashlib
 import hmac
@@ -221,8 +220,6 @@ class WorkerOptions:
     executor_uid: int = -1
     executor_gid: int = -1
     """Fixed package identity, or ``-1/-1`` for the native same-user development lane."""
-    persistent_state: bool = True
-    """Keep crash-recovery state for a standalone worker; false behind pod-supervisor."""
 
 
 @dataclass(slots=True)
@@ -295,20 +292,16 @@ class OwnershipFence:
     structural. `activity` lives in NEITHER of the two halves; it is the worker's own
     narration lane and now sits on the worker.
 
-    `record_owner_epoch` is authority-granter-minted and durable; `control_stream_generation`
-    is WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at
-    worker boot and never reused. The executor generation is PLACEMENT truth (#454) and
-    deliberately not here.
+    `record_owner_epoch` is authority-granter-minted; `control_stream_generation` is
+    WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at worker
+    boot and never reused. The caller owns recovery across worker processes. The executor
+    generation is PLACEMENT truth (#454) and deliberately not here.
     """
 
     worker_boot_id: str = ""
     record_owner_epoch: int = 0
     record_owner_id: str = ""
-    #: TRUE once a (record_owner_epoch, record_owner_id) pair has been DURABLY recorded —
-    #: this boot, or by a previous boot whose record recovery replayed (#494e). The claim
-    #: fence reads this and not the generation: authority survives a restart, so a
-    #: pre-restart owner at a lower epoch must still be refused by a worker that has claimed
-    #: nobody yet.
+    #: TRUE once this process accepted a (record_owner_epoch, record_owner_id) pair.
     record_owner_recorded: bool = False
     control_stream_generation: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
@@ -326,7 +319,7 @@ class AcceptedDesiredState:
     observed placement state satisfies it. `applied_revision` is retired as dishonest (#473):
     it advanced on acceptance while claiming to report reality.
 
-    `placement_set_canonical_bytes` is the EXACT accepted bytes, journaled and re-quoted —
+    `placement_set_canonical_bytes` is the EXACT accepted bytes, recorded and re-quoted —
     never a re-serialization and never a structured projection (§4). The snapshot carries
     these bytes verbatim.
     """
@@ -763,7 +756,7 @@ class Worker:
         self.admission_generation = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
-        self.journal = Journal(self.root / "journal.log" if options.persistent_state else None)
+        self.journal = Journal()
         self.ledger = Ledger(
             host_budget=options.host_budget,
             pinned_budget=options.pinned_budget,
@@ -1342,11 +1335,8 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
                     "equal epoch, different RecordOwner: the epoch is held",
                 )
-            # RECORD BEFORE ACKNOWLEDGING. The ack is the moment this worker starts obeying
-            # an owner, so the authority behind it has to outlive the process that obeys it —
-            # exactly the order acceptance and terminals already follow. A journal that
-            # cannot commit it makes this a boot-fatal verdict rather than an ack: accepting
-            # an authority the worker will forget is how a superseded owner reclaims.
+            # RECORD BEFORE ACKNOWLEDGING so a reconnect to this process cannot race the
+            # ownership fence. The caller owns recovery across worker processes.
             if not self.record_ownership(claim):
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
@@ -1363,7 +1353,7 @@ class Worker:
             generation = self.fence.control_stream_generation
             # A FRESH queue for this stream. The superseded sender keeps its own and drains
             # into a dead call; nothing it still holds was ever this stream's to deliver, and
-            # everything the law owes regenerates — terminals replay from the journal after
+            # everything the law owes regenerates — unacked terminals replay after
             # SnapshotAck, reports re-tick.
             outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
             self.outbound = outbound
@@ -1382,17 +1372,10 @@ class Worker:
         self.claim_ready.set()
 
     def record_ownership(self, claim: pb.Claim) -> bool:
-        """Journal the authority this claim carries, BEFORE any ClaimAck (#494e).
+        """Record the authority this claim carries before ClaimAck.
 
-        Called with `claim_lock` held. False means the record could not be committed, and the
-        claim is REFUSED rather than accepted — a worker that cannot remember whose authority
-        it accepted must not accept it.
-
-        rev-2 gives that refusal its own name: `CLAIM_REJECTION_UNDURABLE` (#507d/#510d).
-        The frozen wire could only route it to `BootFailure(DISK_SHAPE)`, which was
-        representable and true but less direct — the failure is about this CLAIM's
-        durability, not about a boot that never happened, and a RecordOwner reading
-        DISK_SHAPE could not tell those apart.
+        Called with `claim_lock` held. The pathless log can fail only on a structural record
+        defect; in that case the claim is refused rather than accepted.
         """
         try:
             self.journal.append(
@@ -1406,35 +1389,14 @@ class Worker:
             )
         except JournalError as exc:
             self.exit_code = int(Exit.internal)
-            self.note("claim", f"REFUSED: ownership is not durable ({exc.code})")
+            self.note("claim", f"REFUSED: ownership could not be recorded ({exc.code})")
             return False
         return True
-
-    def restore_ownership(self) -> None:
-        """Replay the journalled ownership high-water mark at boot (#494e).
-
-        The fence the owner relies on is "no epoch below the highest this worker ever
-        accepted". Held only in memory it lasted exactly as long as the process, so a
-        restart re-opened the worker to any epoch at all, including the stale owner a higher
-        epoch had already superseded.
-        """
-        rows = self.journal.of_kind("ownership")
-        if not rows:
-            return
-        best = max(rows, key=lambda record: int(record.body.get("record_owner_epoch", 0)))
-        self.fence.record_owner_epoch = int(best.body.get("record_owner_epoch", 0))
-        self.fence.record_owner_id = str(best.body.get("record_owner_id", ""))
-        self.fence.record_owner_recorded = True
-        self.note(
-            "recovery",
-            f"the durable ownership high-water mark is epoch {self.fence.record_owner_epoch} held "
-            f"by {self.fence.record_owner_id or '(unnamed)'}; a lower epoch is refused",
-        )
 
     def _send_claim_ack(
         self, claim: pb.Claim, generation: int, send: Callable[[pb.WorkerFrame], None]
     ) -> None:
-        """ClaimAck + the one recovery snapshot, for a claim this worker can actually serve.
+        """ClaimAck + the convergence snapshot, for a claim this worker can actually serve.
 
         `control_runtime_digest` is the exact image-owned cozy-runtime wheel fact from
         WheelhouseManifest/1. OCI identity remains the provider-readback axis; neither is
@@ -1498,7 +1460,7 @@ class Worker:
                         snapshot_id=self.fence.snapshot_id,
                         snapshot_digest=digest,
                         snapshot_canonical_bytes=canonical_bytes,
-                        # THE EXACT ACCEPTED BYTES, as journaled — never a re-serialization
+                        # THE EXACT ACCEPTED BYTES, as recorded — never a re-serialization
                         # and never a structured projection (§4). Its digest lives INSIDE
                         # the snapshot document, so the two cannot drift apart.
                         accepted_placement_set_canonical_bytes=(
@@ -1509,7 +1471,7 @@ class Worker:
             )
         )
         self.note(
-            "recovery",
+            "snapshot",
             f"snapshot {self.fence.snapshot_id} ({len(canonical_bytes)} B, "
             f"{documents.spell(digest)[:23]}…) reports {held} held attempt(s); the "
             "RecordOwner reconciles them durably before any dispatch",
@@ -3596,20 +3558,9 @@ class Worker:
                     "recovery",
                     f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
                 )
-            if self.options.persistent_state:
-                # Standalone workers recover their own authority and attempt state. The
-                # pod-supervisor child starts empty: its outer supervisor owns replay.
-                self.restore_ownership()
-                recovered = self.engine.recover()
-                if recovered:
-                    self.note(
-                        "recovery",
-                        f"the recovered journal holds {len(recovered)} attempt(s); they ride "
-                        "the snapshot and the owner closes them before minting any next ordinal",
-                    )
             # THE MACHINE IS UP (#482). `worker_phase` is machine lifecycle, pulled out of
-            # the placement enum: BOOTING is true only until the journal, the socket, the
-            # orphan sweep, the recovered ownership and the lanes are all real. It moves
+            # the placement enum: BOOTING is true only until the socket, orphan sweep and
+            # lanes are all real. It moves
             # here and not at the first claim, because a worker is online whether or not a
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
@@ -3674,28 +3625,6 @@ _CONTROL_RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 #: The loopback names a worker may serve plaintext, and without a bootstrap credential.
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
-
-
-def instance_identity(root: Path) -> str:
-    """THE instance identity for this journal root, minted once and reused (#494d).
-
-    `instance_id` is the terminal-replay authorization key: recovery only replays journal
-    rows whose instance matches. Minting a fresh `ins-<random>` on every boot therefore made
-    a bare restart declare its own journal foreign — the rows were dropped, and until #494d
-    they were dropped SILENTLY. The identity belongs to the durable root, so it lives beside
-    the journal: the first boot writes it, every later boot reads it, and a launcher that
-    genuinely rotates instances passes `--instance-id` and says so.
-    """
-    root.mkdir(parents=True, exist_ok=True)
-    marker = root / "instance-id"
-    existing = ""
-    with contextlib.suppress(OSError):
-        existing = marker.read_text().strip()
-    if existing:
-        return existing
-    minted = f"ins-{uuid.uuid4().hex[:16]}"
-    marker.write_text(minted + "\n")
-    return minted
 
 
 def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
@@ -3817,7 +3746,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     options = WorkerOptions(
         root=Path(args.root),
         worker_id=args.worker_id,
-        instance_id=args.instance_id or instance_identity(Path(args.root)),
+        instance_id=args.instance_id or f"ins-{uuid.uuid4().hex[:16]}",
         release_id=args.release_id,
         control_runtime_digest=args.control_runtime_digest,
         git_commit=args.git_commit,

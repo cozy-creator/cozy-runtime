@@ -11,7 +11,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   construction-fill-order
   one-address-predicate
   dynamic-pods-skip-boot-warm
-  supervised-worker-memory-state
+  worker-control-memory-state
   delivery-plan-observation
   pod-media-grant-root
   measured-backend-version
@@ -1540,45 +1540,34 @@ def fence_dynamic_pods_skip_boot_warm() -> list[str]:
     return []
 
 
-def fence_supervised_worker_memory_state() -> list[str]:
-    """The pod child keeps only same-process state; pod-supervisor owns replay."""
+def fence_worker_control_memory_state() -> list[str]:
+    """Every WorkerControl server is process-local; its caller owns restart recovery."""
 
-    path = SRC / "cli" / "runtime_worker.py"
-    tree = ast.parse(path.read_text())
-    command = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_worker_options"
-        ),
-        None,
-    )
-    if command is None:
-        return [f"{path.relative_to(ROOT)}: fixed product-worker options are gone"]
-    values = [
-        keyword.value
-        for node in ast.walk(command)
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg == "persistent_state"
-    ]
-    if not any(isinstance(value, ast.Constant) and value.value is False for value in values):
-        return [
-            f"{path.relative_to(ROOT)}: fixed Runtime child regained a persistent journal; "
-            "pod-supervisor is the sole replay authority"
-        ]
+    bad: list[str] = []
     session = (SRC / "internal" / "worker" / "session.py").read_text()
-    if 'Journal(self.root / "journal.log" if options.persistent_state else None)' not in session:
-        return [
+    if "self.journal = Journal()" not in session:
+        bad.append(
             "src/cozy_runtime/internal/worker/session.py: memory-only worker state no longer "
-            "selects a pathless log"
-        ]
-    if "if self.options.persistent_state:" not in session:
-        return [
-            "src/cozy_runtime/internal/worker/session.py: the supervised child can scan "
-            "crash-recovery state"
-        ]
-    return []
+            "uses one pathless log"
+        )
+    for spelling in ("journal.log", "persistent_state", "restore_ownership(", ".recover()"):
+        if spelling in session:
+            bad.append(
+                "src/cozy_runtime/internal/worker/session.py: WorkerControl retained "
+                f"restart state through {spelling!r}"
+            )
+    if "def instance_identity(" in session or 'root / "instance-id"' in session:
+        bad.append(
+            "src/cozy_runtime/internal/worker/session.py: WorkerControl retained an "
+            "instance recovery file"
+        )
+    runtime_worker = (SRC / "cli" / "runtime_worker.py").read_text()
+    if "persistent_state" in runtime_worker:
+        bad.append(
+            "src/cozy_runtime/cli/runtime_worker.py: persistence is a launch option; all "
+            "WorkerControl children must be process-local"
+        )
+    return bad
 
 
 def fence_delivery_plan_observation() -> list[str]:
@@ -1747,7 +1736,7 @@ FENCES = {
     "construction-fill-order": fence_construction_fill_order,
     "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
-    "supervised-worker-memory-state": fence_supervised_worker_memory_state,
+    "worker-control-memory-state": fence_worker_control_memory_state,
     "delivery-plan-observation": fence_delivery_plan_observation,
     "pod-media-grant-root": fence_pod_media_grant_root,
     "measured-backend-version": fence_measured_backend_version,

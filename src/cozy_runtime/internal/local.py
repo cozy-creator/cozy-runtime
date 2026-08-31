@@ -9,9 +9,9 @@ and un-branched:
     the same Claim -> ClaimAck -> snapshot -> SnapshotAck handshake and envelope fence
     the same `InvocationSpec` canonical bytes and the same digest recomputation
     the same atomic acceptance boundary (payload fetch -> features -> plan -> prepare ->
-      reserve -> JOURNAL -> AttemptAccepted)
+      reserve -> record -> AttemptAccepted)
     the same worker/executor process boundary, exec-first trampoline and env seal
-    the same durable journal, the same terminal-before-send rule, the same TerminalAck
+    the same in-memory attempt log, the same terminal-before-send rule, the same TerminalAck
     the same output grant, freeze point, tail and manifest
     the same ledger, reconciled at attempt close
 
@@ -21,9 +21,8 @@ The only two things that are LOCAL are stated out loud here rather than hidden:
    deployment set, resolves the binding plan id, builds the spec document, grants the
    payload input and one destination per output field path, and acks the terminal. That is
    exactly the local client's job on the network path.
-2. **The journal is DELETABLE** after a fully acknowledged terminal (§8). It is deleted at
-   the END, never before: a run that is killed mid-attempt leaves its journal behind, which
-   is what makes the next run's recovery honest instead of amnesiac.
+2. **The workspace is disposable** after a fully acknowledged terminal. Creator owns retry
+   and recovery across child processes; Runtime keeps only this process's attempt state.
 
 What this module is NOT: it is not the `run` verb. cr-016 owns the CLI surface, the
 descriptor-derived output ids and the exit-code mapping, and it will WRAP this — never the
@@ -49,6 +48,7 @@ from typing import Any, TypeVar
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import canonical, descriptor, fill
 from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.journal import Journal
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker import triage
@@ -1494,7 +1494,7 @@ def _collect(
     delete_journal: bool,
 ) -> SliceOutcome:
     outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
-    outcome.journal = _journal_rows(worker.root / "journal.log")
+    outcome.journal = _journal_rows(worker.journal)
     outcome.reconciliation = (
         worker.ledger.reconciliations[-1] if worker.ledger.reconciliations else {}
     )
@@ -1551,7 +1551,7 @@ def _collect(
         body = documents.read(record_owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         outcome.terminal = body
         # The triage read, exactly as cl-006 will do it: take the opaque subject off the
-        # terminal, and read the bundle BY KEY, verified against its journaled receipt.
+        # terminal, and read the bundle BY KEY, verified against its in-memory receipt.
         # Nothing here holds a path to it.
         outcome.triage_subject = str((body.get("triage_bundle") or {}).get("subject_id", ""))
         if outcome.triage_subject:
@@ -1559,7 +1559,7 @@ def _collect(
                 outcome.triage = triage.BundleStore.read(
                     worker.root / "triage",
                     outcome.triage_subject,
-                    worker.root / "journal.log",
+                    worker.journal,
                 )
                 outcome.triage_explained = triage.explain(outcome.triage)
         outcome.status = pb.OutcomeStatus.Name(
@@ -1614,8 +1614,7 @@ def _collect(
     }
     outcome.timings["wall_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
-    # §8: the journal MAY be deleted after a fully acknowledged terminal — and only then.
-    # A run that died mid-attempt leaves it behind on purpose, so the next run recovers.
+    # A closed one-shot run has no remaining reader for its disposable workspace.
     closed = any(row.get("kind") == "closed" for row in outcome.journal)
     if delete_journal and closed:
         shutil.rmtree(worker.root, ignore_errors=True)
@@ -1634,8 +1633,14 @@ def _b64(text: str) -> bytes:
     return base64.b64decode(text)
 
 
-def _journal_rows(path: Path) -> list[dict[str, Any]]:
-    """Read the journal back the way it was written: `<sha256 hex> <canonical json>`."""
+def _journal_rows(source: Journal | Path) -> list[dict[str, Any]]:
+    """Project same-process records, or read an explicit durable proof log."""
+    if isinstance(source, Journal):
+        return [
+            {"seq": row.seq, "kind": row.kind, "at_unix_ms": row.at_unix_ms, "body": row.body}
+            for row in source.records
+        ]
+    path = source
     if not path.is_file():
         return []
     rows: list[dict[str, Any]] = []

@@ -1,8 +1,8 @@
-"""The attempt/outcome record — standalone durability or supervised process memory.
+"""The worker's same-process attempt/outcome record.
 
-Standalone workers supply a path and fsync before sending. The fixed pod child supplies no
-path: it retains only same-process reconnect state while pod-supervisor records exact control
-frames before exposing them outside the pod.
+WorkerControl always supplies no path: it retains reconnect state only for this process while
+its caller records exact control frames before exposing them. Explicit proof tooling may supply
+a path when testing the old disk-failure boundary; product workers never do.
 
 Journal honesty (§4): ENOSPC, corruption or I/O uncertainty means NO acknowledgement, NO
 execution, and no further acceptance — at-most-once is never claimed from memory. The
@@ -33,9 +33,9 @@ from cozy_runtime.internal import canonical
 #: Record kinds. Closed on purpose: a new kind is a schema change, not a new string.
 KINDS = (
     "session",  # a new session minted (control-parent boot)
-    "ownership",  # an ACCEPTED (record_owner_epoch, id), journaled before ClaimAck (#494e)
+    "ownership",  # an ACCEPTED (record_owner_epoch, id), recorded before ClaimAck
     # THE EXACT ACCEPTED SET BYTES (rev-2 §4). Never a re-serialization and never a
-    # structured projection: recovery, status attribution and the snapshot all quote these,
+    # structured projection: status attribution and the snapshot both quote these,
     # which is what makes "the set this worker accepted" a byte fact.
     "placement_set",
     "accepted",  # PREPARED acceptance: spec + plan + model-construction digests
@@ -71,7 +71,7 @@ class Record:
 class Journal:
     """An append-only record log, fsynced when a path is supplied."""
 
-    path: Path | None
+    path: Path | None = None
     _fd: int = -1
     seq: int = 0
     stopped: str = ""

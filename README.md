@@ -85,11 +85,11 @@ header, or authentication fallback.
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
 | `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
-| `internal/worker/triage.py` | bounded triage assembly and its journal-backed store |
+| `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
 | `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
-| `internal/journal.py` | same-process attempt state; fsynced only for standalone workers |
+| `internal/journal.py` | same-process attempt state; callers own restart recovery |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
