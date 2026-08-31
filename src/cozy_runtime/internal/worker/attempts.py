@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import stat
 import threading
@@ -38,13 +39,13 @@ from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any, cast
 
-from cozy.worker.v1 import artifact_limits
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import artifact_sink as artifact_bridge
 from cozy_runtime.internal import canonical, seam
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
+from cozy_runtime.internal.worker.artifacts import ArtifactExchange
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
 from cozy_runtime.internal.worker.plan import (
@@ -56,7 +57,7 @@ from cozy_runtime.internal.worker.plan import (
     PreparedRequest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import artifact_limits, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
@@ -113,13 +114,32 @@ def artifact_exchange_bytes(
     if not 0 < expected_length <= cap:
         raise ValueError(f"artifact {kind} length is outside 1..={cap}")
     path = artifact_bridge.exchange_file(spool, output_slot, kind)
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_size != expected_length:
-        raise ValueError(f"artifact {kind} spool file is not an exact regular file")
-    raw = path.read_bytes()
-    if len(raw) != expected_length or path.lstat().st_size != expected_length:
-        raise ValueError(f"artifact {kind} spool file changed while being read")
-    return raw
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_length:
+            raise ValueError(f"artifact {kind} spool file is not an exact regular file")
+        chunks: list[bytes] = []
+        remaining = expected_length + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 << 10))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) != expected_length
+            or (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+        ):
+            raise ValueError(f"artifact {kind} spool file changed while being read")
+        return raw
+    finally:
+        os.close(descriptor)
+
 
 #: The fault tail this worker keeps. Every reader takes the last 8.
 FAULTS_HELD = 64
@@ -369,7 +389,7 @@ class AttemptEngine:
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
         device_process: Callable[[], int],
-        artifacts: Any = None,
+        artifacts: ArtifactExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         artifact_store: Path | None = None,
     ) -> None:
@@ -1238,9 +1258,7 @@ class AttemptEngine:
         )
         return {"ok": True, "receipt_id": receipt_id, "replayed": False}
 
-    def durable_exchange(
-        self, attempt: AttemptRecord, frame: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
         if kind == "checkpoint":
@@ -1255,9 +1273,7 @@ class AttemptEngine:
             output_slot = str(frame.get("output_slot", ""))
             if kind == "artifact_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
-                raw = artifact_exchange_bytes(
-                    attempt.spool, output_slot, "declaration", length
-                )
+                raw = artifact_exchange_bytes(attempt.spool, output_slot, "declaration", length)
                 return self.artifacts.intent(
                     attempt,
                     output_slot=output_slot,
@@ -1265,9 +1281,7 @@ class AttemptEngine:
                         str(frame.get("tensorfs_declaration_digest", ""))
                     ),
                     declaration=raw,
-                    requested_writer_generation=int(
-                        frame.get("requested_writer_generation", 0)
-                    ),
+                    requested_writer_generation=int(frame.get("requested_writer_generation", 0)),
                 )
             if kind == "artifact_receipt":
                 length = int(frame.get("artifact_receipt_length", 0))
@@ -1276,9 +1290,7 @@ class AttemptEngine:
                     attempt,
                     output_slot=output_slot,
                     transaction_id=str(frame.get("artifact_transaction_id", "")),
-                    receipt_digest=documents.raw(
-                        str(frame.get("artifact_receipt_digest", ""))
-                    ),
+                    receipt_digest=documents.raw(str(frame.get("artifact_receipt_digest", ""))),
                     canonical_receipt=raw,
                 )
             return {
@@ -1372,9 +1384,7 @@ class AttemptEngine:
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=(lambda frame: self.durable_exchange(attempt, frame))
-                if job
-                else None,
+                on_request=(lambda frame: self.durable_exchange(attempt, frame)) if job else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()

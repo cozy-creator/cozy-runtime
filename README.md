@@ -11,7 +11,7 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
-Runtime release `0.0.11` targets standard CPython 3.12 only. Project
+Runtime release `0.0.12` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 
 Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
@@ -541,7 +541,9 @@ An opened transaction may read exact source-part ranges into caller-owned contig
 buffers (at most one 64 MiB TensorFS grid window); TensorFS validates alias/component/key/role,
 offset and length under the same pinned source lease before any added value commits.
 The job receives only the exact receipt—never a store, path, publisher or destination. The
-post-commit Worker Protocol receipt format is already supported. The pod product path remains
-deliberately unclaimed until pod-supervisor supplies the missing durable transaction handshake and
-JobInvocationSpec carries the exact model-input/output authorization. The real local boundary is
-exercised by `proofs/internal/artifact_sink_acceptance.py` against a TensorFS wheel and `tfs` binary.
+worker sends exact declaration intent before TensorFS opens, waits for the host's writer-generation
+ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves bounded object
+ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
+Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;
+pod-supervisor owns durability. The real boundary is exercised by
+`proofs/internal/artifact_sink_acceptance.py` against TensorFS 0.0.4 and its `tfs` binary.

@@ -1642,6 +1642,7 @@ class Worker:
 
     def shutdown_from_stream(self) -> None:
         self.stop.set()
+        self.artifacts.close()
         self.outbound.put(None)
         self.work.put(None)
         self.watches.end_all()
@@ -3546,6 +3547,7 @@ class Worker:
             else {}
         )
         self.stop.set()
+        self.artifacts.close()
         self.work.put(None)
         self.convergences.put(None)
         self.outbound.put(None)

@@ -1118,9 +1118,7 @@ class Executor:
             def bind_intent(
                 output_slot: str, declaration_digest: bytes, declaration: bytes
             ) -> artifact_sink.ArtifactHostBinding:
-                artifact_sink.write_exchange_file(
-                    spool, output_slot, "declaration", declaration
-                )
+                artifact_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
                 answer = self._durable(
                     "artifact_intent",
                     {
@@ -1163,9 +1161,9 @@ class Executor:
                         "artifact_receipt_length": len(canonical_receipt),
                     },
                 )
-                if not answer.get("ok") or answer.get(
-                    "artifact_receipt_digest"
-                ) != documents.spell(receipt_digest):
+                if not answer.get("ok") or answer.get("artifact_receipt_digest") != documents.spell(
+                    receipt_digest
+                ):
                     raise CapabilityError(
                         str(answer.get("detail", "the artifact host refused receipt")),
                         code=str(answer.get("code", "artifact_host_refused")),

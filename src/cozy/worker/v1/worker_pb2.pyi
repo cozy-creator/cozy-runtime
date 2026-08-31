@@ -1200,7 +1200,7 @@ class ArtifactIntentFrame(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_generation: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class ArtifactHostAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "writer_generation", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "artifact_receipt")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "writer_generation", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "artifact_receipt", "manifest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1215,6 +1215,7 @@ class ArtifactHostAck(_message.Message):
     OUTCOME_FIELD_NUMBER: _ClassVar[int]
     REFUSAL_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -1229,10 +1230,11 @@ class ArtifactHostAck(_message.Message):
     outcome: ArtifactHostOutcome
     refusal: ArtifactHostRefusal
     artifact_receipt: ArtifactReceiptRef
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., writer_generation: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., stage: _Optional[_Union[ArtifactHostStage, str]] = ..., outcome: _Optional[_Union[ArtifactHostOutcome, str]] = ..., refusal: _Optional[_Union[ArtifactHostRefusal, str]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptRef, _Mapping]] = ...) -> None: ...
+    manifest: Ref
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., writer_generation: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., stage: _Optional[_Union[ArtifactHostStage, str]] = ..., outcome: _Optional[_Union[ArtifactHostOutcome, str]] = ..., refusal: _Optional[_Union[ArtifactHostRefusal, str]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptRef, _Mapping]] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class ArtifactReceiptFrame(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "writer_generation", "tensorfs_declaration_digest", "artifact_receipt", "objects")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "writer_generation", "tensorfs_declaration_digest", "artifact_receipt", "objects", "manifest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1245,6 +1247,7 @@ class ArtifactReceiptFrame(_message.Message):
     TENSORFS_DECLARATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
     OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -1257,7 +1260,8 @@ class ArtifactReceiptFrame(_message.Message):
     tensorfs_declaration_digest: bytes
     artifact_receipt: ArtifactReceiptRef
     objects: _containers.RepeatedCompositeFieldContainer[ArtifactObjectSource]
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., writer_generation: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptRef, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[ArtifactObjectSource, _Mapping]]] = ...) -> None: ...
+    manifest: Ref
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., writer_generation: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptRef, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[ArtifactObjectSource, _Mapping]]] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class ArtifactTransactionStatus(_message.Message):
     __slots__ = ("artifact_transaction_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "writer_generation", "state", "tensorfs_declaration_digest", "artifact_receipt_digest")

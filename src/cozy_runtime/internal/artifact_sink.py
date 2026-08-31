@@ -70,7 +70,8 @@ def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -
         if target.read_bytes() != data:
             raise CapabilityError(
                 f"artifact {kind} replay changed exact bytes",
-                code="artifact_receipt_mismatch" if kind == "receipt"
+                code="artifact_receipt_mismatch"
+                if kind == "receipt"
                 else "artifact_intent_conflict",
             ) from None
     return target
