@@ -727,7 +727,7 @@ app.production(
     steps=(
         ProductionStep(
             name="distill-full",
-            callable="tensorhub/h3/distill",
+            callable="tensorhub/h3@v1/distill",
             models={"base": "dits", "shared": "shared"},
             outputs=("bf16-full",),
             resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),

@@ -508,7 +508,7 @@ def _productions(value: Json, source: str) -> None:
                 _invalid(source, f"{step_path}.name", "must be unique")
             callable_name = step["callable"]
             if not isinstance(callable_name, str) or _CALLABLE.fullmatch(callable_name) is None:
-                _invalid(source, f"{step_path}.callable", "must be org/package/function")
+                _invalid(source, f"{step_path}.callable", "must be org/package@vN/function")
             outputs = _portable_names(step["outputs"], source, f"{step_path}.outputs", 8)
             step_outputs[step_name] = set(outputs)
             dependencies[step_name] = set()
@@ -595,7 +595,8 @@ def _productions(value: Json, source: str) -> None:
 _PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
 _CALLABLE = re.compile(
-    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
+    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}"
+    r"@v(?:0|[1-9][0-9]*)/"
     r"[a-z][a-z0-9_-]{0,63}$"
 )
 
