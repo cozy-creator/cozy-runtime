@@ -833,7 +833,8 @@ class Worker:
         # Exact code/descriptor/Environment revisions prepared over the private loopback seam.
         # This is same-process admission state, not a Runtime journal. After worker restart the
         # RecordOwner replays preparation before a model-bound PlacementSet can join it.
-        self.private_revisions: dict[str, Placement] = {}
+        self.private_revisions: dict[tuple[str, str], Placement] = {}
+        self.private_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
@@ -936,6 +937,41 @@ class Worker:
         self, request: pb.PreparePrivatePackageRequest
     ) -> pb.PreparePackageSetResult:
         return self._prepare_package(request, private=True)
+
+    def prepare_private_placement(
+        self, request: pb.PreparePrivatePlacementRequest
+    ) -> pb.PreparePackageSetResult:
+        from cozy_runtime.internal.worker import package_prepare
+
+        with self.preparation_lock:
+            revision = documents.spell(request.private_revision_digest)
+            prepared = self.private_operations.get((request.operation_id, revision))
+            if prepared is None:
+                raise package_prepare.PreparationRefusal("private_revision_unprepared", revision)
+
+            def mark_verified(digest: str, length: int, path: Path) -> None:
+                self.verified_artifacts.record(digest, length, path)
+
+            result = package_prepare.prepare_private_placement(
+                request,
+                prepared=prepared.document,
+                artifact_cache=Path(self.options.artifact_cache or ""),
+                artifact_store=(
+                    Path(self.options.artifact_store)
+                    if self.options.artifact_store is not None
+                    else None
+                ),
+                verified=mark_verified,
+            )
+            joined = read_placement_set(result.placement_set)
+            if (
+                len(joined) != 1
+                or joined[0].get("development", {}).get("private_revision_digest") != revision
+            ):
+                raise package_prepare.PreparationRefusal(
+                    "private_placement_result_invalid", revision
+                )
+            return result
 
     def _prepare_package(
         self,
@@ -1040,7 +1076,8 @@ class Worker:
                         "private_package_revision_mismatch",
                         "prepared Placement changed the declared private revision",
                     )
-                self.private_revisions[revision] = stored
+                self.private_operations[(request.operation_id, revision)] = stored
+                self.private_revisions[(stored.placement_id, revision)] = stored
                 return result
             assert isinstance(request, pb.PreparePackageSetRequest)
             return package_prepare.prepare_package_set(
@@ -2234,7 +2271,9 @@ class Worker:
             )
             return None
         if placement.development:
-            prepared = self.private_revisions.get(placement.execution_digest)
+            prepared = self.private_revisions.get(
+                (placement.placement_id, placement.execution_digest)
+            )
             if prepared is None:
                 self._materialization_failed(
                     placement,

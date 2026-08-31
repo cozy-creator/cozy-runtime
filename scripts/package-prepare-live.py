@@ -11,17 +11,18 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime.cli import private_preflight
 from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
-from cozy_runtime.internal.worker.session import read_placement_set
+from cozy_runtime.internal.worker.session import Worker, read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -297,7 +298,8 @@ def main(argv: list[str] | None = None) -> int:
             "sha256:" + digest.hex()
         )
         assert private["environment"]["wheels"] == []
-        assert private["entrypoints"] == []
+        assert private["entrypoints"]
+        assert all(entrypoint["slots"] == [] for entrypoint in private["entrypoints"])
         assert private["models"] == []
         assert len(read_placement_set(private_result.placement_set)) == 1
         changed_refs = [pb.PrivatePackageFileRef() for _row in revision.files]
@@ -615,21 +617,102 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     assert private_body["development"]["private_revision_digest"] == documents.spell(
         private_revision
     )
-    dynamic = copy.deepcopy(private_body)
-    dynamic["models"] = value["models"]
-    dynamic["entrypoints"] = value["entrypoints"]
-    dynamic["bindings_digest"] = canonical.digest(
-        {"entrypoints": dynamic["entrypoints"], "models": dynamic["models"]}
+    private_delegation_doc = copy.deepcopy(delegation_doc)
+    private_delegation_doc["packages"] = []
+    private_delegation = canonical.write(private_delegation_doc)
+    private_model_files = [
+        row
+        for row in local_files
+        if row.kind
+        in {
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
+        }
+    ]
+    joined_result = package_prepare.prepare_private_placement(
+        pb.PreparePrivatePlacementRequest(
+            operation_id="private-modeled-01",
+            private_revision_digest=private_revision,
+            download_delegation=private_delegation,
+            files=private_model_files,
+        ),
+        prepared=private_body,
+        artifact_cache=cache,
+        artifact_store=target_store,
+        verified=mark,
     )
-    dynamic_bytes = canonical.write(
-        {"format": "cozy.worker.v1.PlacementSet/1", "placements": [dynamic]}
-    )
-    parsed_dynamic = read_placement_set(
-        pb.DesiredPlacementSet(
-            placement_set_digest=documents.digest_of(dynamic_bytes),
-            placement_set_canonical_bytes=dynamic_bytes,
+    parsed_dynamic = read_placement_set(joined_result.placement_set)[0]
+    dynamic = parsed_dynamic
+    assert parsed_dynamic["development"] == private_body["development"]
+    assert parsed_dynamic["environment"] == private_body["environment"]
+    assert parsed_dynamic["package_descriptor"] == private_body["package_descriptor"]
+    assert parsed_dynamic["models"] == value["models"]
+    assert parsed_dynamic["entrypoints"] == value["entrypoints"]
+
+    changed_revision = bytearray(private_revision)
+    changed_revision[0] ^= 1
+    try:
+        package_prepare.prepare_private_placement(
+            pb.PreparePrivatePlacementRequest(
+                operation_id="private-modeled-01",
+                private_revision_digest=bytes(changed_revision),
+                download_delegation=private_delegation,
+                files=private_model_files,
+            ),
+            prepared=private_body,
+            artifact_cache=cache,
+            artifact_store=target_store,
+            verified=mark,
         )
-    )[0]
+    except package_prepare.PreparationRefusal as exc:
+        assert exc.code == "private_placement_identity_invalid"
+    else:
+        raise RuntimeError("changed private revision was joined to prepared code")
+
+    same_revision_other_operation = cast(Any, object.__new__(Worker))
+    same_revision_other_operation.preparation_lock = threading.Lock()
+    same_revision_other_operation.private_operations = {
+        ("private-modeled-02", documents.spell(private_revision)): SimpleNamespace(
+            document=private_body
+        )
+    }
+    same_revision_other_operation.verified_artifacts = verified
+    same_revision_other_operation.options = SimpleNamespace(
+        artifact_cache=cache, artifact_store=target_store
+    )
+    try:
+        same_revision_other_operation.prepare_private_placement(
+            pb.PreparePrivatePlacementRequest(
+                operation_id="private-modeled-01",
+                private_revision_digest=private_revision,
+                download_delegation=private_delegation,
+                files=private_model_files,
+            )
+        )
+    except package_prepare.PreparationRefusal as exc:
+        assert exc.code == "private_revision_unprepared"
+    else:
+        raise RuntimeError("operation A joined operation B's same-digest private core")
+
+    wrong_package_doc = copy.deepcopy(private_delegation_doc)
+    wrong_package_doc["models"][0]["package"] = "proof/another-package"
+    try:
+        package_prepare.prepare_private_placement(
+            pb.PreparePrivatePlacementRequest(
+                operation_id="private-modeled-01",
+                private_revision_digest=private_revision,
+                download_delegation=canonical.write(wrong_package_doc),
+                files=private_model_files,
+            ),
+            prepared=private_body,
+            artifact_cache=cache,
+            artifact_store=target_store,
+            verified=mark,
+        )
+    except package_prepare.PreparationRefusal as exc:
+        assert exc.code == "package_prepare_model_selection_mismatch"
+    else:
+        raise RuntimeError("model binding for another package joined private code")
 
     def private_namespace(selected: dict[str, Any]) -> SimpleNamespace:
         return SimpleNamespace(

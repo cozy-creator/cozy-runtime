@@ -488,6 +488,18 @@ class PreparePrivatePackageRequest(_message.Message):
     environment_root: str
     def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalDownloadFile, _Mapping]]] = ..., environment_root: _Optional[str] = ...) -> None: ...
 
+class PreparePrivatePlacementRequest(_message.Message):
+    __slots__ = ("operation_id", "private_revision_digest", "download_delegation", "files")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    private_revision_digest: bytes
+    download_delegation: bytes
+    files: _containers.RepeatedCompositeFieldContainer[LocalDownloadFile]
+    def __init__(self, operation_id: _Optional[str] = ..., private_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., files: _Optional[_Iterable[_Union[LocalDownloadFile, _Mapping]]] = ...) -> None: ...
+
 class LocalModelSourceFile(_message.Message):
     __slots__ = ("member", "object_id", "length", "path")
     MEMBER_FIELD_NUMBER: _ClassVar[int]
@@ -761,7 +773,7 @@ class SnapshotAck(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ...) -> None: ...
 
 class DesiredWorkerState(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "private_package_set")
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "private_package_set", "private_placement_set")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -773,6 +785,7 @@ class DesiredWorkerState(_message.Message):
     PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     PRIVATE_PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_generation: int
     worker_boot_id: str
@@ -784,7 +797,8 @@ class DesiredWorkerState(_message.Message):
     placement_set: DesiredPlacementSet
     package_set: DesiredPackageSet
     private_package_set: DesiredPrivatePackageSet
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., private_package_set: _Optional[_Union[DesiredPrivatePackageSet, _Mapping]] = ...) -> None: ...
+    private_placement_set: DesiredPrivatePlacementSet
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., private_package_set: _Optional[_Union[DesiredPrivatePackageSet, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ...) -> None: ...
 
 class DesiredPackageSet(_message.Message):
     __slots__ = ("download_delegation", "download_delegation_signature")
@@ -803,6 +817,18 @@ class DesiredPrivatePackageSet(_message.Message):
     package: DevelopmentPackage
     files: _containers.RepeatedCompositeFieldContainer[PrivatePackageFileRef]
     def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[PrivatePackageFileRef, _Mapping]]] = ...) -> None: ...
+
+class DesiredPrivatePlacementSet(_message.Message):
+    __slots__ = ("operation_id", "private_revision_digest", "download_delegation", "download_delegation_signature")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    private_revision_digest: bytes
+    download_delegation: bytes
+    download_delegation_signature: bytes
+    def __init__(self, operation_id: _Optional[str] = ..., private_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class PrivatePackageFileRef(_message.Message):
     __slots__ = ("digest", "filename", "kind", "length")
