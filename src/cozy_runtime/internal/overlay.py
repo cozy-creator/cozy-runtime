@@ -942,6 +942,11 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                     "overlay_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
+            if wheel.owner == "custom" and native_members:
+                raise OverlayRefusal(
+                    "overlay_custom_wheel_native_unsupported",
+                    f"{wheel.filename}: custom native wheels are not admitted yet",
+                )
             if native_members and any(
                 tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
                 for tag in declared_tags
