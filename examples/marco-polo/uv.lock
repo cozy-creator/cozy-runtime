@@ -144,7 +144,7 @@ wheels = [
 ]
 
 [[package]]
-name = "marco-polo-package"
+name = "marco-polo"
 version = "1.0.3"
 source = { editable = "." }
 dependencies = [

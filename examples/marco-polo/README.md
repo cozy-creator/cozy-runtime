@@ -23,7 +23,7 @@ Cozy from this directory:
 cozy package publish
 ```
 
-The default metadata publishes `paul/marco-polo-package@1.0.3`. Cozy derives the name and version
+The default metadata publishes `paul/marco-polo@1.0.3`. Cozy derives the name and version
 from the built wheel and never adds a `v` prefix.
 
 Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module

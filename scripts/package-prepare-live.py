@@ -92,7 +92,7 @@ def main() -> int:
                 "models": [],
                 "packages": [
                     {
-                        "package": "paul/marco-polo-package",
+                        "package": "paul/marco-polo",
                         "release": "1.0.3",
                         "release_digest": release_digest,
                     }
