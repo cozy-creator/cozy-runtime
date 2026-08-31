@@ -307,8 +307,8 @@ uid-65533 domain, not merely an environment token or process group, so token scr
 double-fork, worker restart, and PID reuse do not leave an old executor alive. A writable but
 undelegated cgroup-v2 host and an unbounded read-only container still refuse before package import.
 
-An overlay contains exactly one project wheel and at most 127 custom wheels. The Runtime bound is
-128 total package-owned wheels, counting the project; 128 custom rows plus the project refuses
+An overlay contains exactly one project wheel and at most 128 custom wheels. The Runtime bound is
+129 total package-owned wheels, counting the project; 129 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
 The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
