@@ -1354,7 +1354,7 @@ def fence_development_placement() -> list[str]:
     source_digest = "sha256:" + "7" * 64
     built = local.development_placement_documents(
         descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-        package="paul/marco-polo-package",
+        package="paul/marco-polo",
         release="1.0.3",
         source_digest=source_digest,
     )
@@ -1400,7 +1400,7 @@ def fence_development_placement() -> list[str]:
         cache = pathlib.Path(directory)
         staged = local.development_placement_documents(
             descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-            package="paul/marco-polo-package",
+            package="paul/marco-polo",
             release="1.0.3",
             source_digest=source_digest,
             artifact_cache=cache,
@@ -1413,7 +1413,7 @@ def fence_development_placement() -> list[str]:
                 entrypoints=tuple(document["entrypoints"]),
                 package_descriptor=(descriptor_digest, len(staged.descriptor)),
                 development={
-                    "package": "paul/marco-polo-package",
+                    "package": "paul/marco-polo",
                     "release": "1.0.3",
                     "source_digest": source_digest,
                 },
