@@ -1,16 +1,15 @@
-"""The durable attempt/outcome journal — the worker's at-most-once evidence.
+"""The attempt/outcome record — standalone durability or supervised process memory.
 
-Journal-before-send is the non-negotiable order (worker-protocol/02 §2): acceptance persists
-before AttemptAccepted, the outcome persists before AttemptOutcome, closure records only on
-AttemptOutcomeAck. Everything the worker may later CLAIM about an attempt is a line in this
-file, and a line is written with `fsync` before the claim leaves the process.
+Standalone workers supply a path and fsync before sending. The fixed pod child supplies no
+path: it retains only same-process reconnect state while pod-supervisor records exact control
+frames before exposing them outside the pod.
 
 Journal honesty (§4): ENOSPC, corruption or I/O uncertainty means NO acknowledgement, NO
 execution, and no further acceptance — at-most-once is never claimed from memory. The
 mechanism is `stopped`: the first failed append latches it, and the worker's admission
 path reads it before anything else.
 
-Line format is `<sha256 hex> <canonical json>`: the digest is over exactly the canonical
+The durable line format is `<sha256 hex> <canonical json>`: the digest is over canonical
 bytes that follow, so a flipped byte anywhere in the record is a detected corruption rather
 than a plausible different record, and a re-emitted (pretty-printed, reordered) line refuses
 under the re-emit law. Recovery reads forward and stops at the first unreadable line — a
