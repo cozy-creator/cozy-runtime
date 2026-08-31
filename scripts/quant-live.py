@@ -338,10 +338,10 @@ def snapshot() -> str:
     import tensorfs
 
     store = tensorfs.Store.open(str(STORE))
-    installed = tensorfs.ingest_installed(store)
-    if not installed:
+    installed = getattr(store, "resolve_local")("cr006")
+    if installed is None:
         raise SystemExit("nothing installed in the cr-006 store — run `ingest` first")
-    return str(installed[-1])
+    return str(installed)
 
 
 def unet_config() -> dict[str, Any]:

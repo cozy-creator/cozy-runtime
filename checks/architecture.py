@@ -704,16 +704,16 @@ def fence_base_ownership_vectors() -> list[str]:
     mirror_specs = (
         (
             "base-worker-image-wheelhouse-cpu.json",
-            24_977,
-            "sha256:2ea86f5131b1f95efd1f2bd3870efd52b94cdd25c623e438614e6ff3afb31cb8",
-            (27, 322, 26),
+            24_683,
+            "sha256:0332d1afd11b222df7ef411ef6567cbe12af7ec8edf0309c5ccd846bcbf35406",
+            (26, 323, 25),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
-            32_558,
-            "sha256:62be81f24f970df1db8dce059a06c208b6d35c1b277450c5e98ea495474b15f0",
-            (46, 325, 45),
+            25_651,
+            "sha256:6614fddec7ab1ecf634293c4ff6c254f4fb2ed143d96022fbe9f6169deeede50",
+            (86, 363, 10),
             ("cuda", "cu130"),
         ),
     )
@@ -744,7 +744,7 @@ def fence_base_ownership_vectors() -> list[str]:
         target = dict(manifest.platform_target)
         expected_target = {
             "os_arch": "linux/amd64",
-            "libc": "glibc2.36",
+            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
             "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],
@@ -754,16 +754,16 @@ def fence_base_ownership_vectors() -> list[str]:
         versions = manifest.distribution_versions
         expected_wheels = {
             "cozy-runtime": (
-                "0.0.10",
-                "cozy_runtime-0.0.10-py3-none-any.whl",
-                "sha256:94460296a7c6ad745d25693f8c67faa6543579ffb0779ee1f9b8056ef9a30ba8",
-                698_262,
+                "0.0.11.dev0",
+                "cozy_runtime-0.0.11.dev0-py3-none-any.whl",
+                "sha256:c633b3e5d1b1aa81249cc61c63d1aadb6347a534935191a52cc553cabba34448",
+                690_512,
             ),
             "tensorfs": (
-                "0.0.2",
-                "tensorfs-0.0.2-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-                "sha256:5d5420f9571778ae884daf6fe31bc649318014cd644d94b17a7c465929be5d93",
-                2_085_526,
+                "0.0.3.dev0",
+                "tensorfs-0.0.3.dev0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                "sha256:894e14456673adfe569a8f5c368ba96df878f2d75799c7058fd45d509068efa3",
+                2_093_057,
             ),
         }
         wheels = {wheel.distribution: wheel for wheel in manifest.wheels}
