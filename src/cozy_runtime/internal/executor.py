@@ -1423,6 +1423,7 @@ class Executor:
                             "name": str(frame.name)[:120],
                             "value": frame.fraction,
                             "position": frame.position,
+                            "step_ms": frame.step_ms,
                         }
                     )
                 else:

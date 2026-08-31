@@ -136,6 +136,25 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 ADMISSION_WINDOW = 1
 
 
+def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
+    """Preserve the measured progress coordinates the executor already supplied.
+
+    The old worker serialized only ``value`` and silently discarded stage, position, and
+    step time. That left clients with a percentage but no honest way to name a denoising
+    stage, count its steps, or estimate its remaining wall time.
+    """
+    kind = frame.get("kind", "progress")
+    payload: Any = frame.get("value")
+    if kind == "progress":
+        payload = {
+            "name": str(frame.get("name", ""))[:120],
+            "fraction": frame.get("value"),
+            "position": frame.get("position"),
+            "step_ms": frame.get("step_ms", 0.0),
+        }
+    return {"type": kind, "payload": payload}
+
+
 def _delivery_observation(delivery: Mapping[str, Any]) -> str:
     """Render only the current resolution-plan projection; narration never gates serving."""
 
@@ -1256,9 +1275,7 @@ class Worker:
                     attempt_ordinal=attempt,
                     seq=next(counter),
                     content_type="application/x-cozy-event+json",
-                    data=json.dumps(
-                        {"type": frame.get("kind", "progress"), "payload": frame.get("value")}
-                    ).encode()[:65536],
+                    data=json.dumps(_progress_document(frame)).encode()[:65536],
                     placement_id=self.placement.placement_id if self.placement else "",
                 )
             )
