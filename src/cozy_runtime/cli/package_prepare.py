@@ -116,15 +116,18 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             timeout=1.0,
             total_timeout=65.0,
         )
-        raw = output.read_bytes()
-        if (
-            not reply.get("ok")
-            or reply.get("digest") != _digest(raw)
-            or reply.get("length") != len(raw)
-        ):
+        if not reply.get("ok"):
             raise PreparationRefusal(
                 "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))
             )
+        try:
+            raw = output.read_bytes()
+        except OSError as exc:
+            raise PreparationRefusal(
+                "package_prepare_descriptor_failed", "descriptor output is absent"
+            ) from exc
+        if reply.get("digest") != _digest(raw) or reply.get("length") != len(raw):
+            raise PreparationRefusal("package_prepare_descriptor_failed", "invalid reply")
         return raw
 
     try:
