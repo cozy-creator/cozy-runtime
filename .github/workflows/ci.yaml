@@ -39,19 +39,28 @@ jobs:
       # The architecture fence validates the closed grammar; these exact replays prove the two
       # source fixtures derive byte-identically without dirtying either repository.
       - run: |
-          test "$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)" = \
-            "$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)"
-          test "$(uv run --locked --project examples/marco-polo \
-            cozy-runtime --json --dir examples/marco-polo describe)" = \
-            "$(uv run --locked --project examples/marco-polo \
-            cozy-runtime --json --dir examples/marco-polo describe)"
+          set -euo pipefail
+          tiny_a=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
+          tiny_b=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
+          test "$tiny_a" = "$tiny_b"
+          marco_a=$(uv run --locked --project examples/marco-polo \
+            cozy-runtime --json --dir examples/marco-polo describe)
+          marco_b=$(uv run --locked --project examples/marco-polo \
+            cozy-runtime --json --dir examples/marco-polo describe)
+          test "$marco_a" = "$marco_b"
       - run: |
+          set -euo pipefail
+          shopt -s nullglob
           a=$(mktemp -d)
           b=$(mktemp -d)
           uv build --wheel --out-dir "$a" examples/marco-polo
           uv build --wheel --out-dir "$b" examples/marco-polo
-          cmp "$a"/*.whl "$b"/*.whl
-          unzip -l "$a"/*.whl | grep -F 'marco_polo_package/__init__.py'
+          wheel_a=("$a"/*.whl)
+          wheel_b=("$b"/*.whl)
+          test "${#wheel_a[@]}" -eq 1
+          test "${#wheel_b[@]}" -eq 1
+          cmp "${wheel_a[0]}" "${wheel_b[0]}"
+          unzip -l "${wheel_a[0]}" | grep -F 'marco_polo_package/__init__.py'
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python checks/declared_facts.py
