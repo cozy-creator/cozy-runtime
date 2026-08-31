@@ -318,11 +318,13 @@ def package_overlay_input(
 ) -> overlay.Input:
     """Join direct executable package facts with the selected inline Environment."""
 
-    _closed(
-        package,
-        {"package", "project_wheel", "release", "release_digest"},
-        "package",
-    )
+    fields = set(package)
+    published = {"package", "project_wheel", "release", "release_digest"}
+    development = {"package", "project_wheel", "release", "source_digest"}
+    if fields not in (published, development):
+        raise LaunchRefusal(
+            "package_invalid", f"fields={sorted(fields)} expected published or private development"
+        )
     identity = package["package"]
     version = package["release"]
     if (
@@ -333,7 +335,8 @@ def package_overlay_input(
         or not version
     ):
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
-    _require_digest(package["release_digest"], "package.release_digest")
+    revision_field = "release_digest" if fields == published else "source_digest"
+    _require_digest(package[revision_field], f"package.{revision_field}")
 
     _closed(environment, {"wheels"}, "environment")
     measured_environment = (

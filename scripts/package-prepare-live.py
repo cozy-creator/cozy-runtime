@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             wheels = args.wheel_dir
-        wheel = next(wheels.glob("marco_polo_package-*.whl"))
+        wheel = next(wheels.glob("marco_polo-*.whl"))
         digest = hashlib.sha256(wheel.read_bytes()).digest()
         cache = root / "artifacts"
         view = cache / "sets" / "marco"
@@ -190,8 +190,39 @@ def main(argv: list[str] | None = None) -> int:
             result.placement_set.placement_set_canonical_bytes
         )
         assert len(read_placement_set(result.placement_set)) == 1
+        private_source = hashlib.sha256(b"exact editable Marco source").digest()
+        private_result = package_prepare.prepare_private_package(
+            pb.PreparePrivatePackageRequest(
+                operation_id="private-marco-01",
+                package=pb.DevelopmentPackage(
+                    package="local/marco-polo",
+                    release="1.0.4",
+                    source_digest=private_source,
+                ),
+                files=files,
+                environment_root=str(root / "private-environments"),
+            ),
+            artifact_cache=cache,
+            environment_root=root / "private-environments",
+            python=Path(sys.executable),
+            describe=describe,
+            verified=lambda digest, _length, _path: verified.append(digest),
+            job_plan_root=root / "private-job-plans",
+            base_manifest=base,
+        )
+        private = documents.read(
+            private_result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+        )["placements"][0]
+        assert private["development"]["source_digest"] == documents.spell(private_source)
+        assert private["development"]["project_wheel"]["ref"]["digest"] == (
+            "sha256:" + digest.hex()
+        )
+        assert private["environment"]["wheels"] == []
+        assert len(read_placement_set(private_result.placement_set)) == 1
         modeled(root, base, cache, args.wheel_dir)
-        print("package preparation: weightless Marco and exact modeled TensorFS package passed")
+        print(
+            "package preparation: published/private Marco and exact modeled TensorFS package passed"
+        )
     return 0
 
 

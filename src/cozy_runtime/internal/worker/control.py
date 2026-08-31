@@ -124,6 +124,9 @@ class GrpcControlHost:
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
+        private_package_preparer: (
+            Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
+        ) = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -132,6 +135,7 @@ class GrpcControlHost:
         self.on_bound = on_bound
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
+        self.private_package_preparer = private_package_preparer
         self.server: Any = None
         self.stopped = threading.Event()
 
@@ -144,11 +148,18 @@ class GrpcControlHost:
 
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
-        if self.preparer is not None or self.model_source_preparer is not None:
+        if (
+            self.preparer is not None
+            or self.model_source_preparer is not None
+            or self.private_package_preparer is not None
+        ):
             if not _loopback_preparation_listener(self.listen):
                 raise RuntimeError("RuntimePreparation can only bind a loopback listener")
             pb_grpc.add_RuntimePreparationServicer_to_server(
-                _PreparationServicer(self.preparer, self.model_source_preparer), self.server
+                _PreparationServicer(
+                    self.preparer, self.model_source_preparer, self.private_package_preparer
+                ),
+                self.server,
             )
         if self.listen.startswith("unix:"):
             self.server.add_insecure_port(self.listen)
@@ -195,9 +206,13 @@ class _PreparationServicer:
         model_source_handler: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ),
+        private_package_handler: (
+            Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
+        ),
     ) -> None:
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
+        self.private_package_handler = private_package_handler
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler
@@ -228,6 +243,21 @@ class _PreparationServicer:
             import grpc
 
             context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
+
+    def PreparePrivatePackage(self, request: pb.PreparePrivatePackageRequest, context: Any) -> Any:
+        handler = self.private_package_handler
+        if handler is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "private package preparation is unavailable"
+            )
+        try:
+            return handler(request)
+        except Exception as exc:
+            import grpc
+
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
 
 
 def _loopback_preparation_listener(listen: str) -> bool:
