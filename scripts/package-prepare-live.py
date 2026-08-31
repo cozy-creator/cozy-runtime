@@ -36,6 +36,10 @@ def main() -> int:
         view.mkdir(parents=True)
         local_wheel = view / wheel.name
         local_wheel.write_bytes(wheel.read_bytes())
+        redundant = view / (
+            "msgspec-" + importlib.metadata.version("msgspec") + "-py3-none-any.whl"
+        )
+        redundant.write_bytes(b"base-owned carrier is deliberately not installed")
         base = root / "WheelhouseManifest.json"
         base.write_bytes(
             canonical.write(
@@ -103,18 +107,28 @@ def main() -> int:
                 "worker_tls_certificate_digest": "sha256:" + (b"t" * 32).hex(),
             }
         )
+        files = [
+            pb.LocalDownloadFile(
+                digest=digest,
+                filename=wheel.name,
+                kind=pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
+                length=wheel.stat().st_size,
+                path=str(local_wheel),
+            ),
+            pb.LocalDownloadFile(
+                digest=hashlib.sha256(redundant.read_bytes()).digest(),
+                filename=redundant.name,
+                kind=pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+                length=redundant.stat().st_size,
+                path=str(redundant),
+            ),
+        ]
+        files.sort(key=lambda row: row.digest)
+        verified: list[str] = []
         request = pb.PreparePackageSetRequest(
             download_delegation=delegation,
             environment_root=str(root / "environments"),
-            files=[
-                pb.LocalDownloadFile(
-                    digest=digest,
-                    filename=wheel.name,
-                    kind=pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-                    length=wheel.stat().st_size,
-                    path=str(local_wheel),
-                )
-            ],
+            files=files,
         )
 
         def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
@@ -133,13 +147,15 @@ def main() -> int:
             environment_root=root / "environments",
             python=Path(sys.executable),
             describe=describe,
-            verified=lambda _digest, _length, _path: None,
+            verified=lambda digest, _length, _path: verified.append(digest),
             base_manifest=base,
         )
         value = documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)
         placement = value["placements"][0]
         assert placement["package"]["release_digest"] == release_digest
         assert placement["models"] == []
+        assert placement["environment"]["wheels"] == []
+        assert len(verified) == 2
         assert [row["name"] for row in placement["entrypoints"]] == ["marco"]
         assert placement["entrypoints"][0]["slots"] == []
         assert result.placement_set.placement_set_digest == documents.digest_of(

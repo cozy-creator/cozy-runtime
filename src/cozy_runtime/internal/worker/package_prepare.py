@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
 from cozy_runtime.internal import canonical, descriptor, overlay, placement_materialization
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents
@@ -97,6 +99,20 @@ def prepare_package_set(
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
         parents.add(path.parent)
         owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
+        if owner == "custom":
+            try:
+                distribution, _version, _build, _tags = parse_wheel_filename(row.filename)
+            except InvalidWheelFilename as exc:
+                raise PreparationRefusal(
+                    "package_prepare_file_invalid", row.filename
+                ) from exc
+            if _DISTRIBUTION.sub("-", str(distribution)).lower() in base.distribution_versions:
+                # A release is portable across CPU/CUDA bases with different ambient
+                # inventories. Never overlay or shadow an image-owned distribution;
+                # materialize() checks the project requirement against the actual base
+                # version after these redundant carrier bytes are omitted.
+                verified(documents.spell(bytes(row.digest)), row.length, path)
+                continue
         try:
             wheel, receipt = overlay.measure_wheel(path, owner, base)
         except overlay.OverlayRefusal as exc:
