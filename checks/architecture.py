@@ -721,17 +721,10 @@ def fence_base_ownership_vectors() -> list[str]:
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
     mirror_specs = (
         (
-            "base-worker-image-wheelhouse-cpu.json",
-            24_653,
-            "sha256:0618d4ad492648320b8c79ed087ef3bfd252a918b80326789f104c4ef1614eed",
-            (26, 323, 25),
-            ("none", "none"),
-        ),
-        (
             "base-worker-image-wheelhouse-cu130.json",
-            25_305,
-            "sha256:73738b08458a6c83cae1b97a9675f775d27b616e08a7d034b85a481e63b1b2da",
-            (86, 363, 9),
+            25_538,
+            "sha256:29bb3d46c3a2370c1055042ef5c1c77a073a21a351cf853e3086b4cc4cdfc585",
+            (86, 363, 10),
             ("cuda", "cu130"),
         ),
     )
@@ -762,7 +755,7 @@ def fence_base_ownership_vectors() -> list[str]:
         target = dict(manifest.platform_target)
         expected_target = {
             "os_arch": "linux/amd64",
-            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
+            "libc": "glibc2.39",
             "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],
@@ -771,6 +764,12 @@ def fence_base_ownership_vectors() -> list[str]:
             bad.append(f"{cross}: platform target is {target}, want {expected_target}")
         versions = manifest.distribution_versions
         expected_wheels = {
+            "click": (
+                "8.5.0",
+                "click-8.5.0-py3-none-any.whl",
+                "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+                125_251,
+            ),
             "cozy-runtime": (
                 "0.0.11",
                 "cozy_runtime-0.0.11-py3-none-any.whl",
