@@ -296,6 +296,8 @@ def control_runtime_digest(
 
     if manifest is None:
         manifest = baked_base_manifest(manifest_path)
+    if manifest.ownership != "image":
+        raise LaunchRefusal("control_runtime_manifest_ownership_invalid", manifest.ownership)
     matches = [wheel.digest for wheel in manifest.wheels if wheel.distribution == "cozy-runtime"]
     if len(matches) != 1:
         raise LaunchRefusal(

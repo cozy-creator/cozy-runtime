@@ -684,6 +684,8 @@ def fence_base_ownership_vectors() -> list[str]:
 
     sys.path.insert(0, str(ROOT / "src"))
     from cozy_runtime.internal import canonical, overlay
+    from cozy_runtime.internal.placement_materialization import control_runtime_digest
+    from cozy_runtime.internal.refusal import LaunchRefusal
 
     bad: list[str] = []
     path = ROOT / "vectors" / "base-ownership.jsonl"
@@ -709,13 +711,27 @@ def fence_base_ownership_vectors() -> list[str]:
         raw = canonical.write(document)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         try:
-            overlay.parse_base_manifest(raw, digest)
+            manifest = overlay.parse_base_manifest(raw, digest)
             got = "ok"
         except overlay.OverlayRefusal as exc:
             got = exc.code
         if got != expected:
             bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
-    wanted = {"minimal-complete-v1", "unknown-format-refused", "unknown-provider-refused"}
+        if name == "observed-local-v1" and got == "ok":
+            try:
+                control_runtime_digest(manifest=manifest)
+            except LaunchRefusal as exc:
+                if exc.code != "control_runtime_manifest_ownership_invalid":
+                    bad.append(f"{path}:{line_number}: pod refusal was {exc.code}")
+            else:
+                bad.append(f"{path}:{line_number}: pod accepted an observed-local base")
+    wanted = {
+        "minimal-complete-v1",
+        "observed-local-v1",
+        "observed-local-wheel-refused",
+        "unknown-format-refused",
+        "unknown-provider-refused",
+    }
     if names != wanted:
         bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
