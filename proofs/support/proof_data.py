@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import base64
-import csv
 import hashlib
-import importlib.metadata
-import io
 import json
 import re
-import stat
-import sys
 import zipfile
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any
 
 _IMPORT_ROOT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -68,84 +62,8 @@ def wheel(entry: Wheel, *, import_roots: bool = False) -> dict[str, Any]:
     return row
 
 
-def installed_base_ownership() -> tuple[list[dict[str, str]], list[dict[str, object]]]:
-    """Measure the proof driver's complete installed distribution/import-root ownership."""
-
-    versions: dict[str, str] = {}
-    for installed in importlib.metadata.distributions():
-        name = normalize_distribution(str(installed.metadata["Name"] or ""))
-        version = str(installed.version)
-        if not name or not version or name in versions:
-            raise ProofFailure(f"installed distribution inventory is ambiguous: {name!r}")
-        versions[name] = version
-    providers: dict[str, set[str]] = {}
-    for root, names in importlib.metadata.packages_distributions().items():
-        if _IMPORT_ROOT_RE.fullmatch(root) is None:
-            continue
-        normalized = {normalize_distribution(name) for name in names}
-        if not normalized or not normalized.issubset(versions):
-            raise ProofFailure(f"installed import root has unknown providers: {root!r}")
-        providers.setdefault(root, set()).update(normalized)
-    for root in sys.stdlib_module_names:
-        if _IMPORT_ROOT_RE.fullmatch(root) is not None:
-            providers.setdefault(root, set()).add("python-stdlib")
-    distributions = [
-        {"distribution": name, "version": version} for name, version in sorted(versions.items())
-    ]
-    roots: list[dict[str, object]] = [
-        {"providers": sorted(names), "root": root} for root, names in sorted(providers.items())
-    ]
-    return distributions, roots
-
-
 def normalize_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", value).lower()
-
-
-def pack_installed(root: Path, distribution: str) -> Path:
-    """Repack one installed proof distribution into deterministic exact wheel bytes."""
-
-    installed = importlib.metadata.distribution(distribution)
-    files: dict[str, bytes] = {}
-    record = ""
-    for member in installed.files or ():
-        name = PurePosixPath(str(member)).as_posix()
-        if ".." in PurePosixPath(name).parts or name.endswith(
-            ("/INSTALLER", "/RECORD", "/REQUESTED", "/direct_url.json", "/uv_cache.json")
-        ):
-            continue
-        path = cast(Path, installed.locate_file(member))
-        if path.is_file():
-            files[name] = path.read_bytes()
-        if name.endswith(".dist-info/METADATA"):
-            record = str(PurePosixPath(name).parent / "RECORD")
-    require(
-        bool(record and files), f"installed distribution has no wheel inventory: {distribution}"
-    )
-    rows = [[name, _record_hash(raw), str(len(raw))] for name, raw in sorted(files.items())]
-    rows.append([record, "", ""])
-    rendered = io.StringIO(newline="")
-    csv.writer(rendered, lineterminator="\n").writerows(rows)
-    files[record] = rendered.getvalue().encode()
-    wheel_meta = next(raw for name, raw in files.items() if name.endswith(".dist-info/WHEEL"))
-    tags = BytesParser().parsebytes(wheel_meta).get_all("Tag") or []
-    require(bool(tags), f"installed distribution has no wheel tag: {distribution}")
-    normalized = str(installed.metadata["Name"]).replace("-", "_")
-    path = root / f"{normalized}-{installed.version}-{tags[0]}.whl"
-    with zipfile.ZipFile(
-        path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-    ) as wheel_file:
-        for name, raw in sorted(files.items()):
-            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (stat.S_IFREG | 0o644) << 16
-            wheel_file.writestr(info, raw)
-    return path
-
-
-def _record_hash(raw: bytes) -> str:
-    encoded = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
-    return "sha256=" + encoded
 
 
 def _wheel_import_roots(names: list[str]) -> tuple[str, ...]:
