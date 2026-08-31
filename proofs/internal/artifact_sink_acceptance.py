@@ -131,8 +131,9 @@ def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSin
         "derived": ArtifactTarget(
             source="full",
             source_component="unet",
+            drop=(SOURCE_KEY,),
             add={
-                "window": ArtifactTensor(
+                SOURCE_KEY: ArtifactTensor(
                     logical_dtype="bf16",
                     shape=(32, 32),
                     encoding=PLAIN,
@@ -141,7 +142,10 @@ def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSin
             },
         )
     }
-    order = (*(("derived", key) for key in SOURCE_KEYS), ("derived", "window"))
+    order = (
+        *(("derived", key) for key in SOURCE_KEYS if key != SOURCE_KEY),
+        ("derived", SOURCE_KEY),
+    )
     with artifacts.open(
         "model", sources={"full": model}, targets=targets, order=order
     ) as transaction:
@@ -160,7 +164,7 @@ def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSin
         )
         raw = bytes(writable)
         digest = hashlib.sha256(raw).hexdigest()
-        transaction.add_part("derived", "window", "value", raw)
+        transaction.add_part("derived", SOURCE_KEY, "value", raw)
         receipt = transaction.commit()
         return ReadResult(receipt.artifact_transaction_id, digest)
 
