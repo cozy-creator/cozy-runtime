@@ -228,8 +228,19 @@ class _Inspected:
     native_members: tuple[str, ...]
 
 
-def measure_wheel(path: Path, owner: str, base: BaseManifest) -> tuple[Wheel, VerifiedFile]:
-    """Derive one local wheel fact, then run the ordinary full wheel inspection once."""
+def measure_wheel(
+    path: Path,
+    owner: str,
+    base: BaseManifest,
+    *,
+    allow_native_custom: bool = False,
+) -> tuple[Wheel, VerifiedFile]:
+    """Derive one local wheel fact, then run the ordinary full wheel inspection once.
+
+    Native custom wheels stay closed by default. The same-user local preparation command
+    opts in because installing a package already authorizes its Python code to execute with
+    that user's authority; the pod worker never opts in.
+    """
 
     if owner not in {"project", "custom"} or not path.is_absolute():
         raise OverlayRefusal("overlay_wheel_invalid", str(path))
@@ -252,7 +263,7 @@ def measure_wheel(path: Path, owner: str, base: BaseManifest) -> tuple[Wheel, Ve
         owner=owner,
         import_roots=tuple(sorted(roots)),
     )
-    inspected = _inspect(wheel, path, base)
+    inspected = _inspect(wheel, path, base, allow_native_custom=allow_native_custom)
     return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
 
 
@@ -274,12 +285,16 @@ def materialize(
     python: Path = Path(sys.executable),
     base_manifest: Path = DEFAULT_BASE_MANIFEST,
     expected_receipt_digest: str = "",
+    allow_native_custom: bool = False,
 ) -> InstalledOverlay:
     """Verify and atomically publish package content plus a placement receipt.
 
     Installed bytes are keyed only by the base family and sorted wheel digests.  The
     environment spec remains in the small placement receipt, so two specs with identical
     wheels join the same compiled content without weakening the receipt join.
+
+    ``allow_native_custom`` belongs to the local same-user lane. Its default is the rented-pod
+    boundary, where native dependency wheels require separate hardware-class proof.
     """
 
     _require_digest(source.environment_digest, "environment_digest")
@@ -314,7 +329,16 @@ def materialize(
             python=python,
         )
     reused = final.exists()
-    inspected = None if reused else _verify_grants(source, wheels, base)
+    inspected = (
+        None
+        if reused
+        else _verify_grants(
+            source,
+            wheels,
+            base,
+            allow_native_custom=allow_native_custom,
+        )
+    )
     _require_owned_root(root)
     _remove_dead_staging(root)
     contents.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -802,7 +826,11 @@ def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
 
 
 def _verify_grants(
-    source: Input, wheels: Sequence[Wheel], base: BaseManifest
+    source: Input,
+    wheels: Sequence[Wheel],
+    base: BaseManifest,
+    *,
+    allow_native_custom: bool,
 ) -> tuple[_Inspected, ...]:
     grants = {grant.digest: grant for grant in source.grants}
     expected = {wheel.digest for wheel in wheels}
@@ -834,7 +862,14 @@ def _verify_grants(
                 raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
         elif verified.digest != wheel.digest:
             raise OverlayRefusal("overlay_wheel_digest_mismatch", wheel.digest)
-        inspected.append(_inspect(wheel, grant.path, base))
+        inspected.append(
+            _inspect(
+                wheel,
+                grant.path,
+                base,
+                allow_native_custom=allow_native_custom,
+            )
+        )
     root_owners: dict[str, str] = {}
     for item in inspected:
         for root in item.import_roots:
@@ -849,7 +884,13 @@ def _verify_grants(
     return tuple(inspected)
 
 
-def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
+def _inspect(
+    wheel: Wheel,
+    path: Path,
+    base: BaseManifest,
+    *,
+    allow_native_custom: bool = False,
+) -> _Inspected:
     try:
         filename_name, filename_version, _build, filename_tags = parse_wheel_filename(
             wheel.filename
@@ -956,7 +997,11 @@ def _inspect(wheel: Wheel, path: Path, base: BaseManifest) -> _Inspected:
                     "overlay_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
-            if wheel.owner == "custom" and native_members:
+            if (
+                wheel.owner == "custom"
+                and native_members
+                and (not allow_native_custom or base.ownership != "observed-local")
+            ):
                 raise OverlayRefusal(
                     "overlay_custom_wheel_native_unsupported",
                     f"{wheel.filename}: custom native wheels are not admitted yet",

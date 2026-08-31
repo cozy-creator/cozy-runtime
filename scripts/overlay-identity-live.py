@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -142,6 +143,42 @@ def base_manifest(path: Path) -> str:
                     "version": "1.0.0",
                 }
             ],
+        }
+    )
+    path.write_bytes(raw)
+    path.chmod(0o444)
+    return digest(raw)
+
+
+def local_base_manifest(path: Path) -> str:
+    raw = canonical.write(
+        {
+            "base_distributions": [
+                {"distribution": "base-control", "version": "1.0.0"},
+                {"distribution": "numpy", "version": "2.0.0"},
+            ],
+            "base_import_roots": [
+                {"providers": ["base-control"], "root": "base_control"},
+                {"providers": ["numpy"], "root": "numpy"},
+            ],
+            "compatibility_profile": {
+                "accelerator_build": "cpu",
+                "os_cpu": "linux-x86",
+                "python_abi": "cp312",
+                "torch_release": "none",
+            },
+            "format": "WheelhouseManifest/1",
+            "minimum_cuda_version": "none",
+            "minimum_driver_version": "none",
+            "ownership": "observed-local",
+            "platform_target": {
+                "accelerator_abi": "none",
+                "accelerator_backend": "none",
+                "libc": "glibc2.39",
+                "os_arch": "linux/amd64",
+                "python_abi": "cp312",
+            },
+            "wheels": [],
         }
     )
     path.write_bytes(raw)
@@ -409,6 +446,31 @@ def main() -> int:
         else:
             raise AssertionError("custom native wheel was admitted")
 
+        try:
+            overlay.materialize(
+                source("native-custom-image-opt-in", family, project, native_custom),
+                root / "native-custom-image-opt-in",
+                base_manifest=manifest,
+                allow_native_custom=True,
+            )
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "overlay_custom_wheel_native_unsupported", exc.code
+        else:
+            raise AssertionError("image-owned base admitted a custom native wheel")
+
+        local_manifest = root / "LocalBaseManifest.json"
+        local_family = local_base_manifest(local_manifest)
+        native_local = overlay.materialize(
+            source("native-custom-local", local_family, project, native_custom),
+            root / "native-custom-local",
+            base_manifest=local_manifest,
+            allow_native_custom=True,
+        )
+        library = ctypes.CDLL(str(native_local.import_root / "proof_native_custom" / "_native.so"))
+        library.proof_add.argtypes = (ctypes.c_int, ctypes.c_int)
+        library.proof_add.restype = ctypes.c_int
+        assert library.proof_add(20, 22) == 42
+
         false_marker = build_wheel(
             wheels,
             "proof-false-marker",
@@ -558,6 +620,8 @@ def main() -> int:
                     "jit_cache_warm_reuse_within_pod": True,
                     "jit_cache_defaults_never_used": True,
                     "custom_native_wheel_refused": True,
+                    "custom_native_wheel_image_opt_in_refused": True,
+                    "custom_native_wheel_local_loaded": True,
                     "mutable_local_base_refused": True,
                     "source_path_injection_erased": True,
                     "killed_materialization_retry_atomic": True,

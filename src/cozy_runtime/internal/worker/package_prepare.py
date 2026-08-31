@@ -118,8 +118,13 @@ def prepare_package(
     models: Sequence[Any] = (),
     artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
+    allow_native_custom: bool = False,
 ) -> pb.PreparePackageSetResult:
-    """Inspect, install, import, and describe one exact package."""
+    """Inspect, install, import, and describe one exact package.
+
+    The pod session uses the closed default. Creator's private same-user command alone opts
+    into native dependency wheels after the same digest, tag, RECORD, and collision checks.
+    """
 
     try:
         documents.raw(release_digest)
@@ -181,7 +186,12 @@ def prepare_package(
                 verified(digest, row.length, path)
                 continue
         try:
-            wheel, receipt = overlay.measure_wheel(path, owner, base)
+            wheel, receipt = overlay.measure_wheel(
+                path,
+                owner,
+                base,
+                allow_native_custom=allow_native_custom,
+            )
         except overlay.OverlayRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
         if wheel.digest != digest or wheel.length != row.length:
@@ -229,6 +239,7 @@ def prepare_package(
             environment_root,
             python=python,
             base_manifest=base_manifest,
+            allow_native_custom=allow_native_custom,
         )
     except (overlay.OverlayRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_prepare_overlay_failed")
