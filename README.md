@@ -167,7 +167,8 @@ package code rather than merely unused.
 **Anima's CUDA optimization is an exact post-fill plan.** Runtime recognizes only
 `anima:AnimaModel` with Diffusers `0.40.0` and the exact Anima Base 1.0 Cosmos config. After
 TensorFS has filled the ordinary module tree, it installs fused RMSNorm + split-half RoPE,
-`addcmul` residuals, native RMSNorm and a latent-sized zero padding mask. The installation
+direct split-half RoPE matrix production, `addcmul` residuals, native RMSNorm and a
+latent-sized zero padding mask. The installation
 compares state-dict topology and every parameter/buffer storage address before and after;
 its source/dependency digest enters constructed-generation identity. Any source, class or
 config drift refuses typed.

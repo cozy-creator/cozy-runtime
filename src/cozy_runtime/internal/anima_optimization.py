@@ -43,6 +43,7 @@ _SOURCE_DIGESTS = {
 _IDENTITY_DOCUMENT = {
     "diffusers": DIFFUSERS_VERSION,
     "comfy-kitchen": COMFY_KITCHEN_VERSION,
+    "plan": "direct-split-half-rope-matrix",
     "sources": _SOURCE_DIGESTS,
 }
 OPTIMIZATION_ID = (
@@ -164,9 +165,16 @@ class _RopeMatrix:
     def clear(self) -> None:
         self.value = None
 
-    def get(self, rotary: object) -> Any:
+    def get(self, rotary: Any) -> Any:
         if self.value is not None:
             return self.value
+        if hasattr(rotary, "shape"):
+            if rotary.ndim != 6 or tuple(rotary.shape[-3:]) != (64, 2, 2):
+                raise _refuse(
+                    "anima_optimization_rope_layout",
+                    f"direct Cosmos rotary matrix has unsupported shape {tuple(rotary.shape)}",
+                )
+            return rotary
         if not isinstance(rotary, tuple) or len(rotary) != 2:
             raise _refuse(
                 "anima_optimization_rope_layout",
@@ -188,6 +196,44 @@ class _RopeMatrix:
             1, 1, cos.shape[0], half, 2, 2
         )
         return self.value
+
+
+def _direct_rope_forward(rope: Any, hidden_states: Any, fps: int | None = None) -> Any:
+    """Produce comfy-kitchen's split-half matrix without duplicated cosine/sine tensors."""
+    import torch
+
+    _, _, frames, height, width = hidden_states.shape
+    sizes = [
+        frames // rope.patch_size[0],
+        height // rope.patch_size[1],
+        width // rope.patch_size[2],
+    ]
+    device = hidden_states.device
+    seq = torch.arange(max(rope.max_size), device=device, dtype=torch.float32)
+    dim_h = (
+        torch.arange(0, rope.dim_h, 2, device=device, dtype=torch.float32)[: rope.dim_h // 2]
+        / rope.dim_h
+    )
+    dim_w = (
+        torch.arange(0, rope.dim_w, 2, device=device, dtype=torch.float32)[: rope.dim_w // 2]
+        / rope.dim_w
+    )
+    dim_t = (
+        torch.arange(0, rope.dim_t, 2, device=device, dtype=torch.float32)[: rope.dim_t // 2]
+        / rope.dim_t
+    )
+    freq_h = 1.0 / ((10000.0 * rope.h_ntk_factor) ** dim_h)
+    freq_w = 1.0 / ((10000.0 * rope.w_ntk_factor) ** dim_w)
+    freq_t = 1.0 / ((10000.0 * rope.t_ntk_factor) ** dim_t)
+    emb_h = torch.outer(seq[: sizes[1]], freq_h)[None, :, None, :].repeat(sizes[0], 1, sizes[2], 1)
+    emb_w = torch.outer(seq[: sizes[2]], freq_w)[None, None, :, :].repeat(sizes[0], sizes[1], 1, 1)
+    time = seq[: sizes[0]] if fps is None else seq[: sizes[0]] / fps * rope.base_fps
+    emb_t = torch.outer(time, freq_t)[:, None, None, :].repeat(1, sizes[1], sizes[2], 1)
+    phase = torch.cat((emb_t, emb_h, emb_w), dim=-1).flatten(0, 2).float()
+    cos, sin = torch.cos(phase), torch.sin(phase)
+    return torch.stack((cos, -sin, sin, cos), dim=-1).reshape(
+        1, 1, phase.shape[0], phase.shape[1], 2, 2
+    )
 
 
 class _FusedSelfAttention:
@@ -376,6 +422,7 @@ def _install_transformer_plan(transformer: Any, *, kitchen: Any, torch: Any) -> 
         norm.forward = MethodType(_native_rms_forward, norm)
     for block in blocks:
         _install_block_plan(block, kitchen=kitchen, torch=torch, rope=rope)
+    transformer.rope.forward = MethodType(_direct_rope_forward, transformer.rope)
 
     original_forward = transformer.forward
 
@@ -477,5 +524,6 @@ def apply_anima_execution_plan(
             "addcmul_residuals",
             "latent_sized_zero_padding_mask",
             "native_rms_norm",
+            "direct_split_half_rope_matrix",
         ),
     )

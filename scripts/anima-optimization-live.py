@@ -30,6 +30,7 @@ from cozy_runtime.internal.anima_optimization import (
     DIFFUSERS_VERSION,
     OPTIMIZATION_ID,
     AnimaOptimizationRefusal,
+    _direct_rope_forward,
     _install_block_plan,
     _install_transformer_plan,
     _native_rms_forward,
@@ -88,6 +89,17 @@ def main() -> None:
     assert exact_before == _tensor_census(exact), "full transformer topology changed"
 
     torch.manual_seed(11)
+    rope = CosmosRotaryPosEmbed(
+        128,
+        max_size=(128, 240, 240),
+        patch_size=(1, 2, 2),
+        rope_scale=(1.0, 4.0, 4.0),
+    ).to("cuda")
+    latent = torch.empty(1, 17, 1, 128, 128, device="cuda", dtype=torch.bfloat16)
+    eager_rotary = rope(latent)
+    direct_rotary = _direct_rope_forward(rope, latent)
+    assert torch.equal(_RopeMatrix(torch).get(eager_rotary), direct_rotary)
+
     final_norm = RMSNorm(2048, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
     norm_input = torch.randn(1, 4096, 2048, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
@@ -145,6 +157,7 @@ def main() -> None:
     print(f"identity: {OPTIMIZATION_ID}")
     print("config refusal: PASS")
     print("full 28-block topology: PASS")
+    print("direct split-half RoPE matrix: PASS")
     print("topology and storage pointers: PASS")
     print("optimized determinism: PASS")
     print("latent-sized zero mask: PASS")
