@@ -264,6 +264,10 @@ class Executor:
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config
         from cozy_runtime.author._model import component_use
+        from cozy_runtime.internal.anima_optimization import (
+            AnimaOptimizationRefusal,
+            apply_anima_execution_plan,
+        )
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import (
@@ -595,6 +599,22 @@ class Executor:
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in names}
             )
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
+            optimization = apply_anima_execution_plan(
+                model,
+                application=str(binding["application"]),
+                model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
+            )
+        except AnimaOptimizationRefusal as exc:
+            backend.poison(())
+            self.poisoned = f"execution plan refused: {exc.code}"
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": str(exc)[:900],
+                "state": backend.state,
+                "envelope": envelope,
+                "poison": backend.poison_report,
+            }
         except Exception as exc:
             # The two failures this path owns, and nothing else: a typed fill refusal, or
             # the backend's own OOM — which is asked of the accelerator boundary rather
@@ -695,6 +715,7 @@ class Executor:
                 "config_digest": record.config_digest,
                 # THE APPLIED CEILING — derived or declared — never the wire's absent 0 (cl-027).
                 "resident_budget_bytes": resident_budget,
+                "execution_optimization": optimization.document() if optimization else None,
             }
         )
         self.constructed_model_digest = (
@@ -759,6 +780,7 @@ class Executor:
             # a plan that resolved three routes prices as what it COSTS and reports
             # `mixed(...)` as what it IS.
             "delivery": plan.wire_document(),
+            "execution_optimization": optimization.document() if optimization else None,
         }
         return {
             "ok": True,

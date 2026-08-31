@@ -142,6 +142,11 @@ corpus = ["torch>=2.13,<3", "diffusers>=0.36", "transformers>=4.40,<5"]
 media = [
     "av>=18.1,<19",
 ]
+# Exact post-fill Anima/Cosmos kernel plan. Base worker images opt into this only on their
+# NVIDIA CUDA profile; CPU/MPS/Windows Runtime wheels remain free of a Linux CUDA extension.
+anima-cuda = [
+    "comfy-kitchen==0.2.31; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.
