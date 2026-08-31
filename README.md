@@ -11,7 +11,7 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
-Runtime release `0.0.12` targets standard CPython 3.12 only. Project
+Runtime release `0.0.13` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 
 Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1

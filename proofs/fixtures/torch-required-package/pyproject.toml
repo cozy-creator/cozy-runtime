@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "torch-required-package"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>=0.0.12,<0.1", "msgspec>=0.19", "torch>=2.13,<3"]
+dependencies = ["cozy-runtime>=0.0.13,<0.1", "msgspec>=0.19", "torch>=2.13,<3"]
 
 [project.entry-points."cozy.application"]
 default = "torch_required_package:app"
