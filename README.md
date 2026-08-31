@@ -164,6 +164,22 @@ host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cac
 mapping. The `package-owns-no-residency` fence proves the vocabulary is unreachable from
 package code rather than merely unused.
 
+**Anima's CUDA optimization is an exact post-fill plan.** Runtime recognizes only
+`anima:AnimaModel` with Diffusers `0.40.0` and the exact Anima Base 1.0 Cosmos config. After
+TensorFS has filled the ordinary module tree, it installs fused RMSNorm + split-half RoPE,
+`addcmul` residuals, native RMSNorm and a latent-sized zero padding mask. The installation
+compares state-dict topology and every parameter/buffer storage address before and after;
+its source/dependency digest enters constructed-generation identity. Any source, class or
+config drift refuses typed.
+
+The NVIDIA CUDA base worker image must install `cozy-runtime[anima-cuda]`, which currently
+means the exact `comfy-kitchen==0.2.31` CPython-3.12 ABI3 wheel
+`sha256:d7c2522e6a6cde7a7303e30d739c05989cf4b0a246684e496a129b950055d35f`.
+CPU, MPS and Windows profiles do not install that extra. A candidate CUDA image runs
+`python scripts/anima-optimization-live.py`; the proof compares eager and optimized real
+CUDA blocks at Anima's native token width, checks determinism and storage identity, and
+measures the block speedup.
+
 **The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
 coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming
 `measured` without a source refuses. An uncalibrated coefficient may DEEPEN placement —
