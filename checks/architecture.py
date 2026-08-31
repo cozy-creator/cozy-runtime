@@ -739,14 +739,14 @@ def fence_base_ownership_vectors() -> list[str]:
         (
             "base-worker-image-wheelhouse-cpu.json",
             24_968,
-            "sha256:84108430ba9dd2b23892034006aa5fb916af91ec14d7e2e1a13d30b29a1df8be",
+            "sha256:b7ddfe9f9771be6c6582835649c199422d76f12fe69b69f1578ad88e7311f1b6",
             (27, 324, 26),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
             25_538,
-            "sha256:29bb3d46c3a2370c1055042ef5c1c77a073a21a351cf853e3086b4cc4cdfc585",
+            "sha256:c7d164b63b22a63b865d414f59d0893d5e05f45cb354f82c94628324735f35b1",
             (86, 363, 10),
             ("cuda", "cu130"),
         ),
@@ -794,16 +794,16 @@ def fence_base_ownership_vectors() -> list[str]:
                 125_251,
             ),
             "cozy-runtime": (
-                "0.0.11",
-                "cozy_runtime-0.0.11-py3-none-any.whl",
-                "sha256:9ad5642698d4879d4982152c5f88d0599a2b2c2f418f20c38bbb7d7fc5760334",
-                705_603,
+                "0.0.14",
+                "cozy_runtime-0.0.14-py3-none-any.whl",
+                "sha256:76b9756b06fb280b7942447c77334a138074ba32bdf2a26c3c583930c9befd05",
+                729_507,
             ),
             "tensorfs": (
-                "0.0.3",
-                "tensorfs-0.0.3-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-                "sha256:55db3ee75eda51e77ef9c821d5a7b62294036b67c893bccb1bab910b783f9269",
-                2_092_918,
+                "0.0.5",
+                "tensorfs-0.0.5-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                "sha256:a131c4688188dacd1518fbe93c417e64d6af575f65b52edac48bcb60f88d43a5",
+                2_337_278,
             ),
         }
         wheels = {wheel.distribution: wheel for wheel in manifest.wheels}
