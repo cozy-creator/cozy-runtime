@@ -517,7 +517,7 @@ an ordinary dependency (and registers its own construction adapter);
 `proofs/fixtures/tiny-models/package.toml` are the RUNTIME's side — resolved artifacts and default
 bindings. Author code never names an artifact identifier; a fence proves it.
 
-`run` · `serve` · `job` · `pull` · `ingest` · `list` · `rm` · `doctor` · `fit` land in
+`run` · `serve` · `job` · `ingest` · `doctor` · `fit` land in
 cr-016 over the real attempt kernel.
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:

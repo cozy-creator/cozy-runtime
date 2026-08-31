@@ -135,23 +135,6 @@ def binding_record(**overrides: Any) -> dict[str, Any]:
     return record
 
 
-def install_row(home: Path) -> None:
-    """The artifact index row the record's ref resolves against (#567e): a binding names a
-    REF and the machine that serves says what it means on ITS disk."""
-    from cozy_runtime.internal import artifacts
-
-    artifacts.install(
-        home,
-        artifacts.Artifact(
-            ref=RELEASE,
-            store=str(STORE),
-            config=str(CONFIG),
-            snapshots=dict(sorted(snapshots().items())),
-            vram_floor_bytes=1 * GIB,
-        ),
-    )
-
-
 def section_fixtures(args: argparse.Namespace) -> None:
     """Build what the other sections read: the pipeline config and the bundled tokenizers.
 
@@ -234,7 +217,6 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(spec["workspace"])
     home = workspace / "home"
     home.mkdir(parents=True, exist_ok=True)
-    install_row(home)
     # The runtime reads the environment ONCE, here, and everything not erased becomes the
     # device child's base env. The throttle has to be in this dict or it stops at the
     # worker — and the worker does not read weights, the executor does.

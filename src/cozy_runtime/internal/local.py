@@ -673,8 +673,8 @@ class LocalRecordOwner:
     def scratch_model(self) -> str:
         """The opaque scratch model a job's publishes are rewritten into.
 
-        The underscore is deliberately outside the public model grammar (`artifacts.REF`
-        admits `[a-zA-Z0-9]` first), so no user ref can ever squat a job's scratch. Promotion
+        The underscore is deliberately outside the public model-name grammar, so no user ref
+        can ever squat a job's scratch. Promotion
         OUT of scratch is an explicit later act under the caller's own credentials; a verdict
         stamps metadata and never gates persistence — a failed run's writes still land. The
         wire request id is hashed because a model name is authority, not identity.

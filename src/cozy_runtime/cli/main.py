@@ -1,7 +1,6 @@
 """The `cozy-runtime` entrypoint: the ONE config authority, flag parsing, verb dispatch.
 
-No interactive prompt exists anywhere — anything that would ask is a flag, and a
-destructive act without `--yes` is a typed refusal (exit 7), never a question.
+No interactive prompt exists anywhere; anything that would ask is a flag.
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli import fit as fit_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import new as new_verb
-from cozy_runtime.cli import pull as pull_verb
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
@@ -28,19 +26,14 @@ BUILT = (
     "bindings",
     "doctor",
     "fit",
-    "list",
-    "rm",
     "new",
-    "pull",
     "version",
 )
 PRIVATE = ("development-placement",)
 #: `ingest` PARSES and refuses typed: it is a thin invocation of TensorFS's one INGEST
 #: implementation — the carrier decode, classification and semantic converters — and that
 #: half of the border is not a dependency of this build yet (tfs-003). It is a verb, not an
-#: unknown word, and the refusal names the owner. `pull` is BUILT: the fetch half landed
-#: with tfs-003 row 220, and it invokes TensorFS's `fetch_plan`/`fetch_admit` rather than
-#: carrying any transfer-to-store logic of its own.
+#: unknown word, and the refusal names the owner.
 UNAVAILABLE = ("ingest",)
 
 HELP = """cozy-runtime — everything a single package venv can do alone
@@ -53,11 +46,8 @@ verbs:
   serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
   describe [<fn>]                the PackageDescriptor, without loading weights
   bindings                       the RESOLVED binding records this project selects
-  doctor                         this host's device/driver/CAS/credential facts
+  doctor                         this host's device/driver/credential facts
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
-  pull <ref> --hub <url>         fetch a hub checkpoint into the local CAS
-  list [<ref-prefix>]            CAS-resident checkpoints, one artifact one size
-  rm <ref> … --yes               remove artifacts from the local CAS
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
@@ -73,14 +63,6 @@ run/job flags:
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --strict-keys         a local bind's unknown extra keys refuse instead of confessing
   --stream              typed deltas as NDJSON
-
-pull flags:
-  --hub <url>           the tensorhub to resolve and read from (required)
-  --lane <k=v,...>      narrow a release with several lanes
-  --store <dir>         local CAS root (default $COZY_HOME/store)
-  --as <ref>            index the pulled checkpoint under this ref
-  --timeout <dur>       a deadline for the whole pull; absent means none
-  --dry-run             the plan — what would move — without moving it
 
 serve modes (exactly one):
   --artifact-store <dir>                     serve selected published model Manifests
@@ -103,8 +85,6 @@ _OWNS_ARGS = (
     "job",
     "fit",
     "serve",
-    "rm",
-    "pull",
     "ingest",
     "development-placement",
 )
@@ -203,11 +183,9 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 "declared selection and constructs nothing, so it takes no payload",
                 Exit.usage,
             )
-        return host_verbs.bindings(config, opts)
+        return host_verbs.bindings(opts)
     if verb == "development-placement":
         return host_verbs.development_placement(config, args, opts)
-    if verb == "pull":
-        return pull_verb.run(args, opts, config)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
     if verb == "doctor":
@@ -220,23 +198,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return host_verbs.doctor(config, opts)
-    if verb == "list":
-        if len(args) > 1:
-            raise CliError(
-                "usage",
-                f"list takes at most one ref prefix, got {len(args)}",
-                "cozy-runtime list [<ref-prefix>]",
-                Exit.usage,
-            )
-        return host_verbs.list_artifacts(config, args[0] if args else "", opts)
-    if verb == "rm":
-        refs = [a for a in args if not a.startswith("-")]
-        flags = [a for a in args if a.startswith("-")]
-        if unknown := [f for f in flags if f != "--yes"]:
-            raise CliError(
-                "usage", f"unknown flag {unknown[0]!r}", "rm takes --yes only", Exit.usage
-            )
-        return host_verbs.remove(config, refs, "--yes" in flags)
     if verb in UNAVAILABLE:
         return host_verbs.unavailable(verb)
     raise CliError(

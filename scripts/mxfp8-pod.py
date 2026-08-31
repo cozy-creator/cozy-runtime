@@ -325,7 +325,6 @@ def fill_arm(arm: str) -> tuple[Any, Any, Any]:
         slots=16,
         readers=16,
         inflight=8,
-        probe_cache=ROOT / "probe",
         decode_scratch_bytes=64 * MIB,
         release="cozy/h3-block@mxfp8",
     )
@@ -496,7 +495,6 @@ def probe() -> None:
         device,
         ["bfloat16", "float32", "float16"],
         release="cozy/mxfp8-pod",
-        cache=None,
     )
     by_dtype = {o["output_dtype"]: o["evidence"] for o in evidence["observations"]}
     print(f"  device     {device.predicate} ({device.name}, driver cuda {device.driver})")

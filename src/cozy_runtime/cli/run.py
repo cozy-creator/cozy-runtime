@@ -23,7 +23,6 @@ from typing import Any
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import artifacts
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import descriptor as desc
 from cozy_runtime.internal.canonical import Json
@@ -338,17 +337,11 @@ def _timeout(spelled: str) -> int:
     )
 
 
-def resolved_bindings(
-    config: RuntimeConfig, opts: Options
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Every declared slot's RESOLVED SELECTION, from the one resolver (cl-010's debt 7).
 
-    It prints what `package.toml` SELECTS — the ref, the lane, and which rule won — plus
-    whatever the local CAS has for it. Deliberately NOT the full binding-plan record: an
-    uninstalled artifact still has a selection, and a verb that refused `offline_miss` here
-    would be useless for the question it exists to answer ("what does this project bind?").
-    That question is the whole of the second reader cozy-creator grew, and answering it is
-    what deletes `internal/launch/bindings.go` (the deletion is cl-003's).
+    It prints what `package.toml` selects: the ref, lane and rule. Downloaded model state is
+    owned by TensorFS and the worker placement, not by a Runtime-local index.
 
     It resolves and reports; it constructs nothing, touches no device and loads no weights.
     """
@@ -403,7 +396,6 @@ def resolved_bindings(
     records: list[dict[str, Any]] = []
     for slot in sorted(slots, key=lambda s: s.path):
         chosen = resolved[slot.path]
-        installed = artifacts.find(config.cozy_home, chosen.ref)
         records.append(
             {
                 "model_binding_path": slot.path,
@@ -412,14 +404,6 @@ def resolved_bindings(
                 "ref": chosen.ref,
                 "lane": chosen.lane or "",
                 "source": chosen.source,
-                "components": list(installed.components) if installed else [],
-                "store": str(config.cozy_home) if installed else "",
-                "snapshots": dict(installed.snapshots) if installed else {},
-                "custody": installed.custody if installed else "",
-                "stamps": (
-                    {k: list(v) for k, v in sorted(installed.stamps.items())} if installed else {}
-                ),
-                "installed": installed is not None,
             }
         )
     return records, []

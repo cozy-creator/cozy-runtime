@@ -1141,7 +1141,6 @@ def dequant_lane() -> None:
         device,
         ["bfloat16", "float32", "float16"],
         release="cozy/mxfp8-native-probe",
-        cache=None,
     )
     by_dtype = {o["output_dtype"]: o["evidence"] for o in evidence["observations"]}
     print(f"  device     {device.predicate} ({device.name}, driver cuda {device.driver})")

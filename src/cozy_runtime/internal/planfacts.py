@@ -1,39 +1,8 @@
-"""#549.2 — measured envelopes, keyed by RESOLVED-PLAN DIGEST, in private SQLite rows.
+"""Process-local measured plan facts.
 
-**What this replaces, and why it was a real defect.** `DeliveryTable` keyed a measured
-envelope by `(variant, rung)`. Neither half of that key binds the thing the numbers describe:
-
-* not the SNAPSHOT BYTES — a variant is a NAME in a binding record, so re-pointing
-  `"fp8"` at a different snapshot reused the old artifact's fill wall, resident bytes and
-  deviation under the new one's name;
-* not the RUNTIME BUILD — a decode rewritten between deploys inherited the old decode's
-  timings;
-* not the PROVIDER MAP — the whole point of #517e is that one artifact has two routes with
-  opposite standings, and a rung LABEL cannot tell them apart in a mixed plan;
-* not the CONSTRUCTION CONTRACT or the CONFIG — a different topology under one variant name
-  is a different resident footprint.
-
-So a reused label reused timings from unrelated bytes. The key here is the resolved plan's
-own digest, which binds all five by construction (`resolution.py`'s `ResolvedModelPlan`
-hashes the snapshot map, the per-tensor implementation digests, the runtime identity, the
-device identity, the construction facts and the config digest).
-
-**Immutable per-run rows, and the choice is stated.** The old table was a shared JSON
-document that every writer loaded, merged and rewrote. Two concurrent prepares could silently
-drop one observation. Each run now inserts one row under a unique `(plan_digest, run_id)` key:
-
-* a run inserts ONE row. There is nothing to merge, so there is nothing to lose.
-* reading is a query and a fold. Every run's observation survives, which is also
-  what makes `samples` an honest count instead of an incremented integer nobody can audit.
-* SQLite supplies the concurrency and crash boundary; there is no hand-rolled file lock.
-
-`prune` remains the explicit operator ceiling.
-
-**Old label-keyed files are INVALID and are not migrated.** They live under a different name
-(`delivery-*.json`), nothing here reads them, and the numbers inside them cannot be
-attributed to a plan after the fact — that is precisely what they failed to record. A first
-prepare on the new key banks a fresh fact, which is the same rule #511b applies to capability
-records: measurement-minted, and a re-measure re-mints.
+Measurements remain keyed by the resolved plan digest so unrelated bytes, builds, devices,
+providers and construction contracts cannot share them. They deliberately die with the
+process: Runtime executes and measures, but it is not a durable observation store.
 """
 
 from __future__ import annotations
@@ -43,10 +12,10 @@ import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from threading import Lock
 from typing import Any
 
-from cozy_runtime.internal import cache, canonical
+from cozy_runtime.internal import canonical
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,95 +145,47 @@ def fold(plan_digest: str, runs: Iterable[RunFact]) -> PlanFact:
 
 
 class PlanFacts:
-    """The private cache: one immutable SQLite row per run.
+    """One process's immutable observations, grouped by exact plan digest."""
 
-    It is a DEVICE-and-BUILD property, like the probe cache, and it lives beside that one
-    under `cozy_home` rather than beside a checkpoint. Unlike the probe cache it retains
-    every distinct run, because two runs of one plan are two observations and both are true.
-    """
-
-    def __init__(self, root: Path | str | None) -> None:
-        self.root = Path(root) if root is not None else None
+    def __init__(self) -> None:
+        self._rows: dict[str, dict[str, RunFact]] = {}
+        self._lock = Lock()
 
     def runs(self, plan_digest: str) -> list[RunFact]:
-        if self.root is None:
-            return []
-        with cache.connect(self.root) as database:
-            rows = database.execute(
-                """
-                SELECT plan_digest, run_id, stored_bytes, resident_bytes, scratch_bytes,
-                       fill_ms, decode_ms, step_ms, reference_deviation_rel_l2, evidence, at_ns
-                FROM plan_facts WHERE plan_digest = ? ORDER BY at_ns, run_id
-                """,
-                (plan_digest,),
+        with self._lock:
+            return sorted(
+                self._rows.get(plan_digest, {}).values(),
+                key=lambda row: (row.at_ns, row.run_id),
             )
-            return [RunFact(**dict(row)) for row in rows]
 
     def get(self, plan_digest: str) -> PlanFact:
         return fold(plan_digest, self.runs(plan_digest))
 
     def digests(self) -> tuple[str, ...]:
-        """Every plan with at least one banked run, for operator/reporting views."""
+        with self._lock:
+            return tuple(sorted(self._rows))
 
-        if self.root is None:
-            return ()
-        with cache.connect(self.root) as database:
-            rows = database.execute("SELECT DISTINCT plan_digest FROM plan_facts ORDER BY 1")
-            return tuple(str(row["plan_digest"]) for row in rows)
+    def bank(self, fact: RunFact) -> None:
+        """Retain one run for this process. A duplicate run id keeps its first value."""
 
-    def bank(self, fact: RunFact) -> Path | None:
-        """Insert ONE run's observation. No merge and no rewrite.
-
-        A run id collision means the same run wrote twice, which is a caller bug rather than
-        a race, so the existing row is left alone.
-        """
-        if self.root is None:
-            return None
-        with cache.connect(self.root) as database:
-            database.execute(
-                """
-                INSERT OR IGNORE INTO plan_facts (
-                    plan_digest, run_id, stored_bytes, resident_bytes, scratch_bytes, fill_ms,
-                    decode_ms, step_ms, reference_deviation_rel_l2, evidence, at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    fact.plan_digest,
-                    fact.run_id,
-                    fact.stored_bytes,
-                    fact.resident_bytes,
-                    fact.scratch_bytes,
-                    fact.fill_ms,
-                    fact.decode_ms,
-                    fact.step_ms,
-                    fact.reference_deviation_rel_l2,
-                    fact.evidence,
-                    fact.at_ns,
-                ),
-            )
-            database.commit()
-        return self.root / cache.FILENAME
+        with self._lock:
+            self._rows.setdefault(fact.plan_digest, {}).setdefault(fact.run_id, fact)
 
     def prune(self, plan_digest: str, keep: int) -> int:
-        """Drop all but the `keep` newest runs of one plan. An operator's ceiling, never
-        automatic: a store that silently forgot its own samples would make `samples` a lie."""
-        if self.root is None:
-            return 0
-        with cache.connect(self.root) as database:
-            removed = database.execute(
-                """
-                DELETE FROM plan_facts
-                WHERE plan_digest = ? AND run_id IN (
-                    SELECT run_id FROM plan_facts
-                    WHERE plan_digest = ?
-                    ORDER BY at_ns DESC, run_id DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (plan_digest, plan_digest, max(keep, 0)),
-            ).rowcount
-            database.commit()
-        return removed
+        """Keep the newest observations for one plan in this process."""
+
+        with self._lock:
+            rows = self._rows.get(plan_digest)
+            if not rows:
+                return 0
+            ordered = sorted(rows.values(), key=lambda row: (row.at_ns, row.run_id), reverse=True)
+            retained = {row.run_id: row for row in ordered[: max(keep, 0)]}
+            removed = len(rows) - len(retained)
+            if retained:
+                self._rows[plan_digest] = retained
+            else:
+                self._rows.pop(plan_digest, None)
+            return removed
 
 
 def run_id(plan_digest: str, device_tuple: str, release: str) -> str:

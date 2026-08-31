@@ -1,18 +1,10 @@
-"""`doctor`, `list`, `rm`, `pull`, `ingest` — the host and artifact verbs.
+"""Runtime host facts, development placement, serving, and typed unavailable verbs.
 
 `doctor` reports THIS host's facts and derives no fit verdict (cozy-runtime-cli.md): device,
-driver and CUDA as tri-state facts, CAS reachability, and per-source credential presence.
+driver and CUDA as tri-state facts and per-source credential presence.
 cozy-creator renders these unmodified; nothing here is a policy read.
 
-`list`/`rm` speak checkpoint-and-lane vocabulary over the local artifact index — one
-artifact, one size, object mechanics stay in diagnostics. `rm` without `--yes` is a typed
-exit-7 refusal, never a prompt, and an absent ref is an idempotent 0 that says so.
-
-`pull`/`ingest` are the two verbs this build cannot honestly implement: both are thin
-invocations of TensorFS's ONE fetch+ingest implementation, and that border (the safetensors
-carrier decode and the semantic converters, tfs-002/tfs-003) is not in this runtime's
-dependency yet. They refuse typed and NAME the owner rather than growing a second converter
-here, which is exactly the duplication the CLI reference forbids.
+`ingest` is a typed unavailable verb until TensorFS's ingest border is a dependency.
 """
 
 from __future__ import annotations
@@ -23,7 +15,7 @@ import os
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import artifacts, hostfacts
+from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 
@@ -32,8 +24,6 @@ GIB = 1 << 30
 
 def doctor(config: RuntimeConfig, opts: Options) -> Result:
     facts = hostfacts.measure()
-    store = config.cozy_home
-    installed = artifacts.rows(config.cozy_home)
     present = config.credentials.present()
     rows: tuple[tuple[str, str], ...] = (
         ("device", f"{facts.gpu_name or facts.state('gpu_name')}"),
@@ -49,8 +39,6 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
         ("host_ram", f"{facts.host_ram_total_bytes / GIB:.1f} GiB"),
         ("vcpus", str(facts.vcpu_count)),
         ("platform", facts.platform),
-        ("cas", f"{store} ({'present' if store.is_dir() else 'absent'})"),
-        ("artifacts", f"{len(installed)} installed"),
         ("credentials", ", ".join(present) if present else "0 sources configured"),
         ("unreadable", ", ".join(facts.unreadable) if facts.unreadable else "none"),
     )
@@ -68,7 +56,6 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
             "ram_total_bytes": facts.host_ram_total_bytes,
             "vcpu_count": facts.vcpu_count,
         },
-        "cas": {"root": str(store), "present": store.is_dir(), "artifacts": len(installed)},
         "credentials": list(present),
         "unreadable": list(facts.unreadable),
     }
@@ -79,63 +66,15 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
     )
 
 
-def list_artifacts(config: RuntimeConfig, prefix: str, opts: Options) -> Result:
-    installed = artifacts.rows(config.cozy_home, prefix)
-    rows: list[tuple[str, str]] = []
-    total = 0
-    for row in installed:
-        total += row.bytes
-        rows.append(
-            (
-                row.ref,
-                f"{row.lane}  {row.bytes / GIB:.3f} GiB  {len(row.snapshots)} component"
-                f"{'s' if len(row.snapshots) != 1 else ''}  {row.custody}",
-            )
-        )
-    # Empty states are definitive and aggregates ride the listing.
-    rows.append(
-        (
-            "total",
-            f"{len(installed)} artifact{'s' if len(installed) != 1 else ''}, {total / GIB:.3f} GiB",
-        )
-    )
-    return Result(
-        rows=tuple(rows),
-        document=[row.view() for row in installed] if opts.json else None,
-        next=("cozy-runtime rm <ref> --yes — remove one from the local CAS",),
-    )
-
-
-def remove(config: RuntimeConfig, refs: list[str], yes: bool) -> Result:
-    if not refs:
-        raise CliError(
-            "usage", "rm needs at least one ref", "cozy-runtime rm <ref> … --yes", Exit.usage
-        )
-    if not yes:
-        raise CliError(
-            "confirm",
-            f"rm would remove {len(refs)} artifact(s) from the local CAS: {', '.join(refs)}",
-            "rerun with --yes; a destructive act is a typed refusal, never a prompt",
-            Exit.confirm,
-            next=(f"cozy-runtime rm {' '.join(refs)} --yes",),
-        )
-    rows: list[tuple[str, str]] = []
-    for ref in refs:
-        rows.append((ref, "removed" if artifacts.remove(config.cozy_home, ref) else "not present"))
-    return Result(rows=tuple(rows), next=("cozy-runtime list",))
-
-
 def unavailable(verb: str) -> Result:
-    """The typed refusal `pull`/`ingest` are, until TensorFS's border is a dependency."""
+    """The typed refusal `ingest` is, until TensorFS's border is a dependency."""
     raise CliError(
         "unavailable",
         f"{verb!r} invokes TensorFS's one fetch+ingest implementation, which this runtime "
         "build does not depend on yet",
         "the carrier decode, classification and semantic converters are tfs-002/tfs-003's "
-        "border; a second converter here would be the duplication the CLI reference "
-        "forbids. Artifacts already in the local CAS are usable — `cozy-runtime list`",
+        "border; a second converter here would be the duplication the CLI reference forbids",
         Exit.unavailable,
-        next=("cozy-runtime list",),
     )
 
 
@@ -431,7 +370,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     )
 
 
-def bindings(config: RuntimeConfig, opts: Options) -> Result:
+def bindings(opts: Options) -> Result:
     """`cozy-runtime bindings` — the RESOLVED binding records, from the one resolver.
 
     cl-010's finding: no runtime verb emitted the resolved record, so cozy-creator grew a
@@ -445,18 +384,13 @@ def bindings(config: RuntimeConfig, opts: Options) -> Result:
     """
     from cozy_runtime.cli import run as run_verb
 
-    records, weightless_plans = run_verb.resolved_bindings(config, opts)
+    records, weightless_plans = run_verb.resolved_bindings(opts)
     rows = tuple(
         (
             str(record["model_binding_path"]),
             f"{record['ref']}"
             + (f" lane={record['lane']}" if record["lane"] else "")
-            + f" ({record['source']}) "
-            + (
-                "installed: " + ", ".join(record["components"])
-                if record["installed"]
-                else "NOT installed"
-            ),
+            + f" ({record['source']})",
         )
         for record in records
     )

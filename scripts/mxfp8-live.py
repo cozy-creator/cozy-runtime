@@ -234,7 +234,6 @@ def probe() -> None:
         device,
         ["bfloat16", "float32", "float16"],
         release="cozy/mxfp8-live",
-        cache=None,
     )
     print(f"  device     {device.predicate} ({device.name})")
     # Keyed on the IMPLEMENTATION as well as the dtype since #517e: one digest now carries
@@ -401,7 +400,6 @@ def carrier() -> None:
         device,
         sorted({dtype_name(r.dtype) for r in rows}),
         release="cozy/mxfp8-live",
-        cache=None,
     )
     answer = servability_for_script(
         rows,
@@ -409,7 +407,6 @@ def carrier() -> None:
         providers=providers,
         capabilities=capabilities,
         device=device,
-        facts_dir=str(WORK / "plan-facts"),
         store=str(STORE),
         snapshot=snapshot,
     )
@@ -602,9 +599,7 @@ def arms() -> None:
     device = measure_device(torch)
     providers = launch_providers()
     mx = digests_of("mxfp8/1")[0]
-    capabilities, _ = qualify(
-        torch, providers, device, ["bfloat16"], release="cozy/mxfp8-live", cache=None
-    )
+    capabilities, _ = qualify(torch, providers, device, ["bfloat16"], release="cozy/mxfp8-live")
     selector = Selector(providers, capabilities, device)
     parts = (RolePart("data", "f8_e4m3fn", (64, 96), 6144), RolePart("scale", "u8", (64, 3), 192))
 
@@ -646,7 +641,6 @@ def arms() -> None:
         providers=providers,
         capabilities=capabilities,
         device=device,
-        facts_dir=str(WORK / "plan-facts"),
     )
     check(
         "the servability answer is GREEN for bytes this build serves", answer.serves, answer.line()
@@ -657,7 +651,6 @@ def arms() -> None:
         providers=providers,
         capabilities=Capabilities(),
         device=device,
-        facts_dir=str(WORK / "plan-facts"),
     )
     check(
         "a worker with NO capability record says so TYPED, before any fill",

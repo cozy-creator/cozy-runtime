@@ -147,24 +147,6 @@ def binding_record(
     }
 
 
-def install_row(offered: list[dict[str, Any]] | None = None) -> None:
-    """The artifact index row the record's ref resolves against (#567e)."""
-    from cozy_runtime.internal import artifacts
-
-    reference = next(v for v in (offered or variants()) if v["reference"])
-    HOME.mkdir(parents=True, exist_ok=True)
-    artifacts.install(
-        HOME,
-        artifacts.Artifact(
-            ref=RELEASE,
-            store=str(PLAIN_STORE),
-            config=str(Q.PIPE_CONFIG),
-            snapshots=dict(reference["snapshots"]),
-            vram_floor_bytes=1 * GIB,
-        ),
-    )
-
-
 def survey() -> None:
     head("variants — what each artifact's HEADER demands, and what plan that resolves to")
 
@@ -192,7 +174,6 @@ def survey() -> None:
             providers=context["providers"],
             capabilities=context["capabilities"],
             device=device,
-            facts_dir=str(HOME / "probe"),
         )
         routes, refusal = answer.routes, answer.refusal
         labels[name] = route_label(routes)
@@ -275,7 +256,6 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
     spec = json.loads(spec_path.read_text())
     workspace = Path(spec["workspace"])
     HOME.mkdir(parents=True, exist_ok=True)
-    install_row(spec["binding"].get("variants"))
     config = read_config(
         {
             "PATH": os.environ["PATH"],
@@ -350,13 +330,17 @@ def exec_conform(spec_path: Path, out_path: Path) -> None:
 # ------------------------------------------------------------------------ calibrate
 
 
+_PLAN_FACTS: Any = None
+
+
 def plan_facts() -> Any:
-    """The #549.2 store, rooted where the executor roots it. NOT the old delivery table:
-    those rows were keyed by `(variant, rung)`, which bound neither the snapshot bytes nor
-    the runtime build nor the provider map, and they are INVALID rather than migrated."""
+    """The process-local #549.2 observations shared by this multi-section proof run."""
     from cozy_runtime.internal.planfacts import PlanFacts
 
-    return PlanFacts(HOME / "probe")
+    global _PLAN_FACTS
+    if _PLAN_FACTS is None:
+        _PLAN_FACTS = PlanFacts()
+    return _PLAN_FACTS
 
 
 def resolved() -> Any:
@@ -392,7 +376,6 @@ def resolved() -> Any:
         device,
         sorted({dtype_name(r.dtype) for rows in rows_for.values() for r in rows}),
         release=RELEASE,
-        cache=HOME / "probe",
         runtime=runtime,
     )
     reference = offered[0]
@@ -963,7 +946,7 @@ def arms() -> None:
     )
 
     # ARM 4 — an unmeasured plan may not be SELECTED. Empty fact store, both variants.
-    plan = resolve_with(facts=PlanFacts(None))
+    plan = resolve_with(facts=PlanFacts())
     check(
         "ARM: with NOTHING measured resolution takes the reference FLOOR and CONFESSES",
         plan.variant == "fp16" and plan.measurements is None and "UNCALIBRATED" in plan.confession,
@@ -982,7 +965,7 @@ def arms() -> None:
     )
 
     # ARM 6 — a faster plan with NO conformance observation still loses to the reference.
-    partial = PlanFacts(WORK / "arm-partial")
+    partial = PlanFacts()
     shutil.rmtree(WORK / "arm-partial", ignore_errors=True)
     fp16_digest = plan_for("fp16").digest()
     fp8_digest = plan_for("fp8").digest()

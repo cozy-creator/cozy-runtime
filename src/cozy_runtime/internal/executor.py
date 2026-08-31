@@ -247,7 +247,7 @@ class Executor:
             dtype_name,
             topology_of,
         )
-        from cozy_runtime.internal.planfacts import PlanFacts, RunFact, run_id
+        from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
@@ -352,7 +352,6 @@ class Executor:
             device_facts,
             sorted({dtype_name(r.dtype) for _, rs in surveyed.values() for r in rs}),
             release=binding["release"],
-            cache=Path(binding["probe_cache"]) if binding.get("probe_cache") else None,
             runtime=runtime_identity,
         )
         objective = str(binding.get("objective") or "latency")
@@ -388,7 +387,7 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
-        facts = PlanFacts(binding.get("delivery_cache") or binding.get("probe_cache") or ".")
+        facts = PlanFacts()
         try:
             plan = resolve(
                 variants=offered,
@@ -442,11 +441,6 @@ class Executor:
             slots=binding.get("slots", 16),
             readers=binding.get("readers", 16),
             inflight=binding.get("inflight", 8),
-            # cr-006: the per-device qualification suite persists here, first-writer-wins.
-            # It is a DEVICE fact, not a store or artifact fact, so it lives under
-            # cozy_home rather than beside a checkpoint; a worker landing on a tuple this
-            # rig has already probed skips the suite entirely.
-            probe_cache=binding.get("probe_cache"),
             release=binding["release"],
             # The suite already ran, above, to resolve the plan. Running it a second time
             # here would re-measure a device fact that has not changed.
@@ -746,36 +740,6 @@ class Executor:
             # `mixed(...)` as what it IS.
             "delivery": plan.wire_document(),
         }
-        # BANK WHAT THIS RUN MEASURED, keyed by THIS PLAN'S DIGEST (#549.2), as an
-        # IMMUTABLE per-run file. The numbers are the ones this fill actually paid: its wall,
-        # its decode share, the destinations that ended up resident and the decode scratch
-        # high-water the ledger saw. `step_ms` and the reference deviation are NOT measurable
-        # here — they need a forward pass and a comparison against the reference — so they
-        # are written -1 and stay -1 until something measures them.
-        #
-        # No merge, no read-modify-write, no `.partial`: the old `DeliveryTable.save` loaded
-        # the shared file, merged one row and replaced it, so two concurrent prepares each
-        # dropped the other's row with nothing detecting it. One run writes one O_EXCL file
-        # and every observation survives, which is also what makes the sample count auditable.
-        plan_digest = plan.digest()
-        facts.bank(
-            RunFact(
-                plan_digest=plan_digest,
-                run_id=run_id(plan_digest, device_facts.tuple_key(), binding["release"]),
-                stored_bytes=sum(r.stored_nbytes for r in rows),
-                resident_bytes=sum(backend.vram_charge.values()),
-                # Decode scratch is PRICED by the envelope and no longer metered by a
-                # fill-local counter (#613); -1 is the spelling for NOT MEASURED.
-                scratch_bytes=-1,
-                fill_ms=int(backend.stats.get("fill_ms", 0)),
-                decode_ms=int(backend.decoded["ms"]),
-                reference_deviation_rel_l2=(
-                    0.0 if plan.variant == plan.reference_variant else -1.0
-                ),
-                evidence=f"prepare on {device_facts.tuple_key()} at {binding['release']}",
-                at_ns=time.time_ns(),
-            )
-        )
         return {
             "ok": True,
             "ready": True,

@@ -575,27 +575,6 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     }
 
 
-def install_row(home: Path, facts: dict[str, Any]) -> None:
-    """This harness's artifact index (#567e): the ref the record names, resolved HERE.
-
-    A binding record carries no store root any more, because a store root is a fact about
-    the machine that serves and the record's writer may not be it. These arms therefore
-    install the row the way `pull` installs it in production, and the worker looks the ref
-    up in the index of the COZY_HOME it was launched under.
-    """
-    from cozy_runtime.internal import artifacts
-
-    artifacts.install(
-        home,
-        artifacts.Artifact(
-            ref=str(facts.get("ref", RELEASE)),
-            store=str(facts.get("store") or working_store(WORK / "store")),
-            config=str(facts.get("config", CONFIG)),
-            snapshots=dict(facts.get("snapshots") or {COMPONENT: snapshot()}),
-        ),
-    )
-
-
 def prefill_journal(root: Path, target_bytes: int) -> int:
     """Grow a REAL journal to just under the planted file-size limit, using the real writer.
 
@@ -735,7 +714,6 @@ def stage(
     over.pop("variant", None)
     over.pop("custody", None)
     over.pop("vram_floor_bytes", None)
-    install_row(tmp, facts)
     ids = {}
     for entrypoint in entrypoints:
         plan_id = plan_id_for(entrypoint, release)

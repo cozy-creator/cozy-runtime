@@ -107,14 +107,7 @@ class DeviceFacts:
         return self.sm == int(floor)
 
     def tuple_key(self) -> str:
-        """The probe cache key (§3.2), now carrying every #549.9 field.
-
-        Every pre-#549 probe fact and delivery table keyed by the OLD tuple is INVALID and
-        is not migrated: it named a driver it had not read, on a card it had not queried.
-        The keys simply do not collide, so a stale file is never found and a re-probe
-        re-mints — which is #511b's rule (records are measurement-minted) doing its job
-        rather than a migration doing it badly.
-        """
+        """The measured device identity carried by qualification evidence."""
         return (
             f"{self.kind}/{self.name}/dev{self.index}/{self.configuration}/"
             f"driver={self.driver}/cudart={self.cuda_runtime}/{self.os_arch}"
