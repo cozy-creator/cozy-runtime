@@ -937,6 +937,41 @@ class Worker:
     ) -> pb.PreparePackageSetResult:
         return self._prepare_package(request, private=True)
 
+    def prepare_private_placement(
+        self, request: pb.PreparePrivatePlacementRequest
+    ) -> pb.PreparePackageSetResult:
+        from cozy_runtime.internal.worker import package_prepare
+
+        with self.preparation_lock:
+            revision = documents.spell(request.private_revision_digest)
+            prepared = self.private_revisions.get(revision)
+            if prepared is None:
+                raise package_prepare.PreparationRefusal("private_revision_unprepared", revision)
+
+            def mark_verified(digest: str, length: int, path: Path) -> None:
+                self.verified_artifacts.record(digest, length, path)
+
+            result = package_prepare.prepare_private_placement(
+                request,
+                prepared=prepared.document,
+                artifact_cache=Path(self.options.artifact_cache or ""),
+                artifact_store=(
+                    Path(self.options.artifact_store)
+                    if self.options.artifact_store is not None
+                    else None
+                ),
+                verified=mark_verified,
+            )
+            joined = read_placement_set(result.placement_set)
+            if (
+                len(joined) != 1
+                or joined[0].get("development", {}).get("private_revision_digest") != revision
+            ):
+                raise package_prepare.PreparationRefusal(
+                    "private_placement_result_invalid", revision
+                )
+            return result
+
     def _prepare_package(
         self,
         request: pb.PreparePackageSetRequest | pb.PreparePrivatePackageRequest,

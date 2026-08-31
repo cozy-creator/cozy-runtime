@@ -127,6 +127,9 @@ class GrpcControlHost:
         private_package_preparer: (
             Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
         ) = None,
+        private_placement_preparer: (
+            Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
+        ) = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -136,6 +139,7 @@ class GrpcControlHost:
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
         self.private_package_preparer = private_package_preparer
+        self.private_placement_preparer = private_placement_preparer
         self.server: Any = None
         self.stopped = threading.Event()
 
@@ -152,12 +156,16 @@ class GrpcControlHost:
             self.preparer is not None
             or self.model_source_preparer is not None
             or self.private_package_preparer is not None
+            or self.private_placement_preparer is not None
         ):
             if not _loopback_preparation_listener(self.listen):
                 raise RuntimeError("RuntimePreparation can only bind a loopback listener")
             pb_grpc.add_RuntimePreparationServicer_to_server(
                 _PreparationServicer(
-                    self.preparer, self.model_source_preparer, self.private_package_preparer
+                    self.preparer,
+                    self.model_source_preparer,
+                    self.private_package_preparer,
+                    self.private_placement_preparer,
                 ),
                 self.server,
             )
@@ -209,10 +217,14 @@ class _PreparationServicer:
         private_package_handler: (
             Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
         ),
+        private_placement_handler: (
+            Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
+        ),
     ) -> None:
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.private_package_handler = private_package_handler
+        self.private_placement_handler = private_placement_handler
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler
@@ -251,6 +263,23 @@ class _PreparationServicer:
 
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "private package preparation is unavailable"
+            )
+        try:
+            return handler(request)
+        except Exception as exc:
+            import grpc
+
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+
+    def PreparePrivatePlacement(
+        self, request: pb.PreparePrivatePlacementRequest, context: Any
+    ) -> Any:
+        handler = self.private_placement_handler
+        if handler is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "private placement preparation is unavailable"
             )
         try:
             return handler(request)

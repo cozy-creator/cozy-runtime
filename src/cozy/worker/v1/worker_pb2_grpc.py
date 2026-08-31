@@ -179,6 +179,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
                 _registered_method=True)
+        self.PreparePrivatePlacement = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
+                _registered_method=True)
 
 
 class RuntimePreparationServicer(object):
@@ -205,6 +210,12 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PreparePrivatePlacement(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RuntimePreparationServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -221,6 +232,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
             'PreparePrivatePackage': grpc.unary_unary_rpc_method_handler(
                     servicer.PreparePrivatePackage,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.SerializeToString,
+            ),
+            'PreparePrivatePlacement': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreparePrivatePlacement,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.SerializeToString,
             ),
     }
@@ -307,6 +323,33 @@ class RuntimePreparation(object):
             target,
             '/cozy.worker.v1.RuntimePreparation/PreparePrivatePackage',
             cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreparePrivatePlacement(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
             options,
             channel_credentials,

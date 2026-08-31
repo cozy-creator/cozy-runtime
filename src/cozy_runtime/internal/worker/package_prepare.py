@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -156,6 +157,116 @@ def prepare_private_package(
         job_plan_root=job_plan_root,
         base_manifest=base_manifest,
         development=package,
+    )
+
+
+def prepare_private_placement(
+    request: pb.PreparePrivatePlacementRequest,
+    *,
+    prepared: Mapping[str, Any],
+    artifact_cache: Path,
+    artifact_store: Path | None,
+    verified: Callable[[str, int, Path], None],
+) -> pb.PreparePackageSetResult:
+    """Bind verified models to one exact already-prepared private revision core."""
+
+    development = prepared.get("development")
+    descriptor_ref = prepared.get("package_descriptor")
+    if (
+        _OPERATION_ID.fullmatch(request.operation_id) is None
+        or len(request.private_revision_digest) != 32
+        or not isinstance(development, dict)
+        or development.get("private_revision_digest")
+        != documents.spell(request.private_revision_digest)
+        or not isinstance(descriptor_ref, dict)
+        or not isinstance(descriptor_ref.get("digest"), str)
+        or not isinstance(descriptor_ref.get("length"), int)
+    ):
+        raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
+    try:
+        delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
+    except documents.DocumentError as exc:
+        raise PreparationRefusal("private_placement_delegation_invalid", exc.detail) from exc
+    packages = delegation.get("packages", [])
+    models = delegation.get("models", [])
+    if packages != [] or not isinstance(models, list) or len(models) > 32:
+        raise PreparationRefusal(
+            "private_placement_delegation_invalid",
+            "private model delegation carries no package refs and at most 32 models",
+        )
+
+    rows = list(request.files)
+    model_files: dict[str, tuple[int, int, Path]] = {}
+    prior = b""
+    parents: set[Path] = set()
+    for row in rows:
+        path = Path(row.path)
+        if (
+            len(row.digest) != 32
+            or row.digest <= prior
+            or not 0 < row.length <= MAX_FILE_BYTES
+            or row.kind
+            not in {
+                pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
+                pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
+            }
+            or not path.is_absolute()
+            or path.name != row.filename
+            or not path.is_relative_to(artifact_cache / "sets")
+            or path.resolve(strict=True) != path
+        ):
+            raise PreparationRefusal("private_placement_file_invalid", row.filename)
+        prior = bytes(row.digest)
+        parents.add(path.parent)
+        model_files[documents.spell(bytes(row.digest))] = (row.kind, row.length, path)
+    if rows and len(parents) != 1:
+        raise PreparationRefusal("private_placement_file_invalid", "files span package sets")
+
+    digest = str(descriptor_ref["digest"])
+    length = int(descriptor_ref["length"])
+    try:
+        documents.raw(digest)
+    except (documents.DocumentError, ValueError) as exc:
+        raise PreparationRefusal("private_placement_descriptor_invalid", digest) from exc
+    descriptor_raw = _read_file(artifact_cache / digest.removeprefix("sha256:"), length)
+    if (
+        len(descriptor_raw) != length
+        or "sha256:" + hashlib.sha256(descriptor_raw).hexdigest() != digest
+    ):
+        raise PreparationRefusal("private_placement_descriptor_invalid", digest)
+    try:
+        descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared private descriptor")
+    except descriptor.StalePackageDescriptor as exc:
+        raise PreparationRefusal("private_placement_descriptor_invalid", str(exc)) from exc
+    selected_models, entrypoints = _entrypoints(
+        descriptor_body,
+        package_name=str(development.get("package", "")),
+        selections=models,
+        files=model_files,
+        artifact_cache=artifact_cache,
+        artifact_store=artifact_store,
+        verified=verified,
+    )
+    entrypoint_bodies = [documents.body(row) for row in entrypoints]
+    for entrypoint in entrypoint_bodies:
+        entrypoint.setdefault("slots", [])
+    model_bodies = [documents.body(row) for row in selected_models]
+    joined = copy.deepcopy(dict(prepared))
+    joined["models"] = model_bodies
+    joined["entrypoints"] = entrypoint_bodies
+    joined["bindings_digest"] = documents.spell(
+        documents.digest_of(
+            canonical.write({"entrypoints": entrypoint_bodies, "models": model_bodies})
+        )
+    )
+    placement_bytes = canonical.write(
+        {"format": "cozy.worker.v1.PlacementSet/1", "placements": [joined]}
+    )
+    return pb.PreparePackageSetResult(
+        placement_set=pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(placement_bytes),
+            placement_set_canonical_bytes=placement_bytes,
+        )
     )
 
 
