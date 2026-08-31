@@ -12,10 +12,13 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from cozy_runtime.internal import canonical, overlay
 
 _NAME_RUNS = re.compile(r"[-_.]+")
 _ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CUDA_13_MINIMUM_DRIVER = "580.126.20"
 
 
 class LocalBaseRefusal(Exception):
@@ -35,31 +38,17 @@ def manifest_bytes() -> bytes:
         raise LocalBaseRefusal("local base requires a readable glibc version")
 
     distributions, roots = _ownership()
-    if any(row["distribution"] == "torch" for row in distributions):
-        raise LocalBaseRefusal(
-            "the current local Runtime environment contains Torch; use a Runtime-only base"
-        )
+    profile, platform_target, minimum_cuda, minimum_driver = _profile(distributions)
     raw = canonical.write(
         {
             "base_distributions": distributions,
             "base_import_roots": roots,
-            "compatibility_profile": {
-                "accelerator_build": "cpu",
-                "os_cpu": "linux-x86",
-                "python_abi": "cp312",
-                "torch_release": "none",
-            },
+            "compatibility_profile": profile,
             "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none",
-            "minimum_driver_version": "none",
+            "minimum_cuda_version": minimum_cuda,
+            "minimum_driver_version": minimum_driver,
             "ownership": "observed-local",
-            "platform_target": {
-                "accelerator_abi": "none",
-                "accelerator_backend": "none",
-                "libc": "glibc" + libc_version,
-                "os_arch": "linux/amd64",
-                "python_abi": "cp312",
-            },
+            "platform_target": {**platform_target, "libc": "glibc" + libc_version},
             # Installed environments do not retain original wheel bytes. Claiming their
             # digests here would be fabricated; distribution/import ownership is what the
             # overlay collision and requirement checks consume.
@@ -68,6 +57,70 @@ def manifest_bytes() -> bytes:
     )
     overlay.parse_base_manifest(raw, _digest(raw))
     return raw
+
+
+def _profile(
+    distributions: list[dict[str, str]],
+) -> tuple[dict[str, str], dict[str, str], str, str]:
+    installed = {row["distribution"]: row["version"] for row in distributions}
+    torch_version = installed.get("torch")
+    if torch_version is None:
+        return (
+            {
+                "accelerator_build": "cpu",
+                "os_cpu": "linux-x86",
+                "python_abi": "cp312",
+                "torch_release": "none",
+            },
+            {
+                "accelerator_abi": "none",
+                "accelerator_backend": "none",
+                "os_arch": "linux/amd64",
+                "python_abi": "cp312",
+            },
+            "none",
+            "none",
+        )
+
+    try:
+        import torch
+    except Exception as exc:
+        raise LocalBaseRefusal(f"installed Torch cannot be imported: {exc}") from exc
+    return _cuda_profile(torch_version, torch.version.cuda)
+
+
+def _cuda_profile(
+    torch_version: str, cuda: str | None
+) -> tuple[dict[str, str], dict[str, str], str, str]:
+    try:
+        release = Version(torch_version).release
+    except InvalidVersion as exc:
+        raise LocalBaseRefusal(f"installed Torch has invalid version {torch_version!r}") from exc
+    if len(release) != 3 or release[:2] != (2, 13):
+        raise LocalBaseRefusal(
+            f"local CUDA base requires Torch 2.13.x; installed version is {torch_version}"
+        )
+    if cuda != "13.0":
+        raise LocalBaseRefusal(
+            f"local CUDA base requires a CUDA 13.0 Torch build; installed build is {cuda or 'cpu'}"
+        )
+    torch_release = ".".join(str(part) for part in release)
+    return (
+        {
+            "accelerator_build": "cu130",
+            "os_cpu": "linux-x86",
+            "python_abi": "cp312",
+            "torch_release": torch_release,
+        },
+        {
+            "accelerator_abi": "cu130",
+            "accelerator_backend": "cuda",
+            "os_arch": "linux/amd64",
+            "python_abi": "cp312",
+        },
+        "13.0",
+        _CUDA_13_MINIMUM_DRIVER,
+    )
 
 
 def write_manifest(path: Path) -> tuple[str, int, bool]:
