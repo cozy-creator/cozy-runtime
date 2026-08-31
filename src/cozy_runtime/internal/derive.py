@@ -170,10 +170,10 @@ def _refuse_compile() -> Iterator[None]:
 class _Capability:
     """The DECLARED hardware variant, answered instead of this box's card.
 
-    Construction that gates on `sm89` vs `sm90` derives PER VARIANT (cr-004): one contract
-    each, never one contract for both. `read` records whether the construction actually
-    asked — an undeclared variant on a construction that asks is a refusal, and a declared
-    variant on one that never asks is simply the same contract twice.
+    Construction that gates on CPU vs CUDA or `sm89` vs `sm90` derives PER VARIANT
+    (cr-004): one contract each, never one contract for both. `read` records whether the
+    construction actually asked — an undeclared variant on a construction that asks is a
+    refusal, and a declared variant on one that never asks is simply the same contract twice.
     """
 
     variant: str
@@ -181,6 +181,8 @@ class _Capability:
 
     @property
     def major_minor(self) -> tuple[int, int]:
+        if self.variant == "cpu":
+            return (0, 0)
         digits = self.variant.removeprefix("sm")
         if not digits.isdigit() or len(digits) < 2:
             raise ConstructionFault(
@@ -205,10 +207,11 @@ def _capability(cap: _Capability) -> Iterator[None]:
 
         return answer
 
+    cuda = cap.variant != "cpu"
     torch.cuda.get_device_capability = mark(cap.major_minor)  # type: ignore[assignment]
     torch.cuda.get_device_name = mark(cap.variant)  # type: ignore[assignment]
-    torch.cuda.is_available = mark(True)  # type: ignore[assignment]
-    torch.cuda.device_count = mark(1)  # type: ignore[assignment]
+    torch.cuda.is_available = mark(cuda)  # type: ignore[assignment]
+    torch.cuda.device_count = mark(1 if cuda else 0)  # type: ignore[assignment]
     try:
         yield
     finally:

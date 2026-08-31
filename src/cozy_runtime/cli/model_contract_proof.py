@@ -41,7 +41,7 @@ RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
 MEMORY_CAP_BYTES = 24 << 30
 CPU_CAP_SECONDS = 600
 WALL_CAP_SECONDS = 900
-_VARIANT = re.compile(r"^sm[0-9]{2,}$")
+_VARIANT = re.compile(r"^(?:cpu|sm[0-9]{2,})$")
 
 REQUEST_FIELDS = {
     "bindings",
@@ -241,7 +241,7 @@ def _binding(value: object, index: int) -> BindingRequest:
         or variants != sorted(set(variants))
     ):
         raise _request_error(
-            f"{name}.hardware_variants must be a sorted unique non-empty sm<major><minor> array"
+            f"{name}.hardware_variants must be a sorted unique non-empty cpu|sm<major><minor> array"
         )
     return BindingRequest(
         path=path,
