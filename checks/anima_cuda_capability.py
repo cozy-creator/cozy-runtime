@@ -32,6 +32,11 @@ def source_custody() -> None:
     assert native_files == {*UPSTREAM_NATIVE, "binding.cpp"}
     cmake = (COMPANION / "CMakeLists.txt").read_text()
     assert 'set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;89;90a-real;100f;120f")' in cmake
+    assert (
+        'if(CMAKE_SYSTEM_NAME STREQUAL "Linux")\n'
+        "    target_link_options(_C PRIVATE -Wl,--build-id=none)\n"
+        "endif()"
+    ) in cmake, "Linux companion builds must not carry process-varying GNU build IDs"
     project = tomllib.loads((COMPANION / "pyproject.toml").read_text())
     assert project["build-system"]["requires"] == [
         "scikit-build-core==1.0.3",
