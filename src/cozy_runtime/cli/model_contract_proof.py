@@ -371,7 +371,7 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledOverlay:
+def _verify_installed_generation(request: ProofRequest) -> overlay.InstalledEnvironment:
     if request.environment_generation.parent.name != "contents":
         raise ProofRefusal(
             "model_contract_environment_generation_invalid",
@@ -469,8 +469,7 @@ def _child_entry(args: Sequence[str]) -> int:
     try:
         request_path = _existing_file(args[0], "request")
         request = _read_request(request_path)
-        installed = _verify_installed_generation(request)
-        sys.path.append(str(installed.import_root))
+        _verify_installed_generation(request)
         descriptor_doc = _read_descriptor(request.package_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:

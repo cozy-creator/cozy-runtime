@@ -103,16 +103,18 @@ def compile_shared(root: Path, name: str, source: str, *linker_flags: str) -> by
     return library_path.read_bytes()
 
 
-def base_manifest(path: Path) -> str:
+def base_manifest(path: Path, runtime_version: str = "0.0.20") -> str:
     raw = canonical.write(
         {
             "base_distributions": [
                 {"distribution": "base-control", "version": "1.0.0"},
+                {"distribution": "cozy-runtime", "version": runtime_version},
                 {"distribution": "numpy", "version": "2.0.0"},
                 {"distribution": "torch", "version": "2.13.0+cpu"},
             ],
             "base_import_roots": [
                 {"providers": ["base-control"], "root": "base_control"},
+                {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
                 {"providers": ["numpy"], "root": "numpy"},
                 {"providers": ["torch"], "root": "torch"},
             ],
@@ -155,10 +157,12 @@ def local_base_manifest(path: Path) -> str:
         {
             "base_distributions": [
                 {"distribution": "base-control", "version": "1.0.0"},
+                {"distribution": "cozy-runtime", "version": "0.0.20"},
                 {"distribution": "numpy", "version": "2.0.0"},
             ],
             "base_import_roots": [
                 {"providers": ["base-control"], "root": "base_control"},
+                {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
                 {"providers": ["numpy"], "root": "numpy"},
             ],
             "compatibility_profile": {
@@ -235,7 +239,14 @@ def main() -> int:
         wheels.mkdir()
         manifest = root / "WheelhouseManifest.json"
         family = base_manifest(manifest)
-        project = build_wheel(wheels, "proof-project", "proof_project", "stable", owner="project")
+        project = build_wheel(
+            wheels,
+            "proof-project",
+            "proof_project",
+            "stable",
+            owner="project",
+            requires_dist=("cozy-runtime>=0.0.19,<1.0.0",),
+        )
         custom_one = build_wheel(wheels, "proof-custom", "proof_custom", "one", owner="custom")
         custom_two = build_wheel(wheels, "proof-custom", "proof_custom", "two", owner="custom")
         environment = root / "installed"
@@ -270,12 +281,37 @@ def main() -> int:
         assert cold.content_digest == warm.content_digest
         assert cold.generation == warm.generation and warm.reused
         assert changed.content_digest != cold.content_digest
-        cold_project = cold.import_root / "proof_project" / "__init__.py"
-        changed_project = changed.import_root / "proof_project" / "__init__.py"
-        cold_custom = cold.import_root / "proof_custom" / "__init__.py"
-        changed_custom = changed.import_root / "proof_custom" / "__init__.py"
-        assert cold_project.stat().st_ino == changed_project.stat().st_ino
-        assert cold_custom.stat().st_ino != changed_custom.stat().st_ino
+        assert (cold.site_packages / "proof_project" / "__init__.py").is_file()
+        assert (changed.site_packages / "proof_project" / "__init__.py").is_file()
+        assert (cold.site_packages / "proof_custom" / "__init__.py").read_bytes() != (
+            changed.site_packages / "proof_custom" / "__init__.py"
+        ).read_bytes()
+
+        patch_manifest = root / "WheelhouseManifest.patch.json"
+        patch_family = base_manifest(patch_manifest, "0.0.21")
+        compatible_patch = overlay.materialize(
+            source("spec-runtime-patch", patch_family, project, custom_one),
+            environment,
+            python=Path(sys.executable),
+            base_manifest=patch_manifest,
+        )
+        assert compatible_patch.reused
+        assert compatible_patch.generation == cold.generation
+
+        incompatible_manifest = root / "WheelhouseManifest.incompatible.json"
+        incompatible_family = base_manifest(incompatible_manifest, "1.0.0")
+        try:
+            overlay.materialize(
+                source("spec-runtime-major", incompatible_family, project, custom_one),
+                environment,
+                python=Path(sys.executable),
+                base_manifest=incompatible_manifest,
+            )
+        except overlay.OverlayRefusal as exc:
+            assert exc.code == "overlay_dependency_base_conflict"
+            assert "cozy-runtime<1.0.0,>=0.0.19" in exc.detail
+        else:
+            raise AssertionError("an incompatible Runtime major reused the package environment")
 
         corrupt_path = root / "corrupt.whl"
         corrupt = bytearray(custom_one[1].read_bytes())
@@ -317,7 +353,7 @@ def main() -> int:
             python=Path(sys.executable),
             base_manifest=manifest,
         )
-        assert (abi3.import_root / "proof_abi3" / "__init__.py").is_file()
+        assert (abi3.site_packages / "proof_abi3" / "__init__.py").is_file()
 
         incompatible_cases = {
             "overlay_wheel_platform_incompatible": build_wheel(
@@ -466,7 +502,9 @@ def main() -> int:
             base_manifest=local_manifest,
             allow_native_custom=True,
         )
-        library = ctypes.CDLL(str(native_local.import_root / "proof_native_custom" / "_native.so"))
+        library = ctypes.CDLL(
+            str(native_local.site_packages / "proof_native_custom" / "_native.so")
+        )
         library.proof_add.argtypes = (ctypes.c_int, ctypes.c_int)
         library.proof_add.restype = ctypes.c_int
         assert library.proof_add(20, 22) == 42
@@ -493,9 +531,7 @@ def main() -> int:
             cozy_home=root / "node-local",
         )
         try:
-            assert supervision.use_overlay(
-                str(cold.python), str(cold.import_root), cold.content_digest
-            )
+            assert supervision.use_environment(str(cold.python), cold.content_digest)
             jit_env = supervision._prepare_jit_cache()
             assert set(jit_env) == {name for name, _directory in child_env.JIT_CACHE_ENV}
             executor_scope = Path(next(iter(jit_env.values()))).parent
@@ -601,7 +637,9 @@ def main() -> int:
                     "verified_bytes": first.verified_bytes,
                     "trusted_reuse_bytes": second.trusted_reuse_bytes,
                     "same_wheels_different_spec_one_content": True,
-                    "one_changed_wheel_shared_project_inode": cold_project.stat().st_ino,
+                    "compatible_runtime_patch_reused": True,
+                    "incompatible_runtime_major_refused": True,
+                    "one_changed_wheel_has_distinct_environment": True,
                     "changed_stat_rehashed": True,
                     "restart_rehashed": True,
                     "corrupt_first_arrival_refused": True,

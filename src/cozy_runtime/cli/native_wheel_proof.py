@@ -67,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             base_manifest=request.wheelhouse_manifest,
             python=request.python,
         )
-        inspection = native_wheel.inspect_installed(installed.import_root)
+        inspection = native_wheel.inspect_installed(installed.site_packages)
         runtime_config = config.read_config()
         base_environment = spawn.seal(runtime_config.child_base_env, {})
         selected_seat = native_wheel.observe_seat(request.python, base_environment)
@@ -106,8 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
         try:
             operator = native_wheel.qualify_operator(
-                python=request.python,
-                overlay=installed.import_root,
+                python=installed.python,
+                overlay=installed.site_packages,
                 fixture=request.fixture,
                 expected_result_digest=request.expected_result_digest,
                 environment=spawn.seal(runtime_config.child_base_env, imposed),

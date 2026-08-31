@@ -990,9 +990,9 @@ class Worker:
                     "replace the active package through desired state",
                 )
 
-            def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
-                changed = self.supervision.use_overlay(
-                    str(installed.python), str(installed.import_root), installed.content_digest
+            def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+                changed = self.supervision.use_environment(
+                    str(installed.python), installed.content_digest
                 )
                 executor = self.supervision.current
                 try:
@@ -2118,8 +2118,8 @@ class Worker:
             return
         installed = acquired.installed
         if installed is not None:
-            changed = self.supervision.use_overlay(
-                str(installed.python), str(installed.import_root), installed.content_digest
+            changed = self.supervision.use_environment(
+                str(installed.python), installed.content_digest
             )
             if changed and self.supervision.current is not None:
                 self.supervision.current.poisoned = "package overlay generation changed"
@@ -2498,8 +2498,8 @@ class Worker:
             )
             self.latched = "job_plan_mismatch"
             return
-        self.supervision.use_overlay(
-            self.supervision.python, binding.overlay, binding.overlay_content_digest
+        self.supervision.use_environment(
+            binding.python, binding.environment_content_digest
         )
         self.jobs[job.job_descriptor_id] = binding
         self.engine.jobs = self.jobs

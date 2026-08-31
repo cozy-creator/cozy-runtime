@@ -137,7 +137,7 @@ class VerifiedArtifactCache:
 
 @dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
-    installed: overlay.InstalledOverlay | None
+    installed: overlay.InstalledEnvironment | None
     bindings: Mapping[str, DeclaredBinding]
     model_objects: int
     documents: int
@@ -412,7 +412,7 @@ class Acquirer:
 
     def _run_package(
         self, placement: Any
-    ) -> tuple[overlay.InstalledOverlay, Mapping[str, DeclaredBinding], int]:
+    ) -> tuple[overlay.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
@@ -430,7 +430,7 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _environment(self, placement: Any) -> overlay.InstalledOverlay:
+    def _environment(self, placement: Any) -> overlay.InstalledEnvironment:
         environment_digest = documents.spell(placement.environment_digest)
         wheelhouse_raw = self.base_manifest.read_bytes()
         package = placement.package or placement.development

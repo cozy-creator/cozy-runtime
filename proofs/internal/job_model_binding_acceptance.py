@@ -171,8 +171,8 @@ def binding(descriptor_id: str, descriptor_path: Path) -> JobBinding:
         build_id=PRIVATE_REVISION,
         application="job_model_binding_acceptance:app",
         package_descriptor=str(descriptor_path),
-        overlay="",
-        overlay_content_digest="",
+        python=sys.executable,
+        environment_content_digest="sha256:" + "a" * 64,
         job="join",
     )
 
@@ -400,9 +400,9 @@ def main() -> None:
             root=root / "job-plans",
             build_id=PRIVATE_REVISION,
             descriptor_path=descriptor_path,
-            installed=overlay.InstalledOverlay(
+            installed=overlay.InstalledEnvironment(
                 generation=root / "private-generation",
-                import_root=root,
+                site_packages=root,
                 python=Path(sys.executable),
                 receipt_bytes=b"{}",
                 receipt_digest="sha256:" + "b" * 64,

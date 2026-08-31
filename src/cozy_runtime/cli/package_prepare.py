@@ -136,10 +136,8 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     )
     (scratch / "executor").mkdir(parents=True)
 
-    def describe(installed: overlay.InstalledOverlay, distribution: str) -> bytes:
-        supervisor.use_overlay(
-            str(installed.python), str(installed.import_root), installed.content_digest
-        )
+    def describe(installed: overlay.InstalledEnvironment, distribution: str) -> bytes:
+        supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
         output = scratch / "executor" / "descriptor.json"
         reply = executor.call(
