@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -47,6 +48,7 @@ def prepare_package_set(
     python: Path,
     describe: Callable[[overlay.InstalledOverlay, str], bytes],
     verified: Callable[[str, int, Path], None],
+    job_plan_root: Path | None = None,
     base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
 ) -> pb.PreparePackageSetResult:
     """Parse one signed delegation, then use the shared package preparation path."""
@@ -55,6 +57,7 @@ def prepare_package_set(
         Path(request.environment_root) != environment_root
         or not environment_root.is_absolute()
         or not artifact_store.is_absolute()
+        or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
         raise PreparationRefusal(
             "package_prepare_environment_root_invalid", request.environment_root
@@ -94,6 +97,7 @@ def prepare_package_set(
         python=python,
         describe=describe,
         verified=verified,
+        job_plan_root=job_plan_root,
         base_manifest=base_manifest,
     )
 
@@ -113,6 +117,7 @@ def prepare_package(
     base_manifest: Path,
     models: Sequence[Any] = (),
     artifact_store: Path | None = None,
+    job_plan_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package."""
 
@@ -239,6 +244,13 @@ def prepare_package(
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
     _stage(artifact_cache, base_raw)
+    jobs = _stage_job_plans(
+        descriptor_body,
+        root=job_plan_root,
+        build_id=release_digest,
+        descriptor_path=artifact_cache / descriptor_ref[0].removeprefix("sha256:"),
+        installed=installed,
+    )
     selected_models, entrypoints = _entrypoints(
         descriptor_body,
         package_name=package_name,
@@ -248,6 +260,11 @@ def prepare_package(
         artifact_store=artifact_store,
         verified=verified,
     )
+    if not entrypoints and not jobs:
+        raise PreparationRefusal(
+            "package_prepare_callable_absent",
+            "package has no runnable serving or weightless job callable",
+        )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     for entrypoint_body in entrypoint_bodies:
         entrypoint_body.setdefault("slots", [])
@@ -309,8 +326,8 @@ def _entrypoints(
     verified: Callable[[str, int, Path], None],
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
-    if not isinstance(rows, list) or not rows:
-        raise PreparationRefusal("package_prepare_entrypoints_absent", "package is not serving")
+    if not isinstance(rows, list):
+        raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoints")
     selected = _selected_models(
         package_name, selections, files, artifact_cache, artifact_store, verified
     )
@@ -396,6 +413,55 @@ def _entrypoints(
             f"extra={sorted(described_slots - set(selected))}",
         )
     return models, out
+
+
+def _stage_job_plans(
+    body: Mapping[str, Any],
+    *,
+    root: Path | None,
+    build_id: str,
+    descriptor_path: Path,
+    installed: overlay.InstalledOverlay,
+) -> set[str]:
+    rows = body.get("jobs")
+    if not isinstance(rows, list):
+        raise PreparationRefusal("package_prepare_descriptor_invalid", "jobs")
+    weightless = [row for row in rows if isinstance(row, dict) and not row.get("models")]
+    if not weightless or root is None:
+        return set()
+    root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if root.is_symlink() or not root.is_dir():
+        raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
+    application = str(body.get("application", ""))
+    staged: set[str] = set()
+    for row in weightless:
+        name = str(row.get("name", ""))
+        descriptor_id = descriptor.job_descriptor_id(body, name)
+        resources = row.get("resources") or {}
+        if not isinstance(resources, dict):
+            raise PreparationRefusal("package_prepare_descriptor_invalid", f"{name}.resources")
+        record = {
+            "job_descriptor_id": descriptor_id,
+            "build_id": build_id,
+            "application": application,
+            "package_descriptor": str(descriptor_path),
+            "overlay": str(installed.import_root),
+            "overlay_content_digest": installed.content_digest,
+            "job": name,
+            "gpu_count": int(resources.get("gpu_count", 0)),
+            "publishes": bool(row.get("publishes", False)),
+            "emits_media": False,
+            "gpu_rate_micro_usd_per_hour": 0,
+            "cap_micro_usd": 0,
+            "reclaim_on_terminal": True,
+        }
+        target = root / f"{descriptor_id.removeprefix('sha256:')}.json"
+        temporary = root / f".stage-{uuid.uuid4().hex}"
+        temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        temporary.chmod(0o444)
+        temporary.replace(target)
+        staged.add(descriptor_id)
+    return staged
 
 
 def _selected_models(

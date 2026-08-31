@@ -610,8 +610,8 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     known_models = set(model_ids)
 
     entrypoints = entry["entrypoints"]
-    if not isinstance(entrypoints, list) or not entrypoints:
-        raise documents.DocumentError("missing_field", "Placement.entrypoints")
+    if not isinstance(entrypoints, list):
+        raise documents.DocumentError("wrong_type", "Placement.entrypoints")
     entrypoint_names: list[str] = []
     for entrypoint_index, value in enumerate(entrypoints):
         entrypoint = _closed_document(
@@ -936,6 +936,7 @@ class Worker:
                 python=Path(self.options.python or sys.executable),
                 describe=describe,
                 verified=mark_verified,
+                job_plan_root=self.config.cozy_home / "job-plans",
             )
 
     def note(self, kind: str, step: str) -> None:
@@ -2264,6 +2265,21 @@ class Worker:
             self.latched = "unresolved_job_descriptor"
             return
         binding = JobBinding.read(json.loads(record.read_text()))
+        if (
+            binding.job_descriptor_id != job.job_descriptor_id
+            or binding.build_id != job.build_id
+            or not job.reclaim_on_terminal
+        ):
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=job.job_descriptor_id,
+                    reason="job_plan_mismatch",
+                    detail="JobDirective does not equal the prepared package job plan",
+                )
+            )
+            self.latched = "job_plan_mismatch"
+            return
         self.supervision.use_overlay(
             self.supervision.python, binding.overlay, binding.overlay_content_digest
         )
