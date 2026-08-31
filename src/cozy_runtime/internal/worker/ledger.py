@@ -546,7 +546,7 @@ class Ledger:
         return out
 
     def measurement(self) -> dict[str, Any]:
-        """Current typed ledger fields for journal, triage, and local reporting."""
+        """Current typed ledger fields for records, triage, and local reporting."""
 
         return {
             "classes": [counter.document() for counter in self.counters()],
@@ -556,7 +556,7 @@ class Ledger:
         }
 
     def rows(self) -> dict[str, Any]:
-        """The compact projection the worker summary and the journal carry."""
+        """The compact projection carried by the worker summary and process records."""
         return {
             "host_ram": {
                 "charged": self.host_charged,

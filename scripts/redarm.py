@@ -226,40 +226,40 @@ OMISSION_ARMS = (
 )
 
 #: A committed bundle, edited on disk afterwards, must be a DETECTED corruption rather than
-#: a plausible story — the journaled write receipt is what makes that possible.
+#: a plausible story — the recorded write receipt is what makes that possible.
 TAMPER = """
 import json, pathlib, shutil, tempfile
-from cozy_runtime.internal.journal import Journal
 from cozy_runtime.internal.worker import triage
+from cozy_runtime.internal.worker.records import WorkerRecords
 
 root = pathlib.Path(tempfile.mkdtemp(prefix="cozy-triage-arm"))
-journal = Journal(root / "journal.log")
-store = triage.BundleStore(root / "triage", journal)
+records = WorkerRecords()
+store = triage.BundleStore(root / "triage", records)
 receipt = store.commit(triage.Assembly(triage.mint_subject(), attempt={"request_id": "r"}))
 path = root / "triage" / (receipt.subject_id + ".json")
 document = json.loads(path.read_text())
 document["terminal"] = {"status": "OUTCOME_STATUS_SUCCEEDED"}
 path.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
 try:
-    triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+    triage.BundleStore.read(root / "triage", receipt.subject_id, records)
 finally:
     shutil.rmtree(root, ignore_errors=True)
 """
 
 #: A log line cannot declare terminal success. The bundle has no field that can carry a
-#: terminal claim, and the ONE terminal fact it holds is a COPY of the journaled terminal.
+#: terminal claim, and the ONE terminal fact it holds is a copy of the recorded terminal.
 LOG_AUTHORITY = """
 import pathlib, shutil, tempfile
-from cozy_runtime.internal.journal import Journal
 from cozy_runtime.internal.worker import triage
+from cozy_runtime.internal.worker.records import WorkerRecords
 
 root = pathlib.Path(tempfile.mkdtemp(prefix="cozy-authority-arm"))
-journal = Journal(root / "journal.log")
-store = triage.BundleStore(root / "triage", journal)
+records = WorkerRecords()
+store = triage.BundleStore(root / "triage", records)
 assembly = triage.Assembly(triage.mint_subject(), terminal={"status": "OUTCOME_STATUS_FAILED"})
 assembly.events.append({"kind": "log", "name": "SUCCEEDED", "value": "the handler is done"})
 receipt = store.commit(assembly)
-document = triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+document = triage.BundleStore.read(root / "triage", receipt.subject_id, records)
 shutil.rmtree(root, ignore_errors=True)
 claims = [row for row in document["events"] if row.get("kind") not in ("log", "metric",
           "stage", "confession", "boot", "liveness", "fault")]

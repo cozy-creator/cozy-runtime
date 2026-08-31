@@ -853,12 +853,10 @@ class LocalRecordOwner:
         )
 
     def _on_checkpoint(self, request: pb.JobCheckpointRequest) -> None:
-        """The RecordOwner half of the DURABLE checkpoint exchange (cr-009).
+        """The local RecordOwner half of the checkpoint declaration exchange.
 
-        This is the seam cl-004 and the hub implement for real: the worker already made the
-        save durable in its own journal, and this side records the identity and answers with
-        its receipt. The RecordOwner's answer is a SECOND observation, not a second
-        authority — an at-least-once durable message like every other (law 9).
+        The worker recorded the declaration for this process; this side observes the identity
+        and answers. No checkpoint bytes become durable here.
         """
         digest = documents.spell(request.content_digest) if request.content_digest else ""
         held = next(
@@ -1578,11 +1576,7 @@ def _collect(
         manifest = body.get("output_manifest") or {}
         outcome.manifest = list(manifest.get("outputs", ()))
         outcome.publication = next(
-            (
-                row["body"]
-                for row in outcome.attempt_records
-                if row.get("kind") == "publication"
-            ),
+            (row["body"] for row in outcome.attempt_records if row.get("kind") == "publication"),
             {},
         )
         for row in outcome.manifest:

@@ -2,8 +2,8 @@
 
 This is the ONLY process in the worker that imports torch or touches a device. It is
 disposable in the strong sense: `kill -9` at any instant is a supported input, and the
-worker converges to a typed terminal and a fresh incarnation from what it journaled.
-Nothing durable lives here — no journal, no credential, no monotone wire counter.
+worker converges to a typed terminal and a fresh incarnation from what it recorded.
+Nothing durable lives here — no records, no credential, no monotone wire counter.
 
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
@@ -1102,7 +1102,7 @@ class Executor:
         def durable_checkpoint(save: CheckpointSave) -> CheckpointDeclaration:
             """Block until the worker has JOURNALED the declaration. Never the lossy lane.
 
-            What comes back is a journaled declaration id, not a durability receipt: this
+            What comes back is a recorded declaration id, not a durability receipt: this
             frame carries keys, a digest and a length, and the bytes stay in the spool
             (#553a).
             """
@@ -1342,7 +1342,7 @@ class Executor:
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
-        journaled. The proof is the device's own: every stream is complete."""
+        recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
     def probe(self) -> dict[str, Any]:

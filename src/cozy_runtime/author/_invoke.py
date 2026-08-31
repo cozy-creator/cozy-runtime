@@ -12,7 +12,7 @@ functions, in this order, and neither resolves a request twice.
 Every door runs this. `run`, `job` and a socket-served attempt are user experiences over
 these functions, never second execution implementations (§8) — and the per-service fakes are
 capability adapters over THIS kernel, never a parallel behavioral runtime (§1.6). Where the
-worker/executor process boundary, the journal and the device leases go is cr-008a's;
+worker/executor process boundary, process records and device leases go is cr-008a's;
 what a call MEANS is here.
 
 Package placement is deliberate: the kernel is pure surface semantics (no device, config,
@@ -111,7 +111,7 @@ class Invocation:
     makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
     checkpoints: Callable[[CheckpointSave], CheckpointDeclaration] | None = None
     """The checkpoint DECLARATION exchange. Distinct from the lossy progress lane on
-    purpose: the lossy lane has no authority over a journaled fact. It carries no bytes —
+    purpose: the lossy lane has no authority over a recorded fact. It carries no bytes —
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
@@ -165,7 +165,7 @@ class PreparedRequest:
     facts_digest: str | None
 
     def digests(self) -> dict[str, str]:
-        """What a worker can hold, journal and price against — never the payload."""
+        """What a worker can hold, record and price against — never the payload."""
         return {
             "overlay_digest": self.overlay.digest,
             "features_digest": self.features.digest,

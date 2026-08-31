@@ -23,13 +23,6 @@ KINDS = (
 )
 
 
-class RecordError(Exception):
-    def __init__(self, code: str, detail: str) -> None:
-        super().__init__(f"{code}: {detail}")
-        self.code = code
-        self.detail = detail
-
-
 @dataclass(slots=True)
 class Record:
     seq: int
@@ -51,7 +44,7 @@ class WorkerRecords:
 
     def append(self, kind: str, body: dict[str, Any]) -> Record:
         if kind not in KINDS:
-            raise RecordError("record_kind", f"{kind!r} is not one of {KINDS}")
+            raise ValueError(f"record kind {kind!r} is not one of {KINDS}")
         record = Record(self.seq + 1, kind, int(time.time() * 1000), body)
         self.seq = record.seq
         self.records.append(record)

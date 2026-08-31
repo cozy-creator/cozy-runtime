@@ -1,4 +1,4 @@
-"""The no-CUDA worker: protocol session, journal, grants, arbitration, supervision.
+"""The no-CUDA worker: protocol session, records, grants, arbitration, supervision.
 
 Five modules, one process:
 

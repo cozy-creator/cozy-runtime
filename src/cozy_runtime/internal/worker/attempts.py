@@ -278,7 +278,7 @@ class AttemptRecord:
         spec, the payload, the grant, the plan, the hydrated inputs, the observation ring,
         the reconciliation — was retained for the life of the process because nothing ever
         released it. The terminal BYTES go too: they can carry a 4 MiB inline result and the
-        record log already holds them, so `wrap` re-reads if a replay ever comes (codex audit,
+        process records already hold them, so `wrap` re-reads if a replay comes,
         adopted 2026-08-25).
         """
         self.spec = {}
@@ -356,11 +356,8 @@ class AttemptEngine:
         self.prepared_models = dict(prepared_models)
         self.jobs = dict(jobs)
         self.spool_root = spool_root
-        #: Where a RUN's scratch lives. Deliberately OUTSIDE the record log root: §8 lets a
-        #: one-shot run delete its record log after a fully acknowledged terminal, and scratch
-        #: that lived under it would be deleted by exactly the ABANDONED terminal whose
-        #: whole point is that the next attempt resumes from what the killed one left.
-        #: Found live: the kill arm resumed from nothing until this moved out.
+        #: Where a run's scratch lives. Deliberately outside the disposable worker directory
+        #: so an acknowledged run can clean worker state without deleting resumable scratch.
         self.scratch_root = scratch_root
         self.instance_id = instance_id
         self.send = send
@@ -565,7 +562,7 @@ class AttemptEngine:
         run HANGS — `LocalRecordOwner` only deadlines a run that never dispatched. A 42,719 B
         request on the same path succeeds.
 
-        That violates the acceptance-boundary law directly: everything before the record log
+        That violates the acceptance-boundary law directly: everything before acceptance
         either completes or raises a typed PRE-ACCEPT refusal. So the size is a condition of
         acceptance, it is the CALLER's typed error (the bytes are theirs), and the refusal
         names both the cap and the remedy — media rides as ASSETS, hydrated into the attempt
@@ -822,9 +819,9 @@ class AttemptEngine:
             it -> choose the plan -> prepare the executor -> reserve the envelope -> RECORD
             -> publish AttemptAccepted.
 
-        Everything before the record log either completes or raises a typed PRE-ACCEPT refusal,
-        and the reservation rolls back if the record log cannot commit. The payload is fetched
-        HERE and not at execution time on purpose: a missing, expired or malformed payload
+        Everything before the process record either completes or raises a typed pre-accept
+        refusal. The payload is fetched here and not at execution time: a missing, expired
+        or malformed payload
         must be a refusal the RecordOwner can read, not an accepted attempt that later dies
         on a thread with no terminal to show for it.
 
@@ -1108,15 +1105,17 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ the job lane
 
-    def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
-        """Answer ONE durable mid-attempt request from the executor (cr-009's checkpoints).
+    def checkpoint_exchange(
+        self, attempt: AttemptRecord, frame: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Answer one checkpoint declaration request from the executor.
 
         Identity is (run, attempt, operation key, logical key, content digest). The row is
         recorded before this
         returns.
 
         WHAT IS DURABLE HERE IS THE DECLARATION, NOT THE BYTES (#553a). This handler is where
-        the false promise was measurable: it fsyncs a metadata row and sends a
+        the false promise was measurable: it records a metadata row and sends a
         `JobCheckpointRequest` whose `artifact` field it never fills, so no component on
         either side ever copies the checkpoint. `Checkpoints.save()` used to report success
         on this answer; it now refuses `checkpoint_sink_unbuilt`, and `Checkpoints.declare()`
@@ -1210,7 +1209,7 @@ class AttemptEngine:
         """Record the RecordOwner's verdict on a checkpoint this worker already recorded.
 
         It is a second observer, not a second authority: the declaration is already in this
-        worker's record log. A RecordOwner CONFLICT is a real fact and is recorded as a fault,
+        worker's process records. A RecordOwner conflict is recorded as a fault,
         because it means the run's identity is contested upstream — but it cannot
         retroactively un-write a declaration that is durable here.
         """
@@ -1285,7 +1284,9 @@ class AttemptEngine:
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=(lambda frame: self.durable_exchange(attempt, frame)) if job else None,
+                on_request=(lambda frame: self.checkpoint_exchange(attempt, frame))
+                if job
+                else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -1307,7 +1308,7 @@ class AttemptEngine:
             if attempt.canceling:
                 # The cgroup can be empty before the driver proves every captured birth
                 # absent. Only the watchdog owns that proof/retry; EOF is not permission to
-                # record log CANCELED ahead of it.
+                # record CANCELED ahead of it.
                 attempt.reclaim_done.wait()
                 return self.finish_cancel(attempt, attempt.canceling)
             # A job's scratch tree deliberately SURVIVES — it is the run's, not the
@@ -1820,7 +1821,7 @@ class AttemptEngine:
         The order is the whole point and none of it is negotiable:
 
             release the envelope -> reconcile every byte class -> WRITE and fsync the
-            bundle -> record log its write receipt -> record log the terminal that names it
+            bundle -> record its write receipt -> record the terminal that names it
 
         A terminal may only reference a bundle that is already durable, or it would be a
         claim about bytes nobody wrote. And the bundle is committed BEFORE the terminal so
@@ -2040,8 +2041,8 @@ class AttemptEngine:
         """Wrap the SAME recorded body in the current session envelope. The body and accepted
         placement are byte facts; only ownership-envelope fields move across a reconnect.
 
-        A CLOSED attempt no longer holds those bytes in memory — the record log does, and this
-        is the one place that ever needs them again.
+        A closed attempt no longer holds those bytes on the attempt object; process records
+        do. This is the only path that needs them again.
         """
         if not attempt.outcome_bytes and attempt.outcome_id:
             attempt.outcome_bytes = self.records.outcome_bytes(attempt.key())
@@ -2186,7 +2187,7 @@ class AttemptEngine:
 
     def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output
-        abort -> epoch invalidation -> record log CANCELED. Rebuilding readiness happens
+        abort -> epoch invalidation -> record CANCELED. Rebuilding readiness happens
         AFTER, off the cancellation critical path."""
         executor = attempt.executor
         started = time.perf_counter()

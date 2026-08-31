@@ -10,7 +10,7 @@ acceptance (§3.2). The ledger they are decided AGAINST is `worker/ledger.py`.
   protocol change, no new state, no forward dependency. A probe or a benchmark observed
   inside `choose` is a defect by construction: this function takes no I/O of any kind.
 * **ExecutorPreparer** — applies the chosen plan and DECIDES NOTHING. It is the reason
-  "accepted" never includes seconds of unjournaled preparation: the worker prepares
+  "accepted" never includes seconds of unrecorded preparation: the worker prepares
   first, journals second.
 
 The AttemptPlan is an in-process typed value. ``plan_digest`` is a domain-separated hash of its
@@ -48,7 +48,7 @@ class PreparedRequest:
 
     The resolved payload is an author-typed object and cannot cross a process boundary, so
     it stays in the executor under `request_id` and this carries only what a plan can be
-    priced against and a journal can hold: the NORMALIZED shape axes and the three digests.
+    priced against and process records can hold: the normalized shape axes and three digests.
     `invoke` runs the record these digests describe, so the plan and the handler agree by
     construction rather than by two derivations happening to match (codex audit, adopted
     2026-08-25 — they did not: the planner read an ad hoc scalar projection of the wire
@@ -211,7 +211,7 @@ class JobBinding:
     emits_media: bool = False
     gpu_rate_micro_usd_per_hour: int = 0
     """The GPU rate as an INTEGER of micro-USD: canonical documents are integer-only, and a
-    cost fact that cannot be canonicalized cannot be journaled. It arrives on the typed
+    cost fact that cannot be canonicalized cannot be recorded. It arrives on the typed
     config channel and never from environment (§2)."""
     cap_micro_usd: int = 0
     reclaim_on_terminal: bool = True

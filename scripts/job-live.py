@@ -2,7 +2,7 @@
 """cr-009's live verification: the @job surface, the job services and the runner, run for real.
 
 Not a test suite (#160). Every section below drives the ACTUAL machinery — the ephemeral
-local worker, the real seam, the real disposable executor, the real journal — over the
+local worker, the real seam, the real disposable executor, the real records — over the
 real 6.9 GB cozytensors bench store, and prints what it observed.
 
     corpus/.venv/bin/python scripts/job-live.py e2e       submit -> terminal -> output
@@ -323,14 +323,14 @@ def section_e2e() -> None:
         len(outcome.checkpoints) == 1 and outcome.checkpoints[0]["outcome"] == "RECORDED",
         json.dumps(outcome.checkpoints)[:220],
     )
-    journal_kinds = [row.get("kind") for row in outcome.attempt_records]
+    record_kinds = [row.get("kind") for row in outcome.attempt_records]
     check(
-        "the journal carries accepted -> job_checkpoint -> terminal -> closed, in that order",
-        journal_kinds.count("accepted") == 1
-        and journal_kinds.index("job_checkpoint") > journal_kinds.index("accepted")
-        and journal_kinds.index("outcome") > journal_kinds.index("job_checkpoint")
-        and journal_kinds.index("closed") > journal_kinds.index("outcome"),
-        " ".join(journal_kinds),
+        "the records carry accepted -> job_checkpoint -> outcome -> closed, in that order",
+        record_kinds.count("accepted") == 1
+        and record_kinds.index("job_checkpoint") > record_kinds.index("accepted")
+        and record_kinds.index("outcome") > record_kinds.index("job_checkpoint")
+        and record_kinds.index("closed") > record_kinds.index("outcome"),
+        " ".join(record_kinds),
     )
     check(
         "the accepted plan is the JOB lane's, with no model construction",
@@ -641,7 +641,7 @@ def _oversize_arm() -> None:
         f"{str(outcome.terminal.get('safe_message', ''))[:110]}",
     )
     check(
-        "the refusal is journaled and nothing was ACCEPTED",
+        "the refusal is recorded and nothing was ACCEPTED",
         not any(row.get("kind") == "accepted" for row in outcome.attempt_records),
         " ".join(str(row.get("kind")) for row in outcome.attempt_records),
     )
@@ -857,8 +857,8 @@ def section_identity() -> None:
         cli_bytes == direct_bytes and bool(cli_bytes),
         f"{len(cli_bytes)} B identical",
     )
-    # The receipt the runtime MINTS is the receipt the CLI RENDERS. It was journaled before
-    # the terminal named it and then dropped from the journal record, so a producer could not read
+    # The receipt the runtime MINTS is the receipt the CLI RENDERS. It was recorded before
+    # the terminal named it and then dropped from the process record, so a producer could not read
     # its own publication from the verb that made it (job-001).
     receipt = document.get("publication") or {}
     check(
@@ -937,7 +937,7 @@ def section_bench() -> None:
     check(
         "runner overhead is a fixed cost, not a per-byte one",
         overhead < 1500,
-        f"{overhead:.0f} ms for spawn + accept + journal + output transaction",
+        f"{overhead:.0f} ms for spawn + accept + records + output transaction",
     )
 
 

@@ -190,7 +190,7 @@ def completion_event(torch: Any, kind: str) -> Any:
 
 def streams_idle(torch: Any, kind: str) -> bool:
     """Whether the device has nothing outstanding. The device's OWN answer to quiescence,
-    which is why a terminal may be journaled on it rather than on a timer."""
+    which is why a terminal may be recorded on it rather than on a timer."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "streams_idle")
     return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())

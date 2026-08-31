@@ -52,7 +52,7 @@ def echo(payload: EchoRequest) -> EchoResult:
             json.dumps(
                 {
                     "euid": os.geteuid(),
-                    "worker_secret_read_refused": refused("/run/cozy/worker/journal.log"),
+                    "worker_secret_read_refused": refused("/run/cozy/bootstrap/tls.key"),
                     "worker_proc_mem_refused": refused(f"/proc/{worker_pid}/mem"),
                 },
                 sort_keys=True,

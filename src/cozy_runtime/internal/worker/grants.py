@@ -10,7 +10,7 @@ where that authority is SPENT — the only place the worker reads an input or wr
 output — and every spend goes through `authorize()` first.
 
 **The table is closed** (§3.1). Method + full-path regex + enumerated params, and a refusal
-is a SECURITY EVENT, not a 404: it is counted, journaled by the caller and reported as a
+is a SECURITY EVENT, not a 404: it is counted, recorded by the caller and reported as a
 `Fault`, because a worker asking for something it was never granted is a fact an operator
 must see. Nothing widens the table at runtime; a new call site is a new reviewed row.
 
@@ -686,7 +686,7 @@ def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str
 
 @dataclass(frozen=True, slots=True)
 class PublicationReceipt:
-    """ONE typed journal record per publication (cr-009).
+    """One typed process record per publication (cr-009).
 
     What an attempt actually wrote, as a closed record with its own identity: the scope it wrote
     under, whose build wrote it, which attempt, and every entry with its digest and length.

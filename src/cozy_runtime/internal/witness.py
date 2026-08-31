@@ -2,13 +2,13 @@
 
 Executor death was already covered — the worker outlives it, journals a terminal, and
 converges. The worker's OWN death was not, and it is the one that matters most: the
-journal owner is the process that says what happened, so when the kernel kills it there is
+worker is the process that says what happened, so when the kernel kills it there is
 nobody left to write the sentence. v1's postmortem gap is exactly this shape, and every
 attempt to close it from inside the dying process failed for the same reason — an OOM kill
 is SIGKILL and SIGKILL runs no handler.
 
 So a WITNESS parent execs the worker and outlives it. It is deliberately tiny: no torch,
-no protocol, no journal writes, no threads. It appends a boot event before the child starts,
+no protocol, no worker-record writes, no threads. It appends a boot event before the child starts,
 waits, and appends a death event naming what it saw from outside:
 
     exit status, and the SIGNAL when there was one

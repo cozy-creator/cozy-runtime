@@ -217,7 +217,7 @@ def denoise(
 @app.entrypoint
 def stubborn(payload: StubbornInput, model: SdxlUnetModel, ctx: Context) -> DenoiseOutput:
     """Real GPU work with NO cancellation check anywhere. The cooperative signal lands and
-    nothing reads it — which is exactly the case where `CANCELED` may only be journaled
+    nothing reads it — which is exactly the case where `CANCELED` may only be recorded
     after the executor is provably dead."""
     import hashlib
 

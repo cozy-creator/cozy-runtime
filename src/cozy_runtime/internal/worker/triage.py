@@ -200,10 +200,7 @@ class BundleStore:
     @staticmethod
     def receipts(source: WorkerRecords) -> dict[str, dict[str, Any]]:
         """Every same-process write receipt by subject."""
-        return {
-            str(record.body["subject_id"]): record.body
-            for record in source.of_kind("triage")
-        }
+        return {str(record.body["subject_id"]): record.body for record in source.of_kind("triage")}
 
     @staticmethod
     def read(

@@ -106,7 +106,7 @@ jobs:
 
   lifecycle:
     # The weightless acceptance run (scripts/lifecycle-live.py): boot -> invoke ->
-    # cooperative cancel -> executor SIGKILL -> worker-kill orphan reap -> recovery, no
+    # cooperative cancel -> executor SIGKILL -> worker-kill orphan reap -> fresh process, no
     # model and no device. EXPECTED RED until cr-021's darwin ProcessTree lands: today the
     # executor seal refuses typed (proctree.arm_parent_death has no darwin implementation),
     # and that typed refusal in the transcript IS the port's honest status — #450 says the

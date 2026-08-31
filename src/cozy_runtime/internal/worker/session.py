@@ -224,7 +224,7 @@ class WorkerOptions:
 @dataclass(slots=True)
 class Placement:
     """The ONE hosted placement (launch enforces len(placements) <= 1, §2). The id is the
-    RecordOwner-minted routing + record log key; it is never invocation identity.
+    RecordOwner-minted routing key; it is never invocation identity.
 
     `placement_set_digest` plus `placement_id` is the placement's identity. A single-placement
     replace is this SAME `placement_id` in a new set, which is why routing survives rollout.
@@ -1063,7 +1063,7 @@ class Worker:
         self._settle()
 
     def fail_machine(self, why: str) -> None:
-        """A MACHINE-scope failure: this worker can no longer honour record log-before-send.
+        """A machine-scope failure that closes admission.
 
         `WORKER_PHASE_FAILED` is where that fact lives now (#482) — machine lifecycle is out
         of the placement enum, because "the placement cannot serve" and "the worker cannot
@@ -1075,8 +1075,8 @@ class Worker:
                 kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
                 subject=self.options.worker_id,
                 reason=why[:1024],
-                detail="the worker cannot durably record what it would claim, so it stops "
-                "admitting rather than emitting an outcome it can never replay",
+                detail="the worker hit an unrecoverable local safety fault, so it stops "
+                "admitting further work",
             )
         )
         self.set_phase(pb.WorkerPhase.WORKER_PHASE_FAILED, why)
@@ -1420,7 +1420,6 @@ class Worker:
         body = pb.WorkerSnapshotBody(
             accepted_desired_state_revision=self.accepted.accepted_desired_state_revision,
             accepted_placement_set_digest=self.accepted.accepted_placement_set_digest,
-            journal_highwater=self.records.appends,
             worker_phase=self.phase,
             converged_revision=self.converged_revision(),
             admission_generation=self.admission_generation,
@@ -3031,7 +3030,7 @@ class Worker:
         self.await_settled(attempt)
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance
-        # record log: a queued offer cannot be accepted on the far side of a placement or
+        # A queued offer cannot be accepted on the far side of a placement or
         # admission-generation change merely because it passed `on_offer()` earlier.
         with self.control_lock:
             if attempt.canceling:
