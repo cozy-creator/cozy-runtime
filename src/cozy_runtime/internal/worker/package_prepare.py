@@ -12,8 +12,6 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from packaging.utils import InvalidWheelFilename, parse_wheel_filename
-
 from cozy_runtime.internal import (
     canonical,
     descriptor,
@@ -233,18 +231,6 @@ def prepare_package(
             model_files[digest] = (row.kind, row.length, path)
             continue
         owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
-        if owner == "custom":
-            try:
-                distribution, _version, _build, _tags = parse_wheel_filename(row.filename)
-            except InvalidWheelFilename as exc:
-                raise PreparationRefusal("package_prepare_file_invalid", row.filename) from exc
-            if _DISTRIBUTION.sub("-", str(distribution)).lower() in base.distribution_versions:
-                # A release is portable across CPU/CUDA bases with different ambient
-                # inventories. Never overlay or shadow an image-owned distribution;
-                # materialize() checks the project requirement against the actual base
-                # version after these redundant carrier bytes are omitted.
-                verified(digest, row.length, path)
-                continue
         try:
             wheel, receipt = overlay.measure_wheel(
                 path,
@@ -256,6 +242,9 @@ def prepare_package(
             raise PreparationRefusal(exc.code, exc.detail) from exc
         if wheel.digest != digest or wheel.length != row.length:
             raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
+        if owner == "custom" and overlay.base_owned_wheel(wheel, base):
+            verified(digest, row.length, path)
+            continue
         facts.append((wheel, path, receipt))
     if len(parents) != 1:
         raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")

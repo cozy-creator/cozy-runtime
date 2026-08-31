@@ -9,6 +9,7 @@ from pathlib import Path
 from packaging.utils import canonicalize_name
 
 from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal import overlay
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.protocol import documents
@@ -38,8 +39,7 @@ def run(args: list[str], _opts: Options) -> Result:
     ):
         raise _error("private_preflight_request_invalid", "wheels and bases must be nonempty")
     wheel_paths = [_path(value, "wheel") for value in wheel_values]
-    base_paths = [_path(value, "base manifest") for value in base_values]
-    if len(set(wheel_paths)) != len(wheel_paths) or len(set(base_paths)) != len(base_paths):
+    if len(set(wheel_paths)) != len(wheel_paths):
         raise _error("private_preflight_request_invalid", "paths must be unique")
 
     revision_raw = _bytes(revision_path, MAX_REQUEST_BYTES, "private revision")
@@ -47,7 +47,27 @@ def run(args: list[str], _opts: Options) -> Result:
         revision = documents.read(revision_raw, pb.PrivatePackageRevision)
     except documents.DocumentError as exc:
         raise _error("private_revision_invalid", exc.detail) from exc
+    required_revision = {
+        "files",
+        "format",
+        "package",
+        "package_descriptor",
+        "release",
+        "source_digest",
+    }
+    if set(revision) != required_revision:
+        raise _error("private_revision_invalid", "required revision fields are absent")
+    if not isinstance(revision["package"], str) or not isinstance(revision["release"], str):
+        raise _error("private_revision_invalid", "package or release is malformed")
+    try:
+        documents.raw(str(revision["source_digest"]))
+    except (documents.DocumentError, ValueError) as exc:
+        raise _error("private_revision_invalid", "source_digest is malformed") from exc
     descriptor_raw = _bytes(descriptor_path, MAX_DESCRIPTOR_BYTES, "package descriptor")
+    try:
+        package_descriptor.read_bytes(descriptor_raw, str(descriptor_path))
+    except package_descriptor.StalePackageDescriptor as exc:
+        raise _error("private_revision_descriptor_invalid", str(exc)) from exc
     descriptor = revision.get("package_descriptor")
     expected_descriptor = {
         "digest": "sha256:" + hashlib.sha256(descriptor_raw).hexdigest(),
@@ -105,12 +125,33 @@ def run(args: list[str], _opts: Options) -> Result:
     compatible: list[dict[str, object]] = []
     refused: list[dict[str, str]] = []
     measured_wheels: tuple[overlay.Wheel, ...] | None = None
-    for base_path in base_paths:
+    seen_bases: set[tuple[Path, str]] = set()
+    bases: list[tuple[Path, str, bytes]] = []
+    for value in base_values:
+        if not isinstance(value, dict) or set(value) != {"digest", "path"}:
+            raise _error("private_preflight_request_invalid", "base row is not exact")
+        base_path = _path(value["path"], "base manifest")
+        base_digest = value["digest"]
+        if not isinstance(base_digest, str):
+            raise _error("private_preflight_request_invalid", "base digest is absent")
+        try:
+            documents.raw(base_digest)
+        except (documents.DocumentError, ValueError) as exc:
+            raise _error("private_preflight_request_invalid", "base digest is malformed") from exc
+        identity = (base_path, base_digest)
+        if identity in seen_bases:
+            raise _error("private_preflight_request_invalid", "base rows must be unique")
+        seen_bases.add(identity)
         base_raw = _bytes(base_path, MAX_BASE_BYTES, "base manifest")
+        if "sha256:" + hashlib.sha256(base_raw).hexdigest() != base_digest:
+            raise _error("private_preflight_base_mismatch", str(base_path))
+        bases.append((base_path, base_digest, base_raw))
+
+    for base_path, base_digest, base_raw in bases:
         try:
             base, wheels = overlay.preflight_overlay(project_path, dependencies, base_raw)
         except overlay.OverlayRefusal as exc:
-            refused.append({"base": str(base_path), "code": exc.code, "detail": exc.detail})
+            refused.append({"base": base_digest, "code": exc.code, "detail": exc.detail})
             continue
         facts = {wheel.filename: wheel for wheel in wheels}
         if any(
@@ -121,7 +162,8 @@ def run(args: list[str], _opts: Options) -> Result:
         measured_wheels = wheels
         compatible.append(
             {
-                "base": str(base_path),
+                "base": base_digest,
+                "path": str(base_path),
                 "compatibility_profile": dict(base.compatibility_profile),
                 "platform_target": dict(base.platform_target),
             }

@@ -120,7 +120,7 @@ def fence_python_abi() -> list[str]:
     scaffold = (SRC / "cli" / "new.py").read_text()
     for expected in (
         'requires-python = ">=3.12,<3.13"',
-        'dependencies = ["cozy-runtime>={__version__},<0.1"]',
+        'dependencies = ["cozy-runtime>={__version__},<1.0.0"]',
         'python_version = "3.12"',
     ):
         if expected not in scaffold:
@@ -727,9 +727,7 @@ def fence_base_ownership_vectors() -> list[str]:
             else:
                 bad.append(f"{path}:{line_number}: pod accepted an observed-local base")
     wanted = {
-        "cuda-cpu-torch-refused",
-        "cpu-cuda-inventory-refused",
-        "cpu-cuda-torch-refused",
+        "cpu-ambient-cuda-libs-v1",
         "generic-cuda-torch-fact-refused",
         "generic-cuda-without-torch-v1",
         "generic-image-torch-fact-refused",
@@ -738,7 +736,9 @@ def fence_base_ownership_vectors() -> list[str]:
         "minimal-complete-v1",
         "observed-local-v1",
         "torch-cpu-foreign-root-refused",
+        "torch-cpu-local-tag-v1",
         "torch-cpu-missing-fact-refused",
+        "torch-cuda-local-tag-v1",
         "unknown-format-refused",
         "unknown-provider-refused",
     }
@@ -749,14 +749,14 @@ def fence_base_ownership_vectors() -> list[str]:
         (
             "base-worker-image-wheelhouse-cpu.json",
             24_968,
-            "sha256:e404dfe19c6bf8224e2cd15ba8b33448bd417b38813f61a78249e94e1d6dcbc2",
+            "sha256:584d007d0af334ab40c62fd252646351c9309223e78ad67f5a0ffd721877f9de",
             (27, 324, 26),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
             25_538,
-            "sha256:f2fabb3593193ddd2205e30a1f35269c6b24e8244378b02b39c748bd765d112f",
+            "sha256:fc003f4be5c82e3b6abe0745c35f456d81960edcce4172e82ddc763992a37cba",
             (86, 363, 10),
             ("cuda", "cu130"),
         ),
@@ -806,8 +806,8 @@ def fence_base_ownership_vectors() -> list[str]:
             "cozy-runtime": (
                 "0.0.19",
                 "cozy_runtime-0.0.19-py3-none-any.whl",
-                "sha256:3f75a74da6240654346d5f02c395524cb7f8613757b31c1814ce1c1543d72305",
-                743_708,
+                "sha256:be1a9ee5fdab390ac360acdc163967dead2186d1f659966cdbd3c652f8d466a3",
+                743_799,
             ),
             "tensorfs": (
                 "0.0.5",

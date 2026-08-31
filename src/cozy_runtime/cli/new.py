@@ -29,7 +29,7 @@ def _pyproject(name: str, pkg: str) -> str:
 name = "{name}"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>={__version__},<0.1"]
+dependencies = ["cozy-runtime>={__version__},<1.0.0"]
 
 [project.entry-points."cozy.application"]
 default = "{pkg}:app"

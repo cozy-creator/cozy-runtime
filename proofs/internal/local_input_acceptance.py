@@ -21,7 +21,12 @@ from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal import descriptor
 from cozy_runtime.internal.config import read_config
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import LocalInput, LocalRequest, run_slice
+from cozy_runtime.internal.local import (
+    LocalInput,
+    LocalRequest,
+    development_source_digest,
+    run_slice,
+)
 from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -59,7 +64,11 @@ def _input_slice(
     found = discover(project)
     body = descriptor.build(found)
     descriptor_id = descriptor.job_descriptor_id(body, "inspect")
-    release_id = str(body["application"])
+    release_id = development_source_digest(project)
+    workspace.mkdir(parents=True, exist_ok=True)
+    descriptor_path = workspace / "package-descriptor.json"
+    descriptor_path.write_bytes(descriptor.canonical_bytes(body))
+    overlay_root = project / "src"
 
     def plant(owner: Any, worker: Any) -> None:
         del worker
@@ -101,11 +110,17 @@ def _input_slice(
             {
                 "job_descriptor_id": descriptor_id,
                 "build_id": release_id,
-                "project": str(project),
+                "application": str(body["application"]),
+                "package_descriptor": str(descriptor_path),
+                "overlay": str(overlay_root if overlay_root.is_dir() else project),
+                "overlay_content_digest": release_id,
                 "job": "inspect",
                 "gpu_count": 0,
                 "publishes": False,
                 "emits_media": False,
+                "gpu_rate_micro_usd_per_hour": 0,
+                "cap_micro_usd": 0,
+                "reclaim_on_terminal": True,
             }
         ],
         workspace=workspace,

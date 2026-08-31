@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from cozy_runtime.cli import private_preflight
-from cozy_runtime.cli.io import Options
+from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
@@ -224,7 +224,12 @@ def main(argv: list[str] | None = None) -> int:
         preflight_request.write_text(
             json.dumps(
                 {
-                    "base_manifests": [str(base)],
+                    "base_manifests": [
+                        {
+                            "digest": "sha256:" + hashlib.sha256(base.read_bytes()).hexdigest(),
+                            "path": str(base),
+                        }
+                    ],
                     "descriptor": str(descriptor_path),
                     "revision": str(revision_path),
                     "wheels": [str(local_wheel)],
@@ -236,6 +241,42 @@ def main(argv: list[str] | None = None) -> int:
         assert isinstance(preflight.document, dict)
         assert preflight.document["private_revision_digest"] == documents.spell(private_revision)
         assert len(preflight.document["compatible"]) == 1
+        missing_source = json.loads(_revision_raw)
+        missing_source.pop("source_digest")
+        missing_source_path = root / "private-revision-missing-source.json"
+        missing_source_path.write_bytes(canonical.write(missing_source))
+        missing_request = json.loads(preflight_request.read_text())
+        missing_request["revision"] = str(missing_source_path)
+        missing_request_path = root / "private-preflight-missing-source.json"
+        missing_request_path.write_text(json.dumps(missing_request, sort_keys=True))
+        try:
+            private_preflight.run([str(missing_request_path)], Options())
+        except CliError as exc:
+            assert exc.name == "private_revision_invalid", exc
+        else:
+            raise AssertionError("private preflight admitted an absent source digest")
+
+        malformed_descriptor = b"{}"
+        malformed_descriptor_path = root / "private-descriptor-malformed.json"
+        malformed_descriptor_path.write_bytes(malformed_descriptor)
+        malformed_revision = json.loads(_revision_raw)
+        malformed_revision["package_descriptor"] = {
+            "digest": "sha256:" + hashlib.sha256(malformed_descriptor).hexdigest(),
+            "length": len(malformed_descriptor),
+        }
+        malformed_revision_path = root / "private-revision-malformed-descriptor.json"
+        malformed_revision_path.write_bytes(canonical.write(malformed_revision))
+        malformed_request = json.loads(preflight_request.read_text())
+        malformed_request["descriptor"] = str(malformed_descriptor_path)
+        malformed_request["revision"] = str(malformed_revision_path)
+        malformed_request_path = root / "private-preflight-malformed-descriptor.json"
+        malformed_request_path.write_text(json.dumps(malformed_request, sort_keys=True))
+        try:
+            private_preflight.run([str(malformed_request_path)], Options())
+        except CliError as exc:
+            assert exc.name == "private_revision_descriptor_invalid", exc
+        else:
+            raise AssertionError("private preflight admitted a malformed descriptor")
         private_result = package_prepare.prepare_private_package(
             pb.PreparePrivatePackageRequest(
                 operation_id="private-marco-01",
@@ -343,9 +384,23 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
             check=True,
             stdout=subprocess.DEVNULL,
         )
+        subprocess.run(
+            [
+                "uv",
+                "build",
+                "--wheel",
+                "--out-dir",
+                str(wheels),
+                "proofs/fixtures/environment-resolved",
+            ],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
     else:
         wheels = wheel_dir
     wheel = next(wheels.glob("modeled_development_package-*.whl"))
+    helper_wheel = next(wheels.glob("proof_environment_resolved-*.whl"))
     wheel_raw = wheel.read_bytes()
     wheel_digest = hashlib.sha256(wheel_raw).digest()
     view = cache / "sets" / "modeled"
@@ -353,6 +408,26 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
     local_wheel = view / wheel.name
     local_wheel.write_bytes(wheel_raw)
     (cache / wheel_digest.hex()).hardlink_to(local_wheel)
+    base_without_helper = base.read_bytes()
+    base_with_helper = json.loads(base_without_helper)
+    base_with_helper["base_distributions"].append(
+        {"distribution": "proof-environment-resolved", "version": "2.0.0"}
+    )
+    base_with_helper["base_distributions"].sort(key=lambda row: row["distribution"])
+    base_with_helper["base_import_roots"].append(
+        {
+            "providers": ["proof-environment-resolved"],
+            "root": "proof_environment_resolved",
+        }
+    )
+    base_with_helper["base_import_roots"].sort(key=lambda row: row["root"])
+    _base, carried = overlay.preflight_overlay(
+        local_wheel, (helper_wheel.resolve(),), base_without_helper
+    )
+    _base, reused = overlay.preflight_overlay(
+        local_wheel, (helper_wheel.resolve(),), canonical.write(base_with_helper)
+    )
+    assert len(carried) == 2 and len(reused) == 1
 
     source_root = root / "modeled-source"
     model = create(source_root, tensor=b"\x80\x3f" * 4)

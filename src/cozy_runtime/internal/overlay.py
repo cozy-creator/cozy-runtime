@@ -278,22 +278,48 @@ def preflight_overlay(
 
     base_digest = _sha(base_raw)
     base = parse_base_manifest(base_raw, base_digest)
-    measured = [measure_wheel(project, "project", base)]
-    measured.extend(measure_wheel(path, "custom", base) for path in dependencies)
+    project_row = measure_wheel(project, "project", base)
+    measured = [(project_row[0], project_row[1], project)]
+    for path in dependencies:
+        row = measure_wheel(path, "custom", base)
+        if not base_owned_wheel(row[0], base):
+            measured.append((row[0], row[1], path))
     wheels = tuple(row[0] for row in measured)
     source = Input(
         environment_digest=_sha(canonical.write({"wheels": [wheel.digest for wheel in wheels]})),
         base_family_digest=base_digest,
-        project_wheel_digest=measured[0][0].digest,
+        project_wheel_digest=project_row[0].digest,
         wheels=wheels,
         grants=tuple(
             BlobGrant(wheel.digest, wheel.length, path, receipt)
-            for (wheel, receipt), path in zip(measured, (project, *dependencies), strict=True)
+            for wheel, receipt, path in measured
         ),
     )
     ordered = _verify_inventory(source, base)
     _verify_grants(source, ordered, base, allow_native_custom=False)
     return base, ordered
+
+
+def base_owned_wheel(wheel: Wheel, base: BaseManifest) -> bool:
+    """Normalize an exact redundant carrier to the base or refuse a conflicting shadow."""
+
+    version = base.distribution_versions.get(wheel.distribution)
+    if version is None:
+        return False
+    roots = tuple(
+        sorted(
+            root
+            for root, providers in base.root_providers.items()
+            if wheel.distribution in providers
+        )
+    )
+    if Version(version) != Version(wheel.version) or roots != wheel.import_roots:
+        raise OverlayRefusal(
+            "overlay_base_distribution_conflict",
+            f"distribution={wheel.distribution} carrier={wheel.version}/{wheel.import_roots} "
+            f"base={version}/{roots}",
+        )
+    return True
 
 
 def expected_receipt_bytes(source: Input) -> bytes:
@@ -671,19 +697,10 @@ def _validate_base_profile(
 
     installed = dict(distributions)
     providers = dict(roots)
-    cuda_distributions = {
-        name for name in installed if name in {"triton", "nvidia"} or name.startswith("nvidia-")
-    }
-    cuda_roots = {"triton", "nvidia"}.intersection(providers)
-    if cpu and (cuda_distributions or cuda_roots):
-        raise OverlayRefusal("base_family_manifest_invalid", "contradictory accelerator inventory")
-
     release = profile["torch_release"]
     torch_version = installed.get("torch")
     if torch_version is None:
-        orphan_companions = {"torchaudio", "torchvision"}.intersection(installed)
-        orphan_roots = {"torch", "torchaudio", "torchvision"}.intersection(providers)
-        if release != "none" or orphan_companions or orphan_roots:
+        if release != "none" or "torch" in providers:
             raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
         return
 
@@ -694,15 +711,8 @@ def _validate_base_profile(
         raise OverlayRefusal(
             "base_family_manifest_invalid", "contradictory Torch profile"
         ) from None
-    local = installed_torch.local
     release_matches = installed_torch.release[:3] == declared_torch.release[:3]
-    build_matches = local in (None, "cpu") if cpu else local == abi
-    if (
-        release == "none"
-        or not release_matches
-        or not build_matches
-        or providers.get("torch") != ("torch",)
-    ):
+    if release == "none" or not release_matches or "torch" not in providers.get("torch", ()):
         raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
 
 
