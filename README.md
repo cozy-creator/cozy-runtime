@@ -11,7 +11,8 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
-Runtime `0.0.10` targets the standard CPython 3.14 ABI only. Project tooling pins `3.14`;
+Runtime source master is `0.0.11.dev0` and targets the standard CPython 3.14 ABI only. Project
+tooling pins `3.14`;
 the separate free-threaded `cp314t` ABI is deliberately refused until Runtime, Torch, TensorFS
 and the complete native dependency set have an independently qualified free-threaded seat.
 
