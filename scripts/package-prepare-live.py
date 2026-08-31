@@ -12,6 +12,7 @@ from pathlib import Path
 
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import package_prepare
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -144,6 +145,7 @@ def main() -> int:
         assert result.placement_set.placement_set_digest == documents.digest_of(
             result.placement_set.placement_set_canonical_bytes
         )
+        assert len(read_placement_set(result.placement_set)) == 1
         print(
             "package preparation: pure Marco wheel -> overlay -> derived descriptor -> "
             "weightless PlacementSet passed"
