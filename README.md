@@ -11,7 +11,7 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
-Runtime release `0.0.16` targets standard CPython 3.12 only. Project
+Runtime release `0.0.19` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 
 Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
@@ -249,10 +249,13 @@ publishes it. Cold and independent rebuilds produce the same compact receipt.
 ### Installed base plus package overlay
 
 `internal/overlay.py` is the serving materializer. The image already contains Python,
-Torch/CUDA, cozy-runtime, TensorFS, and the registered base-family dependencies. A placement
-therefore installs only its deterministic project wheel and optional exact custom wheels. It
-never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
-archives after extraction.
+cozy-runtime, TensorFS, and its complete declared base-family inventory. Accelerator profiles also
+contain Torch/CUDA; a generic CPU image may instead declare `torch_release=none` only when both
+accelerator coordinates are `none`, `accelerator_build=cpu`, and its distribution/import-root
+inventory proves that no Torch family, Triton, or NVIDIA fact exists. A placement therefore
+installs only its deterministic project wheel and optional exact custom wheels. It never creates a
+venv, copies Torch, reads an index, resolves a dependency, or retains wheel archives after
+extraction.
 
 The image's OCI digest owns image-resident integrity. `WheelhouseManifest/1` is the complete
 canonical ownership document for that image: its existing platform target and exact control-wheel

@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
                         "accelerator_build": "cpu",
                         "os_cpu": "linux-x86",
                         "python_abi": "cp312",
-                        "torch_release": "2.13.0",
+                        "torch_release": "none",
                     },
                     "format": "WheelhouseManifest/1",
                     "minimum_cuda_version": "none",
@@ -191,6 +191,28 @@ def main(argv: list[str] | None = None) -> int:
         )
         assert len(read_placement_set(result.placement_set)) == 1
         private_source = hashlib.sha256(b"exact editable Marco source").digest()
+        private_descriptor = descriptor.canonical_bytes(
+            descriptor.build(discovery.discover(ROOT / "examples" / "marco-polo"))
+        )
+        revision = pb.PrivatePackageRevision(
+            package="local/marco-polo",
+            release="1.0.4",
+            source_digest=private_source,
+            package_descriptor=pb.Ref(
+                digest=hashlib.sha256(private_descriptor).digest(),
+                length=len(private_descriptor),
+            ),
+            files=[
+                pb.PrivatePackageFileRef(
+                    digest=row.digest,
+                    filename=row.filename,
+                    kind=row.kind,
+                    length=row.length,
+                )
+                for row in files
+            ],
+        )
+        _revision_raw, private_revision = documents.identity(revision)
         private_result = package_prepare.prepare_private_package(
             pb.PreparePrivatePackageRequest(
                 operation_id="private-marco-01",
@@ -198,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                     package="local/marco-polo",
                     release="1.0.4",
                     source_digest=private_source,
+                    private_revision_digest=private_revision,
                 ),
                 files=files,
                 environment_root=str(root / "private-environments"),
@@ -214,10 +237,15 @@ def main(argv: list[str] | None = None) -> int:
             private_result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
         )["placements"][0]
         assert private["development"]["source_digest"] == documents.spell(private_source)
+        assert private["development"]["private_revision_digest"] == documents.spell(
+            private_revision
+        )
         assert private["development"]["project_wheel"]["ref"]["digest"] == (
             "sha256:" + digest.hex()
         )
         assert private["environment"]["wheels"] == []
+        assert private["entrypoints"] == []
+        assert private["models"] == []
         assert len(read_placement_set(private_result.placement_set)) == 1
         modeled(root, base, cache, args.wheel_dir)
         print(

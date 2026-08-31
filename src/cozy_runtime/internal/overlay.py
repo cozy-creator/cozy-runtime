@@ -1,9 +1,10 @@
 """Small package overlays over the immutable base-worker-image Python environment.
 
-The base worker image already owns Python, Torch/CUDA, cozy-runtime, TensorFS, and their
-common dependencies. A placement therefore materializes only the package project wheel
-and optional package-owned custom wheels. It never creates a venv, resolves a dependency,
-copies a base package, or re-hashes the base environment's RECORD tree.
+The base worker image already owns Python, cozy-runtime, TensorFS, and its complete declared
+distribution/import-root inventory. Accelerator profiles also own Torch/CUDA; a generic CPU image
+may explicitly prove that it owns neither. A placement therefore materializes only the package
+project wheel and optional package-owned custom wheels. It never creates a venv, resolves a
+dependency, copies a base package, or re-hashes the base environment's RECORD tree.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
 after boot: exact wheel grants are hashed once, inspected, extracted into private staging,
@@ -570,7 +571,7 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
     if not isinstance(value, dict) or set(value) not in shapes:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong fields")
     ownership = value.get("ownership", "image")
-    if ownership not in {"image", "observed-local"}:
+    if not isinstance(ownership, str) or not ownership:
         raise OverlayRefusal("base_family_manifest_invalid", "invalid ownership")
     if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong format")
@@ -579,56 +580,27 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         not isinstance(platform, dict)
         or set(platform) != _PLATFORM_TARGET_FIELDS
         or not all(isinstance(item, str) and item for item in platform.values())
+        or platform["python_abi"] != "cp312"
+        or platform["os_arch"] != "linux/amd64"
+        or re.fullmatch(r"glibc[0-9]+\.[0-9]+", platform["libc"]) is None
+        or platform["accelerator_backend"] not in {"none", "cuda"}
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid platform_target")
     profile = value["compatibility_profile"]
-    accelerator_build = profile.get("accelerator_build") if isinstance(profile, dict) else None
-    cpu_profile = (
-        accelerator_build == "cpu"
-        and platform.get("accelerator_backend") == "none"
-        and platform.get("accelerator_abi") == "none"
-    )
-    accelerator_profile = (
-        isinstance(profile, dict)
-        and accelerator_build == platform.get("accelerator_abi")
-        and platform.get("accelerator_backend") == "cuda"
-    )
     if (
         not isinstance(profile, dict)
         or set(profile) != _COMPATIBILITY_PROFILE_FIELDS
         or not all(isinstance(item, str) and item for item in profile.values())
-        or not (cpu_profile or accelerator_profile)
         or profile["python_abi"] != platform["python_abi"]
         or profile["os_cpu"] != "linux-x86"
-        or platform["os_arch"] != "linux/amd64"
-        or (
-            re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", profile["torch_release"]) is None
-            and not (ownership == "observed-local" and profile["torch_release"] == "none")
-        )
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
     minimum_cuda = value["minimum_cuda_version"]
     minimum_driver = value["minimum_driver_version"]
-    cuda_floors = (
-        isinstance(minimum_cuda, str)
-        and re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is not None
-        and isinstance(minimum_driver, str)
-        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is not None
-    )
-    cpu_floors = minimum_cuda == "none" and minimum_driver == "none"
-    if not ((cpu_profile and cpu_floors) or (accelerator_profile and cuda_floors)):
-        raise OverlayRefusal("base_family_manifest_invalid", "invalid CUDA or driver floor")
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
-    if ownership == "observed-local":
-        # A local Runtime observes either its lightweight CPU environment or the exact
-        # Torch/CUDA environment Creator uses for local GPU execution. Unlike an image,
-        # an installed environment has no retained source wheel bytes to claim here.
-        if value["wheels"] != []:
-            raise OverlayRefusal("base_family_manifest_invalid", "invalid observed-local base")
-        wheels: tuple[Wheel, ...] = ()
-    else:
-        wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
+    _validate_base_profile(platform, profile, minimum_cuda, minimum_driver, distributions, roots)
+    wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
     return BaseManifest(
         platform_target=tuple(sorted(platform.items())),
         compatibility_profile=tuple(sorted(profile.items())),
@@ -639,6 +611,70 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         base_import_roots=roots,
         ownership=ownership,
     )
+
+
+def _validate_base_profile(
+    platform: dict[str, object],
+    profile: dict[str, object],
+    minimum_cuda: object,
+    minimum_driver: object,
+    distributions: tuple[tuple[str, str], ...],
+    roots: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    backend = platform["accelerator_backend"]
+    abi = platform["accelerator_abi"]
+    build = profile["accelerator_build"]
+    cpu = backend == "none" and abi == "none" and build == "cpu"
+    cuda = (
+        backend == "cuda"
+        and isinstance(abi, str)
+        and re.fullmatch(r"cu[0-9]+", abi) is not None
+        and build == abi
+    )
+    floors = (
+        minimum_cuda == "none" and minimum_driver == "none"
+        if cpu
+        else isinstance(minimum_cuda, str)
+        and re.fullmatch(r"[0-9]+\.[0-9]+", minimum_cuda) is not None
+        and isinstance(minimum_driver, str)
+        and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", minimum_driver) is not None
+    )
+    if not (cpu or cuda) or not floors:
+        raise OverlayRefusal("base_family_manifest_invalid", "contradictory accelerator profile")
+
+    installed = dict(distributions)
+    providers = dict(roots)
+    torch_facts = {
+        name
+        for name in installed
+        if name in {"torch", "torchaudio", "torchvision", "triton", "nvidia"}
+        or name.startswith("nvidia-")
+    }
+    torch_roots = {"torch", "torchaudio", "torchvision", "triton", "nvidia"}
+    release = profile["torch_release"]
+    torch_version = installed.get("torch")
+    if torch_version is None:
+        if not cpu or release != "none" or torch_facts or torch_roots.intersection(providers):
+            raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
+        return
+
+    try:
+        installed_torch = Version(torch_version)
+        declared_torch = Version(str(release))
+    except InvalidVersion:
+        raise OverlayRefusal(
+            "base_family_manifest_invalid", "contradictory Torch profile"
+        ) from None
+    local = installed_torch.local
+    release_matches = installed_torch.release[:3] == declared_torch.release[:3]
+    build_matches = local in (None, "cpu") if cpu else local == abi
+    if (
+        release == "none"
+        or not release_matches
+        or not build_matches
+        or providers.get("torch") != ("torch",)
+    ):
+        raise OverlayRefusal("base_family_manifest_invalid", "contradictory Torch profile")
 
 
 def _base_distribution_rows(value: object) -> tuple[tuple[str, str], ...]:
@@ -704,7 +740,7 @@ def _base_wheel_rows(
     distributions: dict[str, str],
     root_providers: dict[str, tuple[str, ...]],
 ) -> tuple[Wheel, ...]:
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list):
         raise OverlayRefusal("base_family_manifest_invalid", "wheels is not a list")
     wheels: list[Wheel] = []
     for item in value:

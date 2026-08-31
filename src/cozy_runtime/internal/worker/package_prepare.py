@@ -131,6 +131,7 @@ def prepare_private_package(
         or package.package.count("/") != 1
         or not package.release
         or len(package.source_digest) != 32
+        or len(package.private_revision_digest) != 32
         or package.HasField("project_wheel")
     ):
         raise PreparationRefusal("private_package_identity_invalid", request.operation_id)
@@ -146,9 +147,9 @@ def prepare_private_package(
     return prepare_package(
         package_name=package.package,
         release=package.release,
-        release_digest=documents.spell(package.source_digest),
+        release_digest=documents.spell(package.private_revision_digest),
         files=request.files,
-        placement_seed=(request.operation_id.encode("ascii") + package.source_digest),
+        placement_seed=(request.operation_id.encode("ascii") + package.private_revision_digest),
         artifact_cache=artifact_cache,
         environment_root=environment_root,
         python=python,
@@ -314,23 +315,33 @@ def prepare_package(
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
     _stage(artifact_cache, base_raw)
+    if development is not None:
+        _verify_private_revision(development, descriptor_ref, rows)
     jobs = _stage_job_plans(
         descriptor_body,
         root=job_plan_root,
         build_id=release_digest,
         descriptor_path=artifact_cache / descriptor_ref[0].removeprefix("sha256:"),
         installed=installed,
+        include_modeled=development is not None,
     )
-    selected_models, entrypoints = _entrypoints(
-        descriptor_body,
-        package_name=package_name,
-        selections=models,
-        files=model_files,
-        artifact_cache=artifact_cache,
-        artifact_store=artifact_store,
-        verified=verified,
-    )
-    if not entrypoints and not jobs:
+    if development is None:
+        selected_models, entrypoints = _entrypoints(
+            descriptor_body,
+            package_name=package_name,
+            selections=models,
+            files=model_files,
+            artifact_cache=artifact_cache,
+            artifact_store=artifact_store,
+            verified=verified,
+        )
+    else:
+        # Private transport freezes code, descriptor and Environment only. A later ordinary
+        # PlacementSet supplies the exact serving model bindings; JobDirective + InvocationSpec
+        # supplies a job's exact model inputs. Returning only weightless callables here made the
+        # same private revision change shape according to which callable happened to need weights.
+        selected_models, entrypoints = [], []
+    if development is None and not entrypoints and not jobs:
         raise PreparationRefusal(
             "package_prepare_callable_absent",
             "package has no runnable serving or weightless job callable",
@@ -365,11 +376,13 @@ def prepare_package(
                 package=development.package,
                 release=development.release,
                 source_digest=development.source_digest,
+                private_revision_digest=development.private_revision_digest,
                 project_wheel=_wheel_fact(project),
             )
         )
     placement_body = documents.body(placement)
     placement_body.setdefault("models", [])
+    placement_body.setdefault("entrypoints", [])
     placement_body["environment"].setdefault("wheels", [])
     for entrypoint_body in placement_body["entrypoints"]:
         entrypoint_body.setdefault("slots", [])
@@ -393,6 +406,37 @@ def _wheel_fact(wheel: overlay.Wheel) -> pb.WheelFact:
         import_roots=list(wheel.import_roots),
         tags=list(wheel.tags),
     )
+
+
+def _verify_private_revision(
+    development: pb.DevelopmentPackage,
+    descriptor_ref: tuple[str, int],
+    files: Sequence[pb.LocalDownloadFile],
+) -> None:
+    revision = pb.PrivatePackageRevision(
+        package=development.package,
+        release=development.release,
+        source_digest=development.source_digest,
+        package_descriptor=pb.Ref(
+            digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
+        ),
+        files=[
+            pb.PrivatePackageFileRef(
+                digest=row.digest,
+                filename=row.filename,
+                kind=row.kind,
+                length=row.length,
+            )
+            for row in files
+        ],
+    )
+    _raw, measured = documents.identity(revision)
+    if measured != development.private_revision_digest:
+        raise PreparationRefusal(
+            "private_package_revision_mismatch",
+            f"measured {documents.spell(measured)}, expected "
+            f"{documents.spell(development.private_revision_digest)}",
+        )
 
 
 def _entrypoints(
@@ -503,19 +547,22 @@ def _stage_job_plans(
     build_id: str,
     descriptor_path: Path,
     installed: overlay.InstalledOverlay,
+    include_modeled: bool = False,
 ) -> set[str]:
     rows = body.get("jobs")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_descriptor_invalid", "jobs")
-    weightless = [row for row in rows if isinstance(row, dict) and not row.get("models")]
-    if not weightless or root is None:
+    selected = [
+        row for row in rows if isinstance(row, dict) and (include_modeled or not row.get("models"))
+    ]
+    if not selected or root is None:
         return set()
     root.mkdir(parents=True, exist_ok=True, mode=0o755)
     if root.is_symlink() or not root.is_dir():
         raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
     application = str(body.get("application", ""))
     staged: set[str] = set()
-    for row in weightless:
+    for row in selected:
         name = str(row.get("name", ""))
         descriptor_id = descriptor.job_descriptor_id(body, name)
         resources = row.get("resources") or {}

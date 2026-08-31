@@ -285,7 +285,10 @@ class Placement:
         """Published release.json provenance or explicit development source identity."""
 
         return str(
-            self.package.get("release_digest") or self.development.get("source_digest") or ""
+            self.package.get("release_digest")
+            or self.development.get("private_revision_digest")
+            or self.development.get("source_digest")
+            or ""
         )
 
     @property
@@ -525,7 +528,15 @@ def _package_selection(value: object) -> dict[str, Any]:
 
 def _development_package(value: object) -> dict[str, Any]:
     row = _closed_document(
-        value, {"package", "release", "source_digest", "project_wheel"}, "DevelopmentPackage"
+        value,
+        {
+            "package",
+            "release",
+            "source_digest",
+            "project_wheel",
+            "private_revision_digest",
+        },
+        "DevelopmentPackage",
     )
     _required(row, {"package", "release", "source_digest"}, "DevelopmentPackage")
     package = _identifier(row["package"], "DevelopmentPackage.package")
@@ -543,6 +554,18 @@ def _development_package(value: object) -> dict[str, Any]:
         project = _wheel_fact(row["project_wheel"], "DevelopmentPackage.project_wheel")
         if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
             raise documents.DocumentError("project_wheel_mismatch", package)
+    remote = "project_wheel" in row
+    private_revision = "private_revision_digest" in row
+    if remote != private_revision:
+        raise documents.DocumentError(
+            "development_invalid",
+            "project_wheel and private_revision_digest must be present together",
+        )
+    if private_revision and (
+        not isinstance(row["private_revision_digest"], str)
+        or HASH_ENTRY.fullmatch(row["private_revision_digest"]) is None
+    ):
+        raise documents.DocumentError("development_invalid", "private_revision_digest is malformed")
     return row
 
 
@@ -807,6 +830,10 @@ class Worker:
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
+        # Exact code/descriptor/Environment revisions prepared over the private loopback seam.
+        # This is same-process admission state, not a Runtime journal. After worker restart the
+        # RecordOwner replays preparation before a model-bound PlacementSet can join it.
+        self.private_revisions: dict[str, Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
@@ -974,7 +1001,7 @@ class Worker:
 
             if private:
                 assert isinstance(request, pb.PreparePrivatePackageRequest)
-                return package_prepare.prepare_private_package(
+                result = package_prepare.prepare_private_package(
                     request,
                     artifact_cache=Path(self.options.artifact_cache or ""),
                     environment_root=Path(self.options.environment_root or ""),
@@ -983,6 +1010,38 @@ class Worker:
                     verified=mark_verified,
                     job_plan_root=self.config.cozy_home / "job-plans",
                 )
+                prepared = read_placement_set(result.placement_set)
+                if len(prepared) != 1 or not prepared[0].get("development"):
+                    raise package_prepare.PreparationRefusal(
+                        "private_package_result_invalid",
+                        "private preparation did not return one development Placement",
+                    )
+                entry = prepared[0]
+                package_descriptor = dict(entry.get("package_descriptor", {}))
+                stored = Placement(
+                    placement_id=str(entry.get("placement_id", "")),
+                    placement_set_digest=result.placement_set.placement_set_digest,
+                    package=dict(entry.get("package", {})),
+                    development=dict(entry.get("development", {})),
+                    environment_digest=_digest_field(entry.get("environment_digest")),
+                    package_descriptor=(
+                        str(package_descriptor.get("digest", "")),
+                        int(package_descriptor.get("length", 0)),
+                    ),
+                    bindings_digest=_digest_field(entry.get("bindings_digest")),
+                    models=tuple(dict(row) for row in entry.get("models", [])),
+                    entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
+                    environment=dict(entry.get("environment", {})),
+                    document=dict(entry),
+                )
+                revision = stored.execution_digest
+                if revision != documents.spell(request.package.private_revision_digest):
+                    raise package_prepare.PreparationRefusal(
+                        "private_package_revision_mismatch",
+                        "prepared Placement changed the declared private revision",
+                    )
+                self.private_revisions[revision] = stored
+                return result
             assert isinstance(request, pb.PreparePackageSetRequest)
             return package_prepare.prepare_package_set(
                 request,
@@ -2174,6 +2233,46 @@ class Worker:
                 terminal=True,
             )
             return None
+        if placement.development:
+            prepared = self.private_revisions.get(placement.execution_digest)
+            if prepared is None:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        subject=placement.placement_id,
+                        reason="private_revision_unprepared",
+                        detail="prepare this exact private code revision before binding models",
+                    ),
+                    terminal=True,
+                )
+                return None
+            core_fields = (
+                "development",
+                "environment_digest",
+                "environment",
+                "package_descriptor",
+            )
+            changed = next(
+                (
+                    name
+                    for name in core_fields
+                    if placement.document.get(name) != prepared.document.get(name)
+                ),
+                "",
+            )
+            if changed:
+                self._materialization_failed(
+                    placement,
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        subject=placement.placement_id,
+                        reason="private_revision_changed",
+                        detail=f"model-bound Placement changed prepared field {changed}",
+                    ),
+                    terminal=True,
+                )
+                return None
         if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,

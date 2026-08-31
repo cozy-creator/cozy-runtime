@@ -727,9 +727,16 @@ def fence_base_ownership_vectors() -> list[str]:
             else:
                 bad.append(f"{path}:{line_number}: pod accepted an observed-local base")
     wanted = {
+        "cuda-none-refused",
+        "cuda-cpu-torch-refused",
+        "cpu-cuda-torch-refused",
+        "generic-image-torch-fact-refused",
+        "generic-image-without-torch-v1",
+        "minimal-cuda-v1",
         "minimal-complete-v1",
         "observed-local-v1",
-        "observed-local-wheel-refused",
+        "torch-cpu-foreign-root-refused",
+        "torch-cpu-missing-fact-refused",
         "unknown-format-refused",
         "unknown-provider-refused",
     }
@@ -740,14 +747,14 @@ def fence_base_ownership_vectors() -> list[str]:
         (
             "base-worker-image-wheelhouse-cpu.json",
             24_968,
-            "sha256:806b8217dbb70e64edbdd6bb1cdf99b8b703e689abf96d920f360edf23340d72",
+            "sha256:df6f35fadeb465e78052464524b11970e5543b3b3dd17c384cbcac13a4a4633f",
             (27, 324, 26),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
             25_538,
-            "sha256:8fd4df91c84283f656bc204d20a29ff84f1068f288199bc943eb5436a61de7f4",
+            "sha256:6c2de0e589db8650cb6897ef13c5d3efa73a7a10ae121dc9836b6548b53e5d35",
             (86, 363, 10),
             ("cuda", "cu130"),
         ),
@@ -795,10 +802,10 @@ def fence_base_ownership_vectors() -> list[str]:
                 125_251,
             ),
             "cozy-runtime": (
-                "0.0.16",
-                "cozy_runtime-0.0.16-py3-none-any.whl",
-                "sha256:1b6aa4209c906640881fd1c8066b0a7db03b5acb7987acc20dc7744bdadf5552",
-                738_310,
+                "0.0.19",
+                "cozy_runtime-0.0.19-py3-none-any.whl",
+                "sha256:20ca77dac3d7196e4449f16b792e775300a3926e483956c77180696e6f327e8b",
+                740_584,
             ),
             "tensorfs": (
                 "0.0.5",

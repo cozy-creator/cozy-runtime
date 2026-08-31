@@ -801,6 +801,20 @@ class PrivatePackageFileRef(_message.Message):
     length: int
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., kind: _Optional[_Union[LocalDownloadKind, str]] = ..., length: _Optional[int] = ...) -> None: ...
 
+class PrivatePackageRevision(_message.Message):
+    __slots__ = ("package", "release", "source_digest", "package_descriptor", "files")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_DESCRIPTOR_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    package: str
+    release: str
+    source_digest: bytes
+    package_descriptor: Ref
+    files: _containers.RepeatedCompositeFieldContainer[PrivatePackageFileRef]
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[PrivatePackageFileRef, _Mapping]]] = ...) -> None: ...
+
 class DesiredPlacementSet(_message.Message):
     __slots__ = ("placement_set_digest", "placement_set_canonical_bytes")
     PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -916,16 +930,18 @@ class PackageSelection(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[bytes] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ...) -> None: ...
 
 class DevelopmentPackage(_message.Message):
-    __slots__ = ("package", "release", "source_digest", "project_wheel")
+    __slots__ = ("package", "release", "source_digest", "project_wheel", "private_revision_digest")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROJECT_WHEEL_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     source_digest: bytes
     project_wheel: WheelFact
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ...) -> None: ...
+    private_revision_digest: bytes
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ..., private_revision_digest: _Optional[bytes] = ...) -> None: ...
 
 class Environment(_message.Message):
     __slots__ = ("wheels",)

@@ -557,7 +557,7 @@ class Acquirer:
             ) from exc
         visible = _visible_entrypoints(descriptor)
         models = {str(row["id"]): row for row in placement.models}
-        release_digest = str(placement.package["release_digest"])
+        release_digest = placement.execution_digest
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:
@@ -597,6 +597,7 @@ class Acquirer:
                     model_parameter_name="",
                     application=application,
                     descriptor_path=str(descriptor_path),
+                    development=bool(placement.development),
                 )
                 continue
             slot = slots[0]
@@ -671,16 +672,20 @@ class Acquirer:
                 stamps={key: tuple(sorted(values)) for key, values in sorted(stamps.items())},
                 model_weight_bytes=model_weight_bytes,
                 expected_logical_model_digest="",
+                development=bool(placement.development),
             )
             for asset in slot["config"].get("assets", []):
                 ref = _ref(asset["ref"], "slot.config.asset")
                 self._stage(ref[0], self.fetch(*ref).read_bytes())
                 count += 1
-        if set(visible) != {str(row["name"]) for row in placement.entrypoints}:
+        selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}
+        if (placement.development and not selected_entrypoints) or (
+            not placement.development and set(visible) != selected_entrypoints
+        ):
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",
-                "PlacementSet/1 does not cover every descriptor entrypoint",
+                "PlacementSet/1 does not select the required descriptor entrypoints",
             )
         return bindings, count
 
