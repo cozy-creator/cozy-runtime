@@ -221,6 +221,8 @@ class WorkerOptions:
     executor_uid: int = -1
     executor_gid: int = -1
     """Fixed package identity, or ``-1/-1`` for the native same-user development lane."""
+    persistent_state: bool = True
+    """Keep crash-recovery state for a standalone worker; false behind pod-supervisor."""
 
 
 @dataclass(slots=True)
@@ -761,7 +763,7 @@ class Worker:
         self.admission_generation = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
-        self.journal = Journal(self.root / "journal.log")
+        self.journal = Journal(self.root / "journal.log" if options.persistent_state else None)
         self.ledger = Ledger(
             host_budget=options.host_budget,
             pinned_budget=options.pinned_budget,
@@ -3594,18 +3596,17 @@ class Worker:
                     "recovery",
                     f"killed {len(killed)} orphan executor(s) from before this restart: {killed}",
                 )
-            # The accepted-authority high-water mark comes back BEFORE the first claim can
-            # be fenced against it (#494e).
-            self.restore_ownership()
-            # Recovery replays the journal ONCE at boot; the snapshot on every later claim
-            # reads the engine's own held state.
-            recovered = self.engine.recover()
-            if recovered:
-                self.note(
-                    "recovery",
-                    f"the recovered journal holds {len(recovered)} attempt(s); they ride "
-                    "the snapshot and the owner closes them before minting any next ordinal",
-                )
+            if self.options.persistent_state:
+                # Standalone workers recover their own authority and attempt state. The
+                # pod-supervisor child starts empty: its outer supervisor owns replay.
+                self.restore_ownership()
+                recovered = self.engine.recover()
+                if recovered:
+                    self.note(
+                        "recovery",
+                        f"the recovered journal holds {len(recovered)} attempt(s); they ride "
+                        "the snapshot and the owner closes them before minting any next ordinal",
+                    )
             # THE MACHINE IS UP (#482). `worker_phase` is machine lifecycle, pulled out of
             # the placement enum: BOOTING is true only until the journal, the socket, the
             # orphan sweep, the recovered ownership and the lanes are all real. It moves

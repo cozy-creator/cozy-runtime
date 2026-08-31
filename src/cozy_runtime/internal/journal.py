@@ -70,9 +70,9 @@ class Record:
 
 @dataclass(slots=True)
 class Journal:
-    """An append-only, fsynced, self-verifying record log."""
+    """An append-only record log, fsynced when a path is supplied."""
 
-    path: Path
+    path: Path | None
     _fd: int = -1
     seq: int = 0
     stopped: str = ""
@@ -82,6 +82,8 @@ class Journal:
     records: list[Record] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.path is None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.records = list(self._load())
         self.seq = self.records[-1].seq if self.records else 0
@@ -90,6 +92,8 @@ class Journal:
     # ------------------------------------------------------------------ read
 
     def _load(self) -> Iterator[Record]:
+        if self.path is None:
+            return
         if not self.path.exists():
             return
         raw = self.path.read_bytes()
@@ -114,6 +118,7 @@ class Journal:
 
     def _tear(self, index: int, line: bytes, why: str) -> None:
         """A torn tail is a crash mid-append: admissible ONLY as the last line."""
+        assert self.path is not None
         if index != len(self.path.read_bytes().split(b"\n")) - 2:
             raise JournalError("journal_corrupt", f"{self.path}:{index + 1}: {why}")
         self.torn_tail = True
@@ -127,6 +132,11 @@ class Journal:
         if self.stopped:
             raise JournalError("journal_stopped", self.stopped)
         record = Record(self.seq + 1, kind, int(time.time() * 1000), body)
+        if self.path is None:
+            self.seq = record.seq
+            self.appends += 1
+            self.records.append(record)
+            return record
         data = canonical.write(
             {"seq": record.seq, "kind": kind, "at_unix_ms": record.at_unix_ms, "body": body}
         )

@@ -207,6 +207,7 @@ def _worker_options(
         claim_ready=False,
         executor_uid=POD_EXECUTOR_UID,
         executor_gid=POD_EXECUTOR_GID,
+        persistent_state=False,
     )
 
 
