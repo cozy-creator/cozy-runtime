@@ -1647,7 +1647,7 @@ def run_boundary(name: str, toml: str, module: str, expect: str, code: int) -> s
 
 
 def run_retired_descriptor_shapes() -> list[str]:
-    """The descriptor/1 hardcut has no reader for its four redundant old spellings."""
+    """The descriptor/1 reader refuses retired fields and escaping contract tokens."""
     base = descriptor_document.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
     def clone() -> dict[str, Any]:
@@ -1715,11 +1715,23 @@ def run_retired_descriptor_shapes() -> list[str]:
         },
     )
 
+    structure_escape = clone()
+    structure_escape["model_productions"][0]["outputs"][0]["required_contract"]["structure"] = (
+        "../h3"
+    )
+
+    encoding_escape = clone()
+    encoding_escape["model_productions"][0]["outputs"][0]["required_contract"]["encodings"] = [
+        "mxfp8//1"
+    ]
+
     return [
         refused("hidden", hidden),
         refused("param", param),
         refused("required-wire", required_wire),
         refused("repeated-tag-field", old_tag),
+        refused("production-structure-escape", structure_escape),
+        refused("production-encoding-empty-segment", encoding_escape),
     ]
 
 

@@ -195,7 +195,7 @@ def main() -> int:
                         "lane_key": "bf16",
                         "required_contract": {
                             "tasks": ["generate"],
-                            "structure": "full",
+                            "structure": "h3/full",
                             "encodings": ["plain/1"],
                             "stamps": {},
                         },

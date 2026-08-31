@@ -588,7 +588,7 @@ def _productions(value: Json, source: str) -> None:
 
 
 _PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+/-]{0,127}$")
+_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
 _CALLABLE = re.compile(
     r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
     r"[a-z][a-z0-9_-]{0,63}$"
@@ -619,6 +619,12 @@ def _contract_values(value: Json, source: str, path: str, cap: int) -> list[str]
     if len(set(out)) != len(out):
         _invalid(source, path, "must be unique")
     return out
+
+
+def _contract_value(value: Json, source: str, path: str) -> str:
+    if not isinstance(value, str) or _CONTRACT_VALUE.fullmatch(value) is None:
+        _invalid(source, path, "is not a bounded contract token")
+    return value
 
 
 def _string_map_value(value: Json, source: str, path: str, cap: int) -> dict[str, str]:
@@ -652,7 +658,7 @@ def _production_resources(value: Json, source: str, path: str) -> None:
 def _production_contract_value(value: Json, source: str, path: str) -> None:
     contract = _closed(value, {"tasks", "structure", "encodings", "stamps"}, set(), source, path)
     _portable_names(contract["tasks"], source, f"{path}.tasks", 32)
-    _portable_name(contract["structure"], source, f"{path}.structure")
+    _contract_value(contract["structure"], source, f"{path}.structure")
     _contract_values(contract["encodings"], source, f"{path}.encodings", 32)
     _string_map_value(contract["stamps"], source, f"{path}.stamps", 32)
 

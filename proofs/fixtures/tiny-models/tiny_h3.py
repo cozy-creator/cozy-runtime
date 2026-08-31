@@ -738,7 +738,7 @@ app.production(
             lane_key="bf16-full",
             required=ProductionContract(
                 tasks=("fl2va", "ref2va"),
-                structure="h3-full",
+                structure="h3/bf16-full",
                 encodings=("plain/1",),
                 stamps={"family": "h3"},
             ),

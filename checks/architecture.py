@@ -525,8 +525,26 @@ def fence_no_identifiers() -> list[str]:
     """
     bad: list[str] = []
     for path in package_modules():
-        for node in ast.walk(ast.parse(path.read_text())):
+        tree = ast.parse(path.read_text())
+        contract_values = {
+            id(value)
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and (
+                (isinstance(call.func, ast.Name) and call.func.id == "ProductionContract")
+                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ProductionContract")
+            )
+            for keyword in call.keywords
+            if keyword.arg in {"structure", "encodings"}
+            for value in ast.walk(keyword.value)
+            if isinstance(value, ast.Constant)
+        }
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in contract_values:
+                # A production contract is a requirement Tensorhub independently derives
+                # from output bytes, not a model/release/checkpoint selection.
                 continue
             text = node.value.strip()
             if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):

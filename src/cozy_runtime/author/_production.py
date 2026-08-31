@@ -28,7 +28,7 @@ _CALLABLE = re.compile(
     r"[a-z][a-z0-9_-]{0,63}$"
 )
 _MEMBER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
-_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+/-]{0,127}$")
+_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
 
 
 def _name(value: str, where: str) -> None:
@@ -73,7 +73,12 @@ class ProductionContract:
 
     def __post_init__(self) -> None:
         _unique(self.tasks, "production contract tasks", MAX_CONTRACT_VALUES)
-        _name(self.structure, "production contract structure")
+        if _CONTRACT_VALUE.fullmatch(self.structure) is None:
+            raise ConformanceError(
+                f"production contract structure {self.structure!r} is malformed",
+                code="production_contract",
+                fields=["structure"],
+            )
         if not self.encodings or len(self.encodings) > MAX_CONTRACT_VALUES:
             raise ConformanceError(
                 f"production contract encodings has {len(self.encodings)} entries; "
