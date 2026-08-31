@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from typing import cast
+from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author._markers import Resources
+from cozy_runtime.author._production import Production, ProductionContract, ProductionNode
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -26,6 +28,7 @@ TOP_LEVEL_KEYS = frozenset(
         "application",
         "entrypoints",
         "jobs",
+        "model_productions",
     }
 )
 
@@ -53,6 +56,9 @@ def build(found: Discovered) -> dict[str, Json]:
         "application": found.application,
         "entrypoints": sorted(entrypoints, key=_by_name),
         "jobs": sorted(jobs, key=_by_name),
+        "model_productions": sorted(
+            (_production(production) for production in found.app.productions()), key=_by_name
+        ),
     }
     assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
     _fixed_point(body, _binding_values(found.bindings))
@@ -97,6 +103,58 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
         },
     }
     return doc
+
+
+def _resources(resources: Resources) -> dict[str, Json]:
+    out: dict[str, Json] = {}
+    if resources.gpu_count is not None:
+        out["gpu_count"] = resources.gpu_count
+    if resources.placement is not None:
+        out["placement"] = resources.placement
+    if resources.requires is not None:
+        out["requires"] = resources.requires
+    return out
+
+
+def _production(production: Production) -> dict[str, Json]:
+    return {
+        "name": production.name,
+        "source": production.source,
+        "nodes": [
+            _production_node(node) for node in sorted(production.nodes, key=lambda n: n.name)
+        ],
+        "outputs": [
+            {
+                "name": output.name,
+                "source": output.source,
+                "lane_key": output.lane_key,
+                "required_contract": _production_contract(output.required),
+            }
+            for output in sorted(production.outputs, key=lambda row: row.name)
+        ],
+    }
+
+
+def _production_node(node: ProductionNode) -> dict[str, Json]:
+    doc: dict[str, Json] = {
+        "name": node.name,
+        "callable": node.callable,
+        "models": dict(sorted(node.models.items())),
+        "outputs": sorted(node.outputs),
+        "assets": dict(sorted(node.assets.items())),
+    }
+    if node.resources is not None:
+        doc["resources"] = _resources(node.resources)
+    return doc
+
+
+def _production_contract(contract: ProductionContract) -> dict[str, Json]:
+    return {
+        "tasks": sorted(contract.tasks),
+        "structure": contract.structure,
+        "encodings": sorted(contract.encodings),
+        "stamps": dict(sorted(contract.stamps.items())),
+    }
 
 
 # -------------------------------------------------------------------- fixed-point scan
@@ -304,6 +362,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
     application = body["application"]
     if not isinstance(application, str) or not application:
         _invalid(source, "application", "must be a non-empty string")
+    _productions(body["model_productions"], source)
     for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
         rows = body[collection]
         if not isinstance(rows, list):
@@ -369,6 +428,182 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     count = resources["gpu_count"]
                     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                         _invalid(source, f"{path}.resources.gpu_count", "must be positive")
+
+
+def _productions(value: Json, source: str) -> None:
+    if not isinstance(value, list) or len(value) > 16:
+        _invalid(source, "model_productions", "must be an array of at most 16 entries")
+    names: set[str] = set()
+    for index, raw in enumerate(value):
+        path = f"model_productions[{index}]"
+        production = _closed(raw, {"name", "source", "nodes", "outputs"}, set(), source, path)
+        name = _portable_name(production["name"], source, f"{path}.name")
+        if name in names:
+            _invalid(source, f"{path}.name", "must be unique")
+        names.add(name)
+        root = _portable_name(production["source"], source, f"{path}.source")
+        nodes = production["nodes"]
+        if not isinstance(nodes, list) or not 1 <= len(nodes) <= 64:
+            _invalid(source, f"{path}.nodes", "must contain 1 through 64 nodes")
+        node_outputs: dict[str, set[str]] = {}
+        dependencies: dict[str, set[str]] = {}
+        for node_index, node_raw in enumerate(nodes):
+            node_path = f"{path}.nodes[{node_index}]"
+            node = _closed(
+                node_raw,
+                {"name", "callable", "models", "outputs", "assets"},
+                {"resources"},
+                source,
+                node_path,
+            )
+            node_name = _portable_name(node["name"], source, f"{node_path}.name")
+            if node_name in node_outputs:
+                _invalid(source, f"{node_path}.name", "must be unique")
+            callable_name = node["callable"]
+            if not isinstance(callable_name, str) or _CALLABLE.fullmatch(callable_name) is None:
+                _invalid(source, f"{node_path}.callable", "must be org/package/function")
+            outputs = _portable_names(node["outputs"], source, f"{node_path}.outputs", 8)
+            node_outputs[node_name] = set(outputs)
+            dependencies[node_name] = set()
+            models = _string_map_value(node["models"], source, f"{node_path}.models", 16)
+            if not models:
+                _invalid(source, f"{node_path}.models", "must not be empty")
+            _string_map_value(node["assets"], source, f"{node_path}.assets", 16)
+            if "resources" in node:
+                _production_resources(node["resources"], source, f"{node_path}.resources")
+
+        def edge(
+            reference: str,
+            edge_path: str,
+            root_name: str = root,
+            outputs_by_node: dict[str, set[str]] = node_outputs,
+        ) -> str | None:
+            if reference == root_name:
+                return None
+            node_name, separator, output = reference.partition(".")
+            if not separator or output not in outputs_by_node.get(node_name, set()):
+                _invalid(source, edge_path, f"references unknown edge {reference!r}")
+            return node_name
+
+        for node_index, node_raw in enumerate(nodes):
+            assert isinstance(node_raw, dict)
+            node_name = str(node_raw["name"])
+            models = node_raw["models"]
+            assert isinstance(models, dict)
+            for model_name, reference in models.items():
+                dependency = edge(str(reference), f"{path}.nodes[{node_index}].models.{model_name}")
+                if dependency is not None:
+                    dependencies[node_name].add(dependency)
+
+        outputs = production["outputs"]
+        if not isinstance(outputs, list) or not 1 <= len(outputs) <= 16:
+            _invalid(source, f"{path}.outputs", "must contain 1 through 16 required outputs")
+        output_names: set[str] = set()
+        lane_keys: set[str] = set()
+        required_nodes: set[str] = set()
+
+        def retain(
+            node_name: str,
+            visiting: set[str],
+            production_path: str = path,
+            graph: dict[str, set[str]] = dependencies,
+            retained: set[str] = required_nodes,
+        ) -> None:
+            if node_name in visiting:
+                _invalid(source, production_path, f"contains a cycle through {node_name}")
+            if node_name in retained:
+                return
+            visiting.add(node_name)
+            for dependency in graph[node_name]:
+                retain(dependency, visiting)
+            visiting.remove(node_name)
+            retained.add(node_name)
+
+        for output_index, output_raw in enumerate(outputs):
+            output_path = f"{path}.outputs[{output_index}]"
+            output = _closed(
+                output_raw,
+                {"name", "source", "lane_key", "required_contract"},
+                set(),
+                source,
+                output_path,
+            )
+            output_name = _portable_name(output["name"], source, f"{output_path}.name")
+            lane_key = _portable_name(output["lane_key"], source, f"{output_path}.lane_key")
+            if output_name in output_names or lane_key in lane_keys:
+                _invalid(source, output_path, "repeats an output name or lane key")
+            output_names.add(output_name)
+            lane_keys.add(lane_key)
+            selected = edge(str(output["source"]), f"{output_path}.source")
+            if selected is None:
+                _invalid(source, f"{output_path}.source", "must name a node output")
+            retain(selected, set())
+            _production_contract_value(
+                output["required_contract"], source, f"{output_path}.required_contract"
+            )
+        disconnected = sorted(set(node_outputs) - required_nodes)
+        if disconnected:
+            _invalid(source, path, f"contains disconnected nodes {disconnected}")
+
+
+_PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_CALLABLE = re.compile(
+    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
+    r"[a-z][a-z0-9_-]{0,63}$"
+)
+
+
+def _portable_name(value: Json, source: str, path: str) -> str:
+    if not isinstance(value, str) or _PRODUCTION_NAME.fullmatch(value) is None:
+        _invalid(source, path, "must be a portable lowercase name")
+    return value
+
+
+def _portable_names(value: Json, source: str, path: str, cap: int) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= cap:
+        _invalid(source, path, f"must contain 1 through {cap} names")
+    out = [_portable_name(item, source, path) for item in value]
+    if len(set(out)) != len(out):
+        _invalid(source, path, "must be unique")
+    return out
+
+
+def _string_map_value(value: Json, source: str, path: str, cap: int) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > cap:
+        _invalid(source, path, f"must be an object with at most {cap} entries")
+    out: dict[str, str] = {}
+    for key, item in value.items():
+        _portable_name(key, source, path)
+        if not isinstance(item, str) or not item:
+            _invalid(source, f"{path}.{key}", "must be a non-empty string")
+        out[key] = item
+    return out
+
+
+def _production_resources(value: Json, source: str, path: str) -> None:
+    resources = _closed(value, set(), {"gpu_count", "placement", "requires"}, source, path)
+    if not resources:
+        _invalid(source, path, "must not be empty")
+    gpu_count = resources.get("gpu_count")
+    if gpu_count is not None and (
+        not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count < 1
+    ):
+        _invalid(source, f"{path}.gpu_count", "must be positive")
+    if resources.get("placement") not in (None, "single_node", "any"):
+        _invalid(source, f"{path}.placement", "must be single_node or any")
+    requires = resources.get("requires")
+    if requires is not None and (not isinstance(requires, str) or not requires):
+        _invalid(source, f"{path}.requires", "must be a non-empty string")
+
+
+def _production_contract_value(value: Json, source: str, path: str) -> None:
+    contract = _closed(
+        value, {"tasks", "structure", "encodings", "stamps"}, set(), source, path
+    )
+    _portable_names(contract["tasks"], source, f"{path}.tasks", 32)
+    _portable_name(contract["structure"], source, f"{path}.structure")
+    _portable_names(contract["encodings"], source, f"{path}.encodings", 32)
+    _string_map_value(contract["stamps"], source, f"{path}.stamps", 32)
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
@@ -492,7 +727,7 @@ def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> No
         _invalid(source, path, f"must be a non-empty object using {sorted(allowed)}")
 
 
-def _invalid(source: str, path: str, detail: str) -> None:
+def _invalid(source: str, path: str, detail: str) -> NoReturn:
     raise StalePackageDescriptor(f"{source}: {path} {detail}", code="malformed_package_descriptor")
 
 
@@ -513,4 +748,11 @@ def counts(body: Mapping[str, Json]) -> dict[str, int]:
         models = doc.get("models", [])
         assert isinstance(models, list)
         slots += len(models)
-    return {"entrypoints": len(entrypoints), "jobs": len(jobs), "model_bindings": slots}
+    productions = body.get("model_productions", [])
+    assert isinstance(productions, list)
+    return {
+        "entrypoints": len(entrypoints),
+        "jobs": len(jobs),
+        "model_bindings": slots,
+        "model_productions": len(productions),
+    }

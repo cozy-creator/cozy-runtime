@@ -23,6 +23,7 @@ from typing import ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources
+from cozy_runtime.author._production import Production, ProductionNode, ProductionOutput
 from cozy_runtime.author._signature import Kind, Surface, analyze
 
 P = ParamSpec("P")
@@ -84,7 +85,32 @@ class App:
     """The one registry a package module exports as `app = App()`."""
 
     _registry: dict[str, Registration] = field(default_factory=dict)
+    _productions: dict[str, Production] = field(default_factory=dict)
     _frozen: bool = False
+
+    def production(
+        self,
+        name: str,
+        *,
+        source: str,
+        nodes: tuple[ProductionNode, ...],
+        outputs: tuple[ProductionOutput, ...],
+    ) -> None:
+        """Register one static graph over ordinary installed jobs.
+
+        A production is descriptor data only. It cannot execute, resolve a package,
+        acquire capacity, or publish a release.
+        """
+        if self._frozen:
+            raise RegistrationError(
+                f"production {name!r}: the registry is frozen — after describe, "
+                "registration is immutable (§1.0)"
+            )
+        if name in self._productions:
+            raise RegistrationError(f"duplicate production {name!r}: names are unique per app")
+        if len(self._productions) >= 16:
+            raise RegistrationError("an app declares at most 16 model productions")
+        self._productions[name] = Production(name, source, nodes, outputs)
 
     @overload
     def entrypoint(self, fn: Callable[P, R], /) -> Callable[P, R]: ...
@@ -216,6 +242,10 @@ class App:
     def registrations(self) -> tuple[Registration, ...]:
         """Registered callables in declaration order."""
         return tuple(self._registry.values())
+
+    def productions(self) -> tuple[Production, ...]:
+        """Registered production graphs in declaration order."""
+        return tuple(self._productions.values())
 
     def get(self, name: str) -> Registration:
         try:
