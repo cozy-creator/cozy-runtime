@@ -11,17 +11,18 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime.cli import private_preflight
 from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
-from cozy_runtime.internal.worker.session import read_placement_set
+from cozy_runtime.internal.worker.session import Worker, read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -666,6 +667,31 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         assert exc.code == "private_placement_identity_invalid"
     else:
         raise RuntimeError("changed private revision was joined to prepared code")
+
+    same_revision_other_operation = cast(Any, object.__new__(Worker))
+    same_revision_other_operation.preparation_lock = threading.Lock()
+    same_revision_other_operation.private_operations = {
+        ("private-modeled-02", documents.spell(private_revision)): SimpleNamespace(
+            document=private_body
+        )
+    }
+    same_revision_other_operation.verified_artifacts = verified
+    same_revision_other_operation.options = SimpleNamespace(
+        artifact_cache=cache, artifact_store=target_store
+    )
+    try:
+        same_revision_other_operation.prepare_private_placement(
+            pb.PreparePrivatePlacementRequest(
+                operation_id="private-modeled-01",
+                private_revision_digest=private_revision,
+                download_delegation=private_delegation,
+                files=private_model_files,
+            )
+        )
+    except package_prepare.PreparationRefusal as exc:
+        assert exc.code == "private_revision_unprepared"
+    else:
+        raise RuntimeError("operation A joined operation B's same-digest private core")
 
     wrong_package_doc = copy.deepcopy(private_delegation_doc)
     wrong_package_doc["models"][0]["package"] = "proof/another-package"
