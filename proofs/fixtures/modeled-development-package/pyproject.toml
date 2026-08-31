@@ -5,6 +5,9 @@ description = "Repository-only modeled DevelopmentPackage fixture"
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
+[project.entry-points."cozy.application"]
+app = "modeled_development_package:app"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

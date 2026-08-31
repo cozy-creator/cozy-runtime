@@ -309,23 +309,16 @@ before any grant or ZIP is opened.
 
 The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
 `WHEEL` tags, `Root-Is-Purelib`, members, and native magic. A project `.so` or a platform-specific
-project tag refuses. Every dependency wheel remains a separate exact prebuilt subject selected by
-Tensorhub. Runtime accepts no build request and rejects C/C++/CUDA/Rust sources, build manifests,
+project tag refuses. Every dependency wheel remains a separate exact prebuilt subject selected from
+the publisher's lock. Runtime accepts no build request and rejects C/C++/CUDA/Rust sources, build manifests,
 headers/objects/static archives, and wheel install schemes that would inject scripts or data. It
 never invokes pip, a resolver, PEP 517, or a compiler.
 
-Ordinary native dependency and custom-extension wheels keep the semantic Python/ABI/platform,
-`abi3`, marker, manylinux-floor, digest, ZIP, RECORD, and ownership checks. Before native bytes are
-published, `internal/native_wheel.py` parses bounded ELF64 metadata and refuses a wrong machine,
-hostile or escaping RPATH/RUNPATH, invalid `DT_NEEDED`, and any bundled library that shadows the
-selected base's Torch, Triton, CUDA, cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSolver, NCCL, or other NVIDIA
-families. CUDA-bearing ELF requires bounded `cuobjdump` cubin/PTX inventory; unavailable tooling is
-a refusal, not an omitted proof. The hardware qualification seat then joins that evidence to the
-actual loader inventory and SM and runs the registered no-argument operator fixture in a separate
-process. Missing libraries/symbols, wrong SM/PTX, `no kernel image`, timeout, oversized output, and
-result-digest mismatch are named refusals. Tensorhub's networkless VM/cgroup remains the isolation
-authority; Runtime additionally applies CPU/address-space/file/descriptor bounds and kills the
-whole fixture process group.
+The ordinary package lane admits only pure dependency wheels. A dependency wheel containing ELF,
+`.so`, `.pyd`, or another native member refuses as `overlay_custom_wheel_native_unsupported` before
+installation. Shared native libraries belong in the base worker image. A package-specific native
+wheel lane remains absent until a real package requires it and can justify actual loader, SM/PTX,
+operator, and isolation checks; the dormant inspection helpers are not publication authority.
 
 PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation, but those
 keys are never treated as a same-UID security boundary. Runtime scopes cache reuse by unpredictable

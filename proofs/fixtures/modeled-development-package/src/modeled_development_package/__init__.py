@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import msgspec
 
 from cozy_runtime.author import App, Config, Loader, Model, uses_components
@@ -14,7 +16,7 @@ class Result(msgspec.Struct):
 
 
 class Pipeline:
-    def __init__(self, core: object) -> None:
+    def __init__(self, core: Any) -> None:
         self.components = {"core": core}
 
 
@@ -23,7 +25,11 @@ def build(config: Config) -> Pipeline:
 
     if config.as_int("width") != 4:
         raise ValueError("wrong exact config")
-    return Pipeline(torch.nn.Module())
+    core = torch.nn.Module()
+    core.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(4, dtype=torch.bfloat16), requires_grad=False)
+    )
+    return Pipeline(core)
 
 
 class TinyModel(Model[Pipeline]):
@@ -31,8 +37,8 @@ class TinyModel(Model[Pipeline]):
         self.pipe = loader.construct(Pipeline, factory=build)
 
     @uses_components("core")
-    def touch(self) -> None:
-        return None
+    def first(self) -> int:
+        return int(self.pipe.components["core"].weight[0].item())
 
 
 app = App()
@@ -40,5 +46,4 @@ app = App()
 
 @app.entrypoint
 def render(payload: Request, model: TinyModel) -> Result:
-    model.touch()
-    return Result(payload.value)
+    return Result(payload.value + model.first())

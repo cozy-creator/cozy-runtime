@@ -5,7 +5,7 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   forbidden-dependency · canonical-numbers · torch-free-import
   package-imports · author-import-boundary · prelaunch-version · python-abi
   env-authority · single-config · no-interactive · excluded-keywords
-  document-kinds · qualification-selection · implementation-ids · report-format-tags
+  document-kinds · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
   package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
   construction-fill-order
@@ -684,6 +684,8 @@ def fence_base_ownership_vectors() -> list[str]:
 
     sys.path.insert(0, str(ROOT / "src"))
     from cozy_runtime.internal import canonical, overlay
+    from cozy_runtime.internal.placement_materialization import control_runtime_digest
+    from cozy_runtime.internal.refusal import LaunchRefusal
 
     bad: list[str] = []
     path = ROOT / "vectors" / "base-ownership.jsonl"
@@ -709,17 +711,38 @@ def fence_base_ownership_vectors() -> list[str]:
         raw = canonical.write(document)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         try:
-            overlay.parse_base_manifest(raw, digest)
+            manifest = overlay.parse_base_manifest(raw, digest)
             got = "ok"
         except overlay.OverlayRefusal as exc:
             got = exc.code
         if got != expected:
             bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
-    wanted = {"minimal-complete-v1", "unknown-format-refused", "unknown-provider-refused"}
+        if name == "observed-local-v1" and got == "ok":
+            try:
+                control_runtime_digest(manifest=manifest)
+            except LaunchRefusal as exc:
+                if exc.code != "control_runtime_manifest_ownership_invalid":
+                    bad.append(f"{path}:{line_number}: pod refusal was {exc.code}")
+            else:
+                bad.append(f"{path}:{line_number}: pod accepted an observed-local base")
+    wanted = {
+        "minimal-complete-v1",
+        "observed-local-v1",
+        "observed-local-wheel-refused",
+        "unknown-format-refused",
+        "unknown-provider-refused",
+    }
     if names != wanted:
         bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
     mirror_specs = (
+        (
+            "base-worker-image-wheelhouse-cpu.json",
+            24_968,
+            "sha256:84108430ba9dd2b23892034006aa5fb916af91ec14d7e2e1a13d30b29a1df8be",
+            (27, 324, 26),
+            ("none", "none"),
+        ),
         (
             "base-worker-image-wheelhouse-cu130.json",
             25_538,
@@ -755,7 +778,7 @@ def fence_base_ownership_vectors() -> list[str]:
         target = dict(manifest.platform_target)
         expected_target = {
             "os_arch": "linux/amd64",
-            "libc": "glibc2.39",
+            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
             "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],
@@ -918,11 +941,7 @@ def fence_tensorhub_package_release() -> list[str]:
 
     manifest_path = root / "base-worker-image-wheelhouse-cu130.json"
     manifest = manifest_path.read_bytes()
-    manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
-    environment = {
-        "wheelhouse_manifest": {"digest": manifest_digest, "length": len(manifest)},
-        "wheels": dependencies,
-    }
+    environment = {"wheels": dependencies}
     environment_digest = (
         "sha256:"
         + hashlib.sha256(
@@ -1220,7 +1239,6 @@ DOCUMENT_KINDS = {
     "cozy.package.descriptor/1": "internal/descriptor.py",
     "cozy.runtime.EnvironmentReceipt/1": "internal/overlay.py",
     "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
-    "cozy.runtime.Qualification/1": "qualification.py",
 }
 #: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
 #: Naming them is decoding, not authoring; the owner's fence polices the name.
@@ -1277,7 +1295,6 @@ def fence_document_kinds() -> list[str]:
         "cozy.package.descriptor/1",
         "cozy.runtime.EnvironmentReceipt/1",
         "cozy.runtime.ModelConstructionContract/1",
-        "cozy.runtime.Qualification/1",
     }
     if set(DOCUMENT_KINDS) != expected:
         bad.append(
@@ -1317,52 +1334,6 @@ def fence_document_kinds() -> list[str]:
     return bad
 
 
-def fence_qualification_selection() -> list[str]:
-    """Qualification binds exactly one selected PlacementSet fact tuple."""
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime import qualification
-    from cozy_runtime.internal import canonical
-
-    ref = {"digest": "sha256:" + "1" * 64, "length": 1}
-    package = {
-        "package": "proof/proof-package",
-        "project_wheel": {
-            "distribution": "proof-package",
-            "filename": "proof_package-1.0.0-py3-none-any.whl",
-            "import_roots": ["proof_package"],
-            "ref": ref,
-            "tags": ["py3-none-any"],
-            "version": "1.0.0",
-        },
-        "release": "1.0.0",
-        "release_digest": "sha256:" + "5" * 64,
-    }
-    try:
-        selected = qualification.selection_digest(
-            bindings_digest="sha256:" + "2" * 64,
-            environment_digest="sha256:" + "3" * 64,
-            environment_receipt=ref,
-            package_descriptor=ref,
-            package=package,
-        )
-        raw = canonical.write(qualification.document(selected))
-        if qualification.read(raw) != selected:
-            return ["Qualification selection does not round-trip"]
-        changed = qualification.selection_digest(
-            bindings_digest="sha256:" + "4" * 64,
-            environment_digest="sha256:" + "3" * 64,
-            environment_receipt=ref,
-            package_descriptor=ref,
-            package=package,
-        )
-        if changed == selected:
-            return ["Qualification selection ignores bindings_digest"]
-    except qualification.QualificationError as exc:
-        return [f"Qualification selection refused its own closed tuple: {exc}"]
-    return []
-
-
 def fence_development_placement() -> list[str]:
     """Development is explicit and never aliases source identity to an Environment."""
 
@@ -1376,7 +1347,7 @@ def fence_development_placement() -> list[str]:
     source_digest = "sha256:" + "7" * 64
     built = local.development_placement_documents(
         descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-        package="paul/marco-polo",
+        package="paul/marco-polo-package",
         release="1.0.3",
         source_digest=source_digest,
     )
@@ -1393,8 +1364,6 @@ def fence_development_placement() -> list[str]:
     forbidden = {
         "environment",
         "environment_digest",
-        "environment_receipt_digest",
-        "qualification",
     } & set(parsed)
     if forbidden:
         return [f"development Placement carries published field {sorted(forbidden)[0]}"]
@@ -1422,7 +1391,7 @@ def fence_development_placement() -> list[str]:
         cache = pathlib.Path(directory)
         staged = local.development_placement_documents(
             descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-            package="paul/marco-polo",
+            package="paul/marco-polo-package",
             release="1.0.3",
             source_digest=source_digest,
             artifact_cache=cache,
@@ -1435,7 +1404,7 @@ def fence_development_placement() -> list[str]:
                 entrypoints=tuple(document["entrypoints"]),
                 package_descriptor=(descriptor_digest, len(staged.descriptor)),
                 development={
-                    "package": "paul/marco-polo",
+                    "package": "paul/marco-polo-package",
                     "release": "1.0.3",
                     "source_digest": source_digest,
                 },
@@ -1833,7 +1802,6 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "document-kinds": fence_document_kinds,
-    "qualification-selection": fence_qualification_selection,
     "development-placement": fence_development_placement,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,

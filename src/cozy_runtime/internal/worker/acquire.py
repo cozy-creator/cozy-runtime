@@ -18,10 +18,8 @@ from pathlib import Path
 from threading import Lock, local
 from typing import Any, Literal
 
-from cozy_runtime import qualification
 from cozy_runtime.internal import (
     canonical,
-    contract,
     fill,
     overlay,
     placement_materialization,
@@ -38,7 +36,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 type FaultKind = pb.FaultKind
 type LegName = Literal["package", "model"]
-MAX_DOCUMENT_BYTES = 64 << 20
 
 
 class AcquisitionRefusal(Exception):
@@ -435,9 +432,7 @@ class Acquirer:
 
     def _environment(self, placement: Any) -> overlay.InstalledOverlay:
         environment_digest = documents.spell(placement.environment_digest)
-        receipt_digest = documents.spell(placement.environment_receipt_digest)
-        wheelhouse = _ref(placement.environment["wheelhouse_manifest"], "wheelhouse_manifest")
-        wheelhouse_raw = self.fetch(*wheelhouse).read_bytes()
+        wheelhouse_raw = self.base_manifest.read_bytes()
         wheel_rows = [placement.package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
         verified: dict[str, overlay.VerifiedFile] = {}
@@ -468,15 +463,10 @@ class Acquirer:
                 self.environment_root,
                 python=self.python,
                 base_manifest=self.base_manifest,
-                expected_receipt_digest=receipt_digest,
             )
         except (LaunchRefusal, overlay.OverlayRefusal) as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                if "receipt" in exc.code
-                else pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                exc.code,
-                exc.detail,
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
             ) from exc
 
     def _models(self, placement: Any) -> int:
@@ -497,7 +487,7 @@ class Acquirer:
                     manifest_path = self.fetch(manifest_digest, manifest_length)
                     manifest_raw = manifest_path.read_bytes()
                     store.put_manifest(manifest_raw, manifest_digest, manifest_length)
-                    for digest, length in _manifest_entries(manifest_raw):
+                    for digest, length in manifest_entries(tensorfs, manifest_raw):
                         path = self.fetch(digest, length)
                         store.put_file(str(path), digest, length)
                 reached = {
@@ -566,39 +556,11 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
             ) from exc
-        qualification_digest, qualification_length = placement.qualification
-        qualification_raw = self.fetch(qualification_digest, qualification_length).read_bytes()
-        try:
-            selected = qualification.read(qualification_raw)
-            expected = qualification.selection_digest(
-                bindings_digest=documents.spell(placement.bindings_digest),
-                environment_digest=documents.spell(placement.environment_digest),
-                environment_receipt={
-                    "digest": installed.receipt_digest,
-                    "length": len(installed.receipt_bytes),
-                },
-                package_descriptor={
-                    "digest": descriptor_digest,
-                    "length": descriptor_length,
-                },
-                package=placement.package,
-            )
-        except qualification.QualificationError as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "qualification_invalid", str(exc)
-            ) from exc
-        if selected != expected:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "qualification_selection_mismatch",
-                "Qualification does not authorize this exact PlacementSet/1 selection",
-            )
-        self._stage(qualification_digest, qualification_raw)
         visible = _visible_entrypoints(descriptor)
         models = {str(row["id"]): row for row in placement.models}
         release_digest = str(placement.package["release_digest"])
         bindings: dict[str, DeclaredBinding] = {}
-        count = 2
+        count = 1
         for entrypoint in placement.entrypoints:
             name = str(entrypoint["name"])
             binding_digest = str(entrypoint["entrypoint_binding_digest"])
@@ -651,44 +613,16 @@ class Acquirer:
                 )
             config_ref = _ref(slot["config"]["document"], "slot.config.document")
             config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
-            contract_ref = _ref(slot["model_construction_contract"], "slot.mcc")
-            contract_raw = self.fetch(*contract_ref).read_bytes()
-            self._stage(contract_ref[0], contract_raw)
-            count += 2
-            try:
-                construction = contract.read_contract(contract_raw)
-            except contract.ContractError as exc:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "model_construction_contract_invalid",
-                    str(exc),
-                ) from exc
-            candidate = construction.candidate
+            count += 1
             reference = models[str(slot["reference_model_id"])]
             reference_manifest = str(reference["manifest"]["digest"])
             model_class = str(declared.get("class", ""))
-            if (
-                candidate.release
-                not in {
-                    release_digest,
-                    release_digest.removeprefix("sha256:"),
-                }
-                or candidate.application != application
-                or not candidate.model_class.endswith(":" + model_class)
-                or candidate.snapshot != reference_manifest
-                or candidate.config_digest != config_ref[0]
-            ):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "selected_binding_mismatch",
-                    f"{name}: MCC candidate does not equal PlacementSet/1",
-                )
             components = tuple(str(row["component"]) for row in slot.get("components", []))
-            if components != tuple(row.component for row in construction.destination_sets):
+            if not components:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     "selected_binding_mismatch",
-                    f"{name}: component order differs from the MCC",
+                    f"{name}: selected model has no components",
                 )
             snapshots = {
                 str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
@@ -707,14 +641,15 @@ class Acquirer:
                     f"{name}: descriptor stamps are not selected",
                 )
             try:
-                model_weight_bytes = contract.destination_resident_bytes(
-                    construction, contract.tensorfs_destination_widths(fill.tensorfs_module())
+                store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+                model_weight_bytes = sum(
+                    int(row["length"]) for row in store.walk(reference_manifest)
                 )
-            except (contract.ContractError, fill.FillRefusal) as exc:
+            except Exception as exc:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "model_construction_contract_invalid",
-                    str(exc),
+                    "selected_model_manifest_unavailable",
+                    f"{type(exc).__name__}: {exc}",
                 ) from exc
             bindings[binding_digest] = DeclaredBinding(
                 entrypoint_binding_digest=binding_digest,
@@ -730,13 +665,13 @@ class Acquirer:
                 descriptor_path=str(descriptor_path),
                 store=str(self.artifact_store),
                 config=str(config_path),
-                variant=candidate.hardware_variant,
+                variant="",
                 reference_snapshot=reference_manifest,
                 components=components,
                 snapshots=snapshots,
                 stamps={key: tuple(sorted(values)) for key, values in sorted(stamps.items())},
                 model_weight_bytes=model_weight_bytes,
-                expected_logical_model_digest=contract.logical_model_digest(construction),
+                expected_logical_model_digest="",
             )
             for asset in slot["config"].get("assets", []):
                 ref = _ref(asset["ref"], "slot.config.asset")
@@ -808,24 +743,6 @@ def _verify_bytes(raw: bytes, digest: str, length: int) -> None:
         )
 
 
-def _document(raw: bytes, name: str) -> dict[str, Any]:
-    if len(raw) > MAX_DOCUMENT_BYTES:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_too_large", str(len(raw))
-        )
-    try:
-        value = canonical.parse_canonical(raw)
-    except canonical.CanonicalError as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_noncanonical", str(exc)
-        ) from exc
-    if not isinstance(value, dict):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, f"{name}_invalid", "not an object"
-        )
-    return value
-
-
 def _ref(value: object, name: str) -> tuple[str, int]:
     if (
         not isinstance(value, dict)
@@ -845,23 +762,27 @@ def _ref(value: object, name: str) -> tuple[str, int]:
     return str(value["digest"]), int(value["length"])
 
 
-def _manifest_entries(raw: bytes) -> set[tuple[str, int]]:
-    manifest = _document(raw, "model_manifest")
-    if set(manifest) != {"entries"} or not isinstance(manifest["entries"], list):
+def manifest_entries(tensorfs: Any, raw: bytes) -> set[tuple[str, int]]:
+    """Read exact blob refs through TensorFS's canonical Manifest parser."""
+
+    try:
+        manifest = tensorfs.parse_manifest(raw)
+        rows = manifest["entries"]
+        refs = {
+            ("sha256:" + str(row["blob"]["sha256"]), int(row["blob"]["length"])) for row in rows
+        }
+    except Exception as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "model_manifest_invalid",
-            "Manifest has one entries array",
+            f"TensorFS refused Manifest bytes: {type(exc).__name__}: {exc}",
+        ) from exc
+    if not rows or len(refs) != len(rows) or any(length <= 0 for _digest, length in refs):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "model_manifest_invalid",
+            "TensorFS Manifest refs are not unique and positive",
         )
-    refs: set[tuple[str, int]] = set()
-    for row in manifest["entries"]:
-        if not isinstance(row, dict) or set(row) != {"blob", "kind", "path"}:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "model_manifest_invalid",
-                "entry fields are closed",
-            )
-        refs.add(_ref(row["blob"], "manifest.entry.blob"))
     return refs
 
 

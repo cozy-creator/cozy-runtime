@@ -162,9 +162,7 @@ def _prepare(args: argparse.Namespace) -> None:
         "release": "1.0.0",
         "release_digest": _digest(b"proof release.json provenance"),
     }
-    environment = pb.Environment(
-        wheelhouse_manifest=pb.Ref(digest=documents.digest_of(wheelhouse), length=len(wheelhouse))
-    )
+    environment = pb.Environment()
     environment_body = {**documents.body(environment), "wheels": []}
     environment_digest = documents.digest_of(
         _canonical({**environment_body, "format": "cozy.worker.v1.Environment/1"})

@@ -296,6 +296,8 @@ def control_runtime_digest(
 
     if manifest is None:
         manifest = baked_base_manifest(manifest_path)
+    if manifest.ownership != "image":
+        raise LaunchRefusal("control_runtime_manifest_ownership_invalid", manifest.ownership)
     matches = [wheel.digest for wheel in manifest.wheels if wheel.distribution == "cozy-runtime"]
     if len(matches) != 1:
         raise LaunchRefusal(
@@ -333,8 +335,7 @@ def package_overlay_input(
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
     _require_digest(package["release_digest"], "package.release_digest")
 
-    _closed(environment, {"wheelhouse_manifest", "wheels"}, "environment")
-    wheelhouse_ref = _ref(environment["wheelhouse_manifest"], "wheelhouse_manifest")
+    _closed(environment, {"wheels"}, "environment")
     measured_environment = (
         "sha256:"
         + hashlib.sha256(canonical.write({**environment, "format": ENVIRONMENT_FORMAT})).hexdigest()
@@ -344,9 +345,9 @@ def package_overlay_input(
             "environment_digest_mismatch",
             f"measured {measured_environment}, expected {environment_digest}",
         )
-    _ref_matches(wheelhouse_ref, wheelhouse_manifest_bytes, "wheelhouse_manifest")
+    base_digest = _digest(wheelhouse_manifest_bytes)
     try:
-        overlay.parse_base_manifest(wheelhouse_manifest_bytes, str(wheelhouse_ref["digest"]))
+        overlay.parse_base_manifest(wheelhouse_manifest_bytes, base_digest)
     except overlay.OverlayRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
 
@@ -380,7 +381,7 @@ def package_overlay_input(
         raise LaunchRefusal("wheel_grant_set_mismatch", f"missing={missing[:1]} extra={extra[:1]}")
     return overlay.Input(
         environment_digest=environment_digest,
-        base_family_digest=_digest(wheelhouse_manifest_bytes),
+        base_family_digest=base_digest,
         project_wheel_digest=project.digest,
         wheels=tuple(wheels),
         grants=tuple(

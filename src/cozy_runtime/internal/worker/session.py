@@ -243,12 +243,10 @@ class Placement:
     package: dict[str, Any]
     development: dict[str, Any]
     environment_digest: bytes
-    environment_receipt_digest: bytes
     package_descriptor: tuple[str, int]
     bindings_digest: bytes
     models: tuple[dict[str, Any], ...]
     entrypoints: tuple[dict[str, Any], ...]
-    qualification: tuple[str, int]
     environment: dict[str, Any]
     document: dict[str, Any]
     acquisition: pb.PlacementAcquisitionObservation = field(
@@ -528,12 +526,10 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         "package",
         "development",
         "environment_digest",
-        "environment_receipt_digest",
         "package_descriptor",
         "bindings_digest",
         "models",
         "entrypoints",
-        "qualification",
         "environment",
     }
     _closed_document(entry, fields, "Placement")
@@ -557,18 +553,15 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         package = _package_selection(entry["package"])
         _required(
             entry,
-            {"environment_digest", "environment_receipt_digest", "qualification", "environment"},
+            {"environment_digest", "environment"},
             "Placement",
         )
-        _exact_ref(entry["qualification"], "Placement.qualification")
-        for name in ("environment_digest", "environment_receipt_digest"):
-            if not isinstance(entry[name], str) or HASH_ENTRY.fullmatch(entry[name]) is None:
-                raise documents.DocumentError("malformed_digest", f"Placement.{name}")
-        environment = _closed_document(
-            entry["environment"], {"wheelhouse_manifest", "wheels"}, "Environment"
-        )
-        _required(environment, {"wheelhouse_manifest"}, "Environment")
-        _exact_ref(environment["wheelhouse_manifest"], "Environment.wheelhouse_manifest")
+        if (
+            not isinstance(entry["environment_digest"], str)
+            or HASH_ENTRY.fullmatch(entry["environment_digest"]) is None
+        ):
+            raise documents.DocumentError("malformed_digest", "Placement.environment_digest")
+        environment = _closed_document(entry["environment"], {"wheels"}, "Environment")
         wheels = environment.get("wheels", [])
         if not isinstance(wheels, list):
             raise documents.DocumentError("wrong_type", "Environment.wheels")
@@ -592,8 +585,6 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         _development_package(entry["development"])
         forbidden = {
             "environment_digest",
-            "environment_receipt_digest",
-            "qualification",
             "environment",
         } & set(entry)
         if forbidden:
@@ -607,10 +598,12 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     model_ids: list[str] = []
     for index, value in enumerate(models):
         model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
-        _required(model, {"id", "repo", "version", "lane", "manifest"}, "Model")
+        _required(model, {"id", "repo", "version", "manifest"}, "Model")
         model_ids.append(_identifier(model["id"], f"models[{index}].id"))
-        for name in ("repo", "version", "lane"):
+        for name in ("repo", "version"):
             _identifier(model[name], f"models[{index}].{name}")
+        if "lane" in model:
+            _identifier(model["lane"], f"models[{index}].lane")
         _exact_ref(model["manifest"], f"models[{index}].manifest")
     if model_ids != sorted(set(model_ids)):
         raise documents.DocumentError("sort_order", "Placement.models")
@@ -645,10 +638,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 },
                 "Slot",
             )
-            required_slot = {"slot", "reference_model_id", "config"}
-            if published:
-                required_slot.add("model_construction_contract")
-            _required(slot, required_slot, "Slot")
+            _required(slot, {"slot", "reference_model_id", "config"}, "Slot")
             if development and "model_construction_contract" in slot:
                 raise documents.DocumentError(
                     "development_fields_invalid",
@@ -685,7 +675,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
-            if published:
+            if "model_construction_contract" in slot:
                 _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
             stamps = slot.get("stamps", [])
             if not isinstance(stamps, list):
@@ -941,6 +931,7 @@ class Worker:
             return package_prepare.prepare_package_set(
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
+                artifact_store=Path(self.options.artifact_store or ""),
                 environment_root=Path(self.options.environment_root or ""),
                 python=Path(self.options.python or sys.executable),
                 describe=describe,
@@ -1830,14 +1821,12 @@ class Worker:
         package = dict(entry.get("package", {}))
         development = dict(entry.get("development", {}))
         package_descriptor = dict(entry.get("package_descriptor", {}))
-        qualification = dict(entry.get("qualification", {}))
         candidate = Placement(
             placement_id=placement_id,
             placement_set_digest=desired_set.placement_set_digest,
             package=package,
             development=development,
             environment_digest=_digest_field(entry.get("environment_digest")),
-            environment_receipt_digest=_digest_field(entry.get("environment_receipt_digest")),
             package_descriptor=(
                 str(package_descriptor.get("digest", "")),
                 int(package_descriptor.get("length", 0)),
@@ -1845,10 +1834,6 @@ class Worker:
             bindings_digest=_digest_field(entry.get("bindings_digest")),
             models=tuple(dict(row) for row in entry.get("models", [])),
             entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-            qualification=(
-                str(qualification.get("digest", "")),
-                int(qualification.get("length", 0)),
-            ),
             environment=dict(entry.get("environment", {})),
             document=dict(entry),
             # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
@@ -1930,8 +1915,8 @@ class Worker:
         (fallback-retention #474 clauses 1-2), so an incoming failure costs zero intake
         interruption and LATCHES for this desired revision rather than looping (clause 5).
 
-        `MATERIALIZATION_STATE_STAGED` ASSERTS that the measured EnvironmentReceipt equals
-        `environment_receipt_digest`; it is unspeakable otherwise (§8).
+        `MATERIALIZATION_STATE_STAGED` asserts that the exact overlay installed and imported;
+        it is unspeakable otherwise (§8).
         """
         candidate = self.pending or self.placement
         assert candidate is not None
@@ -2108,20 +2093,6 @@ class Worker:
                 terminal=True,
             )
             return None
-        expected = documents.spell(placement.environment_receipt_digest)
-        if not expected:
-            self._materialization_failed(
-                placement,
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=placement.placement_id,
-                    reason="environment_receipt_absent_from_spec",
-                    detail="a published Placement names the receipt a completed materialization "
-                    "must measure to; a spec without one is unmaterializable",
-                ),
-                terminal=True,
-            )
-            return None
         if self.options.environment_root is None or self.options.artifact_store is None:
             self._materialization_failed(
                 placement,
@@ -2129,8 +2100,8 @@ class Worker:
                     kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
-                    detail=f"receipt {expected} is required, but this worker was launched "
-                    "without --environment-root and --artifact-store; the worker will not "
+                    detail="this worker was launched without --environment-root and "
+                    "--artifact-store; the worker will not "
                     "guess where the worker put package overlays or TensorFS objects",
                 ),
                 terminal=False,
@@ -2188,11 +2159,7 @@ class Worker:
                     reason=exc.code,
                     detail=safe(exc.detail),
                 ),
-                terminal=exc.kind
-                in (
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
-                ),
+                terminal=exc.kind in (pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,),
             )
             return None
         except (OSError, overlay.OverlayRefusal) as exc:
@@ -2200,7 +2167,7 @@ class Worker:
             self._materialization_failed(
                 placement,
                 pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
                     if isinstance(exc, overlay.OverlayRefusal)
                     else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
                     subject=placement.placement_id,
@@ -3397,7 +3364,7 @@ class Worker:
                     pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
                     pb.FaultKind.FAULT_KIND_EXECUTOR_POISONED,
-                    pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH,
+                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     pb.FaultKind.FAULT_KIND_FALLBACK_PIN_MISSING,
                 )
             ],

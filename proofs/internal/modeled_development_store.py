@@ -12,7 +12,7 @@ from typing import Any
 
 
 def create(
-    root: Path, *, config: bytes = b'{"width":4}', tensor: bytes = b"\0" * 8
+    root: Path, *, config: bytes = b'{"width":4}', tensor: bytes = b"\x80\x3f" * 4
 ) -> dict[str, Any]:
     import tensorfs
 

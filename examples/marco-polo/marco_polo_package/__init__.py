@@ -16,9 +16,9 @@ class MarcoRequest(msgspec.Struct, forbid_unknown_fields=True):
 
 
 class PoloResponse(msgspec.Struct):
-    message: Literal["polo2222"]
+    message: Literal["polo"]
 
 
 @app.entrypoint
 def marco(payload: MarcoRequest) -> PoloResponse:
-    return PoloResponse(message="polo2222")
+    return PoloResponse(message="polo")

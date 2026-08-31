@@ -7,13 +7,22 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime import qualification
-from cozy_runtime.internal import canonical, descriptor, overlay, placement_materialization
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
+from cozy_runtime.internal import (
+    canonical,
+    descriptor,
+    fill,
+    overlay,
+    placement_materialization,
+    pull,
+)
 from cozy_runtime.internal.refusal import LaunchRefusal
+from cozy_runtime.internal.worker import acquire
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -33,15 +42,20 @@ def prepare_package_set(
     request: pb.PreparePackageSetRequest,
     *,
     artifact_cache: Path,
+    artifact_store: Path,
     environment_root: Path,
     python: Path,
     describe: Callable[[overlay.InstalledOverlay, str], bytes],
     verified: Callable[[str, int, Path], None],
     base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
 ) -> pb.PreparePackageSetResult:
-    """Materialize and describe one weightless package into an existing PlacementSet."""
+    """Parse one signed delegation, then use the shared package preparation path."""
 
-    if Path(request.environment_root) != environment_root or not environment_root.is_absolute():
+    if (
+        Path(request.environment_root) != environment_root
+        or not environment_root.is_absolute()
+        or not artifact_store.is_absolute()
+    ):
         raise PreparationRefusal(
             "package_prepare_environment_root_invalid", request.environment_root
         )
@@ -51,9 +65,10 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_delegation_invalid", exc.detail) from exc
     packages = delegation.get("packages")
     models = delegation.get("models")
-    if not isinstance(packages, list) or len(packages) != 1 or models != []:
+    if not isinstance(packages, list) or len(packages) != 1 or not isinstance(models, list):
         raise PreparationRefusal(
-            "package_prepare_weightless_only", "exactly one package and zero models are supported"
+            "package_prepare_selection_invalid",
+            "exactly one package and a model array are required",
         )
     selected = packages[0]
     if not isinstance(selected, dict):
@@ -66,6 +81,46 @@ def prepare_package_set(
     except (documents.DocumentError, ValueError) as exc:
         raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
 
+    return prepare_package(
+        package_name=package_name,
+        release=release,
+        release_digest=release_digest,
+        files=request.files,
+        placement_seed=request.download_delegation,
+        artifact_cache=artifact_cache,
+        artifact_store=artifact_store,
+        models=models,
+        environment_root=environment_root,
+        python=python,
+        describe=describe,
+        verified=verified,
+        base_manifest=base_manifest,
+    )
+
+
+def prepare_package(
+    *,
+    package_name: str,
+    release: str,
+    release_digest: str,
+    files: Sequence[pb.LocalDownloadFile],
+    placement_seed: bytes,
+    artifact_cache: Path,
+    environment_root: Path,
+    python: Path,
+    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    verified: Callable[[str, int, Path], None],
+    base_manifest: Path,
+    models: Sequence[Any] = (),
+    artifact_store: Path | None = None,
+) -> pb.PreparePackageSetResult:
+    """Inspect, install, import, and describe one exact package."""
+
+    try:
+        documents.raw(release_digest)
+    except (documents.DocumentError, ValueError) as exc:
+        raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
+
     base_raw = _read_file(base_manifest, 64 << 20)
     base_digest = "sha256:" + hashlib.sha256(base_raw).hexdigest()
     try:
@@ -73,10 +128,11 @@ def prepare_package_set(
     except overlay.OverlayRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
 
-    rows = list(request.files)
+    rows = list(files)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     facts: list[tuple[overlay.Wheel, Path, overlay.VerifiedFile]] = []
+    model_files: dict[str, tuple[int, int, Path]] = {}
     prior = b""
     parents: set[Path] = set()
     for row in rows:
@@ -86,8 +142,10 @@ def prepare_package_set(
         if row.kind not in {
             pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
             pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
         }:
-            raise PreparationRefusal("package_prepare_weightless_only", row.filename)
+            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
         path = Path(row.path)
         if (
             not path.is_absolute()
@@ -97,12 +155,31 @@ def prepare_package_set(
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
         parents.add(path.parent)
+        digest = documents.spell(bytes(row.digest))
+        if row.kind in {
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
+        }:
+            model_files[digest] = (row.kind, row.length, path)
+            continue
         owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
+        if owner == "custom":
+            try:
+                distribution, _version, _build, _tags = parse_wheel_filename(row.filename)
+            except InvalidWheelFilename as exc:
+                raise PreparationRefusal("package_prepare_file_invalid", row.filename) from exc
+            if _DISTRIBUTION.sub("-", str(distribution)).lower() in base.distribution_versions:
+                # A release is portable across CPU/CUDA bases with different ambient
+                # inventories. Never overlay or shadow an image-owned distribution;
+                # materialize() checks the project requirement against the actual base
+                # version after these redundant carrier bytes are omitted.
+                verified(digest, row.length, path)
+                continue
         try:
             wheel, receipt = overlay.measure_wheel(path, owner, base)
         except overlay.OverlayRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
-        if wheel.digest != documents.spell(bytes(row.digest)) or wheel.length != row.length:
+        if wheel.digest != digest or wheel.length != row.length:
             raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
         facts.append((wheel, path, receipt))
     if len(parents) != 1:
@@ -119,10 +196,7 @@ def prepare_package_set(
         (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
         key=lambda wheel: wheel.distribution,
     )
-    environment = pb.Environment(
-        wheelhouse_manifest=pb.Ref(digest=documents.raw(base_digest), length=len(base_raw)),
-        wheels=[_wheel_fact(wheel) for wheel in dependency_facts],
-    )
+    environment = pb.Environment(wheels=[_wheel_fact(wheel) for wheel in dependency_facts])
     environment_body = documents.body(environment)
     environment_body.setdefault("wheels", [])
     environment_digest = documents.spell(
@@ -165,38 +239,36 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
     _stage(artifact_cache, base_raw)
-    entrypoints = _entrypoints(descriptor_body)
+    selected_models, entrypoints = _entrypoints(
+        descriptor_body,
+        package_name=package_name,
+        selections=models,
+        files=model_files,
+        artifact_cache=artifact_cache,
+        artifact_store=artifact_store,
+        verified=verified,
+    )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     for entrypoint_body in entrypoint_bodies:
         entrypoint_body.setdefault("slots", [])
     bindings_digest = documents.digest_of(
-        canonical.write({"entrypoints": entrypoint_bodies, "models": []})
+        canonical.write(
+            {
+                "entrypoints": entrypoint_bodies,
+                "models": [documents.body(model) for model in selected_models],
+            }
+        )
     )
-    receipt_ref = {"digest": installed.receipt_digest, "length": len(installed.receipt_bytes)}
-    descriptor_value = {"digest": descriptor_ref[0], "length": descriptor_ref[1]}
-    selection = qualification.selection_digest(
-        bindings_digest=documents.spell(bindings_digest),
-        environment_digest=environment_digest,
-        environment_receipt=receipt_ref,
-        package_descriptor=descriptor_value,
-        package=documents.body(package),
-    )
-    qualification_raw = canonical.write(qualification.document(selection))
-    qualification_ref = _stage(artifact_cache, qualification_raw)
     placement = pb.Placement(
-        placement_id="private-" + hashlib.sha256(request.download_delegation).hexdigest()[:24],
+        placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
         package=package,
         environment_digest=documents.raw(environment_digest),
-        environment_receipt_digest=documents.raw(installed.receipt_digest),
         package_descriptor=pb.Ref(
             digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
         ),
         bindings_digest=bindings_digest,
-        models=[],
+        models=selected_models,
         entrypoints=entrypoints,
-        qualification=pb.Ref(
-            digest=documents.raw(qualification_ref[0]), length=qualification_ref[1]
-        ),
         environment=environment,
     )
     placement_body = documents.body(placement)
@@ -226,25 +298,217 @@ def _wheel_fact(wheel: overlay.Wheel) -> pb.WheelFact:
     )
 
 
-def _entrypoints(body: Mapping[str, Any]) -> list[pb.Entrypoint]:
+def _entrypoints(
+    body: Mapping[str, Any],
+    *,
+    package_name: str,
+    selections: Sequence[Any],
+    files: Mapping[str, tuple[int, int, Path]],
+    artifact_cache: Path,
+    artifact_store: Path | None,
+    verified: Callable[[str, int, Path], None],
+) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list) or not rows:
         raise PreparationRefusal("package_prepare_entrypoints_absent", "package is not serving")
+    selected = _selected_models(
+        package_name, selections, files, artifact_cache, artifact_store, verified
+    )
+    model_ids = {slot: f"model-{index:04d}" for index, slot in enumerate(sorted(selected))}
+    models = [
+        pb.Model(
+            id=model_ids[slot],
+            repo=str(value["selection"]["model"]),
+            version=str(value["selection"]["release"]),
+            manifest=pb.Ref(
+                digest=documents.raw(str(value["selection"]["manifest"])),
+                length=int(value["manifest_length"]),
+            ),
+        )
+        for slot, value in sorted(selected.items())
+    ]
     out: list[pb.Entrypoint] = []
+    described_slots: set[str] = set()
     for value in rows:
         if not isinstance(value, dict) or not isinstance(value.get("name"), str):
             raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoint")
-        if value.get("models") not in (None, []):
-            raise PreparationRefusal("package_prepare_weightless_only", value["name"])
-        entrypoint = pb.Entrypoint(name=value["name"], slots=[])
+        described = value.get("models", [])
+        if not isinstance(described, list) or len(described) > 1:
+            raise PreparationRefusal(
+                "package_prepare_model_count_unsupported",
+                f"{value['name']}: at most one exact model slot is supported",
+            )
+        described_paths: set[str] = set()
+        for row in described:
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                raise PreparationRefusal("package_prepare_descriptor_invalid", "model slot")
+            described_paths.add(str(row["path"]))
+        if described_paths and not described_paths.issubset(selected):
+            # One desired package set names the entrypoints it can actually bind. A
+            # different invocation may select another model later; it should not force
+            # this worker to download unrelated weights now.
+            continue
+        slots: list[pb.Slot] = []
+        for row in described:
+            path = str(row["path"])
+            prefix = f"{value['name']}.models."
+            if (
+                not path.startswith(prefix)
+                or path not in selected
+                or row.get("stamps") not in ({}, None)
+            ):
+                raise PreparationRefusal("package_prepare_model_selection_mismatch", path)
+            described_slots.add(path)
+            model = selected[path]
+            model_id = model_ids[path]
+            slots.append(
+                pb.Slot(
+                    slot=path.removeprefix(prefix),
+                    reference_model_id=model_id,
+                    config=pb.Config(
+                        document=pb.Ref(
+                            digest=documents.raw(str(model["config_digest"])),
+                            length=len(model["config_bytes"]),
+                        ),
+                        assets=[],
+                    ),
+                    components=[
+                        pb.Component(component=component, model_id=model_id)
+                        for component in model["components"]
+                    ],
+                    stamps=[],
+                )
+            )
+        entrypoint = pb.Entrypoint(name=value["name"], slots=slots)
         entrypoint.entrypoint_binding_digest = documents.digest_of(
-            canonical.write({"name": entrypoint.name, "slots": []})
+            canonical.write(
+                {"name": entrypoint.name, "slots": [documents.body(slot) for slot in slots]}
+            )
         )
         out.append(entrypoint)
     out.sort(key=lambda row: row.name)
     if len({row.name for row in out}) != len(out):
         raise PreparationRefusal("package_prepare_descriptor_invalid", "duplicate entrypoint")
-    return out
+    if described_slots != set(selected):
+        raise PreparationRefusal(
+            "package_prepare_model_selection_mismatch",
+            f"missing={sorted(set(selected) - described_slots)} "
+            f"extra={sorted(described_slots - set(selected))}",
+        )
+    return models, out
+
+
+def _selected_models(
+    package_name: str,
+    selections: Sequence[Any],
+    files: Mapping[str, tuple[int, int, Path]],
+    artifact_cache: Path,
+    artifact_store: Path | None,
+    verified: Callable[[str, int, Path], None],
+) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for row in selections:
+        if not isinstance(row, dict) or row.get("package") != package_name:
+            raise PreparationRefusal("package_prepare_model_selection_mismatch", "package")
+        slot = str(row.get("slot", ""))
+        if not slot or slot in selected:
+            raise PreparationRefusal("package_prepare_model_selection_mismatch", slot)
+        selected[slot] = {"selection": row}
+
+    manifest_refs = {str(value["selection"]["manifest"]) for value in selected.values()}
+    manifest_files = {
+        digest: (length, path)
+        for digest, (kind, length, path) in files.items()
+        if kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST
+    }
+    object_files = {
+        digest: (length, path)
+        for digest, (kind, length, path) in files.items()
+        if kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT
+    }
+    if set(manifest_files) != manifest_refs:
+        raise PreparationRefusal(
+            "package_prepare_model_manifest_set_mismatch",
+            f"wanted={sorted(manifest_refs)} got={sorted(manifest_files)}",
+        )
+    if not selected:
+        if object_files:
+            raise PreparationRefusal(
+                "package_prepare_model_object_set_mismatch", "unexpected objects"
+            )
+        return selected
+
+    if artifact_store is None:
+        raise PreparationRefusal(
+            "package_prepare_model_store_absent", "modeled package requires a TensorFS store"
+        )
+
+    try:
+        tensorfs = fill.tensorfs_module()
+        store = pull.open_store(tensorfs, artifact_store)
+        closures: dict[str, set[tuple[str, int]]] = {}
+        reached: set[tuple[str, int]] = set()
+        for digest, (length, path) in sorted(manifest_files.items()):
+            raw = _read_file(path, int(tensorfs.manifest_max_bytes()))
+            store.put_manifest(raw, digest, length)
+            closure = acquire.manifest_entries(tensorfs, raw)
+            closures[digest] = closure
+            reached.update(closure)
+        if {(digest, length) for digest, (length, _path) in object_files.items()} != reached:
+            raise PreparationRefusal(
+                "package_prepare_model_object_set_mismatch",
+                "downloaded model objects do not equal the selected Manifest closure",
+            )
+        for digest, (length, path) in sorted(object_files.items()):
+            store.put_file(str(path), digest, length)
+            verified(digest, length, path)
+        for digest, (length, path) in sorted(manifest_files.items()):
+            store.acquire_manifest(digest).release()
+            held = store.manifest(digest)
+            header = tensorfs.parse_header(bytes(held["header"]))
+            configs = header.get("configs")
+            components = header.get("components")
+            if (
+                not isinstance(configs, dict)
+                or len(configs) != 1
+                or not isinstance(components, dict)
+                or not components
+                or header.get("assets") not in ({}, None)
+            ):
+                raise PreparationRefusal(
+                    "package_prepare_model_header_unsupported",
+                    f"{digest}: expected one config, components, and no assets",
+                )
+            config = next(iter(configs.values()))
+            config_digest = "sha256:" + str(config["sha256"])
+            config_length = int(config["length"])
+            config_bytes = bytes(store.document(config_digest))
+            if (
+                len(config_bytes) != config_length
+                or "sha256:" + hashlib.sha256(config_bytes).hexdigest() != config_digest
+            ):
+                raise PreparationRefusal("package_prepare_model_config_mismatch", digest)
+            _stage(artifact_cache, config_bytes)
+            for value in selected.values():
+                if value["selection"]["manifest"] == digest:
+                    value.update(
+                        manifest_length=length,
+                        config_digest=config_digest,
+                        config_bytes=config_bytes,
+                        components=tuple(sorted(str(component) for component in components)),
+                    )
+            verified(digest, length, path)
+    except PreparationRefusal:
+        raise
+    except (acquire.AcquisitionRefusal, pull.PullRefusal, fill.FillRefusal) as exc:
+        raise PreparationRefusal(
+            "package_prepare_model_refused", f"{getattr(exc, 'code', type(exc).__name__)}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise PreparationRefusal(
+            "package_prepare_model_refused", f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return selected
 
 
 def _read_file(path: Path, maximum: int) -> bytes:
