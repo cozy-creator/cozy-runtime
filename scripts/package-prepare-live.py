@@ -23,7 +23,11 @@ from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.internal import canonical, descriptor, discovery, package_environment
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
-from cozy_runtime.internal.worker.session import Worker, read_placement_set
+from cozy_runtime.internal.worker.session import (
+    Worker,
+    executor_prepare_command,
+    read_placement_set,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -189,6 +193,22 @@ def main(argv: list[str] | None = None) -> int:
         assert len(verified) == 1
         assert [row["name"] for row in placement["entrypoints"]] == ["marco"]
         assert placement["entrypoints"][0]["slots"] == []
+        weightless = executor_prepare_command(
+            DeclaredBinding(
+                entrypoint_binding_digest=str(
+                    placement["entrypoints"][0]["entrypoint_binding_digest"]
+                ),
+                entrypoint="marco",
+                model_class="",
+                model_binding_path="",
+                model_parameter_name="",
+                release="1.0.4",
+                application="marco_polo_package:app",
+                descriptor_path=str(cache / "descriptor.json"),
+            )
+        )
+        assert "models" not in weightless
+        assert weightless["binding"]["model_class"] == ""
         descriptor_path = cache / str(placement["package_descriptor"]["digest"]).removeprefix(
             "sha256:"
         )

@@ -788,6 +788,66 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         )
 
 
+def executor_prepare_command(binding: DeclaredBinding) -> dict[str, Any]:
+    """Translate one resolved callable binding into the executor's closed prepare shape."""
+
+    models = []
+    for index, model in enumerate(binding.model_bindings()):
+        models.append(
+            {
+                "binding": {
+                    "application": binding.application,
+                    "package_descriptor": binding.descriptor_path,
+                    "development_project": binding.development_project,
+                    "model_class": model.model_class,
+                    "model_binding_path": model.model_binding_path,
+                    "model_parameter_name": model.model_parameter_name,
+                    "component": model.components[0] if model.components else "",
+                    "components": list(model.components),
+                    "snapshots": dict(model.snapshots),
+                    "store": model.store,
+                    "config": model.config,
+                    "snapshot": model.reference_snapshot,
+                    "release": binding.release,
+                    "variant": model.variant,
+                    "development": binding.development,
+                    "stamps": {key: list(value) for key, value in model.stamps.items()},
+                    "custody": model.custody,
+                    "strict_keys": model.strict_keys,
+                    "variants": [dataclasses.asdict(offer) for offer in model.offered],
+                    "objective": model.objective,
+                    "steps_basis": model.steps_basis,
+                },
+                "budgets": {
+                    "declared_weight_bytes": model.model_weight_bytes,
+                    "pinned": binding.pinned_bytes if index == 0 else 0,
+                    "resident": model.resident_budget_bytes,
+                    "vram_floor": model.vram_floor_bytes,
+                },
+                "expect_construction_digest": model.expected_logical_model_digest,
+            }
+        )
+    command: dict[str, Any] = {"cmd": "prepare"}
+    if not models:
+        command.update(
+            {
+                "binding": {
+                    "application": binding.application,
+                    "package_descriptor": binding.descriptor_path,
+                    "development_project": binding.development_project,
+                    "model_class": "",
+                },
+                "budgets": {},
+                "expect_construction_digest": "",
+            }
+        )
+    elif len(models) == 1:
+        command.update(models[0])
+    else:
+        command["models"] = models
+    return command
+
+
 class Worker:
     """The no-CUDA control parent — the machine's WORKER process (#455/#484; the name
     `Supervisor` is retired everywhere, and "supervision" survives only as the verb for its
@@ -2726,49 +2786,8 @@ class Worker:
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
             self.monitor.start(subject, "load")
             try:
-                model_commands = []
-                for index, model in enumerate(first.model_bindings()):
-                    model_commands.append(
-                        {
-                            "binding": {
-                                "application": first.application,
-                                "package_descriptor": first.descriptor_path,
-                                "development_project": first.development_project,
-                                "model_class": model.model_class,
-                                "model_binding_path": model.model_binding_path,
-                                "model_parameter_name": model.model_parameter_name,
-                                "component": model.components[0] if model.components else "",
-                                "components": list(model.components),
-                                "snapshots": dict(model.snapshots),
-                                "store": model.store,
-                                "config": model.config,
-                                "snapshot": model.reference_snapshot,
-                                "release": first.release,
-                                "variant": model.variant,
-                                "development": first.development,
-                                "stamps": {k: list(v) for k, v in model.stamps.items()},
-                                "custody": model.custody,
-                                "strict_keys": model.strict_keys,
-                                "variants": [dataclasses.asdict(offer) for offer in model.offered],
-                                "objective": model.objective,
-                                "steps_basis": model.steps_basis,
-                            },
-                            "budgets": {
-                                "declared_weight_bytes": model.model_weight_bytes,
-                                "pinned": first.pinned_bytes if index == 0 else 0,
-                                "resident": model.resident_budget_bytes,
-                                "vram_floor": model.vram_floor_bytes,
-                            },
-                            "expect_construction_digest": model.expected_logical_model_digest,
-                        }
-                    )
-                prepare_command: dict[str, Any] = {"cmd": "prepare"}
-                if len(model_commands) == 1:
-                    prepare_command.update(model_commands[0])
-                else:
-                    prepare_command["models"] = model_commands
                 reply = executor.call(
-                    prepare_command,
+                    executor_prepare_command(first),
                     timeout=None,
                     on_progress=lambda frame: self.monitor.advance(
                         f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
