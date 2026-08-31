@@ -24,7 +24,8 @@ MAX_CONTRACT_VALUES = 32
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _CALLABLE = re.compile(
-    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
+    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}"
+    r"@v(?:0|[1-9][0-9]*)/"
     r"[a-z][a-z0-9_-]{0,63}$"
 )
 _CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
@@ -112,7 +113,7 @@ class ProductionStep:
         if _CALLABLE.fullmatch(self.callable) is None:
             raise ConformanceError(
                 f"production step {self.name} callable {self.callable!r} is not "
-                "org/package/function",
+                "org/package@vN/function",
                 code="production_callable",
                 fields=[self.name],
             )

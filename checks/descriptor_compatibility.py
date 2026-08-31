@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from cozy_runtime.author import ConformanceError, ProductionStep
 from cozy_runtime.internal import canonical, descriptor
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.descriptor_compat import Result, classify_bytes
@@ -182,7 +183,7 @@ def main() -> int:
                 "steps": [
                     {
                         "name": "copy",
-                        "callable": "example/model/copy",
+                        "callable": "example/model@v1/copy",
                         "models": {"model": "source"},
                         "outputs": ["model"],
                     }
@@ -202,6 +203,48 @@ def main() -> int:
         )
 
     check("new model production", "minor", add_production, "added model production copy-model")
+
+    major_selected = ProductionStep(
+        name="copy",
+        callable="example/model@v1/copy",
+        models={"model": "source"},
+        outputs=("model",),
+    )
+    assert major_selected.callable == "example/model@v1/copy"
+    selected = _base()
+    add_production(selected)
+    selected_productions = selected["model_productions"]
+    assert isinstance(selected_productions, list) and isinstance(selected_productions[0], dict)
+    selected_steps = selected_productions[0]["steps"]
+    assert isinstance(selected_steps, list) and isinstance(selected_steps[0], dict)
+    selected_steps[0]["callable"] = major_selected.callable
+    parsed = descriptor.read_bytes(canonical.write(selected), "major-selected production")
+    parsed_productions = parsed["model_productions"]
+    assert isinstance(parsed_productions, list) and isinstance(parsed_productions[0], dict)
+    parsed_steps = parsed_productions[0]["steps"]
+    assert isinstance(parsed_steps, list) and isinstance(parsed_steps[0], dict)
+    assert parsed_steps[0]["callable"] == "example/model@v1/copy"
+    cases += 1
+
+    for invalid in (
+        "example/model/copy",
+        "example/model@v/copy",
+        "example/model@v01/copy",
+        "example/model@v1.0/copy",
+        "example/model@1/copy",
+    ):
+        try:
+            ProductionStep(
+                name="copy",
+                callable=invalid,
+                models={"model": "source"},
+                outputs=("model",),
+            )
+        except ConformanceError as exc:
+            assert exc.code == "production_callable"
+        else:
+            raise AssertionError(f"invalid production callable {invalid!r} was accepted")
+        cases += 1
 
     before_with_production = _base()
     add_production(before_with_production)
