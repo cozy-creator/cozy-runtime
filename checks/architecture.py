@@ -722,9 +722,9 @@ def fence_base_ownership_vectors() -> list[str]:
     mirror_specs = (
         (
             "base-worker-image-wheelhouse-cpu.json",
-            24_653,
-            "sha256:0618d4ad492648320b8c79ed087ef3bfd252a918b80326789f104c4ef1614eed",
-            (26, 323, 25),
+            24_968,
+            "sha256:84108430ba9dd2b23892034006aa5fb916af91ec14d7e2e1a13d30b29a1df8be",
+            (27, 324, 26),
             ("none", "none"),
         ),
         (

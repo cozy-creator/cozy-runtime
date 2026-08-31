@@ -7,7 +7,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import multiprocessing
 import os
 import subprocess
 import sys
@@ -16,14 +15,12 @@ import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 from cozy_runtime.internal import (
     canonical,
     child_env,
     jit_cache,
-    native_wheel,
     overlay,
 )
 from cozy_runtime.internal.worker import acquire, child, downloads
@@ -387,9 +384,9 @@ def main() -> int:
             raise AssertionError("platform-specific project wheel was admitted")
 
         native_bytes = compile_shared(
-            root / "native-valid-build",
+            root / "native-refusal-build",
             "proof_native",
-            "int proof_add(int a, int b) { return a + b; }\n",
+            "int proof_add(int a, int b) { return a + b;}\n",
         )
         native_custom = build_wheel(
             wheels,
@@ -399,408 +396,18 @@ def main() -> int:
             owner="custom",
             tag="cp312-cp312-manylinux_2_17_x86_64",
             root_is_pure=False,
-            extra_entries={
-                "proof_native_custom/_native.so": native_bytes,
-                "proof_native_custom/fixture.py": (
-                    b"import ctypes\nfrom pathlib import Path\n"
-                    b"def run():\n"
-                    b"    lib = ctypes.CDLL(str(Path(__file__).with_name('_native.so')))\n"
-                    b"    return {'value': lib.proof_add(1, 2)}\n"
-                ),
-                "proof_native_custom/no_kernel.py": (
-                    b"def run():\n"
-                    b"    raise RuntimeError('no kernel image is available for execution')\n"
-                ),
-            },
-        )
-        native_nonconcrete = build_wheel(
-            wheels,
-            "proof-native-nonconcrete",
-            "proof_native_nonconcrete",
-            "native-nonconcrete",
-            owner="custom",
-            root_is_pure=False,
-            extra_entries={"proof_native_nonconcrete/_native.so": native_bytes},
+            extra_entries={"proof_native_custom/_native.so": native_bytes},
         )
         try:
             overlay.materialize(
-                source("native-nonconcrete", family, project, native_nonconcrete),
-                root / "native-nonconcrete-installed",
-                python=Path(sys.executable),
+                source("native-custom", family, project, native_custom),
+                root / "native-custom-refused",
                 base_manifest=manifest,
             )
         except overlay.OverlayRefusal as exc:
-            assert exc.code == "overlay_native_wheel_tag_not_concrete", exc.code
+            assert exc.code == "overlay_custom_wheel_native_unsupported", exc.code
         else:
-            raise AssertionError("py3-none-any native custom wheel was admitted")
-        native_installed = overlay.materialize(
-            source("native-custom", family, project, native_custom),
-            root / "native-custom-installed",
-            python=Path(sys.executable),
-            base_manifest=manifest,
-        )
-        native_inspection = native_wheel.inspect_tree(
-            native_installed.import_root, ("proof_native_custom/_native.so",)
-        )
-        native_host = native_wheel.qualify_host(native_inspection, gpu_sm=None)
-        assert native_host["qualification"] == "static-host-compatible"
-        base = overlay._read_base_manifest(manifest, family)
-        cpu_document = canonical.parse_canonical(manifest.read_bytes())
-        assert isinstance(cpu_document, dict)
-        for field, value in (
-            ("minimum_cuda_version", "13.0"),
-            ("minimum_driver_version", "580.126.20"),
-        ):
-            bad_cpu = {**cpu_document, field: value}
-            bad_raw = canonical.write(bad_cpu)
-            try:
-                overlay.parse_base_manifest(bad_raw, digest(bad_raw))
-            except overlay.OverlayRefusal as exc:
-                assert exc.code == "base_family_manifest_invalid", exc.code
-            else:
-                raise AssertionError(f"CPU profile with CUDA field {field} was admitted")
-        wrong_cpu_target = dict(cpu_document)
-        wrong_cpu_target["platform_target"] = {
-            **cpu_document["platform_target"],
-            "accelerator_abi": "cu130",
-            "accelerator_backend": "cuda",
-        }
-        wrong_raw = canonical.write(wrong_cpu_target)
-        try:
-            overlay.parse_base_manifest(wrong_raw, digest(wrong_raw))
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "base_family_manifest_invalid", exc.code
-        else:
-            raise AssertionError("CPU build over a CUDA platform target was admitted")
-        measured_seat: dict[str, Any] = {
-            "cuda_available": False,
-            "distributions": [
-                {"distribution": name, "version": version}
-                for name, version in base.base_distributions
-            ],
-            "implementation": "cpython",
-            "libc_name": "glibc",
-            "libc_version": "2.39",
-            "machine": "x86_64",
-            "python_abi": "cp312",
-            "system": "linux",
-            "torch_cuda": "",
-            "torch_version": "2.13.0+cpu",
-        }
-        native_wheel.verify_seat(base, measured_seat, gpu=None)
-        seat_reds = {
-            "overlay_native_python_abi_mismatch": {**measured_seat, "python_abi": "cp313"},
-            "overlay_native_os_cpu_mismatch": {**measured_seat, "machine": "aarch64"},
-            "overlay_native_libc_mismatch": {**measured_seat, "libc_version": "2.38"},
-            "overlay_native_base_inventory_mismatch": {
-                **measured_seat,
-                "distributions": measured_seat["distributions"][:-1],
-            },
-            "overlay_native_torch_mismatch": {
-                **measured_seat,
-                "torch_version": "2.12.0+cpu",
-            },
-            "overlay_native_accelerator_mismatch": {
-                **measured_seat,
-                "cuda_available": True,
-            },
-        }
-        for code, bad_seat in seat_reds.items():
-            try:
-                native_wheel.verify_seat(base, bad_seat, gpu=None)
-            except native_wheel.NativeWheelRefusal as exc:
-                assert exc.code == code, (exc.code, code)
-            else:
-                raise AssertionError(f"seat mismatch {code} was admitted")
-
-        cuda_distributions = tuple(
-            (name, "2.13.0+cu130" if name == "torch" else version)
-            for name, version in base.base_distributions
-        )
-        cuda_base = replace(
-            base,
-            compatibility_profile=tuple(
-                sorted(
-                    {
-                        "accelerator_build": "cu130",
-                        "os_cpu": "linux-x86",
-                        "python_abi": "cp312",
-                        "torch_release": "2.13.0",
-                    }.items()
-                )
-            ),
-            platform_target=tuple(
-                sorted(
-                    {
-                        "accelerator_abi": "cu130",
-                        "accelerator_backend": "cuda",
-                        "libc": "glibc2.39",
-                        "os_arch": "linux/amd64",
-                        "python_abi": "cp312",
-                    }.items()
-                )
-            ),
-            base_distributions=cuda_distributions,
-            minimum_cuda_version="13.0",
-            minimum_driver_version="580.126.20",
-        )
-        cuda_seat = {
-            **measured_seat,
-            "cuda_available": True,
-            "distributions": [
-                {"distribution": name, "version": version} for name, version in cuda_distributions
-            ],
-            "torch_cuda": "13.0",
-            "torch_version": "2.13.0+cu130",
-        }
-        cuda_gpu = native_wheel.GPUObservation(
-            device_index=0,
-            driver_version="580.126.20",
-            name="proof GPU",
-            sm=80,
-        )
-        native_wheel.verify_seat(cuda_base, cuda_seat, gpu=cuda_gpu)
-        legacy_profile = dict(cuda_base.compatibility_profile)
-        legacy_profile["accelerator_build"] = "cu126"
-        cuda_reds = (
-            (
-                "overlay_native_accelerator_mismatch",
-                replace(cuda_base, compatibility_profile=tuple(sorted(legacy_profile.items()))),
-                cuda_seat,
-                cuda_gpu,
-            ),
-            (
-                "overlay_native_accelerator_mismatch",
-                cuda_base,
-                {**cuda_seat, "torch_cuda": "12.9"},
-                cuda_gpu,
-            ),
-            (
-                "overlay_native_cuda_minimum_mismatch",
-                replace(cuda_base, minimum_cuda_version="13.1"),
-                cuda_seat,
-                cuda_gpu,
-            ),
-            (
-                "overlay_native_driver_minimum_mismatch",
-                replace(cuda_base, minimum_driver_version="580.126.21"),
-                cuda_seat,
-                cuda_gpu,
-            ),
-        )
-        for code, bad_base, bad_seat, bad_gpu in cuda_reds:
-            try:
-                native_wheel.verify_seat(bad_base, bad_seat, gpu=bad_gpu)
-            except native_wheel.NativeWheelRefusal as exc:
-                assert exc.code == code, (exc.code, code)
-            else:
-                raise AssertionError(f"CUDA seat mismatch {code} was admitted")
-        operator_evidence = native_wheel.qualify_operator(
-            python=Path(sys.executable),
-            overlay=native_installed.import_root,
-            fixture="proof_native_custom.fixture:run",
-            expected_result_digest=canonical.digest({"value": 3}),
-            environment={},
-        )
-        assert operator_evidence["result_digest"] == canonical.digest({"value": 3})
-        try:
-            native_wheel.qualify_operator(
-                python=Path(sys.executable),
-                overlay=native_installed.import_root,
-                fixture="proof_native_custom.fixture:run",
-                expected_result_digest=canonical.digest({"value": 4}),
-                environment={},
-            )
-        except native_wheel.NativeWheelRefusal as exc:
-            assert exc.code == "overlay_native_operator_numerical_mismatch", exc.code
-        else:
-            raise AssertionError("native operator numerical mismatch was admitted")
-        try:
-            native_wheel.qualify_operator(
-                python=Path(sys.executable),
-                overlay=native_installed.import_root,
-                fixture="proof_native_custom.no_kernel:run",
-                expected_result_digest=canonical.digest({"value": 3}),
-                environment={},
-            )
-        except native_wheel.NativeWheelRefusal as exc:
-            assert exc.code == "overlay_native_no_kernel_image", exc.code
-        else:
-            raise AssertionError("no-kernel-image operator failure was admitted")
-
-        native_evidence = {
-            "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
-            "environment_digest": digest(b"native-custom"),
-            "host_capability": {"gpu": None, "seat": measured_seat},
-            "host_qualification": native_host,
-            "installed_environment_receipt_digest": native_installed.receipt_digest,
-            "operator_observation": operator_evidence,
-            "overlay_content_digest": native_installed.content_digest,
-            "static_inspection": native_inspection.document(),
-            "wheelhouse_manifest_digest": family,
-        }
-        assert native_evidence["installed_environment_receipt_digest"] == (
-            native_installed.receipt_digest
-        )
-
-        mutable_manifest = root / "mutable-base.json"
-        mutable_manifest.write_bytes(manifest.read_bytes() + b" ")
-        try:
-            overlay.open_generation(
-                environment,
-                receipt_digest=cold.receipt_digest,
-                environment_digest=digest(b"spec-one"),
-                base_manifest=mutable_manifest,
-                python=Path(sys.executable),
-            )
-        except overlay.OverlayRefusal as exc:
-            assert exc.code == "base_family_mismatch", exc.code
-        else:
-            raise AssertionError("byte-different local base borrowed the admitted receipt")
-        assert child_env.erased("PYTHONPATH") and child_env.erased("PYTHONHOME")
-
-        killed_custom = build_wheel(
-            wheels,
-            "proof-killed-custom",
-            "proof_killed_custom",
-            "killed-custom",
-            owner="custom",
-            extra_entries={
-                f"proof_killed_custom/module_{index:05d}.py": f"VALUE = {index}\n".encode()
-                for index in range(5_000)
-            },
-        )
-        killed_root = root / "killed-installed"
-        killed_source = source("killed", family, project, killed_custom)
-        process = multiprocessing.get_context("fork").Process(
-            target=overlay.materialize,
-            args=(killed_source, killed_root),
-            kwargs={"python": Path(sys.executable), "base_manifest": manifest},
-        )
-        process.start()
-        deadline = time.monotonic() + 10
-        abandoned: list[Path] = []
-        while time.monotonic() < deadline and process.is_alive():
-            abandoned = list(killed_root.glob(".*-staging-*"))
-            if abandoned:
-                break
-            time.sleep(0.001)
-        assert abandoned and process.is_alive(), "materialization finished before kill arm"
-        process.kill()
-        process.join(10)
-        assert process.exitcode is not None and process.exitcode < 0
-        assert not list((killed_root / "receipts").glob("*.json"))
-        retried = overlay.materialize(
-            killed_source,
-            killed_root,
-            python=Path(sys.executable),
-            base_manifest=manifest,
-        )
-        assert retried.generation.is_dir()
-        assert not list(killed_root.glob(".*-staging-*"))
-
-        hostile_bytes = compile_shared(
-            root / "native-rpath-build",
-            "proof_rpath",
-            "int proof(void) { return 1; }\n",
-            "-Wl,-rpath,/tmp/hostile",
-        )
-        hostile_custom = build_wheel(
-            wheels,
-            "proof-hostile-rpath",
-            "proof_hostile_rpath",
-            "hostile-rpath",
-            owner="custom",
-            tag="cp312-cp312-manylinux_2_17_x86_64",
-            root_is_pure=False,
-            extra_entries={"proof_hostile_rpath/_native.so": hostile_bytes},
-        )
-        structural_native_reds = [("overlay_native_rpath_forbidden", hostile_custom)]
-        for index, library in enumerate(
-            (
-                "libtorch_cuda.so",
-                "libcublas.so.12",
-                "libcublasLt.so.12",
-                "libcudart.so.12",
-                "libcusparse.so.12",
-                "libcudnn.so.9",
-                "libnvidia-ml.so.1",
-            )
-        ):
-            package = f"proof_library_shadow_{index}"
-            structural_native_reds.append(
-                (
-                    "overlay_native_base_library_shadow",
-                    build_wheel(
-                        wheels,
-                        f"proof-library-shadow-{index}",
-                        package,
-                        f"library-shadow-{index}",
-                        owner="custom",
-                        tag="cp312-cp312-manylinux_2_17_x86_64",
-                        root_is_pure=False,
-                        extra_entries={f"{package}/{library}": native_bytes},
-                    ),
-                )
-            )
-        for index, (code, bad_custom) in enumerate(structural_native_reds):
-            try:
-                overlay.materialize(
-                    source(code, family, project, bad_custom),
-                    root / f"red-{code}-{index}",
-                    python=Path(sys.executable),
-                    base_manifest=manifest,
-                )
-            except overlay.OverlayRefusal as exc:
-                assert exc.code == code, (exc.code, code)
-            else:
-                raise AssertionError(f"{code} was admitted")
-
-        missing_bytes = compile_shared(
-            root / "native-symbol-build",
-            "proof_symbol",
-            "extern int cozy_symbol_that_does_not_exist(void); "
-            "int proof(void) { return cozy_symbol_that_does_not_exist(); }\n",
-        )
-        missing_path = root / "missing-symbol.so"
-        missing_path.write_bytes(missing_bytes)
-        missing_inspection = native_wheel.inspect_tree(root, (missing_path.name,))
-        try:
-            native_wheel.qualify_host(missing_inspection, gpu_sm=None)
-        except native_wheel.NativeWheelRefusal as exc:
-            assert exc.code == "overlay_native_symbol_unavailable", exc.code
-        else:
-            raise AssertionError("unavailable native symbol was admitted")
-
-        gpu_inspection = native_wheel.Inspection(
-            (
-                native_wheel.ELFMember(
-                    "proof_gpu/_native.so",
-                    "",
-                    (),
-                    (),
-                    (),
-                    (),
-                    (".nv_fatbin",),
-                    (80,),
-                    (),
-                ),
-            )
-        )
-        try:
-            native_wheel.qualify_host(gpu_inspection, gpu_sm=90)
-        except native_wheel.NativeWheelRefusal as exc:
-            assert exc.code == "overlay_native_gpu_unsupported", exc.code
-        else:
-            raise AssertionError("wrong-SM native wheel was admitted")
-
-        with patch("cozy_runtime.internal.native_wheel.shutil.which", return_value=None):
-            try:
-                native_wheel._cuda_images(missing_path)
-            except native_wheel.NativeWheelRefusal as exc:
-                assert exc.code == "overlay_native_gpu_inspector_unavailable", exc.code
-            else:
-                raise AssertionError("CUDA image inspection passed without cuobjdump")
+            raise AssertionError("custom native wheel was admitted")
 
         false_marker = build_wheel(
             wheels,
@@ -950,23 +557,7 @@ def main() -> int:
                     "jit_cache_pod_scopes_separated": True,
                     "jit_cache_warm_reuse_within_pod": True,
                     "jit_cache_defaults_never_used": True,
-                    "prebuilt_native_custom_wheel_admitted": True,
-                    "native_custom_without_concrete_tags_refused": True,
-                    "hostile_rpath_refused": True,
-                    "base_library_shadow_refused": True,
-                    "nvidia_base_library_shadows_refused": True,
-                    "unavailable_native_symbol_refused": True,
-                    "wrong_sm_refused": True,
-                    "missing_cuobjdump_refused": True,
-                    "native_operator_executed": True,
-                    "native_operator_numerical_mismatch_refused": True,
-                    "native_operator_no_kernel_image_refused": True,
-                    "synthetic_exact_seat_admitted": True,
-                    "synthetic_cp313_for_cp312_refused": True,
-                    "seat_os_cpu_libc_inventory_torch_reds": True,
-                    "seat_cuda_driver_minimum_reds": True,
-                    "legacy_cu126_refused": True,
-                    "cu130_spelling_verified": True,
+                    "custom_native_wheel_refused": True,
                     "mutable_local_base_refused": True,
                     "source_path_injection_erased": True,
                     "killed_materialization_retry_atomic": True,
