@@ -59,7 +59,15 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.worker import acquire, child, downloads, grants, observe, triage
+from cozy_runtime.internal.worker import (
+    acquire,
+    artifacts,
+    child,
+    downloads,
+    grants,
+    observe,
+    triage,
+)
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     ORIGIN,
@@ -801,6 +809,13 @@ class Worker:
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
+        self.stop = threading.Event()
+        self.artifacts = artifacts.ArtifactExchange(
+            store_root=options.artifact_store,
+            send=self.send,
+            stop=self.stop,
+            owner_scope=lambda: self.fence.record_owner_id,
+        )
         self.engine = AttemptEngine(
             records=self.records,
             ledger=self.ledger,
@@ -819,6 +834,9 @@ class Worker:
             monitor=self.monitor,
             posture=self.applied_posture,
             device_process=self.read_device_process,
+            artifacts=self.artifacts,
+            owner_scope=lambda: self.fence.record_owner_id,
+            artifact_store=options.artifact_store,
         )
         self.engine.boot_id = self.fence.worker_boot_id
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
@@ -837,7 +855,6 @@ class Worker:
         # stream thread. One lane serializes revisions; the revision check after every slow
         # leg discards a superseded result before it can move serving state.
         self.convergences: queue.Queue[int | None] = queue.Queue()
-        self.stop = threading.Event()
         self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
         self.supervision.on_exit = self.executor_exited
@@ -1546,6 +1563,7 @@ class Worker:
             self.connected.set()
             self.bump_admission(f"snapshot {inner.snapshot_id} acknowledged; dispatch opens")
             self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
+            self.artifacts.replay_pending()
             for attempt in self.engine.pending_outcomes():
                 self.note(
                     "outcome",
@@ -1588,6 +1606,13 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
+        elif kind == "artifact_host_ack":
+            try:
+                self.artifacts.absorb_ack(inner)
+            except artifacts.ArtifactExchangeError as exc:
+                self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
+        elif kind == "artifact_read_request":
+            self.send(self.artifacts.read(inner))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
@@ -1617,6 +1642,7 @@ class Worker:
 
     def shutdown_from_stream(self) -> None:
         self.stop.set()
+        self.artifacts.close()
         self.outbound.put(None)
         self.work.put(None)
         self.watches.end_all()
@@ -3521,6 +3547,7 @@ class Worker:
             else {}
         )
         self.stop.set()
+        self.artifacts.close()
         self.work.put(None)
         self.convergences.put(None)
         self.outbound.put(None)

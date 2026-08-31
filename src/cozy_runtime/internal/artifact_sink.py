@@ -5,16 +5,20 @@ privileged half: it validates the immutable invocation grant, opens the real tfs
 transaction before pulling bytes, streams directly into TensorFS, and returns exact receipt
 bytes suitable for Worker Protocol's ``ArtifactReceipt`` wrapper.
 
-Pod-supervisor does not yet expose this handshake to its stateless Runtime child.  The
-adapter therefore has no implicit worker hookup: local Runtime or the future host bridge
-must construct it with exact owner/request/spec/source/output facts.
+The worker supplies two callbacks for the pod lane: bind exact intent before TensorFS opens,
+then durably record the exact protocol receipt before commit returns to package code. Local
+execution omits them and retains the same TensorFS transaction implementation.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+import os
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
@@ -31,6 +35,47 @@ from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+_OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+_EXCHANGE_KINDS = frozenset({"declaration", "receipt"})
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactHostBinding:
+    """The supervisor's durable answer to one exact TensorFS declaration."""
+
+    transaction_id: str
+    writer_generation: int
+    artifact_receipt_digest: bytes = b""
+
+
+def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
+    """One worker-chosen spool file; no child-authored path crosses the seam."""
+    if _OUTPUT_SLOT.fullmatch(output_slot) is None or kind not in _EXCHANGE_KINDS:
+        raise CapabilityError(
+            "artifact exchange identity is invalid", code="artifact_host_identity"
+        )
+    return spool / f"artifact-{output_slot}-{kind}.canonical"
+
+
+def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -> Path:
+    """Publish immutable exact bytes into the already-brokered attempt spool."""
+    target = exchange_file(spool, output_slot, kind)
+    try:
+        with target.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        target.chmod(0o444)
+    except FileExistsError:
+        if target.read_bytes() != data:
+            raise CapabilityError(
+                f"artifact {kind} replay changed exact bytes",
+                code="artifact_receipt_mismatch"
+                if kind == "receipt"
+                else "artifact_intent_conflict",
+            ) from None
+    return target
+
 
 class ArtifactTransactionHost:
     """One immutable invocation's real TensorFS artifact authority."""
@@ -45,6 +90,8 @@ class ArtifactTransactionHost:
         writer_session_id: int,
         allowed_sources: Mapping[str, int],
         output_bounds: Mapping[str, int],
+        bind_intent: Callable[[str, bytes, bytes], ArtifactHostBinding] | None = None,
+        record_receipt: Callable[[ArtifactReceipt], None] | None = None,
     ) -> None:
         if (
             not owner_scope
@@ -62,6 +109,8 @@ class ArtifactTransactionHost:
         self.writer_session_id = writer_session_id
         self.allowed_sources = dict(allowed_sources)
         self.output_bounds = dict(output_bounds)
+        self.bind_intent = bind_intent
+        self.record_receipt = record_receipt
 
     def open(self, request: ArtifactCommit) -> ArtifactHostTransaction:
         """Lock one tfs-019 declaration before exposing any source reader or writer."""
@@ -96,16 +145,50 @@ class ArtifactTransactionHost:
                 for alias, (manifest, length) in sources.items()
             },
         }
+        declaration = canonical_json.encode(expected_declaration)
+        declaration_digest = hashlib.sha256(declaration).digest()
+        binding = (
+            self.bind_intent(request.output_slot, declaration_digest, declaration)
+            if self.bind_intent is not None
+            else ArtifactHostBinding(transaction_id, self.writer_session_id)
+        )
+        if binding.transaction_id != transaction_id or binding.writer_generation <= 0:
+            raise CapabilityError(
+                "the artifact host bound another transaction or an invalid writer generation",
+                code="artifact_host_identity",
+            )
+        self.writer_session_id = binding.writer_generation
         existing = self.store.derived_lookup(transaction_id)
         if existing.get("state") == "committed":
             facts = self._receipt(existing.get("receipt"), transaction_id, expected_declaration)
+            receipt = self._wrap(request.output_slot, transaction_id, facts, replayed=True)
+            _, _, protocol_digest = protocol_receipt(
+                receipt,
+                owner_scope=self.owner_scope,
+                request_id=self.request_id,
+                invocation_spec_digest=self.invocation_spec_digest,
+            )
+            if binding.artifact_receipt_digest:
+                if binding.artifact_receipt_digest != protocol_digest:
+                    raise CapabilityError(
+                        "the artifact host replayed another receipt digest",
+                        code="artifact_receipt_mismatch",
+                    )
+            elif self.record_receipt is not None:
+                # TensorFS committed before the host receipt ACK. Close that crash gap now.
+                self.record_receipt(receipt)
             return OpenedArtifactTransaction(
                 host=self,
                 request=request,
                 transaction_id=transaction_id,
                 declaration=expected_declaration,
                 writer=None,
-                receipt=self._wrap(request.output_slot, transaction_id, facts, replayed=True),
+                receipt=receipt,
+            )
+        if binding.artifact_receipt_digest:
+            raise CapabilityError(
+                "the artifact host replayed a receipt absent from local TensorFS",
+                code="artifact_receipt_mismatch",
             )
         if existing.get("state") == "abandoned":
             raise CapabilityError(
@@ -115,7 +198,7 @@ class ArtifactTransactionHost:
         try:
             writer = self.store.begin_derived(
                 transaction_id,
-                self.writer_session_id,
+                binding.writer_generation,
                 sources,
                 targets,
                 configs,
@@ -153,6 +236,11 @@ class ArtifactTransactionHost:
         return bool(
             self.store.derived_fence(self.transaction_id(output_slot), self.writer_session_id)
         )
+
+    def acknowledge(self, receipt: ArtifactReceipt) -> None:
+        """Do not return a TensorFS commit to package code before the host records it."""
+        if self.record_receipt is not None:
+            self.record_receipt(receipt)
 
     def abandon(self, output_slot: str) -> ArtifactReceipt | None:
         """Fence then atomically abandon, returning a commit-race winner if one exists."""
@@ -346,6 +434,7 @@ class OpenedArtifactTransaction:
         self.receipt = self.host._wrap(
             self.request.output_slot, self.transaction_id, facts, replayed=False
         )
+        self.host.acknowledge(self.receipt)
         return self.receipt
 
     def fence(self) -> None:

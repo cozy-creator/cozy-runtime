@@ -15,7 +15,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import msgspec
@@ -34,8 +36,13 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author.fakes import invoke_with_fakes
 from cozy_runtime.internal import descriptor
-from cozy_runtime.internal.artifact_sink import ArtifactTransactionHost, protocol_receipt
+from cozy_runtime.internal.artifact_sink import (
+    ArtifactHostBinding,
+    ArtifactTransactionHost,
+    protocol_receipt,
+)
 from cozy_runtime.internal.discovery import Discovered
+from cozy_runtime.internal.worker.artifacts import ArtifactExchange
 from cozy_runtime.protocol import documents
 
 
@@ -300,6 +307,195 @@ def main() -> None:
         if reference.artifact_receipt_digest != digest or parsed["output_slot"] != "model":
             raise RuntimeError("Worker Protocol ArtifactReceipt did not preserve identity")
 
+        order: list[str] = []
+        durable_digest = b""
+        ordered_host: ArtifactTransactionHost
+
+        def bind_ordered(
+            output_slot: str, declaration_digest: bytes, declaration: bytes
+        ) -> ArtifactHostBinding:
+            del declaration_digest, declaration
+            state = store.derived_lookup(ordered_host.transaction_id(output_slot))["state"]
+            order.append(f"intent:{state}")
+            return ArtifactHostBinding(ordered_host.transaction_id(output_slot), 11)
+
+        def record_ordered(value: Any) -> None:
+            nonlocal durable_digest
+            state = store.derived_lookup(value.artifact_transaction_id)["state"]
+            order.append(f"receipt:{state}")
+            durable_digest = protocol_receipt(
+                value,
+                owner_scope="proof-owner",
+                request_id="artifact-host-order",
+                invocation_spec_digest="sha256:" + "3" * 64,
+            )[2]
+
+        ordered_host = ArtifactTransactionHost(
+            store=store,
+            owner_scope="proof-owner",
+            request_id="artifact-host-order",
+            invocation_spec_digest="sha256:" + "3" * 64,
+            writer_session_id=1,
+            allowed_sources={manifest_id: manifest_length},
+            output_bounds={"model": 4096},
+            bind_intent=bind_ordered,
+            record_receipt=record_ordered,
+        )
+        ordered_result = invoke_with_fakes(
+            app.get("derive"),
+            {"marker": "table"},
+            request_id="artifact-host-order",
+            spool=root / "spool-host-order",
+            models={"model": chosen},
+            artifacts=ordered_host.open,
+        ).result
+        if order != ["intent:absent", "receipt:committed"] or not durable_digest:
+            raise RuntimeError(f"host durability order was {order}")
+        replay_records = 0
+
+        def bind_committed(
+            output_slot: str, declaration_digest: bytes, declaration: bytes
+        ) -> ArtifactHostBinding:
+            del declaration_digest, declaration
+            return ArtifactHostBinding(ordered_host.transaction_id(output_slot), 12, durable_digest)
+
+        def record_replay(value: Any) -> None:
+            nonlocal replay_records
+            del value
+            replay_records += 1
+
+        replay_host = ArtifactTransactionHost(
+            store=store,
+            owner_scope="proof-owner",
+            request_id="artifact-host-order",
+            invocation_spec_digest="sha256:" + "3" * 64,
+            writer_session_id=1,
+            allowed_sources={manifest_id: manifest_length},
+            output_bounds={"model": 4096},
+            bind_intent=bind_committed,
+            record_receipt=record_replay,
+        )
+        replayed_result = invoke_with_fakes(
+            app.get("derive"),
+            {"marker": "table"},
+            request_id="artifact-host-order",
+            spool=root / "spool-host-replay",
+            models={"model": chosen},
+            artifacts=replay_host.open,
+        ).result
+        if replayed_result != ordered_result or replay_records:
+            raise RuntimeError("committed host replay rewrote or re-recorded the artifact")
+
+        sent: list[pb.WorkerFrame] = []
+        exchange: ArtifactExchange
+
+        def host_send(frame: pb.WorkerFrame) -> None:
+            sent.append(frame)
+            kind = frame.WhichOneof("msg")
+            if kind == "artifact_intent":
+                intent = frame.artifact_intent
+                exchange.absorb_ack(
+                    pb.ArtifactHostAck(
+                        request_id=intent.request_id,
+                        attempt_ordinal=intent.attempt_ordinal,
+                        invocation_spec_digest=intent.invocation_spec_digest,
+                        output_slot=intent.output_slot,
+                        artifact_transaction_id=first.transaction,
+                        writer_generation=9,
+                        tensorfs_declaration_digest=intent.tensorfs_declaration_digest,
+                        stage=pb.ARTIFACT_HOST_STAGE_INTENT,
+                        outcome=pb.ARTIFACT_HOST_OUTCOME_RECORDED,
+                    )
+                )
+            elif kind == "artifact_receipt":
+                carried = frame.artifact_receipt
+                exchange.absorb_ack(
+                    pb.ArtifactHostAck(
+                        request_id=carried.request_id,
+                        attempt_ordinal=carried.attempt_ordinal,
+                        invocation_spec_digest=carried.invocation_spec_digest,
+                        output_slot=carried.output_slot,
+                        artifact_transaction_id=carried.artifact_transaction_id,
+                        writer_generation=carried.writer_generation,
+                        tensorfs_declaration_digest=carried.tensorfs_declaration_digest,
+                        stage=pb.ARTIFACT_HOST_STAGE_RECEIPT,
+                        outcome=pb.ARTIFACT_HOST_OUTCOME_RECORDED,
+                        artifact_receipt=carried.artifact_receipt,
+                        manifest=carried.manifest,
+                    )
+                )
+            else:
+                raise RuntimeError(f"unexpected host frame {kind!r}")
+
+        exchange = ArtifactExchange(
+            store_root=root / "store",
+            send=host_send,
+            stop=threading.Event(),
+            owner_scope=lambda: "proof-owner",
+        )
+        attempt_record = SimpleNamespace(
+            request_id="artifact-proof",
+            attempt=1,
+            digest=documents.raw("sha256:" + "1" * 64),
+            canceling="",
+            artifact_receipts={},
+        )
+        declaration = json.dumps(
+            receipt["declaration"], separators=(",", ":"), sort_keys=True
+        ).encode()
+        bound = exchange.intent(
+            attempt_record,
+            output_slot="model",
+            declaration_digest=hashlib.sha256(declaration).digest(),
+            declaration=declaration,
+            requested_writer_generation=0,
+        )
+        if bound["artifact_transaction_id"] != first.transaction or bound["writer_generation"] != 9:
+            raise RuntimeError(f"host intent did not bind exact transaction: {bound}")
+        recorded = exchange.receipt(
+            attempt_record,
+            output_slot="model",
+            transaction_id=first.transaction,
+            receipt_digest=digest,
+            canonical_receipt=canonical,
+        )
+        receipt_frame = sent[-1].artifact_receipt
+        if (
+            recorded["artifact_receipt_digest"] != documents.spell(digest)
+            or not receipt_frame.objects
+            or not receipt_frame.HasField("manifest")
+            or list(receipt_frame.objects)
+            != sorted(receipt_frame.objects, key=lambda row: row.object_id)
+        ):
+            raise RuntimeError("host receipt did not carry sorted exact object rows")
+        manifest_id_from_frame = documents.spell(receipt_frame.manifest.digest)
+        if manifest_id_from_frame != manifest_id_out:
+            raise RuntimeError("typed produced Manifest does not match TensorFS receipt")
+        first_object = receipt_frame.objects[0]
+        read = pb.ArtifactReadRequest(
+            artifact_transaction_id=first.transaction,
+            writer_generation=9,
+            object_id=first_object.object_id,
+            source_ref=first_object.source_ref,
+            read_id="proof-read",
+            offset=0,
+            max_bytes=min(64, first_object.length),
+        )
+        artifact_read_result = exchange.read(read).artifact_read_result
+        if (
+            artifact_read_result.outcome != pb.ARTIFACT_READ_OUTCOME_DATA
+            or hashlib.sha256(artifact_read_result.data).digest()
+            != artifact_read_result.data_digest
+        ):
+            raise RuntimeError("host object read did not return digest-bound bytes")
+        read.source_ref = "tensorfs-object:sha256:" + "0" * 64
+        if (
+            exchange.read(read).artifact_read_result.refusal
+            != pb.ARTIFACT_READ_REFUSAL_SOURCE_REF_MISMATCH
+        ):
+            raise RuntimeError("foreign source ref did not refuse")
+        exchange.close()
+
         released = host.release("model")
         if released.tensorfs_receipt_digest != first.receipt:
             raise RuntimeError("release changed the TensorFS receipt")
@@ -469,7 +665,8 @@ def main() -> None:
             first.receipt,
             "replay=true protocol=true release=true direct_stream=true "
             "cap_before_read=true overlong_fenced=true source_read=true "
-            "foreign_offset_buffer_cancel_red=true",
+            "foreign_offset_buffer_cancel_red=true host_intent_before_write=true "
+            "host_committed_replay=true host_intent_receipt_read=true typed_manifest=true",
         )
 
 
