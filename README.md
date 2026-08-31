@@ -13,7 +13,7 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.21` targets standard CPython 3.12 only. Project
+Runtime release `0.0.22` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
 delegation plus verified model files after private code preparation, and Runtime alone binds
@@ -179,10 +179,10 @@ compares state-dict topology and every parameter/buffer storage address before a
 its source/dependency digest enters constructed-generation identity. Any source, class or
 config drift refuses typed.
 
-The NVIDIA CUDA base worker image may install `cozy-runtime[cuda-kernels]`. The fused Anima
-CUDA kernel library is currently supplied by the exact upstream `comfy-kitchen==0.2.31`
-CPython-3.12 ABI3 wheel
-`sha256:d7c2522e6a6cde7a7303e30d739c05989cf4b0a246684e496a129b950055d35f`.
+The NVIDIA CUDA base worker image may install `cozy-runtime[cuda-kernels]`. That extra selects
+the small, CUDA-only `cozy-runtime-cuda-kernels` companion built from this same Runtime
+commit. It carries only the fused operations Runtime actually uses; CPU profiles carry no
+native companion, and adding future Cozy-owned kernels extends this one reviewed boundary.
 Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0 built with CUDA 13.0
 when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs, and profiles without
 the exact native library keep the ordinary eager implementation. CPU, MPS and Windows

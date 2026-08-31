@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.0.21"
+version = "0.0.22"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 requires-python = ">=3.12,<3.13"
 # The worker speaks `cozy.worker.v1` (worker-protocol/01), so the bindings' two runtimes are
@@ -43,6 +43,9 @@ package = true
 [tool.uv.workspace]
 members = ["packages/*"]
 
+[tool.uv.sources]
+cozy-runtime-cuda-kernels = { workspace = true }
+
 [tool.mypy]
 python_version = "3.12"
 files = [
@@ -59,6 +62,7 @@ files = [
     "proofs/fixtures/modeled-development-package/src",
     "proofs/fixtures/tiny-models",
     "examples",
+    "packages/cozy-runtime-cuda-kernels/src",
 ]
 # The bindings live under the PROTO PACKAGE PATH (`src/cozy/worker/v1`) and are PEP 420
 # namespace packages — no `__init__.py`, because protoc writes none and the copy is
@@ -145,7 +149,7 @@ media = [
 # Optional fused Anima CUDA kernels. Base worker images opt into this only on their exact
 # supported NVIDIA CUDA profile; every other Runtime profile keeps ordinary eager execution.
 cuda-kernels = [
-    "comfy-kitchen==0.2.31; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cozy-runtime-cuda-kernels==0.1.0+torch2.13cu130; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [[tool.mypy.overrides]]
@@ -156,7 +160,7 @@ follow_imports = "skip"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "checks", "scripts", "proofs", "examples"]
+src = ["src", "checks", "scripts", "proofs", "examples", "packages"]
 # Generated bindings: protoc's line lengths and import style are not ours to lint.
 extend-exclude = ["src/cozy/worker/v1/worker_pb2.py",
                   "src/cozy/worker/v1/worker_pb2_grpc.py",

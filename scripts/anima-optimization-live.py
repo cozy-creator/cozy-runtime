@@ -28,6 +28,8 @@ from packaging.version import Version
 from cozy_runtime.internal.anima_optimization import (
     _TRANSFORMER_CONFIG,
     DIFFUSERS_VERSION,
+    FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION,
+    FUSED_ANIMA_CUDA_KERNEL_MODULE,
     FUSED_ANIMA_CUDA_KERNEL_VERSION,
     FUSED_ANIMA_CUDA_RELEASE,
     FUSED_ANIMA_TORCH_RELEASE,
@@ -68,18 +70,18 @@ def main() -> None:
         raise SystemExit(f"REFUSED: built CUDA must be {FUSED_ANIMA_CUDA_RELEASE}")
     if metadata.version("diffusers") != DIFFUSERS_VERSION:
         raise SystemExit(f"REFUSED: diffusers must be {DIFFUSERS_VERSION}")
-    if metadata.version("comfy-kitchen") != FUSED_ANIMA_CUDA_KERNEL_VERSION:
+    if metadata.version(FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION) != FUSED_ANIMA_CUDA_KERNEL_VERSION:
         raise SystemExit(
             f"REFUSED: fused Anima CUDA kernel library must be {FUSED_ANIMA_CUDA_KERNEL_VERSION}"
         )
-    anima_kernels = import_module("comfy_kitchen")
+    anima_kernels = import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE)
     for name, source in {
         "RMSNorm.forward": RMSNorm.forward,
         "CosmosAttnProcessor2_0.__call__": CosmosAttnProcessor2_0.__call__,
         "CosmosRotaryPosEmbed.forward": CosmosRotaryPosEmbed.forward,
         "CosmosTransformerBlock.forward": CosmosTransformerBlock.forward,
         "AnimaPrepareLatentsStep.__call__": AnimaPrepareLatentsStep.__call__,
-        "comfy_kitchen.rms_rope_split_half": anima_kernels.rms_rope_split_half,
+        "cozy_runtime_cuda_kernels.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }.items():
         _require_source(name, source)
 

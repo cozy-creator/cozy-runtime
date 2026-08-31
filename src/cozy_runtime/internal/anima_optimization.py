@@ -23,7 +23,9 @@ from typing import Any
 from packaging.version import InvalidVersion, Version
 
 DIFFUSERS_VERSION = "0.40.0"
-FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.2.31"
+FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION = "cozy-runtime-cuda-kernels"
+FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime_cuda_kernels"
+FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.1.0+torch2.13cu130"
 FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
 FUSED_ANIMA_CUDA_RELEASE = "13.0"
 
@@ -43,13 +45,13 @@ _SOURCE_DIGESTS = {
     "AnimaPrepareLatentsStep.__call__": (
         "5f758c69ad2f82a37d707e3ca736b88011b41f04a958dbc657ec397b88c2bef5"
     ),
-    "comfy_kitchen.rms_rope_split_half": (
-        "6c1aca28177cd3ef9750e3130e741ab33d5d9d4eecbdd5fc7a6396028725603d"
+    "cozy_runtime_cuda_kernels.rms_rope_split_half": (
+        "5c3aa37b7166a2465d099a42749a26d70712054cf5b2cc4e871a66e8cb3cf74f"
     ),
 }
 _IDENTITY_DOCUMENT = {
     "diffusers": DIFFUSERS_VERSION,
-    "comfy-kitchen": FUSED_ANIMA_CUDA_KERNEL_VERSION,
+    FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION: FUSED_ANIMA_CUDA_KERNEL_VERSION,
     "plan": "direct-split-half-rope-matrix",
     "sources": _SOURCE_DIGESTS,
 }
@@ -482,11 +484,11 @@ def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
             return None
     except (AttributeError, RuntimeError):
         return None
-    native_version = _installed_version("comfy-kitchen")
+    native_version = _installed_version(FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION)
     if native_version != FUSED_ANIMA_CUDA_KERNEL_VERSION:
         return None
     try:
-        anima_kernels = import_module("comfy_kitchen")
+        anima_kernels = import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE)
     except ImportError:
         return None
     return torch, anima_kernels
@@ -512,7 +514,7 @@ def _apply_fused_anima_cuda_plan(
         "CosmosRotaryPosEmbed.forward": CosmosRotaryPosEmbed.forward,
         "CosmosTransformerBlock.forward": CosmosTransformerBlock.forward,
         "AnimaPrepareLatentsStep.__call__": AnimaPrepareLatentsStep.__call__,
-        "comfy_kitchen.rms_rope_split_half": anima_kernels.rms_rope_split_half,
+        "cozy_runtime_cuda_kernels.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }
     for name, source in sources.items():
         _require_source(name, source)
@@ -559,7 +561,8 @@ def _apply_fused_anima_cuda_plan(
     AnimaPrepareLatentsStep.__call__ = _latent_prepare_call
     return AppliedAnimaOptimization(
         OPTIMIZATION_ID,
-        f"diffusers=={DIFFUSERS_VERSION};comfy-kitchen=={FUSED_ANIMA_CUDA_KERNEL_VERSION}",
+        f"diffusers=={DIFFUSERS_VERSION};"
+        f"{FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION}=={FUSED_ANIMA_CUDA_KERNEL_VERSION}",
         (
             "fused_rmsnorm_split_half_rope",
             "addcmul_residuals",
