@@ -140,6 +140,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             describe=describe,
             verified=lambda _digest, _length, _path: None,
             base_manifest=base_manifest,
+            allow_native_custom=True,
         )
     except (PreparationRefusal, ExecutorGone, OSError) as exc:
         name = getattr(exc, "code", "package_prepare_failed")
@@ -147,7 +148,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         raise CliError(
             str(name),
             str(detail),
-            "use a compatible pure-Python package or repair the current local Runtime base",
+            "use wheels compatible with this machine or repair the current local Runtime base",
             Exit.validation,
         ) from exc
     finally:
