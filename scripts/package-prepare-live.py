@@ -368,10 +368,47 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise AssertionError("changed wheel bytes under one private revision were admitted")
         modeled(root, base, cache, args.wheel_dir)
+        _prove_preinstalled_serve_flag(root)
         print(
             "package preparation: published/private Marco and exact modeled TensorFS package passed"
         )
     return 0
+
+
+def _prove_preinstalled_serve_flag(root: Path) -> None:
+    from cozy_runtime.cli import host
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.worker import session
+
+    captured: list[str] = []
+    original = session.serve_worker
+
+    def fake_serve(config: RuntimeConfig, argv: list[str] | None = None) -> int:
+        _ = config
+        assert argv is not None
+        captured.extend(argv)
+        return 17
+
+    session.serve_worker = fake_serve
+    try:
+        code = host.serve(
+            RuntimeConfig(cozy_home=root, credentials=Credentials()),
+            [
+                "--socket",
+                str(root / "control.sock"),
+                "--out",
+                str(root / "worker"),
+                "--artifact-store",
+                str(root / "store"),
+                "--environment-python",
+                sys.executable,
+            ],
+        )
+    finally:
+        session.serve_worker = original
+    assert code == 17
+    index = captured.index("--environment-python")
+    assert captured[index + 1] == sys.executable
 
 
 def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None:
