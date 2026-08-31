@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 
+[manifest]
+members = [
+    "cozy-runtime",
+    "cozy-runtime-cuda-kernels",
+]
+
 [[package]]
 name = "anyio"
 version = "4.14.2"
@@ -159,17 +165,8 @@ wheels = [
 ]
 
 [[package]]
-name = "comfy-kitchen"
-version = "0.2.31"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/5d/7df83ccb2b3fc4b9660dd337dcc56f7c65926318ae0303840a1e5b72493d/comfy_kitchen-0.2.31-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d7c2522e6a6cde7a7303e30d739c05989cf4b0a246684e496a129b950055d35f", size = 58541121, upload-time = "2026-08-13T02:11:35.132Z" },
-    { url = "https://files.pythonhosted.org/packages/27/d1/e53410260b81610233cb56c2fac1a9f3d39887be3cbb983cd8baa6a07528/comfy_kitchen-0.2.31-py3-none-any.whl", hash = "sha256:5117946c30f308cfc73b9c26f723ae3918308bd090e57a8eae298406934aabd6", size = 180907, upload-time = "2026-08-13T02:11:41.753Z" },
-]
-
-[[package]]
 name = "cozy-runtime"
-version = "0.0.21"
+version = "0.0.22"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -181,13 +178,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-anima-cuda = [
-    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
 corpus = [
     { name = "diffusers" },
     { name = "torch" },
     { name = "transformers" },
+]
+cuda-kernels = [
+    { name = "cozy-runtime-cuda-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 derive = [
     { name = "torch" },
@@ -207,7 +204,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
-    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'anima-cuda'", specifier = "==0.2.31" },
+    { name = "cozy-runtime-cuda-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda-kernels'", editable = "packages/cozy-runtime-cuda-kernels" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
@@ -219,7 +216,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "anima-cuda"]
+provides-extras = ["derive", "corpus", "media", "cuda-kernels"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -228,6 +225,17 @@ dev = [
     { name = "ruff", specifier = ">=0.16" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
+
+[[package]]
+name = "cozy-runtime-cuda-kernels"
+version = "0.1.0+torch2.13cu130"
+source = { editable = "packages/cozy-runtime-cuda-kernels" }
+dependencies = [
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "torch", specifier = "==2.13.0" }]
 
 [[package]]
 name = "cryptography"

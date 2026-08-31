@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.21"
+version = "0.0.22"
 source = { editable = "../../" }
 dependencies = [
     { name = "cryptography" },
@@ -41,7 +41,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
-    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'anima-cuda'", specifier = "==0.2.31" },
+    { name = "cozy-runtime-cuda-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda-kernels'", editable = "../../packages/cozy-runtime-cuda-kernels" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
@@ -53,7 +53,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "anima-cuda"]
+provides-extras = ["derive", "corpus", "media", "cuda-kernels"]
 
 [package.metadata.requires-dev]
 dev = [
