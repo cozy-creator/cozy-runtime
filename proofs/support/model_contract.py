@@ -113,11 +113,14 @@ def _prepare(args: argparse.Namespace) -> None:
         "torch_release": "2.13.0",
     }
     base_distributions, base_import_roots = _installed_base_ownership()
+    torch_release = dict(
+        (str(row["distribution"]), str(row["version"])) for row in base_distributions
+    )["torch"].partition("+")[0]
     wheelhouse = _canonical(
         {
             "base_distributions": base_distributions,
             "base_import_roots": base_import_roots,
-            "compatibility_profile": profile,
+            "compatibility_profile": {**profile, "torch_release": torch_release},
             "format": "WheelhouseManifest/1",
             "minimum_cuda_version": "none",
             "minimum_driver_version": "none",
@@ -134,6 +137,7 @@ def _prepare(args: argparse.Namespace) -> None:
         "entrypoints",
         "format",
         "jobs",
+        "model_productions",
     }:
         raise ProofFailure("fixture descriptor is not one closed PackageDescriptor/1")
     _require(

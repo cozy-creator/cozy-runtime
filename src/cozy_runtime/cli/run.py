@@ -177,8 +177,8 @@ def run(
 
     kind = "job" if verb == "job" else "entrypoint"
     surface = next((s for s in found.surfaces if s.name == function), None)
-    if surface is None or surface.kind != kind:
-        known = sorted(s.name for s in found.surfaces if s.kind == kind)
+    if surface is None or surface.kind != kind or surface.hidden:
+        known = sorted(s.name for s in found.surfaces if s.kind == kind and not s.hidden)
         raise CliError(
             "not_found",
             f"no registered {kind} named {function!r}",

@@ -95,11 +95,11 @@ expect_exit 2 "run needs a function name" cli run
 expect_exit 4 "no registered entrypoint named 'nosuchfn'" cli run nosuchfn
 expect_exit 3 "declares no field(s) colour" cli run echo text=hello colour=blue
 expect_exit 3 "declares count as int" cli run echo text=hello count=many
-expect_exit 6 "flat local binding records were removed" cli run modeled text=hello
+expect_exit 4 "no registered entrypoint named 'modeled'" cli run modeled text=hello
 expect_exit 2 "unknown verb 'pull'" cli pull proof/absent@v1
 expect_exit 2 "unknown verb 'list'" cli list
 expect_exit 2 "unknown verb 'rm'" cli rm proof/absent@v1
-expect_exit 9 "'ingest' invokes TensorFS" cli ingest proof/absent@v1
+expect_exit 2 "unknown verb 'ingest'" cli ingest proof/absent@v1
 expect_exit 4 "no registered callable named 'nosuchfn'" cli describe nosuchfn
 
 cli --help >"$proof_root/help.stdout"

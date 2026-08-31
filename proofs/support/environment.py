@@ -362,11 +362,24 @@ def _release(
     root.mkdir()
     base_distributions, base_import_roots = _installed_base_ownership()
     cpu = target["accelerator_backend"] == "none"
+    if not cpu:
+        base_distributions = [
+            {
+                **row,
+                "version": str(row["version"]).partition("+")[0] + "+" + target["accelerator_abi"],
+            }
+            if row["distribution"] == "torch"
+            else row
+            for row in base_distributions
+        ]
+    torch_release = dict(
+        (str(row["distribution"]), str(row["version"])) for row in base_distributions
+    )["torch"].partition("+")[0]
     profile = {
         "accelerator_build": "cpu" if cpu else target["accelerator_abi"],
         "os_cpu": "linux-x86",
         "python_abi": target["python_abi"],
-        "torch_release": "2.13.0",
+        "torch_release": torch_release,
     }
     wheelhouse = _canonical(
         {

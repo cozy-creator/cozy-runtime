@@ -269,6 +269,33 @@ def measure_wheel(
     return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
 
 
+def preflight_overlay(
+    project: Path,
+    dependencies: Sequence[Path],
+    base_raw: bytes,
+) -> tuple[BaseManifest, tuple[Wheel, ...]]:
+    """Apply the rented-overlay admission policy without installing or executing code."""
+
+    base_digest = _sha(base_raw)
+    base = parse_base_manifest(base_raw, base_digest)
+    measured = [measure_wheel(project, "project", base)]
+    measured.extend(measure_wheel(path, "custom", base) for path in dependencies)
+    wheels = tuple(row[0] for row in measured)
+    source = Input(
+        environment_digest=_sha(canonical.write({"wheels": [wheel.digest for wheel in wheels]})),
+        base_family_digest=base_digest,
+        project_wheel_digest=measured[0][0].digest,
+        wheels=wheels,
+        grants=tuple(
+            BlobGrant(wheel.digest, wheel.length, path, receipt)
+            for (wheel, receipt), path in zip(measured, (project, *dependencies), strict=True)
+        ),
+    )
+    ordered = _verify_inventory(source, base)
+    _verify_grants(source, ordered, base, allow_native_custom=False)
+    return base, ordered
+
+
 def expected_receipt_bytes(source: Input) -> bytes:
     """Canonical receipt implied by already-joined release documents.
 
