@@ -22,4 +22,5 @@ organization = "paul"
 cozy-runtime = { path = "../..", editable = true }
 
 [tool.uv.build-backend]
+module-name = "marco_polo_package"
 module-root = ""
