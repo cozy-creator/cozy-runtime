@@ -219,7 +219,7 @@ may yield several exact converter closures without a filename heuristic or a fak
 Each output contract contains only the final topology digest and sorted exact TensorFS EncodingSpec
 object IDs. Tensorhub derives both from the produced header; human task, structure and stamp labels
 cannot make bytes admissible. Static recipe assets remain private importlib resources of the job,
-not Creator inputs. Job and production-node resource floors use the same descriptor shape.
+not Creator inputs. Job and production-step resource floors use the same descriptor shape.
 Productions execute nothing and carry no concrete source selection, destination, credential or
 exact resolved job release.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and

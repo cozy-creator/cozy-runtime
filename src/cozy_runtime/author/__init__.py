@@ -112,8 +112,8 @@ from cozy_runtime.author._model import (
 )
 from cozy_runtime.author._production import (
     ProductionContract,
-    ProductionNode,
     ProductionOutput,
+    ProductionStep,
 )
 from cozy_runtime.author._services import (
     JOB_ONLY,
@@ -223,8 +223,8 @@ __all__ = [
     "PreflightViolation",
     "PreparedRequest",
     "ProductionContract",
-    "ProductionNode",
     "ProductionOutput",
+    "ProductionStep",
     "Recipe",
     "Registration",
     "RegistrationError",

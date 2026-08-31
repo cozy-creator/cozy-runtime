@@ -49,8 +49,8 @@ from cozy_runtime.author import (
     Outputs,
     Preflight,
     ProductionContract,
-    ProductionNode,
     ProductionOutput,
+    ProductionStep,
     RequestView,
     Resources,
     Scheduler,
@@ -724,8 +724,8 @@ app.production(
         "dits": "hf/minimax-h3/native-dual-bf16/1",
         "shared": "hf/minimax-h3/shared-bf16/1",
     },
-    nodes=(
-        ProductionNode(
+    steps=(
+        ProductionStep(
             name="distill-full",
             callable="tensorhub/h3/distill",
             models={"base": "dits", "shared": "shared"},
