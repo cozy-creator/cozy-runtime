@@ -856,19 +856,22 @@ def fence_base_ownership_vectors() -> list[str]:
                 grants=(),
             )
 
-        admitted = overlay._verify_inventory(counted_input(127), cu130_manifest)
-        if len(admitted) != 128:
-            bad.append(f"cr-027 wheel-count boundary admitted {len(admitted)} rows, want 128")
+        admitted = overlay._verify_inventory(counted_input(128), cu130_manifest)
+        if len(admitted) != overlay.MAX_PACKAGE_WHEELS:
+            bad.append(
+                f"cr-027 wheel-count boundary admitted {len(admitted)} rows, "
+                f"want {overlay.MAX_PACKAGE_WHEELS}"
+            )
         try:
-            overlay._verify_inventory(counted_input(128), cu130_manifest)
+            overlay._verify_inventory(counted_input(129), cu130_manifest)
         except overlay.OverlayRefusal as exc:
-            if exc.code != "overlay_wheel_set_invalid" or exc.detail != "129":
+            if exc.code != "overlay_wheel_set_invalid" or exc.detail != "130":
                 bad.append(
-                    "cr-027 128-custom refusal was "
-                    f"{exc.code}:{exc.detail}, want overlay_wheel_set_invalid:129"
+                    "cr-027 129-custom refusal was "
+                    f"{exc.code}:{exc.detail}, want overlay_wheel_set_invalid:130"
                 )
         else:
-            bad.append("cr-027 admitted 128 custom wheels plus the project wheel")
+            bad.append("cr-027 admitted 129 custom wheels plus the project wheel")
     return bad
 
 

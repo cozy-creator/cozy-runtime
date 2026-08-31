@@ -52,6 +52,7 @@ MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
 MAX_WHEEL_EXPANSION = 64
 MAX_METADATA_BYTES = 4 << 20
+MAX_PACKAGE_WHEELS = 129
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
@@ -496,7 +497,7 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
             raise OverlayRefusal("overlay_receipt_invalid", f"{field} is not a digest")
         _require_digest(item, field)
     rows = value.get("overlay_wheels")
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 128:
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_PACKAGE_WHEELS:
         raise OverlayRefusal("overlay_receipt_invalid", "overlay_wheels is empty or oversized")
     distributions: list[str] = []
     digests: set[str] = set()
@@ -770,7 +771,7 @@ def _base_wheel_rows(
 
 
 def _verify_inventory(source: Input, base: BaseManifest) -> tuple[Wheel, ...]:
-    if not source.wheels or len(source.wheels) > 128:
+    if not source.wheels or len(source.wheels) > MAX_PACKAGE_WHEELS:
         raise OverlayRefusal("overlay_wheel_set_invalid", str(len(source.wheels)))
     names: set[str] = set()
     digests: set[str] = set()
