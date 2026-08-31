@@ -133,6 +133,7 @@ class BaseManifest:
     wheels: tuple[Wheel, ...]
     base_distributions: tuple[tuple[str, str], ...]
     base_import_roots: tuple[tuple[str, tuple[str, ...]], ...]
+    ownership: str = "image"
 
     @property
     def distribution_versions(self) -> dict[str, str]:
@@ -540,8 +541,12 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         "platform_target",
         "wheels",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    shapes = {frozenset(fields), frozenset({*fields, "ownership"})}
+    if not isinstance(value, dict) or set(value) not in shapes:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong fields")
+    ownership = value.get("ownership", "image")
+    if ownership not in {"image", "observed-local"}:
+        raise OverlayRefusal("base_family_manifest_invalid", "invalid ownership")
     if value["format"] != WHEELHOUSE_MANIFEST_FORMAT:
         raise OverlayRefusal("base_family_manifest_invalid", "wrong format")
     platform = value["platform_target"]
@@ -571,7 +576,10 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         or profile["python_abi"] != platform["python_abi"]
         or profile["os_cpu"] != "linux-x86"
         or platform["os_arch"] != "linux/amd64"
-        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", profile["torch_release"]) is None
+        or (
+            re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", profile["torch_release"]) is None
+            and not (ownership == "observed-local" and profile["torch_release"] == "none")
+        )
     ):
         raise OverlayRefusal("base_family_manifest_invalid", "invalid compatibility_profile")
     minimum_cuda = value["minimum_cuda_version"]
@@ -587,7 +595,12 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         raise OverlayRefusal("base_family_manifest_invalid", "invalid CUDA or driver floor")
     distributions = _base_distribution_rows(value["base_distributions"])
     roots = _base_import_root_rows(value["base_import_roots"], dict(distributions))
-    wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
+    if ownership == "observed-local":
+        if value["wheels"] != [] or not cpu_profile or profile["torch_release"] != "none":
+            raise OverlayRefusal("base_family_manifest_invalid", "invalid observed-local base")
+        wheels: tuple[Wheel, ...] = ()
+    else:
+        wheels = _base_wheel_rows(value["wheels"], dict(distributions), dict(roots))
     return BaseManifest(
         platform_target=tuple(sorted(platform.items())),
         compatibility_profile=tuple(sorted(profile.items())),
@@ -596,6 +609,7 @@ def parse_base_manifest(raw: bytes, expected_digest: str) -> BaseManifest:
         wheels=wheels,
         base_distributions=distributions,
         base_import_roots=roots,
+        ownership=ownership,
     )
 
 

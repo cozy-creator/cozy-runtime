@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,7 @@ def prepare_package_set(
     verified: Callable[[str, int, Path], None],
     base_manifest: Path = overlay.DEFAULT_BASE_MANIFEST,
 ) -> pb.PreparePackageSetResult:
-    """Materialize and describe one weightless package into an existing PlacementSet."""
+    """Parse one remote delegation, then use the shared package preparation path."""
 
     if Path(request.environment_root) != environment_root or not environment_root.is_absolute():
         raise PreparationRefusal(
@@ -67,6 +67,42 @@ def prepare_package_set(
     except (documents.DocumentError, ValueError) as exc:
         raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
 
+    return prepare_package(
+        package_name=package_name,
+        release=release,
+        release_digest=release_digest,
+        files=request.files,
+        placement_seed=request.download_delegation,
+        artifact_cache=artifact_cache,
+        environment_root=environment_root,
+        python=python,
+        describe=describe,
+        verified=verified,
+        base_manifest=base_manifest,
+    )
+
+
+def prepare_package(
+    *,
+    package_name: str,
+    release: str,
+    release_digest: str,
+    files: Sequence[pb.LocalDownloadFile],
+    placement_seed: bytes,
+    artifact_cache: Path,
+    environment_root: Path,
+    python: Path,
+    describe: Callable[[overlay.InstalledOverlay, str], bytes],
+    verified: Callable[[str, int, Path], None],
+    base_manifest: Path,
+) -> pb.PreparePackageSetResult:
+    """Inspect, install, import, and describe one exact weightless package."""
+
+    try:
+        documents.raw(release_digest)
+    except (documents.DocumentError, ValueError) as exc:
+        raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
+
     base_raw = _read_file(base_manifest, 64 << 20)
     base_digest = "sha256:" + hashlib.sha256(base_raw).hexdigest()
     try:
@@ -74,7 +110,7 @@ def prepare_package_set(
     except overlay.OverlayRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
 
-    rows = list(request.files)
+    rows = list(files)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     facts: list[tuple[overlay.Wheel, Path, overlay.VerifiedFile]] = []
@@ -183,7 +219,7 @@ def prepare_package_set(
         canonical.write({"entrypoints": entrypoint_bodies, "models": []})
     )
     placement = pb.Placement(
-        placement_id="private-" + hashlib.sha256(request.download_delegation).hexdigest()[:24],
+        placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
         package=package,
         environment_digest=documents.raw(environment_digest),
         package_descriptor=pb.Ref(
