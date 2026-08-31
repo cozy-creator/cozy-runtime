@@ -24,6 +24,7 @@ _PROTECTED = frozenset(
     {
         "cozy-runtime",
         "cozy-runtime-cuda-kernels",
+        "msgspec",
         "tensorfs",
         "torch",
         "torchaudio",
@@ -182,6 +183,11 @@ def _ownership() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[st
         versions[name] = selected.version
         for root in _distribution_roots(selected):
             providers.setdefault(root, set()).add(name)
+    for root, names in importlib.metadata.packages_distributions().items():
+        for raw_name in names:
+            name = _normalize(raw_name)
+            if name in versions and _ROOT.fullmatch(root):
+                providers.setdefault(root, set()).add(name)
     for root in sys.stdlib_module_names:
         try:
             present = importlib.util.find_spec(root) is not None
@@ -202,6 +208,22 @@ def _distribution_roots(distribution: importlib.metadata.Distribution) -> set[st
         if not parts:
             continue
         first = parts[0]
+        if len(parts) == 1 and first.endswith(".pth"):
+            try:
+                lines = Path(str(distribution.locate_file(entry))).read_text().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                path = Path(line.strip())
+                if not path.is_absolute() or not path.is_dir():
+                    continue
+                for child in path.iterdir():
+                    name = child.stem if child.is_file() and child.suffix == ".py" else child.name
+                    if _ROOT.fullmatch(name) and (
+                        child.is_dir() or (child.is_file() and child.suffix == ".py")
+                    ):
+                        roots.add(name)
+            continue
         if first.endswith((".dist-info", ".egg-info")):
             continue
         if first.endswith(".data"):

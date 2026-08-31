@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Any, ClassVar, Self
 
-__version__ = "0.0.0-proof"
+__version__ = "0.0.0"
 
 
 class _Version:

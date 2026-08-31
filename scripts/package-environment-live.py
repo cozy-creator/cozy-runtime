@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cozy_runtime.internal import (
-    canonical,
+    base_observation,
     child_env,
     jit_cache,
     package_environment,
@@ -44,16 +44,17 @@ def build_wheel(
     requires_dist: tuple[str, ...] = (),
     root_is_pure: bool = True,
     extra_entries: dict[str, bytes] | None = None,
+    version: str = "1.0.0",
 ) -> tuple[package_environment.Wheel, Path]:
-    filename = f"{distribution.replace('-', '_')}-1.0.0-{tag}.whl"
+    filename = f"{distribution.replace('-', '_')}-{version}-{tag}.whl"
     wheel_root = root / f"{distribution}-{value}-{tag.replace('.', '_')}"
     wheel_root.mkdir()
     path = wheel_root / filename
-    info = f"{distribution.replace('-', '_')}-1.0.0.dist-info"
+    info = f"{distribution.replace('-', '_')}-{version}.dist-info"
     entries = {
         f"{package}/__init__.py": f"VALUE = {value!r}\n".encode(),
         f"{info}/METADATA": (
-            f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0.0\n"
+            f"Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n"
             + (f"Requires-Python: {requires_python}\n" if requires_python else "")
             + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires_dist)
         ).encode(),
@@ -75,7 +76,7 @@ def build_wheel(
     return (
         package_environment.Wheel(
             distribution=distribution,
-            version="1.0.0",
+            version=version,
             filename=filename,
             digest=digest(raw),
             length=len(raw),
@@ -103,100 +104,22 @@ def compile_shared(root: Path, name: str, source: str, *linker_flags: str) -> by
     return library_path.read_bytes()
 
 
-def base_manifest(path: Path, runtime_version: str = "0.0.20", uv_version: str = "0.12.7") -> str:
-    raw = canonical.write(
-        {
-            "base_distributions": [
-                {"distribution": "base-control", "version": "1.0.0"},
-                {"distribution": "cozy-runtime", "version": runtime_version},
-                {"distribution": "numpy", "version": "2.0.0"},
-                {"distribution": "torch", "version": "2.13.0+cpu"},
-                {"distribution": "uv", "version": uv_version},
-            ],
-            "base_import_roots": [
-                {"providers": ["base-control"], "root": "base_control"},
-                {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
-                {"providers": ["numpy"], "root": "numpy"},
-                {"providers": ["torch"], "root": "torch"},
-                {"providers": ["uv"], "root": "uv"},
-            ],
-            "compatibility_profile": {
-                "accelerator_build": "cpu",
-                "os_cpu": "linux-x86",
-                "python_abi": "cp312",
-                "torch_release": "2.13.0",
-            },
-            "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none",
-            "minimum_driver_version": "none",
-            "platform_target": {
-                "accelerator_abi": "none",
-                "accelerator_backend": "none",
-                "libc": "glibc2.39",
-                "os_arch": "linux/amd64",
-                "python_abi": "cp312",
-            },
-            "wheels": [
-                {
-                    "digest": "sha256:" + "0" * 64,
-                    "distribution": "base-control",
-                    "filename": "base_control-1.0.0-py3-none-any.whl",
-                    "import_roots": ["base_control"],
-                    "length": 1,
-                    "tags": ["py3-none-any"],
-                    "version": "1.0.0",
-                }
-            ],
-        }
+def fixture_base(
+    *, runtime_version: str | None = None, uv_version: str | None = None
+) -> base_observation.Observation:
+    observed = base_observation.current()
+    distributions = dict(observed.distributions)
+    if runtime_version is not None:
+        distributions["cozy-runtime"] = runtime_version
+    return replace(
+        observed,
+        distributions=tuple(sorted(distributions.items())),
+        uv_version=uv_version or observed.uv_version,
     )
-    path.write_bytes(raw)
-    path.chmod(0o444)
-    return digest(raw)
-
-
-def local_base_manifest(path: Path) -> str:
-    raw = canonical.write(
-        {
-            "base_distributions": [
-                {"distribution": "base-control", "version": "1.0.0"},
-                {"distribution": "cozy-runtime", "version": "0.0.20"},
-                {"distribution": "numpy", "version": "2.0.0"},
-                {"distribution": "uv", "version": "0.12.7"},
-            ],
-            "base_import_roots": [
-                {"providers": ["base-control"], "root": "base_control"},
-                {"providers": ["cozy-runtime"], "root": "cozy_runtime"},
-                {"providers": ["numpy"], "root": "numpy"},
-                {"providers": ["uv"], "root": "uv"},
-            ],
-            "compatibility_profile": {
-                "accelerator_build": "cpu",
-                "os_cpu": "linux-x86",
-                "python_abi": "cp312",
-                "torch_release": "none",
-            },
-            "format": "WheelhouseManifest/1",
-            "minimum_cuda_version": "none",
-            "minimum_driver_version": "none",
-            "ownership": "observed-local",
-            "platform_target": {
-                "accelerator_abi": "none",
-                "accelerator_backend": "none",
-                "libc": "glibc2.39",
-                "os_arch": "linux/amd64",
-                "python_abi": "cp312",
-            },
-            "wheels": [],
-        }
-    )
-    path.write_bytes(raw)
-    path.chmod(0o444)
-    return digest(raw)
 
 
 def source(
     spec: str,
-    family: str,
     project: tuple[package_environment.Wheel, Path],
     custom: tuple[package_environment.Wheel, Path],
     *,
@@ -205,7 +128,6 @@ def source(
     rows = (project, custom)
     return package_environment.Input(
         environment_digest=digest(spec.encode()),
-        base_family_digest=family,
         project_wheel_digest=project[0].digest,
         wheels=tuple(row[0] for row in rows),
         grants=tuple(
@@ -243,8 +165,7 @@ def main() -> int:
         root = Path(raw)
         wheels = root / "wheels"
         wheels.mkdir()
-        manifest = root / "WheelhouseManifest.json"
-        family = base_manifest(manifest)
+        base = fixture_base()
         project = build_wheel(
             wheels,
             "proof-project",
@@ -264,25 +185,25 @@ def main() -> int:
         ):
             cold_started = time.perf_counter_ns()
             cold = package_environment.materialize(
-                source("spec-one", family, project, custom_one),
+                source("spec-one", project, custom_one),
                 environment,
                 python=Path(sys.executable),
-                base_manifest=manifest,
+                base=base,
             )
             cold_ns = time.perf_counter_ns() - cold_started
             warm_started = time.perf_counter_ns()
             warm = package_environment.materialize(
-                source("spec-two", family, project, custom_one),
+                source("spec-two", project, custom_one),
                 environment,
                 python=Path(sys.executable),
-                base_manifest=manifest,
+                base=base,
             )
             warm_ns = time.perf_counter_ns() - warm_started
             changed = package_environment.materialize(
-                source("spec-three", family, project, custom_two),
+                source("spec-three", project, custom_two),
                 environment,
                 python=Path(sys.executable),
-                base_manifest=manifest,
+                base=base,
             )
 
         assert cold.receipt_digest != warm.receipt_digest
@@ -294,6 +215,64 @@ def main() -> int:
         assert (cold.site_packages / "proof_custom" / "__init__.py").read_bytes() != (
             changed.site_packages / "proof_custom" / "__init__.py"
         ).read_bytes()
+
+        ordinary_v2 = build_wheel(
+            wheels,
+            "proof-custom",
+            "proof_custom",
+            "version-two",
+            owner="custom",
+            version="2.0.0",
+        )
+        independent = package_environment.materialize(
+            source("ordinary-v2", project, ordinary_v2),
+            root / "ordinary-v2",
+            python=Path(sys.executable),
+            base=base,
+        )
+        assert independent.content_digest != cold.content_digest
+        assert (independent.site_packages / "proof_custom" / "__init__.py").read_text() == (
+            "VALUE = 'version-two'\n"
+        )
+
+        protected_distribution = build_wheel(
+            wheels,
+            "cozy-runtime",
+            "cozy_runtime",
+            "shadow",
+            owner="custom",
+            version=base.distribution_versions["cozy-runtime"],
+        )
+        protected_root = build_wheel(
+            wheels,
+            "different-runtime-name",
+            "cozy_runtime",
+            "shadow",
+            owner="custom",
+        )
+        msgspec_shadow = build_wheel(
+            wheels,
+            "msgspec",
+            "msgspec",
+            "shadow",
+            owner="custom",
+            version=base.distribution_versions["msgspec"],
+        )
+        for code, shadow in (
+            ("package_environment_shadows_base_distribution", protected_distribution),
+            ("package_environment_shadows_base_import", protected_root),
+            ("package_environment_shadows_base_distribution", msgspec_shadow),
+        ):
+            try:
+                package_environment.materialize(
+                    source(code, project, shadow),
+                    root / code,
+                    base=base,
+                )
+            except package_environment.EnvironmentRefusal as exc:
+                assert exc.code == code, (exc.code, code)
+            else:
+                raise AssertionError(f"{code} was admitted")
         opened = package_environment.open_existing_environment(cold.python, "sha256:" + "f" * 64)
         assert opened.python == cold.python
         assert opened.generation == cold.generation
@@ -302,35 +281,33 @@ def main() -> int:
         interrupted.mkdir()
         (interrupted / "partial").write_text("not a selectable venv")
         recovered = package_environment.materialize(
-            source("spec-after-interruption", family, project, custom_two),
+            source("spec-after-interruption", project, custom_two),
             environment,
             python=Path(sys.executable),
-            base_manifest=manifest,
+            base=base,
         )
         assert recovered.reused and recovered.generation == changed.generation
         assert not interrupted.exists()
         assert not list(environment.glob(".environment-staging-*"))
         assert recovered.generation.stat().st_mode & 0o222 == 0
 
-        patch_manifest = root / "WheelhouseManifest.patch.json"
-        patch_family = base_manifest(patch_manifest, "0.0.21")
+        patch_base = fixture_base(runtime_version="0.0.21")
         compatible_patch = package_environment.materialize(
-            source("spec-runtime-patch", patch_family, project, custom_one),
+            source("spec-runtime-patch", project, custom_one),
             environment,
             python=Path(sys.executable),
-            base_manifest=patch_manifest,
+            base=patch_base,
         )
         assert compatible_patch.reused
         assert compatible_patch.generation == cold.generation
 
-        incompatible_manifest = root / "WheelhouseManifest.incompatible.json"
-        incompatible_family = base_manifest(incompatible_manifest, "1.0.0")
+        incompatible_base = fixture_base(runtime_version="1.0.0")
         try:
             package_environment.materialize(
-                source("spec-runtime-major", incompatible_family, project, custom_one),
+                source("spec-runtime-major", project, custom_one),
                 environment,
                 python=Path(sys.executable),
-                base_manifest=incompatible_manifest,
+                base=incompatible_base,
             )
         except package_environment.EnvironmentRefusal as exc:
             assert exc.code == "package_environment_dependency_base_conflict"
@@ -338,18 +315,17 @@ def main() -> int:
         else:
             raise AssertionError("an incompatible Runtime major reused the package environment")
 
-        wrong_uv_manifest = root / "WheelhouseManifest.wrong-uv.json"
-        wrong_uv_family = base_manifest(wrong_uv_manifest, uv_version="0.12.6")
+        wrong_uv_base = fixture_base(uv_version="0.0.0")
         try:
             package_environment.materialize(
-                source("spec-wrong-uv", wrong_uv_family, project, custom_one),
+                source("spec-wrong-uv", project, custom_one),
                 environment,
                 python=Path(sys.executable),
-                base_manifest=wrong_uv_manifest,
+                base=wrong_uv_base,
             )
         except package_environment.EnvironmentRefusal as exc:
-            assert exc.code == "package_environment_uv_version_mismatch"
-            assert "executable=0.12.7 base_manifest=0.12.6" in exc.detail
+            assert exc.code == "package_environment_uv_changed"
+            assert "observed=0.0.0" in exc.detail
         else:
             raise AssertionError("an unpinned uv executable materialized a package environment")
 
@@ -357,7 +333,7 @@ def main() -> int:
         corrupt = bytearray(custom_one[1].read_bytes())
         corrupt[len(corrupt) // 2] ^= 1
         corrupt_path.write_bytes(corrupt)
-        corrupt_source = source("corrupt", family, project, custom_one, verified=False)
+        corrupt_source = source("corrupt", project, custom_one, verified=False)
         corrupt_source = replace(
             corrupt_source,
             grants=(
@@ -370,7 +346,7 @@ def main() -> int:
                 corrupt_source,
                 root / "corrupt-installed",
                 python=Path(sys.executable),
-                base_manifest=manifest,
+                base=base,
             )
         except package_environment.EnvironmentRefusal as exc:
             assert exc.code == "package_environment_wheel_digest_mismatch"
@@ -388,10 +364,10 @@ def main() -> int:
             root_is_pure=False,
         )
         abi3 = package_environment.materialize(
-            source("abi3", family, project, abi3_custom),
+            source("abi3", project, abi3_custom),
             root / "abi3-installed",
             python=Path(sys.executable),
-            base_manifest=manifest,
+            base=base,
         )
         assert (abi3.site_packages / "proof_abi3" / "__init__.py").is_file()
 
@@ -415,11 +391,11 @@ def main() -> int:
             ),
             "package_environment_dependency_base_conflict": build_wheel(
                 wheels,
-                "proof-numpy-pin",
-                "proof_numpy_pin",
-                "numpy-pin",
+                "proof-runtime-pin",
+                "proof_runtime_pin",
+                "runtime-pin",
                 owner="project",
-                requires_dist=("numpy==1.0.0",),
+                requires_dist=("cozy-runtime==1.0.0",),
             ),
             "package_environment_dependency_missing": build_wheel(
                 wheels,
@@ -435,10 +411,10 @@ def main() -> int:
             bad_custom = bad_wheel if bad_wheel[0].owner == "custom" else custom_one
             try:
                 package_environment.materialize(
-                    source(code, family, bad_project, bad_custom),
+                    source(code, bad_project, bad_custom),
                     root / f"red-{code}",
                     python=Path(sys.executable),
-                    base_manifest=manifest,
+                    base=base,
                 )
             except package_environment.EnvironmentRefusal as exc:
                 assert exc.code == code, (exc.code, code)
@@ -468,10 +444,10 @@ def main() -> int:
         for code, (bad_project, bad_custom) in native_reds.items():
             try:
                 package_environment.materialize(
-                    source(code, family, bad_project, bad_custom),
+                    source(code, bad_project, bad_custom),
                     root / f"red-{code}",
                     python=Path(sys.executable),
-                    base_manifest=manifest,
+                    base=base,
                 )
             except package_environment.EnvironmentRefusal as exc:
                 assert exc.code == code, (exc.code, code)
@@ -486,10 +462,10 @@ def main() -> int:
         try:
             package_environment._verify_inventory(
                 replace(
-                    source("tagged-project", family, project, custom_one),
+                    source("tagged-project", project, custom_one),
                     wheels=(tagged_project, custom_one[0]),
                 ),
-                package_environment._read_base_manifest(manifest, family),
+                base,
             )
         except package_environment.EnvironmentRefusal as exc:
             assert exc.code == "package_environment_project_wheel_not_pure", exc.code
@@ -513,33 +489,19 @@ def main() -> int:
         )
         try:
             package_environment.materialize(
-                source("native-custom", family, project, native_custom),
+                source("native-custom", project, native_custom),
                 root / "native-custom-refused",
-                base_manifest=manifest,
+                base=base,
             )
         except package_environment.EnvironmentRefusal as exc:
             assert exc.code == "package_environment_custom_wheel_native_unsupported", exc.code
         else:
             raise AssertionError("custom native wheel was admitted")
 
-        try:
-            package_environment.materialize(
-                source("native-custom-image-opt-in", family, project, native_custom),
-                root / "native-custom-image-opt-in",
-                base_manifest=manifest,
-                allow_native_custom=True,
-            )
-        except package_environment.EnvironmentRefusal as exc:
-            assert exc.code == "package_environment_custom_wheel_native_unsupported", exc.code
-        else:
-            raise AssertionError("image-owned base admitted a custom native wheel")
-
-        local_manifest = root / "LocalBaseManifest.json"
-        local_family = local_base_manifest(local_manifest)
         native_local = package_environment.materialize(
-            source("native-custom-local", local_family, project, native_custom),
+            source("native-custom-local", project, native_custom),
             root / "native-custom-local",
-            base_manifest=local_manifest,
+            base=base,
             allow_native_custom=True,
         )
         library = ctypes.CDLL(
@@ -558,10 +520,10 @@ def main() -> int:
             requires_dist=("missing-package; python_version < '3.12'",),
         )
         package_environment.materialize(
-            source("false-marker", family, false_marker, custom_one),
+            source("false-marker", false_marker, custom_one),
             root / "false-marker-installed",
             python=Path(sys.executable),
-            base_manifest=manifest,
+            base=base,
         )
 
         supervision = child.ExecutorSupervision(
@@ -672,6 +634,9 @@ def main() -> int:
         print(
             json.dumps(
                 {
+                    "actual_base_python_abi": base.python_abi,
+                    "actual_base_uv_version": base.uv_version,
+                    "actual_protected_distributions": len(base.distributions),
                     "cold_ns": cold_ns,
                     "warm_ns": warm_ns,
                     "verified_bytes": first.verified_bytes,
@@ -682,6 +647,10 @@ def main() -> int:
                     "incompatible_runtime_major_refused": True,
                     "wrong_uv_version_refused": True,
                     "one_changed_wheel_has_distinct_environment": True,
+                    "incompatible_ordinary_versions_isolated": True,
+                    "protected_distribution_shadow_refused": True,
+                    "protected_import_shadow_refused": True,
+                    "runtime_abi_msgspec_shadow_refused": True,
                     "interrupted_staging_removed_before_reuse": True,
                     "changed_stat_rehashed": True,
                     "restart_rehashed": True,
@@ -700,7 +669,6 @@ def main() -> int:
                     "jit_cache_pod_scopes_separated": True,
                     "jit_cache_warm_reuse_within_pod": True,
                     "custom_native_wheel_refused": True,
-                    "custom_native_wheel_image_opt_in_refused": True,
                     "custom_native_wheel_local_loaded": True,
                     "base_version_conflict_refused": True,
                 },

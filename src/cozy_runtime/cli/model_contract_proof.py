@@ -1,7 +1,7 @@
 """Public build-seat author for exact ModelConstructionContract documents.
 
 The command runs from a receipt-selected package venv over the base worker image.
-It verifies the package-environment receipt and base-family join, then delegates package import and
+It verifies the package-environment receipt, then delegates package import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
 reads, writes, or subprocesses. The parent is the only writer and publishes one complete
 digest-addressed result directory by atomic rename.

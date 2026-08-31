@@ -15,7 +15,6 @@ Architecture fences, each provable red by planting the violation (`scripts/redar
   delivery-plan-observation
   pod-media-grant-root
   measured-backend-version
-  base-ownership-vectors
   typed-model-binding
 """
 
@@ -678,213 +677,6 @@ def fence_torch_free_import() -> list[str]:
     return bad
 
 
-def fence_base_ownership_vectors() -> list[str]:
-    """Run the strict complete-base parser over frozen v1/refusal vectors."""
-
-    import hashlib
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical, package_environment
-    from cozy_runtime.internal.placement_materialization import control_runtime_digest
-    from cozy_runtime.internal.refusal import LaunchRefusal
-
-    bad: list[str] = []
-    path = ROOT / "vectors" / "base-ownership.jsonl"
-    names: set[str] = set()
-    rows = [line for line in path.read_text().splitlines() if line.strip()]
-    for line_number, line in enumerate(rows, 1):
-        vector = json.loads(line)
-        if not isinstance(vector, dict):
-            bad.append(f"{path}:{line_number}: vector is not an object")
-            continue
-        name = vector.get("name")
-        document = vector.get("document")
-        expected = vector.get("expect")
-        if (
-            not isinstance(name, str)
-            or name in names
-            or not isinstance(document, dict)
-            or not isinstance(expected, str)
-        ):
-            bad.append(f"{path}:{line_number}: vector fields are incomplete or duplicated")
-            continue
-        names.add(name)
-        raw = canonical.write(document)
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        try:
-            manifest = package_environment.parse_base_manifest(raw, digest)
-            got = "ok"
-        except package_environment.EnvironmentRefusal as exc:
-            got = exc.code
-        if got != expected:
-            bad.append(f"{path}:{line_number}: got {got}, expected {expected}")
-        if name == "observed-local-v1" and got == "ok":
-            try:
-                control_runtime_digest(manifest=manifest)
-            except LaunchRefusal as exc:
-                if exc.code != "control_runtime_manifest_ownership_invalid":
-                    bad.append(f"{path}:{line_number}: pod refusal was {exc.code}")
-            else:
-                bad.append(f"{path}:{line_number}: pod accepted an observed-local base")
-    wanted = {
-        "cpu-ambient-cuda-libs-v1",
-        "generic-cuda-torch-fact-refused",
-        "generic-cuda-without-torch-v1",
-        "generic-image-torch-fact-refused",
-        "generic-image-without-torch-v1",
-        "minimal-cuda-v1",
-        "minimal-complete-v1",
-        "observed-local-v1",
-        "torch-cpu-foreign-root-refused",
-        "torch-cpu-local-tag-v1",
-        "torch-cpu-missing-fact-refused",
-        "torch-cuda-local-tag-v1",
-        "unknown-format-refused",
-        "unknown-provider-refused",
-    }
-    if names != wanted:
-        bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
-    root = ROOT / "vectors" / "tensorhub-wheel-contract"
-    mirror_specs = (
-        (
-            "base-worker-image-wheelhouse-cpu.json",
-            24_968,
-            "sha256:6dd580aec64cc13fc1ac51150d8d7d9dadeb1ac43dac09c4802117189912556f",
-            (27, 324, 26),
-            ("none", "none"),
-        ),
-        (
-            "base-worker-image-wheelhouse-cu130.json",
-            25_538,
-            "sha256:c9c000daf9e83f9a97ad4119d3309cf19c3c6c96aa5a50fdaf88f4a0523974d0",
-            (86, 363, 10),
-            ("cuda", "cu130"),
-        ),
-    )
-    manifests: dict[str, package_environment.BaseManifest] = {}
-    manifest_digests: dict[str, str] = {}
-    for filename, length, expected_digest, expected_census, accelerator in mirror_specs:
-        cross = root / filename
-        raw = cross.read_bytes()
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        if len(raw) != length or digest != expected_digest:
-            bad.append(
-                f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
-            )
-        try:
-            manifest = package_environment.parse_base_manifest(raw, digest)
-        except package_environment.EnvironmentRefusal as exc:
-            bad.append(f"{cross}: Runtime refused Tensorhub bytes: {exc.code}: {exc.detail}")
-            continue
-        manifests[filename] = manifest
-        manifest_digests[filename] = digest
-        census = (
-            len(manifest.base_distributions),
-            len(manifest.base_import_roots),
-            len(manifest.wheels),
-        )
-        if census != expected_census:
-            bad.append(f"{cross}: ownership census is {census}, want {expected_census}")
-        target = dict(manifest.platform_target)
-        expected_target = {
-            "os_arch": "linux/amd64",
-            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
-            "python_abi": "cp312",
-            "accelerator_backend": accelerator[0],
-            "accelerator_abi": accelerator[1],
-        }
-        if target != expected_target:
-            bad.append(f"{cross}: platform target is {target}, want {expected_target}")
-        versions = manifest.distribution_versions
-        expected_wheels = {
-            "click": (
-                "8.5.0",
-                "click-8.5.0-py3-none-any.whl",
-                "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
-                125_251,
-            ),
-            "cozy-runtime": (
-                "0.0.19",
-                "cozy_runtime-0.0.19-py3-none-any.whl",
-                "sha256:ad48274299c80ed2013cfa4259672517fc8b6718637a173196434c83320fafbb",
-                744_067,
-            ),
-            "tensorfs": (
-                "0.0.5",
-                "tensorfs-0.0.5-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-                "sha256:a131c4688188dacd1518fbe93c417e64d6af575f65b52edac48bcb60f88d43a5",
-                2_337_278,
-            ),
-        }
-        wheels = {wheel.distribution: wheel for wheel in manifest.wheels}
-        for distribution, expected_wheel in expected_wheels.items():
-            version = expected_wheel[0]
-            if versions.get(distribution) != version:
-                bad.append(
-                    f"{cross}: base owns {distribution}=={versions.get(distribution)}, "
-                    f"want {version}"
-                )
-            wheel = wheels.get(distribution)
-            fact = (
-                None
-                if wheel is None
-                else (wheel.version, wheel.filename, wheel.digest, wheel.length)
-            )
-            if fact != expected_wheel:
-                bad.append(f"{cross}: {distribution} wheel is {fact}, want {expected_wheel}")
-
-    cu130_manifest = manifests.get("base-worker-image-wheelhouse-cu130.json")
-    if cu130_manifest is not None:
-        base_family_digest = manifest_digests["base-worker-image-wheelhouse-cu130.json"]
-
-        def counted_wheel(index: int, owner: str) -> package_environment.Wheel:
-            label = "project" if owner == "project" else f"custom-{index:03d}"
-            distribution = f"cr027-{label}"
-            return package_environment.Wheel(
-                distribution=distribution,
-                version="1.0.0",
-                filename=f"{distribution}-1.0.0-py3-none-any.whl",
-                digest="sha256:" + hashlib.sha256(label.encode()).hexdigest(),
-                length=1,
-                tags=("py3-none-any",),
-                owner=owner,
-                import_roots=(distribution.replace("-", "_"),),
-            )
-
-        project = counted_wheel(0, "project")
-
-        def counted_input(custom_count: int) -> package_environment.Input:
-            wheels = (
-                project,
-                *(counted_wheel(index, "custom") for index in range(custom_count)),
-            )
-            return package_environment.Input(
-                environment_digest="sha256:" + "1" * 64,
-                base_family_digest=base_family_digest,
-                project_wheel_digest=project.digest,
-                wheels=wheels,
-                grants=(),
-            )
-
-        admitted = package_environment._verify_inventory(counted_input(128), cu130_manifest)
-        if len(admitted) != package_environment.MAX_PACKAGE_WHEELS:
-            bad.append(
-                f"cr-027 wheel-count boundary admitted {len(admitted)} rows, "
-                f"want {package_environment.MAX_PACKAGE_WHEELS}"
-            )
-        try:
-            package_environment._verify_inventory(counted_input(129), cu130_manifest)
-        except package_environment.EnvironmentRefusal as exc:
-            if exc.code != "package_environment_wheel_set_invalid" or exc.detail != "130":
-                bad.append(
-                    "cr-027 129-custom refusal was "
-                    f"{exc.code}:{exc.detail}, want package_environment_wheel_set_invalid:130"
-                )
-        else:
-            bad.append("cr-027 admitted 129 custom wheels plus the project wheel")
-    return bad
-
-
 #: §8's ONE ATTEMPT KERNEL, as a structural rule rather than a promise.
 #:
 #: `run`, `job` and `serve` are three ENTRANCES to one execution state machine. The v1
@@ -952,8 +744,6 @@ def fence_tensorhub_package_release() -> list[str]:
     if bad:
         return bad
 
-    manifest_path = root / "base-worker-image-wheelhouse-cu130.json"
-    manifest = manifest_path.read_bytes()
     environment = {"wheels": dependencies}
     environment_digest = (
         "sha256:"
@@ -980,7 +770,6 @@ def fence_tensorhub_package_release() -> list[str]:
             package=package,
             environment=environment,
             environment_digest=environment_digest,
-            wheelhouse_manifest_bytes=manifest,
             wheel_paths=wheel_paths,
         )
     except LaunchRefusal as exc:
@@ -997,7 +786,6 @@ def fence_tensorhub_package_release() -> list[str]:
             package={**package, "project_wheel": flat},
             environment=environment,
             environment_digest=environment_digest,
-            wheelhouse_manifest_bytes=manifest,
             wheel_paths=wheel_paths,
         )
     except LaunchRefusal as exc:
@@ -1810,7 +1598,6 @@ FENCES = {
     "descriptor-minimality": fence_descriptor_minimality,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
-    "base-ownership-vectors": fence_base_ownership_vectors,
     "tensorhub-package-release": fence_tensorhub_package_release,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
