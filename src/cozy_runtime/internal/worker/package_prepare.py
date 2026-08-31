@@ -538,6 +538,21 @@ def _selected_models(
                 selection = value["selection"]
                 digest = str(selection["manifest"])
                 length = int(selection.get("manifest_length", 0))
+                model = str(selection.get("model", ""))
+                release = str(selection.get("release", ""))
+                lane = str(selection.get("lane", ""))
+                parts = model.split("/")
+                if len(parts) != 2 or not all(parts) or not release or not lane:
+                    raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
+                resolved = store.resolve_release(parts[0], parts[1], release, lane)
+                if (
+                    str(resolved["manifest_digest"]) != digest
+                    or int(resolved["manifest_length"]) != length
+                ):
+                    raise PreparationRefusal(
+                        "package_prepare_model_selection_mismatch",
+                        f"{model}@{release}/{lane} does not resolve to {digest}",
+                    )
                 held = store.manifest(digest)
                 raw = bytes(held["manifest"])
                 if (
