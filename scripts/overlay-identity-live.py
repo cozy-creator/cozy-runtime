@@ -121,7 +121,7 @@ def base_manifest(path: Path) -> str:
             "compatibility_profile": {
                 "accelerator_build": "cpu",
                 "os_cpu": "linux-x86",
-                "python_abi": "cp314",
+                "python_abi": "cp312",
                 "torch_release": "2.13.0",
             },
             "format": "WheelhouseManifest/1",
@@ -132,7 +132,7 @@ def base_manifest(path: Path) -> str:
                 "accelerator_backend": "none",
                 "libc": "glibc2.39",
                 "os_arch": "linux/amd64",
-                "python_abi": "cp314",
+                "python_abi": "cp312",
             },
             "wheels": [
                 {
@@ -292,7 +292,7 @@ def main() -> int:
                 "proof_new_manylinux",
                 "new-manylinux",
                 owner="custom",
-                tag="cp314-cp314-manylinux_2_40_x86_64",
+                tag="cp312-cp312-manylinux_2_40_x86_64",
                 root_is_pure=False,
             ),
             "overlay_python_incompatible": build_wheel(
@@ -370,8 +370,8 @@ def main() -> int:
 
         tagged_project = replace(
             project[0],
-            filename="proof_project-1.0.0-cp314-cp314-manylinux_2_17_x86_64.whl",
-            tags=("cp314-cp314-manylinux_2_17_x86_64",),
+            filename="proof_project-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl",
+            tags=("cp312-cp312-manylinux_2_17_x86_64",),
         )
         try:
             overlay._verify_inventory(
@@ -397,7 +397,7 @@ def main() -> int:
             "proof_native_custom",
             "native-custom",
             owner="custom",
-            tag="cp314-cp314-manylinux_2_17_x86_64",
+            tag="cp312-cp312-manylinux_2_17_x86_64",
             root_is_pure=False,
             extra_entries={
                 "proof_native_custom/_native.so": native_bytes,
@@ -482,7 +482,7 @@ def main() -> int:
             "libc_name": "glibc",
             "libc_version": "2.39",
             "machine": "x86_64",
-            "python_abi": "cp314",
+            "python_abi": "cp312",
             "system": "linux",
             "torch_cuda": "",
             "torch_version": "2.13.0+cpu",
@@ -524,7 +524,7 @@ def main() -> int:
                     {
                         "accelerator_build": "cu130",
                         "os_cpu": "linux-x86",
-                        "python_abi": "cp314",
+                        "python_abi": "cp312",
                         "torch_release": "2.13.0",
                     }.items()
                 )
@@ -536,7 +536,7 @@ def main() -> int:
                         "accelerator_backend": "cuda",
                         "libc": "glibc2.39",
                         "os_arch": "linux/amd64",
-                        "python_abi": "cp314",
+                        "python_abi": "cp312",
                     }.items()
                 )
             ),
@@ -629,7 +629,7 @@ def main() -> int:
             raise AssertionError("no-kernel-image operator failure was admitted")
 
         native_evidence = {
-            "base_worker_profile": "torch2.13.0-cpu-cp314-linux-x86",
+            "base_worker_profile": "torch2.13.0-cpu-cp312-linux-x86",
             "environment_digest": digest(b"native-custom"),
             "host_capability": {"gpu": None, "seat": measured_seat},
             "host_qualification": native_host,
@@ -711,7 +711,7 @@ def main() -> int:
             "proof_hostile_rpath",
             "hostile-rpath",
             owner="custom",
-            tag="cp314-cp314-manylinux_2_17_x86_64",
+            tag="cp312-cp312-manylinux_2_17_x86_64",
             root_is_pure=False,
             extra_entries={"proof_hostile_rpath/_native.so": hostile_bytes},
         )
@@ -737,7 +737,7 @@ def main() -> int:
                         package,
                         f"library-shadow-{index}",
                         owner="custom",
-                        tag="cp314-cp314-manylinux_2_17_x86_64",
+                        tag="cp312-cp312-manylinux_2_17_x86_64",
                         root_is_pure=False,
                         extra_entries={f"{package}/{library}": native_bytes},
                     ),
@@ -962,7 +962,7 @@ def main() -> int:
                     "native_operator_numerical_mismatch_refused": True,
                     "native_operator_no_kernel_image_refused": True,
                     "synthetic_exact_seat_admitted": True,
-                    "synthetic_cp313_for_cp314_refused": True,
+                    "synthetic_cp313_for_cp312_refused": True,
                     "seat_os_cpu_libc_inventory_torch_reds": True,
                     "seat_cuda_driver_minimum_reds": True,
                     "legacy_cu126_refused": True,

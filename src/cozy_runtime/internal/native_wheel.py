@@ -435,7 +435,7 @@ def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, obj
         executable = _ELF(Path(sys.executable), require_shared=False)
         executable_defined, _executable_required = executable.symbols()
         loaded_symbols.update(executable_defined)
-    except OSError, NativeWheelRefusal:
+    except (OSError, NativeWheelRefusal):
         pass
     visited: set[Path] = set()
     missing_libraries: set[str] = set()
@@ -461,7 +461,7 @@ def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, obj
             elf = _ELF(path, require_shared=False)
             _soname, needed, _runpaths = elf.dynamic()
             defined, _required = elf.symbols()
-        except OSError, NativeWheelRefusal:
+        except (OSError, NativeWheelRefusal):
             missing_libraries.add(library)
             continue
         loaded_symbols.update(defined)
@@ -804,7 +804,7 @@ def _host_library_rows() -> tuple[tuple[str, str], ...]:
                 check=False,
                 timeout=10,
             )
-        except OSError, subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
             result = None
         if result is not None and result.returncode == 0 and len(result.stdout) <= MAX_TOOL_OUTPUT:
             for line in result.stdout.decode("utf-8", "replace").splitlines():

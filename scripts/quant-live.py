@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -95,7 +95,7 @@ def gpu_used_mib() -> int:
             timeout=20,
             check=True,
         ).stdout
-    except OSError, subprocess.SubprocessError, ValueError, IndexError:
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return -1
     mine = 0
     for line in apps.strip().splitlines():
@@ -338,10 +338,10 @@ def snapshot() -> str:
     import tensorfs
 
     store = tensorfs.Store.open(str(STORE))
-    installed = tensorfs.ingest_installed(store)
-    if not installed:
+    installed = cast(Any, store).resolve_local("cr006")  # native extension stub lags
+    if installed is None:
         raise SystemExit("nothing installed in the cr-006 store — run `ingest` first")
-    return str(installed[-1])
+    return str(installed)
 
 
 def unet_config() -> dict[str, Any]:

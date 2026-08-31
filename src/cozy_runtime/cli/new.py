@@ -28,7 +28,7 @@ def _pyproject(name: str, pkg: str) -> str:
     return f"""[project]
 name = "{name}"
 version = "0.1.0"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
 dependencies = ["cozy-runtime>={__version__},<0.1"]
 
 [project.entry-points."cozy.application"]
@@ -54,7 +54,7 @@ build-backend = "hatchling.build"
 packages = ["src/{pkg}"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 files = ["src"]
 strict = true
 warn_unreachable = true

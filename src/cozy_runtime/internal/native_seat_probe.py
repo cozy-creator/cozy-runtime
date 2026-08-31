@@ -35,7 +35,7 @@ def facts() -> dict[str, object]:
         torch_version = str(torch.__version__)
         torch_cuda = str(torch.version.cuda or "")
         cuda_available = bool(torch.cuda.is_available())
-    except ImportError, AttributeError:
+    except (ImportError, AttributeError):
         pass
     libc_name, libc_version = platform.libc_ver()
     return {

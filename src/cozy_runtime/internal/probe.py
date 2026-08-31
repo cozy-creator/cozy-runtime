@@ -634,7 +634,7 @@ def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
         if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
             return None
         data = json.loads(raw)
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) and set(data) == {"cases"} else None
 

@@ -2,7 +2,7 @@
 name = "proof-cli-package"
 version = "1.0.0"
 description = "Repository-only fixture for the cozy-runtime CLI proof"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [build-system]

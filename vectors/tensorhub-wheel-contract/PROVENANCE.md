@@ -1,10 +1,11 @@
 # Tensorhub PackageRelease contract fixture
 
 `package-release-v1.json` is copied byte-for-byte from Tensorhub's
-`vectors/package-release-v1.json`. Its stored file includes one trailing LF and hashes to
-`9fc018fcda64fee307ee7db28b632b7abe15dd77c290451525c632ab4a0c16fe`; the canonical document is
-the preceding 962 bytes and has identity
-`sha256:a7169ae741990c565ad3f6cd27ff2ce28c294aba53815156d2ad70422c39dbbd`.
+`vectors/package-release-v1.json` at Tensorhub commit
+`47bb83f2b0c712d88f0ae7184d6c7b6c26c18e35`. Its stored file includes one trailing LF and hashes to
+`5f868fe549a22151e3a925d5638a13a315ae3508b16cbbad07ca0382d552313e`; the canonical document is
+the preceding 968 bytes and has identity
+`sha256:f894cff72dce53a2f85943bc10d1a1226f3fcacc983faddad6afbd6d61c425cf`.
 
 Runtime's `tensorhub-package-release` architecture fence consumes those exact canonical bytes,
 requires nested `{ref, distribution, filename, import_roots, tags, version}` project and dependency
@@ -13,10 +14,10 @@ WheelFact shape refuses. The two small wheel files are retained from the earlier
 solely to exercise the complete Runtime join.
 
 `base-worker-image-wheelhouse-cpu.json` and `base-worker-image-wheelhouse-cu130.json` are copied
-byte-for-byte from Tensorhub commit `ee0ff10d75da84e5341c9f2cd90f25e6ee1ec4e6`. They are the
-released CPU and CUDA 13.0 base worker image manifests containing the same Runtime `0.0.10` wheel
-(`sha256:94460296a7c6ad745d25693f8c67faa6543579ffb0779ee1f9b8056ef9a30ba8`) and TensorFS `0.0.2`
-wheel (`sha256:5d5420f9571778ae884daf6fe31bc649318014cd644d94b17a7c465929be5d93`).
-Runtime CI checks these local producer bytes only: CPU is 24,977 bytes with SHA-256
-`2ea86f5131b1f95efd1f2bd3870efd52b94cdd25c623e438614e6ff3afb31cb8`; CUDA is 32,558 bytes
-with SHA-256 `62be81f24f970df1db8dce059a06c208b6d35c1b277450c5e98ea495474b15f0`.
+byte-for-byte from the same Tensorhub commit's CPython 3.12 producer. They are the CPU and official PyTorch
+CUDA 13.0 base worker image manifests containing the same Runtime `0.0.11` wheel
+(`sha256:032f372a77290160ca118adfae0a6928540d0e837975366032fa2d4e37161ce1`) and TensorFS
+`0.0.3.dev0` wheel (`sha256:894e14456673adfe569a8f5c368ba96df878f2d75799c7058fd45d509068efa3`).
+Runtime CI checks these local producer bytes only: CPU is 24,668 bytes with SHA-256
+`f1027c384b2ab34ecada82bf494bfaab92d019907005128aa9c78b2d4d3c392a`; CUDA is 25,636 bytes
+with SHA-256 `5437560d941af71770c9625f8b15a9b2d4618432215432652e6120e164995f6c`.

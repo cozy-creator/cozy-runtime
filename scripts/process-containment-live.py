@@ -24,7 +24,7 @@ def wait_file(path: Path, seconds: float) -> int:
     while time.monotonic() < deadline:
         try:
             return int(path.read_text())
-        except FileNotFoundError, ValueError:
+        except (FileNotFoundError, ValueError):
             time.sleep(0.01)
     raise TimeoutError(path)
 
