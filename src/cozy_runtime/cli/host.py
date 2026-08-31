@@ -81,6 +81,7 @@ _SERVE_FLAGS: dict[str, str] = {
     # which is exactly what puts it in this closed set.
     "--grant-root": "--grant-root",
     "--environment-root": "--environment-root",
+    "--environment-python": "--environment-python",
     "--base-manifest": "--base-manifest",
     "--artifact-store": "--artifact-store",
     "--artifact-cache": "--artifact-cache",
@@ -169,7 +170,9 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     artifact_flags = ("--artifact-store",)
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
     forbidden_development = [
-        flag for flag in ("--environment-root", "--artifact-cache") if flag in values
+        flag
+        for flag in ("--environment-root", "--environment-python", "--artifact-cache")
+        if flag in values
     ]
     if all(development.values()) and forbidden_development:
         raise CliError(
@@ -244,6 +247,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "--artifact-store",
             "--artifact-cache",
             "--environment-root",
+            "--environment-python",
         }:
             continue
         if flag in values:
