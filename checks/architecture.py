@@ -1132,7 +1132,7 @@ def fence_descriptor_minimality() -> list[str]:
     bad: list[str] = []
     if first_bytes != second_bytes:
         bad.append("two fresh example derivations produced different canonical bytes")
-    expected = {"format", "application", "entrypoints", "jobs"}
+    expected = {"format", "application", "entrypoints", "jobs", "model_productions"}
     if set(document) != expected:
         bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
     if document.get("format") != "cozy.package.descriptor/1":
@@ -1177,7 +1177,12 @@ def fence_descriptor_minimality() -> list[str]:
     def visit(value: object, where: str) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in forbidden:
+                production_resource = (
+                    ".model_productions[" in where
+                    and ".resources" in where
+                    and key in {"placement", "requires"}
+                )
+                if key in forbidden and not production_resource:
                     bad.append(f"{where}.{key} is an unused descriptor fact")
                 if key == "wire" and item == "required":
                     bad.append(f"{where}.wire repeats the required-field default")

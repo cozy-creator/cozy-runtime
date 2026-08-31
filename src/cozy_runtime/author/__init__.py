@@ -14,6 +14,15 @@ fakes live in `cozy_runtime.author.fakes`.
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
+from cozy_runtime.author._artifact import (
+    ArtifactConfig,
+    ArtifactOutput,
+    ArtifactPart,
+    ArtifactReceipt,
+    ArtifactSink,
+    ArtifactTarget,
+    ArtifactTensor,
+)
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -142,6 +151,13 @@ __all__ = [
     "Adjustments",
     "App",
     "Artifact",
+    "ArtifactConfig",
+    "ArtifactOutput",
+    "ArtifactPart",
+    "ArtifactReceipt",
+    "ArtifactSink",
+    "ArtifactTarget",
+    "ArtifactTensor",
     "Asset",
     "AssetBound",
     "AudioAsset",

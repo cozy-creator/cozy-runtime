@@ -28,6 +28,7 @@ _CALLABLE = re.compile(
     r"[a-z][a-z0-9_-]{0,63}$"
 )
 _MEMBER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+/-]{0,127}$")
 
 
 def _name(value: str, where: str) -> None:
@@ -73,7 +74,21 @@ class ProductionContract:
     def __post_init__(self) -> None:
         _unique(self.tasks, "production contract tasks", MAX_CONTRACT_VALUES)
         _name(self.structure, "production contract structure")
-        _unique(self.encodings, "production contract encodings", MAX_CONTRACT_VALUES)
+        if not self.encodings or len(self.encodings) > MAX_CONTRACT_VALUES:
+            raise ConformanceError(
+                f"production contract encodings has {len(self.encodings)} entries; "
+                f"the bound is 1..={MAX_CONTRACT_VALUES}",
+                code="production_bound",
+                fields=["encodings"],
+            )
+        if len(set(self.encodings)) != len(self.encodings) or any(
+            _CONTRACT_VALUE.fullmatch(value) is None for value in self.encodings
+        ):
+            raise ConformanceError(
+                "production contract encodings must be unique versioned contract values",
+                code="production_contract",
+                fields=["encodings"],
+            )
         if len(self.stamps) > MAX_CONTRACT_VALUES:
             raise ConformanceError(
                 f"production contract has {len(self.stamps)} stamps; "

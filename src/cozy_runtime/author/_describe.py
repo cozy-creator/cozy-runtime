@@ -15,6 +15,7 @@ import inspect
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from cozy_runtime.author._artifact import MAX_ARTIFACT_OUTPUTS
 from cozy_runtime.author._assets import asset_kinds
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
@@ -136,6 +137,40 @@ def _separation(surface: Surface) -> None:
             "Outputs — grants mint off the DECLARATION, so a declaration the body cannot "
             "act on would grant a destination nothing can write (§2)",
             code="publication_declaration",
+        )
+    artifact_names = [output.name for output in surface.artifact_outputs]
+    if len(artifact_names) > MAX_ARTIFACT_OUTPUTS:
+        raise ConformanceError(
+            f"{surface.name}: declares {len(artifact_names)} artifact outputs; "
+            f"the bound is {MAX_ARTIFACT_OUTPUTS}",
+            code="artifact_output_bound",
+        )
+    if len(set(artifact_names)) != len(artifact_names):
+        raise ConformanceError(
+            f"{surface.name}: artifact output names are not unique",
+            code="artifact_output_duplicate",
+        )
+    if surface.artifact_outputs and "artifacts" not in surface.capabilities:
+        raise ConformanceError(
+            f"{surface.name}: declares artifact outputs but its signature has no ArtifactSink",
+            code="artifact_sink_declaration",
+        )
+    if "artifacts" in surface.capabilities and not surface.artifact_outputs:
+        raise ConformanceError(
+            f"{surface.name}: requests ArtifactSink but declares no artifact outputs",
+            code="artifact_sink_declaration",
+        )
+    if surface.artifact_outputs and ("save" in surface.capabilities or surface.publishes):
+        raise ConformanceError(
+            f"{surface.name}: a model-artifact job cannot mix ArtifactSink with the retired "
+            "Outputs/publishes path",
+            code="mixed_artifact_outputs",
+        )
+    if surface.artifact_outputs and not surface.model_bindings:
+        raise ConformanceError(
+            f"{surface.name}: ArtifactSink derives from exact typed model inputs, but this job "
+            "declares none",
+            code="artifact_source_absent",
         )
 
 

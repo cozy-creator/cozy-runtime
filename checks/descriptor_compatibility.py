@@ -76,6 +76,7 @@ def _base() -> dict[str, Json]:
                 "resources": {"gpu_count": 1},
             }
         ],
+        "model_productions": [],
     }
 
 
@@ -170,6 +171,55 @@ def main() -> int:
         )
 
     check("new job", "minor", add_job, "added job cleanup")
+
+    def add_production(doc: dict[str, Json]) -> None:
+        rows = doc["model_productions"]
+        assert isinstance(rows, list)
+        rows.append(
+            {
+                "name": "copy-model",
+                "source": "source",
+                "nodes": [
+                    {
+                        "name": "copy",
+                        "callable": "example/model/copy",
+                        "models": {"model": "source"},
+                        "outputs": ["model"],
+                        "assets": {},
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": "model",
+                        "source": "copy.model",
+                        "lane_key": "bf16",
+                        "required_contract": {
+                            "tasks": ["generate"],
+                            "structure": "full",
+                            "encodings": ["plain/1"],
+                            "stamps": {},
+                        },
+                    }
+                ],
+            }
+        )
+
+    check("new model production", "minor", add_production, "added model production copy-model")
+
+    before_with_production = _base()
+    add_production(before_with_production)
+    changed_production = copy.deepcopy(before_with_production)
+    rows = changed_production["model_productions"]
+    assert isinstance(rows, list) and isinstance(rows[0], dict)
+    outputs = rows[0]["outputs"]
+    assert isinstance(outputs, list) and isinstance(outputs[0], dict)
+    outputs[0]["lane_key"] = "fp8"
+    result = classify_bytes(
+        canonical.write(before_with_production), canonical.write(changed_production)
+    )
+    assert result.classification == "major"
+    assert "model production copy-model changed" in result.reasons
+    cases += 1
     check(
         "optional request field",
         "minor",

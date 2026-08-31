@@ -32,6 +32,7 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifact import ArtifactCommit, ArtifactReceipt, ArtifactSink
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import MediaDecoder
@@ -115,6 +116,8 @@ class Invocation:
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
+    artifacts: Callable[[ArtifactCommit], ArtifactReceipt] | None = None
+    """The Runtime/host artifact transaction. Author code receives only ArtifactSink."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -602,7 +605,7 @@ def _inject(
         elif param.role == "model":
             kwargs[param.name] = _model(param, inv)
         else:
-            kwargs[param.name] = _service(param, attempt, ctx, inv)
+            kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs
 
 
@@ -618,7 +621,9 @@ def _model(param: Param, inv: Invocation) -> object:
     return model
 
 
-def _service(param: Param, attempt: Attempt, ctx: Context, inv: Invocation) -> object:
+def _service(
+    param: Param, attempt: Attempt, ctx: Context, inv: Invocation, surface: Surface
+) -> object:
     match param.capability:
         case "save":
             return Outputs(attempt)
@@ -638,6 +643,13 @@ def _service(param: Param, attempt: Attempt, ctx: Context, inv: Invocation) -> o
             return Checkpoints(attempt, inv.checkpoints)
         case "budget":
             return Budget(attempt, inv.budget)
+        case "artifacts":
+            return ArtifactSink(
+                attempt,
+                inv.models,
+                {output.name: output.max_new_bytes for output in surface.artifact_outputs},
+                inv.artifacts,
+            )
         case "media_decode":
             return MediaDecoder(
                 attempt,

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
+from cozy_runtime.author._artifact import ArtifactSink
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -835,13 +836,13 @@ class CheckpointConflict(CapabilityError):
 
 
 class CheckpointSinkUnbuilt(CapabilityError):
-    """`Checkpoints.save()` is HARD-DISABLED: no ArtifactSink exists to store the bytes.
+    """`Checkpoints.save()` is HARD-DISABLED: checkpoint use of ArtifactSink is absent.
 
     The dependency is named because it is the whole answer — #552 adopted ONE ARTIFACT
-    TRANSACTION, in which a runtime-owned ArtifactSink writes TensorFS objects and returns a
-    durable receipt, and checkpoints use that same sink. Until it exists there is no
-    representation of a durable checkpoint, so there is no representation of a receipt for
-    one either. `declare()` is what remains true in the meantime.
+    TRANSACTION, in which Runtime's ArtifactSink writes TensorFS objects and returns a
+    durable receipt. Model outputs now have that transaction; checkpoints do not yet have
+    the separate immutable-operation identity and lifecycle needed to reuse it. `declare()`
+    is what remains true in the meantime.
     """
 
     default_code = "checkpoint_sink_unbuilt"
@@ -947,9 +948,9 @@ class Checkpoints(_Bound):
     are properties of the declaration, and repeating one adds nothing while the same keys
     with different bytes stay a conflict, never a replacement. The DURABILITY is the part
     that was not real, and `save()` now refuses `checkpoint_sink_unbuilt` naming the
-    ArtifactSink #552 adopted. When that sink exists, `save()` gets a body again and the
-    acceptance test is the one #553a names: kill executor and worker, recover BYTES by
-    receipt, never a process record.
+    checkpoint integration with ArtifactSink #552. When that integration exists, `save()`
+    gets a body again and the acceptance test is the one #553a names: kill executor and
+    worker, recover BYTES by receipt, never a process record.
     """
 
     __slots__ = ("_sink",)
@@ -1008,11 +1009,11 @@ class Checkpoints(_Bound):
         self._attempt.check_open("Checkpoints.save")
         raise CheckpointSinkUnbuilt(
             f"{logical_key or '<unkeyed>'}: Checkpoints.save() is disabled because the "
-            "ArtifactSink it needs is UNBUILT — nothing in this runtime stores checkpoint "
-            "bytes, and the durable receipt this used to return was a claim about a metadata "
-            "row. Use Checkpoints.declare() for the fact that IS true (an attempt declared "
-            "this checkpoint), and Scratch.checkpoint_dir(key=) for bytes a retried attempt "
-            "of the same run can read back."
+            "checkpoint-to-ArtifactSink lifecycle is unbuilt — model outputs have a durable "
+            "transaction, but checkpoint identity/adoption is still absent. Use "
+            "Checkpoints.declare() for the fact that IS true (an attempt declared this "
+            "checkpoint), and Scratch.checkpoint_dir(key=) for bytes a retried attempt of "
+            "the same run can read back."
         )
 
 
@@ -1083,11 +1084,12 @@ SERVICES: Mapping[str, type] = {
     "checkpoints": Checkpoints,
     "budget": Budget,
     "media_decode": MediaDecoder,
+    "artifacts": ArtifactSink,
 }
 
 #: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs
 #: to completion and owns durable working state; a request handler owns neither.
-JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget"})
+JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget", "artifacts"})
 
 #: The mirror: SERVING-ONLY surface. `adjust` writes the caller-visible adjustments envelope,
 #: which is a fact about serving one request; a run-to-completion job has no caller to

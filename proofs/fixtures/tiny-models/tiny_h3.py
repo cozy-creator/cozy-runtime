@@ -727,7 +727,7 @@ app.production(
             callable="tensorhub/h3/distill",
             models={"base": "source"},
             outputs=("bf16-full",),
-            assets={"plan": "plans/full.json"},
+            assets={"plan": "full-plan"},
             resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),
         ),
     ),
@@ -739,7 +739,7 @@ app.production(
             required=ProductionContract(
                 tasks=("fl2va", "ref2va"),
                 structure="h3-full",
-                encodings=("plain",),
+                encodings=("plain/1",),
                 stamps={"family": "h3"},
             ),
         ),

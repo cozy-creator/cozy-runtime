@@ -83,6 +83,15 @@ def _callable(surface: Surface) -> dict[str, Json]:
         doc["models"] = models
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
+        if surface.artifact_outputs:
+            doc["artifact_outputs"] = [
+                {
+                    "output_id": output.name,
+                    "mime_type": "application/vnd.cozy.model-manifest",
+                    "max_bytes": output.max_new_bytes,
+                }
+                for output in sorted(surface.artifact_outputs, key=lambda row: row.name)
+            ]
         if surface.resources is not None and surface.resources.gpu_count is not None:
             doc["resources"] = {"gpu_count": surface.resources.gpu_count}
     return doc
@@ -374,7 +383,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             optional = {"models"}
             if kind == "job":
                 required.add("publishes")
-                optional.add("resources")
+                optional.update(("resources", "artifact_outputs"))
             item = _closed(row, required, optional, source, path)
             name = item["name"]
             if not isinstance(name, str) or not name or name in names:
@@ -428,6 +437,38 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     count = resources["gpu_count"]
                     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                         _invalid(source, f"{path}.resources.gpu_count", "must be positive")
+                if "artifact_outputs" in item:
+                    artifact_outputs = item["artifact_outputs"]
+                    if (
+                        not isinstance(artifact_outputs, list)
+                        or not 1 <= len(artifact_outputs) <= 16
+                    ):
+                        _invalid(
+                            source,
+                            f"{path}.artifact_outputs",
+                            "must contain 1 through 16 outputs",
+                        )
+                    artifact_names: set[str] = set()
+                    for output_index, output_raw in enumerate(artifact_outputs):
+                        output_path = f"{path}.artifact_outputs[{output_index}]"
+                        output = _closed(
+                            output_raw,
+                            {"output_id", "mime_type", "max_bytes"},
+                            set(),
+                            source,
+                            output_path,
+                        )
+                        output_id = _portable_name(
+                            output["output_id"], source, f"{output_path}.output_id"
+                        )
+                        if output_id in artifact_names:
+                            _invalid(source, f"{output_path}.output_id", "must be unique")
+                        artifact_names.add(output_id)
+                        if output["mime_type"] != "application/vnd.cozy.model-manifest":
+                            _invalid(source, f"{output_path}.mime_type", "is not the model MIME")
+                        maximum = output["max_bytes"]
+                        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+                            _invalid(source, f"{output_path}.max_bytes", "must be non-negative")
 
 
 def _productions(value: Json, source: str) -> None:
@@ -547,6 +588,7 @@ def _productions(value: Json, source: str) -> None:
 
 
 _PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+/-]{0,127}$")
 _CALLABLE = re.compile(
     r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
     r"[a-z][a-z0-9_-]{0,63}$"
@@ -563,6 +605,17 @@ def _portable_names(value: Json, source: str, path: str, cap: int) -> list[str]:
     if not isinstance(value, list) or not 1 <= len(value) <= cap:
         _invalid(source, path, f"must contain 1 through {cap} names")
     out = [_portable_name(item, source, path) for item in value]
+    if len(set(out)) != len(out):
+        _invalid(source, path, "must be unique")
+    return out
+
+
+def _contract_values(value: Json, source: str, path: str, cap: int) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= cap:
+        _invalid(source, path, f"must contain 1 through {cap} contract values")
+    if not all(isinstance(item, str) and _CONTRACT_VALUE.fullmatch(item) for item in value):
+        _invalid(source, path, "contains a malformed contract value")
+    out = cast(list[str], value)
     if len(set(out)) != len(out):
         _invalid(source, path, "must be unique")
     return out
@@ -597,12 +650,10 @@ def _production_resources(value: Json, source: str, path: str) -> None:
 
 
 def _production_contract_value(value: Json, source: str, path: str) -> None:
-    contract = _closed(
-        value, {"tasks", "structure", "encodings", "stamps"}, set(), source, path
-    )
+    contract = _closed(value, {"tasks", "structure", "encodings", "stamps"}, set(), source, path)
     _portable_names(contract["tasks"], source, f"{path}.tasks", 32)
     _portable_name(contract["structure"], source, f"{path}.structure")
-    _portable_names(contract["encodings"], source, f"{path}.encodings", 32)
+    _contract_values(contract["encodings"], source, f"{path}.encodings", 32)
     _string_map_value(contract["stamps"], source, f"{path}.stamps", 32)
 
 
