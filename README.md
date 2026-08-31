@@ -191,6 +191,10 @@ the launch and invocation facts with current readers. It carries no Runtime-glob
 inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
 no release digest, build timestamp, machine path or mutable binding reached it.
+The same `/1` document may carry bounded `model_productions`: static graphs over ordinary job
+callables with fixed required outputs, recipe-owned lane keys and independently verifiable
+contracts. They execute nothing and carry no source selection, destination, credential or exact
+resolved job release.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.
@@ -525,7 +529,16 @@ cr-016 over the real attempt kernel.
 `@app.job` over the one invocation kernel, the same worker/executor split, the same
 records, the same output transaction. What differs is stated out loud and is short — a
 `JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
-(serving never accepts-then-cold-loads; a job has nothing to be warm for), the three job
+(serving never accepts-then-cold-loads; a job has nothing to be warm for), the job
 services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose path rides
 the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
+
+Model-producing jobs declare `ArtifactOutput` slots and request `ArtifactSink`. The sink accepts
+only exact typed `Model` inputs, locks the declaration/output bound, and streams produced values
+directly into TensorFS's real copy/create/derive transaction without a model-sized spool copy.
+The job receives only the exact receipt—never a store, path, publisher or destination. The
+post-commit Worker Protocol receipt format is already supported. The pod product path remains
+deliberately unclaimed until pod-supervisor supplies the missing durable transaction handshake and
+JobInvocationSpec carries the exact model-input/output authorization. The real local boundary is
+exercised by `proofs/internal/artifact_sink_acceptance.py` against a TensorFS wheel and `tfs` binary.

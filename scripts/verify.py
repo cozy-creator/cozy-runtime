@@ -632,7 +632,8 @@ def descriptor_sections() -> None:
         size = len(raw)
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
-            f"{counts['model_bindings']} slots · {size:>6,} B canonical · {elapsed_ms:6.1f} ms · "
+            f"{counts['model_bindings']} slots/{counts['model_productions']} productions · "
+            f"{size:>6,} B canonical · {elapsed_ms:6.1f} ms · "
             f"{descriptor.package_descriptor_digest(body)[:26]}…"
         )
 
@@ -691,6 +692,9 @@ def descriptor_sections() -> None:
             "component_use"
         ].update(denoise=["fl2va_transformer", "smuggled"]),
         "published surface removed": lambda d: d["entrypoints"].pop(),
+        "production contract changed": lambda d: d["model_productions"][0]["outputs"][0][
+            "required_contract"
+        ].update(structure="h3-other"),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))

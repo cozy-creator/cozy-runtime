@@ -525,8 +525,26 @@ def fence_no_identifiers() -> list[str]:
     """
     bad: list[str] = []
     for path in package_modules():
-        for node in ast.walk(ast.parse(path.read_text())):
+        tree = ast.parse(path.read_text())
+        contract_values = {
+            id(value)
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and (
+                (isinstance(call.func, ast.Name) and call.func.id == "ProductionContract")
+                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ProductionContract")
+            )
+            for keyword in call.keywords
+            if keyword.arg in {"structure", "encodings"}
+            for value in ast.walk(keyword.value)
+            if isinstance(value, ast.Constant)
+        }
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in contract_values:
+                # A production contract is a requirement Tensorhub independently derives
+                # from output bytes, not a model/release/checkpoint selection.
                 continue
             text = node.value.strip()
             if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):
@@ -1132,7 +1150,7 @@ def fence_descriptor_minimality() -> list[str]:
     bad: list[str] = []
     if first_bytes != second_bytes:
         bad.append("two fresh example derivations produced different canonical bytes")
-    expected = {"format", "application", "entrypoints", "jobs"}
+    expected = {"format", "application", "entrypoints", "jobs", "model_productions"}
     if set(document) != expected:
         bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
     if document.get("format") != "cozy.package.descriptor/1":
@@ -1177,7 +1195,12 @@ def fence_descriptor_minimality() -> list[str]:
     def visit(value: object, where: str) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in forbidden:
+                production_resource = (
+                    ".model_productions[" in where
+                    and ".resources" in where
+                    and key in {"placement", "requires"}
+                )
+                if key in forbidden and not production_resource:
                     bad.append(f"{where}.{key} is an unused descriptor fact")
                 if key == "wire" and item == "required":
                     bad.append(f"{where}.wire repeats the required-field default")

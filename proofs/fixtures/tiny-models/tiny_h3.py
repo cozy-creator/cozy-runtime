@@ -48,6 +48,9 @@ from cozy_runtime.author import (
     ModelDefault,
     Outputs,
     Preflight,
+    ProductionContract,
+    ProductionNode,
+    ProductionOutput,
     RequestView,
     Resources,
     Scheduler,
@@ -711,3 +714,34 @@ def distill(
             media_type="text/plain",
         ),
     )
+
+
+# Descriptor-only orchestration over an ordinary installed job. The fixture deliberately
+# keeps this separate from ``distill``: registering the graph executes nothing.
+app.production(
+    "four-lane",
+    source="source",
+    nodes=(
+        ProductionNode(
+            name="distill-full",
+            callable="tensorhub/h3/distill",
+            models={"base": "source"},
+            outputs=("bf16-full",),
+            assets={"plan": "full-plan"},
+            resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),
+        ),
+    ),
+    outputs=(
+        ProductionOutput(
+            name="bf16-full",
+            source="distill-full.bf16-full",
+            lane_key="bf16-full",
+            required=ProductionContract(
+                tasks=("fl2va", "ref2va"),
+                structure="h3/bf16-full",
+                encodings=("plain/1",),
+                stamps={"family": "h3"},
+            ),
+        ),
+    ),
+)

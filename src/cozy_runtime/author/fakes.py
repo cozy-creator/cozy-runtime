@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifact import ArtifactCommit, ArtifactReceipt
 from cozy_runtime.author._assets import Asset, GrantedInput
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, DecodeLimits, MediaDecoder
@@ -155,6 +156,7 @@ def invoke_with_fakes(
     wire: Mapping[str, object],
     *,
     request_id: str = "fake-attempt",
+    spool: Path | None = None,
     models: Mapping[str, Model[Any]] | None = None,
     settings: object = None,
     secrets: object = None,
@@ -165,11 +167,13 @@ def invoke_with_fakes(
     seconds: float = 300.0,
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
+    artifacts: Callable[[ArtifactCommit], ArtifactReceipt] | None = None,
     assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> InvocationResult:
     """Run a handler through the REAL kernel with no GPU, no hub and no RecordOwner."""
-    spool = _spool(request_id)
+    spool = spool or _spool(request_id)
+    spool.mkdir(parents=True, exist_ok=True)
     return invoke(
         prepare(registration, wire, recipes=recipes, clamps=clamps, settings=settings),
         Invocation(
@@ -185,6 +189,7 @@ def invoke_with_fakes(
             secrets=secrets,
             adapters=adapters,
             egress_broker=egress_broker,
+            artifacts=artifacts,
             assets=assets or {},
             max_output_bytes=max_output_bytes,
         ),
