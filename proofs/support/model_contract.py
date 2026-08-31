@@ -66,6 +66,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     red = sub.add_parser("red-request")
     red.add_argument("root", type=Path)
 
+    variant_red = sub.add_parser("variant-red-request")
+    variant_red.add_argument("root", type=Path)
+
     verify = sub.add_parser("verify")
     verify.add_argument("root", type=Path)
 
@@ -82,6 +85,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProofFailure("cold model request is not an object")
         request["bindings"] = request["bindings"][:1]
         _json(args.root / "model-red.json", request)
+    elif args.command == "variant-red-request":
+        request = _read_json(args.root / "model-cold.json")
+        if not isinstance(request, dict):
+            raise ProofFailure("cold model request is not an object")
+        bindings = request.get("bindings")
+        if not isinstance(bindings, list) or not isinstance(bindings[0], dict):
+            raise ProofFailure("cold model bindings are malformed")
+        bindings[0]["hardware_variants"] = ["gpu"]
+        _json(args.root / "model-variant-red.json", request)
     else:
         _verify(args.root)
     return 0
@@ -230,7 +242,7 @@ def _write_model_request(root: Path, name: str) -> None:
                         "length": state["config_length"],
                         "path": state["config"],
                     },
-                    "hardware_variants": ["sm90"],
+                    "hardware_variants": ["cpu", "sm90"],
                     "path": "render.models.model",
                     "snapshot": _digest(b"proof-snapshot"),
                 },
@@ -298,9 +310,9 @@ def _verify(root: Path) -> None:
         "proof did not retain the complete selected callable slot set",
     )
     contracts = [raw for path, raw in outputs[0].items() if path.startswith("contracts/")]
-    _require(len(contracts) == 2, f"expected two MCCs, found {len(contracts)}")
+    _require(len(contracts) == 3, f"expected three MCCs, found {len(contracts)}")
     topologies = [raw for path, raw in outputs[0].items() if path.startswith("code-topologies/")]
-    _require(len(topologies) == 2, f"expected two CodeTopologies, found {len(topologies)}")
+    _require(len(topologies) == 3, f"expected three CodeTopologies, found {len(topologies)}")
     topology_refs = {
         variant["code_topology"]["digest"]
         for binding in index["functions"][0]["bindings"]
@@ -310,6 +322,12 @@ def _verify(root: Path) -> None:
         topology_refs == {_digest(raw) for raw in topologies},
         "result index does not bind every exact CodeTopology output",
     )
+    variants = {
+        variant["hardware_variant"]
+        for binding in index["functions"][0]["bindings"]
+        for variant in binding["variants"]
+    }
+    _require(variants == {"cpu", "sm90"}, f"CPU/SM variants drifted: {variants!r}")
     parsed = _parse_canonical(contracts[0])
     if not isinstance(parsed, dict):
         raise ProofFailure("MCC is not an object")

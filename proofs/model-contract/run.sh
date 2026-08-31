@@ -82,4 +82,16 @@ test "$red_status" -eq 6
 grep -q model_contract_binding_set_mismatch "$proof_root/model-red.stderr"
 test ! -e "$proof_root/model-output-red"
 
+(cd / && env -u PYTHONPATH "$driver_python" "$support" variant-red-request "$proof_root")
+set +e
+(cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
+    "$proof_root/driver/bin/cozy-model-contract-proof" \
+    "$proof_root/model-variant-red.json" "$proof_root/model-output-variant-red" \
+    >"$proof_root/model-variant-red.stdout" 2>"$proof_root/model-variant-red.stderr")
+variant_red_status=$?
+set -e
+test "$variant_red_status" -eq 3
+grep -q 'cpu|sm<major><minor>' "$proof_root/model-variant-red.stderr"
+test ! -e "$proof_root/model-output-variant-red"
+
 (cd / && env -u PYTHONPATH "$driver_python" "$support" verify "$proof_root")
