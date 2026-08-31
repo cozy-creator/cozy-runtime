@@ -30,12 +30,6 @@ BUILT = (
     "version",
 )
 PRIVATE = ("development-placement",)
-#: `ingest` PARSES and refuses typed: it is a thin invocation of TensorFS's one INGEST
-#: implementation — the carrier decode, classification and semantic converters — and that
-#: half of the border is not a dependency of this build yet (tfs-003). It is a verb, not an
-#: unknown word, and the refusal names the owner.
-UNAVAILABLE = ("ingest",)
-
 HELP = """cozy-runtime — everything a single package venv can do alone
 
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
@@ -85,7 +79,6 @@ _OWNS_ARGS = (
     "job",
     "fit",
     "serve",
-    "ingest",
     "development-placement",
 )
 
@@ -198,8 +191,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return host_verbs.doctor(config, opts)
-    if verb in UNAVAILABLE:
-        return host_verbs.unavailable(verb)
     raise CliError(
         "usage",
         f"unknown verb {verb!r}",
