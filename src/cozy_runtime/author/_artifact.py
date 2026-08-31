@@ -10,17 +10,18 @@ no complete output is copied through the attempt spool.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Buffer, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Literal, NoReturn, Protocol, runtime_checkable
 
-from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._errors import Cancelled, CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
 MAX_ARTIFACT_OUTPUTS = 16
 MAX_ARTIFACT_SOURCES = 16
 MAX_ARTIFACT_COMPONENTS = 64
 MAX_ARTIFACT_ADDITIONS = 65_536
+MAX_ARTIFACT_SOURCE_READ = 64 << 20
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
@@ -58,7 +59,7 @@ class ArtifactOutput:
 class ArtifactPart:
     dtype: str
     shape: tuple[int, ...]
-    data: ArtifactBytes
+    data: ArtifactBytes | None = None
 
     def __post_init__(self) -> None:
         if not self.dtype or any(dimension <= 0 for dimension in self.shape):
@@ -66,7 +67,9 @@ class ArtifactPart:
                 "an artifact part needs a dtype and positive dimensions",
                 code="artifact_part_declaration",
             )
-        if not isinstance(self.data, (bytes, bytearray, memoryview, Readable)):
+        if self.data is not None and not isinstance(
+            self.data, (bytes, bytearray, memoryview, Readable)
+        ):
             raise CapabilityError(
                 "an artifact part is bytes or a readable stream",
                 code="artifact_part_source",
@@ -175,25 +178,227 @@ class ArtifactReceipt:
     replayed: bool = False
 
 
+class ArtifactHostTransaction(Protocol):
+    """Runtime-private host operations behind one author-facing transaction."""
+
+    replayed: bool
+    receipt: ArtifactReceipt | None
+
+    def source_read_into(
+        self,
+        source: str,
+        component: str,
+        key: str,
+        role: str,
+        offset: int,
+        into: memoryview,
+    ) -> None: ...
+
+    def add_part(self, component: str, key: str, role: str, data: ArtifactBytes) -> None: ...
+
+    def add_config(self, name: str, data: ArtifactBytes) -> None: ...
+
+    def commit(self) -> ArtifactReceipt: ...
+
+    def fence(self) -> None: ...
+
+
+class ArtifactTransaction:
+    """One opened, declaration-locked ArtifactSink output transaction."""
+
+    __slots__ = (
+        "_attempt",
+        "_cancel",
+        "_closed",
+        "_configs",
+        "_host",
+        "_output",
+        "_sources",
+        "_targets",
+    )
+
+    def __init__(
+        self,
+        *,
+        attempt: object,
+        cancel: Callable[[], bool],
+        output: str,
+        sources: Mapping[str, str],
+        targets: Mapping[str, ArtifactTarget],
+        configs: Mapping[str, ArtifactConfig],
+        host: ArtifactHostTransaction,
+    ) -> None:
+        self._attempt = attempt
+        self._cancel = cancel
+        self._output = output
+        self._sources = frozenset(sources)
+        self._targets = dict(targets)
+        self._configs = dict(configs)
+        self._host = host
+        self._closed = False
+
+    @property
+    def replayed(self) -> bool:
+        return self._host.replayed
+
+    @property
+    def receipt(self) -> ArtifactReceipt | None:
+        """The prior receipt on replay; absent for a newly opened writer."""
+        return self._host.receipt
+
+    def source_read_into(
+        self,
+        source: str,
+        component: str,
+        key: str,
+        role: str,
+        offset: int,
+        into: Buffer,
+    ) -> None:
+        """Read one exact source-part range into caller-owned bounded writable memory."""
+        self._check("ArtifactTransaction.source_read_into")
+        if source not in self._sources:
+            self._fail(
+                f"artifact source alias {source!r} is outside this transaction",
+                code="artifact_source_ungranted",
+            )
+        if offset < 0:
+            self._fail("artifact source offset is negative", code="artifact_source_range")
+        try:
+            view = memoryview(into)
+        except TypeError as exc:
+            self._fail(
+                f"artifact source destination is not a writable buffer: {exc}",
+                code="artifact_source_buffer",
+            )
+        if (
+            view.readonly
+            or not view.c_contiguous
+            or not 0 < view.nbytes <= MAX_ARTIFACT_SOURCE_READ
+        ):
+            self._fail(
+                f"artifact source destination is readonly, non-contiguous, empty, or over "
+                f"{MAX_ARTIFACT_SOURCE_READ} bytes",
+                code="artifact_source_buffer",
+            )
+        try:
+            self._host.source_read_into(source, component, key, role, offset, view.cast("B"))
+        except Exception as exc:
+            self._host.fence()
+            self._closed = True
+            if isinstance(exc, CapabilityError):
+                raise
+            raise CapabilityError(
+                f"TensorFS source read refused: {type(exc).__name__}: {exc}",
+                code="artifact_source_refused",
+            ) from exc
+
+    def add_part(self, component: str, key: str, role: str, data: ArtifactBytes) -> None:
+        self._check("ArtifactTransaction.add_part")
+        target = self._targets.get(component)
+        tensor = target.add.get(key) if target is not None else None
+        if tensor is None or role not in tensor.parts:
+            self._fail(
+                f"artifact part {component}/{key}#{role} is undeclared",
+                code="artifact_part_ungranted",
+            )
+        self._call(lambda: self._host.add_part(component, key, role, data), "artifact part")
+
+    def add_config(self, name: str, data: ArtifactBytes) -> None:
+        self._check("ArtifactTransaction.add_config")
+        config = self._configs.get(name)
+        if config is None or config.data is None:
+            self._fail(
+                f"artifact config {name!r} is undeclared",
+                code="artifact_config_ungranted",
+            )
+        self._call(lambda: self._host.add_config(name, data), "artifact config")
+
+    def commit(self) -> ArtifactReceipt:
+        self._check("ArtifactTransaction.commit")
+        try:
+            receipt = self._host.commit()
+        except Exception as exc:
+            self._host.fence()
+            self._closed = True
+            if isinstance(exc, CapabilityError):
+                raise
+            raise CapabilityError(
+                f"TensorFS artifact commit refused: {type(exc).__name__}: {exc}",
+                code="artifact_tensorfs_refused",
+            ) from exc
+        self._closed = True
+        return receipt
+
+    def fence(self) -> None:
+        if not self._closed:
+            self._host.fence()
+            self._closed = True
+
+    def __enter__(self) -> ArtifactTransaction:
+        self._check("ArtifactTransaction.__enter__")
+        return self
+
+    def __exit__(self, *exc: object) -> Literal[False]:
+        self.fence()
+        return False
+
+    def _check(self, what: str) -> None:
+        from cozy_runtime.author._services import Attempt
+
+        attempt = self._attempt
+        assert isinstance(attempt, Attempt)
+        attempt.check_open(what)
+        if self._closed:
+            raise CapabilityError(
+                f"{what} used after artifact output {self._output!r} closed",
+                code="artifact_transaction_closed",
+            )
+        if self._cancel():
+            self._host.fence()
+            self._closed = True
+            raise Cancelled(f"artifact output {self._output!r} was canceled")
+
+    def _fail(self, detail: str, *, code: str) -> NoReturn:
+        self._host.fence()
+        self._closed = True
+        raise CapabilityError(detail, code=code)
+
+    def _call(self, operation: Callable[[], None], what: str) -> None:
+        try:
+            operation()
+        except Exception as exc:
+            self._host.fence()
+            self._closed = True
+            if isinstance(exc, CapabilityError):
+                raise
+            raise CapabilityError(
+                f"TensorFS {what} refused: {type(exc).__name__}: {exc}",
+                code="artifact_tensorfs_refused",
+            ) from exc
+
+
 class ArtifactSink:
     """Attempt-bound capability for one or more descriptor-declared model outputs."""
 
-    __slots__ = ("_attempt", "_models", "_outputs", "_sink", "_spent")
+    __slots__ = ("_attempt", "_cancel", "_models", "_open", "_outputs", "_spent")
 
     def __init__(
         self,
         attempt: object,
         models: Mapping[str, Model[object]],
         outputs: Mapping[str, int],
-        sink: Callable[[ArtifactCommit], ArtifactReceipt] | None,
+        open_transaction: Callable[[ArtifactCommit], ArtifactHostTransaction] | None,
+        cancel: Callable[[], bool] = lambda: False,
     ) -> None:
         self._attempt = attempt
         self._models = dict(models)
         self._outputs = dict(outputs)
-        self._sink = sink
+        self._open = open_transaction
+        self._cancel = cancel
         self._spent: set[str] = set()
 
-    def derive(
+    def open(
         self,
         output: str,
         *,
@@ -201,14 +406,14 @@ class ArtifactSink:
         targets: Mapping[str, ArtifactTarget],
         configs: Mapping[str, ArtifactConfig] | None = None,
         order: Sequence[tuple[str, str]],
-    ) -> ArtifactReceipt:
-        """Commit one exact derived Manifest and return only its durable receipt."""
+    ) -> ArtifactTransaction:
+        """Lock one exact declaration and return its bounded reader/writer capability."""
         from cozy_runtime.author._services import Attempt
 
         attempt = self._attempt
         assert isinstance(attempt, Attempt)
         attempt.check_open("ArtifactSink.derive")
-        if self._sink is None:
+        if self._open is None:
             raise CapabilityError(
                 "this attempt has no artifact transaction host",
                 code="artifact_sink_unavailable",
@@ -255,20 +460,61 @@ class ArtifactSink:
             )
 
         maximum = self._outputs[output]
-        receipt = self._sink(
-            ArtifactCommit(
-                output_slot=output,
-                sources=selected,
-                targets=dict(targets),
-                configs=dict(configs or {}),
-                order=tuple(order),
-                max_new_bytes=maximum,
-            )
+        transaction = ArtifactTransaction(
+            attempt=attempt,
+            cancel=self._cancel,
+            output=output,
+            sources=selected,
+            targets=targets,
+            configs=dict(configs or {}),
+            host=self._open(
+                ArtifactCommit(
+                    output_slot=output,
+                    sources=selected,
+                    targets=dict(targets),
+                    configs=dict(configs or {}),
+                    order=tuple(order),
+                    max_new_bytes=maximum,
+                )
+            ),
         )
-        if receipt.output_slot != output:
-            raise CapabilityError(
-                "the artifact transaction host returned another output slot",
-                code="artifact_receipt_mismatch",
-            )
         self._spent.add(output)
-        return receipt
+        return transaction
+
+    def derive(
+        self,
+        output: str,
+        *,
+        sources: Mapping[str, Model[object]],
+        targets: Mapping[str, ArtifactTarget],
+        configs: Mapping[str, ArtifactConfig] | None = None,
+        order: Sequence[tuple[str, str]],
+    ) -> ArtifactReceipt:
+        """One-shot convenience for jobs whose produced readers need no source reads."""
+        with self.open(
+            output, sources=sources, targets=targets, configs=configs, order=order
+        ) as transaction:
+            if transaction.replayed:
+                receipt = transaction.receipt
+                assert receipt is not None
+                return receipt
+            for component, target in sorted(targets.items()):
+                for key, tensor in sorted(target.add.items()):
+                    for role, part in sorted(tensor.parts.items()):
+                        if part.data is None:
+                            transaction.fence()
+                            raise CapabilityError(
+                                f"artifact part {component}/{key}#{role} has no data",
+                                code="artifact_part_source",
+                            )
+                        transaction.add_part(component, key, role, part.data)
+            for name, config in sorted((configs or {}).items()):
+                if config.data is not None:
+                    transaction.add_config(name, config.data)
+            receipt = transaction.commit()
+            if receipt.output_slot != output:
+                raise CapabilityError(
+                    "the artifact transaction host returned another output slot",
+                    code="artifact_receipt_mismatch",
+                )
+            return receipt

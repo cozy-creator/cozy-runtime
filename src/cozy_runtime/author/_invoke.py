@@ -32,7 +32,7 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._artifact import ArtifactCommit, ArtifactReceipt, ArtifactSink
+from cozy_runtime.author._artifact import ArtifactCommit, ArtifactHostTransaction, ArtifactSink
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import MediaDecoder
@@ -116,7 +116,7 @@ class Invocation:
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
-    artifacts: Callable[[ArtifactCommit], ArtifactReceipt] | None = None
+    artifacts: Callable[[ArtifactCommit], ArtifactHostTransaction] | None = None
     """The Runtime/host artifact transaction. Author code receives only ArtifactSink."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
@@ -649,6 +649,7 @@ def _service(
                 inv.models,
                 {output.name: output.max_new_bytes for output in surface.artifact_outputs},
                 inv.artifacts,
+                inv.cancel,
             )
         case "media_decode":
             return MediaDecoder(
