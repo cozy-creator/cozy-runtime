@@ -6,7 +6,7 @@ import base64
 import hashlib
 import shutil
 import sys
-import uuid
+import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
@@ -92,7 +92,10 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     seed = canonical.write(
         {"package": package, "release": release, "release_digest": release_digest}
     )
-    scratch = artifact_cache / f"prepare-{uuid.uuid4().hex}"
+    # Linux caps Unix socket paths at 108 bytes. The generation/cache path is
+    # user-selectable and may be much longer, so disposable executor control
+    # belongs in a private short system-temporary directory.
+    scratch = Path(tempfile.mkdtemp(prefix="cozy-prepare-"))
     supervisor = ExecutorSupervision(
         root=scratch / "worker",
         python=sys.executable,
