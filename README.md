@@ -6,19 +6,22 @@ executor, and the single-package CLI. Design authority: [tracker-v2](https://git
 
 ## Compatibility status
 
-Cozy Runtime is pre-launch `0.x`: its Python author API may still change incompatibly. Package
-code has one supported production import root, `cozy_runtime.author`; package tests may also use
+Cozy Runtime is the platform's declared Python author-API channel. Package code has one supported
+production import root, `cozy_runtime.author`; package tests may also use
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
-package APIs.
+package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: retained public
+author behavior stays compatible throughout that range, and an incompatible author change requires
+a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.16` targets standard CPython 3.12 only. Project
+Runtime release `0.0.19` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 
-Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
-baseline recorded. From v1 onward the distribution major is the Python compatibility major:
-minor releases are additive, breaking author changes require a new major, and candidate base
-worker images must replay the supported-major package corpus before activation. The protobuf
-package major and additive wire minor remain their own worker-control compatibility contract.
+The distribution major is the Python compatibility major: compatible additions remain in the
+current range, breaking author changes require a new major, and candidate base worker images must
+replay the supported-range package corpus before activation. Tensorhub images still pin one exact
+Runtime wheel digest; package admission uses the declared range and selects the newest compatible
+active Runtime/profile. The protobuf package major and additive wire minor remain their own
+worker-control compatibility contract.
 
 **No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
 deterministic contract/arithmetic/staleness checks; everything else is verified by running
@@ -249,10 +252,13 @@ publishes it. Cold and independent rebuilds produce the same compact receipt.
 ### Installed base plus package overlay
 
 `internal/overlay.py` is the serving materializer. The image already contains Python,
-Torch/CUDA, cozy-runtime, TensorFS, and the registered base-family dependencies. A placement
-therefore installs only its deterministic project wheel and optional exact custom wheels. It
-never creates a venv, copies Torch, reads an index, resolves a dependency, or retains wheel
-archives after extraction.
+cozy-runtime, TensorFS, and its complete declared base-family inventory. Accelerator profiles also
+contain Torch/CUDA; a generic CPU image may instead declare `torch_release=none` only when both
+accelerator coordinates are `none`, `accelerator_build=cpu`, and its distribution/import-root
+inventory proves that no Torch family, Triton, or NVIDIA fact exists. A placement therefore
+installs only its deterministic project wheel and optional exact custom wheels. It never creates a
+venv, copies Torch, reads an index, resolves a dependency, or retains wheel archives after
+extraction.
 
 The image's OCI digest owns image-resident integrity. `WheelhouseManifest/1` is the complete
 canonical ownership document for that image: its existing platform target and exact control-wheel

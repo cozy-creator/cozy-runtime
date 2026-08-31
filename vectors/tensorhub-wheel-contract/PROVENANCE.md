@@ -13,13 +13,13 @@ wheel facts, joins them with an inline PlacementSet/1 Environment, and proves th
 WheelFact shape refuses. The two small wheel files are retained from the earlier Tensorhub vector
 solely to exercise the complete Runtime join.
 
-The CPU and CUDA 13.0 wheelhouse fixtures are the exact candidate manifests for Runtime `0.0.16`.
-They carry its twice-reproduced `cozy_runtime-0.0.16-py3-none-any.whl`
-(`sha256:1b6aa4209c906640881fd1c8066b0a7db03b5acb7987acc20dc7744bdadf5552`,
-738,310 bytes) and TensorFS `0.0.5`
+The CPU and CUDA 13.0 wheelhouse fixtures are the exact candidate manifests for Runtime `0.0.19`.
+They carry its twice-reproduced `cozy_runtime-0.0.19-py3-none-any.whl`
+(`sha256:ad48274299c80ed2013cfa4259672517fc8b6718637a173196434c83320fafbb`,
+744,067 bytes) and TensorFS `0.0.5`
 (`sha256:a131c4688188dacd1518fbe93c417e64d6af575f65b52edac48bcb60f88d43a5`,
 2,337,278 bytes). They also record the exact Click `8.5.0` control wheel
 (`sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360`).
 Runtime CI checks the canonical producer bytes directly: the CPU fixture is 24,968 bytes with
-SHA-256 `806b8217dbb70e64edbdd6bb1cdf99b8b703e689abf96d920f360edf23340d72`; the CUDA fixture is
-25,538 bytes with SHA-256 `8fd4df91c84283f656bc204d20a29ff84f1068f288199bc943eb5436a61de7f4`.
+SHA-256 `6dd580aec64cc13fc1ac51150d8d7d9dadeb1ac43dac09c4802117189912556f`; the CUDA fixture is
+25,538 bytes with SHA-256 `c9c000daf9e83f9a97ad4119d3309cf19c3c6c96aa5a50fdaf88f4a0523974d0`.

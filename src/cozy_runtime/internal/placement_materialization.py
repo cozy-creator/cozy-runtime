@@ -320,7 +320,13 @@ def package_overlay_input(
 
     fields = set(package)
     published = {"package", "project_wheel", "release", "release_digest"}
-    development = {"package", "project_wheel", "release", "source_digest"}
+    development = {
+        "package",
+        "private_revision_digest",
+        "project_wheel",
+        "release",
+        "source_digest",
+    }
     if fields not in (published, development):
         raise LaunchRefusal(
             "package_invalid", f"fields={sorted(fields)} expected published or private development"
@@ -335,7 +341,7 @@ def package_overlay_input(
         or not version
     ):
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
-    revision_field = "release_digest" if fields == published else "source_digest"
+    revision_field = "release_digest" if fields == published else "private_revision_digest"
     _require_digest(package[revision_field], f"package.{revision_field}")
 
     _closed(environment, {"wheels"}, "environment")

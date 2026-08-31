@@ -177,8 +177,8 @@ def run(
 
     kind = "job" if verb == "job" else "entrypoint"
     surface = next((s for s in found.surfaces if s.name == function), None)
-    if surface is None or surface.kind != kind:
-        known = sorted(s.name for s in found.surfaces if s.kind == kind)
+    if surface is None or surface.kind != kind or surface.hidden:
+        known = sorted(s.name for s in found.surfaces if s.kind == kind and not s.hidden)
         raise CliError(
             "not_found",
             f"no registered {kind} named {function!r}",
@@ -215,23 +215,36 @@ def run(
     if kind == "job":
         descriptor_id = desc.job_descriptor_id(body, function)
         trees = _input_trees(flags.get("--input") or [])
-        job_records.append(
-            {
-                "job_descriptor_id": descriptor_id,
-                "build_id": release_id_of(body),
-                "project": str(found.project),
-                "job": function,
-                "gpu_count": int((surface.resources.gpu_count or 0) if surface.resources else 0),
-                "publishes": bool(surface.publishes),
-                "emits_media": bool(surface.emits_media),
-            }
-        )
 
     out_dir = Path((flags.get("--out") or ["outputs"])[0]).expanduser().resolve()
     workspace = out_dir / ".run"
     if workspace.exists():
         shutil.rmtree(workspace, ignore_errors=True)
     workspace.mkdir(parents=True, exist_ok=True)
+    package_revision_digest = development_source_digest(project)
+    if kind == "job":
+        descriptor_path = workspace / "package-descriptor.json"
+        descriptor_path.write_bytes(desc.canonical_bytes(body))
+        overlay_root = found.project / "src"
+        if not overlay_root.is_dir():
+            overlay_root = found.project
+        job_records.append(
+            {
+                "job_descriptor_id": descriptor_id,
+                "build_id": package_revision_digest,
+                "application": str(body["application"]),
+                "package_descriptor": str(descriptor_path),
+                "overlay": str(overlay_root),
+                "overlay_content_digest": package_revision_digest,
+                "job": function,
+                "gpu_count": int((surface.resources.gpu_count or 0) if surface.resources else 0),
+                "publishes": bool(surface.publishes),
+                "emits_media": bool(surface.emits_media),
+                "gpu_rate_micro_usd_per_hour": 0,
+                "cap_micro_usd": 0,
+                "reclaim_on_terminal": True,
+            }
+        )
 
     request = LocalRequest(
         entrypoint=function,
@@ -245,7 +258,6 @@ def run(
         inputs=inputs,
         org=(flags.get("--org") or ["local"])[0],
     )
-    package_revision_digest = development_source_digest(project)
     # The worker narrates itself to stdout, which is the right place for a long-lived
     # `serve` process and the wrong place for a verb whose stdout IS a result document. The
     # narration is not suppressed — it is a real progress channel — it just goes where
@@ -272,11 +284,6 @@ def run(
             ),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
-
-
-def release_id_of(body: Mapping[str, Json]) -> str:
-    """The build this job runs from. Locally that is the configured application export."""
-    return str(body["application"])
 
 
 def _input_trees(values: Sequence[str]) -> dict[str, str]:

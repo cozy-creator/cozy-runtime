@@ -26,11 +26,11 @@ from cozy_runtime.author import (
     Model,
 )
 from cozy_runtime.author._describe import describe
-from cozy_runtime.internal import canonical, descriptor
+from cozy_runtime.internal import canonical, descriptor, overlay
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
-from cozy_runtime.internal.worker import grants
+from cozy_runtime.internal.worker import grants, package_prepare
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord, AttemptRefusal
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.protocol import documents
@@ -66,6 +66,7 @@ class RightModel(Model[object]):
 
 
 app = App()
+PRIVATE_REVISION = "sha256:" + "a" * 64
 
 
 @app.job(artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
@@ -167,7 +168,7 @@ def discovered() -> tuple[Discovered, dict[str, Any], str]:
 def binding(descriptor_id: str, descriptor_path: Path) -> JobBinding:
     return JobBinding(
         job_descriptor_id=descriptor_id,
-        build_id="sha256:" + "a" * 64,
+        build_id=PRIVATE_REVISION,
         application="job_model_binding_acceptance:app",
         package_descriptor=str(descriptor_path),
         overlay="",
@@ -199,7 +200,7 @@ def offered(
         pb.InputBinding(input_id="model:right", digest=right[0], length=right[1], kind_mime=mime),
     ]
     spec = pb.InvocationSpec(
-        package_revision_digest="sha256:" + "a" * 64,
+        package_revision_digest=PRIVATE_REVISION,
         payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(),
         inputs=rows,
         outputs=[pb.OutputBinding(output_id="model", max_bytes=4096)],
@@ -209,7 +210,7 @@ def offered(
     else:
         spec.job.CopyFrom(
             pb.JobInvocationSpec(
-                build_id="sha256:" + "a" * 64,
+                build_id=PRIVATE_REVISION,
                 job_descriptor_id=descriptor_id,
                 publication_contract=pb.PublicationContract(
                     outputs=[pb.OutputBinding(output_id="model", max_bytes=4096)]
@@ -394,6 +395,31 @@ def main() -> None:
         descriptor_path = root / "package.descriptor.json"
         descriptor_path.write_bytes(descriptor.canonical_bytes(body))
         store = tensorfs.Store.open(str(root / "store"))
+        staged = package_prepare._stage_job_plans(
+            body,
+            root=root / "job-plans",
+            build_id=PRIVATE_REVISION,
+            descriptor_path=descriptor_path,
+            installed=overlay.InstalledOverlay(
+                generation=root / "private-generation",
+                import_root=root,
+                python=Path(sys.executable),
+                receipt_bytes=b"{}",
+                receipt_digest="sha256:" + "b" * 64,
+                content_digest="sha256:" + "c" * 64,
+                reused=False,
+            ),
+            include_modeled=True,
+        )
+        if staged != {descriptor_id}:
+            raise RuntimeError("private revision did not stage its modeled job")
+        staged_binding = JobBinding.read(
+            json.loads(
+                (root / "job-plans" / f"{descriptor_id.removeprefix('sha256:')}.json").read_text()
+            )
+        )
+        if staged_binding.build_id != PRIVATE_REVISION:
+            raise RuntimeError("private modeled job lost its exact revision identity")
 
         engine1, attempt1, command1 = attempt_command(
             store_root=root / "store",
@@ -455,7 +481,7 @@ def main() -> None:
             f"JOB MODEL BINDING PASS protocol_minor={WIRE_MINOR} exact_descriptor_params=2 "
             "host_capability=model:// attempt_manifest_holds=dedup terminal_release=1 "
             "derive_only=1 artifact_sink_nodes=2 manifest_handoff=1 serving=refused "
-            "param_class_digest_length_scheme_store_absence=refused"
+            "private_revision=1 param_class_digest_length_scheme_store_absence=refused"
         )
 
 
