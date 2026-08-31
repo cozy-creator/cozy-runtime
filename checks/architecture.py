@@ -729,9 +729,9 @@ def fence_base_ownership_vectors() -> list[str]:
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
-            25_305,
-            "sha256:73738b08458a6c83cae1b97a9675f775d27b616e08a7d034b85a481e63b1b2da",
-            (86, 363, 9),
+            25_538,
+            "sha256:29bb3d46c3a2370c1055042ef5c1c77a073a21a351cf853e3086b4cc4cdfc585",
+            (86, 363, 10),
             ("cuda", "cu130"),
         ),
     )
@@ -771,6 +771,12 @@ def fence_base_ownership_vectors() -> list[str]:
             bad.append(f"{cross}: platform target is {target}, want {expected_target}")
         versions = manifest.distribution_versions
         expected_wheels = {
+            "click": (
+                "8.5.0",
+                "click-8.5.0-py3-none-any.whl",
+                "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+                125_251,
+            ),
             "cozy-runtime": (
                 "0.0.11",
                 "cozy_runtime-0.0.11-py3-none-any.whl",
