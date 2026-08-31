@@ -700,27 +700,92 @@ def fence_base_ownership_vectors() -> list[str]:
     wanted = {"minimal-complete-v1", "unknown-format-refused", "unknown-provider-refused"}
     if names != wanted:
         bad.append(f"{path}: vector names are {sorted(names)}, want {sorted(wanted)}")
-    cross = ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse.json"
-    raw = cross.read_bytes()
-    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    if len(raw) != 32_213 or digest != (
-        "sha256:bc864ba08dd8663e9b77edbed2fa2935c2d962c74936604bc4d7c3510779a3ab"
-    ):
-        bad.append(
-            f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
-        )
-    try:
-        manifest = overlay.parse_base_manifest(raw, digest)
-    except overlay.OverlayRefusal as exc:
-        bad.append(f"{cross}: Runtime refused Tensorhub bytes: {exc.code}: {exc.detail}")
-    else:
+    root = ROOT / "vectors" / "tensorhub-wheel-contract"
+    mirror_specs = (
+        (
+            "base-worker-image-wheelhouse-cpu.json",
+            24_977,
+            "sha256:2ea86f5131b1f95efd1f2bd3870efd52b94cdd25c623e438614e6ff3afb31cb8",
+            (27, 322, 26),
+            ("none", "none"),
+        ),
+        (
+            "base-worker-image-wheelhouse-cu130.json",
+            32_558,
+            "sha256:62be81f24f970df1db8dce059a06c208b6d35c1b277450c5e98ea495474b15f0",
+            (46, 325, 45),
+            ("cuda", "cu130"),
+        ),
+    )
+    manifests: dict[str, overlay.BaseManifest] = {}
+    manifest_digests: dict[str, str] = {}
+    for filename, length, expected_digest, expected_census, accelerator in mirror_specs:
+        cross = root / filename
+        raw = cross.read_bytes()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if len(raw) != length or digest != expected_digest:
+            bad.append(
+                f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
+            )
+        try:
+            manifest = overlay.parse_base_manifest(raw, digest)
+        except overlay.OverlayRefusal as exc:
+            bad.append(f"{cross}: Runtime refused Tensorhub bytes: {exc.code}: {exc.detail}")
+            continue
+        manifests[filename] = manifest
+        manifest_digests[filename] = digest
         census = (
             len(manifest.base_distributions),
             len(manifest.base_import_roots),
             len(manifest.wheels),
         )
-        if census != (45, 324, 44):
-            bad.append(f"{cross}: ownership census is {census}, want (45, 324, 44)")
+        if census != expected_census:
+            bad.append(f"{cross}: ownership census is {census}, want {expected_census}")
+        target = dict(manifest.platform_target)
+        expected_target = {
+            "os_arch": "linux/amd64",
+            "libc": "glibc2.36",
+            "python_abi": "cp314",
+            "accelerator_backend": accelerator[0],
+            "accelerator_abi": accelerator[1],
+        }
+        if target != expected_target:
+            bad.append(f"{cross}: platform target is {target}, want {expected_target}")
+        versions = manifest.distribution_versions
+        expected_wheels = {
+            "cozy-runtime": (
+                "0.0.10",
+                "cozy_runtime-0.0.10-py3-none-any.whl",
+                "sha256:94460296a7c6ad745d25693f8c67faa6543579ffb0779ee1f9b8056ef9a30ba8",
+                698_262,
+            ),
+            "tensorfs": (
+                "0.0.2",
+                "tensorfs-0.0.2-cp314-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                "sha256:5d5420f9571778ae884daf6fe31bc649318014cd644d94b17a7c465929be5d93",
+                2_085_526,
+            ),
+        }
+        wheels = {wheel.distribution: wheel for wheel in manifest.wheels}
+        for distribution, expected_wheel in expected_wheels.items():
+            version = expected_wheel[0]
+            if versions.get(distribution) != version:
+                bad.append(
+                    f"{cross}: base owns {distribution}=={versions.get(distribution)}, "
+                    f"want {version}"
+                )
+            wheel = wheels.get(distribution)
+            fact = (
+                None
+                if wheel is None
+                else (wheel.version, wheel.filename, wheel.digest, wheel.length)
+            )
+            if fact != expected_wheel:
+                bad.append(f"{cross}: {distribution} wheel is {fact}, want {expected_wheel}")
+
+    cu130_manifest = manifests.get("base-worker-image-wheelhouse-cu130.json")
+    if cu130_manifest is not None:
+        base_family_digest = manifest_digests["base-worker-image-wheelhouse-cu130.json"]
 
         def counted_wheel(index: int, owner: str) -> overlay.Wheel:
             label = "project" if owner == "project" else f"custom-{index:03d}"
@@ -745,17 +810,17 @@ def fence_base_ownership_vectors() -> list[str]:
             )
             return overlay.Input(
                 environment_digest="sha256:" + "1" * 64,
-                base_family_digest=digest,
+                base_family_digest=base_family_digest,
                 project_wheel_digest=project.digest,
                 wheels=wheels,
                 grants=(),
             )
 
-        admitted = overlay._verify_inventory(counted_input(127), manifest)
+        admitted = overlay._verify_inventory(counted_input(127), cu130_manifest)
         if len(admitted) != 128:
             bad.append(f"cr-027 wheel-count boundary admitted {len(admitted)} rows, want 128")
         try:
-            overlay._verify_inventory(counted_input(128), manifest)
+            overlay._verify_inventory(counted_input(128), cu130_manifest)
         except overlay.OverlayRefusal as exc:
             if exc.code != "overlay_wheel_set_invalid" or exc.detail != "129":
                 bad.append(
@@ -834,7 +899,7 @@ def fence_tensorhub_package_release() -> list[str]:
     if bad:
         return bad
 
-    manifest_path = root / "base-worker-image-wheelhouse.json"
+    manifest_path = root / "base-worker-image-wheelhouse-cu130.json"
     manifest = manifest_path.read_bytes()
     manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
     environment = {
