@@ -113,6 +113,7 @@ def _run(config: WorkerHostConfig) -> int:
     )
     worker = Worker(runtime_config, options, host)
     host.preparer = worker.prepare_package_set
+    host.model_source_preparer = worker.prepare_model_source
 
     def ready(_address: str) -> None:
         if worker.stop.is_set():

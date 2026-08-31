@@ -694,7 +694,7 @@ def descriptor_sections() -> None:
         "published surface removed": lambda d: d["entrypoints"].pop(),
         "production contract changed": lambda d: d["model_productions"][0]["outputs"][0][
             "required_contract"
-        ].update(structure="h3-other"),
+        ].update(topology_digest="sha256:" + "2" * 64),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))

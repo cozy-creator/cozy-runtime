@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Resources
@@ -27,8 +27,8 @@ _CALLABLE = re.compile(
     r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/"
     r"[a-z][a-z0-9_-]{0,63}$"
 )
-_MEMBER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 _CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _name(value: str, where: str) -> None:
@@ -60,24 +60,20 @@ def _unique(values: Sequence[str], where: str, cap: int, *, nonempty: bool = Tru
 class ProductionContract:
     """Facts Tensorhub must independently derive from one produced Manifest.
 
-    ``tasks`` is the complete task-capability set, ``structure`` is the model-family
-    structure contract, and ``encodings`` is the complete stored encoding set.  ``stamps``
-    carries the remaining open, package-owned compatibility vocabulary.  These are
-    requirements to verify, never labels that can make incompatible bytes admissible.
+    Both fields are exact TensorFS identities: the final header topology digest and its
+    complete EncodingSpec object-ID set. Human task/structure/stamp labels cannot make
+    produced bytes admissible and have no place in this contract.
     """
 
-    tasks: tuple[str, ...]
-    structure: str
+    topology_digest: str
     encodings: tuple[str, ...]
-    stamps: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _unique(self.tasks, "production contract tasks", MAX_CONTRACT_VALUES)
-        if _CONTRACT_VALUE.fullmatch(self.structure) is None:
+        if _DIGEST.fullmatch(self.topology_digest) is None:
             raise ConformanceError(
-                f"production contract structure {self.structure!r} is malformed",
+                f"production contract topology digest {self.topology_digest!r} is malformed",
                 code="production_contract",
-                fields=["structure"],
+                fields=["topology_digest"],
             )
         if not self.encodings or len(self.encodings) > MAX_CONTRACT_VALUES:
             raise ConformanceError(
@@ -86,24 +82,14 @@ class ProductionContract:
                 code="production_bound",
                 fields=["encodings"],
             )
-        if len(set(self.encodings)) != len(self.encodings) or any(
-            _CONTRACT_VALUE.fullmatch(value) is None for value in self.encodings
+        if tuple(sorted(set(self.encodings))) != self.encodings or any(
+            _DIGEST.fullmatch(value) is None for value in self.encodings
         ):
             raise ConformanceError(
-                "production contract encodings must be unique versioned contract values",
+                "production contract encodings must be sorted unique exact EncodingSpec object IDs",
                 code="production_contract",
                 fields=["encodings"],
             )
-        if len(self.stamps) > MAX_CONTRACT_VALUES:
-            raise ConformanceError(
-                f"production contract has {len(self.stamps)} stamps; "
-                f"the bound is {MAX_CONTRACT_VALUES}",
-                code="production_bound",
-                fields=["stamps"],
-            )
-        for key, value in self.stamps.items():
-            _name(key, "production contract stamp")
-            _name(value, f"production contract stamp {key}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,15 +97,14 @@ class ProductionNode:
     """One ordinary job invocation in a static production graph.
 
     ``models`` maps the referenced job's model input name to either one production source
-    slot or ``<node>.<output>``. ``assets`` maps typed input names to package-relative
-    immutable members; the package builder, not the job, resolves their bytes.
+    slot or ``<node>.<output>``. Static recipe assets are ordinary importlib resources owned
+    internally by the installed job, not Creator inputs or graph edges.
     """
 
     name: str
     callable: str
     models: Mapping[str, str]
     outputs: tuple[str, ...]
-    assets: Mapping[str, str] = field(default_factory=dict)
     resources: Resources | None = None
 
     def __post_init__(self) -> None:
@@ -147,27 +132,6 @@ class ProductionNode:
                     fields=[self.name, input_name],
                 )
         _unique(self.outputs, f"production node {self.name} outputs", MAX_NODE_OUTPUTS)
-        if len(self.assets) > MAX_NODE_INPUTS:
-            raise ConformanceError(
-                f"production node {self.name} has {len(self.assets)} static assets; "
-                f"the bound is {MAX_NODE_INPUTS}",
-                code="production_bound",
-                fields=[self.name],
-            )
-        for input_name, member in self.assets.items():
-            _name(input_name, f"production node {self.name} asset input")
-            if (
-                not isinstance(member, str)
-                or _MEMBER.fullmatch(member) is None
-                or member.startswith(("/", "~"))
-                or ".." in member.split("/")
-            ):
-                raise ConformanceError(
-                    f"production node {self.name} asset {member!r} is not a safe "
-                    "package-relative member",
-                    code="production_asset",
-                    fields=[self.name, input_name],
-                )
 
 
 @dataclass(frozen=True, slots=True)

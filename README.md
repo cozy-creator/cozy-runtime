@@ -11,7 +11,7 @@ code has one supported production import root, `cozy_runtime.author`; package te
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
 package APIs.
 
-Runtime release `0.0.14` targets standard CPython 3.12 only. Project
+Runtime release `0.0.15` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 
 Proto-014 owns the eventual v1 cut. Before that cut, the author surface will be pruned and a v1
@@ -193,8 +193,12 @@ The same `/1` document may carry bounded `model_productions`: static graphs over
 callables with fixed required outputs, recipe-owned lane keys and independently verifiable
 contracts. Named source slots bind reviewed TensorFS source-profile IDs, so one foreign repository
 may yield several exact converter closures without a filename heuristic or a fake aggregate model.
-Job and production-node resource floors use the same descriptor shape. Productions execute nothing
-and carry no concrete source selection, destination, credential or exact resolved job release.
+Each output contract contains only the final topology digest and sorted exact TensorFS EncodingSpec
+object IDs. Tensorhub derives both from the produced header; human task, structure and stamp labels
+cannot make bytes admissible. Static recipe assets remain private importlib resources of the job,
+not Creator inputs. Job and production-node resource floors use the same descriptor shape.
+Productions execute nothing and carry no concrete source selection, destination, credential or
+exact resolved job release.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.
@@ -539,4 +543,6 @@ ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves 
 ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
 Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;
 pod-supervisor owns durability. The real boundary is exercised by
-`proofs/internal/artifact_sink_acceptance.py` against TensorFS 0.0.4 and its `tfs` binary.
+`proofs/internal/artifact_sink_acceptance.py` against TensorFS 0.0.5 and its `tfs` binary. Both
+source-preparation results and derived Artifact receipts forward TensorFS canonical
+`ReleaseEvidence/1` bytes exactly; Runtime never reconstructs provenance.

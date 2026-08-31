@@ -185,7 +185,6 @@ def main() -> int:
                         "callable": "example/model/copy",
                         "models": {"model": "source"},
                         "outputs": ["model"],
-                        "assets": {},
                     }
                 ],
                 "outputs": [
@@ -194,10 +193,8 @@ def main() -> int:
                         "source": "copy.model",
                         "lane_key": "bf16",
                         "required_contract": {
-                            "tasks": ["generate"],
-                            "structure": "h3/full",
-                            "encodings": ["plain/1"],
-                            "stamps": {},
+                            "topology_digest": "sha256:" + "1" * 64,
+                            "encodings": ["sha256:" + "2" * 64],
                         },
                     }
                 ],

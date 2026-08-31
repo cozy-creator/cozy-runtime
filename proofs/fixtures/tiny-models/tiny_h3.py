@@ -730,7 +730,6 @@ app.production(
             callable="tensorhub/h3/distill",
             models={"base": "dits", "shared": "shared"},
             outputs=("bf16-full",),
-            assets={"plan": "full-plan"},
             resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),
         ),
     ),
@@ -740,10 +739,10 @@ app.production(
             source="distill-full.bf16-full",
             lane_key="bf16-full",
             required=ProductionContract(
-                tasks=("fl2va", "ref2va"),
-                structure="h3/bf16-full",
-                encodings=("plain/1",),
-                stamps={"family": "h3"},
+                topology_digest="sha256:" + "1" * 64,
+                encodings=(
+                    "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+                ),
             ),
         ),
     ),
