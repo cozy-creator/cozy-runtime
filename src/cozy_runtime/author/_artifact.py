@@ -116,9 +116,10 @@ class ArtifactTarget:
                 "an artifact target either derives from a component or creates values",
                 code="artifact_target_empty",
             )
-        if len(set(self.drop)) != len(self.drop) or set(self.drop) & set(self.add):
+        if len(set(self.drop)) != len(self.drop):
             raise CapabilityError(
-                "artifact target drop/add keys must be unique and disjoint",
+                "artifact target drop keys must be unique; replacing a tensor is spelled "
+                "by dropping and adding the same key",
                 code="artifact_target_keys",
             )
 
