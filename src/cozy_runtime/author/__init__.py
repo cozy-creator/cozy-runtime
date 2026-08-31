@@ -22,6 +22,7 @@ from cozy_runtime.author._artifact import (
     ArtifactSink,
     ArtifactTarget,
     ArtifactTensor,
+    ArtifactTransaction,
 )
 from cozy_runtime.author._assets import (
     Asset,
@@ -158,6 +159,7 @@ __all__ = [
     "ArtifactSink",
     "ArtifactTarget",
     "ArtifactTensor",
+    "ArtifactTransaction",
     "Asset",
     "AssetBound",
     "AudioAsset",

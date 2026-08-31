@@ -9,6 +9,7 @@ actual tfs-019 transaction. No store or path enters the job surface.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -46,6 +47,18 @@ class Request(msgspec.Struct, forbid_unknown_fields=True):
 class Result(msgspec.Struct):
     transaction: str
     receipt: str
+
+
+class ReadRequest(msgspec.Struct, forbid_unknown_fields=True):
+    alias: str = "full"
+    offset: int = 0
+    size: int = 2048
+    readonly: bool = False
+
+
+class ReadResult(msgspec.Struct):
+    transaction: str
+    source_digest: str
 
 
 class SourceModel(Model[object]):
@@ -112,8 +125,51 @@ def derive_tight(payload: Request, model: SourceModel, artifacts: ArtifactSink) 
     return produce(payload, model, artifacts)
 
 
+@app.job(name="derive-read", artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
+def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSink) -> ReadResult:
+    targets = {
+        "derived": ArtifactTarget(
+            source="full",
+            source_component="unet",
+            add={
+                "window": ArtifactTensor(
+                    logical_dtype="bf16",
+                    shape=(32, 32),
+                    encoding=PLAIN,
+                    parts={"value": ArtifactPart("bf16", (32, 32))},
+                )
+            },
+        )
+    }
+    order = (*(("derived", key) for key in SOURCE_KEYS), ("derived", "window"))
+    with artifacts.open(
+        "model", sources={"full": model}, targets=targets, order=order
+    ) as transaction:
+        if transaction.replayed:
+            receipt = transaction.receipt
+            assert receipt is not None
+            return ReadResult(receipt.artifact_transaction_id, EXPECTED_SOURCE_DIGEST)
+        writable = bytes(payload.size) if payload.readonly else bytearray(payload.size)
+        transaction.source_read_into(
+            payload.alias,
+            "unet",
+            SOURCE_KEY,
+            "value",
+            payload.offset,
+            writable,
+        )
+        raw = bytes(writable)
+        digest = hashlib.sha256(raw).hexdigest()
+        transaction.add_part("derived", "window", "value", raw)
+        receipt = transaction.commit()
+        return ReadResult(receipt.artifact_transaction_id, digest)
+
+
 PLAIN = ""
 ORDER: tuple[tuple[str, str], ...] = ()
+SOURCE_KEY = ""
+SOURCE_KEYS: tuple[str, ...] = ()
+EXPECTED_SOURCE_DIGEST = ""
 
 
 def command(*argv: str) -> str:
@@ -177,12 +233,16 @@ def main() -> None:
         root = Path(temporary)
         store, manifest_id, manifest_length, header = source(args.tfs, root / "store")
         component = header["components"]["unet"]
-        global PLAIN, ORDER
-        PLAIN = next(
-            tensor["encoding"]
-            for tensor in component.values()
-            if list(tensor["parts"]) == ["value"]
+        global EXPECTED_SOURCE_DIGEST, PLAIN, SOURCE_KEY, SOURCE_KEYS, ORDER
+        SOURCE_KEYS = tuple(component)
+        SOURCE_KEY, source_tensor = next(
+            (key, tensor) for key, tensor in component.items() if list(tensor["parts"]) == ["value"]
         )
+        PLAIN = source_tensor["encoding"]
+        source_part = source_tensor["parts"]["value"]
+        source_segment = source_part["segments"][0]
+        source_bytes = store.document(source_segment["sha256"], 1 << 20)
+        EXPECTED_SOURCE_DIGEST = hashlib.sha256(source_bytes[128 : 128 + 2048]).hexdigest()
         ORDER = (*(("derived", key) for key in component), ("derived", "table"))
         chosen = model(manifest_id)
 
@@ -204,7 +264,7 @@ def main() -> None:
                 request_id="artifact-proof",
                 spool=spool,
                 models={"model": chosen},
-                artifacts=host.commit,
+                artifacts=host.open,
             ).result
             assert isinstance(result, Result)
             return result, host
@@ -258,7 +318,7 @@ def main() -> None:
                 request_id="artifact-overlong",
                 spool=refused_spool,
                 models={"model": chosen},
-                artifacts=refused_host.commit,
+                artifacts=refused_host.open,
             )
         except Exception as exc:
             if getattr(exc, "code", "") != "artifact_tensorfs_refused":
@@ -285,7 +345,7 @@ def main() -> None:
                 {"marker": "table"},
                 request_id="artifact-bounded",
                 models={"model": chosen},
-                artifacts=bounded_host.commit,
+                artifacts=bounded_host.open,
             )
         except Exception as exc:
             if getattr(exc, "code", "") != "artifact_tensorfs_refused":
@@ -296,13 +356,109 @@ def main() -> None:
             raise RuntimeError("TensorFS read bytes before enforcing the aggregate output cap")
         if store.derived_lookup(bounded_host.transaction_id("model")).get("state") != "absent":
             raise RuntimeError("over-bound declaration created a transaction")
+
+        def read_run(
+            request_id: str,
+            digest_seed: str,
+            payload: dict[str, object],
+            *,
+            writer_session: int = 1,
+            cancelled: bool = False,
+        ) -> tuple[ReadResult, ArtifactTransactionHost]:
+            host = ArtifactTransactionHost(
+                store=store,
+                owner_scope="proof-owner",
+                request_id=request_id,
+                invocation_spec_digest="sha256:" + digest_seed * 64,
+                writer_session_id=writer_session,
+                allowed_sources={manifest_id: manifest_length},
+                output_bounds={"model": 4096},
+            )
+            result = invoke_with_fakes(
+                app.get("derive-read"),
+                payload,
+                request_id=request_id,
+                models={"model": chosen},
+                artifacts=host.open,
+                cancelled=cancelled,
+            ).result
+            assert isinstance(result, ReadResult)
+            return result, host
+
+        read_result, read_host = read_run("artifact-read", "4", {"offset": 128})
+        if read_result.source_digest != EXPECTED_SOURCE_DIGEST:
+            raise RuntimeError("transaction source read returned different bytes")
+        replay, _ = read_run("artifact-read", "4", {"offset": 128}, writer_session=2)
+        if replay != read_result:
+            raise RuntimeError("source-read transaction replay changed its result")
+        read_host.release("model")
+
+        refusal_cases: tuple[tuple[str, str, dict[str, object], str, bool], ...] = (
+            (
+                "foreign-source",
+                "5",
+                {"alias": "foreign", "offset": 128},
+                "artifact_source_ungranted",
+                False,
+            ),
+            (
+                "offset-bound",
+                "6",
+                {"offset": 1 << 30},
+                "artifact_tensorfs_refused",
+                False,
+            ),
+            (
+                "readonly-buffer",
+                "7",
+                {"offset": 128, "readonly": True},
+                "artifact_source_buffer",
+                False,
+            ),
+            (
+                "empty-buffer",
+                "8",
+                {"offset": 128, "size": 0},
+                "artifact_source_buffer",
+                False,
+            ),
+            (
+                "canceled-read",
+                "9",
+                {"offset": 128},
+                "cancelled",
+                True,
+            ),
+        )
+        for name, seed, payload, expected, canceled in refusal_cases:
+            try:
+                _, failed_host = read_run(f"artifact-{name}", seed, payload, cancelled=canceled)
+            except Exception as exc:
+                if getattr(exc, "code", "") != expected:
+                    raise RuntimeError(f"{name} refused as {exc!r}, want {expected}") from exc
+                failed_host = ArtifactTransactionHost(
+                    store=store,
+                    owner_scope="proof-owner",
+                    request_id=f"artifact-{name}",
+                    invocation_spec_digest="sha256:" + seed * 64,
+                    writer_session_id=1,
+                    allowed_sources={manifest_id: manifest_length},
+                    output_bounds={"model": 4096},
+                )
+            else:
+                raise RuntimeError(f"{name} source read was admitted")
+            state = store.derived_lookup(failed_host.transaction_id("model"))
+            if state.get("state") != "open" or "writer_session_id" in state:
+                raise RuntimeError(f"{name} did not fence its writer: {state}")
+            failed_host.abandon("model")
         print(
             "ARTIFACT SINK PASS",
             manifest_id_out,
             first.transaction,
             first.receipt,
             "replay=true protocol=true release=true direct_stream=true "
-            "cap_before_read=true overlong_fenced=true",
+            "cap_before_read=true overlong_fenced=true source_read=true "
+            "foreign_offset_buffer_cancel_red=true",
         )
 
 

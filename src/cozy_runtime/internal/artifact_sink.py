@@ -19,8 +19,10 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifact import (
+    ArtifactBytes,
     ArtifactCommit,
     ArtifactConfig,
+    ArtifactHostTransaction,
     ArtifactReceipt,
     ArtifactTarget,
     Readable,
@@ -61,7 +63,8 @@ class ArtifactTransactionHost:
         self.allowed_sources = dict(allowed_sources)
         self.output_bounds = dict(output_bounds)
 
-    def commit(self, request: ArtifactCommit) -> ArtifactReceipt:
+    def open(self, request: ArtifactCommit) -> ArtifactHostTransaction:
+        """Lock one tfs-019 declaration before exposing any source reader or writer."""
         maximum = self.output_bounds.get(request.output_slot)
         if maximum is None or maximum != request.max_new_bytes:
             raise CapabilityError(
@@ -96,17 +99,20 @@ class ArtifactTransactionHost:
         existing = self.store.derived_lookup(transaction_id)
         if existing.get("state") == "committed":
             facts = self._receipt(existing.get("receipt"), transaction_id, expected_declaration)
-            return self._wrap(request.output_slot, transaction_id, facts, replayed=True)
+            return OpenedArtifactTransaction(
+                host=self,
+                request=request,
+                transaction_id=transaction_id,
+                declaration=expected_declaration,
+                writer=None,
+                receipt=self._wrap(request.output_slot, transaction_id, facts, replayed=True),
+            )
         if existing.get("state") == "abandoned":
             raise CapabilityError(
                 f"artifact transaction {transaction_id} was abandoned",
                 code="artifact_transaction_closed",
             )
-        writer: Any = None
         try:
-            # Declaration and aggregate new-byte bound lock BEFORE TensorFS asks any
-            # produced stream for one byte. No model-sized output copy exists between the
-            # job and the CAS writer.
             writer = self.store.begin_derived(
                 transaction_id,
                 self.writer_session_id,
@@ -116,30 +122,19 @@ class ArtifactTransactionHost:
                 list(request.order),
                 request.max_new_bytes,
             )
-            for component, target in sorted(request.targets.items()):
-                for key, tensor in sorted(target.add.items()):
-                    for role, part in sorted(tensor.parts.items()):
-                        writer.add_part(component, key, role, self._reader(part.data))
-            for name, config in sorted(request.configs.items()):
-                if config.data is not None:
-                    writer.add_config(name, self._reader(config.data))
-            facts = self._receipt(writer.commit(), transaction_id, expected_declaration)
-        except CapabilityError:
-            if writer is not None:
-                writer.fence()
-            raise
         except Exception as exc:
-            fence_error = ""
-            if writer is not None:
-                try:
-                    writer.fence()
-                except Exception as fence:
-                    fence_error = f"; writer fence also failed: {type(fence).__name__}: {fence}"
             raise CapabilityError(
-                f"TensorFS artifact transaction refused: {type(exc).__name__}: {exc}{fence_error}",
+                f"TensorFS artifact declaration refused: {type(exc).__name__}: {exc}",
                 code="artifact_tensorfs_refused",
             ) from exc
-        return self._wrap(request.output_slot, transaction_id, facts, replayed=False)
+        return OpenedArtifactTransaction(
+            host=self,
+            request=request,
+            transaction_id=transaction_id,
+            declaration=expected_declaration,
+            writer=writer,
+            receipt=None,
+        )
 
     def transaction_id(self, output_slot: str) -> str:
         subject = canonical_json.encode(
@@ -253,7 +248,7 @@ class ArtifactTransactionHost:
         return value
 
     @staticmethod
-    def _reader(source: object) -> Readable:
+    def _reader(source: ArtifactBytes) -> Readable:
         if isinstance(source, (bytes, bytearray, memoryview)):
             return BytesIO(bytes(source))
         if isinstance(source, Readable):
@@ -290,6 +285,107 @@ class ArtifactTransactionHost:
             tensorfs_receipt=raw,
             replayed=replayed,
         )
+
+
+class OpenedArtifactTransaction:
+    """One declaration-locked TensorFS writer exposed through the narrow host protocol."""
+
+    def __init__(
+        self,
+        *,
+        host: ArtifactTransactionHost,
+        request: ArtifactCommit,
+        transaction_id: str,
+        declaration: object,
+        writer: Any,
+        receipt: ArtifactReceipt | None,
+    ) -> None:
+        self.host = host
+        self.request = request
+        self.transaction_id = transaction_id
+        self.declaration = declaration
+        self.writer = writer
+        self.receipt = receipt
+        self.replayed = receipt is not None
+        self.closed = self.replayed
+
+    def source_read_into(
+        self,
+        source: str,
+        component: str,
+        key: str,
+        role: str,
+        offset: int,
+        into: memoryview,
+    ) -> None:
+        self._call(
+            "source read",
+            lambda writer: writer.source_read_into(source, component, key, role, offset, into),
+        )
+
+    def add_part(self, component: str, key: str, role: str, data: ArtifactBytes) -> None:
+        self._call(
+            "artifact part",
+            lambda writer: writer.add_part(component, key, role, self.host._reader(data)),
+        )
+
+    def add_config(self, name: str, data: ArtifactBytes) -> None:
+        self._call(
+            "artifact config", lambda writer: writer.add_config(name, self.host._reader(data))
+        )
+
+    def commit(self) -> ArtifactReceipt:
+        if self.receipt is not None:
+            return self.receipt
+        writer = self._writer("commit")
+        try:
+            facts = self.host._receipt(writer.commit(), self.transaction_id, self.declaration)
+        except Exception as exc:
+            self._fence_after(exc, "commit")
+        self.closed = True
+        self.receipt = self.host._wrap(
+            self.request.output_slot, self.transaction_id, facts, replayed=False
+        )
+        return self.receipt
+
+    def fence(self) -> None:
+        if self.closed:
+            return
+        writer = self._writer("fence")
+        try:
+            writer.fence()
+        finally:
+            self.closed = True
+
+    def _writer(self, what: str) -> Any:
+        if self.closed or self.writer is None:
+            raise CapabilityError(
+                f"artifact transaction {self.transaction_id} is closed during {what}",
+                code="artifact_transaction_closed",
+            )
+        return self.writer
+
+    def _call(self, what: str, operation: Any) -> None:
+        writer = self._writer(what)
+        try:
+            operation(writer)
+        except Exception as exc:
+            self._fence_after(exc, what)
+
+    def _fence_after(self, cause: Exception, what: str) -> None:
+        fence_error = ""
+        try:
+            if self.writer is not None:
+                self.writer.fence()
+        except Exception as fence:
+            fence_error = f"; writer fence also failed: {type(fence).__name__}: {fence}"
+        self.closed = True
+        if isinstance(cause, CapabilityError) and not fence_error:
+            raise cause
+        raise CapabilityError(
+            f"TensorFS {what} refused: {type(cause).__name__}: {cause}{fence_error}",
+            code="artifact_tensorfs_refused",
+        ) from cause
 
 
 def protocol_receipt(
