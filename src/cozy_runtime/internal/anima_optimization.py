@@ -4,6 +4,9 @@ The package constructs and TensorFS fills the ordinary Diffusers module tree fir
 then does this module replace Python callables: parameters, buffers, state-dict names and
 storage addresses are invariants.  This is intentionally one closed plan, not a generic
 monkey-patching framework.
+
+``torch.compile`` is a qualification-time discovery oracle, never an invocation-time path.
+Reusable fusion belongs in Runtime's maintained CUDA-kernel companion; eager stays available.
 """
 
 from __future__ import annotations
@@ -17,8 +20,12 @@ from importlib import import_module, metadata
 from types import MethodType
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 DIFFUSERS_VERSION = "0.40.0"
-COMFY_KITCHEN_VERSION = "0.2.31"
+FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.2.31"
+FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
+FUSED_ANIMA_CUDA_RELEASE = "13.0"
 
 _APPLICATION = "anima:app"
 _MODEL_CLASS = "anima:AnimaModel"
@@ -42,7 +49,7 @@ _SOURCE_DIGESTS = {
 }
 _IDENTITY_DOCUMENT = {
     "diffusers": DIFFUSERS_VERSION,
-    "comfy-kitchen": COMFY_KITCHEN_VERSION,
+    "comfy-kitchen": FUSED_ANIMA_CUDA_KERNEL_VERSION,
     "plan": "direct-split-half-rope-matrix",
     "sources": _SOURCE_DIGESTS,
 }
@@ -135,6 +142,13 @@ def _version(distribution: str, expected: str) -> None:
         )
 
 
+def _installed_version(distribution: str) -> str | None:
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return None
+
+
 def _type_name(value: object) -> str:
     cls = type(value)
     return f"{cls.__module__}:{cls.__qualname__}"
@@ -199,7 +213,7 @@ class _RopeMatrix:
 
 
 def _direct_rope_forward(rope: Any, hidden_states: Any, fps: int | None = None) -> Any:
-    """Produce comfy-kitchen's split-half matrix without duplicated cosine/sine tensors."""
+    """Produce the fused Anima CUDA kernel matrix without duplicate cosine/sine tensors."""
     import torch
 
     _, _, frames, height, width = hidden_states.shape
@@ -237,9 +251,9 @@ def _direct_rope_forward(rope: Any, hidden_states: Any, fps: int | None = None) 
 
 
 class _FusedSelfAttention:
-    def __init__(self, torch: Any, kitchen: Any, rope: _RopeMatrix) -> None:
+    def __init__(self, torch: Any, anima_kernels: Any, rope: _RopeMatrix) -> None:
         self.torch = torch
-        self.kitchen = kitchen
+        self.anima_kernels = anima_kernels
         self.rope = rope
 
     def __call__(
@@ -268,7 +282,7 @@ class _FusedSelfAttention:
                 "anima_optimization_rope_absent",
                 "the exact Anima Cosmos self-attention call omitted rotary embeddings",
             )
-        query, key = self.kitchen.rms_rope_split_half(
+        query, key = self.anima_kernels.rms_rope_split_half(
             query,
             key,
             self.rope.get(image_rotary_emb),
@@ -374,7 +388,7 @@ def _latent_prepare_call(step: Any, components: Any, state: Any) -> Any:
         return components, state
 
 
-def _install_block_plan(block: Any, *, kitchen: Any, torch: Any, rope: _RopeMatrix) -> None:
+def _install_block_plan(block: Any, *, anima_kernels: Any, torch: Any, rope: _RopeMatrix) -> None:
     from diffusers.models.transformers.transformer_cosmos import CosmosAttnProcessor2_0
 
     if (
@@ -387,11 +401,11 @@ def _install_block_plan(block: Any, *, kitchen: Any, torch: Any, rope: _RopeMatr
             "anima_optimization_block_shape",
             "Anima Cosmos block projections or attention processors do not match the plan",
         )
-    block.attn1.set_processor(_FusedSelfAttention(torch, kitchen, rope))
+    block.attn1.set_processor(_FusedSelfAttention(torch, anima_kernels, rope))
     block.forward = MethodType(_block_forward, block)
 
 
-def _install_transformer_plan(transformer: Any, *, kitchen: Any, torch: Any) -> None:
+def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: Any) -> None:
     from diffusers.models.normalization import RMSNorm
     from diffusers.models.transformers.transformer_cosmos import (
         CosmosTransformerBlock,
@@ -421,7 +435,7 @@ def _install_transformer_plan(transformer: Any, *, kitchen: Any, torch: Any) -> 
             )
         norm.forward = MethodType(_native_rms_forward, norm)
     for block in blocks:
-        _install_block_plan(block, kitchen=kitchen, torch=torch, rope=rope)
+        _install_block_plan(block, anima_kernels=anima_kernels, torch=torch, rope=rope)
     transformer.rope.forward = MethodType(_direct_rope_forward, transformer.rope)
 
     original_forward = transformer.forward
@@ -445,16 +459,44 @@ def _require_transformer_config(transformer: Any) -> None:
         )
 
 
-def apply_anima_execution_plan(
-    model: object, *, application: str, model_class: str
-) -> AppliedAnimaOptimization | None:
-    """Install the one exact plan after fill; return ``None`` for every other package."""
-    if application != _APPLICATION or model_class != _MODEL_CLASS:
+def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
+    """Return the exact supported Torch/native pair, or ``None`` for eager execution."""
+    torch_version = _installed_version("torch")
+    if torch_version is None:
         return None
+    try:
+        installed_torch = Version(torch_version)
+    except InvalidVersion:
+        return None
+    if installed_torch.public != FUSED_ANIMA_TORCH_RELEASE:
+        return None
+    try:
+        torch = import_module("torch")
+    except ImportError:
+        return None
+    if getattr(getattr(torch, "version", None), "cuda", None) != FUSED_ANIMA_CUDA_RELEASE:
+        return None
+    cuda = getattr(torch, "cuda", None)
+    try:
+        if cuda is None or not cuda.is_available():
+            return None
+    except (AttributeError, RuntimeError):
+        return None
+    native_version = _installed_version("comfy-kitchen")
+    if native_version != FUSED_ANIMA_CUDA_KERNEL_VERSION:
+        return None
+    try:
+        anima_kernels = import_module("comfy_kitchen")
+    except ImportError:
+        return None
+    return torch, anima_kernels
 
+
+def _apply_fused_anima_cuda_plan(
+    model: object, *, torch: Any, anima_kernels: Any
+) -> AppliedAnimaOptimization:
+    """Apply the strict post-capability plan; all source/config/topology drift refuses."""
     _version("diffusers", DIFFUSERS_VERSION)
-    _version("comfy-kitchen", COMFY_KITCHEN_VERSION)
-    import torch
     from diffusers.models.normalization import RMSNorm
     from diffusers.models.transformers.transformer_cosmos import (
         CosmosAttnProcessor2_0,
@@ -464,14 +506,13 @@ def apply_anima_execution_plan(
     )
     from diffusers.modular_pipelines.anima.before_denoise import AnimaPrepareLatentsStep
 
-    comfy_kitchen = import_module("comfy_kitchen")
     sources: dict[str, Callable[..., object]] = {
         "RMSNorm.forward": RMSNorm.forward,
         "CosmosAttnProcessor2_0.__call__": CosmosAttnProcessor2_0.__call__,
         "CosmosRotaryPosEmbed.forward": CosmosRotaryPosEmbed.forward,
         "CosmosTransformerBlock.forward": CosmosTransformerBlock.forward,
         "AnimaPrepareLatentsStep.__call__": AnimaPrepareLatentsStep.__call__,
-        "comfy_kitchen.rms_rope_split_half": comfy_kitchen.rms_rope_split_half,
+        "comfy_kitchen.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }
     for name, source in sources.items():
         _require_source(name, source)
@@ -508,7 +549,7 @@ def apply_anima_execution_plan(
     _require_transformer_config(transformer)
 
     before = _tensor_census(transformer)
-    _install_transformer_plan(transformer, kitchen=comfy_kitchen, torch=torch)
+    _install_transformer_plan(transformer, anima_kernels=anima_kernels, torch=torch)
     after = _tensor_census(transformer)
     if after != before:
         raise _refuse(
@@ -518,7 +559,7 @@ def apply_anima_execution_plan(
     AnimaPrepareLatentsStep.__call__ = _latent_prepare_call
     return AppliedAnimaOptimization(
         OPTIMIZATION_ID,
-        f"diffusers=={DIFFUSERS_VERSION};comfy-kitchen=={COMFY_KITCHEN_VERSION}",
+        f"diffusers=={DIFFUSERS_VERSION};comfy-kitchen=={FUSED_ANIMA_CUDA_KERNEL_VERSION}",
         (
             "fused_rmsnorm_split_half_rope",
             "addcmul_residuals",
@@ -527,3 +568,16 @@ def apply_anima_execution_plan(
             "direct_split_half_rope_matrix",
         ),
     )
+
+
+def apply_anima_execution_plan(
+    model: object, *, application: str, model_class: str
+) -> AppliedAnimaOptimization | None:
+    """Apply fused Anima CUDA kernels when supported; otherwise retain eager execution."""
+    if application != _APPLICATION or model_class != _MODEL_CLASS:
+        return None
+    capability = _fused_anima_cuda_capability()
+    if capability is None:
+        return None
+    torch, anima_kernels = capability
+    return _apply_fused_anima_cuda_plan(model, torch=torch, anima_kernels=anima_kernels)

@@ -179,13 +179,23 @@ compares state-dict topology and every parameter/buffer storage address before a
 its source/dependency digest enters constructed-generation identity. Any source, class or
 config drift refuses typed.
 
-The NVIDIA CUDA base worker image must install `cozy-runtime[anima-cuda]`, which currently
-means the exact `comfy-kitchen==0.2.31` CPython-3.12 ABI3 wheel
+The NVIDIA CUDA base worker image may install `cozy-runtime[cuda-kernels]`. The fused Anima
+CUDA kernel library is currently supplied by the exact upstream `comfy-kitchen==0.2.31`
+CPython-3.12 ABI3 wheel
 `sha256:d7c2522e6a6cde7a7303e30d739c05989cf4b0a246684e496a129b950055d35f`.
-CPU, MPS and Windows profiles do not install that extra. A candidate CUDA image runs
+Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0 built with CUDA 13.0
+when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs, and profiles without
+the exact native library keep the ordinary eager implementation. CPU, MPS and Windows
+profiles do not install that extra. A candidate CUDA image runs
 `python scripts/anima-optimization-live.py`; the proof compares eager and optimized real
 CUDA blocks at Anima's native token width, checks determinism and storage identity, and
 measures the block speedup.
+
+Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
+oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
+latency, peak VRAM and output equivalence. Reusable fusion becomes a maintained companion
+kernel; otherwise qualification may produce one exact AOT artifact. Runtime never compiles
+on each invocation, and eager execution remains the fallback.
 
 **The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
 coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming

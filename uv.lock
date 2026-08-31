@@ -181,13 +181,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-anima-cuda = [
-    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
 corpus = [
     { name = "diffusers" },
     { name = "torch" },
     { name = "transformers" },
+]
+cuda-kernels = [
+    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 derive = [
     { name = "torch" },
@@ -207,7 +207,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
-    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'anima-cuda'", specifier = "==0.2.31" },
+    { name = "comfy-kitchen", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda-kernels'", specifier = "==0.2.31" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
@@ -219,7 +219,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "anima-cuda"]
+provides-extras = ["derive", "corpus", "media", "cuda-kernels"]
 
 [package.metadata.requires-dev]
 dev = [

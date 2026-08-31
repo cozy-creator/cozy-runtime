@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Real-CUDA oracle for the exact Diffusers 0.40 Anima execution plan.
 
-Run inside the candidate base worker image, where Torch, Diffusers and comfy-kitchen are
-already exact installed distributions:
+Run inside the candidate base worker image, where Torch, Diffusers and the fused Anima
+CUDA kernel library are already installed at their exact pinned versions:
 
     python scripts/anima-optimization-live.py
 """
@@ -23,11 +23,14 @@ from diffusers.models.transformers.transformer_cosmos import (
     CosmosTransformerBlock,
 )
 from diffusers.modular_pipelines.anima.before_denoise import AnimaPrepareLatentsStep
+from packaging.version import Version
 
 from cozy_runtime.internal.anima_optimization import (
     _TRANSFORMER_CONFIG,
-    COMFY_KITCHEN_VERSION,
     DIFFUSERS_VERSION,
+    FUSED_ANIMA_CUDA_KERNEL_VERSION,
+    FUSED_ANIMA_CUDA_RELEASE,
+    FUSED_ANIMA_TORCH_RELEASE,
     OPTIMIZATION_ID,
     AnimaOptimizationRefusal,
     _direct_rope_forward,
@@ -59,18 +62,24 @@ def _bench(block: Any, hidden: Any, context: Any, timestep: Any, rotary: Any) ->
 def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("REFUSED: the Anima optimization oracle requires CUDA")
+    if Version(metadata.version("torch")).public != FUSED_ANIMA_TORCH_RELEASE:
+        raise SystemExit(f"REFUSED: Torch must be {FUSED_ANIMA_TORCH_RELEASE}")
+    if torch.version.cuda != FUSED_ANIMA_CUDA_RELEASE:
+        raise SystemExit(f"REFUSED: built CUDA must be {FUSED_ANIMA_CUDA_RELEASE}")
     if metadata.version("diffusers") != DIFFUSERS_VERSION:
         raise SystemExit(f"REFUSED: diffusers must be {DIFFUSERS_VERSION}")
-    if metadata.version("comfy-kitchen") != COMFY_KITCHEN_VERSION:
-        raise SystemExit(f"REFUSED: comfy-kitchen must be {COMFY_KITCHEN_VERSION}")
-    kitchen = import_module("comfy_kitchen")
+    if metadata.version("comfy-kitchen") != FUSED_ANIMA_CUDA_KERNEL_VERSION:
+        raise SystemExit(
+            f"REFUSED: fused Anima CUDA kernel library must be {FUSED_ANIMA_CUDA_KERNEL_VERSION}"
+        )
+    anima_kernels = import_module("comfy_kitchen")
     for name, source in {
         "RMSNorm.forward": RMSNorm.forward,
         "CosmosAttnProcessor2_0.__call__": CosmosAttnProcessor2_0.__call__,
         "CosmosRotaryPosEmbed.forward": CosmosRotaryPosEmbed.forward,
         "CosmosTransformerBlock.forward": CosmosTransformerBlock.forward,
         "AnimaPrepareLatentsStep.__call__": AnimaPrepareLatentsStep.__call__,
-        "comfy_kitchen.rms_rope_split_half": kitchen.rms_rope_split_half,
+        "comfy_kitchen.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }.items():
         _require_source(name, source)
 
@@ -85,7 +94,7 @@ def main() -> None:
     else:
         raise AssertionError("a non-Anima Cosmos config was accepted")
     exact_before = _tensor_census(exact)
-    _install_transformer_plan(exact, kitchen=kitchen, torch=torch)
+    _install_transformer_plan(exact, anima_kernels=anima_kernels, torch=torch)
     assert exact_before == _tensor_census(exact), "full transformer topology changed"
 
     torch.manual_seed(11)
@@ -139,7 +148,7 @@ def main() -> None:
     for module in block.modules():
         if type(module) is RMSNorm:
             module.forward = MethodType(_native_rms_forward, module)
-    _install_block_plan(block, kitchen=kitchen, torch=torch, rope=_RopeMatrix(torch))
+    _install_block_plan(block, anima_kernels=anima_kernels, torch=torch, rope=_RopeMatrix(torch))
     after = _tensor_census(block)
     optimized = _call(block, hidden, context, timestep, rotary)
     repeat = _call(block, hidden, context, timestep, rotary)
