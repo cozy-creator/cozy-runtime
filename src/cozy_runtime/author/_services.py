@@ -808,16 +808,16 @@ class Secrets[S]:
 
 @dataclass(frozen=True, slots=True)
 class CheckpointDeclaration:
-    """One attempt DECLARED a checkpoint, and the declaration is journaled.
+    """One attempt DECLARED a checkpoint, and the declaration is recorded.
 
     NOT A DURABILITY RECEIPT, and the name is the fix (#553a). The type this replaces was
     called `CheckpointReceipt` and carried a `receipt_id`, which is what a caller reads when
     it decides the bytes survive an executor kill. Nothing stores the bytes: the worker
-    fsyncs a metadata row and the protocol's `JobCheckpointRequest.artifact` field goes out
-    empty, so the only true fact in the exchange is that an attempt said it had a checkpoint,
-    with this digest, at this length. That fact is what this carries.
+    keeps a process-local metadata row and the protocol's `JobCheckpointRequest.artifact`
+    field goes out empty, so the only true fact in the exchange is that an attempt said it
+    had a checkpoint, with this digest, at this length. That fact is what this carries.
 
-    `replayed` says the identity was already journaled and this call added nothing.
+    `replayed` says the identity was already recorded and this call added nothing.
     """
 
     declaration_id: str
@@ -937,8 +937,8 @@ class Checkpoints(_Bound):
 
     What this service could honestly do and what it CLAIMED to do had come apart. The claim
     was that `save()` made bytes durable and returned only once they were. The mechanism was
-    a metadata row: the worker fsyncs (run, attempt, operation key, logical key, content
-    digest, length) into its journal and the RecordOwner records a second copy, while the
+    a metadata row: the worker records (run, attempt, operation key, logical key, content
+    digest, length) in process memory and the RecordOwner stores a copy, while the
     protocol's `JobCheckpointRequest.artifact` field — the only place bytes could ride — goes
     out empty and no component anywhere copies or stores them. A killed executor took every
     checkpoint with it, and the receipt said otherwise.
@@ -949,7 +949,7 @@ class Checkpoints(_Bound):
     that was not real, and `save()` now refuses `checkpoint_sink_unbuilt` naming the
     ArtifactSink #552 adopted. When that sink exists, `save()` gets a body again and the
     acceptance test is the one #553a names: kill executor and worker, recover BYTES by
-    receipt, never a journal entry.
+    receipt, never a process record.
     """
 
     __slots__ = ("_sink",)
@@ -965,7 +965,7 @@ class Checkpoints(_Bound):
     def declare(
         self, logical_key: str, data: bytes | Path, *, operation_key: str = ""
     ) -> CheckpointDeclaration:
-        """Journal that this attempt HAS a checkpoint: its keys, digest and length.
+        """Record that this attempt HAS a checkpoint: its keys, digest and length.
 
         Everything this returns is true. The bytes stay exactly where the caller put them —
         the attempt spool, or the run's `Scratch.checkpoint_dir(key=)` tree, which is what

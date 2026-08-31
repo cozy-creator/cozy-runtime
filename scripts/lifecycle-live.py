@@ -2,7 +2,7 @@
 """The WEIGHTLESS worker lifecycle, live: the platform port's acceptance run (#450).
 
 One run, six core sections, no model, no CAS, no GPU: boot -> invoke -> cooperative cancel ->
-executor crash -> worker kill + orphan check -> journal recovery, then the control-spine and
+executor crash -> worker kill + orphan check -> fresh process, then the control-spine and
 executor-liveness and egress arms (`--only <name>` runs one of those alone). This is the sequence
 a platform port must pass before it may call itself a port (cr-020 items 1-5, cr-021's
 process half): every section exercises the REAL worker control process, the REAL executor spawn path
@@ -167,25 +167,15 @@ def stage_development(home: Path, project: Path) -> Any:
 def start_weightless(
     tmp: Path,
     *,
-    instance_id: str,
     fresh: bool,
     hub: Any = None,
     connect: bool = True,
-    rlimit_fsize: int = 0,
     root_name: str = "worker",
     posture: Any = None,
 ) -> Any:
     """worker-live's spawn, minus the quiet-card gate (there is no card in this run) and
     minus the CAS staging. Same control-process argv, same env seal inputs, same log pump.
-
-    `instance_id` EMPTY omits `--instance-id` entirely — that is the bare-restart shape
-    #494d is about, and the harness has to be able to express it. `rlimit_fsize` is the same
-    HARNESS-SIDE kernel fault injection worker-live uses: a real EFBIG on the one regular
-    file the control process appends to, planted in the forked child before exec, so the
-    runtime carries no fault switch of its own.
     """
-    import resource
-    import signal as _signal
     import subprocess
     import threading
 
@@ -258,16 +248,12 @@ def start_weightless(
         "0.0.0",
         "--development-source-digest",
         source_digest,
-        *(("--instance-id", instance_id) if instance_id else ()),
         "--release-id",
         RELEASE,
         "--grace",
         "3.0",
         "--no-warm",
     ]
-
-    def ignore_file_limit_signal() -> None:
-        _signal.signal(_signal.SIGXFSZ, _signal.SIG_IGN)
 
     process = subprocess.Popen(
         argv,
@@ -276,7 +262,6 @@ def start_weightless(
         env=env,
         cwd=project,
         bufsize=0,
-        preexec_fn=ignore_file_limit_signal if rlimit_fsize else None,
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
@@ -285,14 +270,6 @@ def start_weightless(
         staged.placement,
         posture or pb.Posture.POSTURE_ACCEPTING,
     )
-    if rlimit_fsize:
-        # The plant targets the journal append, not local release construction. Apply it
-        # only after the production `serve` path has staged and checked its exact inputs.
-        resource.prlimit(
-            process.pid,
-            resource.RLIMIT_FSIZE,
-            (rlimit_fsize, rlimit_fsize),
-        )
     if connect:
         hub.connect(addr)
     worker = wl.Worker(home, root, process, hub, log, ids)
@@ -335,9 +312,9 @@ def pid_gone(pid: int, budget: float, what: str) -> bool:
 
 # --------------------------------------------------------------------- the control spine
 #
-# Sections 7-13 are the CONTROL SPINE arms (decisions #493 item 10, #494, #495d). They are
+# The remaining sections are same-process control and executor-lifecycle arms. They are
 # here and not in worker-live.py because none of them needs a card, a model or the CAS: every
-# one is about the claim fence, the journal, the snapshot and the durable lane, which a
+# one is about the claim fence, snapshot and control lane, which a
 # weightless worker exercises exactly as a loaded one does. Each arm is observed in BOTH
 # directions — the plant produces the refusal, removing it produces the ordinary path — and
 # every plant is a real kernel or filesystem condition, never a switch in the runtime.
@@ -351,24 +328,6 @@ def faults(hub: Any, kind: Any, since: int = 0) -> list[Any]:
             continue
         out.extend(row for row in message.observed_state.faults if row.kind == kind)
     return out
-
-
-def journal_prefix(journal: Path, kind: str) -> int:
-    """Bytes of `journal` up to and including its LAST record of `kind`.
-
-    This is the fault plant's calibration (section 9): a second run over the same fixture
-    writes the same records at the same lengths, so an RLIMIT_FSIZE of exactly this many
-    bytes lets acceptance commit and makes the very next append — the one that would carry
-    the OUTCOME — fail with a real EFBIG.
-    """
-    total = through = 0
-    for line in journal.read_bytes().split(b"\n"):
-        if not line:
-            continue
-        total += len(line) + 1
-        if json.loads(line.partition(b" ")[2])["kind"] == kind:
-            through = total
-    return through
 
 
 def terminal_for(hub: Any, request_id: str, seconds: float, since: int = 0) -> Any:
@@ -389,7 +348,7 @@ def section_reconnect(args: argparse.Namespace, base: str) -> None:
     """#494a: a reconnect re-presenting the SAME desired revision is not a changed body."""
     wl.head("7. reconnect: the same desired revision is UNCHANGED; a changed one still refuses")
     tmp = Path(base + "-reconnect")
-    worker, ids = start_weightless(tmp, instance_id="ins-recon", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     try:
         hub.ready(ids["tick"], args.observe * 4)
@@ -446,12 +405,10 @@ def section_boot_failure(args: argparse.Namespace, base: str) -> None:
     """#494c: BootFailure INSTEAD of ClaimAck, never an ack followed by a confession."""
     wl.head("8. boot failure: the claiming owner gets BootFailure and NO ClaimAck")
     tmp = Path(base + "-boot")
-    # The plant is a real kernel limit: a journal root deep enough that the executor's
+    # The plant is a real kernel limit: a worker root deep enough that the executor's
     # control socket would not fit `sockaddr_un.sun_path`, which is a boot-fatal
     # CONFIG_INVALID verdict long before any owner dials.
-    worker, _ = start_weightless(
-        tmp, instance_id="ins-bootfail", fresh=True, connect=False, root_name="d" * 90
-    )
+    worker, _ = start_weightless(tmp, fresh=True, connect=False, root_name="d" * 90)
     hub = worker.hub
     try:
         hub.connect(wl.read_addr(worker.root, worker.process))
@@ -481,7 +438,7 @@ def section_boot_failure(args: argparse.Namespace, base: str) -> None:
         worker.stop()
         hub.close()
     # GREEN: the same fixture on a root that fits acks the claim and serves.
-    worker2, ids2 = start_weightless(Path(base + "-boot-ok"), instance_id="ins-bootok", fresh=True)
+    worker2, ids2 = start_weightless(Path(base + "-boot-ok"), fresh=True)
     try:
         worker2.hub.ready(ids2["tick"], args.observe * 4)
         wl.check(
@@ -494,238 +451,11 @@ def section_boot_failure(args: argparse.Namespace, base: str) -> None:
         worker2.hub.close()
 
 
-def section_undurable(args: argparse.Namespace, base: str) -> None:
-    """#494b: an outcome that could not be journaled is HELD, never sent."""
-    wl.head("9. an outcome that cannot be journaled is HELD; nothing unreplayable is sent")
-    tmp = Path(base + "-durable")
-    # GREEN first, and it doubles as the plant's calibration: the same fixture writes the
-    # same journal records at the same lengths, so acceptance's byte offset is the limit
-    # that lets acceptance commit and makes the OUTCOME's append fail.
-    worker, ids = start_weightless(tmp, instance_id="ins-durable", fresh=True)
-    try:
-        worker.hub.ready(ids["tick"], args.observe * 4)
-        wl.dispatch(
-            worker.hub,
-            tmp,
-            ids["tick"],
-            request_id="req-dur",
-            payload={"note": "x"},
-            release=RELEASE,
-            outputs=0,
-        )
-        body = wl.terminal_body(terminal_for(worker.hub, "req-dur", args.observe))
-        wl.check(
-            "with a writable journal the same dispatch lands a SUCCEEDED terminal",
-            body["status"] == 1,
-            f"status={body['status']}",
-        )
-    finally:
-        worker.stop()
-        worker.hub.close()
-    limit = journal_prefix(tmp / "worker" / "journal.log", "accepted") + 8
-    tmp2 = Path(base + "-durable-red")
-    worker2, ids2 = start_weightless(
-        tmp2, instance_id="ins-durable", fresh=True, rlimit_fsize=limit
-    )
-    hub = worker2.hub
-    try:
-        hub.ready(ids2["tick"], args.observe * 4)
-        since = hub.mark()
-        wl.dispatch(
-            hub,
-            tmp2,
-            ids2["tick"],
-            request_id="req-dur",
-            payload={"note": "x"},
-            release=RELEASE,
-            outputs=0,
-        )
-        hub.wait(
-            lambda m: (
-                m.attempt_accepted
-                if m.WhichOneof("msg") == "attempt_accepted"
-                and m.attempt_accepted.request_id == "req-dur"
-                else None
-            ),
-            args.observe,
-            "acceptance under the planted limit",
-            since,
-        )
-        # The outcome's append is the one that hits EFBIG. Observe the worker settle into
-        # its typed local fault instead of shipping something it cannot replay.
-        held = hub.wait(
-            lambda m: (
-                m.observed_state
-                if m.WhichOneof("msg") == "observed_state"
-                and m.observed_state.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED
-                else None
-            ),
-            args.observe,
-            "the worker's FAILED edge",
-            since,
-        )
-        # ORDERING, not a clock: the outcome is enqueued on the durable lane immediately
-        # after the FAILED edge, on the same FIFO queue the reporter ticks into. Two ticks
-        # landing after that edge with no outcome between them is the observation that no
-        # outcome was sent — waiting a wall-clock second would not be.
-        for tick in range(2):
-            hub.wait(
-                lambda m: m.observed_state if m.WhichOneof("msg") == "observed_state" else None,
-                args.observe,
-                f"observed-state tick {tick + 1} after the FAILED edge",
-                hub.mark(),
-            )
-        wl.check(
-            "an unjournalable outcome is NEVER sent",
-            not hub.terminals("req-dur"),
-            f"{len(hub.terminals('req-dur'))} terminals for req-dur under a journal that "
-            f"stopped at {limit} B; worker log: "
-            + (worker2.tail("HOLDING", 1)[-1][:110] if worker2.tail("HOLDING", 1) else "-"),
-        )
-        latest = hub.reports()[-1]
-        wl.check(
-            "and the attempt is HELD in its OWN wire state, never silently dropped",
-            any(
-                a.request_id == "req-dur"
-                and a.state == pb.AttemptState.ATTEMPT_STATE_HELD_UNDURABLE
-                for a in latest.held_attempts
-            )
-            and held.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED,
-            "held_attempts="
-            + str([(a.request_id, pb.AttemptState.Name(a.state)) for a in latest.held_attempts])
-            + f", phase {pb.WorkerPhase.Name(latest.worker_phase)} — rev-2 spells this "
-            "HELD_UNDURABLE (#507d/#510d), not RUNNING plus a compound fault",
-        )
-    finally:
-        worker2.stop()
-        hub.close()
-
-
-def section_identity(args: argparse.Namespace, base: str) -> None:
-    """#494d: a bare restart recovers its OWN rows; a foreign instance is typed LOSS."""
-    wl.head("10. instance identity: a bare restart recovers its own journal rows")
-    tmp = Path(base + "-identity")
-    worker, ids = start_weightless(tmp, instance_id="", fresh=True)
-    hub = worker.hub
-    hub.auto_ack = False  # leave the terminal unacked, so recovery has something to find
-    try:
-        hub.ready(ids["tick"], args.observe * 4)
-        wl.dispatch(
-            hub,
-            tmp,
-            ids["tick"],
-            request_id="req-ident",
-            payload={"note": "x"},
-            release=RELEASE,
-            outputs=0,
-        )
-        first = terminal_for(hub, "req-ident", args.observe)
-    finally:
-        worker.process.send_signal(signal.SIGKILL)
-        worker.process.wait(timeout=args.observe)
-        hub.close()
-    minted = (tmp / "worker" / "instance-id").read_text().strip()
-    hub2 = wl.Hub()
-    hub2.auto_ack = False
-    worker2, _ = start_weightless(tmp, instance_id="", fresh=False, hub=hub2)
-    try:
-        replay = terminal_for(hub2, "req-ident", args.observe * 2)
-        wl.check(
-            "a restart with NO --instance-id reuses the root's identity and replays its own row",
-            replay.outcome_canonical_bytes == first.outcome_canonical_bytes
-            and len(hub2.snapshot) == 1,
-            f"identity {minted} persisted; {len(hub2.snapshot)} snapshot entr(y|ies), "
-            f"{len(first.outcome_canonical_bytes)} identical canonical bytes",
-        )
-    finally:
-        worker2.stop()
-        hub2.close()
-
-    wl.head("11. a GENUINELY foreign instance is a typed LOSS outcome, never silence")
-    hub3 = wl.Hub()
-    hub3.auto_ack = False
-    worker3, _ = start_weightless(tmp, instance_id="ins-someone-else", fresh=False, hub=hub3)
-    try:
-        loss = terminal_for(hub3, "req-ident", args.observe * 2)
-        body = wl.terminal_body(loss)
-        wl.check(
-            "a row authorized under another instance becomes a durable ABANDONED outcome",
-            body["status"] == 5
-            and body["cause"]["code"] == 16
-            and "foreign_instance_identity" in body["safe_message"]
-            and len(hub3.snapshot) == 1,
-            f"status={body['status']} cause={body['cause']['code']}; {body['safe_message'][:90]}",
-        )
-    finally:
-        worker3.stop()
-        hub3.close()
-
-
-def section_ownership(args: argparse.Namespace, base: str) -> None:
-    """#494e: the accepted (record_owner_epoch, id) survives the process that accepted it."""
-    wl.head("12. ownership durability: the accepted epoch outlives the process")
-    tmp = Path(base + "-ownership")
-    hub = wl.Hub()
-    hub.epoch, hub.record_owner_id = 5, "hub-authority"
-    worker, ids = start_weightless(tmp, instance_id="ins-owner", fresh=True, hub=hub)
-    try:
-        hub.ready(ids["tick"], args.observe * 4)
-    finally:
-        worker.process.send_signal(signal.SIGKILL)
-        worker.process.wait(timeout=args.observe)
-        hub.close()
-    worker2, _ids2 = start_weightless(tmp, instance_id="ins-owner", fresh=False, connect=False)
-    addr = wl.read_addr(worker2.root, worker2.process)
-    try:
-        for epoch, controller, expect in (
-            (4, "hub-superseded", pb.ClaimRejection.CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH),
-            (5, "hub-imposter", pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD),
-        ):
-            probe = wl.Hub()
-            probe.process, probe.log = worker2.process, worker2.log
-            probe.epoch, probe.record_owner_id = epoch, controller
-            probe.connect(addr, claim_only=True)
-            ack = probe.wait(
-                lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None,
-                args.observe,
-                "the claim verdict",
-            )
-            wl.check(
-                f"after a restart, epoch {epoch} as {controller!r} is refused "
-                f"{pb.ClaimRejection.Name(expect)}",
-                not ack.accepted and ack.rejection == expect,
-                f"accepted={ack.accepted} rejection={pb.ClaimRejection.Name(ack.rejection)}",
-            )
-            probe.close()
-        keeper = wl.Hub()
-        keeper.epoch, keeper.record_owner_id = 5, "hub-authority"
-        keeper.process, keeper.log = worker2.process, worker2.log
-        keeper.directive = wl.serving_directive(
-            stage_development(worker2.home, Path(base + "-ownership") / "project").placement,
-            pb.Posture.POSTURE_ACCEPTING,
-        )
-        keeper.connect(addr)
-        ack = keeper.wait(
-            lambda m: m.claim_ack if m.WhichOneof("msg") == "claim_ack" else None,
-            args.observe,
-            "the keeper's claim verdict",
-        )
-        wl.check(
-            "and the owner that HELD the epoch reclaims it",
-            ack.accepted,
-            f"epoch 5 / hub-authority accepted at generation {ack.control_stream_generation}",
-        )
-        keeper.close()
-    finally:
-        worker2.stop()
-        worker2.hub.close()
-
-
 def section_window(args: argparse.Namespace, base: str) -> None:
     """#494f: the admission window is ONE and there is no invisible queue behind it."""
     wl.head("13. the admission window is one, and the snapshot holds everything held")
     tmp = Path(base + "-window")
-    worker, ids = start_weightless(tmp, instance_id="ins-window", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     # No acks: both attempts stay the worker's, so the snapshot has to name both. An acked
     # terminal would leave the snapshot legitimately, which would weaken the count.
@@ -774,7 +504,7 @@ def section_window(args: argparse.Namespace, base: str) -> None:
         )
         body = wl.terminal_body(terminal_for(hub, "req-overflow", args.observe, since))
         wl.check(
-            "an offer over the window is a JOURNALED REFUSED outcome, not an invisible hold",
+            "an offer over the window is a RECORDED REFUSED outcome, not an invisible hold",
             body["status"] == 2
             and body["cause"]["code"] == 17  # CAUSE_CODE_NO_CAPACITY
             and body["cause"]["origin"] == 4  # CAUSE_ORIGIN_WORKER
@@ -829,7 +559,7 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
     """The live-delivery race: a reconnect must not swallow the next stream's frames."""
     wl.head("14. after a replay-bearing claim, a NEW attempt's terminal arrives LIVE")
     tmp = Path(base + "-delivery")
-    worker, ids = start_weightless(tmp, instance_id="ins-delivery", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     hub.auto_ack = False  # every claim's snapshot replays this, so every round carries one
     try:
@@ -875,205 +605,15 @@ def section_live_delivery(args: argparse.Namespace, base: str) -> None:
             f"{delivered}/4 rounds delivered live; the superseded stream's sender drains "
             "its OWN queue and can no longer consume the live stream's frames",
         )
-        journaled = [
+        dropped = [
             line
             for line in worker.log.read_text(errors="replace").splitlines()
             if "outlived its stream" in line
         ]
         wl.check(
             "and no frame is dropped as having outlived its stream",
-            not journaled,
-            f"{len(journaled)} drop notes in the worker log",
-        )
-    finally:
-        worker.stop()
-        hub.close()
-
-
-def section_claim_convergence_fence(args: argparse.Namespace, base: str) -> None:
-    """A claim stays responsive during convergence and snapshots both honest clocks."""
-    wl.head("15. claim and snapshot stay live while convergence works off-stream")
-    tmp = Path(base + "-claim-convergence")
-    worker, ids = start_weightless(tmp, instance_id="ins-claim-convergence", fresh=True)
-    old = worker.hub
-    successor = wl.Hub()
-    successor.process, successor.log = worker.process, worker.log
-    successor.directive = wl.serving_directive(
-        RELEASE + "-replacement",
-        sorted(ids.values()),
-        pb.Posture.POSTURE_ACCEPTING,
-        worker.home / "binding-plans",
-        revision=2,
-    )
-    entered = tmp / "replacement-entered"
-    release = tmp / "replacement-release"
-    connected = threading.Event()
-    connect_error: list[BaseException] = []
-
-    def claim() -> None:
-        try:
-            successor.connect(wl.read_addr(worker.root, worker.process))
-        except BaseException as exc:
-            connect_error.append(exc)
-        finally:
-            connected.set()
-
-    try:
-        old.ready(ids["tick"], args.observe * 4)
-        old_generation = old.generation
-
-        # The changed release identity forces a fresh executor while retaining the complete
-        # visible-entrypoint plan set the canonical reader requires. Its real import records
-        # that it entered, then waits for the harness to release it; the worker is therefore
-        # blocked inside the actual prepare RPC, halfway through revision-2 convergence.
-        gate = (
-            "import time as _time\n"
-            "from pathlib import Path as _Path\n"
-            f"_Path({str(entered)!r}).write_text('entered')\n"
-            f"while not _Path({str(release)!r}).exists(): _time.sleep(0.01)\n"
-        )
-        (tmp / "project" / "lifecycle_package.py").write_text(gate + PACKAGE_SOURCE)
-        old.send(pb.RecordOwnerFrame(desired_state=old._env(successor.directive)))
-        deadline = time.monotonic() + args.observe
-        while not entered.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not entered.exists():
-            raise TimeoutError("the replacement executor never entered its package import")
-
-        claimant = threading.Thread(target=claim, daemon=True, name="claim-during-convergence")
-        claimant.start()
-        claimant.join(args.observe)
-        early_acks = [m for m in list(successor.seen) if m.WhichOneof("msg") == "claim_ack"]
-        wl.check(
-            "a successor claim ACKS while slow convergence remains blocked",
-            len(early_acks) == 1 and connected.is_set(),
-            f"convergence is blocked in a real prepare RPC; successor emitted "
-            f"{len(early_acks)} ClaimAck frame(s)",
-        )
-        if connect_error:
-            raise connect_error[0]
-        if not successor.connected.wait(args.observe):
-            raise TimeoutError("the successor never acknowledged its snapshot")
-
-        snapshot = successor.snapshot_document
-        wl.check(
-            "the successor snapshot reports accepted intent ahead of observed convergence",
-            int(snapshot.get("accepted_desired_state_revision", 0)) == 2
-            and int(snapshot.get("converged_revision", 0)) == 1,
-            f"snapshot accepted={snapshot.get('accepted_desired_state_revision')} "
-            f"converged={snapshot.get('converged_revision')}",
-        )
-
-        release.touch()
-        converged = successor.ready(ids["tick"], args.observe * 4)
-        wl.check(
-            "the off-stream lane converges after the blocked import is released",
-            converged.converged_revision == 2,
-            f"converged_revision={converged.converged_revision}",
-        )
-
-        old_generations = {
-            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
-            for frame in list(old.seen)
-            if frame.WhichOneof("msg") is not None
-        }
-        successor_generations = {
-            getattr(frame, frame.WhichOneof("msg")).control_stream_generation
-            for frame in list(successor.seen)
-            if frame.WhichOneof("msg") is not None
-        }
-        wl.check(
-            "each stream's outgoing frames retain that stream's generation",
-            successor.generation > old_generation
-            and old_generations <= {old_generation}
-            and successor_generations <= {successor.generation},
-            f"old stream generations={sorted(old_generations)}, successor generations="
-            f"{sorted(successor_generations)}",
-        )
-    finally:
-        release.touch()
-        successor.close()
-        worker.stop()
-        old.close()
-
-
-def section_generation_replacement(args: argparse.Namespace, base: str) -> None:
-    """cr-024: exact release reuse, changed release replacement, then retirement."""
-    wl.head("16. executor generations: reuse exact, replace changed release, retire empty")
-    tmp = Path(base + "-generation")
-    worker, ids = start_weightless(tmp, instance_id="ins-generation", fresh=True)
-    hub = worker.hub
-    try:
-        first_report = hub.ready(ids["tick"], args.observe * 2)
-        first_pid = executor_pid_of(worker, args.observe)
-        first_generation = hub.deployment(first_report).executor_generation
-
-        since = hub.mark()
-        exact = wl.serving_directive(
-            RELEASE,
-            sorted(ids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            worker.home / "binding-plans",
-            revision=2,
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(exact)))
-        exact_report = hub.ready(ids["tick"], args.observe * 2, since=since)
-        exact_pid = executor_pid_of(worker, args.observe)
-        exact_generation = hub.deployment(exact_report).executor_generation
-        wl.check(
-            "reapplying the exact prepared construction/binding set reuses its process",
-            (exact_pid, exact_generation) == (first_pid, first_generation),
-            f"pid {first_pid}->{exact_pid}, generation {first_generation}->{exact_generation}",
-        )
-
-        since = hub.mark()
-        changed = wl.serving_directive(
-            RELEASE + "-replacement",
-            sorted(ids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            worker.home / "binding-plans",
-            revision=3,
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(changed)))
-        changed_report = hub.ready(ids["tick"], args.observe * 2, since=since)
-        changed_pid = executor_pid_of(worker, args.observe)
-        changed_generation = hub.deployment(changed_report).executor_generation
-        wl.check(
-            "a changed release publishes one successor only after the old PID is gone",
-            changed_pid != first_pid
-            and changed_generation == first_generation + 1
-            and pid_gone(first_pid, args.observe, "replaced executor"),
-            f"pid {first_pid}->{changed_pid}, generation {first_generation}->{changed_generation}",
-        )
-
-        since = hub.mark()
-        empty_set = pb.PlacementSet()
-        empty_bytes, empty_digest = wl.documents.identity(empty_set)
-        empty = pb.DesiredWorkerState(
-            revision=4,
-            posture=pb.Posture.POSTURE_ACCEPTING,
-            wire_minor=wl.WIRE_MINOR,
-            placement_set=pb.DesiredPlacementSet(
-                placement_set_digest=empty_digest,
-                placement_set_canonical_bytes=empty_bytes,
-            ),
-        )
-        hub.send(pb.RecordOwnerFrame(desired_state=hub._env(empty)))
-        hub.wait(
-            lambda m: (
-                m.observed_state
-                if m.WhichOneof("msg") == "observed_state"
-                and m.observed_state.accepted_desired_state_revision == 4
-                else None
-            ),
-            args.observe * 2,
-            "empty desired state applied",
-            since,
-        )
-        wl.check(
-            "an explicit empty placement set retires without spawning an unused successor",
-            pid_gone(changed_pid, args.observe, "empty-state executor"),
-            f"pid {changed_pid} is absent and the worker owns no executor child",
+            not dropped,
+            f"{len(dropped)} drop notes in the worker log",
         )
     finally:
         worker.stop()
@@ -1085,7 +625,7 @@ def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
 
     wl.head("16. idle executor liveness: withdraw immediately, rebuild on the device lane")
     tmp = Path(base + "-idle-liveness")
-    worker, ids = start_weightless(tmp, instance_id="ins-idle-liveness", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     try:
         initial = hub.ready(ids["hold"], args.observe * 2)
@@ -1186,9 +726,8 @@ def section_idle_executor_liveness(args: argparse.Namespace, base: str) -> None:
 
 def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     """cr-024: exercise supervision directly, including races the wire serializes."""
-    from cozy_runtime.internal import accel, proctree
-    from cozy_runtime.internal.worker import child as child_module
-    from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
+    from cozy_runtime.internal import accel, descriptor, proctree
+    from cozy_runtime.internal.discovery import discover
     from cozy_runtime.internal.worker.child import (
         ExecutorGone,
         ExecutorSupervision,
@@ -1201,7 +740,9 @@ def section_supervision_atomicity(args: argparse.Namespace, base: str) -> None:
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True)
     root.mkdir(parents=True)
-    staged = stage_development(home, project)
+    write_weightless_project(project)
+    descriptor_path = tmp / "package-descriptor.json"
+    descriptor_path.write_bytes(descriptor.canonical_bytes(descriptor.build(discover(project))))
     detached_file = tmp / "detached.pid"
     package = project / "lifecycle_package.py"
     package.write_text(
@@ -1298,7 +839,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
             "cmd": "prepare",
             "binding": {
                 "application": "lifecycle_package:app",
-                "package_descriptor": str(staged.descriptor),
+                "package_descriptor": str(descriptor_path),
                 "model_class": "",
             },
             "budgets": {},
@@ -1407,7 +948,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
             "cmd": "prepare",
             "binding": {
                 "application": "missing_package:app",
-                "package_descriptor": str(staged.descriptor),
+                "package_descriptor": str(descriptor_path),
                 "model_class": "",
             },
             "budgets": {},
@@ -1418,67 +959,6 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
         "a failed first prepare still consumes and poisons the generation",
         not failed_prepare.get("ok") and refused_retry.get("code") == "generation_already_prepared",
         f"first={failed_prepare.get('code')} second={refused_retry.get('code')}",
-    )
-    previous_reclaim_seconds = child_module.RECLAIM_SECONDS
-    child_module.RECLAIM_SECONDS = 0.2
-    refused_unproven = False
-    blocked_detail = "reclaim unexpectedly returned"
-    cancel = AttemptRecord("req-reclaim", 1, b"digest", {}, executor=guarded_executor)
-    cancel.state = "running"
-    cancel.canceling = "client"
-    cancel.executor_generation = guarded_executor.incarnation
-    cancel_engine: Any = AttemptEngine.__new__(AttemptEngine)
-    cancel_engine.supervision = guarded
-    try:
-        cancel_engine.escalate(cancel, 0.2)
-    except ExecutorGone:
-        retained_owner = guarded._read_owner()
-        refused_unproven = (
-            guarded.current is guarded_executor
-            and cancel.state == "reclaiming"
-            and not cancel.reclaim_done.wait(0.05)
-            and retained_owner is not None
-            and bool(retained_owner.members)
-        )
-        blocked_detail = (
-            f"state={cancel.state} done={cancel.reclaim_done.is_set()} "
-            f"owner_retained={guarded.current is guarded_executor} "
-            f"durable_members={len(retained_owner.members) if retained_owner else 0} "
-            f"pid={guarded_executor.pid}"
-        )
-    finally:
-        reclaim_proven = True
-        child_module.RECLAIM_SECONDS = previous_reclaim_seconds
-    finalization_finished = threading.Event()
-
-    def buffered_reply() -> None:
-        cancel.await_reclaim_before_finalizing()
-        finalization_finished.set()
-
-    reply_thread = threading.Thread(target=buffered_reply, daemon=True)
-    reply_thread.start()
-    buffered_reply_blocked = not finalization_finished.wait(0.05)
-    completed_after_proof = False
-    try:
-        cancel_engine.escalate(cancel, 0.2)
-        reply_thread.join(1)
-        completed_after_proof = (
-            cancel.reclaim_done.is_set()
-            and finalization_finished.is_set()
-            and cancel.state == "finalizing"
-            and guarded.current is None
-        )
-    finally:
-        guarded.close()
-    wl.check(
-        "an unreadable driver observation blocks cancel and a buffered final reply",
-        refused_unproven and buffered_reply_blocked,
-        blocked_detail,
-    )
-    wl.check(
-        "the same cancel completes only after a retry proves exact driver reclaim",
-        completed_after_proof,
-        f"done={cancel.reclaim_done.is_set()} current={guarded.current}",
     )
 
     # A restart can find the durable leader gone while a detached descendant remains. The
@@ -1532,7 +1012,7 @@ while not __import__("pathlib").Path({str(detached_file)!r}).exists():
     finally:
         leaderless.close()
     wl.check(
-        "restart recovery reclaims a detached descendant after its exact leader is gone",
+        "restart orphan sweep reclaims a detached descendant after its exact leader is gone",
         killed == [] and pid_gone(helper.pid, args.observe, "leaderless descendant"),
         f"leader {leader.pid} absent; detached helper birth {helper} was reclaimed by scope",
     )
@@ -1577,7 +1057,7 @@ def section_executor_egress(args: argparse.Namespace, base: str) -> None:
 
     threading.Thread(target=accept_forever, daemon=True).start()
 
-    worker, ids = start_weightless(tmp, instance_id="ins-egress", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     try:
         hub.ready(ids["dial_native"], args.observe * 4)
@@ -1636,13 +1116,8 @@ def section_executor_egress(args: argparse.Namespace, base: str) -> None:
 SECTIONS = {
     "reconnect": section_reconnect,
     "boot-failure": section_boot_failure,
-    "undurable": section_undurable,
-    "identity": section_identity,
-    "ownership": section_ownership,
     "window": section_window,
     "live-delivery": section_live_delivery,
-    "claim-convergence": section_claim_convergence_fence,
-    "generation-replacement": section_generation_replacement,
     "idle-liveness": section_idle_executor_liveness,
     "supervision-atomicity": section_supervision_atomicity,
     "egress": section_executor_egress,
@@ -1662,7 +1137,7 @@ def main() -> int:
     parser.add_argument(
         "--core-only",
         action="store_true",
-        help="stop after boot/invoke/cancel/executor-crash/worker-crash/restart",
+        help="stop after boot/invoke/cancel/executor-crash/worker-crash/fresh-process",
     )
     parser.add_argument(
         "--only",
@@ -1691,7 +1166,7 @@ def main() -> int:
         return 1 if wl.FAIL else 0
 
     wl.head("1. boot: weightless worker, no card, no CAS")
-    worker, ids = start_weightless(tmp, instance_id="ins-lifecycle", fresh=True)
+    worker, ids = start_weightless(tmp, fresh=True)
     hub = worker.hub
     try:
         try:
@@ -1902,30 +1377,18 @@ def main() -> int:
         )
         hub.close()
 
-        wl.head("6. recovery: restart on the same root, journal converges")
-        t3 = time.perf_counter()
-        worker2, ids2 = start_weightless(tmp, instance_id="ins-lifecycle", fresh=False)
+        wl.head("6. fresh process: Runtime owns no restart state")
+        worker2, ids2 = start_weightless(tmp, fresh=False)
         hub2 = worker2.hub
         try:
-            terminal = hub2.wait(
-                lambda m: (
-                    m.attempt_outcome
-                    if m.WhichOneof("msg") == "attempt_outcome"
-                    and m.attempt_outcome.request_id == "req-orphan"
-                    else None
-                ),
-                args.observe * 2,
-                "recovered terminal for the interrupted attempt",
-            )
-            body = wl.terminal_body(terminal)
             wl.check(
-                "the interrupted attempt converges to a typed terminal on restart",
-                body["status"] in (3, 5),
-                f"{(time.perf_counter() - t3) * 1000:.0f} ms restart->replayed terminal, "
-                f"status={body['status']} cause={body.get('cause', {}).get('code', '')}",
+                "the fresh Runtime snapshot contains no previous-process attempt",
+                not hub2.snapshot and not hub2.terminals("req-orphan"),
+                f"snapshot={hub2.snapshot}, terminals={len(hub2.terminals('req-orphan'))}; "
+                "the outer RecordOwner owns settlement",
             )
             hub2.ready(ids2["tick"], args.observe * 2)
-            wl.check("worker DISPATCHABLE again after recovery", True, "second boot serves")
+            wl.check("the fresh process becomes DISPATCHABLE", True, "second boot serves")
         finally:
             worker2.stop()
             hub2.close()

@@ -28,14 +28,12 @@ import json
 import os
 import queue
 import re
-import resource
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -575,28 +573,6 @@ def binding_record(plan_id: str, entrypoint: str) -> dict[str, Any]:
     }
 
 
-def prefill_journal(root: Path, target_bytes: int) -> int:
-    """Grow a REAL journal to just under the planted file-size limit, using the real writer.
-
-    The ENOSPC plant used to be `RLIMIT_FSIZE=440` against an empty journal, on the reasoning
-    that the journal was the one regular file the worker wrote. Since tfs-007 that is no
-    longer true: registering a GC-safe read hold updates the STORE's own state file (502 B),
-    so a 440 B limit now kills PREPARATION and the arm never reaches its subject. Growing the
-    journal first keeps the limit comfortably above everything else the worker writes while
-    still making the ACCEPTANCE append the write that fails — which is the arm.
-    """
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal.journal import Journal
-
-    path = root / "journal.log"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    journal = Journal(path)
-    while path.stat().st_size < target_bytes:
-        journal.append("session", {"session_id": "pre-fill", "instance_id": "pre-fill"})
-    journal.close()
-    return path.stat().st_size
-
-
 def working_store(at: Path) -> str:
     """A HARDLINKED working copy of the read-only bench CAS: a TensorFS lease registers a
     GC-safe hold, which is a write, and the bench store is read-only by standing rule."""
@@ -734,13 +710,11 @@ def start_worker(
     tmp: Path,
     *,
     entrypoints: tuple[str, ...] = ("denoise",),
-    instance_id: str = "",
     hub: Hub | None = None,
     no_warm: bool = False,
     grace: float = 3.0,
     posture: pb.Posture = pb.Posture.POSTURE_ACCEPTING,
     extra: tuple[str, ...] = (),
-    rlimit_fsize: int = 0,
     store: str = "",
     overrides: dict[str, Any] | None = None,
     release: str = RELEASE,
@@ -879,8 +853,6 @@ def start_worker(
         f"unix:{socket_path}",
         "--root",
         str(root),
-        "--instance-id",
-        instance_id or f"ins-{uuid.uuid4().hex[:12]}",
         "--release-id",
         release,
         "--python",
@@ -896,26 +868,12 @@ def start_worker(
         *extra,
     ]
 
-    # stdout is a PIPE, not the log file, and this process copies it. RLIMIT_FSIZE (the
-    # ENOSPC plant) applies to regular files and not to pipes, so the plant bites exactly
-    # the journal — the one regular file the worker writes — instead of also killing
-    # its ability to say what happened.
-    def plant_disk_full() -> None:
-        """HARNESS-SIDE fault injection: cap the child's file size so the journal's next
-        append gets a REAL kernel error (EFBIG), the ENOSPC class. It runs in the harness's
-        forked child before exec, so the runtime carries no plant switch of its own. stdout
-        is a PIPE and pipes are not subject to RLIMIT_FSIZE, so the plant bites exactly the
-        journal — the one regular file the worker writes."""
-        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (rlimit_fsize, rlimit_fsize))
-
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
         bufsize=0,
-        preexec_fn=plant_disk_full if rlimit_fsize else None,
     )
     threading.Thread(target=_pump, args=(process, log), daemon=True).start()
     hub.process, hub.log = process, log
@@ -1451,7 +1409,7 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
         terminal_at = time.perf_counter()
         body = terminal_body(terminal)
         check(
-            "the worker journaled a TYPED terminal for the lost attempt",
+            "the worker recorded a TYPED terminal for the lost attempt",
             body["status"] == 5 and body["cause"]["code"] == 16,
             f"ABANDONED/EXECUTOR_INVALIDATED in "
             f"{(terminal_at - killed_at) * 1000:.0f} ms — {body['safe_message'][:70]}",
@@ -1513,7 +1471,7 @@ def section_kill(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def section_rollback(args: argparse.Namespace) -> dict[str, Any]:
-    """A fill exception: the journal records it AND the device actually gets its bytes back."""
+    """A fill exception is recorded and the device gets its bytes back."""
     tmp = Path(args.tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -1981,7 +1939,7 @@ def section_arms(args: argparse.Namespace) -> None:
         canceled_at = time.perf_counter()
         body = terminal_body(terminal)
         check(
-            "CANCELED is journaled only after the handler is provably gone",
+            "CANCELED is recorded only after the handler is provably gone",
             body["status"] == 4 and body["cause"]["code"] == 11,
             f"{(canceled_at - cancel_at) * 1000:.0f} ms cancel->terminal "
             f"(grace 2.0 s) — {body['safe_message'][:70]}",
@@ -1993,12 +1951,12 @@ def section_arms(args: argparse.Namespace) -> None:
                 break
             time.sleep(0.2)
         check(
-            "the ordering is kill -> output abort -> epoch invalidation -> journal",
+            "the ordering is kill -> output abort -> epoch invalidation -> outcome record",
             bool(forceful),
             forceful[0].split("cancel: forceful: ")[-1] if forceful else "no kill facts",
         )
 
-        head("a terminal ack that does not BIND the journaled terminal")
+        head("a terminal ack that does not BIND the recorded terminal")
         # The forceful cancel above killed the executor; readiness is rebuilt AFTER, off the
         # cancellation critical path, so this waits for a FRESH ready report.
         hub.ready(plan_id, 400, since=hub.mark())
@@ -2100,181 +2058,6 @@ def section_arms(args: argparse.Namespace) -> None:
     finally:
         summary = _shutdown(worker)
         print(f"  worker summary: {json.dumps(summary)}", flush=True)
-        _gpu_clean(idle)
-
-
-def section_journal(args: argparse.Namespace) -> None:
-    """Journal honesty, executor honesty, and the worker restart."""
-    tmp = Path(args.tmp)
-    project = ROOT / "examples" / "marco-polo"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    idle = gpu_used_mib()
-
-    head("a journal that cannot durably commit acknowledges NOTHING and executes NOTHING")
-    # 2,300 B leaves room for the session, ownership and accepted PlacementSet rows under
-    # the 4,096 B limit, and none for the attempt acceptance after them. Grown too far, the
-    # plant bites during claim/convergence and the arm never reaches its subject.
-    grown = prefill_journal(tmp / "worker", 2300)
-    print(f"  the journal starts at {grown} B under a 4096 B planted file-size limit")
-    worker = start_worker(
-        tmp,
-        entrypoints=("marco",),
-        no_warm=True,
-        rlimit_fsize=4096,
-        weightless_project=project,
-    )
-    hub = worker.hub
-    plan_id = worker.plans["marco"]
-    try:
-        hub.ready(plan_id, 400)
-        dispatch(
-            hub,
-            tmp,
-            plan_id,
-            request_id="req-enospc",
-            payload={"message": "marco"},
-            outputs=0,
-        )
-        time.sleep(5.0)
-        accepted = hub.accepted("req-enospc")
-        terminals = hub.terminals("req-enospc")
-        stopped = worker.tail("journal:", 2)
-        check(
-            "no acceptance, no terminal, no execution",
-            not accepted and not terminals and bool(stopped),
-            (stopped[-1].split("journal: ")[-1][:150] if stopped else "no journal note"),
-        )
-        summary = _shutdown(worker)
-        check(
-            "and the attempt's host envelope was not left charged",
-            bool(summary) and summary["ledger"]["host_ram"]["charged"] == 0,
-            f"host ledger {summary.get('ledger', {}).get('host_ram')} — an acceptance "
-            "that could not be journaled releases what it reserved",
-        )
-    finally:
-        worker.hub.close()
-        _gpu_clean(idle)
-
-    head("a corrupted journal refuses to serve rather than guessing")
-    tmp2 = Path(args.tmp + "-corrupt")
-    shutil.rmtree(tmp2, ignore_errors=True)
-    tmp2.mkdir(parents=True)
-    worker = start_worker(
-        tmp2,
-        entrypoints=("marco",),
-        no_warm=True,
-        instance_id="ins-fixed",
-        weightless_project=project,
-    )
-    try:
-        plan_id = worker.plans["marco"]
-        worker.hub.ready(plan_id, 400)
-        dispatch(
-            worker.hub,
-            tmp2,
-            plan_id,
-            request_id="req-j",
-            payload={"message": "marco"},
-            outputs=0,
-        )
-        worker.hub.wait(
-            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
-            300,
-            "terminal",
-        )
-        _shutdown(worker)
-        worker.hub.close()
-        journal = tmp2 / "worker" / "journal.log"
-        data = bytearray(journal.read_bytes())
-        target = len(data) // 2
-        data[target] = data[target] ^ 0x20
-        journal.write_bytes(bytes(data))
-        restarted = start_worker(
-            tmp2,
-            entrypoints=("marco",),
-            no_warm=True,
-            instance_id="ins-fixed",
-            connect=False,
-            weightless_project=project,
-        )
-        code = restarted.process.wait(timeout=60)
-        check(
-            "a corrupted journal is a refusal to start, not a fresh start",
-            code == 1,
-            f"exit {code}: "
-            f"{restarted.log.read_text(errors='replace').strip().splitlines()[-1][:120]}",
-        )
-        restarted.hub.close()
-    finally:
-        _gpu_clean(idle)
-
-    head("worker restart: a NEW session that reports its recovered journal FIRST")
-    tmp3 = Path(args.tmp + "-restart")
-    shutil.rmtree(tmp3, ignore_errors=True)
-    tmp3.mkdir(parents=True)
-    worker = start_worker(
-        tmp3,
-        entrypoints=("marco",),
-        no_warm=True,
-        instance_id="ins-stable",
-        weightless_project=project,
-    )
-    hub = worker.hub
-    try:
-        plan_id = worker.plans["marco"]
-        hub.ready(plan_id, 400)
-        hub.auto_ack = False
-        dispatch(
-            hub,
-            tmp3,
-            plan_id,
-            request_id="req-restart",
-            payload={"message": "marco"},
-            outputs=0,
-        )
-        terminal = hub.wait(
-            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
-            300,
-            "terminal",
-        )
-        first_bytes = terminal.outcome_canonical_bytes
-        first_boot = hub.session()
-        worker.process.send_signal(signal.SIGKILL)
-        worker.process.wait(timeout=20)
-        worker.hub.close()
-        restarted = start_worker(
-            tmp3,
-            entrypoints=("marco",),
-            no_warm=True,
-            instance_id="ins-stable",
-            weightless_project=project,
-        )
-        hub2 = restarted.hub
-        check(
-            "the restart minted a NEW worker boot id, never an epoch bump",
-            hub2.boot_id != first_boot and hub2.epoch == 1,
-            f"{first_boot} -> {hub2.boot_id} (owner epoch still {hub2.epoch})",
-        )
-        check(
-            "the recovered journal rides the SNAPSHOT, before any next ordinal (02 §6)",
-            len(hub2.snapshot) == 1 and hub2.snapshot[0]["request_id"] == "req-restart",
-            f"{len(hub2.snapshot)} recovered: state "
-            + (pb.AttemptState.Name(hub2.snapshot[0]["state"]) if hub2.snapshot else "-"),
-        )
-        replay = hub2.wait(
-            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
-            60,
-            "replayed terminal",
-        )
-        check(
-            "the SAME body is re-wrapped in a fresh envelope, byte for byte",
-            replay.outcome_canonical_bytes == first_bytes and replay.worker_boot_id == hub2.boot_id,
-            f"{len(first_bytes)} identical canonical bytes, id {replay.outcome_id}",
-        )
-        _shutdown(restarted)
-        restarted.hub.close()
-    finally:
         _gpu_clean(idle)
 
 
@@ -2524,107 +2307,6 @@ def section_acceptance(args: argparse.Namespace) -> None:
         _gpu_clean(idle)
 
 
-def section_abandon(args: argparse.Namespace) -> None:
-    """Worker death AFTER acceptance and BEFORE any terminal."""
-    tmp = Path(args.tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    idle = gpu_used_mib()
-    worker = start_worker(
-        tmp, entrypoints=("denoise", "stubborn"), no_warm=True, instance_id="ins-abandon"
-    )
-    hub = worker.hub
-    stubborn_id = plan_id_for("stubborn")
-    try:
-        hub.ready(stubborn_id, 400)
-        head("kill -9 the WORKER while an accepted attempt is running")
-        dispatch(
-            hub,
-            tmp,
-            stubborn_id,
-            request_id="req-lost",
-            payload={"steps": 900, "latent": 80},
-            outputs=0,
-        )
-        hub.wait(
-            lambda m: (
-                m.attempt_accepted
-                if m.WhichOneof("msg") == "attempt_accepted"
-                and m.attempt_accepted.request_id == "req-lost"
-                else None
-            ),
-            120,
-            "accepted",
-        )
-        time.sleep(2.0)
-        check(
-            "the attempt is accepted with no terminal",
-            not hub.terminals("req-lost"),
-            "journaled ACCEPTED, running, nothing shipped",
-        )
-        worker.process.send_signal(signal.SIGKILL)
-        worker.process.wait(timeout=20)
-        worker.hub.close()
-
-        head("the restarted worker mints the terminal the dead one owed")
-        restarted = start_worker(
-            tmp, entrypoints=("denoise", "stubborn"), no_warm=True, instance_id="ins-abandon"
-        )
-        hub2 = restarted.hub
-        check(
-            "the recovered attempt rides the SNAPSHOT as TERMINAL-PENDING-ACK",
-            len(hub2.snapshot) == 1
-            and hub2.snapshot[0]["state"] == pb.AttemptState.ATTEMPT_STATE_OUTCOME_PENDING_ACK,
-            "recovery mints a durable terminal, never a live attempt with no plan",
-        )
-        terminal = hub2.wait(
-            lambda m: m.attempt_outcome if m.WhichOneof("msg") == "attempt_outcome" else None,
-            60,
-            "ABANDONED",
-        )
-        body = terminal_body(terminal)
-        check(
-            "it is ABANDONED / EXECUTOR_INVALIDATED, journaled and replayable",
-            body["status"] == 5 and body["cause"]["code"] == 16,
-            body["safe_message"][:120],
-        )
-
-        head("a duplicate StartAttempt for that ordinal replays, and starts nothing")
-        mark = hub2.mark()
-        dispatch(
-            hub2,
-            tmp,
-            stubborn_id,
-            request_id="req-lost",
-            payload={"steps": 900, "latent": 80},
-            outputs=0,
-        )
-        # The restarted worker is preparing its executor on the reader thread, so the
-        # duplicate waits behind that; it is queued, never lost.
-        hub2.wait(
-            lambda m: (
-                m.attempt_outcome
-                if m.WhichOneof("msg") == "attempt_outcome"
-                and m.attempt_outcome.request_id == "req-lost"
-                else None
-            ),
-            400,
-            "replayed terminal",
-            mark,
-        )
-        replays = hub2.terminals("req-lost")
-        check(
-            "the recovered terminal replays byte-for-byte; no plan is ever demanded",
-            len(replays) >= 2
-            and replays[0].outcome_canonical_bytes == replays[-1].outcome_canonical_bytes,
-            f"{len(replays)} terminals, identical bodies, id {replays[0].outcome_id}",
-        )
-        _shutdown(restarted)
-        restarted.hub.close()
-    finally:
-        _gpu_clean(idle)
-
-
 def section_results(args: argparse.Namespace) -> None:
     """Result truthfulness: serialized once, declared schema digest, ids not positions."""
     tmp = Path(args.tmp)
@@ -2813,18 +2495,21 @@ def pipeline_overrides() -> dict[str, Any]:
 
 
 def _ledger_rows(worker: Worker) -> list[dict[str, Any]]:
-    """Every journaled ledger reconciliation, in order, read from the DURABLE journal."""
-    out = []
-    for line in (worker.root / "journal.log").read_text(errors="replace").splitlines():
-        # Each journal line is `<sha256 of the canonical bytes> <canonical bytes>` — the
-        # digest is the record's own integrity fence, so the body starts after the space.
-        _, _, payload = line.partition(" ")
-        try:
-            row = json.loads(payload)
-        except ValueError:
+    """Every ledger reconciliation, verified through its terminal-bound triage bundle."""
+    out: list[dict[str, Any]] = []
+    for terminal in worker.hub.terminals():
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        ref = body.get("triage_bundle") or {}
+        subject = str(ref.get("subject_id", ""))
+        path = worker.root / "triage" / f"{subject}.json"
+        if not subject or not path.is_file():
             continue
-        if row.get("kind") == "ledger":
-            out.append(dict(row.get("body", {})))
+        raw = path.read_bytes()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if digest != ref.get("write_receipt_digest") or len(raw) != ref.get("length"):
+            raise RuntimeError(f"triage receipt mismatch for {subject}")
+        document = canonical.parse_canonical(raw)
+        out.append(dict(document.get("measurements", {}).get("ledger", {})))
     return out
 
 
@@ -3341,11 +3026,9 @@ def main() -> int:
             "rollback",
             "nocuda",
             "arms",
-            "journal",
             "seal",
             "tripwire",
             "acceptance",
-            "abandon",
             "results",
             "resident",
             "drift",
@@ -3374,11 +3057,9 @@ def main() -> int:
         "rollback": section_rollback,
         "nocuda": section_nocuda,
         "arms": section_arms,
-        "journal": section_journal,
         "seal": section_seal,
         "tripwire": section_tripwire,
         "acceptance": section_acceptance,
-        "abandon": section_abandon,
         "results": section_results,
         "resident": section_resident,
         "drift": section_drift,

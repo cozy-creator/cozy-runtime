@@ -652,7 +652,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         workspace=workspace,
         package_revision_digest=RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=RELEASE, no_warm=True),
-        delete_journal=False,
+        delete_workspace=False,
     )
     out_path.write_text(json.dumps(dataclasses.asdict(outcome), default=str))
 

@@ -257,7 +257,7 @@ class ExecutorSupervision:
         self.root.mkdir(parents=True, exist_ok=True)
         if self.isolated:
             # Group execute admits the fixed executor to the named socket/cancel paths but
-            # not to list or read the worker's journal, owner record, or credentials.
+            # not to list or read the worker's records, owner record, or credentials.
             os.chown(self.root, 0, self.executor_gid)
             self.root.chmod(0o710)
         self._scope_namespace = proctree.executor_scope_namespace(self.root)

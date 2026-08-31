@@ -536,7 +536,7 @@ def _split(value: Any) -> list[str]:
 
 
 def _bind_facts(outcome: SliceOutcome) -> dict[str, Any]:
-    """The `load` boot step's own record — where the bind's confession is journaled."""
+    """The `load` boot step's own record — where the bind's confession is recorded."""
     posture = (outcome.triage or {}).get("posture") or {}
     for step in posture.get("boot_steps", ()):
         if isinstance(step, dict) and step.get("step") == "load":

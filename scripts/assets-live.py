@@ -229,7 +229,7 @@ def exec_one(spec_path: Path, out_path: Path) -> None:
         workspace=workspace,
         package_revision_digest=S.RELEASE,
         options=WorkerOptions(root=workspace / "worker", release_id=S.RELEASE, no_warm=True),
-        delete_journal=False,
+        delete_workspace=False,
         record_owner_hook=hook,
     )
     out_path.write_text(json.dumps(dataclasses.asdict(outcome), default=str))
@@ -342,7 +342,7 @@ def kill() -> None:
     print(f"  status={outcome.get('status')} ended={outcome.get('ended')}")
     print(f"      {refusal_of(outcome)[:240]}")
     check(
-        "the run CONVERGED to a journaled terminal rather than hanging",
+        "the run CONVERGED to a recorded terminal rather than hanging",
         outcome.get("ended") == "terminal" and bool(outcome.get("terminal")),
         f"exit {outcome.get('exit_code')}, status {outcome.get('status')}",
     )
@@ -362,11 +362,11 @@ def kill() -> None:
         else "the handler won the race this time and produced a real terminal; the "
         "property under test is convergence, and a run that hung would fail either way",
     )
-    rows = [r.get("kind") for r in outcome.get("journal") or ()]
+    rows = [r.get("kind") for r in outcome.get("attempt_records") or ()]
     check(
-        "the journal carries the whole acceptance/terminal narrative",
+        "the records carry the whole acceptance/terminal narrative",
         "accepted" in rows and any(r in rows for r in ("outcome", "closed")),
-        f"journal events: {rows}",
+        f"records events: {rows}",
     )
     spool = Path(outcome["_workspace"]) / "worker" / "spool"
     leftover = [p for p in spool.rglob("inputs/*") if p.is_file()]
@@ -400,11 +400,11 @@ def arms() -> None:
         and outcome.get("status") != "OUTCOME_STATUS_SUCCEEDED",
         refusal_of(outcome)[:220],
     )
-    accepted = [r for r in outcome.get("journal") or () if r.get("event") == "accepted"]
+    accepted = [r for r in outcome.get("attempt_records") or () if r.get("kind") == "accepted"]
     check(
-        "and NOTHING was accepted — the refusal is before the journal",
+        "and NOTHING was accepted — the refusal is before the records",
         not accepted,
-        f"{len(accepted)} acceptance rows journaled",
+        f"{len(accepted)} acceptance rows recorded",
     )
 
     # ARM 2 — the bytes are not the type the grant declares.

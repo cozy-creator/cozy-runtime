@@ -10,7 +10,7 @@ somewhere inside a lifecycle path.
 
 The surface is the codex-named containment set: contained spawn support (the trampoline's
 seal steps), parent-death/orphan handling, forced tree kill, birth identity, and CPU/RSS
-metrics. Cooperative stop stays where it is — it is wire/journal semantics, not a platform
+metrics. Cooperative stop stays where it is — it is wire/control semantics, not a platform
 primitive. `spawn.py`'s `posix_spawn` call is POSIX-portable and is not wrapped.
 """
 

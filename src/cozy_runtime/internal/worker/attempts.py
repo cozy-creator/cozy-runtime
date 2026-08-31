@@ -5,8 +5,8 @@ worker-protocol/02 fixes:
 
     VALIDATING  fences, digest recomputation over the resident bytes, local safety
     PREPARING   the PlanChooser fixes ONE plan; the ExecutorPreparer applies it
-    ACCEPTED    acceptance journaled (spec + plan + model-construction digests) FIRST
-    TERMINAL    the canonical TerminalBody journaled BEFORE it is sent, replayed byte-for-
+    ACCEPTED    acceptance recorded (spec + plan + model-construction digests) FIRST
+    TERMINAL    the canonical TerminalBody recorded BEFORE it is sent, replayed byte-for-
                 byte until a TerminalAck echoes its id AND its digest
     CLOSED      closure recorded
 
@@ -40,7 +40,6 @@ from typing import Any, cast
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import canonical, seam
-from cozy_runtime.internal.journal import Journal, JournalError
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
@@ -53,13 +52,14 @@ from cozy_runtime.internal.worker.plan import (
     PreparedModel,
     PreparedRequest,
 )
+from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
 #: only, no secrets, no local paths, no signed URLs. The document profile is integer-only
 #: and printable-ASCII, so an unsanitized message is not merely impolite — it cannot be
-#: canonicalized at all, and the terminal that carries it could not be journaled.
+#: canonicalized at all, and the terminal that carries it could not be recorded.
 _PATHY = re.compile(r"(file|https?)://\S+|(?<![\w.])/[\w./-]{4,}")
 
 
@@ -131,25 +131,6 @@ class InlineResult:
     canonical: bytes
     schema_digest: str
     adjustments: tuple[Mapping[str, Any], ...]
-
-
-class UndurableOutcome(Exception):
-    """This attempt's outcome could not be journaled, so it will not be sent (#494b).
-
-    Ack-after-journal has no exception for the last resort. An outcome the worker cannot
-    replay after a restart, and cannot match against a TerminalAck, is not a terminal — it is
-    a claim about bytes nobody wrote down. The attempt stays HELD in `local_fault`, the
-    worker takes a LOCAL_SAFETY_REFUSAL fault naming it and goes INTAKE_STATE_ERROR, and the
-    owner reads a worker that stopped rather than an outcome it can never close.
-    """
-
-    def __init__(self, attempt: AttemptRecord, why: str) -> None:
-        super().__init__(
-            f"{attempt.request_id}#{attempt.attempt}: the outcome could not be journaled "
-            f"({why}); it is held in local_fault and NOTHING was sent"
-        )
-        self.key = attempt.key()
-        self.why = why
 
 
 class AttemptRefusal(Exception):
@@ -297,7 +278,7 @@ class AttemptRecord:
         spec, the payload, the grant, the plan, the hydrated inputs, the observation ring,
         the reconciliation — was retained for the life of the process because nothing ever
         released it. The terminal BYTES go too: they can carry a 4 MiB inline result and the
-        journal already holds them, so `wrap` re-reads if a replay ever comes (codex audit,
+        process records already hold them, so `wrap` re-reads if a replay comes,
         adopted 2026-08-25).
         """
         self.spec = {}
@@ -344,7 +325,7 @@ class AttemptEngine:
     def __init__(
         self,
         *,
-        journal: Journal,
+        records: WorkerRecords,
         ledger: Ledger,
         chooser: Any,
         supervision: ExecutorSupervision,
@@ -362,7 +343,7 @@ class AttemptEngine:
         posture: Callable[[], dict[str, Any]],
         device_process: Callable[[], int],
     ) -> None:
-        self.journal = journal
+        self.records = records
         self.ledger = ledger
         self.chooser = chooser
         self.supervision = supervision
@@ -375,11 +356,8 @@ class AttemptEngine:
         self.prepared_models = dict(prepared_models)
         self.jobs = dict(jobs)
         self.spool_root = spool_root
-        #: Where a RUN's scratch lives. Deliberately OUTSIDE the journal root: §8 lets a
-        #: one-shot run delete its journal after a fully acknowledged terminal, and scratch
-        #: that lived under it would be deleted by exactly the ABANDONED terminal whose
-        #: whole point is that the next attempt resumes from what the killed one left.
-        #: Found live: the kill arm resumed from nothing until this moved out.
+        #: Where a run's scratch lives. Deliberately outside the disposable worker directory
+        #: so an acknowledged run can clean worker state without deleting resumable scratch.
         self.scratch_root = scratch_root
         self.instance_id = instance_id
         self.send = send
@@ -406,7 +384,7 @@ class AttemptEngine:
         #: planner, the ledger or the fill plane.
         self.demand = observe.DemandLedger()
         #: cr-009's DURABLE checkpoint ledger: (request_id, operation_key, logical_key) ->
-        #: the journaled receipt. Identity replays; the same key with different bytes is a
+        #: the recorded receipt. Identity replays; the same key with different bytes is a
         #: CONFLICT and never a replacement (§2).
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -421,13 +399,6 @@ class AttemptEngine:
 
     def offer(self, offered: pb.AttemptOffer) -> AttemptRecord:
         """VALIDATING: fences and local safety, before any body field is trusted."""
-        if self.journal.stopped:
-            raise AttemptRefusal(
-                "journal_stopped",
-                f"the journal cannot durably commit ({self.journal.stopped}); this worker "
-                "acknowledges nothing and executes nothing",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
         recomputed = documents.digest_of(offered.invocation_spec_canonical_bytes)
         if recomputed != offered.invocation_spec_digest:
             raise AttemptRefusal(
@@ -446,7 +417,7 @@ class AttemptEngine:
             ) from exc
 
         # The (attempt, digest) fence binds the ORDINAL, not the current state: an attempt
-        # is one execution of one spec whether it is running, journaled or already closed.
+        # is one execution of one spec whether it is running, recorded or already closed.
         known = self.history.get((offered.request_id, offered.attempt_ordinal))
         if known is not None and known.digest != offered.invocation_spec_digest:
             raise AttemptRefusal(
@@ -468,8 +439,8 @@ class AttemptEngine:
                 raise AttemptRefusal(
                     "live_attempt_supersession",
                     f"attempt {offered.attempt_ordinal} arrived while attempt "
-                    f"{held.attempt} is live with no journaled outcome: supersession is "
-                    "explicit (CancelAttempt(SUPERSEDED) -> journaled outcome -> ordinal+1), never "
+                    f"{held.attempt} is live with no recorded outcome: supersession is "
+                    "explicit (CancelAttempt(SUPERSEDED) -> recorded outcome -> ordinal+1), never "
                     "the arrival of a successor",
                     cause=CAUSE.CAUSE_CODE_PROTOCOL,
                 )
@@ -503,7 +474,7 @@ class AttemptEngine:
         Registering here and not at acceptance is what keeps the idempotency fences honest
         once acceptance moved off this thread: a second StartAttempt arriving while the
         first is still queued must find it, and a successor ordinal must see a live attempt
-        with no journaled terminal and refuse supersession.
+        with no recorded terminal and refuse supersession.
         """
         attempt.state = "queued"
         attempt.queued_at = time.perf_counter()
@@ -591,7 +562,7 @@ class AttemptEngine:
         run HANGS — `LocalRecordOwner` only deadlines a run that never dispatched. A 42,719 B
         request on the same path succeeds.
 
-        That violates the acceptance-boundary law directly: everything before the journal
+        That violates the acceptance-boundary law directly: everything before acceptance
         either completes or raises a typed PRE-ACCEPT refusal. So the size is a condition of
         acceptance, it is the CALLER's typed error (the bytes are theirs), and the refusal
         names both the cap and the remedy — media rides as ASSETS, hydrated into the attempt
@@ -725,7 +696,7 @@ class AttemptEngine:
         there is nothing to be warm FOR. Preparing before acceptance would only hold a rented
         pod idle while the RecordOwner waits to hear whether its work was taken.
 
-        What does NOT change: acceptance is journaled BEFORE anything runs, the payload is
+        What does NOT change: acceptance is recorded BEFORE anything runs, the payload is
         fetched and decoded here, the input trees are resolved under the grant here, and the
         envelope is reserved here. The preparation this admits is bounded by the attempt's own
         deadline, which the worker owns.
@@ -817,7 +788,7 @@ class AttemptEngine:
                         "the job executor changed before its acceptance could be committed",
                         cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                     )
-                self.journal.append(
+                self.records.append(
                     "accepted",
                     {
                         "request_id": attempt.request_id,
@@ -845,12 +816,12 @@ class AttemptEngine:
         """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
 
             resolve binding -> fetch/verify/decode the payload -> derive REAL features from
-            it -> choose the plan -> prepare the executor -> reserve the envelope -> JOURNAL
+            it -> choose the plan -> prepare the executor -> reserve the envelope -> RECORD
             -> publish AttemptAccepted.
 
-        Everything before the journal either completes or raises a typed PRE-ACCEPT refusal,
-        and the reservation rolls back if the journal cannot commit. The payload is fetched
-        HERE and not at execution time on purpose: a missing, expired or malformed payload
+        Everything before the process record either completes or raises a typed pre-accept
+        refusal. The payload is fetched here and not at execution time: a missing, expired
+        or malformed payload
         must be a refusal the RecordOwner can read, not an accepted attempt that later dies
         on a thread with no terminal to show for it.
 
@@ -992,7 +963,7 @@ class AttemptEngine:
                         "the prepared executor changed before acceptance could be committed",
                         cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                     )
-                self.journal.append(
+                self.records.append(
                     "accepted",
                     {
                         "request_id": attempt.request_id,
@@ -1014,7 +985,7 @@ class AttemptEngine:
                 )
         except Exception:
             # The envelope was granted a moment ago and nothing will ever run under it:
-            # an unjournaled acceptance must not leave the worker's host ledger charged.
+            # an unrecorded acceptance must not leave the worker's host ledger charged.
             self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             raise
         return self._accepted(attempt)
@@ -1029,7 +1000,7 @@ class AttemptEngine:
         if attempt.canceling:
             # Cancelled between arrival and dispatch — while it queued, or while admission
             # was fetching and hydrating it. Nothing reached the device, so the caller's
-            # cancel is complete the moment this terminal is journaled, and spending the
+            # cancel is complete the moment this terminal is recorded, and spending the
             # lease on an answer nobody is waiting for would be the opposite of honouring it.
             return self.finish_cancel(attempt, attempt.canceling)
         return self._run(attempt)
@@ -1067,11 +1038,7 @@ class AttemptEngine:
                 self.ledger.device_unreadable("the executor died before the ledger was read")
             record = self.ledger.close_attempt(key, attempt.opened)
             attempt.reconciliation = record
-            try:
-                self.journal.append("ledger", record)
-            except JournalError as exc:
-                record["journaled"] = False
-                record["journal_error"] = exc.code
+            self.records.append("ledger", record)
         if record["leaks"]:
             self.fault(
                 pb.Fault(
@@ -1133,24 +1100,22 @@ class AttemptEngine:
             "closed": False,
         }
         attempt.reconciliation = record
-        try:
-            self.journal.append("ledger", record)
-        except JournalError as exc:
-            record["journaled"] = False
-            record["journal_error"] = exc.code
+        self.records.append("ledger", record)
         return record
 
     # ------------------------------------------------------------------ the job lane
 
-    def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
-        """Answer ONE durable mid-attempt request from the executor (cr-009's checkpoints).
+    def checkpoint_exchange(
+        self, attempt: AttemptRecord, frame: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Answer one checkpoint declaration request from the executor.
 
         Identity is (run, attempt, operation key, logical key, content digest). The row is
-        JOURNALED — and fsynced, because that is what `Journal.append` does — before this
+        recorded before this
         returns.
 
         WHAT IS DURABLE HERE IS THE DECLARATION, NOT THE BYTES (#553a). This handler is where
-        the false promise was measurable: it fsyncs a metadata row and sends a
+        the false promise was measurable: it records a metadata row and sends a
         `JobCheckpointRequest` whose `artifact` field it never fills, so no component on
         either side ever copies the checkpoint. `Checkpoints.save()` used to report success
         on this answer; it now refuses `checkpoint_sink_unbuilt`, and `Checkpoints.declare()`
@@ -1159,7 +1124,7 @@ class AttemptEngine:
         attach real object references to when #552's transaction lands.
 
         Three answers and no fourth:
-          * a NEW identity is journaled and gets a fresh declaration id;
+          * a NEW identity is recorded and gets a fresh declaration id;
           * the SAME identity replays it and writes nothing a second time;
           * the same key with DIFFERENT bytes is a CONFLICT, never a replacement.
         """
@@ -1210,18 +1175,10 @@ class AttemptEngine:
             "length": int(frame.get("length", 0)),
             "receipt_id": receipt_id,
         }
-        try:
-            self.journal.append("job_checkpoint", record)
-        except JournalError as exc:
-            return {
-                "ok": False,
-                "code": "checkpoint_not_durable",
-                "detail": f"the journal cannot commit ({exc.code}); this worker acknowledges "
-                "no checkpoint declaration it cannot make durable",
-            }
+        self.records.append("job_checkpoint", record)
         self.receipts[key] = record
         # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
-        # journal, at-least-once like every other durable message (law 9). `artifact` stays
+        # record, at-least-once like every other control message. `artifact` stays
         # UNSET, and that is the honest state of this frame: no ArtifactSink exists to fill
         # it, so the RecordOwner is being told an attempt DECLARED a checkpoint and nothing
         # more (#552/#553a).
@@ -1249,10 +1206,10 @@ class AttemptEngine:
         return {"ok": True, "receipt_id": receipt_id, "replayed": False}
 
     def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
-        """Record the RecordOwner's verdict on a checkpoint this worker already journaled.
+        """Record the RecordOwner's verdict on a checkpoint this worker already recorded.
 
         It is a second observer, not a second authority: the declaration is already in this
-        worker's journal. A RecordOwner CONFLICT is a real fact and is journaled as a fault,
+        worker's process records. A RecordOwner conflict is recorded as a fault,
         because it means the run's identity is contested upstream — but it cannot
         retroactively un-write a declaration that is durable here.
         """
@@ -1270,7 +1227,7 @@ class AttemptEngine:
             )
 
     def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
-        """ONE attempt: dispatch, freeze point, tail, journaled terminal.
+        """ONE attempt: dispatch, freeze point, tail, recorded terminal.
 
         ONE pipeline for both lanes. They differ in the COMMAND they send and in nothing
         after the executor answers, and keeping two copies of everything after it had
@@ -1327,7 +1284,9 @@ class AttemptEngine:
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=(lambda frame: self.durable_exchange(attempt, frame)) if job else None,
+                on_request=(lambda frame: self.checkpoint_exchange(attempt, frame))
+                if job
+                else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -1349,7 +1308,7 @@ class AttemptEngine:
             if attempt.canceling:
                 # The cgroup can be empty before the driver proves every captured birth
                 # absent. Only the watchdog owns that proof/retry; EOF is not permission to
-                # journal CANCELED ahead of it.
+                # record CANCELED ahead of it.
                 attempt.reclaim_done.wait()
                 return self.finish_cancel(attempt, attempt.canceling)
             # A job's scratch tree deliberately SURVIVES — it is the run's, not the
@@ -1475,7 +1434,7 @@ class AttemptEngine:
                 shortfall=reply.get("shortfall") or None,
             )
         if not reply.get("quiescent"):
-            # No terminal is journaled while author computation might still mutate GPU or
+            # No terminal is recorded while author computation might still mutate GPU or
             # output state. Unproven quiescence is an executor fault, not a success.
             if attempt.executor is not None:
                 self.supervision.invalidate(attempt.executor, "unproven quiescence")
@@ -1485,7 +1444,7 @@ class AttemptEngine:
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 ORIGIN.CAUSE_ORIGIN_WORKER,
                 "the executor could not prove quiescence after the handler returned; a "
-                "terminal journaled under unproven quiescence would be a claim about state "
+                "terminal recorded under unproven quiescence would be a claim about state "
                 "that may still be moving",
             )
         if not reply.get("env_intact", True):
@@ -1806,17 +1765,7 @@ class AttemptEngine:
             grants.abort_outputs(spool)
             return None, f"{exc.code}: {exc.detail}"
         receipt = self._publication(attempt, entries)
-        try:
-            # DURABLE BEFORE IT IS CLAIMED, exactly like the triage bundle: a terminal may
-            # only name a receipt that already exists. The bytes are at their granted
-            # destinations by now, so a journal that cannot commit makes this a FAILED
-            # attempt naming why — never a publication nobody has a record of.
-            self.journal.append("publication", receipt.document())
-        except JournalError as exc:
-            return None, (
-                f"publication_not_durable: {exc.code} — this attempt wrote its outputs and "
-                "the worker cannot durably record what it published, so it claims nothing"
-            )
+        self.records.append("publication", receipt.document())
         attempt.publication = receipt.document()
         return pb.OutputManifest(publication_receipt_digest=receipt.digest(), outputs=entries), None
 
@@ -1867,12 +1816,12 @@ class AttemptEngine:
         result: InlineResult | None = None,
         shortfall: Mapping[str, Any] | None = None,
     ) -> pb.AttemptOutcome:
-        """CLOSE the ledger, commit the triage bundle, build, JOURNAL, then return to send.
+        """CLOSE the ledger, commit the triage bundle, build, RECORD, then return to send.
 
         The order is the whole point and none of it is negotiable:
 
             release the envelope -> reconcile every byte class -> WRITE and fsync the
-            bundle -> journal its write receipt -> journal the terminal that names it
+            bundle -> record its write receipt -> record the terminal that names it
 
         A terminal may only reference a bundle that is already durable, or it would be a
         claim about bytes nobody wrote. And the bundle is committed BEFORE the terminal so
@@ -1933,7 +1882,7 @@ class AttemptEngine:
         attempt.outcome_id = f"out-{uuid.uuid4().hex[:24]}"
         attempt.outcome_digest = digest
         attempt.outcome_bytes = canonical_bytes
-        self.journal.append(
+        self.records.append(
             "outcome",
             {
                 "request_id": attempt.request_id,
@@ -2028,7 +1977,7 @@ class AttemptEngine:
         )
         try:
             return self.bundles.commit(assembly)
-        except (triage.TriageError, JournalError, OSError) as exc:
+        except (triage.TriageError, OSError) as exc:
             self.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
@@ -2089,14 +2038,14 @@ class AttemptEngine:
         )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
-        """Wrap the SAME journaled body in the current session envelope. The body and accepted
+        """Wrap the SAME recorded body in the current session envelope. The body and accepted
         placement are byte facts; only ownership-envelope fields move across a reconnect.
 
-        A CLOSED attempt no longer holds those bytes in memory — the journal does, and this
-        is the one place that ever needs them again.
+        A closed attempt no longer holds those bytes on the attempt object; process records
+        do. This is the only path that needs them again.
         """
         if not attempt.outcome_bytes and attempt.outcome_id:
-            attempt.outcome_bytes = self.journal.outcome_bytes(attempt.key())
+            attempt.outcome_bytes = self.records.outcome_bytes(attempt.key())
         return pb.AttemptOutcome(
             request_id=attempt.request_id,
             attempt_ordinal=attempt.attempt,
@@ -2212,7 +2161,7 @@ class AttemptEngine:
         if held is None or held.attempt != message.attempt_ordinal:
             return "dropped: no such held attempt"
         if held.digest != message.invocation_spec_digest:
-            return "dropped: cancel digest does not match the journaled acceptance"
+            return "dropped: cancel digest does not match the recorded acceptance"
         with held.transition_lock:
             if held.state in ("finalizing", "outcome", "closed"):
                 return "ignored: the attempt already reached natural finalization"
@@ -2238,7 +2187,7 @@ class AttemptEngine:
 
     def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output
-        abort -> epoch invalidation -> journal CANCELED. Rebuilding readiness happens
+        abort -> epoch invalidation -> record CANCELED. Rebuilding readiness happens
         AFTER, off the cancellation critical path."""
         executor = attempt.executor
         started = time.perf_counter()
@@ -2285,7 +2234,7 @@ class AttemptEngine:
             f"canceled ({reason}); "
             + (
                 "the executor was dead and uncommitted outputs aborted before this terminal "
-                "was journaled"
+                "was recorded"
                 if attempt.executions
                 else "nothing was dispatched, so there is nothing to unwind"
             ),
@@ -2301,12 +2250,8 @@ class AttemptEngine:
         nothing (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
         that has nothing left to fail on.
 
-        It is still journaled before it is sent, and NOT SENT AT ALL when that fails
-        (#494b). It used to name the journal failure in the message and ship anyway, which
-        gave the owner an outcome with no durable identity behind it: a restart replays
-        nothing for it, and an ack naming its terminal_id matches nothing. The attempt is
-        held in `local_fault` instead and the worker refuses onward — a worker that stopped
-        is readable; an unreplayable terminal is not.
+        It is recorded before it is sent so same-process reconnects replay identical bytes.
+        The caller records the frame before exposing it and owns restart recovery.
         """
         body = pb.AttemptOutcomeBody(
             request_id=attempt.request_id,
@@ -2325,40 +2270,21 @@ class AttemptEngine:
         attempt.outcome_id = f"out-{uuid.uuid4().hex[:24]}"
         attempt.outcome_digest = digest
         attempt.outcome_bytes = canonical_bytes
-        try:
-            self.journal.append(
-                "outcome",
-                {
-                    "request_id": attempt.request_id,
-                    "attempt": attempt.attempt,
-                    "worker_boot_id": self.boot_id,
-                    "instance_id": self.instance_id,
-                    "invocation_spec_digest": documents.spell(attempt.digest),
-                    "placement_id": attempt.placement_id,
-                    "outcome_id": attempt.outcome_id,
-                    "outcome_digest": documents.spell(digest),
-                    "outcome_canonical_b64": base64.b64encode(canonical_bytes).decode(),
-                },
-            )
-            attempt.state = "outcome"
-        except Exception as exc:
-            attempt.state = "local_fault"
-            attempt.outcome_id = ""
-            attempt.outcome_digest = b""
-            attempt.outcome_bytes = b""
-            self.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=f"{attempt.request_id}#{attempt.attempt}",
-                    reason="outcome_not_durable",
-                    detail=safe(
-                        f"the last-resort outcome could not be journaled ({exc}); this "
-                        "attempt is HELD and no outcome was sent — ack-after-journal admits "
-                        "no last resort"
-                    ),
-                )
-            )
-            raise UndurableOutcome(attempt, str(exc)) from exc
+        self.records.append(
+            "outcome",
+            {
+                "request_id": attempt.request_id,
+                "attempt": attempt.attempt,
+                "worker_boot_id": self.boot_id,
+                "instance_id": self.instance_id,
+                "invocation_spec_digest": documents.spell(attempt.digest),
+                "placement_id": attempt.placement_id,
+                "outcome_id": attempt.outcome_id,
+                "outcome_digest": documents.spell(digest),
+                "outcome_canonical_b64": base64.b64encode(canonical_bytes).decode(),
+            },
+        )
+        attempt.state = "outcome"
         return self.wrap(attempt)
 
     def abandon(self, attempt: AttemptRecord, why: str) -> pb.AttemptOutcome:
@@ -2379,13 +2305,13 @@ class AttemptEngine:
         """Closure records ONLY on an ack bound by terminal_id AND terminal_digest."""
         attempt = self.history.get((ack.request_id, ack.attempt_ordinal))
         if attempt is None or attempt.state != "outcome":
-            return "dropped: no journaled terminal for that attempt"
+            return "dropped: no recorded terminal for that attempt"
         if ack.outcome_id != attempt.outcome_id or ack.outcome_digest != attempt.outcome_digest:
             return (
                 f"NOT AN ACK: id {ack.outcome_id!r}/digest {ack.outcome_digest.hex()[:12]} "
-                f"does not bind the journaled terminal — replay continues"
+                f"does not bind the recorded terminal — replay continues"
             )
-        self.journal.append(
+        self.records.append(
             "closed",
             {
                 "request_id": attempt.request_id,
@@ -2413,18 +2339,15 @@ class AttemptEngine:
         return "closed"
 
     def _active_row(
-        self, attempt: AttemptRecord, journal_row: Mapping[str, Any] | None = None
+        self, attempt: AttemptRecord, record: Mapping[str, Any] | None = None
     ) -> pb.HeldAttempt:
         """One placement-aware `HeldAttempt` (#481: the set holds unacked OUTCOMES too, and
         those are not active — which is what the old `ActiveAttempt` name got wrong).
 
-        Recovered and live attempts both name the immutable placement and executor generation
-        captured by acceptance. `ATTEMPT_STATE_HELD_UNDURABLE` is the rev-2 state for #494b's
-        hold (#507d/#510d): the frozen wire could only spell it as RUNNING plus a LOCAL_SAFETY
-        fault compound — honest, but compound, and a RecordOwner reading RUNNING could not tell
-        a live execution from an outcome nobody could write down.
+        Every held attempt names the immutable placement and executor generation captured by
+        acceptance.
         """
-        row = journal_row or {}
+        row = record or {}
         pending = attempt.state in ("outcome", "closed")
         held = pb.HeldAttempt(
             request_id=attempt.request_id,
@@ -2432,8 +2355,6 @@ class AttemptEngine:
             kind=_KIND[attempt.kind],
             state=pb.AttemptState.ATTEMPT_STATE_OUTCOME_PENDING_ACK
             if pending
-            else pb.AttemptState.ATTEMPT_STATE_HELD_UNDURABLE
-            if attempt.state == "local_fault"
             else pb.AttemptState.ATTEMPT_STATE_RUNNING,
             invocation_spec_digest=attempt.digest,
             placement_id=str(row.get("placement_id", "")) or attempt.placement_id,
@@ -2450,16 +2371,13 @@ class AttemptEngine:
     def pending_outcomes(self) -> list[AttemptRecord]:
         return [a for a in self.history.values() if a.state == "outcome"]
 
-    #: Every state in which this worker still HOLDS an attempt and owes the owner something.
-    #: `local_fault` is here on purpose (#494b): its outcome was never durable and never
-    #: sent, so the attempt is still the worker's — the wire has no state for "held, outcome
-    #: undurable", and RUNNING plus the LOCAL_SAFETY_REFUSAL fault naming it is the honest
-    #: pair. Dropping it would make the snapshot silent about work the worker is holding.
-    HELD = ("accepted", "running", "reclaiming", "finalizing", "outcome", "local_fault")
+    #: Every state in which this worker still holds an attempt and owes the owner something.
+    HELD = ("accepted", "running", "reclaiming", "finalizing", "outcome")
 
     def snapshot_entries(self) -> list[pb.HeldAttempt]:
-        """The recovery snapshot (02 §6): every attempt this worker still HOLDS — accepted,
-        running, terminal-pending-ack or locally faulted. A queued one is deliberately absent
+        """Every attempt this worker still holds — accepted, running, or outcome-pending-ack.
+
+        A queued one is deliberately absent
         (the wire has no state for held-not-admitted; the owner's DISPATCHING-absent rule
         resends it, and the admission window is one, so there is never a QUEUE of them)."""
         return [self._active_row(a) for a in self.history.values() if a.state in self.HELD]

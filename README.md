@@ -89,7 +89,7 @@ header, or authentication fallback.
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
 | `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
-| `internal/journal.py` | same-process attempt state; callers own restart recovery |
+| `internal/worker/records.py` | bounded same-process worker facts; callers own restart recovery |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
 | `internal/executor.py` | the disposable device process — the ONE torch importer |
@@ -100,7 +100,7 @@ header, or authentication fallback.
 boundary: PackageDescriptor, EnvironmentReceipt, ModelConstructionContract, and the discriminated
 Qualification document. `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
 implementation, plan, and generation digests; those names are executable identity, not document
-formats. Command requests, planner values, journal rows, proof-local state, and benchmark reports
+formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
 are typed by their command/path or storage table and carry no global format tag.
 
 The worker never imports torch, and that is proved against the RUNNING process
@@ -109,7 +109,7 @@ list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
 ephemeral local worker whose RecordOwner is a pair of in-process queues, over the same
-process boundary, attempt log, acceptance boundary, freeze point and ledger. The rule is
+process boundary, acceptance boundary, freeze point and ledger. The rule is
 structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
 exactly one caller (the device executor) and the attempt engine exactly one constructor (the
 worker session), so a direct-call runner beside them cannot be written without turning
@@ -127,7 +127,7 @@ and `output_tokens` are admitted.
 
 **Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
-written and fsynced BEFORE its write receipt is journaled and before the terminal that names
+written and fsynced BEFORE its write receipt is recorded and before the terminal that names
 it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
 killed executor is therefore explainable from a directory, with no live process and no SSH.
 
@@ -176,7 +176,7 @@ confession and exits only below the declared physical floor.
 worker's own bookkeeping, `measured` for a named device or kernel interface,
 `unreadable` for a class this worker genuinely cannot read — never a zero standing in for
 one) and the METHOD that produced it. Every attempt closes by reconciling every class
-against the line taken before its envelope was granted, and the record is journaled.
+against the line taken before its envelope was granted, and the record is recorded.
 
 ## The descriptor
 
@@ -522,7 +522,7 @@ cr-016 over the real attempt kernel.
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
 `@app.job` over the one invocation kernel, the same worker/executor split, the same
-journal, the same output transaction. What differs is stated out loud and is short — a
+records, the same output transaction. What differs is stated out loud and is short — a
 `JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
 (serving never accepts-then-cold-loads; a job has nothing to be warm for), the three job
 services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose path rides

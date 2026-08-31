@@ -108,7 +108,7 @@ REFUSALS = frozenset(
         "lease_live",  # a staging slot reused before its completion event
         "derived_unmaterialized",  # a non-persistent buffer the fill plane cannot supply
         # cr-006's three, spoken in the SAME vocabulary because the worker, the
-        # journal and the CLI all read one refusal table. `encoding.py` owns their
+        # worker records and the CLI all read one refusal table. `encoding.py` owns their
         # meaning; this line is what keeps a new code from appearing unnoticed.
         "unknown_encoding",  # the header cites a spec digest no provider claims
         "encoding_unqualified",  # a claimed encoding, unqualified on THIS device
@@ -324,7 +324,7 @@ STORE_REFUSALS: dict[str, str] = {
     # asks TensorFS whether every tensor's stored roles ARE the roles its cited spec
     # declares. Both codes were escaping this plane UNTRANSLATED — a raw
     # `tensorfs.errors.Refusal` crossing a boundary whose whole contract is that the
-    # worker, the journal and the CLI read ONE refusal table. Same class as #496a, one
+    # worker records and the CLI read ONE refusal table. Same class as #496a, one
     # layer up: the check fired correctly and the answer had nowhere to go.
     "ROLE_SET_MISMATCH": "carrier_geometry",
     "SHAPE_MISMATCH": "carrier_geometry",

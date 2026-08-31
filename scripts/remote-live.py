@@ -111,7 +111,8 @@ def serve_argv(
     key: Path | None = None,
     grant_roots: str = "",
     artifact_store: Path | None = None,
-    artifact_object_set: Path | None = None,
+    project: Path | None = None,
+    development: Any = None,
 ) -> list[str]:
     """ONE argv builder, so every arm below differs only in what it is testing."""
     return [
@@ -126,17 +127,27 @@ def serve_argv(
         listen,
         "--out",
         str(root),
-        "--instance-id",
-        "ins-remote",
         "--release-id",
         ll.RELEASE,
         "--artifact-store",
         str(artifact_store or root.parent / "unused-store"),
-        "--artifact-object-set",
-        str(artifact_object_set or root.parent / "unused-object-set.json"),
         "--grace",
         "3.0",
         "--no-warm",
+        *(
+            (
+                "--development-project",
+                str(project),
+                "--development-package",
+                development.package,
+                "--development-release",
+                development.release,
+                "--development-source-digest",
+                wl.documents.spell(development.source_digest),
+            )
+            if project is not None and development is not None
+            else ()
+        ),
         *(("--grant-root", grant_roots) if grant_roots else ()),
         *(("--tls-cert", str(cert), "--tls-key", str(key)) if cert and key else ()),
     ]
@@ -150,14 +161,14 @@ def start_remote(
     listen: str,
     token: str,
     grant_roots: str = "",
-) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str]]:
+) -> tuple[subprocess.Popen[bytes], Path, Path, dict[str, str], Any]:
     """The weightless worker on a TLS listener, its token provisioned via the environment
     (the one channel a launcher hands it through, #449/#463)."""
     home, root, project = tmp / "home", tmp / "worker", tmp / "project"
     home.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
-    staged = ll.stage_weightless(home, project)
-    ids = dict(staged.plans)
+    staged = ll.stage_development(home, project)
+    ids = dict(staged.bindings)
     log = tmp / f"worker-{len(os.listdir(tmp))}.log"
     (root / "control.addr").unlink(missing_ok=True)
     process = subprocess.Popen(
@@ -168,7 +179,8 @@ def start_remote(
             key=key,
             grant_roots=grant_roots,
             artifact_store=staged.artifact_store,
-            artifact_object_set=staged.artifact_object_set,
+            project=project,
+            development=staged.placement.development,
         ),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -177,7 +189,7 @@ def start_remote(
         bufsize=0,
     )
     threading.Thread(target=wl._pump, args=(process, log), daemon=True).start()
-    return process, root, log, ids
+    return process, root, log, ids, staged.placement
 
 
 def main() -> int:
@@ -190,7 +202,9 @@ def main() -> int:
     cert, key = mint_cert(tmp)
     root_cert = cert.read_bytes()
 
-    process, root, log, ids = start_remote(tmp, cert, key, listen="127.0.0.1:0", token=TOKEN)
+    process, root, log, ids, placement = start_remote(
+        tmp, cert, key, listen="127.0.0.1:0", token=TOKEN
+    )
     try:
         addr = wl.read_addr(root, process)
         wl.head(f"1. red arm: a WRONG bearer token at {addr}")
@@ -214,12 +228,9 @@ def main() -> int:
         wl.head("2. the real leg: TLS + the right token -> DISPATCHABLE -> invoke -> SUCCEEDED")
         hub = wl.Hub()
         hub.process, hub.log = process, log
-        hub.directive = wl.serving_directive(
-            ll.RELEASE,
-            sorted(ids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            root.parent / "home" / "binding-plans",
-        )
+        hub.package_revision_digest = wl.documents.spell(placement.development.source_digest)
+        hub.development = True
+        hub.directive = wl.serving_directive(placement, pb.Posture.POSTURE_ACCEPTING)
         t0 = time.perf_counter()
         hub.connect(addr, root_cert=root_cert, token=TOKEN)
         report = hub.ready(ids["tick"], 60)
@@ -323,7 +334,7 @@ def main() -> int:
     # red arm differ in the destination URL and in nothing else.
     podfs = tmp / "podfs"
     podfs.mkdir(parents=True, exist_ok=True)
-    fenced, froot, flog, fids = start_remote(
+    fenced, froot, flog, fids, fplacement = start_remote(
         tmp / "fenced", cert, key, listen="127.0.0.1:0", token=TOKEN, grant_roots=str(podfs)
     )
     (tmp / "fenced").mkdir(parents=True, exist_ok=True)
@@ -331,12 +342,9 @@ def main() -> int:
         faddr = wl.read_addr(froot, fenced)
         fhub = wl.Hub()
         fhub.process, fhub.log = fenced, flog
-        fhub.directive = wl.serving_directive(
-            ll.RELEASE,
-            sorted(fids.values()),
-            pb.Posture.POSTURE_ACCEPTING,
-            froot.parent / "home" / "binding-plans",
-        )
+        fhub.package_revision_digest = wl.documents.spell(fplacement.development.source_digest)
+        fhub.development = True
+        fhub.directive = wl.serving_directive(fplacement, pb.Posture.POSTURE_ACCEPTING)
         fhub.connect(faddr, root_cert=root_cert, token=TOKEN)
         fhub.ready(fids["tick"], 60)
 

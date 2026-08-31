@@ -73,7 +73,6 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
 #: into the same loop and exactly what this verb exists to prevent.
 _SERVE_FLAGS: dict[str, str] = {
     "--worker-id": "--worker-id",
-    "--instance-id": "--instance-id",
     "--release-id": "--release-id",
     "--git-commit": "--git-commit",
     "--devices": "--devices",

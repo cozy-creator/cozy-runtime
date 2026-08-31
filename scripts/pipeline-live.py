@@ -246,7 +246,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
             release_id=RELEASE,
             no_warm=bool(spec.get("no_warm", True)),
         ),
-        delete_journal=False,
+        delete_workspace=False,
     )
     return dataclasses.asdict(outcome)
 

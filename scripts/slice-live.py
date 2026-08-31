@@ -211,7 +211,6 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
     options = WorkerOptions(
         root=workspace / "worker",
         release_id=RELEASE,
-        instance_id=spec.get("instance_id", ""),
         grace=float(spec.get("grace", 2.0)),
         no_warm=bool(spec.get("no_warm", True)),
         python=executor_python,
@@ -250,7 +249,7 @@ def run_one(spec: dict[str, Any]) -> dict[str, Any]:
         package_revision_digest=RELEASE,
         package_descriptor=package_descriptor,
         options=options,
-        delete_journal=bool(spec.get("delete_journal", True)),
+        delete_workspace=bool(spec.get("delete_workspace", True)),
         record_owner_hook=arm,
     )
     return dataclasses.asdict(outcome)
@@ -378,12 +377,12 @@ def wait_for(path: Path, seconds: float, process: subprocess.Popen[bytes] | None
     return False
 
 
-def journal_rows(workspace: Path, kind: str = "") -> list[dict[str, Any]]:
-    """Read the surviving journal of a run whose process is gone."""
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal.local import _journal_rows
-
-    rows = _journal_rows(workspace / "worker" / "journal.log")
+def record_rows(workspace: Path, kind: str = "") -> list[dict[str, Any]]:
+    """Read the same-process records projected into a completed run's outcome."""
+    outcome = workspace / "outcome.json"
+    if not outcome.is_file():
+        return []
+    rows = list(json.loads(outcome.read_text()).get("attempt_records") or ())
     return [row for row in rows if not kind or row.get("kind") == kind]
 
 
@@ -408,7 +407,7 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
             "outputs": ["image"],
             "request_id": "run-1",
             "no_warm": True,
-            "delete_journal": False,
+            "delete_workspace": False,
         }
     )
     if not outcome:
@@ -487,11 +486,11 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
         str((result.get("image") or {}).get("asset_ref", "none")),
     )
 
-    head("the journal: acceptance, ledger, triage, terminal, closure — in that order")
-    rows = journal_rows(workspace)
+    head("the records: acceptance, ledger, triage, terminal, closure — in that order")
+    rows = record_rows(workspace)
     kinds = [row["kind"] for row in rows]
     check(
-        "every durable step is journaled, once, in order",
+        "every durable step is recorded, once, in order",
         kinds == ["session", "accepted", "ledger", "triage", "outcome", "closed"],
         " -> ".join(kinds),
     )
@@ -545,7 +544,7 @@ def section_slice(args: argparse.Namespace) -> dict[str, Any]:
         f"credential epoch {bundle.get('posture', {}).get('credential_epoch')}",
     )
     check(
-        "the ledger reconciliation is IN the bundle, not a journal join away",
+        "the ledger reconciliation is IN the bundle, not another-state join away",
         bool(bundle.get("measurements", {}).get("ledger", {}).get("classes")),
         f"{len(bundle['measurements']['ledger'].get('classes', ()))} byte classes, "
         f"closed={bundle['measurements']['ledger'].get('closed')}",
@@ -579,7 +578,7 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
             "outputs": ["image"],
             "request_id": "run-ledger",
             "no_warm": True,
-            "delete_journal": False,
+            "delete_workspace": False,
         }
     )
     ledger = outcome.get("ledger", {})
@@ -647,8 +646,8 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
     )
     check(
         "the ledger reconciliation is DURABLE, not a print",
-        len(journal_rows(workspace, "ledger")) == 1,
-        f"{len(journal_rows(workspace, 'ledger'))} ledger row(s) in the journal",
+        len(record_rows(workspace, "ledger")) == 1,
+        f"{len(record_rows(workspace, 'ledger'))} ledger row(s) in the records",
     )
 
     head("the device baseline: a first-attempt SHIFT is named, a per-attempt leak is not")
@@ -661,7 +660,7 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
             "outputs": ["image"],
             "request_id": "run-warm",
             "no_warm": False,  # the boot warm pass runs one case through ORDINARY dispatch
-            "delete_journal": False,
+            "delete_workspace": False,
         }
     )
     warm_record = outcome_warm.get("reconciliation", {})
@@ -707,7 +706,7 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
             "request_id": "run-fail",
             "no_warm": True,
             "store": bad,
-            "delete_journal": False,
+            "delete_workspace": False,
         }
     )
     log = (failed / "run" / "run.log").read_text(errors="replace")
@@ -747,8 +746,8 @@ def section_ledger(args: argparse.Namespace) -> dict[str, Any]:
     )
     check(
         "and no attempt was ever accepted against a generation that never became ready",
-        not journal_rows(failed / "run", "accepted"),
-        "the journal carries no acceptance — serving never accepts-then-cold-loads",
+        not record_rows(failed / "run", "accepted"),
+        "the records carries no acceptance — serving never accepts-then-cold-loads",
     )
     check(
         "no output bytes exist anywhere",
@@ -814,7 +813,7 @@ def section_arms(args: argparse.Namespace) -> None:
                     "outputs": ["image"],
                     "request_id": "run-fetch",
                     "no_warm": True,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -845,11 +844,11 @@ def section_arms(args: argparse.Namespace) -> None:
         f"{outcome.get('status')}: "
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
-    rows = journal_rows(workspace)
+    rows = record_rows(workspace)
     check(
         "exactly ONE durable terminal",
         len([r for r in rows if r["kind"] == "outcome"]) == 1,
-        f"journal kinds {[r['kind'] for r in rows]}",
+        f"records kinds {[r['kind'] for r in rows]}",
     )
     check(
         "and no output bytes were produced",
@@ -873,7 +872,7 @@ def section_arms(args: argparse.Namespace) -> None:
                     "outputs": ["image"],
                     "request_id": "run-fill",
                     "no_warm": True,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -901,13 +900,13 @@ def section_arms(args: argparse.Namespace) -> None:
         f"{(outcome.get('faults') or [{}])[-1].get('reason', 'no fault')}",
     )
     check(
-        "NO acceptance was journaled for a generation that never became ready",
-        not journal_rows(workspace, "accepted"),
-        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+        "NO acceptance was recorded for a generation that never became ready",
+        not record_rows(workspace, "accepted"),
+        f"records kinds {[r['kind'] for r in record_rows(workspace)]}",
     )
     check(
         "no terminal was FABRICATED for an attempt that was never accepted",
-        not journal_rows(workspace, "outcome"),
+        not record_rows(workspace, "outcome"),
         "a worker that owes nothing claims nothing",
     )
     check(
@@ -939,7 +938,7 @@ def section_arms(args: argparse.Namespace) -> None:
                     "request_id": "run-cancel",
                     "no_warm": True,
                     "grace": 2.0,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -960,9 +959,9 @@ def section_arms(args: argparse.Namespace) -> None:
         f"{str(outcome.get('terminal', {}).get('safe_message', ''))[:110]}",
     )
     check(
-        "exactly ONE durable terminal, journaled before it was sent",
-        len(journal_rows(workspace, "outcome")) == 1,
-        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+        "exactly ONE durable terminal, recorded before it was sent",
+        len(record_rows(workspace, "outcome")) == 1,
+        f"records kinds {[r['kind'] for r in record_rows(workspace)]}",
     )
     check(
         "no partial output is visible",
@@ -985,7 +984,7 @@ def section_arms(args: argparse.Namespace) -> None:
                     "request_id": "run-stubborn",
                     "no_warm": True,
                     "grace": 2.0,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -1013,8 +1012,8 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "still exactly ONE durable terminal",
-        len(journal_rows(workspace, "outcome")) == 1,
-        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
+        len(record_rows(workspace, "outcome")) == 1,
+        f"records kinds {[r['kind'] for r in record_rows(workspace)]}",
     )
 
     head("ARM 4/4 — ENCODE: a tail failure, and a run killed inside the attempt window")
@@ -1029,7 +1028,7 @@ def section_arms(args: argparse.Namespace) -> None:
             "outputs": ["image", "thumbnail"],
             "request_id": "run-tail",
             "no_warm": True,
-            "delete_journal": False,
+            "delete_workspace": False,
         }
     )
     check(
@@ -1046,9 +1045,9 @@ def section_arms(args: argparse.Namespace) -> None:
     )
     check(
         "one durable terminal, and the ledger still closed",
-        len(journal_rows(workspace, "outcome")) == 1
+        len(record_rows(workspace, "outcome")) == 1
         and outcome.get("reconciliation", {}).get("closed") is True,
-        f"kinds {[r['kind'] for r in journal_rows(workspace)]}",
+        f"kinds {[r['kind'] for r in record_rows(workspace)]}",
     )
 
     def killrun_arm() -> tuple[dict[str, Any], Path]:
@@ -1064,9 +1063,8 @@ def section_arms(args: argparse.Namespace) -> None:
                     "payload": {"steps": 24, "latent": 80, "seed": 5},
                     "outputs": ["image"],
                     "request_id": "run-killed",
-                    "instance_id": "ins-stable",
                     "no_warm": True,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -1077,29 +1075,21 @@ def section_arms(args: argparse.Namespace) -> None:
         time.sleep(0.3)
         process.send_signal(signal.SIGKILL)  # the whole run dies inside the attempt window
         process.wait(timeout=60)
-        # No outcome document exists — the run was killed before it could write one — so the
-        # JOURNAL it left behind is the evidence, which is exactly the point of the arm.
         return {"killed": True}, workspace
 
     _, workspace = drive("killed-run", killrun_arm)
     check(
-        "a killed run leaves its journal behind — the deletable journal is deleted LAST",
-        (workspace / "worker" / "journal.log").is_file(),
-        f"journal kinds {[r['kind'] for r in journal_rows(workspace)]}",
-    )
-    check(
-        "the accepted-but-incomplete attempt is on record with no terminal",
-        bool(journal_rows(workspace, "accepted")) and not journal_rows(workspace, "outcome"),
-        "acceptance is journaled before anything can run, which is what makes recovery "
-        "possible without guessing",
+        "a killed Runtime projects no cross-process attempt state",
+        not record_rows(workspace),
+        "the outer RecordOwner owns settlement across processes",
     )
     check(
         "and no output bytes are visible from the interrupted attempt",
         not outputs_present(workspace),
         str(outputs_present(workspace) or "nothing at the granted destination"),
     )
-    # The NEXT run over the same journal is the recovery: it must mint exactly one durable
-    # ABANDONED terminal for the interrupted ordinal and never re-execute it.
+    # A fresh Runtime process knows only the new request. The outer RecordOwner settles and
+    # retries interrupted work; this harness proves Runtime does not invent that authority.
     spec_path = workspace / "spec.json"
     spec_path.write_text(
         json.dumps(
@@ -1109,30 +1099,24 @@ def section_arms(args: argparse.Namespace) -> None:
                 "payload": BANKED_PAYLOAD,
                 "outputs": ["image"],
                 "request_id": "run-after",
-                "instance_id": "ins-stable",
                 "no_warm": True,
-                "delete_journal": False,
+                "delete_workspace": False,
             }
         )
     )
-    recovered = start(spec_path, workspace / "outcome.json", workspace)
-    recovered.wait(timeout=900)
-    rows = journal_rows(workspace)
-    killed_terminals = [
-        r for r in rows if r["kind"] == "outcome" and r["body"]["request_id"] == "run-killed"
-    ]
+    fresh = start(spec_path, workspace / "outcome.json", workspace)
+    fresh.wait(timeout=900)
+    outcome = read_outcome(workspace / "outcome.json")
+    rows = record_rows(workspace)
     check(
-        "recovery minted exactly one durable terminal for the interrupted attempt",
-        len(killed_terminals) == 1,
-        f"{len(killed_terminals)} terminal(s) for run-killed",
+        "the fresh process serves the new request",
+        outcome.get("status") == "OUTCOME_STATUS_SUCCEEDED",
+        str(outcome.get("status")),
     )
     check(
-        "the interrupted attempt was never re-executed",
-        len(
-            [r for r in rows if r["kind"] == "accepted" and r["body"]["request_id"] == "run-killed"]
-        )
-        == 1,
-        "one acceptance, one terminal, zero second executions",
+        "and records contain no previous-process attempt",
+        all(row.get("body", {}).get("request_id") != "run-killed" for row in rows),
+        f"recorded requests={sorted({row.get('body', {}).get('request_id') for row in rows})}",
     )
     print(f"\n  GPU {gpu_used_mib()} MiB (idle baseline {idle} MiB)")
 
@@ -1198,7 +1182,7 @@ def section_clone(args: argparse.Namespace) -> None:
         "outputs": ["image"],
         "request_id": "run-clone",
         "no_warm": True,
-        "delete_journal": True,
+        "delete_workspace": True,
     }
     (workspace / "spec.json").write_text(json.dumps(spec))
     run = subprocess.run(
@@ -1238,8 +1222,8 @@ def section_clone(args: argparse.Namespace) -> None:
         f"{(outcome.get('result') or {}).get('digest', 'none')}",
     )
     check(
-        "the one-shot run deleted its journal after a fully acknowledged terminal",
-        outcome.get("journal_deleted") is True,
+        "the one-shot run deleted its workspace after a fully acknowledged terminal",
+        outcome.get("workspace_deleted") is True,
         "§8: deletable AFTER the ack, never before",
     )
     print(f"  GPU {gpu_used_mib()} MiB")
@@ -1262,7 +1246,7 @@ def section_bench(args: argparse.Namespace) -> None:
                 "outputs": ["image"],
                 "request_id": f"bench-{index}",
                 "no_warm": index == 0,
-                "delete_journal": False,
+                "delete_workspace": False,
             }
         )
         if not check(
@@ -1301,8 +1285,8 @@ def bench_observability(runs: list[dict[str, Any]]) -> None:
     import timeit
 
     from cozy_runtime.author._observations import Attribution, EventRing
-    from cozy_runtime.internal.journal import Journal
     from cozy_runtime.internal.worker import triage
+    from cozy_runtime.internal.worker.records import WorkerRecords
 
     head("cr-011 cost — attribution on the hot path, and the bundle off it")
     attribution = Attribution()
@@ -1324,8 +1308,8 @@ def bench_observability(runs: list[dict[str, Any]]) -> None:
 
     root = Path(tempfile.mkdtemp(prefix="cozy-bench-triage"))
     try:
-        journal = Journal(root / "journal.log")
-        store = triage.BundleStore(root / "triage", journal)
+        records = WorkerRecords()
+        store = triage.BundleStore(root / "triage", records)
         full = EventRing(subject="bench#1")
         for index in range(1000):
             full.emit("log", f"handler line {index} with a realistic amount of text", "info")
@@ -1344,12 +1328,12 @@ def bench_observability(runs: list[dict[str, Any]]) -> None:
 
         commit_ms = timeit.timeit(commit_one, number=20) / 20 * 1000
         print(f"  bundle build (256 rows) {build_ms:8.3f} ms")
-        print(f"  build + fsync + journal {commit_ms:8.3f} ms")
+        print(f"  build + fsync + receipt {commit_ms:8.3f} ms")
         check(
             "the bundle is built and made durable OFF the hot path, in the terminal tail",
             commit_ms < 50,
             f"{commit_ms:.2f} ms per terminal, of which {commit_ms - build_ms:.2f} ms is "
-            "two fsyncs — the same durability the terminal itself pays for",
+            "the bundle fsync plus its in-memory receipt",
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -1382,11 +1366,15 @@ def clock_names_in(function: str) -> list[str]:
     raise SystemExit(f"no function named {function!r} in observe.py")
 
 
-def triage_read(root: Path, subject: str) -> dict[str, Any]:
+def triage_read(root: Path, subject: str, digest: str, length: int) -> dict[str, Any]:
     """Read one triage bundle from a DIRECTORY. No process, no socket, no SSH."""
     from cozy_runtime.internal.worker.triage import BundleStore
 
-    return BundleStore.read(root / "triage", subject, root / "journal.log")
+    path = root / "triage" / f"{subject}.json"
+    raw = path.read_bytes()
+    assert "sha256:" + hashlib.sha256(raw).hexdigest() == digest
+    assert len(raw) == length
+    return BundleStore.read(root / "triage", subject)
 
 
 def explain_bundle(document: dict[str, Any]) -> list[str]:
@@ -1403,8 +1391,8 @@ def flood_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     other would produce a terminal a RecordOwner cannot accept.
     """
     from cozy_runtime.author._observations import EventRing, ObservationRefusal
-    from cozy_runtime.internal.journal import Journal
     from cozy_runtime.internal.worker import triage
+    from cozy_runtime.internal.worker.records import WorkerRecords
 
     ring = EventRing(subject="flood#1")
     for index in range(20_000):
@@ -1414,8 +1402,8 @@ def flood_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 ring.emit("log", "auth", "info", api_key="sk-livekeythatmustnevertravel")
     caps = ring.caps()
 
-    journal = Journal(root / "journal.log")
-    store = triage.BundleStore(root / "triage", journal)
+    records = WorkerRecords()
+    store = triage.BundleStore(root / "triage", records)
     assembly = triage.Assembly("trb-" + "f" * 24, attempt={"request_id": "flood"}, caps=caps)
     assembly.events = ring.rows()
     # Push the assembled document PAST the wire cap on purpose: 4,000 rows at the row cap.
@@ -1424,7 +1412,7 @@ def flood_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         for n in range(4000)
     ]
     receipt = store.commit(assembly)
-    document = triage.BundleStore.read(root / "triage", receipt.subject_id, root / "journal.log")
+    document = triage.BundleStore.read(root / "triage", receipt.subject_id, records)
     return caps, {
         "length": receipt.length,
         "shed_to_fit": document["caps"]["shed_to_fit"],
@@ -1457,7 +1445,7 @@ def section_triage(args: argparse.Namespace) -> None:
                     "weightless_project": str(ROOT / "proofs" / "fixtures" / "cli-project"),
                     "request_id": "run-triage",
                     "no_warm": True,
-                    "delete_journal": False,
+                    "delete_workspace": False,
                 }
             )
         )
@@ -1481,11 +1469,12 @@ def section_triage(args: argparse.Namespace) -> None:
     # THE ARM: from here on, nothing but the directory. No process, no socket, no SSH.
     subject = outcome["triage_subject"]
     root = workspace / "worker"
-    bundle = triage_read(root, subject)
+    ref = outcome["terminal"]["triage_bundle"]
+    bundle = triage_read(root, subject, ref["write_receipt_digest"], ref["length"])
     check(
         "the bundle is readable BY OPAQUE KEY from a directory alone",
         bundle.get("subject_id") == subject,
-        f"{root / 'triage' / (subject + '.json')} verified against its journaled receipt",
+        f"{root / 'triage' / (subject + '.json')} verified against the terminal digest",
     )
     lines = explain_bundle(bundle)
     print("\n  the whole postmortem, from the file:")
@@ -1608,7 +1597,7 @@ def section_wedge(args: argparse.Namespace) -> None:
 
 def section_witness(args: argparse.Namespace) -> None:
     """cr-011: OOM-kill the WORKER and name the death from the surviving record."""
-    head("the postmortem witness — a parent that outlives the journal owner")
+    head("the postmortem witness — a parent that outlives the worker")
     from cozy_runtime.internal import witness as wit
 
     workspace = Path(args.tmp) / "witness"

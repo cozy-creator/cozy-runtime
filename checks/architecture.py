@@ -1545,28 +1545,45 @@ def fence_worker_control_memory_state() -> list[str]:
 
     bad: list[str] = []
     session = (SRC / "internal" / "worker" / "session.py").read_text()
-    if "self.journal = Journal()" not in session:
+    if "self.records = WorkerRecords()" not in session:
         bad.append(
             "src/cozy_runtime/internal/worker/session.py: memory-only worker state no longer "
-            "uses one pathless log"
+            "uses one WorkerRecords value"
         )
-    for spelling in ("journal.log", "persistent_state", "restore_ownership(", ".recover()"):
+    for spelling in ("persistent_state", "restore_ownership(", ".recover()"):
         if spelling in session:
             bad.append(
                 "src/cozy_runtime/internal/worker/session.py: WorkerControl retained "
                 f"restart state through {spelling!r}"
             )
-    if "def instance_identity(" in session or 'root / "instance-id"' in session:
-        bad.append(
-            "src/cozy_runtime/internal/worker/session.py: WorkerControl retained an "
-            "instance recovery file"
-        )
     runtime_worker = (SRC / "cli" / "runtime_worker.py").read_text()
     if "persistent_state" in runtime_worker:
         bad.append(
             "src/cozy_runtime/cli/runtime_worker.py: persistence is a launch option; all "
             "WorkerControl children must be process-local"
         )
+    records = (SRC / "internal" / "worker" / "records.py").read_text()
+    for spelling in ("Path", "open(", "os.", "fsync", "_load", "torn_tail"):
+        if spelling in records:
+            bad.append(
+                "src/cozy_runtime/internal/worker/records.py: same-process records retained "
+                f"disk machinery through {spelling!r}"
+            )
+    forbidden = ("journal.log", "cozy_runtime.internal.journal", "Journal(", "--instance-id")
+    paths = [
+        *SRC.rglob("*.py"),
+        *(ROOT / "scripts").glob("*.py"),
+        *(ROOT / "proofs").rglob("*.py"),
+    ]
+    for path in paths:
+        if path.name.startswith("worker_pb2"):
+            continue
+        source = path.read_text()
+        for spelling in forbidden:
+            if spelling in source:
+                bad.append(
+                    f"{path.relative_to(ROOT)}: retired Runtime recovery surface {spelling!r}"
+                )
     return bad
 
 
