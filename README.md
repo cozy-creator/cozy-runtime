@@ -191,8 +191,10 @@ ModelConstructionContract owns that), and `_fixed_point` proves over the built d
 no release digest, build timestamp, machine path or mutable binding reached it.
 The same `/1` document may carry bounded `model_productions`: static graphs over ordinary job
 callables with fixed required outputs, recipe-owned lane keys and independently verifiable
-contracts. They execute nothing and carry no source selection, destination, credential or exact
-resolved job release.
+contracts. Named source slots bind reviewed TensorFS source-profile IDs, so one foreign repository
+may yield several exact converter closures without a filename heuristic or a fake aggregate model.
+Job and production-node resource floors use the same descriptor shape. Productions execute nothing
+and carry no concrete source selection, destination, credential or exact resolved job release.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.

@@ -92,8 +92,10 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 }
                 for output in sorted(surface.artifact_outputs, key=lambda row: row.name)
             ]
-        if surface.resources is not None and surface.resources.gpu_count is not None:
-            doc["resources"] = {"gpu_count": surface.resources.gpu_count}
+        if surface.resources is not None:
+            resources = _resources(surface.resources)
+            if resources:
+                doc["resources"] = resources
     return doc
 
 
@@ -128,7 +130,7 @@ def _resources(resources: Resources) -> dict[str, Json]:
 def _production(production: Production) -> dict[str, Json]:
     return {
         "name": production.name,
-        "source": production.source,
+        "sources": dict(sorted(production.sources.items())),
         "nodes": [
             _production_node(node) for node in sorted(production.nodes, key=lambda n: n.name)
         ],
@@ -431,12 +433,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
                 if "resources" in item:
-                    resources = _closed(
-                        item["resources"], {"gpu_count"}, set(), source, f"{path}.resources"
-                    )
-                    count = resources["gpu_count"]
-                    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-                        _invalid(source, f"{path}.resources.gpu_count", "must be positive")
+                    _production_resources(item["resources"], source, f"{path}.resources")
                 if "artifact_outputs" in item:
                     artifact_outputs = item["artifact_outputs"]
                     if (
@@ -477,12 +474,16 @@ def _productions(value: Json, source: str) -> None:
     names: set[str] = set()
     for index, raw in enumerate(value):
         path = f"model_productions[{index}]"
-        production = _closed(raw, {"name", "source", "nodes", "outputs"}, set(), source, path)
+        production = _closed(raw, {"name", "sources", "nodes", "outputs"}, set(), source, path)
         name = _portable_name(production["name"], source, f"{path}.name")
         if name in names:
             _invalid(source, f"{path}.name", "must be unique")
         names.add(name)
-        root = _portable_name(production["source"], source, f"{path}.source")
+        roots = _string_map_value(production["sources"], source, f"{path}.sources", 16)
+        if not roots:
+            _invalid(source, f"{path}.sources", "must contain at least one source slot")
+        for slot, profile in roots.items():
+            _contract_value(profile, source, f"{path}.sources.{slot}")
         nodes = production["nodes"]
         if not isinstance(nodes, list) or not 1 <= len(nodes) <= 64:
             _invalid(source, f"{path}.nodes", "must contain 1 through 64 nodes")
@@ -516,10 +517,10 @@ def _productions(value: Json, source: str) -> None:
         def edge(
             reference: str,
             edge_path: str,
-            root_name: str = root,
+            root_names: frozenset[str] = frozenset(roots),
             outputs_by_node: dict[str, set[str]] = node_outputs,
         ) -> str | None:
-            if reference == root_name:
+            if reference in root_names:
                 return None
             node_name, separator, output = reference.partition(".")
             if not separator or output not in outputs_by_node.get(node_name, set()):

@@ -720,12 +720,15 @@ def distill(
 # keeps this separate from ``distill``: registering the graph executes nothing.
 app.production(
     "four-lane",
-    source="source",
+    sources={
+        "dits": "hf/minimax-h3/native-dual-bf16/1",
+        "shared": "hf/minimax-h3/shared-bf16/1",
+    },
     nodes=(
         ProductionNode(
             name="distill-full",
             callable="tensorhub/h3/distill",
-            models={"base": "source"},
+            models={"base": "dits", "shared": "shared"},
             outputs=("bf16-full",),
             assets={"plan": "full-plan"},
             resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),

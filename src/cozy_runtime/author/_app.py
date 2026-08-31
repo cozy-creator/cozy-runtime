@@ -17,7 +17,7 @@ environment or config read, any device/allocator surface. Those are fenced (§7)
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
@@ -95,7 +95,7 @@ class App:
         self,
         name: str,
         *,
-        source: str,
+        sources: Mapping[str, str],
         nodes: tuple[ProductionNode, ...],
         outputs: tuple[ProductionOutput, ...],
     ) -> None:
@@ -113,7 +113,7 @@ class App:
             raise RegistrationError(f"duplicate production {name!r}: names are unique per app")
         if len(self._productions) >= 16:
             raise RegistrationError("an app declares at most 16 model productions")
-        self._productions[name] = Production(name, source, nodes, outputs)
+        self._productions[name] = Production(name, sources, nodes, outputs)
 
     @overload
     def entrypoint(self, fn: Callable[P, R], /) -> Callable[P, R]: ...
