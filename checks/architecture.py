@@ -686,8 +686,8 @@ def fence_base_ownership_vectors() -> list[str]:
     cross = ROOT / "vectors" / "tensorhub-wheel-contract" / "base-worker-image-wheelhouse.json"
     raw = cross.read_bytes()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    if len(raw) != 25_503 or digest != (
-        "sha256:ebe66c52bb87be13b834b53d146ccfc7921b334313240e7431a3fd2dc9571c0a"
+    if len(raw) != 32_213 or digest != (
+        "sha256:bc864ba08dd8663e9b77edbed2fa2935c2d962c74936604bc4d7c3510779a3ab"
     ):
         bad.append(
             f"{cross}: exact Tensorhub stored-byte identity changed: {len(raw)} B / {digest}"
@@ -702,8 +702,8 @@ def fence_base_ownership_vectors() -> list[str]:
             len(manifest.base_import_roots),
             len(manifest.wheels),
         )
-        if census != (85, 363, 9):
-            bad.append(f"{cross}: ownership census is {census}, want (85, 363, 9)")
+        if census != (45, 324, 44):
+            bad.append(f"{cross}: ownership census is {census}, want (45, 324, 44)")
 
         def counted_wheel(index: int, owner: str) -> overlay.Wheel:
             label = "project" if owner == "project" else f"custom-{index:03d}"
@@ -784,14 +784,14 @@ def fence_tensorhub_package_release() -> list[str]:
     stored = path.read_bytes()
     bad: list[str] = []
     got = hashlib.sha256(stored).hexdigest()
-    want = "9fc018fcda64fee307ee7db28b632b7abe15dd77c290451525c632ab4a0c16fe"
+    want = "feb53bddb11fefe623a4d4039f88dc53e6345e6e1bd20710f854b9056355b8fa"
     if got != want:
         return [f"{path.relative_to(ROOT)}: stored fixture hashes to {got}, want {want}"]
     if not stored.endswith(b"\n") or stored.endswith(b"\n\n"):
         return [f"{path.relative_to(ROOT)}: producer fixture must carry one trailing LF"]
     raw = stored[:-1]
     document_digest = hashlib.sha256(raw).hexdigest()
-    if document_digest != "a7169ae741990c565ad3f6cd27ff2ce28c294aba53815156d2ad70422c39dbbd":
+    if document_digest != "064632d54e56d601ae1e5fc325f636e1cd94c34b959057d366058cba6f97c175":
         return [f"{path.relative_to(ROOT)}: canonical document hashes to {document_digest}"]
     try:
         release = canonical.parse_canonical(raw)

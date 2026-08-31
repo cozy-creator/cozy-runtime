@@ -39,7 +39,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.7"
+version = "0.0.8"
 source = { editable = "../../" }
 dependencies = [
     { name = "cryptography" },
@@ -58,8 +58,8 @@ requires-dist = [
     { name = "msgspec", specifier = ">=0.19" },
     { name = "packaging", specifier = ">=24" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.6" },
-    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.6" },
+    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
+    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
 provides-extras = ["derive", "corpus", "media"]

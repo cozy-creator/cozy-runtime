@@ -215,6 +215,6 @@ class Resources:
         for token in (t.strip() for t in (self.requires or "").split(",") if t.strip()):
             if not _REQUIRES_TOKEN.match(token):
                 raise ConformanceError(
-                    f"requires={token!r} is outside the grammar: sm89+, vram24g, ram64g, cuda12.8+",
+                    f"requires={token!r} is outside the grammar: sm89+, vram24g, ram64g, cuda13.0+",
                     fields=["requires"],
                 )

@@ -94,7 +94,7 @@ cuda_generation=$(cd / && env -u PYTHONPATH "$driver_python" "$support" generati
     "$proof_root" cuda)
 cuda_fact=$(cd / && env -u PYTHONPATH "$driver_python" -I "$import_probe" \
     "$cuda_generation/site-packages" cuda)
-test "$cuda_fact" = "12.9 False"
+test "$cuda_fact" = "13.0 False"
 
 run_refusal() {
     name=$1

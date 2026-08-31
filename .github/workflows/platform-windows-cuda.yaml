@@ -22,9 +22,9 @@ on:
         default: windows-4090-sm89
         options: [windows-4090-sm89, windows-3090-sm86, windows-5090-sm120]
       torch_index:
-        description: 'PyTorch wheel index. cu128 covers sm86 through sm120.'
+        description: 'PyTorch wheel index. Cozy starts at CUDA 13.0.'
         type: string
-        default: https://download.pytorch.org/whl/cu128
+        default: https://download.pytorch.org/whl/cu130
 
 jobs:
   probe:
