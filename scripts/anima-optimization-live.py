@@ -31,6 +31,7 @@ from cozy_runtime.internal.anima_optimization import (
     OPTIMIZATION_ID,
     AnimaOptimizationRefusal,
     _install_block_plan,
+    _install_transformer_plan,
     _native_rms_forward,
     _require_source,
     _require_transformer_config,
@@ -82,8 +83,19 @@ def main() -> None:
         assert exc.code == "anima_optimization_config"
     else:
         raise AssertionError("a non-Anima Cosmos config was accepted")
+    exact_before = _tensor_census(exact)
+    _install_transformer_plan(exact, kitchen=kitchen, torch=torch)
+    assert exact_before == _tensor_census(exact), "full transformer topology changed"
 
     torch.manual_seed(11)
+    final_norm = RMSNorm(2048, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    norm_input = torch.randn(1, 4096, 2048, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        eager_norm = final_norm(norm_input)
+        final_norm.forward = MethodType(_native_rms_forward, final_norm)
+        optimized_norm = final_norm(norm_input)
+    assert torch.allclose(eager_norm, optimized_norm, atol=0.03125, rtol=0.03125)
+
     block = (
         CosmosTransformerBlock(
             16,
@@ -121,6 +133,7 @@ def main() -> None:
     repeat = _call(block, hidden, context, timestep, rotary)
     optimized_ms = _bench(block, hidden, context, timestep, rotary)
     error = (eager.float() - optimized.float()).abs()
+    norm_error = (eager_norm.float() - optimized_norm.float()).abs()
     assert before == after, "callable installation changed topology or a storage pointer"
     assert torch.equal(optimized, repeat), "optimized block is not deterministic"
     assert torch.allclose(eager, optimized, atol=0.125, rtol=0.03125)
@@ -131,11 +144,13 @@ def main() -> None:
     assert torch.equal(resized, latent_mask), "latent-sized zero mask changed model input"
     print(f"identity: {OPTIMIZATION_ID}")
     print("config refusal: PASS")
+    print("full 28-block topology: PASS")
     print("topology and storage pointers: PASS")
     print("optimized determinism: PASS")
     print("latent-sized zero mask: PASS")
     print(f"max_abs_error: {error.max().item():.6f}")
     print(f"mean_abs_error: {error.mean().item():.9f}")
+    print(f"final_norm_max_abs_error: {norm_error.max().item():.6f}")
     print(f"block_eager_ms: {eager_ms:.3f}")
     print(f"block_optimized_ms: {optimized_ms:.3f}")
     print(f"block_speedup: {eager_ms / optimized_ms:.3f}x")
