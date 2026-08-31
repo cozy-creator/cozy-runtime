@@ -130,10 +130,10 @@ def artifact_exchange_bytes(
             remaining -= len(chunk)
         raw = b"".join(chunks)
         after = os.fstat(descriptor)
-        if (
-            len(raw) != expected_length
-            or (before.st_dev, before.st_ino, before.st_size)
-            != (after.st_dev, after.st_ino, after.st_size)
+        if len(raw) != expected_length or (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
         ):
             raise ValueError(f"artifact {kind} spool file changed while being read")
         return raw
