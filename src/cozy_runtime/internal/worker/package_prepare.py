@@ -438,10 +438,18 @@ def prepare_package(
         )
     else:
         # Private transport freezes code, descriptor and Environment only. A later ordinary
-        # PlacementSet supplies the exact serving model bindings; JobDirective + InvocationSpec
-        # supplies a job's exact model inputs. Returning only weightless callables here made the
-        # same private revision change shape according to which callable happened to need weights.
-        selected_models, entrypoints = [], []
+        # PlacementSet supplies exact modeled serving bindings; JobDirective + InvocationSpec
+        # supplies a job's exact model inputs. Weightless serving bindings need no later model
+        # authority and are already exact consequences of this retained descriptor.
+        selected_models, entrypoints = _entrypoints(
+            descriptor_body,
+            package_name=package_name,
+            selections=(),
+            files={},
+            artifact_cache=artifact_cache,
+            artifact_store=None,
+            verified=verified,
+        )
     if development is None and not entrypoints and not jobs:
         raise PreparationRefusal(
             "package_prepare_callable_absent",

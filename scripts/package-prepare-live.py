@@ -298,7 +298,8 @@ def main(argv: list[str] | None = None) -> int:
             "sha256:" + digest.hex()
         )
         assert private["environment"]["wheels"] == []
-        assert private["entrypoints"] == []
+        assert private["entrypoints"]
+        assert all(entrypoint["slots"] == [] for entrypoint in private["entrypoints"])
         assert private["models"] == []
         assert len(read_placement_set(private_result.placement_set)) == 1
         changed_refs = [pb.PrivatePackageFileRef() for _row in revision.files]
