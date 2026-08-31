@@ -103,9 +103,7 @@ def prepare_package_set(
             try:
                 distribution, _version, _build, _tags = parse_wheel_filename(row.filename)
             except InvalidWheelFilename as exc:
-                raise PreparationRefusal(
-                    "package_prepare_file_invalid", row.filename
-                ) from exc
+                raise PreparationRefusal("package_prepare_file_invalid", row.filename) from exc
             if _DISTRIBUTION.sub("-", str(distribution)).lower() in base.distribution_versions:
                 # A release is portable across CPU/CUDA bases with different ambient
                 # inventories. Never overlay or shadow an image-owned distribution;
