@@ -178,7 +178,7 @@ def main() -> int:
         rows.append(
             {
                 "name": "copy-model",
-                "source": "source",
+                "sources": {"source": "hf/example/model/default"},
                 "nodes": [
                     {
                         "name": "copy",

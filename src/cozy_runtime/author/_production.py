@@ -110,8 +110,8 @@ class ProductionContract:
 class ProductionNode:
     """One ordinary job invocation in a static production graph.
 
-    ``models`` maps the referenced job's model input name to either the production source
-    name or ``<node>.<output>``. ``assets`` maps typed input names to package-relative
+    ``models`` maps the referenced job's model input name to either one production source
+    slot or ``<node>.<output>``. ``assets`` maps typed input names to package-relative
     immutable members; the package builder, not the job, resolves their bytes.
     """
 
@@ -193,13 +193,28 @@ class ProductionOutput:
 @dataclass(frozen=True, slots=True)
 class Production:
     name: str
-    source: str
+    sources: Mapping[str, str]
     nodes: tuple[ProductionNode, ...]
     outputs: tuple[ProductionOutput, ...]
 
     def __post_init__(self) -> None:
         _name(self.name, "production")
-        _name(self.source, f"production {self.name} source")
+        if not self.sources or len(self.sources) > MAX_NODE_INPUTS:
+            raise ConformanceError(
+                f"production {self.name} has {len(self.sources)} source slots; "
+                f"the bound is 1..={MAX_NODE_INPUTS}",
+                code="production_bound",
+                fields=[self.name, "sources"],
+            )
+        for slot, profile in self.sources.items():
+            _name(slot, f"production {self.name} source slot")
+            if not isinstance(profile, str) or _CONTRACT_VALUE.fullmatch(profile) is None:
+                raise ConformanceError(
+                    f"production {self.name} source slot {slot!r} has malformed "
+                    f"TensorFS profile {profile!r}",
+                    code="production_source_profile",
+                    fields=[self.name, slot],
+                )
         if not self.nodes or len(self.nodes) > MAX_NODES:
             raise ConformanceError(
                 f"production {self.name} has {len(self.nodes)} nodes; the bound is 1..={MAX_NODES}",
@@ -235,7 +250,7 @@ class Production:
         dependencies: dict[str, set[str]] = {node.name: set() for node in self.nodes}
 
         def resolve(reference: str, owner: str) -> str | None:
-            if reference == self.source:
+            if reference in self.sources:
                 return None
             node_name, separator, output = reference.partition(".")
             node = by_name.get(node_name)

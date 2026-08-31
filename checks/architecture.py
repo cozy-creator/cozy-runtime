@@ -1188,12 +1188,12 @@ def fence_descriptor_minimality() -> list[str]:
     def visit(value: object, where: str) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                production_resource = (
-                    ".model_productions[" in where
+                scheduling_resource = (
+                    (".model_productions[" in where or ".jobs[" in where)
                     and ".resources" in where
                     and key in {"placement", "requires"}
                 )
-                if key in forbidden and not production_resource:
+                if key in forbidden and not scheduling_resource:
                     bad.append(f"{where}.{key} is an unused descriptor fact")
                 if key == "wire" and item == "required":
                     bad.append(f"{where}.wire repeats the required-field default")

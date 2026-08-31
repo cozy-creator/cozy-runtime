@@ -1725,6 +1725,9 @@ def run_retired_descriptor_shapes() -> list[str]:
         "mxfp8//1"
     ]
 
+    source_profile_escape = clone()
+    source_profile_escape["model_productions"][0]["sources"]["dits"] = "../foreign-profile"
+
     return [
         refused("hidden", hidden),
         refused("param", param),
@@ -1732,6 +1735,7 @@ def run_retired_descriptor_shapes() -> list[str]:
         refused("repeated-tag-field", old_tag),
         refused("production-structure-escape", structure_escape),
         refused("production-encoding-empty-segment", encoding_escape),
+        refused("production-source-profile-escape", source_profile_escape),
     ]
 
 
