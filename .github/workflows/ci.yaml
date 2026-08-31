@@ -24,6 +24,14 @@ jobs:
       # alike — protoc's output is a copied artifact and reformatting it would break the copy.
       - run: uv run ruff format --check .
       - run: uv run mypy
+      - name: Reproduce the CPython 3.12 Runtime wheel
+        run: |
+          set -euo pipefail
+          a=$(mktemp -d)
+          b=$(mktemp -d)
+          SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
+          SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
+          cmp "$a"/*.whl "$b"/*.whl
       # Self-contained architecture fences + frozen ES6 vectors + torch-free import. The
       # one cross-repo TensorFS registry comparison has its own pinned job below.
       - run: uv run python checks/architecture.py --exclude reviewed-specs-exist
