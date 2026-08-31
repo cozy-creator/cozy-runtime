@@ -149,11 +149,11 @@ def run(args: list[str], _opts: Options) -> Result:
 
     for base_path, base_digest, base_raw in bases:
         try:
-            base, wheels = overlay.preflight_overlay(project_path, dependencies, base_raw)
+            base, wheels, observed = overlay.preflight_overlay(project_path, dependencies, base_raw)
         except overlay.OverlayRefusal as exc:
             refused.append({"base": base_digest, "code": exc.code, "detail": exc.detail})
             continue
-        facts = {wheel.filename: wheel for wheel in wheels}
+        facts = {wheel.filename: wheel for wheel in observed}
         if any(
             facts[name].digest != row["digest"] or facts[name].length != row["length"]
             for name, row in expected.items()

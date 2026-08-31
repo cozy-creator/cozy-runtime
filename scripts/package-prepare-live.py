@@ -51,10 +51,6 @@ def main(argv: list[str] | None = None) -> int:
         view.mkdir(parents=True)
         local_wheel = view / wheel.name
         local_wheel.write_bytes(wheel.read_bytes())
-        redundant = view / (
-            "msgspec-" + importlib.metadata.version("msgspec") + "-py3-none-any.whl"
-        )
-        redundant.write_bytes(b"base-owned carrier is deliberately not installed")
         base = root / "WheelhouseManifest.json"
         base.write_bytes(
             canonical.write(
@@ -130,13 +126,6 @@ def main(argv: list[str] | None = None) -> int:
                 length=wheel.stat().st_size,
                 path=str(local_wheel),
             ),
-            pb.LocalDownloadFile(
-                digest=hashlib.sha256(redundant.read_bytes()).digest(),
-                filename=redundant.name,
-                kind=pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
-                length=redundant.stat().st_size,
-                path=str(redundant),
-            ),
         ]
         files.sort(key=lambda row: row.digest)
         verified: list[str] = []
@@ -172,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         assert placement["package"]["release_digest"] == release_digest
         assert placement["models"] == []
         assert placement["environment"]["wheels"] == []
-        assert len(verified) == 2
+        assert len(verified) == 1
         assert [row["name"] for row in placement["entrypoints"]] == ["marco"]
         assert placement["entrypoints"][0]["slots"] == []
         descriptor_path = cache / str(placement["package_descriptor"]["digest"]).removeprefix(
@@ -421,10 +410,10 @@ def modeled(root: Path, base: Path, cache: Path, wheel_dir: Path | None) -> None
         }
     )
     base_with_helper["base_import_roots"].sort(key=lambda row: row["root"])
-    _base, carried = overlay.preflight_overlay(
+    _base, carried, _observed = overlay.preflight_overlay(
         local_wheel, (helper_wheel.resolve(),), base_without_helper
     )
-    _base, reused = overlay.preflight_overlay(
+    _base, reused, _observed = overlay.preflight_overlay(
         local_wheel, (helper_wheel.resolve(),), canonical.write(base_with_helper)
     )
     assert len(carried) == 2 and len(reused) == 1

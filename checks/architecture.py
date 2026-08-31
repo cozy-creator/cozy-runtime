@@ -749,14 +749,14 @@ def fence_base_ownership_vectors() -> list[str]:
         (
             "base-worker-image-wheelhouse-cpu.json",
             24_968,
-            "sha256:584d007d0af334ab40c62fd252646351c9309223e78ad67f5a0ffd721877f9de",
+            "sha256:6dd580aec64cc13fc1ac51150d8d7d9dadeb1ac43dac09c4802117189912556f",
             (27, 324, 26),
             ("none", "none"),
         ),
         (
             "base-worker-image-wheelhouse-cu130.json",
             25_538,
-            "sha256:fc003f4be5c82e3b6abe0745c35f456d81960edcce4172e82ddc763992a37cba",
+            "sha256:c9c000daf9e83f9a97ad4119d3309cf19c3c6c96aa5a50fdaf88f4a0523974d0",
             (86, 363, 10),
             ("cuda", "cu130"),
         ),
@@ -806,8 +806,8 @@ def fence_base_ownership_vectors() -> list[str]:
             "cozy-runtime": (
                 "0.0.19",
                 "cozy_runtime-0.0.19-py3-none-any.whl",
-                "sha256:be1a9ee5fdab390ac360acdc163967dead2186d1f659966cdbd3c652f8d466a3",
-                743_799,
+                "sha256:ad48274299c80ed2013cfa4259672517fc8b6718637a173196434c83320fafbb",
+                744_067,
             ),
             "tensorfs": (
                 "0.0.5",

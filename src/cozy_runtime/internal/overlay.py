@@ -236,6 +236,7 @@ def measure_wheel(
     base: BaseManifest,
     *,
     allow_native_custom: bool = False,
+    allow_base_owned: bool = False,
 ) -> tuple[Wheel, VerifiedFile]:
     """Derive one local wheel fact, then run the ordinary full wheel inspection once.
 
@@ -265,7 +266,13 @@ def measure_wheel(
         owner=owner,
         import_roots=tuple(sorted(roots)),
     )
-    inspected = _inspect(wheel, path, base, allow_native_custom=allow_native_custom)
+    inspected = _inspect(
+        wheel,
+        path,
+        base,
+        allow_native_custom=allow_native_custom,
+        allow_base_owned=allow_base_owned,
+    )
     return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
 
 
@@ -273,15 +280,17 @@ def preflight_overlay(
     project: Path,
     dependencies: Sequence[Path],
     base_raw: bytes,
-) -> tuple[BaseManifest, tuple[Wheel, ...]]:
+) -> tuple[BaseManifest, tuple[Wheel, ...], tuple[Wheel, ...]]:
     """Apply the rented-overlay admission policy without installing or executing code."""
 
     base_digest = _sha(base_raw)
     base = parse_base_manifest(base_raw, base_digest)
     project_row = measure_wheel(project, "project", base)
+    observed = [project_row[0]]
     measured = [(project_row[0], project_row[1], project)]
     for path in dependencies:
-        row = measure_wheel(path, "custom", base)
+        row = measure_wheel(path, "custom", base, allow_base_owned=True)
+        observed.append(row[0])
         if not base_owned_wheel(row[0], base):
             measured.append((row[0], row[1], path))
     wheels = tuple(row[0] for row in measured)
@@ -297,7 +306,7 @@ def preflight_overlay(
     )
     ordered = _verify_inventory(source, base)
     _verify_grants(source, ordered, base, allow_native_custom=False)
-    return base, ordered
+    return base, ordered, tuple(observed)
 
 
 def base_owned_wheel(wheel: Wheel, base: BaseManifest) -> bool:
@@ -969,6 +978,7 @@ def _inspect(
     base: BaseManifest,
     *,
     allow_native_custom: bool = False,
+    allow_base_owned: bool = False,
 ) -> _Inspected:
     try:
         filename_name, filename_version, _build, filename_tags = parse_wheel_filename(
@@ -1108,7 +1118,9 @@ def _inspect(
                 )
             for root in measured_roots:
                 providers = base.root_providers.get(root)
-                if providers is not None:
+                if providers is not None and not (
+                    allow_base_owned and wheel.owner == "custom" and wheel.distribution in providers
+                ):
                     raise _base_import_collision(wheel, root, providers)
             requires_python = parsed.get("Requires-Python")
             requirements: list[Requirement] = []

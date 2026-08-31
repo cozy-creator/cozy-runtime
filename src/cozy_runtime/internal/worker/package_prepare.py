@@ -237,6 +237,7 @@ def prepare_package(
                 owner,
                 base,
                 allow_native_custom=allow_native_custom,
+                allow_base_owned=owner == "custom",
             )
         except overlay.OverlayRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc

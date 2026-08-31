@@ -6,6 +6,7 @@ evidence about the public CLI surface; `proofs/cli/run.sh` owns that contract.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -155,21 +156,22 @@ def _serving_slice(
 
         owner._on_accepted = corrupt_acceptance
 
-    return run_slice(
-        config,
-        LocalRequest(
-            entrypoint="echo",
-            payload=payload,
-            outputs=(),
-            request_id=request_id,
-            inputs=inputs,
-        ),
-        workspace=workspace,
-        package_revision_digest=release_id,
-        package_descriptor=body,
-        options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
-        record_owner_hook=plant if accepted_mutation is not None else None,
-    )
+    with contextlib.chdir(project):
+        return run_slice(
+            config,
+            LocalRequest(
+                entrypoint="echo",
+                payload=payload,
+                outputs=(),
+                request_id=request_id,
+                inputs=inputs,
+            ),
+            workspace=workspace,
+            package_revision_digest=release_id,
+            package_descriptor=body,
+            options=WorkerOptions(root=workspace / "worker", release_id=release_id, no_warm=True),
+            record_owner_hook=plant if accepted_mutation is not None else None,
+        )
 
 
 def main() -> int:
