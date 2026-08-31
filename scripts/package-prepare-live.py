@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from cozy_runtime.cli import private_preflight
+from cozy_runtime.cli.io import Options
 from cozy_runtime.internal import canonical, descriptor, discovery, overlay
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
@@ -191,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         assert len(read_placement_set(result.placement_set)) == 1
         private_source = hashlib.sha256(b"exact editable Marco source").digest()
+        private_files = [row for row in files if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL]
         private_descriptor = descriptor.canonical_bytes(
             descriptor.build(discovery.discover(ROOT / "examples" / "marco-polo"))
         )
@@ -209,10 +212,30 @@ def main(argv: list[str] | None = None) -> int:
                     kind=row.kind,
                     length=row.length,
                 )
-                for row in files
+                for row in private_files
             ],
         )
         _revision_raw, private_revision = documents.identity(revision)
+        revision_path = root / "private-revision.json"
+        revision_path.write_bytes(_revision_raw)
+        descriptor_path = root / "private-descriptor.json"
+        descriptor_path.write_bytes(private_descriptor)
+        preflight_request = root / "private-preflight.json"
+        preflight_request.write_text(
+            json.dumps(
+                {
+                    "base_manifests": [str(base)],
+                    "descriptor": str(descriptor_path),
+                    "revision": str(revision_path),
+                    "wheels": [str(local_wheel)],
+                },
+                sort_keys=True,
+            )
+        )
+        preflight = private_preflight.run([str(preflight_request)], Options())
+        assert isinstance(preflight.document, dict)
+        assert preflight.document["private_revision_digest"] == documents.spell(private_revision)
+        assert len(preflight.document["compatible"]) == 1
         private_result = package_prepare.prepare_private_package(
             pb.PreparePrivatePackageRequest(
                 operation_id="private-marco-01",
@@ -222,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                     source_digest=private_source,
                     private_revision_digest=private_revision,
                 ),
-                files=files,
+                files=private_files,
                 environment_root=str(root / "private-environments"),
             ),
             artifact_cache=cache,
@@ -274,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                         source_digest=private_source,
                         private_revision_digest=changed_revision,
                     ),
-                    files=files,
+                    files=private_files,
                     environment_root=str(root / "private-changed-environments"),
                 ),
                 artifact_cache=cache,
