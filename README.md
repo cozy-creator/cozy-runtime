@@ -535,8 +535,8 @@ the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is th
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
 
 Model-producing jobs declare `ArtifactOutput` slots and request `ArtifactSink`. The sink accepts
-only exact typed `Model` inputs, stages produced streams inside the attempt spool, and delegates
-copy/create/derive, identity, replay, fencing and release to TensorFS's real derived transaction.
+only exact typed `Model` inputs, locks the declaration/output bound, and streams produced values
+directly into TensorFS's real copy/create/derive transaction without a model-sized spool copy.
 The job receives only the exact receipt—never a store, path, publisher or destination. The
 post-commit Worker Protocol receipt format is already supported. The pod product path remains
 deliberately unclaimed until pod-supervisor supplies the missing durable transaction handshake and

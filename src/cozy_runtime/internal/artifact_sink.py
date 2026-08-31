@@ -1,9 +1,9 @@
 """The Runtime/host adapter for TensorFS derived artifact transactions.
 
-The author service stages byte streams and emits :class:`ArtifactCommit`.  This module is
-the privileged half: it validates the immutable invocation grant, opens the real tfs-019
-transaction, journals nothing by assertion, and returns exact receipt bytes suitable for
-Worker Protocol's ``ArtifactReceipt`` wrapper.
+The author service emits one declaration plus bounded byte readers. This module is the
+privileged half: it validates the immutable invocation grant, opens the real tfs-019
+transaction before pulling bytes, streams directly into TensorFS, and returns exact receipt
+bytes suitable for Worker Protocol's ``ArtifactReceipt`` wrapper.
 
 Pod-supervisor does not yet expose this handshake to its stateless Runtime child.  The
 adapter therefore has no implicit worker hookup: local Runtime or the future host bridge
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from pathlib import Path
-from typing import Any, BinaryIO
+from io import BytesIO
+from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifact import (
@@ -23,7 +23,7 @@ from cozy_runtime.author._artifact import (
     ArtifactConfig,
     ArtifactReceipt,
     ArtifactTarget,
-    StagedArtifactValue,
+    Readable,
 )
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.protocol import documents
@@ -37,7 +37,6 @@ class ArtifactTransactionHost:
         self,
         *,
         store: Any,
-        spool: Path,
         owner_scope: str,
         request_id: str,
         invocation_spec_digest: str,
@@ -55,7 +54,6 @@ class ArtifactTransactionHost:
                 "artifact host identity is incomplete", code="artifact_host_identity"
             )
         self.store = store
-        self.spool = spool.resolve()
         self.owner_scope = owner_scope
         self.request_id = request_id
         self.invocation_spec_digest = invocation_spec_digest
@@ -64,10 +62,6 @@ class ArtifactTransactionHost:
         self.output_bounds = dict(output_bounds)
 
     def commit(self, request: ArtifactCommit) -> ArtifactReceipt:
-        if request.spool.resolve() != self.spool:
-            raise CapabilityError(
-                "artifact commit names another attempt spool", code="artifact_spool_mismatch"
-            )
         maximum = self.output_bounds.get(request.output_slot)
         if maximum is None or maximum != request.max_new_bytes:
             raise CapabilityError(
@@ -85,10 +79,7 @@ class ArtifactTransactionHost:
             sources[alias] = (manifest, length)
         transaction_id = self.transaction_id(request.output_slot)
         targets = {name: self._target(target) for name, target in request.targets.items()}
-        configs = {
-            name: self._config(name, config, request.config_values)
-            for name, config in request.configs.items()
-        }
+        configs = {name: self._config(config) for name, config in request.configs.items()}
         expected_declaration = {
             "components": {
                 name: self._locked_target(target)
@@ -111,7 +102,11 @@ class ArtifactTransactionHost:
                 f"artifact transaction {transaction_id} was abandoned",
                 code="artifact_transaction_closed",
             )
+        writer: Any = None
         try:
+            # Declaration and aggregate new-byte bound lock BEFORE TensorFS asks any
+            # produced stream for one byte. No model-sized output copy exists between the
+            # job and the CAS writer.
             writer = self.store.begin_derived(
                 transaction_id,
                 self.writer_session_id,
@@ -121,18 +116,27 @@ class ArtifactTransactionHost:
                 list(request.order),
                 request.max_new_bytes,
             )
-            for (component, key, role), staged in sorted(request.values.items()):
-                with self._open(staged) as source:
-                    writer.add_part(component, key, role, source)
-            for name, staged in sorted(request.config_values.items()):
-                with self._open(staged) as source:
-                    writer.add_config(name, source)
+            for component, target in sorted(request.targets.items()):
+                for key, tensor in sorted(target.add.items()):
+                    for role, part in sorted(tensor.parts.items()):
+                        writer.add_part(component, key, role, self._reader(part.data))
+            for name, config in sorted(request.configs.items()):
+                if config.data is not None:
+                    writer.add_config(name, self._reader(config.data))
             facts = self._receipt(writer.commit(), transaction_id, expected_declaration)
         except CapabilityError:
+            if writer is not None:
+                writer.fence()
             raise
         except Exception as exc:
+            fence_error = ""
+            if writer is not None:
+                try:
+                    writer.fence()
+                except Exception as fence:
+                    fence_error = f"; writer fence also failed: {type(fence).__name__}: {fence}"
             raise CapabilityError(
-                f"TensorFS artifact transaction refused: {type(exc).__name__}: {exc}",
+                f"TensorFS artifact transaction refused: {type(exc).__name__}: {exc}{fence_error}",
                 code="artifact_tensorfs_refused",
             ) from exc
         return self._wrap(request.output_slot, transaction_id, facts, replayed=False)
@@ -235,46 +239,26 @@ class ArtifactTransactionHost:
         return value
 
     @staticmethod
-    def _config(
-        name: str,
-        config: ArtifactConfig,
-        staged: Mapping[str, StagedArtifactValue],
-    ) -> dict[str, Any]:
+    def _config(config: ArtifactConfig) -> dict[str, Any]:
         value: dict[str, Any] = {}
         if config.source:
             value.update(source=config.source, source_config=config.source_config)
         if config.data is not None:
-            held = staged.get(name)
-            if held is None:
-                raise CapabilityError(
-                    f"artifact config {name!r} has no staged bytes",
-                    code="artifact_config_absent",
-                )
-            value.update(media_type=config.media_type, length=held.length)
+            known = (
+                len(config.data)
+                if isinstance(config.data, (bytes, bytearray, memoryview))
+                else config.length
+            )
+            value.update(media_type=config.media_type, length=known)
         return value
 
-    def _open(self, staged: StagedArtifactValue) -> BinaryIO:
-        leaf = staged.handle.rsplit("/", 1)[-1]
-        path = (self.spool / leaf).resolve()
-        if path.parent != self.spool or not path.is_file():
-            raise CapabilityError(
-                f"artifact staged handle {staged.handle!r} is outside the attempt spool",
-                code="artifact_staged_value_absent",
-            )
-        digest = hashlib.sha256()
-        length = 0
-        with path.open("rb") as source:
-            while chunk := source.read(8 << 20):
-                digest.update(chunk)
-                length += len(chunk)
-        observed = "sha256:" + digest.hexdigest()
-        if observed != staged.digest or length != staged.length:
-            raise CapabilityError(
-                f"artifact staged value changed: {observed}/{length}, expected "
-                f"{staged.digest}/{staged.length}",
-                code="artifact_staged_value_changed",
-            )
-        return path.open("rb")
+    @staticmethod
+    def _reader(source: object) -> Readable:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            return BytesIO(bytes(source))
+        if isinstance(source, Readable):
+            return source
+        raise CapabilityError("artifact part source is not readable", code="artifact_part_source")
 
     @staticmethod
     def _receipt(value: object, transaction_id: str, declaration: object) -> dict[str, Any]:

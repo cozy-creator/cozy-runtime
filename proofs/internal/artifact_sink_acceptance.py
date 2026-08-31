@@ -40,6 +40,7 @@ from cozy_runtime.protocol import documents
 
 class Request(msgspec.Struct, forbid_unknown_fields=True):
     marker: str
+    overlong: bool = False
 
 
 class Result(msgspec.Struct):
@@ -52,11 +53,31 @@ class SourceModel(Model[object]):
         del loader
 
 
+class Chunks:
+    """A bounded reader proving TensorFS pulls production directly under backpressure."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.offset = 0
+        self.reads = 0
+        STREAMS.append(self)
+
+    def read(self, size: int = -1) -> bytes:
+        self.reads += 1
+        if self.offset == len(self.data):
+            return b""
+        take = 257 if size < 0 else min(size, 257)
+        chunk = self.data[self.offset : self.offset + take]
+        self.offset += len(chunk)
+        return chunk
+
+
 app = App()
+STREAMS: list[Chunks] = []
 
 
-@app.job(artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
-def derive(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
+def produce(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
+    stream = Chunks(b"x" * (2049 if payload.overlong else 2048))
     receipt = artifacts.derive(
         "model",
         sources={"full": model},
@@ -69,14 +90,26 @@ def derive(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Res
                         logical_dtype="bf16",
                         shape=(32, 32),
                         encoding=PLAIN,
-                        parts={"value": ArtifactPart("bf16", (32, 32), b"x" * 2048)},
+                        parts={"value": ArtifactPart("bf16", (32, 32), stream)},
                     )
                 },
             )
         },
         order=ORDER,
     )
+    if not receipt.replayed and stream.reads < 2:
+        raise RuntimeError("TensorFS did not stream the produced value")
     return Result(receipt.artifact_transaction_id, receipt.tensorfs_receipt_digest)
+
+
+@app.job(artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
+def derive(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
+    return produce(payload, model, artifacts)
+
+
+@app.job(name="derive-tight", artifacts=(ArtifactOutput("model", max_new_bytes=1024),))
+def derive_tight(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
+    return produce(payload, model, artifacts)
 
 
 PLAIN = ""
@@ -158,7 +191,6 @@ def main() -> None:
             spool.mkdir()
             host = ArtifactTransactionHost(
                 store=store,
-                spool=spool,
                 owner_scope="proof-owner",
                 request_id="artifact-proof",
                 invocation_spec_digest="sha256:" + "1" * 64,
@@ -181,6 +213,8 @@ def main() -> None:
         second, _ = run(2)
         if first != second:
             raise RuntimeError("identical retry returned a different artifact receipt")
+        if any(any((root / f"spool-{writer}").iterdir()) for writer in (1, 2)):
+            raise RuntimeError("ArtifactSink made a model-sized attempt-spool copy")
         lookup = store.derived_lookup(first.transaction)
         receipt = lookup.get("receipt")
         if lookup.get("state") != "committed" or not isinstance(receipt, dict):
@@ -205,12 +239,70 @@ def main() -> None:
         released = host.release("model")
         if released.tensorfs_receipt_digest != first.receipt:
             raise RuntimeError("release changed the TensorFS receipt")
+
+        refused_spool = root / "spool-overlong"
+        refused_spool.mkdir()
+        refused_host = ArtifactTransactionHost(
+            store=store,
+            owner_scope="proof-owner",
+            request_id="artifact-overlong",
+            invocation_spec_digest="sha256:" + "2" * 64,
+            writer_session_id=1,
+            allowed_sources={manifest_id: manifest_length},
+            output_bounds={"model": 4096},
+        )
+        try:
+            invoke_with_fakes(
+                app.get("derive"),
+                {"marker": "table", "overlong": True},
+                request_id="artifact-overlong",
+                spool=refused_spool,
+                models={"model": chosen},
+                artifacts=refused_host.commit,
+            )
+        except Exception as exc:
+            if getattr(exc, "code", "") != "artifact_tensorfs_refused":
+                raise RuntimeError(f"overlong stream refused as {exc!r}") from exc
+        else:
+            raise RuntimeError("overlong produced stream committed")
+        refused_state = store.derived_lookup(refused_host.transaction_id("model"))
+        if refused_state.get("state") != "open" or "writer_session_id" in refused_state:
+            raise RuntimeError(f"overlong stream did not fence its writer: {refused_state}")
+        refused_host.abandon("model")
+
+        bounded_host = ArtifactTransactionHost(
+            store=store,
+            owner_scope="proof-owner",
+            request_id="artifact-bounded",
+            invocation_spec_digest="sha256:" + "3" * 64,
+            writer_session_id=1,
+            allowed_sources={manifest_id: manifest_length},
+            output_bounds={"model": 1024},
+        )
+        try:
+            invoke_with_fakes(
+                app.get("derive-tight"),
+                {"marker": "table"},
+                request_id="artifact-bounded",
+                models={"model": chosen},
+                artifacts=bounded_host.commit,
+            )
+        except Exception as exc:
+            if getattr(exc, "code", "") != "artifact_tensorfs_refused":
+                raise RuntimeError(f"over-bound declaration refused as {exc!r}") from exc
+        else:
+            raise RuntimeError("over-bound artifact declaration reached its stream")
+        if STREAMS[-1].reads != 0:
+            raise RuntimeError("TensorFS read bytes before enforcing the aggregate output cap")
+        if store.derived_lookup(bounded_host.transaction_id("model")).get("state") != "absent":
+            raise RuntimeError("over-bound declaration created a transaction")
         print(
             "ARTIFACT SINK PASS",
             manifest_id_out,
             first.transaction,
             first.receipt,
-            "replay=true protocol=true release=true",
+            "replay=true protocol=true release=true direct_stream=true "
+            "cap_before_read=true overlong_fenced=true",
         )
 
 

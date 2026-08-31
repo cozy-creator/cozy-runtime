@@ -2,19 +2,17 @@
 
 The job supplies a closed structural edit and byte streams.  It never sees a TensorFS
 store, transaction id, destination repository, upload grant, or publication credential.
-Runtime stages produced streams inside the attempt spool and hands one immutable request to
-the host transaction implementation.
+Runtime hands one immutable declaration plus bounded readers to the host transaction
+implementation. TensorFS locks geometry/order/sources/output bounds before it pulls a byte;
+no complete output is copied through the attempt spool.
 """
 
 from __future__ import annotations
 
-import hashlib
-import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import BinaryIO, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
@@ -23,7 +21,6 @@ MAX_ARTIFACT_OUTPUTS = 16
 MAX_ARTIFACT_SOURCES = 16
 MAX_ARTIFACT_COMPONENTS = 64
 MAX_ARTIFACT_ADDITIONS = 65_536
-_CHUNK = 8 << 20
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
@@ -131,6 +128,7 @@ class ArtifactConfig:
     source_config: str = ""
     media_type: str = ""
     data: ArtifactBytes | None = None
+    length: int = 0
 
     def __post_init__(self) -> None:
         copied = bool(self.source or self.source_config)
@@ -145,25 +143,26 @@ class ArtifactConfig:
                 "an added artifact config needs media_type and data",
                 code="artifact_config_declaration",
             )
-
-
-@dataclass(frozen=True, slots=True)
-class StagedArtifactValue:
-    handle: str
-    digest: str
-    length: int
+        if self.data is not None:
+            known = len(self.data) if isinstance(self.data, (bytes, bytearray, memoryview)) else 0
+            if (
+                self.length < 0
+                or (known and self.length not in (0, known))
+                or (not known and not self.length)
+            ):
+                raise CapabilityError(
+                    "an artifact config stream needs its exact non-negative length",
+                    code="artifact_config_length",
+                )
 
 
 @dataclass(frozen=True, slots=True)
 class ArtifactCommit:
     output_slot: str
-    spool: Path
     sources: Mapping[str, str]
     targets: Mapping[str, ArtifactTarget]
     configs: Mapping[str, ArtifactConfig]
     order: tuple[tuple[str, str], ...]
-    values: Mapping[tuple[str, str, str], StagedArtifactValue]
-    config_values: Mapping[str, StagedArtifactValue]
     max_new_bytes: int
 
 
@@ -255,37 +254,14 @@ class ArtifactSink:
                 code="artifact_addition_count",
             )
 
-        values: dict[tuple[str, str, str], StagedArtifactValue] = {}
-        config_values: dict[str, StagedArtifactValue] = {}
-        total = 0
-        for component, target in targets.items():
-            for key, tensor in target.add.items():
-                for role, part in tensor.parts.items():
-                    staged = self._stage(attempt, part.data)
-                    total += staged.length
-                    values[(component, key, role)] = staged
-        for name, config in (configs or {}).items():
-            if config.data is not None:
-                staged = self._stage(attempt, config.data)
-                total += staged.length
-                config_values[name] = staged
         maximum = self._outputs[output]
-        if total > maximum:
-            raise CapabilityError(
-                f"artifact output {output!r} staged {total} new bytes over its "
-                f"{maximum}-byte declaration",
-                code="artifact_output_bound",
-            )
         receipt = self._sink(
             ArtifactCommit(
                 output_slot=output,
-                spool=attempt.spool,
                 sources=selected,
                 targets=dict(targets),
                 configs=dict(configs or {}),
                 order=tuple(order),
-                values=values,
-                config_values=config_values,
                 max_new_bytes=maximum,
             )
         )
@@ -296,29 +272,3 @@ class ArtifactSink:
             )
         self._spent.add(output)
         return receipt
-
-    @staticmethod
-    def _stage(attempt: object, source: ArtifactBytes) -> StagedArtifactValue:
-        from cozy_runtime.author._services import Attempt
-
-        assert isinstance(attempt, Attempt)
-        handle = attempt.next_handle("artifact-value")
-        leaf = handle.rsplit("/", 1)[-1]
-        path = attempt.spool / leaf
-        digest = hashlib.sha256()
-        length = 0
-        reader: BinaryIO | Readable
-        if isinstance(source, (bytes, bytearray, memoryview)):
-            from io import BytesIO
-
-            reader = BytesIO(bytes(source))
-        else:
-            reader = source
-        with path.open("xb") as target:
-            while chunk := reader.read(_CHUNK):
-                target.write(chunk)
-                digest.update(chunk)
-                length += len(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-        return StagedArtifactValue(handle, "sha256:" + digest.hexdigest(), length)
