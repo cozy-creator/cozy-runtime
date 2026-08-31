@@ -82,11 +82,11 @@ class ProductionContract:
                 code="production_bound",
                 fields=["encodings"],
             )
-        if len(set(self.encodings)) != len(self.encodings) or any(
+        if tuple(sorted(set(self.encodings))) != self.encodings or any(
             _DIGEST.fullmatch(value) is None for value in self.encodings
         ):
             raise ConformanceError(
-                "production contract encodings must be unique exact EncodingSpec object IDs",
+                "production contract encodings must be sorted unique exact EncodingSpec object IDs",
                 code="production_contract",
                 fields=["encodings"],
             )

@@ -1725,6 +1725,12 @@ def run_retired_descriptor_shapes() -> list[str]:
         "plain/1"
     ]
 
+    encoding_order = clone()
+    encoding_order["model_productions"][0]["outputs"][0]["required_contract"]["encodings"] = [
+        "sha256:" + "2" * 64,
+        "sha256:" + "1" * 64,
+    ]
+
     source_profile_escape = clone()
     source_profile_escape["model_productions"][0]["sources"]["dits"] = "../foreign-profile"
 
@@ -1735,6 +1741,7 @@ def run_retired_descriptor_shapes() -> list[str]:
         refused("repeated-tag-field", old_tag),
         refused("production-topology-invalid", topology_escape),
         refused("production-encoding-alias", encoding_escape),
+        refused("production-encoding-order", encoding_order),
         refused("production-source-profile-escape", source_profile_escape),
     ]
 

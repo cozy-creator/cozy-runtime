@@ -191,7 +191,6 @@ _FORBIDDEN_KEYS = frozenset(
         "snapshot",
         "candidate",
         "destinations",
-        "topology_digest",
     }
 )
 
@@ -227,6 +226,14 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
         for index, item in enumerate(value):
             _fixed_point(item, bindings, f"{path}[{index}]")
     elif isinstance(value, str):
+        # A production output declares the exact byte-level result the package promises to
+        # derive. Those two digest-shaped values are SOURCE facts, unlike a selected release,
+        # model, build, or candidate. The contract's closed parser below is the only place
+        # this exception exists and validates both values as exact sha256 identities.
+        if path.endswith(".required_contract.topology_digest") or re.search(
+            r"\.required_contract\.encodings\[\d+\]$", path
+        ):
+            return
         if value in bindings:
             raise ConformanceError(
                 f"{path}: {value!r} is a package.toml binding value — bindings are MUTABLE "

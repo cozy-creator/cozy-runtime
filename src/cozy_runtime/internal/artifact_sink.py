@@ -21,7 +21,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from cozy.worker.v1 import artifact_limits
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifact import (
     ArtifactBytes,
@@ -33,7 +32,7 @@ from cozy_runtime.author._artifact import (
     Readable,
 )
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import artifact_limits, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")

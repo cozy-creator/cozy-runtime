@@ -25,7 +25,9 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 PROFILE = "hf/stabilityai/stable-diffusion-xl-base-1.0/diffusers-fp16"
-SOURCE_URI = "hf://stabilityai/stable-diffusion-xl-base-1.0@" + "1" * 40
+SOURCE_URI = (
+    "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b"
+)
 MEMBERS = (
     "text_encoder/model.fp16.safetensors",
     "text_encoder_2/model.fp16.safetensors",

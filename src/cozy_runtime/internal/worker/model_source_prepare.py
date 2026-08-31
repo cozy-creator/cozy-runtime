@@ -12,10 +12,9 @@ import stat
 import urllib.parse
 from pathlib import Path
 
-from cozy.worker.v1 import artifact_limits
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.refusal import LaunchRefusal
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import artifact_limits, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
