@@ -78,6 +78,42 @@ def require_encoder() -> None:
     _av()
 
 
+def _image(width: int, height: int, rgb: bytes) -> Any:
+    from PIL import Image
+
+    return Image.frombytes("RGB", (width, height), rgb)
+
+
+def encode_png(width: int, height: int, rgb: bytes) -> bytes:
+    """Encode exact RGB pixels with PNG's maximum practical lossless settings."""
+
+    encoded = io.BytesIO()
+    _image(width, height, rgb).save(encoded, format="PNG", optimize=True, compress_level=9)
+    body = encoded.getvalue()
+    if body[:8] != b"\x89PNG\r\n\x1a\n":
+        raise OutputError("the lossless PNG encoder returned a malformed container", code="encode")
+    return body
+
+
+def encode_webp(width: int, height: int, rgb: bytes) -> bytes:
+    """Encode exact RGB pixels with WebP's maximum practical lossless settings.
+
+    Method 5 is the measured knee: on the retained 1024px Anima output, method 6 took
+    17.16s instead of 1.41s to save only another 10,296 bytes. Compression is lossless,
+    quality 100 and exact either way; method 6 would turn output packaging into a second
+    inference tail.
+    """
+
+    encoded = io.BytesIO()
+    _image(width, height, rgb).save(
+        encoded, format="WEBP", lossless=True, method=5, quality=100, exact=True
+    )
+    body = encoded.getvalue()
+    if len(body) < 12 or body[:4] != b"RIFF" or body[8:12] != b"WEBP":
+        raise OutputError("the lossless WebP encoder returned a malformed container", code="encode")
+    return body
+
+
 def _drain(obj: object, what: str) -> tuple[object, str]:
     """Duck-typed to an ndarray-like on the CPU; returns (ndarray-like, dtype name)."""
     if hasattr(obj, "detach"):
