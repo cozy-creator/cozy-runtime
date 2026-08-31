@@ -57,7 +57,7 @@ def main() -> int:
                     "compatibility_profile": {
                         "accelerator_build": "cpu",
                         "os_cpu": "linux-x86",
-                        "python_abi": "cp314",
+                        "python_abi": "cp312",
                         "torch_release": "2.13.0",
                     },
                     "format": "WheelhouseManifest/1",
@@ -68,7 +68,7 @@ def main() -> int:
                         "accelerator_backend": "none",
                         "libc": "glibc2.39",
                         "os_arch": "linux/amd64",
-                        "python_abi": "cp314",
+                        "python_abi": "cp312",
                     },
                     "wheels": [
                         {

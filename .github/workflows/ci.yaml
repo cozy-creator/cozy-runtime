@@ -11,20 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
-      - run: uv python install 3.14
+      - run: uv python install 3.12
       - run: uv sync
       - run: >-
           uv run python -c "import sys, sysconfig;
-          assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 14)
-          and sysconfig.get_config_var('Py_GIL_DISABLED') == 0"
-      - name: Refuse the free-threaded CPython ABI
-        run: |
-          if uv run --isolated --no-project --python 3.14t python -c \
-            "import sys; sys.path.insert(0, 'src'); import cozy_runtime" 2>cp314t.err; then
-            echo "cozy-runtime admitted cp314t" >&2
-            exit 1
-          fi
-          grep -F "cozy-runtime requires standard CPython 3.14 (cp314, not cp314t)" cp314t.err
+          assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
+          and sysconfig.get_config_var('Py_GIL_DISABLED') != 1"
       - run: uv run ruff check .
       # Formatting is a DETERMINISM check like the others here: one canonical rendering of
       # the tree, so a diff is only ever a change of meaning. The generated `worker_pb2*`

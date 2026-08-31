@@ -2,7 +2,7 @@
 name = "proof-environment-project"
 version = "1.0.0"
 description = "Repository-only project wheel for the Runtime environment proof"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [build-system]

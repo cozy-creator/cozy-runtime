@@ -2,7 +2,7 @@
 name = "proof-environment-resolved"
 version = "2.0.0"
 description = "Repository-only resolved wheel for the Runtime environment proof"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [build-system]

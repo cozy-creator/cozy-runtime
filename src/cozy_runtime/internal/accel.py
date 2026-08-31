@@ -80,7 +80,7 @@ def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
             timeout=PROCESS_QUERY_SECONDS,
             check=True,
         )
-    except OSError, subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         return {pid: ProcessMemory("unreadable") for pid in pids}
     result = {pid: ProcessMemory("absent", 0) for pid in pids}
     for line in out.stdout.strip().splitlines():

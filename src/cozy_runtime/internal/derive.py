@@ -603,7 +603,7 @@ def _load_typed(model: Any, loader: Any) -> None:
 
     try:
         model.load(loader)
-    except DeriveError, FenceViolation, ConformanceError:
+    except (DeriveError, FenceViolation, ConformanceError):
         raise
     except NotImplementedError as exc:
         raise _classify(exc) from exc

@@ -88,19 +88,19 @@ def fence_prelaunch_version() -> list[str]:
 
 
 def fence_python_abi() -> list[str]:
-    """The distribution, tooling and bundled packages target ordinary CPython 3.14."""
+    """The distribution, tooling and bundled packages target standard CPython 3.12."""
 
     bad: list[str] = []
-    requirement = ">=3.14,<3.15"
+    requirement = ">=3.12,<3.13"
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     if project.get("project", {}).get("requires-python") != requirement:
         bad.append(f"pyproject.toml: requires-python must be {requirement!r}")
-    if project.get("tool", {}).get("mypy", {}).get("python_version") != "3.14":
-        bad.append("pyproject.toml: mypy must check the Python 3.14 language surface")
+    if project.get("tool", {}).get("mypy", {}).get("python_version") != "3.12":
+        bad.append("pyproject.toml: mypy must check the Python 3.12 language surface")
 
     pin = ROOT / ".python-version"
-    if not pin.is_file() or pin.read_text() != "3.14\n":
-        bad.append(".python-version: must pin uv to CPython 3.14")
+    if not pin.is_file() or pin.read_text() != "3.12\n":
+        bad.append(".python-version: must pin uv to CPython 3.12")
 
     bundled = sorted((ROOT / "examples").rglob("pyproject.toml"))
     bundled += sorted((ROOT / "proofs" / "fixtures").rglob("pyproject.toml"))
@@ -114,14 +114,14 @@ def fence_python_abi() -> list[str]:
         ROOT / "examples" / "marco-polo" / "uv.lock",
         ROOT / "proofs" / "fixtures" / "environment-project" / "uv.lock",
     ):
-        if tomllib.loads(path.read_text()).get("requires-python") != "==3.14.*":
-            bad.append(f"{path.relative_to(ROOT)}: lock does not cover exactly Python 3.14")
+        if tomllib.loads(path.read_text()).get("requires-python") != "==3.12.*":
+            bad.append(f"{path.relative_to(ROOT)}: lock does not cover exactly Python 3.12")
 
     scaffold = (SRC / "cli" / "new.py").read_text()
     for expected in (
-        'requires-python = ">=3.14,<3.15"',
+        'requires-python = ">=3.12,<3.13"',
         'dependencies = ["cozy-runtime>={__version__},<0.1"]',
-        'python_version = "3.14"',
+        'python_version = "3.12"',
     ):
         if expected not in scaffold:
             bad.append(f"src/cozy_runtime/cli/new.py: generated package omits {expected!r}")
@@ -129,7 +129,7 @@ def fence_python_abi() -> list[str]:
     runtime = (SRC / "_interpreter.py").read_text()
     for expected in (
         'sys.implementation.name != "cpython"',
-        "sys.version_info[:2] != (3, 14)",
+        "sys.version_info[:2] != (3, 12)",
         'sysconfig.get_config_var("Py_GIL_DISABLED") == 1',
     ):
         if expected not in runtime:
@@ -745,7 +745,7 @@ def fence_base_ownership_vectors() -> list[str]:
         expected_target = {
             "os_arch": "linux/amd64",
             "libc": "glibc2.36",
-            "python_abi": "cp314",
+            "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],
         }
@@ -761,7 +761,7 @@ def fence_base_ownership_vectors() -> list[str]:
             ),
             "tensorfs": (
                 "0.0.2",
-                "tensorfs-0.0.2-cp314-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                "tensorfs-0.0.2-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
                 "sha256:5d5420f9571778ae884daf6fe31bc649318014cd644d94b17a7c465929be5d93",
                 2_085_526,
             ),
@@ -866,14 +866,14 @@ def fence_tensorhub_package_release() -> list[str]:
     stored = path.read_bytes()
     bad: list[str] = []
     got = hashlib.sha256(stored).hexdigest()
-    want = "feb53bddb11fefe623a4d4039f88dc53e6345e6e1bd20710f854b9056355b8fa"
+    want = "5f868fe549a22151e3a925d5638a13a315ae3508b16cbbad07ca0382d552313e"
     if got != want:
         return [f"{path.relative_to(ROOT)}: stored fixture hashes to {got}, want {want}"]
     if not stored.endswith(b"\n") or stored.endswith(b"\n\n"):
         return [f"{path.relative_to(ROOT)}: producer fixture must carry one trailing LF"]
     raw = stored[:-1]
     document_digest = hashlib.sha256(raw).hexdigest()
-    if document_digest != "064632d54e56d601ae1e5fc325f636e1cd94c34b959057d366058cba6f97c175":
+    if document_digest != "f894cff72dce53a2f85943bc10d1a1226f3fcacc983faddad6afbd6d61c425cf":
         return [f"{path.relative_to(ROOT)}: canonical document hashes to {document_digest}"]
     try:
         release = canonical.parse_canonical(raw)

@@ -250,7 +250,7 @@ def run_prepared(
     record = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
     try:
         return invoke(prepared, inv, record), SUCCEEDED, record
-    except KeyboardInterrupt, SystemExit:
+    except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
         return None, classify(exc), record
@@ -269,7 +269,7 @@ def attempt(
         prepared = prepare(
             registration, wire, recipes=inv.recipes, clamps=inv.clamps, settings=inv.settings
         )
-    except KeyboardInterrupt, SystemExit:
+    except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
         return (

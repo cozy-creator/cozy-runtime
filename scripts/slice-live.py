@@ -93,7 +93,7 @@ def gpu_used_mib() -> int:
             check=True,
         )
         return int(out.stdout.strip().splitlines()[0])
-    except OSError, subprocess.SubprocessError, ValueError, IndexError:
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return -1
 
 

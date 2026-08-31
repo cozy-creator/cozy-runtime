@@ -1205,7 +1205,7 @@ class Worker:
         """
         try:
             first = next(inbound)
-        except StopIteration, Exception:
+        except (StopIteration, Exception):
             return
         claim = first.claim if first.WhichOneof("msg") == "claim" else None
         if claim is None:

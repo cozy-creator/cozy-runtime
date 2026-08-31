@@ -87,11 +87,11 @@ def measure(expected_backend: str = "") -> HostFacts:
             gpu_name, vram, driver = name, int(float(total)) * 1024 * 1024, drv
             gpu_sm = int(float(cap) * 10)
             backend = "cuda"
-        except OSError, subprocess.SubprocessError, ValueError, IndexError:
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             unreadable += ["gpu_name", "gpu_sm", "vram_total_bytes", "driver_version"]
     try:
         pages = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except ValueError, OSError:
+    except (ValueError, OSError):
         pages = 0
         unreadable.append("host_ram_total_bytes")
     cuda_version, cuda_unreadable = _installed_cuda_version()
@@ -148,7 +148,7 @@ def _installed_cuda_version(paths: Mapping[str, str] | None = None) -> tuple[str
     for raw in documents:
         try:
             tree = ast.parse(raw.decode("utf-8"), filename="torch/version.py")
-        except UnicodeDecodeError, SyntaxError:
+        except (UnicodeDecodeError, SyntaxError):
             return "", True
         assignments: list[ast.expr] = []
         for node in tree.body:

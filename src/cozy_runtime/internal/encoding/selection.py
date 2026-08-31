@@ -183,7 +183,7 @@ def _nvml(query: str, index: int) -> str:
             timeout=10,
             check=True,
         ).stdout.strip()
-    except OSError, subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         return "unreadable"
     return (out.splitlines() or ["unreadable"])[0].strip().replace(" ", "") or "unreadable"
 
