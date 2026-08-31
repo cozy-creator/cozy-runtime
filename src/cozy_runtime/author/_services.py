@@ -74,6 +74,7 @@ class ProgressFrame:
     name: str
     fraction: float
     position: int
+    step_ms: float = 0.0
 
 
 @dataclass(slots=True)
@@ -646,7 +647,10 @@ class Telemetry(_Bound):
             if mark:
                 attempt.attribution.step(name, (now - mark) * 1000)
             attempt._step_mark = now
-            attempt.signal(ProgressFrame(name, (step + 1) / total if total else 1.0, step + 1))
+            step_ms = (now - mark) * 1000 if mark else 0.0
+            attempt.signal(
+                ProgressFrame(name, (step + 1) / total if total else 1.0, step + 1, step_ms)
+            )
 
         return on_step
 

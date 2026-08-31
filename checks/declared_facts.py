@@ -53,8 +53,9 @@ from cozy_runtime.author import (  # noqa: E402
     attempt,
 )
 from cozy_runtime.author._assets import GrantedInput  # noqa: E402
-from cozy_runtime.author._services import SERVICES, Attempt  # noqa: E402
+from cozy_runtime.author._services import SERVICES, Attempt, ProgressFrame  # noqa: E402
 from cozy_runtime.internal import schema  # noqa: E402
+from cozy_runtime.internal.worker.session import _progress_document  # noqa: E402
 
 Observation = str
 probe = App()
@@ -321,9 +322,43 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
         kinds = sorted({event.kind for event in record.ring})
         assert len(record.ring), "Telemetry recorded nothing — its writer is gone"
         caps = record.ring.caps()
+
+        signals: list[object] = []
+        progress_attempt = Attempt("progress", spool / "progress", sink=signals.append)
+        progress = Telemetry(
+            progress_attempt,
+            Context(request_id="progress", deadline=time.monotonic() + 30),
+        )
+        step = progress.step_callback(4, stage="denoise")
+        time.sleep(0.001)
+        step(0)
+        assert len(signals) == 1 and isinstance(signals[0], ProgressFrame), signals
+        frame = signals[0]
+        assert frame.name == "denoise", frame
+        assert frame.fraction == 0.25 and frame.position == 1, frame
+        assert frame.step_ms > 0, frame
+        document = _progress_document(
+            {
+                "kind": "progress",
+                "name": frame.name,
+                "value": frame.fraction,
+                "position": frame.position,
+                "step_ms": frame.step_ms,
+            }
+        )
+        assert document == {
+            "type": "progress",
+            "payload": {
+                "name": "denoise",
+                "fraction": 0.25,
+                "position": 1,
+                "step_ms": frame.step_ms,
+            },
+        }, document
         return (
             f"{caps['admitted']} observations across kinds {kinds}; ring holds "
-            f"{caps['kept']}/{caps['max_events']} at {caps['held_bytes']} B"
+            f"{caps['kept']}/{caps['max_events']} at {caps['held_bytes']} B; "
+            f"progress preserved stage/step/time ({frame.step_ms:.3f} ms)"
         )
 
     def media_decode() -> Observation:

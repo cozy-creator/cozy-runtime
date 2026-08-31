@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.17"
+version = "0.0.18"
 source = { editable = "../../" }
 dependencies = [
     { name = "cryptography" },
