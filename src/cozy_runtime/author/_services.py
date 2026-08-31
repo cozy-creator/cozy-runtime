@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import struct
 import time
-import zlib
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -234,33 +232,9 @@ def as_frame(image: object) -> ImageFrame:
 
 
 def encode_png(frame: ImageFrame) -> bytes:
-    """A real, dependency-free PNG encoder — the encode the fakes exercise IS this one.
+    """Encode exact RGB pixels as maximum-compression lossless PNG."""
 
-    cr-017 owns the codec plane (webp/mp4/flac, the capability probe, the integrity floor,
-    and C2PA signing over the final container). This is the one format that exists today,
-    and it is genuinely produced, not stubbed.
-    """
-    raw = bytearray()
-    stride = frame.width * 3
-    for y in range(frame.height):
-        raw.append(0)
-        raw += frame.rgb[y * stride : (y + 1) * stride]
-
-    def chunk(tag: bytes, body: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(body))
-            + tag
-            + body
-            + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
-        )
-
-    header = struct.pack(">IIBBBBB", frame.width, frame.height, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-        + chunk(b"IEND", b"")
-    )
+    return _codec.encode_png(frame.width, frame.height, frame.rgb)
 
 
 # --------------------------------------------------------------------------- services
@@ -279,14 +253,17 @@ class Outputs(_Bound):
         return _codec.AAC_FRAME_SAMPLES
 
     def save_image(self, image: object, *, format: str = "png") -> ImageAsset:
-        if format != "png":
-            raise OutputError(
-                f"image format {format!r} has no encoder: png is the image product "
-                "(mp4/flac live in save_video/save_audio; webp, the integrity floor and "
-                "C2PA are cr-017's remaining half)",
-                code="encoder_unavailable",
+        frame = as_frame(image)
+        if format == "png":
+            return self._register(encode_png(frame), ImageAsset, "image/png")
+        if format == "webp":
+            return self._register(
+                _codec.encode_webp(frame.width, frame.height, frame.rgb), ImageAsset, "image/webp"
             )
-        return self._register(encode_png(as_frame(image)), ImageAsset, "image/png")
+        raise OutputError(
+            f"image format {format!r} has no encoder: choose png or lossless webp",
+            code="encoder_unavailable",
+        )
 
     def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioAsset:
         self._attempt.check_open("Outputs.save_audio")

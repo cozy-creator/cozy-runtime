@@ -164,6 +164,7 @@ AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec",)
 # an absent wheel is the typed `encoder_unavailable` refusal, not an ImportError at import.
 AUTHOR_ALLOWED_LAZY: dict[str, frozenset[str]] = {
     "av": frozenset({"_codec.py", "_decode.py"}),
+    "PIL": frozenset({"_codec.py"}),
 }
 
 ENV_AUTHORITY = SRC / "internal" / "config.py"

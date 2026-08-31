@@ -327,10 +327,18 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
         )
 
     def media_decode() -> Observation:
+        from io import BytesIO
+
+        from PIL import Image
+
         source = Attempt("media-source", spool / "media-source")
         source.spool.mkdir(parents=True, exist_ok=True)
-        image = Outputs(source).save_image(ImageFrame(1, 1, b"\x10\x20\x30"))
+        pixels = b"\x10\x20\x30\x40\x50\x60"
+        image = Outputs(source).save_image(ImageFrame(2, 1, pixels), format="webp")
         assert image._local is not None
+        assert image.media_type == "image/webp"
+        assert image._local.read_bytes()[8:12] == b"WEBP"
+        assert Image.open(BytesIO(image._local.read_bytes())).convert("RGB").tobytes() == pixels
         grant = GrantedInput(
             "image", image._local, image.media_type, image.digest, image.size_bytes
         )
