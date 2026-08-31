@@ -151,7 +151,7 @@ def _prepare(args: argparse.Namespace) -> None:
     base_request: dict[str, Any] = {
         **{name: str(path) for name, path in paths.items()},
         "package": package,
-        "python": str(args.python.resolve()),
+        "python": str(args.python.parent.resolve() / args.python.name),
         "wheel_files": wheel_files,
     }
     for name in ("cold", "rebuild"):
