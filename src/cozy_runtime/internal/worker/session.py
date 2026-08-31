@@ -598,10 +598,12 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     model_ids: list[str] = []
     for index, value in enumerate(models):
         model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
-        _required(model, {"id", "repo", "version", "lane", "manifest"}, "Model")
+        _required(model, {"id", "repo", "version", "manifest"}, "Model")
         model_ids.append(_identifier(model["id"], f"models[{index}].id"))
-        for name in ("repo", "version", "lane"):
+        for name in ("repo", "version"):
             _identifier(model[name], f"models[{index}].{name}")
+        if "lane" in model:
+            _identifier(model["lane"], f"models[{index}].lane")
         _exact_ref(model["manifest"], f"models[{index}].manifest")
     if model_ids != sorted(set(model_ids)):
         raise documents.DocumentError("sort_order", "Placement.models")
@@ -636,10 +638,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 },
                 "Slot",
             )
-            required_slot = {"slot", "reference_model_id", "config"}
-            if published:
-                required_slot.add("model_construction_contract")
-            _required(slot, required_slot, "Slot")
+            _required(slot, {"slot", "reference_model_id", "config"}, "Slot")
             if development and "model_construction_contract" in slot:
                 raise documents.DocumentError(
                     "development_fields_invalid",
@@ -676,7 +675,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
-            if published:
+            if "model_construction_contract" in slot:
                 _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
             stamps = slot.get("stamps", [])
             if not isinstance(stamps, list):
@@ -932,6 +931,7 @@ class Worker:
             return package_prepare.prepare_package_set(
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
+                artifact_store=Path(self.options.artifact_store or ""),
                 environment_root=Path(self.options.environment_root or ""),
                 python=Path(self.options.python or sys.executable),
                 describe=describe,

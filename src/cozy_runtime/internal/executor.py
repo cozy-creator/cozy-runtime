@@ -326,26 +326,19 @@ class Executor:
         # Every candidate is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
         # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so offering
         # four variants costs four header reads and no load.
-        # Development has no Hub MCC from which to inherit a hardware variant. Derive it
-        # from the executor's own selected device; Repository lane is never a substitute.
+        # Package installation carries no pre-qualified hardware variant. Derive it from
+        # the executor's selected device; a repository lane is never a hardware claim.
         device_index = int(binding.get("device_index") or 0)
         device_facts = measure_device(torch, device_index)
         hardware_variant = str(binding.get("variant") or "")
         if not hardware_variant:
-            if not binding.get("development"):
-                self.poisoned = "published hardware variant absent"
-                return {
-                    "ok": False,
-                    "code": "hardware_variant_absent",
-                    "detail": "a published binding must carry its qualified hardware variant",
-                }
             if device_facts.kind != "cuda" or device_facts.sm <= 0:
-                self.poisoned = "development modeled accelerator unavailable"
+                self.poisoned = "modeled accelerator unavailable"
                 return {
                     "ok": False,
-                    "code": "development_modeled_accelerator_unavailable",
-                    "detail": "modeled source-checkout execution requires a measured CUDA "
-                    "device; no caller-authored hardware variant is accepted",
+                    "code": "modeled_accelerator_unavailable",
+                    "detail": "modeled execution requires a measured CUDA device; no "
+                    "caller-authored hardware variant is accepted",
                 }
             hardware_variant = f"sm{device_facts.sm}"
         offered = [
