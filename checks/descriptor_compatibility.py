@@ -179,7 +179,7 @@ def main() -> int:
             {
                 "name": "copy-model",
                 "sources": {"source": "hf/example/model/default"},
-                "nodes": [
+                "steps": [
                     {
                         "name": "copy",
                         "callable": "example/model/copy",

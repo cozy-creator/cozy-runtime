@@ -1186,6 +1186,14 @@ def fence_descriptor_minimality() -> list[str]:
         bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
     if document.get("format") != "cozy.package.descriptor/1":
         bad.append("descriptor has the wrong format")
+    productions = document.get("model_productions")
+    if not isinstance(productions, list) or not productions:
+        bad.append("descriptor has no model production fixture")
+    else:
+        expected_production = {"name", "sources", "steps", "outputs"}
+        if not isinstance(productions[0], dict) or set(productions[0]) != expected_production:
+            fields = sorted(productions[0]) if isinstance(productions[0], dict) else []
+            bad.append(f"model production fields are {fields}, want {sorted(expected_production)}")
     forbidden = {
         "attribute",
         "capabilities",

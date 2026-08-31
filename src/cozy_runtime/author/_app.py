@@ -24,7 +24,7 @@ from typing import ParamSpec, TypeVar, overload
 from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources
-from cozy_runtime.author._production import Production, ProductionNode, ProductionOutput
+from cozy_runtime.author._production import Production, ProductionOutput, ProductionStep
 from cozy_runtime.author._signature import Kind, Surface, analyze
 
 P = ParamSpec("P")
@@ -96,7 +96,7 @@ class App:
         name: str,
         *,
         sources: Mapping[str, str],
-        nodes: tuple[ProductionNode, ...],
+        steps: tuple[ProductionStep, ...],
         outputs: tuple[ProductionOutput, ...],
     ) -> None:
         """Register one static graph over ordinary installed jobs.
@@ -113,7 +113,7 @@ class App:
             raise RegistrationError(f"duplicate production {name!r}: names are unique per app")
         if len(self._productions) >= 16:
             raise RegistrationError("an app declares at most 16 model productions")
-        self._productions[name] = Production(name, sources, nodes, outputs)
+        self._productions[name] = Production(name, sources, steps, outputs)
 
     @overload
     def entrypoint(self, fn: Callable[P, R], /) -> Callable[P, R]: ...

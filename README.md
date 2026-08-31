@@ -13,7 +13,7 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.20` targets standard CPython 3.12 only. Project
+Runtime release `0.0.21` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
 delegation plus verified model files after private code preparation, and Runtime alone binds
@@ -219,7 +219,7 @@ may yield several exact converter closures without a filename heuristic or a fak
 Each output contract contains only the final topology digest and sorted exact TensorFS EncodingSpec
 object IDs. Tensorhub derives both from the produced header; human task, structure and stamp labels
 cannot make bytes admissible. Static recipe assets remain private importlib resources of the job,
-not Creator inputs. Job and production-node resource floors use the same descriptor shape.
+not Creator inputs. Job and production-step resource floors use the same descriptor shape.
 Productions execute nothing and carry no concrete source selection, destination, credential or
 exact resolved job release.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and

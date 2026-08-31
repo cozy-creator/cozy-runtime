@@ -13,7 +13,7 @@ from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
 from cozy_runtime.author._markers import Resources
-from cozy_runtime.author._production import Production, ProductionContract, ProductionNode
+from cozy_runtime.author._production import Production, ProductionContract, ProductionStep
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -131,8 +131,8 @@ def _production(production: Production) -> dict[str, Json]:
     return {
         "name": production.name,
         "sources": dict(sorted(production.sources.items())),
-        "nodes": [
-            _production_node(node) for node in sorted(production.nodes, key=lambda n: n.name)
+        "steps": [
+            _production_step(step) for step in sorted(production.steps, key=lambda row: row.name)
         ],
         "outputs": [
             {
@@ -146,15 +146,15 @@ def _production(production: Production) -> dict[str, Json]:
     }
 
 
-def _production_node(node: ProductionNode) -> dict[str, Json]:
+def _production_step(step: ProductionStep) -> dict[str, Json]:
     doc: dict[str, Json] = {
-        "name": node.name,
-        "callable": node.callable,
-        "models": dict(sorted(node.models.items())),
-        "outputs": sorted(node.outputs),
+        "name": step.name,
+        "callable": step.callable,
+        "models": dict(sorted(step.models.items())),
+        "outputs": sorted(step.outputs),
     }
-    if node.resources is not None:
-        doc["resources"] = _resources(node.resources)
+    if step.resources is not None:
+        doc["resources"] = _resources(step.resources)
     return doc
 
 
@@ -479,7 +479,7 @@ def _productions(value: Json, source: str) -> None:
     names: set[str] = set()
     for index, raw in enumerate(value):
         path = f"model_productions[{index}]"
-        production = _closed(raw, {"name", "sources", "nodes", "outputs"}, set(), source, path)
+        production = _closed(raw, {"name", "sources", "steps", "outputs"}, set(), source, path)
         name = _portable_name(production["name"], source, f"{path}.name")
         if name in names:
             _invalid(source, f"{path}.name", "must be unique")
@@ -489,81 +489,81 @@ def _productions(value: Json, source: str) -> None:
             _invalid(source, f"{path}.sources", "must contain at least one source slot")
         for slot, profile in roots.items():
             _contract_value(profile, source, f"{path}.sources.{slot}")
-        nodes = production["nodes"]
-        if not isinstance(nodes, list) or not 1 <= len(nodes) <= 64:
-            _invalid(source, f"{path}.nodes", "must contain 1 through 64 nodes")
-        node_outputs: dict[str, set[str]] = {}
+        steps = production["steps"]
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 64:
+            _invalid(source, f"{path}.steps", "must contain 1 through 64 steps")
+        step_outputs: dict[str, set[str]] = {}
         dependencies: dict[str, set[str]] = {}
-        for node_index, node_raw in enumerate(nodes):
-            node_path = f"{path}.nodes[{node_index}]"
-            node = _closed(
-                node_raw,
+        for step_index, step_raw in enumerate(steps):
+            step_path = f"{path}.steps[{step_index}]"
+            step = _closed(
+                step_raw,
                 {"name", "callable", "models", "outputs"},
                 {"resources"},
                 source,
-                node_path,
+                step_path,
             )
-            node_name = _portable_name(node["name"], source, f"{node_path}.name")
-            if node_name in node_outputs:
-                _invalid(source, f"{node_path}.name", "must be unique")
-            callable_name = node["callable"]
+            step_name = _portable_name(step["name"], source, f"{step_path}.name")
+            if step_name in step_outputs:
+                _invalid(source, f"{step_path}.name", "must be unique")
+            callable_name = step["callable"]
             if not isinstance(callable_name, str) or _CALLABLE.fullmatch(callable_name) is None:
-                _invalid(source, f"{node_path}.callable", "must be org/package/function")
-            outputs = _portable_names(node["outputs"], source, f"{node_path}.outputs", 8)
-            node_outputs[node_name] = set(outputs)
-            dependencies[node_name] = set()
-            models = _string_map_value(node["models"], source, f"{node_path}.models", 16)
+                _invalid(source, f"{step_path}.callable", "must be org/package/function")
+            outputs = _portable_names(step["outputs"], source, f"{step_path}.outputs", 8)
+            step_outputs[step_name] = set(outputs)
+            dependencies[step_name] = set()
+            models = _string_map_value(step["models"], source, f"{step_path}.models", 16)
             if not models:
-                _invalid(source, f"{node_path}.models", "must not be empty")
-            if "resources" in node:
-                _production_resources(node["resources"], source, f"{node_path}.resources")
+                _invalid(source, f"{step_path}.models", "must not be empty")
+            if "resources" in step:
+                _production_resources(step["resources"], source, f"{step_path}.resources")
 
         def edge(
             reference: str,
             edge_path: str,
             root_names: frozenset[str] = frozenset(roots),
-            outputs_by_node: dict[str, set[str]] = node_outputs,
+            outputs_by_step: dict[str, set[str]] = step_outputs,
         ) -> str | None:
             if reference in root_names:
                 return None
-            node_name, separator, output = reference.partition(".")
-            if not separator or output not in outputs_by_node.get(node_name, set()):
+            step_name, separator, output = reference.partition(".")
+            if not separator or output not in outputs_by_step.get(step_name, set()):
                 _invalid(source, edge_path, f"references unknown edge {reference!r}")
-            return node_name
+            return step_name
 
-        for node_index, node_raw in enumerate(nodes):
-            assert isinstance(node_raw, dict)
-            node_name = str(node_raw["name"])
-            models = node_raw["models"]
+        for step_index, step_raw in enumerate(steps):
+            assert isinstance(step_raw, dict)
+            step_name = str(step_raw["name"])
+            models = step_raw["models"]
             assert isinstance(models, dict)
             for model_name, reference in models.items():
-                dependency = edge(str(reference), f"{path}.nodes[{node_index}].models.{model_name}")
+                dependency = edge(str(reference), f"{path}.steps[{step_index}].models.{model_name}")
                 if dependency is not None:
-                    dependencies[node_name].add(dependency)
+                    dependencies[step_name].add(dependency)
 
         outputs = production["outputs"]
         if not isinstance(outputs, list) or not 1 <= len(outputs) <= 16:
             _invalid(source, f"{path}.outputs", "must contain 1 through 16 required outputs")
         output_names: set[str] = set()
         lane_keys: set[str] = set()
-        required_nodes: set[str] = set()
+        required_steps: set[str] = set()
 
         def retain(
-            node_name: str,
+            step_name: str,
             visiting: set[str],
             production_path: str = path,
             graph: dict[str, set[str]] = dependencies,
-            retained: set[str] = required_nodes,
+            retained: set[str] = required_steps,
         ) -> None:
-            if node_name in visiting:
-                _invalid(source, production_path, f"contains a cycle through {node_name}")
-            if node_name in retained:
+            if step_name in visiting:
+                _invalid(source, production_path, f"contains a cycle through {step_name}")
+            if step_name in retained:
                 return
-            visiting.add(node_name)
-            for dependency in graph[node_name]:
+            visiting.add(step_name)
+            for dependency in graph[step_name]:
                 retain(dependency, visiting)
-            visiting.remove(node_name)
-            retained.add(node_name)
+            visiting.remove(step_name)
+            retained.add(step_name)
 
         for output_index, output_raw in enumerate(outputs):
             output_path = f"{path}.outputs[{output_index}]"
@@ -582,14 +582,14 @@ def _productions(value: Json, source: str) -> None:
             lane_keys.add(lane_key)
             selected = edge(str(output["source"]), f"{output_path}.source")
             if selected is None:
-                _invalid(source, f"{output_path}.source", "must name a node output")
+                _invalid(source, f"{output_path}.source", "must name a step output")
             retain(selected, set())
             _production_contract_value(
                 output["required_contract"], source, f"{output_path}.required_contract"
             )
-        disconnected = sorted(set(node_outputs) - required_nodes)
+        disconnected = sorted(set(step_outputs) - required_steps)
         if disconnected:
-            _invalid(source, path, f"contains disconnected nodes {disconnected}")
+            _invalid(source, path, f"contains disconnected steps {disconnected}")
 
 
 _PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")

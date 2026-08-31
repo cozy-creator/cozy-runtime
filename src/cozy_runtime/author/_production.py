@@ -2,7 +2,7 @@
 
 A production is reviewed orchestration data in the package descriptor.  It executes
 nothing and owns no source, destination, credential, release, or publication authority.
-Every node names an ordinary installed job and joins model/component outputs by stable
+Every step names an ordinary installed job and joins model/component outputs by stable
 names; Creator resolves the exact job releases and schedules the graph.
 """
 
@@ -16,9 +16,9 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Resources
 
 MAX_PRODUCTIONS = 16
-MAX_NODES = 64
-MAX_NODE_INPUTS = 16
-MAX_NODE_OUTPUTS = 8
+MAX_STEPS = 64
+MAX_STEP_INPUTS = 16
+MAX_STEP_OUTPUTS = 8
 MAX_OUTPUTS = 16
 MAX_CONTRACT_VALUES = 32
 
@@ -93,11 +93,11 @@ class ProductionContract:
 
 
 @dataclass(frozen=True, slots=True)
-class ProductionNode:
+class ProductionStep:
     """One ordinary job invocation in a static production graph.
 
     ``models`` maps the referenced job's model input name to either one production source
-    slot or ``<node>.<output>``. Static recipe assets are ordinary importlib resources owned
+    slot or ``<step>.<output>``. Static recipe assets are ordinary importlib resources owned
     internally by the installed job, not Creator inputs or graph edges.
     """
 
@@ -108,30 +108,30 @@ class ProductionNode:
     resources: Resources | None = None
 
     def __post_init__(self) -> None:
-        _name(self.name, "production node")
+        _name(self.name, "production step")
         if _CALLABLE.fullmatch(self.callable) is None:
             raise ConformanceError(
-                f"production node {self.name} callable {self.callable!r} is not "
+                f"production step {self.name} callable {self.callable!r} is not "
                 "org/package/function",
                 code="production_callable",
                 fields=[self.name],
             )
-        if not self.models or len(self.models) > MAX_NODE_INPUTS:
+        if not self.models or len(self.models) > MAX_STEP_INPUTS:
             raise ConformanceError(
-                f"production node {self.name} has {len(self.models)} model inputs; "
-                f"the bound is 1..={MAX_NODE_INPUTS}",
+                f"production step {self.name} has {len(self.models)} model inputs; "
+                f"the bound is 1..={MAX_STEP_INPUTS}",
                 code="production_bound",
                 fields=[self.name],
             )
         for input_name, source in self.models.items():
-            _name(input_name, f"production node {self.name} model input")
+            _name(input_name, f"production step {self.name} model input")
             if not isinstance(source, str) or not source:
                 raise ConformanceError(
-                    f"production node {self.name} input {input_name} has no source",
+                    f"production step {self.name} input {input_name} has no source",
                     code="production_edge",
                     fields=[self.name, input_name],
                 )
-        _unique(self.outputs, f"production node {self.name} outputs", MAX_NODE_OUTPUTS)
+        _unique(self.outputs, f"production step {self.name} outputs", MAX_STEP_OUTPUTS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +147,7 @@ class ProductionOutput:
         _name(self.name, "production output")
         if not isinstance(self.source, str) or "." not in self.source:
             raise ConformanceError(
-                f"production output {self.name} source {self.source!r} is not <node>.<output>",
+                f"production output {self.name} source {self.source!r} is not <step>.<output>",
                 code="production_edge",
                 fields=[self.name],
             )
@@ -158,15 +158,15 @@ class ProductionOutput:
 class Production:
     name: str
     sources: Mapping[str, str]
-    nodes: tuple[ProductionNode, ...]
+    steps: tuple[ProductionStep, ...]
     outputs: tuple[ProductionOutput, ...]
 
     def __post_init__(self) -> None:
         _name(self.name, "production")
-        if not self.sources or len(self.sources) > MAX_NODE_INPUTS:
+        if not self.sources or len(self.sources) > MAX_STEP_INPUTS:
             raise ConformanceError(
                 f"production {self.name} has {len(self.sources)} source slots; "
-                f"the bound is 1..={MAX_NODE_INPUTS}",
+                f"the bound is 1..={MAX_STEP_INPUTS}",
                 code="production_bound",
                 fields=[self.name, "sources"],
             )
@@ -179,16 +179,16 @@ class Production:
                     code="production_source_profile",
                     fields=[self.name, slot],
                 )
-        if not self.nodes or len(self.nodes) > MAX_NODES:
+        if not self.steps or len(self.steps) > MAX_STEPS:
             raise ConformanceError(
-                f"production {self.name} has {len(self.nodes)} nodes; the bound is 1..={MAX_NODES}",
+                f"production {self.name} has {len(self.steps)} steps; the bound is 1..={MAX_STEPS}",
                 code="production_bound",
                 fields=[self.name],
             )
-        names = [node.name for node in self.nodes]
+        names = [step.name for step in self.steps]
         if len(set(names)) != len(names):
             raise ConformanceError(
-                f"production {self.name} has duplicate node names",
+                f"production {self.name} has duplicate step names",
                 code="production_duplicate",
                 fields=[self.name],
             )
@@ -210,27 +210,27 @@ class Production:
         self._validate_graph()
 
     def _validate_graph(self) -> None:
-        by_name = {node.name: node for node in self.nodes}
-        dependencies: dict[str, set[str]] = {node.name: set() for node in self.nodes}
+        by_name = {step.name: step for step in self.steps}
+        dependencies: dict[str, set[str]] = {step.name: set() for step in self.steps}
 
         def resolve(reference: str, owner: str) -> str | None:
             if reference in self.sources:
                 return None
-            node_name, separator, output = reference.partition(".")
-            node = by_name.get(node_name)
-            if not separator or node is None or output not in node.outputs:
+            step_name, separator, output = reference.partition(".")
+            step = by_name.get(step_name)
+            if not separator or step is None or output not in step.outputs:
                 raise ConformanceError(
                     f"production {self.name} {owner} references unknown edge {reference!r}",
                     code="production_edge",
                     fields=[self.name, owner],
                 )
-            return node_name
+            return step_name
 
-        for node in self.nodes:
-            for input_name, reference in node.models.items():
-                dependency = resolve(reference, f"{node.name}.{input_name}")
+        for step in self.steps:
+            for input_name, reference in step.models.items():
+                dependency = resolve(reference, f"{step.name}.{input_name}")
                 if dependency is not None:
-                    dependencies[node.name].add(dependency)
+                    dependencies[step.name].add(dependency)
 
         visiting: set[str] = set()
         visited: set[str] = set()
@@ -250,24 +250,24 @@ class Production:
             visiting.remove(name)
             visited.add(name)
 
-        required_nodes: set[str] = set()
+        required_steps: set[str] = set()
 
         def retain(name: str) -> None:
-            if name in required_nodes:
+            if name in required_steps:
                 return
-            required_nodes.add(name)
+            required_steps.add(name)
             for dependency in dependencies[name]:
                 retain(dependency)
 
         for output in self.outputs:
-            selected_node = resolve(output.source, f"output {output.name}")
-            assert selected_node is not None
-            visit(selected_node)
-            retain(selected_node)
-        disconnected = sorted(set(by_name) - required_nodes)
+            selected_step = resolve(output.source, f"output {output.name}")
+            assert selected_step is not None
+            visit(selected_step)
+            retain(selected_step)
+        disconnected = sorted(set(by_name) - required_steps)
         if disconnected:
             raise ConformanceError(
-                f"production {self.name} has disconnected node(s): {', '.join(disconnected)}",
+                f"production {self.name} has disconnected step(s): {', '.join(disconnected)}",
                 code="production_disconnected",
                 fields=[self.name],
             )

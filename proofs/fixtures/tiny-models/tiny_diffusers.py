@@ -180,7 +180,7 @@ register_adapter(TinySdxlPipeline, build_sdxl_pipeline)
 class H3Topology:
     """A CONSTRUCTION fact, fixed before load: exactly one modulation route exists."""
 
-    baked: bool
+    pruned: bool
 
 
 class H3Blocks:
@@ -220,12 +220,12 @@ class H3Blocks:
         )
         return tuple(block("adaln", plan, i) for i in range(4))
 
-    def baked_tables(self, plan: object) -> tuple[int, ...]:
+    def timestep_tables(self, plan: object) -> tuple[int, ...]:
         """Ordinary checkpoint components: coverage was proven at admission (§1.1.1)."""
         block = self._use(
             "fl2va_transformer" if self._has("fl2va_transformer") else "ref2va_transformer"
         )
-        return tuple(block("baked", plan, i) for i in range(4))
+        return tuple(block("pruned", plan, i) for i in range(4))
 
     def _has(self, name: str) -> bool:
         return name in self._components
@@ -253,7 +253,7 @@ class MiniMaxH3ModularPipeline:
 
     def __init__(self, config: Config, *, task: Task | None, both: bool = False) -> None:
         width = config.as_int("hidden_size", 32)
-        baked = config.as_bool("baked", False)
+        pruned = config.as_bool("pruned", False)
         components: dict[str, object] = {
             "text_encoder": TinyModule(
                 "text_encoder", _linear(width * 4, width, prefix="qwen.layers.0.attn.q")
@@ -265,16 +265,16 @@ class MiniMaxH3ModularPipeline:
         }
         roles = ("fl2va", "ref2va") if both else ((task,) if task is not None else ())
         for role in roles:
-            components[f"{role}_transformer"] = _transformer(f"{role}_transformer", width, baked)
+            components[f"{role}_transformer"] = _transformer(f"{role}_transformer", width, pruned)
         self.components = components
         self.blocks = H3Blocks(components)
-        self.topology = H3Topology(baked=baked)
+        self.topology = H3Topology(pruned=pruned)
 
 
-def _transformer(name: str, width: int, baked: bool) -> TinyModule:
+def _transformer(name: str, width: int, pruned: bool) -> TinyModule:
     tensors = {**_linear(width, width, prefix="blocks.0.attn.q")}
-    if baked:
-        # A baked artifact CARRIES exact modulation tables and OMITS the projections.
+    if pruned:
+        # A pruned artifact CARRIES exact modulation tables and OMITS the projections.
         tensors["blocks.0.modulation_table"] = TinyTensor(4, width)
     else:
         tensors.update(_linear(width * 6, width, prefix="blocks.0.adaln.proj"))
