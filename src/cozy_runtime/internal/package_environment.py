@@ -1,16 +1,15 @@
 """Per-package uv environments over the immutable base-worker-image Python environment.
 
-The base worker image already owns Python, cozy-runtime, TensorFS, and its complete declared
-distribution/import-root inventory. Accelerator profiles also own Torch/CUDA; a generic CPU image
-may explicitly prove that it owns neither. A placement therefore creates one ordinary uv venv
-containing only the package project wheel and optional package-owned dependency wheels. It never
-resolves dependencies, copies a base package, or re-hashes the base environment's RECORD tree.
+Runtime observes the actual interpreter's standard library and narrow protected platform families:
+Python, cozy-runtime, msgspec, TensorFS, and, when present, Torch/Triton/CUDA/NVIDIA. A placement
+creates one ordinary uv venv containing only the package project wheel and package-owned dependency
+wheels. It never resolves dependencies, copies a protected package, or re-hashes the base
+environment's RECORD tree.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
 after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
 and atomically published. Reuse reads only the small receipt; actual base compatibility is
-re-observed before admission and
-does not walk or hash the installed tree again.
+re-observed before admission and Runtime does not walk or hash the installed tree again.
 """
 
 from __future__ import annotations
@@ -90,12 +89,6 @@ _BUILD_INPUT_NAMES = frozenset(
         "setup.cfg",
         "setup.py",
     }
-)
-_PLATFORM_TARGET_FIELDS = frozenset(
-    {"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"}
-)
-_COMPATIBILITY_PROFILE_FIELDS = frozenset(
-    {"accelerator_build", "os_cpu", "python_abi", "torch_release"}
 )
 
 
