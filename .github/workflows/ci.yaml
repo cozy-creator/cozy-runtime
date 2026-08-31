@@ -43,6 +43,15 @@ jobs:
           tiny_a=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
           tiny_b=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
           test "$tiny_a" = "$tiny_b"
+          modeled=proofs/fixtures/modeled-development-package
+          modeled_descriptor=$(uv run cozy-runtime --json --dir "$modeled" describe)
+          frozen=$(mktemp -d)
+          printf '%s' "$modeled_descriptor" > "$frozen/descriptor.json"
+          cp "$modeled/package.toml" "$frozen/package.toml"
+          imported=$(uv run cozy-runtime --json --dir "$modeled" bindings)
+          descriptor_only=$(uv run cozy-runtime --json --dir "$frozen" \
+            --descriptor "$frozen/descriptor.json" bindings)
+          test "$imported" = "$descriptor_only"
           marco_a=$(uv run --locked --project examples/marco-polo \
             cozy-runtime --json --dir examples/marco-polo describe)
           marco_b=$(uv run --locked --project examples/marco-polo \

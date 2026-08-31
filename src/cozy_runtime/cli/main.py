@@ -68,7 +68,7 @@ global flags:
   --fields a,b,c   pick columns
   --dir <path>     package project root (default: cwd)
   --descriptor <path>
-                   exact PackageDescriptor input for describe (no package import)
+                   exact PackageDescriptor input for describe/bindings (no package import)
   -h, --help       this text
 """
 
@@ -141,11 +141,11 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
-    if opts.descriptor and verb != "describe":
+    if opts.descriptor and verb not in ("describe", "bindings"):
         raise CliError(
             "usage",
-            "--descriptor belongs only to describe",
-            "use --descriptor <exact-package-descriptor> with cozy-runtime describe",
+            "--descriptor belongs only to describe or bindings",
+            "use --descriptor <exact-package-descriptor> with cozy-runtime describe or bindings",
             Exit.usage,
         )
     if verb == "describe":

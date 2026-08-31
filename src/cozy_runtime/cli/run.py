@@ -17,6 +17,7 @@ import json
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -345,27 +346,46 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
     It resolves and reports; it constructs nothing, touches no device and loads no weights.
     """
     project = Path(opts.dir).expanduser().resolve()
-    try:
-        found = discover(project)
-    except ConformanceError as exc:
-        raise CliError(
-            "validation",
-            str(exc),
-            "a package's surface must be valid before its bindings can resolve (§1.0)",
-            Exit.validation,
-        ) from exc
-    slots = [
-        slot
-        for surface in found.surfaces
-        if surface.kind == "entrypoint"
-        for slot in surface.model_bindings
-    ]
-    if not slots:
+    slots: Sequence[binding_table.BindingSlot]
+    if opts.descriptor:
+        try:
+            body = desc.read_bytes(
+                Path(opts.descriptor).expanduser().resolve().read_bytes(),
+                "package bindings descriptor",
+            )
+            table = binding_table.read_table(project / "package.toml")
+            slots = _descriptor_slots(body)
+        except (OSError, ConformanceError) as exc:
+            raise CliError(
+                "validation",
+                str(exc),
+                "supply the exact release descriptor and its package.toml",
+                Exit.validation,
+            ) from exc
+        visible = list(body.get("entrypoints", []))
+    else:
+        try:
+            found = discover(project)
+        except ConformanceError as exc:
+            raise CliError(
+                "validation",
+                str(exc),
+                "a package's surface must be valid before its bindings can resolve (§1.0)",
+                Exit.validation,
+            ) from exc
+        slots = [
+            slot
+            for surface in found.surfaces
+            if surface.kind == "entrypoint"
+            for slot in surface.model_bindings
+        ]
+        table = found.bindings
         visible = [
             surface
             for surface in found.surfaces
             if surface.kind == "entrypoint" and not surface.hidden
         ]
+    if not slots:
         plans = (
             list(
                 development_placement_documents(
@@ -375,7 +395,7 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
                     source_digest=development_source_digest(project),
                 ).subjects()
             )
-            if visible
+            if visible and not opts.descriptor
             else []
         )
         return [], plans
@@ -384,7 +404,7 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
         # does: the selection is checked against every slot the release declares, so a
         # binding for a slot that does not exist refuses here rather than being silently
         # unused by whichever entrypoint happened to be asked for.
-        resolved = binding_table.resolve(slots, found.bindings)
+        resolved = binding_table.resolve(slots, table)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -406,6 +426,47 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
             }
         )
     return records, []
+
+
+@dataclass(frozen=True, slots=True)
+class _DescriptorSlot:
+    path: str
+    param: str
+    class_key: str
+
+
+def _descriptor_slots(body: Mapping[str, Any]) -> list[_DescriptorSlot]:
+    """Recover the binding vocabulary already frozen into PackageDescriptor/1."""
+    out: dict[str, _DescriptorSlot] = {}
+    rows = body.get("entrypoints")
+    if not isinstance(rows, list):
+        raise ConformanceError("descriptor entrypoints are malformed", code="descriptor")
+    for entrypoint in rows:
+        if not isinstance(entrypoint, dict):
+            raise ConformanceError("descriptor entrypoint is malformed", code="descriptor")
+        models = entrypoint.get("models", [])
+        if not isinstance(models, list):
+            raise ConformanceError("descriptor model slots are malformed", code="descriptor")
+        for model in models:
+            if not isinstance(model, dict):
+                raise ConformanceError("descriptor model slot is malformed", code="descriptor")
+            path, class_key = model.get("path"), model.get("class")
+            if not isinstance(path, str) or not isinstance(class_key, str) or not class_key:
+                raise ConformanceError(
+                    "descriptor model slot identity is malformed", code="descriptor"
+                )
+            prefix = f"{entrypoint.get('name', '')}.models."
+            if not path.startswith(prefix) or not path.removeprefix(prefix):
+                raise ConformanceError(
+                    f"descriptor model slot {path!r} is malformed", code="descriptor"
+                )
+            slot = _DescriptorSlot(path, path.removeprefix(prefix), class_key)
+            if path in out and out[path] != slot:
+                raise ConformanceError(
+                    f"descriptor model slot {path!r} conflicts", code="descriptor"
+                )
+            out[path] = slot
+    return [out[path] for path in sorted(out)]
 
 
 def _render(

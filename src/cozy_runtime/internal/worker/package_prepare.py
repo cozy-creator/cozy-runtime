@@ -348,6 +348,7 @@ def _entrypoints(
             id=model_ids[slot],
             repo=str(value["selection"]["model"]),
             version=str(value["selection"]["release"]),
+            lane=str(value["selection"].get("lane", "")),
             manifest=pb.Ref(
                 digest=documents.raw(str(value["selection"]["manifest"])),
                 length=int(value["manifest_length"]),
@@ -503,7 +504,8 @@ def _selected_models(
         for digest, (kind, length, path) in files.items()
         if kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT
     }
-    if set(manifest_files) != manifest_refs:
+    carried_models = bool(manifest_files or object_files)
+    if carried_models and set(manifest_files) != manifest_refs:
         raise PreparationRefusal(
             "package_prepare_model_manifest_set_mismatch",
             f"wanted={sorted(manifest_refs)} got={sorted(manifest_files)}",
@@ -525,13 +527,49 @@ def _selected_models(
         store = pull.open_store(tensorfs, artifact_store)
         closures: dict[str, set[tuple[str, int]]] = {}
         reached: set[tuple[str, int]] = set()
-        for digest, (length, path) in sorted(manifest_files.items()):
-            raw = _read_file(path, int(tensorfs.manifest_max_bytes()))
-            store.put_manifest(raw, digest, length)
+        manifests: dict[str, tuple[int, bytes, Path | None]] = {}
+        if carried_models:
+            for digest, (length, path) in sorted(manifest_files.items()):
+                raw = _read_file(path, int(tensorfs.manifest_max_bytes()))
+                store.put_manifest(raw, digest, length)
+                manifests[digest] = (length, raw, path)
+        else:
+            for value in selected.values():
+                selection = value["selection"]
+                digest = str(selection["manifest"])
+                length = int(selection.get("manifest_length", 0))
+                model = str(selection.get("model", ""))
+                release = str(selection.get("release", ""))
+                lane = str(selection.get("lane", ""))
+                parts = model.split("/")
+                if len(parts) != 2 or not all(parts) or not release or not lane:
+                    raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
+                resolved = store.resolve_release(parts[0], parts[1], release, lane)
+                if (
+                    str(resolved["manifest_digest"]) != digest
+                    or int(resolved["manifest_length"]) != length
+                ):
+                    raise PreparationRefusal(
+                        "package_prepare_model_selection_mismatch",
+                        f"{model}@{release}/{lane} does not resolve to {digest}",
+                    )
+                held = store.manifest(digest)
+                raw = bytes(held["manifest"])
+                if (
+                    length <= 0
+                    or len(raw) != length
+                    or "sha256:" + hashlib.sha256(raw).hexdigest() != digest
+                ):
+                    raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
+                manifests[digest] = (length, raw, None)
+        for digest, (_length, raw, _path) in sorted(manifests.items()):
             closure = acquire.manifest_entries(tensorfs, raw)
             closures[digest] = closure
             reached.update(closure)
-        if {(digest, length) for digest, (length, _path) in object_files.items()} != reached:
+        if (
+            carried_models
+            and {(digest, length) for digest, (length, _path) in object_files.items()} != reached
+        ):
             raise PreparationRefusal(
                 "package_prepare_model_object_set_mismatch",
                 "downloaded model objects do not equal the selected Manifest closure",
@@ -539,7 +577,7 @@ def _selected_models(
         for digest, (length, path) in sorted(object_files.items()):
             store.put_file(str(path), digest, length)
             verified(digest, length, path)
-        for digest, (length, path) in sorted(manifest_files.items()):
+        for digest, (length, _raw, manifest_path) in sorted(manifests.items()):
             store.acquire_manifest(digest).release()
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
@@ -574,7 +612,8 @@ def _selected_models(
                         config_bytes=config_bytes,
                         components=tuple(sorted(str(component) for component in components)),
                     )
-            verified(digest, length, path)
+            if manifest_path is not None:
+                verified(digest, length, manifest_path)
     except PreparationRefusal:
         raise
     except (acquire.AcquisitionRefusal, pull.PullRefusal, fill.FillRefusal) as exc:
