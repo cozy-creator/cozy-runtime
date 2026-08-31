@@ -721,6 +721,13 @@ def fence_base_ownership_vectors() -> list[str]:
     root = ROOT / "vectors" / "tensorhub-wheel-contract"
     mirror_specs = (
         (
+            "base-worker-image-wheelhouse-cpu.json",
+            24_653,
+            "sha256:0618d4ad492648320b8c79ed087ef3bfd252a918b80326789f104c4ef1614eed",
+            (26, 323, 25),
+            ("none", "none"),
+        ),
+        (
             "base-worker-image-wheelhouse-cu130.json",
             25_305,
             "sha256:73738b08458a6c83cae1b97a9675f775d27b616e08a7d034b85a481e63b1b2da",
@@ -755,7 +762,7 @@ def fence_base_ownership_vectors() -> list[str]:
         target = dict(manifest.platform_target)
         expected_target = {
             "os_arch": "linux/amd64",
-            "libc": "glibc2.39",
+            "libc": "glibc2.36" if accelerator[0] == "none" else "glibc2.39",
             "python_abi": "cp312",
             "accelerator_backend": accelerator[0],
             "accelerator_abi": accelerator[1],

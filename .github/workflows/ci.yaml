@@ -93,8 +93,8 @@ jobs:
     if: needs.tensorfs-credential.outputs.present == 'yes'
     runs-on: ubuntu-latest
     env:
-      TENSORFS_SHA: 1e6f5e6d1d9846836161939e0e687dea12ad8d4a
-      TENSORFS_VERSION: 0.0.2
+      TENSORFS_SHA: 7cdb63378c9358561f9e6c51e525231c32804fb2
+      TENSORFS_VERSION: 0.0.3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
