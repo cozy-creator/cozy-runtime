@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import platform
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -79,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         request = _read_json(args.root / "model-cold.json")
         if not isinstance(request, dict):
             raise ProofFailure("cold model request is not an object")
-        request["bindings"] = []
+        request["bindings"] = request["bindings"][:1]
         _json(args.root / "model-red.json", request)
     else:
         _verify(args.root)
@@ -113,6 +114,14 @@ def _prepare(args: argparse.Namespace) -> None:
         "torch_release": "2.13.0",
     }
     base_distributions, base_import_roots = _installed_base_ownership()
+    if not any(row["distribution"] == "uv" for row in base_distributions):
+        uv_version = subprocess.run(
+            ["uv", "--version"], check=True, capture_output=True, text=True
+        ).stdout.split()[1]
+        base_distributions.append({"distribution": "uv", "version": uv_version})
+        base_distributions.sort(key=lambda row: str(row["distribution"]))
+        base_import_roots.append({"providers": ["uv"], "root": "uv"})
+        base_import_roots.sort(key=lambda row: str(row["root"]))
     torch_release = dict(
         (str(row["distribution"]), str(row["version"])) for row in base_distributions
     )["torch"].partition("+")[0]
@@ -224,7 +233,17 @@ def _write_model_request(root: Path, name: str) -> None:
                     "hardware_variants": ["sm90"],
                     "path": "render.models.model",
                     "snapshot": _digest(b"proof-snapshot"),
-                }
+                },
+                {
+                    "config": {
+                        "digest": state["config_digest"],
+                        "length": state["config_length"],
+                        "path": state["config"],
+                    },
+                    "hardware_variants": ["sm90"],
+                    "path": "render.models.peer",
+                    "snapshot": _digest(b"proof-peer-snapshot"),
+                },
             ],
             "package_descriptor": {
                 "digest": state["package_descriptor_digest"],
@@ -272,10 +291,25 @@ def _verify(root: Path) -> None:
     if not isinstance(index, dict):
         raise ProofFailure("model proof result is not an object")
     names = [row["name"] for row in index["functions"]]
-    _require(names == ["metadata", "render"], f"unexpected visible functions: {names!r}")
-    _require(index["functions"][0]["bindings"] == [], "metadata unexpectedly has a binding")
+    _require(names == ["render"], f"proof emitted unselected functions: {names!r}")
+    _require(
+        [row["path"] for row in index["functions"][0]["bindings"]]
+        == ["render.models.model", "render.models.peer"],
+        "proof did not retain the complete selected callable slot set",
+    )
     contracts = [raw for path, raw in outputs[0].items() if path.startswith("contracts/")]
-    _require(len(contracts) == 1, f"expected one MCC, found {len(contracts)}")
+    _require(len(contracts) == 2, f"expected two MCCs, found {len(contracts)}")
+    topologies = [raw for path, raw in outputs[0].items() if path.startswith("code-topologies/")]
+    _require(len(topologies) == 2, f"expected two CodeTopologies, found {len(topologies)}")
+    topology_refs = {
+        variant["code_topology"]["digest"]
+        for binding in index["functions"][0]["bindings"]
+        for variant in binding["variants"]
+    }
+    _require(
+        topology_refs == {_digest(raw) for raw in topologies},
+        "result index does not bind every exact CodeTopology output",
+    )
     parsed = _parse_canonical(contracts[0])
     if not isinstance(parsed, dict):
         raise ProofFailure("MCC is not an object")
@@ -294,8 +328,9 @@ def _verify(root: Path) -> None:
     )
     print(
         "model contract proof: independent offline materializations produced byte-identical "
-        "receipt/index/MCC bytes; hidden function omitted; missing binding exited 6 before "
-        f"output; mcc={_digest(contracts[0])}"
+        "receipt/index/MCC bytes; unselected and hidden functions omitted; partial callable "
+        f"binding exited 6 before output; mccs={','.join(_digest(raw) for raw in contracts)}; "
+        f"code_topologies={','.join(_digest(raw) for raw in topologies)}"
     )
 
 

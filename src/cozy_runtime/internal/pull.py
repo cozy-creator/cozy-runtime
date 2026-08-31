@@ -342,7 +342,7 @@ def resolve(
             "upgrade the hub; /v1/models/resolve must return the owning model",
             cause=json.dumps(doc)[:400],
         )
-    return Resolved(
+    resolved = Resolved(
         org=org,
         name=name,
         release=str(doc.get("release") or ""),
@@ -350,6 +350,14 @@ def resolve(
         lane=str(doc.get("lane") or lane),
         stamps=_stamps(doc.get("stamps")),
     )
+    if not resolved.release or not resolved.lane:
+        raise PullRefusal(
+            "hub_refused",
+            f"{ref}: the hub did not return one exact release and lane public root",
+            "resolve an exact retained model release/lane; manifest digests are not public roots",
+            cause=json.dumps(doc)[:400],
+        )
+    return resolved
 
 
 def _stamps(raw: object) -> dict[str, tuple[str, ...]]:
@@ -386,7 +394,9 @@ def reads(base: str, at: Resolved, deadline: Deadline, *, token: str = "") -> li
     lengths and digests are handed to the border as the EXPECTATION each object must meet,
     and an object that arrives as anything else is refused, not accepted with a warning.
     """
-    path = f"/v1/models/{at.org}/{at.name}/manifests/{at.manifest_ref}/reads"
+    release = urllib.parse.quote(at.release, safe="")
+    lane = urllib.parse.quote(at.lane, safe="")
+    path = f"/v1/models/{at.org}/{at.name}/releases/{release}/lanes/{lane}/reads"
     doc = _json(base, path, deadline, token=token, body={})
     out = [Read(str(r["object_id"]), int(r["length"]), str(r["url"])) for r in doc.get("reads", [])]
     if not out:
@@ -407,7 +417,11 @@ def manifest(base: str, at: Resolved, deadline: Deadline, max_bytes: int) -> byt
     them against the digest the ref resolved to, so a hub that served the wrong manifest is
     caught at the door rather than believed.
     """
-    url = base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/manifests/{at.manifest_ref}"
+    release = urllib.parse.quote(at.release, safe="")
+    lane = urllib.parse.quote(at.lane, safe="")
+    url = (
+        base.rstrip("/") + f"/v1/models/{at.org}/{at.name}/releases/{release}/lanes/{lane}/manifest"
+    )
     guard(url, allow_local=local_hub(base))
     if max_bytes < 1:
         raise PullRefusal(

@@ -521,16 +521,16 @@ class ModelSourceProfile(_message.Message):
     def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ...) -> None: ...
 
 class PreparedModelSource(_message.Message):
-    __slots__ = ("slot", "profile", "manifest", "release_evidence_canonical_bytes")
+    __slots__ = ("slot", "profile", "manifest", "checkpoint_evidence_canonical_bytes")
     SLOT_FIELD_NUMBER: _ClassVar[int]
     PROFILE_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
-    RELEASE_EVIDENCE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_EVIDENCE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     slot: str
     profile: str
     manifest: Ref
-    release_evidence_canonical_bytes: bytes
-    def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., release_evidence_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    checkpoint_evidence_canonical_bytes: bytes
+    def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., checkpoint_evidence_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class PrepareModelSourceRequest(_message.Message):
     __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license")
@@ -1351,7 +1351,7 @@ class ArtifactReceiptRef(_message.Message):
     def __init__(self, artifact_receipt_digest: _Optional[bytes] = ..., artifact_receipt_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class ArtifactReceipt(_message.Message):
-    __slots__ = ("owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "tensorfs_receipt_digest", "tensorfs_receipt_canonical_bytes", "release_evidence_canonical_bytes")
+    __slots__ = ("owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot", "artifact_transaction_id", "tensorfs_receipt_digest", "tensorfs_receipt_canonical_bytes", "checkpoint_evidence_canonical_bytes")
     OWNER_AUTHORITY_SCOPE_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -1359,7 +1359,7 @@ class ArtifactReceipt(_message.Message):
     ARTIFACT_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
     TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     TENSORFS_RECEIPT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
-    RELEASE_EVIDENCE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_EVIDENCE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     owner_authority_scope: str
     request_id: str
     invocation_spec_digest: str
@@ -1367,8 +1367,8 @@ class ArtifactReceipt(_message.Message):
     artifact_transaction_id: str
     tensorfs_receipt_digest: str
     tensorfs_receipt_canonical_bytes: bytes
-    release_evidence_canonical_bytes: bytes
-    def __init__(self, owner_authority_scope: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[str] = ..., tensorfs_receipt_canonical_bytes: _Optional[bytes] = ..., release_evidence_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    checkpoint_evidence_canonical_bytes: bytes
+    def __init__(self, owner_authority_scope: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[str] = ..., tensorfs_receipt_canonical_bytes: _Optional[bytes] = ..., checkpoint_evidence_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class ArtifactObjectSource(_message.Message):
     __slots__ = ("object_id", "length", "source_ref")

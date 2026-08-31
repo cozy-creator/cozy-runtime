@@ -7,6 +7,7 @@ fake_torch="$repo/proofs/fixtures/fake-torch"
 support="$repo/proofs/support/model_contract.py"
 shared_support="$repo/proofs/support/proof_data.py"
 uv_bin=$(command -v uv)
+tensorfs_wheel=${TENSORFS_WHEEL:?set TENSORFS_WHEEL to the exact TensorFS 0.0.6 wheel under test}
 proof_root=$(mktemp -d /tmp/cozy-model-contract-proof.XXXXXX)
 fixture_source="$proof_root/package-source"
 
@@ -35,7 +36,7 @@ test -n "$runtime_wheel" && test -n "$package_wheel" && test -n "$torch_wheel"
 
 UV_OFFLINE=1 "$uv_bin" venv --python "$(command -v python)" "$proof_root/driver"
 UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/python" \
-    "$runtime_wheel" "$torch_wheel"
+    "$runtime_wheel" "$torch_wheel" "$tensorfs_wheel"
 driver_python="$proof_root/driver/bin/python"
 
 descriptor="$proof_root/package-descriptor.json"

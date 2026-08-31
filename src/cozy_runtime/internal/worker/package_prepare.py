@@ -596,16 +596,17 @@ def _entrypoints(
         if not isinstance(value, dict) or not isinstance(value.get("name"), str):
             raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoint")
         described = value.get("models", [])
-        if not isinstance(described, list) or len(described) > 1:
-            raise PreparationRefusal(
-                "package_prepare_model_count_unsupported",
-                f"{value['name']}: at most one exact model slot is supported",
-            )
+        if not isinstance(described, list):
+            raise PreparationRefusal("package_prepare_descriptor_invalid", "model slots")
         described_paths: set[str] = set()
         for row in described:
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
                 raise PreparationRefusal("package_prepare_descriptor_invalid", "model slot")
             described_paths.add(str(row["path"]))
+        if len(described_paths) != len(described):
+            raise PreparationRefusal(
+                "package_prepare_model_selection_mismatch", f"{value['name']}: duplicate slot"
+            )
         if described_paths and not described_paths.issubset(selected):
             # One desired package set names the entrypoints it can actually bind. A
             # different invocation may select another model later; it should not force
@@ -642,6 +643,7 @@ def _entrypoints(
                     stamps=[],
                 )
             )
+        slots.sort(key=lambda row: row.slot)
         entrypoint = pb.Entrypoint(name=value["name"], slots=slots)
         entrypoint.entrypoint_binding_digest = documents.digest_of(
             canonical.write(

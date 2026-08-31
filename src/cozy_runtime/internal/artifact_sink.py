@@ -355,13 +355,13 @@ class ArtifactTransactionHost:
                 "TensorFS receipt declaration differs from the locked artifact request",
                 code="artifact_receipt_mismatch",
             )
-        evidence = value.get("release_evidence_canonical_bytes")
+        evidence = value.get("checkpoint_evidence_canonical_bytes")
         if (
             not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= artifact_limits.MAX_RELEASE_EVIDENCE_BYTES
+            or not 0 < len(evidence) <= artifact_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
         ):
             raise CapabilityError(
-                "TensorFS receipt carries no bounded ReleaseEvidence",
+                "TensorFS receipt carries no bounded CheckpointEvidence",
                 code="artifact_receipt_mismatch",
             )
         return value
@@ -374,14 +374,14 @@ class ArtifactTransactionHost:
         *,
         replayed: bool,
     ) -> ArtifactReceipt:
-        evidence = facts["release_evidence_canonical_bytes"]
+        evidence = facts["checkpoint_evidence_canonical_bytes"]
         assert isinstance(evidence, bytes)
         serializable = dict(facts)
         try:
-            serializable["release_evidence_canonical_bytes"] = evidence.decode("utf-8")
+            serializable["checkpoint_evidence_canonical_bytes"] = evidence.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise CapabilityError(
-                "TensorFS ReleaseEvidence is not canonical UTF-8",
+                "TensorFS CheckpointEvidence is not canonical UTF-8",
                 code="artifact_receipt_mismatch",
             ) from exc
         raw = canonical_json.encode(serializable)
@@ -390,7 +390,7 @@ class ArtifactTransactionHost:
             artifact_transaction_id=transaction_id,
             tensorfs_receipt_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
             tensorfs_receipt=raw,
-            release_evidence_canonical_bytes=evidence,
+            checkpoint_evidence_canonical_bytes=evidence,
             replayed=replayed,
         )
 
@@ -513,7 +513,7 @@ def protocol_receipt(
         artifact_transaction_id=receipt.artifact_transaction_id,
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
-        release_evidence_canonical_bytes=receipt.release_evidence_canonical_bytes,
+        checkpoint_evidence_canonical_bytes=receipt.checkpoint_evidence_canonical_bytes,
     )
     canonical_bytes, digest = documents.identity(body)
     return (
