@@ -18,7 +18,6 @@ from pathlib import Path
 from threading import Lock, local
 from typing import Any, Literal
 
-from cozy_runtime import qualification
 from cozy_runtime.internal import (
     canonical,
     contract,
@@ -435,9 +434,7 @@ class Acquirer:
 
     def _environment(self, placement: Any) -> overlay.InstalledOverlay:
         environment_digest = documents.spell(placement.environment_digest)
-        receipt_digest = documents.spell(placement.environment_receipt_digest)
-        wheelhouse = _ref(placement.environment["wheelhouse_manifest"], "wheelhouse_manifest")
-        wheelhouse_raw = self.fetch(*wheelhouse).read_bytes()
+        wheelhouse_raw = self.base_manifest.read_bytes()
         wheel_rows = [placement.package["project_wheel"], *placement.environment.get("wheels", [])]
         wheel_paths: dict[str, Path] = {}
         verified: dict[str, overlay.VerifiedFile] = {}
@@ -468,15 +465,10 @@ class Acquirer:
                 self.environment_root,
                 python=self.python,
                 base_manifest=self.base_manifest,
-                expected_receipt_digest=receipt_digest,
             )
         except (LaunchRefusal, overlay.OverlayRefusal) as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH
-                if "receipt" in exc.code
-                else pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                exc.code,
-                exc.detail,
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
             ) from exc
 
     def _models(self, placement: Any) -> int:
@@ -566,39 +558,11 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
             ) from exc
-        qualification_digest, qualification_length = placement.qualification
-        qualification_raw = self.fetch(qualification_digest, qualification_length).read_bytes()
-        try:
-            selected = qualification.read(qualification_raw)
-            expected = qualification.selection_digest(
-                bindings_digest=documents.spell(placement.bindings_digest),
-                environment_digest=documents.spell(placement.environment_digest),
-                environment_receipt={
-                    "digest": installed.receipt_digest,
-                    "length": len(installed.receipt_bytes),
-                },
-                package_descriptor={
-                    "digest": descriptor_digest,
-                    "length": descriptor_length,
-                },
-                package=placement.package,
-            )
-        except qualification.QualificationError as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "qualification_invalid", str(exc)
-            ) from exc
-        if selected != expected:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "qualification_selection_mismatch",
-                "Qualification does not authorize this exact PlacementSet/1 selection",
-            )
-        self._stage(qualification_digest, qualification_raw)
         visible = _visible_entrypoints(descriptor)
         models = {str(row["id"]): row for row in placement.models}
         release_digest = str(placement.package["release_digest"])
         bindings: dict[str, DeclaredBinding] = {}
-        count = 2
+        count = 1
         for entrypoint in placement.entrypoints:
             name = str(entrypoint["name"])
             binding_digest = str(entrypoint["entrypoint_binding_digest"])

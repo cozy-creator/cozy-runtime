@@ -141,7 +141,6 @@ class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FAULT_KIND_UNKNOWN_PLACEMENT: _ClassVar[FaultKind]
     FAULT_KIND_PLACEMENT_SET_UNSUPPORTED: _ClassVar[FaultKind]
     FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH: _ClassVar[FaultKind]
-    FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: _ClassVar[FaultKind]
     FAULT_KIND_FALLBACK_PIN_MISSING: _ClassVar[FaultKind]
 
@@ -225,6 +224,27 @@ class ArtifactTransferState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ARTIFACT_TRANSFER_STATE_ALREADY_PRESENT: _ClassVar[ArtifactTransferState]
     ARTIFACT_TRANSFER_STATE_HELD: _ClassVar[ArtifactTransferState]
     ARTIFACT_TRANSFER_STATE_FAILED: _ClassVar[ArtifactTransferState]
+
+class ModelSourceProvider(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MODEL_SOURCE_PROVIDER_UNSPECIFIED: _ClassVar[ModelSourceProvider]
+    MODEL_SOURCE_PROVIDER_HUGGING_FACE: _ClassVar[ModelSourceProvider]
+    MODEL_SOURCE_PROVIDER_CIVITAI: _ClassVar[ModelSourceProvider]
+
+class ModelSourceFileState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MODEL_SOURCE_FILE_STATE_UNSPECIFIED: _ClassVar[ModelSourceFileState]
+    MODEL_SOURCE_FILE_STATE_ACCEPTED: _ClassVar[ModelSourceFileState]
+    MODEL_SOURCE_FILE_STATE_DOWNLOADING: _ClassVar[ModelSourceFileState]
+    MODEL_SOURCE_FILE_STATE_VERIFIED: _ClassVar[ModelSourceFileState]
+    MODEL_SOURCE_FILE_STATE_FAILED: _ClassVar[ModelSourceFileState]
+
+class ModelSourcePrepareOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED: _ClassVar[ModelSourcePrepareOutcome]
+    MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: _ClassVar[ModelSourcePrepareOutcome]
+    MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: _ClassVar[ModelSourcePrepareOutcome]
+    MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: _ClassVar[ModelSourcePrepareOutcome]
 
 class ArtifactFinalizeDisposition(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -331,7 +351,6 @@ FAULT_KIND_CONFIG_REFUSED: FaultKind
 FAULT_KIND_UNKNOWN_PLACEMENT: FaultKind
 FAULT_KIND_PLACEMENT_SET_UNSUPPORTED: FaultKind
 FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH: FaultKind
-FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH: FaultKind
 FAULT_KIND_ARTIFACT_DIGEST_MISMATCH: FaultKind
 FAULT_KIND_FALLBACK_PIN_MISSING: FaultKind
 BOOT_FAILURE_REASON_UNSPECIFIED: BootFailureReason
@@ -385,6 +404,18 @@ ARTIFACT_TRANSFER_STATE_UPLOADED: ArtifactTransferState
 ARTIFACT_TRANSFER_STATE_ALREADY_PRESENT: ArtifactTransferState
 ARTIFACT_TRANSFER_STATE_HELD: ArtifactTransferState
 ARTIFACT_TRANSFER_STATE_FAILED: ArtifactTransferState
+MODEL_SOURCE_PROVIDER_UNSPECIFIED: ModelSourceProvider
+MODEL_SOURCE_PROVIDER_HUGGING_FACE: ModelSourceProvider
+MODEL_SOURCE_PROVIDER_CIVITAI: ModelSourceProvider
+MODEL_SOURCE_FILE_STATE_UNSPECIFIED: ModelSourceFileState
+MODEL_SOURCE_FILE_STATE_ACCEPTED: ModelSourceFileState
+MODEL_SOURCE_FILE_STATE_DOWNLOADING: ModelSourceFileState
+MODEL_SOURCE_FILE_STATE_VERIFIED: ModelSourceFileState
+MODEL_SOURCE_FILE_STATE_FAILED: ModelSourceFileState
+MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED: ModelSourcePrepareOutcome
+MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: ModelSourcePrepareOutcome
+MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: ModelSourcePrepareOutcome
+MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: ModelSourcePrepareOutcome
 ARTIFACT_FINALIZE_DISPOSITION_UNSPECIFIED: ArtifactFinalizeDisposition
 ARTIFACT_FINALIZE_DISPOSITION_ADOPT: ArtifactFinalizeDisposition
 ARTIFACT_FINALIZE_DISPOSITION_ABANDON: ArtifactFinalizeDisposition
@@ -423,8 +454,66 @@ class PreparePackageSetResult(_message.Message):
     placement_set: DesiredPlacementSet
     def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
 
+class LocalModelSourceFile(_message.Message):
+    __slots__ = ("member", "object_id", "length", "path")
+    MEMBER_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    LENGTH_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    member: str
+    object_id: str
+    length: int
+    path: str
+    def __init__(self, member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
+
+class ModelSourceProfile(_message.Message):
+    __slots__ = ("slot", "profile")
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PROFILE_FIELD_NUMBER: _ClassVar[int]
+    slot: str
+    profile: str
+    def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ...) -> None: ...
+
+class PreparedModelSource(_message.Message):
+    __slots__ = ("slot", "profile", "manifest")
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PROFILE_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    slot: str
+    profile: str
+    manifest: Ref
+    def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
+
+class PrepareModelSourceRequest(_message.Message):
+    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PROFILES_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
+    DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    source_selection_digest: bytes
+    profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
+    files: _containers.RepeatedCompositeFieldContainer[LocalModelSourceFile]
+    source_uri: str
+    declared_license: str
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ...) -> None: ...
+
+class PrepareModelSourceResult(_message.Message):
+    __slots__ = ("outcome", "sources", "safe_code", "safe_detail")
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    outcome: ModelSourcePrepareOutcome
+    sources: _containers.RepeatedCompositeFieldContainer[PreparedModelSource]
+    safe_code: str
+    safe_detail: str
+    def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request", "artifact_host_ack", "artifact_transfer_request", "artifact_read_request")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "artifact_finalize_request", "artifact_host_ack", "artifact_transfer_request", "artifact_read_request", "model_source_file_request", "model_source_prepare_request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -436,6 +525,8 @@ class RecordOwnerFrame(_message.Message):
     ARTIFACT_HOST_ACK_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_TRANSFER_REQUEST_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_READ_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    MODEL_SOURCE_FILE_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    MODEL_SOURCE_PREPARE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -447,10 +538,12 @@ class RecordOwnerFrame(_message.Message):
     artifact_host_ack: ArtifactHostAck
     artifact_transfer_request: ArtifactTransferRequest
     artifact_read_request: ArtifactReadRequest
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ..., artifact_host_ack: _Optional[_Union[ArtifactHostAck, _Mapping]] = ..., artifact_transfer_request: _Optional[_Union[ArtifactTransferRequest, _Mapping]] = ..., artifact_read_request: _Optional[_Union[ArtifactReadRequest, _Mapping]] = ...) -> None: ...
+    model_source_file_request: ModelSourceFileRequest
+    model_source_prepare_request: ModelSourcePrepareRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., artifact_finalize_request: _Optional[_Union[ArtifactFinalizeRequest, _Mapping]] = ..., artifact_host_ack: _Optional[_Union[ArtifactHostAck, _Mapping]] = ..., artifact_transfer_request: _Optional[_Union[ArtifactTransferRequest, _Mapping]] = ..., artifact_read_request: _Optional[_Union[ArtifactReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
-    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result", "artifact_intent", "artifact_receipt", "artifact_read_result", "artifact_transfer_status")
+    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "artifact_finalize_result", "artifact_intent", "artifact_receipt", "artifact_read_result", "artifact_transfer_status", "model_source_file_status", "model_source_prepared")
     CLAIM_ACK_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ACCEPTED_FIELD_NUMBER: _ClassVar[int]
@@ -464,6 +557,8 @@ class WorkerFrame(_message.Message):
     ARTIFACT_RECEIPT_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_READ_RESULT_FIELD_NUMBER: _ClassVar[int]
     ARTIFACT_TRANSFER_STATUS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_SOURCE_FILE_STATUS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_SOURCE_PREPARED_FIELD_NUMBER: _ClassVar[int]
     claim_ack: ClaimAck
     observed_state: ObservedWorkerState
     attempt_accepted: AttemptAccepted
@@ -477,7 +572,9 @@ class WorkerFrame(_message.Message):
     artifact_receipt: ArtifactReceiptFrame
     artifact_read_result: ArtifactReadResult
     artifact_transfer_status: ArtifactTransferStatus
-    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResult, _Mapping]] = ..., artifact_intent: _Optional[_Union[ArtifactIntentFrame, _Mapping]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptFrame, _Mapping]] = ..., artifact_read_result: _Optional[_Union[ArtifactReadResult, _Mapping]] = ..., artifact_transfer_status: _Optional[_Union[ArtifactTransferStatus, _Mapping]] = ...) -> None: ...
+    model_source_file_status: ModelSourceFileStatus
+    model_source_prepared: ModelSourcePrepared
+    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., artifact_finalize_result: _Optional[_Union[ArtifactFinalizeResult, _Mapping]] = ..., artifact_intent: _Optional[_Union[ArtifactIntentFrame, _Mapping]] = ..., artifact_receipt: _Optional[_Union[ArtifactReceiptFrame, _Mapping]] = ..., artifact_read_result: _Optional[_Union[ArtifactReadResult, _Mapping]] = ..., artifact_transfer_status: _Optional[_Union[ArtifactTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
@@ -708,30 +805,26 @@ class DownloadPackageRef(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
-    __slots__ = ("placement_id", "package", "development", "environment_digest", "environment_receipt_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "qualification", "environment")
+    __slots__ = ("placement_id", "package", "development", "environment_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "environment")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     DEVELOPMENT_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_DESCRIPTOR_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MODELS_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINTS_FIELD_NUMBER: _ClassVar[int]
-    QUALIFICATION_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     package: PackageSelection
     development: DevelopmentPackage
     environment_digest: bytes
-    environment_receipt_digest: bytes
     package_descriptor: Ref
     bindings_digest: bytes
     models: _containers.RepeatedCompositeFieldContainer[Model]
     entrypoints: _containers.RepeatedCompositeFieldContainer[Entrypoint]
-    qualification: Ref
     environment: Environment
-    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., environment_receipt_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., qualification: _Optional[_Union[Ref, _Mapping]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
+    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
 
 class Ref(_message.Message):
     __slots__ = ("digest", "length")
@@ -780,12 +873,10 @@ class DevelopmentPackage(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ...) -> None: ...
 
 class Environment(_message.Message):
-    __slots__ = ("wheelhouse_manifest", "wheels")
-    WHEELHOUSE_MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("wheels",)
     WHEELS_FIELD_NUMBER: _ClassVar[int]
-    wheelhouse_manifest: Ref
     wheels: _containers.RepeatedCompositeFieldContainer[WheelFact]
-    def __init__(self, wheelhouse_manifest: _Optional[_Union[Ref, _Mapping]] = ..., wheels: _Optional[_Iterable[_Union[WheelFact, _Mapping]]] = ...) -> None: ...
+    def __init__(self, wheels: _Optional[_Iterable[_Union[WheelFact, _Mapping]]] = ...) -> None: ...
 
 class Model(_message.Message):
     __slots__ = ("id", "repo", "version", "lane", "manifest")
@@ -1446,6 +1537,108 @@ class ArtifactTransferStatus(_message.Message):
     safe_code: str
     safe_detail: str
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., artifact_transaction_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., update_sequence: _Optional[int] = ..., state: _Optional[_Union[ArtifactTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., etag: _Optional[str] = ..., checksum_sha256: _Optional[str] = ..., attempts: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class ModelSourceFileRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_selection_digest", "member", "object_id", "length", "provider", "url", "expires_at_unix", "capability_revision")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MEMBER_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    LENGTH_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_FIELD_NUMBER: _ClassVar[int]
+    URL_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
+    CAPABILITY_REVISION_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    member: str
+    object_id: str
+    length: int
+    provider: ModelSourceProvider
+    url: str
+    expires_at_unix: int
+    capability_revision: int
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., provider: _Optional[_Union[ModelSourceProvider, str]] = ..., url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., capability_revision: _Optional[int] = ...) -> None: ...
+
+class ModelSourceFileStatus(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_selection_digest", "member", "object_id", "length", "capability_revision", "state", "transferred_bytes", "attempts", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MEMBER_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    LENGTH_FIELD_NUMBER: _ClassVar[int]
+    CAPABILITY_REVISION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPTS_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    member: str
+    object_id: str
+    length: int
+    capability_revision: int
+    state: ModelSourceFileState
+    transferred_bytes: int
+    attempts: int
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., capability_revision: _Optional[int] = ..., state: _Optional[_Union[ModelSourceFileState, str]] = ..., transferred_bytes: _Optional[int] = ..., attempts: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class ModelSourcePrepareRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_selection_digest", "profiles", "source_uri", "declared_license")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PROFILES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
+    DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
+    source_uri: str
+    declared_license: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ...) -> None: ...
+
+class ModelSourcePrepared(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "operation_id", "source_selection_digest", "outcome", "sources", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_generation: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    outcome: ModelSourcePrepareOutcome
+    sources: _containers.RepeatedCompositeFieldContainer[PreparedModelSource]
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_generation: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class ArtifactFinalizeRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_generation", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "disposition", "artifact_receipt_digest", "scratch_root_id", "owner_authority_scope")

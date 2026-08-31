@@ -400,10 +400,7 @@ def _release(
             "source_files": [],
         }
     )
-    environment = pb.Environment(
-        wheelhouse_manifest=pb.Ref(digest=documents.digest_of(wheelhouse), length=len(wheelhouse)),
-        wheels=[_proto_wheel(row) for row in selected_rows],
-    )
+    environment = pb.Environment(wheels=[_proto_wheel(row) for row in selected_rows])
     return {
         "package": {
             "package": f"proof/{project_fact['distribution']}",
