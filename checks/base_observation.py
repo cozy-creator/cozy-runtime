@@ -26,6 +26,7 @@ def main() -> None:
     assert observed.uv_version
     assert "cozy-runtime" in observed.distribution_versions
     assert "msgspec" in observed.distribution_versions
+    assert "packaging" in observed.distribution_versions
     assert "python-stdlib" in observed.root_providers["json"]
     assert "cozy-runtime" in observed.root_providers["cozy_runtime"]
     assert "msgspec" in observed.root_providers["msgspec"]
