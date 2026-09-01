@@ -13,7 +13,7 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.24` targets standard CPython 3.12 only. Project
+Runtime release `0.0.25` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
 delegation plus verified model files after private code preparation, and Runtime alone binds
@@ -453,7 +453,10 @@ and echoing one is not proof. Tensorhub joins Runtime's measured evidence to pro
 
 Runtime asks both its running proof interpreter and the selected `python` to report the actual
 CPython ABI, OS/CPU, glibc, protected distribution versions, Torch release, and CUDA build. It
-requires both reports to agree with the boot observation. GPU name, driver and SM are measured through
+compares Torch metadata and imports by their PEP 440 public release because official CUDA images
+may expose `2.13.0` metadata for an import identified as `2.13.0+cu130`; the import local tag must
+still match the separately measured CPU or exact CUDA runtime build. Runtime requires both reports
+to agree with the boot observation. GPU name, driver and SM are measured through
 `nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
 command emits a bounded result DTO containing those measured facts. Tensorhub normalizes the
 result into its own rows and alone decides whether the measured evidence qualifies the package
