@@ -9,11 +9,11 @@ executor, and the single-package CLI. Design authority: [tracker-v2](https://git
 Cozy Runtime is the platform's declared Python author-API channel. Package code has one supported
 production import root, `cozy_runtime.author`; package tests may also use
 `cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
-package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: retained public
-author behavior stays compatible throughout that range, and an incompatible author change requires
-a new distribution major rather than ordinary user-package `v0` exact-selection policy.
+package APIs. Runtime remains pre-release: `0.0.x` may make a coordinated hardcut rather than carry
+a compatibility alias for an unused or dishonest surface. Published packages declare the supported
+Runtime range and must be requalified when a hardcut removes something they used.
 
-Runtime release `0.0.29` targets standard CPython 3.12 only. Project
+Runtime release `0.0.33` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 16 allows an authenticated external RecordOwner to make the existing bounded
 WeightsSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
@@ -227,6 +227,11 @@ the launch and invocation facts with current readers. It carries no Runtime-glob
 inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
 no release digest, build timestamp, machine path or mutable binding reached it.
+Packages declare no GPU count, VRAM floor, accelerator class, placement, or free-form hardware
+predicate. Those facts come from the selected model lane and its concrete topology/encoding,
+RecordOwner placement, qualification measurements, and the worker's observed machine. The
+descriptor reader rejects the retired `resources` key as an unknown field; format `/1` has one
+current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
 workflow language. `source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
 inferred `Model` parameter exactly; each profile is emitted on that model row, beside the class and

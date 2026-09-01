@@ -2952,6 +2952,7 @@ class Worker:
         self.supervision.use_environment(binding.python, binding.environment_content_digest)
         self.jobs[job.job_descriptor_id] = binding
         self.engine.jobs = self.jobs
+        self.engine.job_device_count = job.device_count
         self.job_caps = job.resource_caps
         self.reclaim_on_terminal = job.reclaim_on_terminal
         self.note(

@@ -1,5 +1,5 @@
 """Annotation markers and the override doors: `Shape`, `ModelDefault`, `Preflight`,
-`Bound`, `Resources`.
+and `Bound`.
 
 Every one of these is an ORDINARY TYPED VALUE — `ModelDefault[int]` is `int` to mypy,
 `Shape(...)` is a frozen record inside `Annotated`. There is no mypy plugin and no DSL
@@ -9,7 +9,6 @@ below exist only for facts derivation and measurement cannot know.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, TypeAlias, TypeVar
@@ -183,38 +182,3 @@ class AssetBound:
                 "because a type the runtime cannot decode is not a capability",
                 fields=["media_types"],
             )
-
-
-_REQUIRES_TOKEN = re.compile(r"^(sm\d{2,3}\+?|vram\d+g|ram\d+g|cuda\d+\.\d+\+?)$")
-
-
-@dataclass(frozen=True, slots=True)
-class Resources:
-    """The override door for STRUCTURAL FLOORS ONLY (§1.2).
-
-    `gpu` is derived from the signature and is not spellable here. `vcpus` and host RAM
-    are MEASURED per (lane, plan) fleet-side. There is deliberately no `recommended`
-    form: "runs better on newer silicon" is a measured ranking fact, not a declaration —
-    and because this is a slotted frozen dataclass, `Resources(recommended=...)` is a
-    TypeError, not a review comment.
-    """
-
-    gpu_count: int | None = None
-    placement: str | None = None
-    requires: str | None = None
-    """Compact incapability grammar the probe vocabulary cannot express: `sm89+, vram24g`."""
-
-    def __post_init__(self) -> None:
-        if self.gpu_count is not None and self.gpu_count < 1:
-            raise ConformanceError("Resources(gpu_count=) must be >= 1", fields=["gpu_count"])
-        if self.placement is not None and self.placement not in ("single_node", "any"):
-            raise ConformanceError(
-                f"unknown placement class {self.placement!r}: single_node | any",
-                fields=["placement"],
-            )
-        for token in (t.strip() for t in (self.requires or "").split(",") if t.strip()):
-            if not _REQUIRES_TOKEN.match(token):
-                raise ConformanceError(
-                    f"requires={token!r} is outside the grammar: sm89+, vram24g, ram64g, cuda13.0+",
-                    fields=["requires"],
-                )

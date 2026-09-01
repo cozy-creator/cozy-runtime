@@ -12,7 +12,6 @@ from collections.abc import Mapping, Sequence
 from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
-from cozy_runtime.author._markers import Resources
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -93,10 +92,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
                     }
                 outputs.append(declared)
             doc["weights_outputs"] = outputs
-        if surface.resources is not None:
-            resources = _resources(surface.resources)
-            if resources:
-                doc["resources"] = resources
     return doc
 
 
@@ -117,17 +112,6 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
     if binding.source_profile is not None:
         doc["source_profile"] = binding.source_profile
     return doc
-
-
-def _resources(resources: Resources) -> dict[str, Json]:
-    out: dict[str, Json] = {}
-    if resources.gpu_count is not None:
-        out["gpu_count"] = resources.gpu_count
-    if resources.placement is not None:
-        out["placement"] = resources.placement
-    if resources.requires is not None:
-        out["requires"] = resources.requires
-    return out
 
 
 # -------------------------------------------------------------------- fixed-point scan
@@ -354,7 +338,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             optional = {"models"}
             if kind == "job":
                 required.add("publishes")
-                optional.update(("resources", "weights_outputs"))
+                optional.add("weights_outputs")
             item = _closed(row, required, optional, source, path)
             name = item["name"]
             if not isinstance(name, str) or not name or name in names:
@@ -417,10 +401,8 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     _invalid(
                         source,
                         path,
-                        "source_profile requires descriptor-declared artifact outputs",
+                        "source_profile requires descriptor-declared weight outputs",
                     )
-                if "resources" in item:
-                    _resources_value(item["resources"], source, f"{path}.resources")
                 if "weights_outputs" in item:
                     weights_outputs = item["weights_outputs"]
                     if not isinstance(weights_outputs, list) or not 1 <= len(weights_outputs) <= 16:
@@ -484,22 +466,6 @@ def _contract_value(value: Json, source: str, path: str) -> str:
     ):
         _invalid(source, path, "is not a bounded contract token")
     return value
-
-
-def _resources_value(value: Json, source: str, path: str) -> None:
-    resources = _closed(value, set(), {"gpu_count", "placement", "requires"}, source, path)
-    if not resources:
-        _invalid(source, path, "must not be empty")
-    gpu_count = resources.get("gpu_count")
-    if gpu_count is not None and (
-        not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count < 1
-    ):
-        _invalid(source, f"{path}.gpu_count", "must be positive")
-    if resources.get("placement") not in (None, "single_node", "any"):
-        _invalid(source, f"{path}.placement", "must be single_node or any")
-    requires = resources.get("requires")
-    if requires is not None and (not isinstance(requires, str) or not requires):
-        _invalid(source, f"{path}.requires", "must be a non-empty string")
 
 
 def _artifact_contract(value: Json, source: str, path: str) -> None:
