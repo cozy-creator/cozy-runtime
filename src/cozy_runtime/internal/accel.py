@@ -184,6 +184,49 @@ def _nvml_compute_table() -> dict[int, int] | None:
     return table
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceMemory:
+    """The driver's view of ONE device's memory, read from outside any CUDA context."""
+
+    state: Literal["measured", "unreadable"]
+    free_bytes: int = -1
+    total_bytes: int = -1
+
+
+def device_memory(device: str, kind: str) -> DeviceMemory:
+    """Free and total bytes of one envelope entry, measured by the DRIVER, torch-free.
+
+    The worker assigns residence ceilings from this number (cr-066): it is the only view
+    that sees every process on the device, and it is readable before any executor exists.
+    `device` is one `CUDA_VISIBLE_DEVICES` entry verbatim — an index or a GPU UUID — and
+    nvidia-smi's `--id` takes exactly that spelling. An entry the driver does not have, or
+    a query that fails, is UNREADABLE and never a zero: a lane whose capacity cannot be
+    read cannot be shown to fit anything. MPS has no per-device driver query.
+    """
+    if kind == "mps" or not device:
+        return DeviceMemory("unreadable")
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={device}",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_QUERY_SECONDS,
+            check=True,
+        )
+        line = out.stdout.strip().splitlines()[0]
+        free, total = (int(part.strip()) * 1024 * 1024 for part in line.split(","))
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return DeviceMemory("unreadable")
+    if total <= 0 or free < 0 or free > total:
+        return DeviceMemory("unreadable")
+    return DeviceMemory("measured", free, total)
+
+
 def synchronize(torch: Any, kind: str) -> None:
     """A device-order fence for `kind`. `cpu` is a no-op (host code is already ordered)."""
     if kind == "mps":

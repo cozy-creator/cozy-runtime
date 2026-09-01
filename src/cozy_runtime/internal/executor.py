@@ -146,15 +146,20 @@ def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
     }
 
 
-def residence_ceiling(*, destinations: int, allocatable: int) -> int:
-    """The construction's residence ceiling, DERIVED from the card (cl-027 / cr-025).
+def residence_ceiling(*, destinations: int, authorized: int, allocatable: int) -> int:
+    """The construction's residence ceiling: ASSIGNED by the worker, VERIFIED by the card.
 
-    Nothing authors this: it is the measured allocatable capacity, capped at the artifact's
-    own complete destination bytes so a card with room reports the artifact's size rather
-    than its own. Whatever it comes to is what the generation's digest carries. Zero means
-    the card has no room at all, which is a typed shortfall at the caller.
+    `authorized` is the ceiling the worker handed this executor for this prepare (cr-025's
+    `authorized_device_limit_bytes`; cr-066 assigns it from the lane's measured free bytes
+    less what other executors on the lane hold outstanding). `allocatable` is what this
+    process measures it can actually get. Predictions authorize, observations verify: the
+    ceiling is the smaller of the two, capped at the artifact's own complete destination
+    bytes so a card with room reports the artifact's size rather than its own. Nothing here
+    derives a ceiling from free bytes alone any more — that is how two executors preparing
+    on one device were each handed the same headroom. Whatever it comes to is what the
+    generation's digest carries; zero is a typed shortfall at the caller.
     """
-    return min(int(destinations), max(int(allocatable), 0))
+    return min(int(destinations), max(int(authorized), 0), max(int(allocatable), 0))
 
 
 # --------------------------------------------------------------------------- state
@@ -344,6 +349,19 @@ class Executor:
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
+        sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
+        if str(command.get("devices", "")) != sealed_devices:
+            # THE SEAL IS THE DEVICE SELECTION (cr-066). The worker names the lane it
+            # sealed this process to; a prepare for any other set of devices is a prepare
+            # in the wrong process, refused before Torch can pick a card.
+            self.poisoned = "env seal names other devices"
+            return {
+                "ok": False,
+                "code": "env_seal_broken",
+                "detail": "this executor is sealed to CUDA_VISIBLE_DEVICES="
+                f"{sealed_devices!r} and the prepare names {command.get('devices')!r}: "
+                "an executor serves exactly its lane's devices",
+            }
         if "models" in command:
             return self._prepare_many(command)
         binding = command["binding"]
@@ -351,6 +369,18 @@ class Executor:
         started = time.perf_counter()
         if not binding.get("model_class"):
             return self._prepare_weightless(binding, started)
+        if "authorized_device_limit_bytes" not in command:
+            # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
+            # model-bearing prepare. An absent assignment is a worker defect, refused
+            # rather than defaulted to a read of free bytes.
+            self.poisoned = "prepare without an authorized device limit"
+            return {
+                "ok": False,
+                "code": "authorization_absent",
+                "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
+                "assigns the residence ceiling and this executor derives none",
+            }
+        authorized = int(command["authorized_device_limit_bytes"])
 
         changed = _env_changes()
         if changed:
@@ -443,8 +473,10 @@ class Executor:
         # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so this
         # costs one header read and no load.
         # Package installation carries no pre-qualified hardware variant. Derive it from
-        # the executor's selected device; a repository lane is never a hardware claim.
-        device_index = int(binding.get("device_index") or 0)
+        # the executor's device; a repository lane is never a hardware claim. THE DEVICE IS
+        # ORDINAL 0 BY CONSTRUCTION (cr-066): the worker sealed this process to exactly its
+        # lane's devices, so there is nothing to select here and no index to carry.
+        device_index = 0
         device_facts = measure_device(torch, device_index)
         hardware_variant = str(binding.get("variant") or "")
         if not hardware_variant:
@@ -469,9 +501,8 @@ class Executor:
             name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
         }
         rows = [r for name in names for r in checkpoints[name].rows(name)]
-        # THE SELECTED DEVICE, not card zero (#549.9). `device_index` is the binding's, and
-        # NVML is queried with it — a multi-GPU pod used to mint every record against GPU 0's
-        # power cap and MIG profile whatever card the fill was about to use.
+        # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
+        # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding["release"])
         providers = launch_providers()
         qualified = qualify(
@@ -586,27 +617,31 @@ class Executor:
         allocatable = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
-        # THE RESIDENCE CEILING (cl-027 / cr-025). DERIVED here from measured capacity and
-        # the artifact's complete destination bytes; the APPLIED value is what the
-        # generation's digest carries. A staging generation re-reads the store after
-        # construction, so its GC-safe hold must outlive the first commit; that is
-        # `hold_lease`.
+        # THE RESIDENCE CEILING (cl-027 / cr-025 / cr-066): the worker's ASSIGNED limit,
+        # verified against measured capacity, capped at the artifact's complete destination
+        # bytes; the APPLIED value is what the generation's digest carries. A staging
+        # generation re-reads the store after construction, so its GC-safe hold must
+        # outlive the first commit; that is `hold_lease`.
         destinations = max(int(envelope["destination_bytes"]), declared)
-        resident_budget = residence_ceiling(destinations=destinations, allocatable=int(allocatable))
+        admissible = min(authorized, int(allocatable))
+        resident_budget = residence_ceiling(
+            destinations=destinations, authorized=authorized, allocatable=int(allocatable)
+        )
         if resident_budget <= 0:
             self.poisoned = "fill refused: device_shortfall"
             return {
                 "ok": False,
                 "code": "device_shortfall",
                 "detail": (
-                    f"{allocatable} B allocatable leaves no residence ceiling — nothing of "
-                    "this construction can stay resident, so there is no plan to derive"
+                    f"{authorized} B authorized by the worker and {allocatable} B "
+                    "allocatable leave no residence ceiling — nothing of this construction "
+                    "can stay resident, so there is no plan to derive"
                 ),
                 "shortfall": {
                     "resource": "vram",
                     "scope": "component_generation",
                     "needed_bytes": destinations,
-                    "available_bytes": int(allocatable),
+                    "available_bytes": admissible,
                     "evidence_class": "measured",
                 },
             }
@@ -626,26 +661,27 @@ class Executor:
             **envelope,
             "resident_destination_bytes": resident_destinations,
             "resident_budget_bytes": resident_budget,
+            "authorized_device_limit_bytes": authorized,
             "required_bytes": required,
         }
-        if required > allocatable:
+        if required > admissible:
             self.poisoned = "fill refused: device_shortfall"
             return {
                 "ok": False,
                 "code": "device_shortfall",
                 "detail": (
                     f"this fill will hold {required} B on the device "
-                    f"({resident_destinations} B of resident destinations under a "
-                    f"derived ceiling of {resident_budget} B; "
+                    f"({resident_destinations} B of resident destinations under an "
+                    f"assigned ceiling of {resident_budget} B; "
                     f"{envelope['destination_bytes']} B of logical destinations, "
                     f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
                     "destinations, "
                     f"{envelope['native_bytes']} B of native encoded leaves, "
                     f"{envelope['decode_peak_bytes']} B of decode scratch at its widest "
-                    f"component) against {allocatable} B allocatable - refused on the "
-                    f"arithmetic, before a byte moved. The binding's MCC priced {declared} B "
-                    "of logical plus derived destinations; the header independently prices "
-                    "stored encoding overhead"
+                    f"component) against {authorized} B authorized and {allocatable} B "
+                    "allocatable - refused on the arithmetic, before a byte moved. The "
+                    f"binding's MCC priced {declared} B of logical plus derived "
+                    "destinations; the header independently prices stored encoding overhead"
                 ),
                 "envelope": envelope,
                 "declared_weight_bytes": declared,
@@ -653,7 +689,7 @@ class Executor:
                     "resource": "vram",
                     "scope": "component_generation",
                     "needed_bytes": required,
-                    "available_bytes": int(allocatable),
+                    "available_bytes": admissible,
                     "evidence_class": "measured",
                 },
             }
@@ -846,6 +882,7 @@ class Executor:
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
             "resident_budget_bytes": resident_budget,
+            "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),
             "pinned": dict(backend.pinned),
             "store": backend.stats.get("store", {}),
@@ -918,6 +955,18 @@ class Executor:
                 "detail": "model paths must be sorted unique and parameters must be unique",
             }
 
+        if "authorized_device_limit_bytes" not in command:
+            self.poisoned = "prepare without an authorized device limit"
+            return {
+                "ok": False,
+                "code": "authorization_absent",
+                "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
+                "assigns the residence ceiling and this executor derives none",
+            }
+        # ONE authorization for the PROCESS: each construction fits under what the previous
+        # ones left of it, measured by this process's own allocator after their fills.
+        authorized = int(command["authorized_device_limit_bytes"])
+        held = 0
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
             binding = row["binding"]
@@ -925,7 +974,15 @@ class Executor:
             child = Executor(self.channel, self.root, self.fill_forensics_dir)
             child.discovered = self.discovered
             child.surface_names = dict(self.surface_names)
-            reply = child._prepare_first(row)
+            reply = child._prepare_first(
+                {
+                    **row,
+                    "devices": command.get("devices", ""),
+                    "authorized_device_limit_bytes": max(authorized - held, 0),
+                }
+            )
+            if reply.get("ok"):
+                held = int(reply["facts"].get("allocator_bytes", held))
             if not reply.get("ok"):
                 self.poisoned = f"model {parameter} refused: {reply.get('code', 'unknown')}"
                 return {**reply, "model_parameter": parameter}
@@ -1840,7 +1897,8 @@ class Executor:
         return cached
 
     def _device(self) -> Device:
-        """No torch in this process means no device to name (cl-013)."""
+        """No torch in this process means no device to name (cl-013). Ordinal 0 IS the
+        lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
 
     def _quiescent(self) -> bool:

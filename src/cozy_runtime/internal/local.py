@@ -1583,9 +1583,8 @@ def _collect(
 ) -> SliceOutcome:
     outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
     outcome.attempt_records = _record_rows(worker.records)
-    outcome.reconciliation = (
-        worker.ledger.reconciliations[-1] if worker.ledger.reconciliations else {}
-    )
+    ledger = worker.primary_ledger()
+    outcome.reconciliation = ledger.reconciliations[-1] if ledger.reconciliations else {}
     # The ledger as it stood AT ATTEMPT CLOSE, not after shutdown. Reading it here would
     # report the executor's RSS as unreadable and its device classes as stale, because by
     # now the process that owned them is gone — true, and useless. The reconciliation record
@@ -1593,7 +1592,7 @@ def _collect(
     outcome.ledger = (
         {"classes": outcome.reconciliation["classes"]}
         if outcome.reconciliation
-        else worker.ledger.measurement()
+        else ledger.measurement()
     )
     outcome.warm = list(worker.warm)
     outcome.faults = [

@@ -136,9 +136,7 @@ def _run(config: WorkerHostConfig) -> int:
     host.on_bound = ready
 
     def stop_worker() -> None:
-        worker.stop.set()
-        worker.outbound.put(None)
-        worker.work.put(None)
+        worker.request_stop()
         host.stop()
 
     def stop_signal(_signum: int, _frame: object) -> None:
