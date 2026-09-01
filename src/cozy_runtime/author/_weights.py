@@ -24,6 +24,9 @@ MAX_WEIGHTS_ADDITIONS = 65_536
 MAX_WEIGHTS_SOURCE_READ = 64 << 20
 MAX_WEIGHTS_NEW_BYTES = (1 << 53) - 1
 MAX_WEIGHTS_ENCODINGS = 32
+MAX_WEIGHTS_SOURCE_CONFIGS = 64
+MAX_WEIGHTS_SOURCE_TENSORS = 65_536
+MAX_WEIGHTS_SOURCE_ROLES = 16
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -205,6 +208,39 @@ class WeightsReceipt:
     tensorfs_receipt: bytes
     checkpoint_evidence_canonical_bytes: bytes
     replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WeightsSourcePart:
+    """One bounded role fact from an already-granted source Manifest."""
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightsSourceTensor:
+    """Logical geometry and stored roles, with no object or location information."""
+
+    component: str
+    key: str
+    logical_dtype: str
+    shape: tuple[int, ...]
+    parts: tuple[WeightsSourcePart, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightsSource:
+    """The closed structural view of one exact granted Manifest.
+
+    Tuple order is the Manifest's construction order.  The view deliberately omits
+    object references, offsets, store paths, and configuration bytes; those stay behind
+    the Runtime-owned weights transaction.
+    """
+
+    configs: tuple[str, ...]
+    tensors: tuple[WeightsSourceTensor, ...]
 
 
 class WeightsHostTransaction(Protocol):
@@ -406,7 +442,15 @@ class WeightsTransaction:
 class WeightsSink:
     """Attempt-bound capability for one or more descriptor-declared model outputs."""
 
-    __slots__ = ("_attempt", "_cancel", "_models", "_open", "_outputs", "_spent")
+    __slots__ = (
+        "_attempt",
+        "_cancel",
+        "_models",
+        "_open",
+        "_outputs",
+        "_source_structure",
+        "_spent",
+    )
 
     def __init__(
         self,
@@ -414,14 +458,86 @@ class WeightsSink:
         models: Mapping[str, Model[object]],
         outputs: Mapping[str, int],
         open_transaction: Callable[[WeightsCommit], WeightsHostTransaction] | None,
+        source_structure: Callable[[str], WeightsSource] | None = None,
         cancel: Callable[[], bool] = lambda: False,
     ) -> None:
         self._attempt = attempt
         self._models = dict(models)
         self._outputs = dict(outputs)
         self._open = open_transaction
+        self._source_structure = source_structure
         self._cancel = cancel
         self._spent: set[str] = set()
+
+    def structure(self, source: Model[object]) -> WeightsSource:
+        """Return bounded tensor geometry for one exact source already granted to this job."""
+        from cozy_runtime.author._services import Attempt
+
+        attempt = self._attempt
+        assert isinstance(attempt, Attempt)
+        attempt.check_open("WeightsSink.structure")
+        allowed = {id(model): model for model in self._models.values()}
+        if id(source) not in allowed:
+            raise CapabilityError(
+                "weights structure source is not one of this job's exact model inputs",
+                code="weights_source_ungranted",
+            )
+        if not source.checkpoint_ref.startswith("sha256:"):
+            raise CapabilityError(
+                "weights structure source has no exact Manifest identity",
+                code="weights_source_identity",
+            )
+        if self._source_structure is None:
+            raise CapabilityError(
+                "this attempt has no weights source-structure host",
+                code="weights_source_structure_unavailable",
+            )
+        if self._cancel():
+            raise Cancelled("weights source-structure read was canceled")
+        try:
+            observed = self._source_structure(source.checkpoint_ref)
+        except Exception as exc:
+            if isinstance(exc, CapabilityError):
+                raise
+            raise CapabilityError(
+                f"TensorFS source structure refused: {type(exc).__name__}: {exc}",
+                code="weights_source_refused",
+            ) from exc
+        if (
+            not isinstance(observed, WeightsSource)
+            or not 0 <= len(observed.configs) <= MAX_WEIGHTS_SOURCE_CONFIGS
+            or not 0 < len(observed.tensors) <= MAX_WEIGHTS_SOURCE_TENSORS
+            or len(set(observed.configs)) != len(observed.configs)
+        ):
+            raise CapabilityError(
+                "weights source structure exceeds its closed bounds",
+                code="weights_source_structure_invalid",
+            )
+        seen: set[tuple[str, str]] = set()
+        for tensor in observed.tensors:
+            identity = (tensor.component, tensor.key)
+            if (
+                not tensor.component
+                or not tensor.key
+                or not tensor.logical_dtype
+                or not tensor.parts
+                or len(tensor.parts) > MAX_WEIGHTS_SOURCE_ROLES
+                or any(dimension <= 0 for dimension in tensor.shape)
+                or identity in seen
+                or len({part.name for part in tensor.parts}) != len(tensor.parts)
+                or any(
+                    not part.name
+                    or not part.dtype
+                    or any(dimension <= 0 for dimension in part.shape)
+                    for part in tensor.parts
+                )
+            ):
+                raise CapabilityError(
+                    "weights source structure contains invalid tensor geometry",
+                    code="weights_source_structure_invalid",
+                )
+            seen.add(identity)
+        return observed
 
     def open(
         self,

@@ -71,7 +71,12 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
-from cozy_runtime.author._weights import WeightsCommit, WeightsHostTransaction, WeightsSink
+from cozy_runtime.author._weights import (
+    WeightsCommit,
+    WeightsHostTransaction,
+    WeightsSink,
+    WeightsSource,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +123,8 @@ class Invocation:
     """Cost-governor facts from the typed config channel. Never read from environment."""
     weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None
     """The Runtime/host weights transaction. Author code receives only WeightsSink."""
+    weights_source_structure: Callable[[str], WeightsSource] | None = None
+    """Bounded structure reader for exact Manifest inputs already granted to this attempt."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -645,11 +652,12 @@ def _service(
             return Budget(attempt, inv.budget)
         case "weights":
             return WeightsSink(
-                attempt,
-                inv.models,
-                {output.name: output.max_new_bytes for output in surface.weights_outputs},
-                inv.weights,
-                inv.cancel,
+                attempt=attempt,
+                models=inv.models,
+                outputs={output.name: output.max_new_bytes for output in surface.weights_outputs},
+                open_transaction=inv.weights,
+                source_structure=inv.weights_source_structure,
+                cancel=inv.cancel,
             )
         case "media_decode":
             return MediaDecoder(
