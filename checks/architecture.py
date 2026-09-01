@@ -638,15 +638,15 @@ DECIDING_MODULES = (
     "cozy_runtime.author._model",
     "torch",
 )
-#: Names through which residency could be reached even without an import.
+#: Names through which residency could be reached even without an import — an object PASSED
+#: in closes no import. Only this runtime's own residency vocabulary belongs here: `reserve`
+#: and `rollback` were removed because every container and every transaction answers to
+#: them, and `commit_fill` because it names nothing that exists.
 DECIDING_NAMES = (
     "_cozy_scope",
     "_cozy_active",
     "materialize",
     "evict",
-    "reserve",
-    "rollback",
-    "commit_fill",
     "empty_cache",
 )
 
@@ -658,6 +658,16 @@ def fence_timing_decides_nothing() -> list[str]:
     proof is not a comment: the observation plane cannot import a deciding module and cannot
     name a residency operation, so a timing bracket has no reachable way to alter component
     availability, placement, or the ComponentUseContract.
+
+    A TYPE cannot hold this. `stage_ms` is a float the observation plane itself must
+    min/max/sum (`_observations.Track.add`) and round for the wire, so an opaque
+    non-comparable number would break the observer before it stopped anything — and it
+    would still leave `internal/worker/observe.py` free to import `internal.fill`. The
+    invariant is about a module's import graph, which is not a property of a value.
+
+    `author/_observations.py` is listed for completeness only: `package-imports` already
+    denies the whole author package `cozy_runtime.internal`. The two `internal/worker`
+    modules are what nothing else covers.
     """
     bad: list[str] = []
     for path in py_files():
