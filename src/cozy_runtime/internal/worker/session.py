@@ -2399,6 +2399,11 @@ class Worker:
 
         for placement_id in sorted(set(self.hosted) - keep):
             hosted = self.hosted[placement_id]
+            self._hosted_set_serving(
+                placement_id,
+                pb.ServingState.SERVING_STATE_DRAINING,
+                f"placement {placement_id!r} removed from desired state",
+            )
             for attempt in list(self.engine.history.values()):
                 while attempt.placement_id == placement_id and attempt.state in self.engine.HELD:
                     time.sleep(0.02)
@@ -2540,6 +2545,11 @@ class Worker:
             for binding in group:
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
                 hosted.prepared_models[binding.entrypoint_binding_digest] = prepared
+            self.note(
+                "boot",
+                f"{placement.placement_id!r} executor generation {executor.incarnation} "
+                f"pid {executor.pid} prepared {len(group)} binding(s)",
+            )
         except Exception as exc:
             placement.serving = pb.ServingState.SERVING_STATE_OFFLINE
             hosted.latched = f"activation_failed: {safe(str(exc))}"[:200]
