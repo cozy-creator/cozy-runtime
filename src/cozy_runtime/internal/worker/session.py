@@ -57,6 +57,7 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
+    spawn,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -1256,6 +1257,8 @@ class Worker:
                     verified=mark_verified,
                     job_plan_root=self.config.cozy_home / "job-plans",
                     base=self.base,
+                    native_environment=self.native_environment(),
+                    native_device_index=self.native_device_index(),
                 )
                 prepared = read_placement_set(result.placement_set)
                 if len(prepared) != 1 or not prepared[0].get("development"):
@@ -1301,6 +1304,8 @@ class Worker:
                 verified=mark_verified,
                 job_plan_root=self.config.cozy_home / "job-plans",
                 base=self.base,
+                native_environment=self.native_environment(),
+                native_device_index=self.native_device_index(),
             )
 
     def prepare_model_source(
@@ -2861,6 +2866,8 @@ class Worker:
                 base=self.base,
                 installed_environment=installed_environment,
                 verified_cache=self.verified_artifacts,
+                native_environment=self.native_environment(),
+                native_device_index=self.native_device_index(),
                 on_observation=lambda value: self._observe_acquisition(placement, value),
             )
 
@@ -3581,6 +3588,20 @@ class Worker:
         if where:
             imposed[child_env.FILL_FORENSICS_DIR] = where
         return imposed
+
+    def native_environment(self) -> dict[str, str]:
+        """The sealed environment one native dependency wheel is qualified under.
+
+        Exactly the executor's own seal, because the question the qualification answers is
+        whether these bytes load and import in the process that will actually run them. A
+        wheel proved under some other environment has been proved about some other host.
+        """
+        return spawn.seal(self.config.child_base_env, self.imposed())
+
+    def native_device_index(self) -> int:
+        """The device the GPU seat is measured on: the first this worker was given."""
+        first = self.options.devices.split(",")[0].strip()
+        return int(first) if first.isdigit() else 0
 
     # ------------------------------------------------------------------ dispatch
 

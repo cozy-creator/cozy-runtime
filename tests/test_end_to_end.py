@@ -332,7 +332,6 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=base,
-                allow_native_custom=True,
                 installed_environment=installed,
             )
 
@@ -346,7 +345,7 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
 
         package_names = {"marco-polo", "annotated-doc"}
         rental_distributions = tuple(
-            (name, "0.0.36" if name == "cozy-runtime" else version)
+            (name, "0.0.37" if name == "cozy-runtime" else version)
             for name, version in observed.distributions
             if name not in package_names
         )
@@ -472,3 +471,165 @@ def test_a_refusal_terminates_the_process(installed_cli: str) -> None:
                 refused.returncode,
             )
             assert "containment unavailable" in error["message"], error
+
+
+def _write_native_dependency(root: Path, version: str) -> None:
+    """A REAL native dependency: one compiled CPython extension, not a renamed text file.
+
+    The admission path under test loads these bytes with the dynamic loader and imports the
+    module, so a fake `.so` would prove only that the fake was rejected.
+    """
+
+    package = root / "src" / "native_leaf"
+    package.mkdir(parents=True)
+    source = root / "csrc"
+    source.mkdir()
+    (root / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["setuptools"]\n'
+        'build-backend = "setuptools.build_meta"\n\n'
+        "[project]\n"
+        'name = "native-leaf"\n'
+        f'version = "{version}"\n'
+        'requires-python = ">=3.12,<3.13"\n\n'
+        "[tool.setuptools]\n"
+        'package-dir = {"" = "src"}\n\n'
+        "[tool.setuptools.packages.find]\n"
+        'where = ["src"]\n'
+    )
+    (root / "setup.py").write_text(
+        "from setuptools import Extension, setup\n\n"
+        "setup(ext_modules=[Extension('native_leaf._leaf', ['csrc/_leaf.c'])])\n"
+    )
+    (package / "__init__.py").write_text("from native_leaf._leaf import answer\n")
+    # The C source lives OUTSIDE the package: a wheel may not ship its own build inputs,
+    # and the admission path refuses one that does.
+    (source / "_leaf.c").write_text(
+        "#define PY_SSIZE_T_CLEAN\n"
+        "#include <Python.h>\n\n"
+        "static PyObject *answer(PyObject *self, PyObject *args) {\n"
+        "    (void)self; (void)args;\n"
+        "    return PyLong_FromLong(42);\n"
+        "}\n\n"
+        "static PyMethodDef methods[] = {\n"
+        '    {"answer", answer, METH_NOARGS, "the admitted answer"},\n'
+        "    {NULL, NULL, 0, NULL}\n"
+        "};\n\n"
+        "static struct PyModuleDef module = {\n"
+        '    PyModuleDef_HEAD_INIT, "native_leaf._leaf", NULL, -1, methods\n'
+        "};\n\n"
+        "PyMODINIT_FUNC PyInit__leaf(void) { return PyModule_Create(&module); }\n"
+    )
+
+
+def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -> None:
+    """A native dependency wheel installs only where it is proved to load, import and run.
+
+    The retired `allow_native_custom` flag admitted native wheels on WHO was asking. This
+    asserts the replacement: the same wheel refuses with no qualification host to prove it
+    against, and is admitted once the sealed execution environment is supplied — because the
+    loader actually opened the ELF and the interpreter actually imported the module.
+    """
+
+    uv = shutil.which("uv")
+    assert uv is not None
+    if shutil.which("cc") is None:
+        pytest.skip("a C compiler is required to build the native dependency under test")
+
+    with tempfile.TemporaryDirectory(prefix="cozy-native-admission.") as raw:
+        root = Path(raw)
+        dependency = root / "native-leaf"
+        _write_native_dependency(dependency, "0.0.1")
+
+        artifact_cache = root / "artifacts"
+        wheel_set = artifact_cache / "sets" / "package"
+        wheel_set.mkdir(parents=True)
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
+        runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
+        project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
+        native_wheel_path = next(wheel_set.glob("native_leaf-*.whl"))
+        # A pure-Python build would defeat the test silently, so the concrete ABI tag the
+        # admission path requires is asserted, not assumed.
+        assert "-py3-none-any.whl" not in native_wheel_path.name, native_wheel_path.name
+
+        environment = root / "environment"
+        python = environment / "bin" / "python"
+        _run(uv, "venv", "--python", sys.executable, str(environment))
+        _run(
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            str(runtime_wheel),
+            str(native_wheel_path),
+            str(project_wheel),
+        )
+        release_digest = "sha256:" + "23" * 32
+        installed = package_environment.open_existing_environment(python, release_digest)
+        observed = package_environment.observe_base(python)
+        artifact_store = root / "artifact-store"
+        artifact_store.mkdir()
+
+        def describe_real(
+            selected: package_environment.InstalledEnvironment, distribution: str
+        ) -> bytes:
+            command = (
+                "from cozy_runtime.internal import descriptor; "
+                "from cozy_runtime.internal.discovery import discover_distribution; "
+                f"found=discover_distribution({distribution!r}); "
+                "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+            )
+            return _run(str(selected.python), "-I", "-c", command, cwd="/").stdout.encode()
+
+        rows = [
+            _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
+            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, native_wheel_path),
+            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
+        ]
+        rows.sort(key=lambda row: row.digest)
+
+        def prepare(native_environment: dict[str, str] | None) -> pb.PreparePackageSetResult:
+            return prepare_package(
+                package_name="paul/marco-polo",
+                release="1.0.4",
+                release_digest=release_digest,
+                files=rows,
+                placement_seed=b"native-dependency-admission",
+                artifact_cache=artifact_cache,
+                artifact_store=artifact_store,
+                environment_root=environment,
+                python=python,
+                describe=describe_real,
+                verified=lambda _digest, _length, _path: None,
+                base=observed,
+                native_environment=native_environment,
+                installed_environment=installed,
+            )
+
+        # RED ARM: no sealed execution environment means no qualification host. There is no
+        # caller identity that substitutes for one.
+        with pytest.raises(PreparationRefusal) as absent:
+            prepare(None)
+        assert absent.value.code == "package_environment_native_proof_environment_absent"
+
+        # GREEN ARM: the same bytes, admitted, because the operator child opened the ELF with
+        # the dynamic loader and imported the module out of this exact environment.
+        prepared = prepare(_sealed_child_environment())
+        assert prepared.placement_set.placement_set_canonical_bytes
+        assert (
+            _run(
+                str(python), "-I", "-c", "import native_leaf; print(native_leaf.answer())"
+            ).stdout.strip()
+            == "42"
+        )
+
+
+def _sealed_child_environment() -> dict[str, str]:
+    """The seal a worker would hand the operator child, built through the one env authority."""
+
+    from cozy_runtime.internal import config, spawn
+
+    return spawn.seal(config.read_config().child_base_env, {})
