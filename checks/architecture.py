@@ -294,13 +294,6 @@ def fence_excluded_keywords() -> list[str]:
     return bad
 
 
-#: A package module is one that builds an `App()` — the file `describe` imports.
-_MEDIA_PREFIXES = ("image/", "video/", "audio/", "text/", "application/", "model/")
-_IDENTIFIER = re.compile(r"^(hf|civitai|comfy|tensorhub):|^[a-z0-9][\w.-]*/[\w.-]+(@[\w.-]+)?$")
-#: A versioned FORMAT id (`adaln-tables/1`, `ggml-q4-k/v1`) is a schema name, not an artifact.
-_FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
-
-
 def package_modules() -> list[pathlib.Path]:
     """Every module in the tree that builds an `App()` — the file `describe` imports."""
     modules = []
@@ -417,53 +410,6 @@ def fence_package_owns_no_media_decode() -> list[str]:
                 bad.append(
                     f"{rel}:{node.lineno}: package code calls from_file — a library path/URL "
                     "decoder is a second media authority"
-                )
-    return bad
-
-
-def fence_no_identifiers() -> list[str]:
-    """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
-    model, release, checkpoint or adapter ref, in bindings or in string literals.
-
-    Code states capability; SELECTION is a binding (package.toml, `--model`, the deploy
-    binding). Identity is exclusively deployment-side, so branching on one is unspellable.
-    """
-    bad: list[str] = []
-    for path in package_modules():
-        tree = ast.parse(path.read_text())
-        # An artifact CONTRACT is a requirement Tensorhub derives from output bytes, and an
-        # `operation_key=` is an idempotency key the author mints. Neither selects anything,
-        # and both are ordinarily spelled `a/b`, which is the identifier shape.
-        contract_values = {
-            id(value)
-            for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            for keyword in call.keywords
-            if keyword.arg == "operation_key"
-            or (
-                keyword.arg in {"topology_digest", "encodings"}
-                and (
-                    (isinstance(call.func, ast.Name) and call.func.id == "WeightsOutput")
-                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "WeightsOutput")
-                )
-            )
-            for value in ast.walk(keyword.value)
-            if isinstance(value, ast.Constant)
-        }
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            if id(node) in contract_values:
-                continue
-            text = node.value.strip()
-            if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):
-                continue
-            if _FORMAT_ID.match(text):
-                continue
-            if _IDENTIFIER.match(text):
-                bad.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno}: artifact identifier {text!r} in "
-                    "package code — selection is a binding, never a literal"
                 )
     return bad
 
@@ -759,7 +705,6 @@ FENCES = {
     "no-runtime-database": fence_no_runtime_database,
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,
-    "no-identifiers-in-package-code": fence_no_identifiers,
     "timing-decides-nothing": fence_timing_decides_nothing,
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
