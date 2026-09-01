@@ -17,7 +17,7 @@ import time
 import traceback
 from typing import Any
 
-from corpus.harness import Case, artifact_for, diff, ground_truth_census, model_for
+from corpus.harness import Case, diff, ground_truth_census, model_for, weights_for
 from cozy_runtime.internal import sandbox
 from cozy_runtime.internal.derive import ConstructionFault, HarnessGap, derive
 
@@ -43,7 +43,7 @@ def run(case: Case) -> dict[str, Any]:
         except Exception as exc:
             out["ground_truth_error"] = f"{type(exc).__name__}: {exc}"
 
-    artifact = artifact_for(case, truth) if truth is not None else _bare(case)
+    artifact = weights_for(case, truth) if truth is not None else _bare(case)
 
     # Torch defers a lot of its own import graph (`torch._dynamo` lands the first time an
     # in-place init runs). Warm it BEFORE the bounds, or the address-space cap turns a

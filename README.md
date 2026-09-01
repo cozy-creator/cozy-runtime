@@ -16,7 +16,7 @@ a new distribution major rather than ordinary user-package `v0` exact-selection 
 Runtime release `0.0.29` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 16 allows an authenticated external RecordOwner to make the existing bounded
-ArtifactSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
+WeightsSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
 WorkerControl stream without a second byte-plane listener.
 
 The distribution major is the Python compatibility major: compatible additions remain in the
@@ -230,7 +230,7 @@ no release digest, build timestamp, machine path or mutable binding reached it.
 An ordinary `@app.job` may opt into source-first model production without introducing another
 workflow language. `source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
 inferred `Model` parameter exactly; each profile is emitted on that model row, beside the class and
-component-use contract it prepares. Each `ArtifactOutput` may declare `topology_digest=` and a
+component-use contract it prepares. Each `WeightsOutput` may declare `topology_digest=` and a
 sorted `encodings=` tuple. Those exact requirements appear under the output's
 `required_contract`; Tensorhub derives both from the produced header before retention. The
 executor still receives only verified model capabilities, never the foreign source credential or
@@ -497,7 +497,7 @@ services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose p
 the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
 
-Model-producing jobs declare `ArtifactOutput` slots and request `ArtifactSink`. The sink accepts
+Model-producing jobs declare `WeightsOutput` slots and request `WeightsSink`. The sink accepts
 only exact typed `Model` inputs, locks the declaration/output bound, and streams produced values
 directly into TensorFS's real copy/create/derive transaction without a model-sized spool copy.
 An opened transaction may read exact source-part ranges into caller-owned contiguous writable

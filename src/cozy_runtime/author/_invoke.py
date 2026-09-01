@@ -32,7 +32,6 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._artifact import ArtifactCommit, ArtifactHostTransaction, ArtifactSink
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import MediaDecoder
@@ -72,6 +71,7 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
+from cozy_runtime.author._weights import WeightsCommit, WeightsHostTransaction, WeightsSink
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +116,8 @@ class Invocation:
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
-    artifacts: Callable[[ArtifactCommit], ArtifactHostTransaction] | None = None
-    """The Runtime/host artifact transaction. Author code receives only ArtifactSink."""
+    weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None
+    """The Runtime/host weights transaction. Author code receives only WeightsSink."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -643,12 +643,12 @@ def _service(
             return Checkpoints(attempt, inv.checkpoints)
         case "budget":
             return Budget(attempt, inv.budget)
-        case "artifacts":
-            return ArtifactSink(
+        case "weights":
+            return WeightsSink(
                 attempt,
                 inv.models,
-                {output.name: output.max_new_bytes for output in surface.artifact_outputs},
-                inv.artifacts,
+                {output.name: output.max_new_bytes for output in surface.weights_outputs},
+                inv.weights,
                 inv.cancel,
             )
         case "media_decode":

@@ -17,7 +17,6 @@ import inspect
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author._artifact import MAX_ARTIFACT_OUTPUTS
 from cozy_runtime.author._assets import asset_kinds
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
@@ -27,6 +26,7 @@ from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
 from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._walker import walk
+from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
 
 if TYPE_CHECKING:
     from cozy_runtime.author._app import App
@@ -105,45 +105,45 @@ def _separation(surface: Surface) -> None:
             "act on would grant a destination nothing can write (§2)",
             code="publication_declaration",
         )
-    artifact_names = [output.name for output in surface.artifact_outputs]
-    if len(artifact_names) > MAX_ARTIFACT_OUTPUTS:
+    weights_names = [output.name for output in surface.weights_outputs]
+    if len(weights_names) > MAX_WEIGHTS_OUTPUTS:
         raise ConformanceError(
-            f"{surface.name}: declares {len(artifact_names)} artifact outputs; "
-            f"the bound is {MAX_ARTIFACT_OUTPUTS}",
-            code="artifact_output_bound",
+            f"{surface.name}: declares {len(weights_names)} weights outputs; "
+            f"the bound is {MAX_WEIGHTS_OUTPUTS}",
+            code="weights_output_bound",
         )
-    if len(set(artifact_names)) != len(artifact_names):
+    if len(set(weights_names)) != len(weights_names):
         raise ConformanceError(
-            f"{surface.name}: artifact output names are not unique",
-            code="artifact_output_duplicate",
+            f"{surface.name}: weights output names are not unique",
+            code="weights_output_duplicate",
         )
-    if surface.artifact_outputs and "artifacts" not in surface.capabilities:
+    if surface.weights_outputs and "weights" not in surface.capabilities:
         raise ConformanceError(
-            f"{surface.name}: declares artifact outputs but its signature has no ArtifactSink",
-            code="artifact_sink_declaration",
+            f"{surface.name}: declares weights outputs but its signature has no WeightsSink",
+            code="weights_sink_declaration",
         )
-    if "artifacts" in surface.capabilities and not surface.artifact_outputs:
+    if "weights" in surface.capabilities and not surface.weights_outputs:
         raise ConformanceError(
-            f"{surface.name}: requests ArtifactSink but declares no artifact outputs",
-            code="artifact_sink_declaration",
+            f"{surface.name}: requests WeightsSink but declares no weights outputs",
+            code="weights_sink_declaration",
         )
-    if surface.artifact_outputs and ("save" in surface.capabilities or surface.publishes):
+    if surface.weights_outputs and ("save" in surface.capabilities or surface.publishes):
         raise ConformanceError(
-            f"{surface.name}: a model-artifact job cannot mix ArtifactSink with the retired "
+            f"{surface.name}: a weights-producing job cannot mix WeightsSink with the retired "
             "Outputs/publishes path",
-            code="mixed_artifact_outputs",
+            code="mixed_weights_outputs",
         )
-    if surface.artifact_outputs and not surface.model_bindings:
+    if surface.weights_outputs and not surface.model_bindings:
         raise ConformanceError(
-            f"{surface.name}: ArtifactSink derives from exact typed model inputs, but this job "
+            f"{surface.name}: WeightsSink derives from exact typed model inputs, but this job "
             "declares none",
-            code="artifact_source_absent",
+            code="weights_source_absent",
         )
-    if surface.source_profiles and not surface.artifact_outputs:
+    if surface.source_profiles and not surface.weights_outputs:
         raise ConformanceError(
-            f"{surface.name}: source_profiles prepare inputs for a model-artifact job, but "
-            "this job declares no ArtifactOutput",
-            code="source_profile_without_artifact",
+            f"{surface.name}: source_profiles prepare inputs for a weights-producing job, but "
+            "this job declares no WeightsOutput",
+            code="source_profile_without_weights",
         )
 
 

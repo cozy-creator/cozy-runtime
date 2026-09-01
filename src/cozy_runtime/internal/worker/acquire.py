@@ -340,7 +340,7 @@ class Acquirer:
         if planned is not None and planned != length:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                "artifact_length_conflict",
+                "weights_length_conflict",
                 f"{digest} is named at {length} B and planned at {planned} B",
             )
         already = target.exists()

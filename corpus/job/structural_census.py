@@ -152,7 +152,7 @@ def census(
     projection = {name: [[row["key"], row["shape"]] for row in done[name]] for name in sorted(done)}
     body = canonical_json.encode(projection)
     topology = canonical_json.digest(projection)
-    # DECLARED, not saved: the durable-save door is disabled while the ArtifactSink is
+    # DECLARED, not saved: the durable-save door is disabled while the WeightsSink is
     # unbuilt (#553a). The component trees under `scratch.checkpoint_dir` are what a
     # retried attempt of this run actually reads back, and they are written above.
     receipts.append(ckpt.declare("topology", body, operation_key="census/topology").declaration_id)

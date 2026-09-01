@@ -401,7 +401,7 @@ class Model[PipelineT]:
             if name in {"load", "unload", "for_request", "_cozy_scope"}:
                 raise CapabilityError(
                     f"{type(self).__name__}.{name}: this job Model is an exact Manifest "
-                    "capability for ArtifactSink derivation, not a loadable generation",
+                    "capability for WeightsSink derivation, not a loadable generation",
                     code="derive_model_read_only",
                     fields=[name],
                 )
