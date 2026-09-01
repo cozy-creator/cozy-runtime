@@ -976,10 +976,12 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
-        #: lane name -> its kernel thread id, recorded by the lane itself as it starts. An
-        #: observer judging this worker's PROGRESS by CPU reads the lanes that work and
-        #: leaves out the ones that tick on a clock (`pollers`).
-        self.lanes: dict[str, int] = {}
+        #: thread name -> its kernel thread id, recorded by each `_lane`-wrapped thread as
+        #: it starts (every device lane, convergence, report, watchdog, sender). An observer
+        #: judging this worker's PROGRESS by CPU reads the threads that work and leaves out
+        #: the ones that tick on a clock (`pollers`). Not the device lanes: those are
+        #: `self.lanes`, the resource the threads serve.
+        self.lane_threads: dict[str, int] = {}
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
         self.stop = threading.Event()
         self.weights = weights.WeightsExchange(
@@ -1733,7 +1735,7 @@ class Worker:
         """
 
         def guarded() -> None:
-            self.lanes[name] = threading.get_native_id()
+            self.lane_threads[name] = threading.get_native_id()
             try:
                 body(*args)
             except BaseException as exc:
@@ -1832,7 +1834,7 @@ class Worker:
         honest progress meter for an outside observer."""
         return {
             tid
-            for name, tid in self.lanes.items()
+            for name, tid in self.lane_threads.items()
             if name in ("report", "watchdog", "control-send")
         }
 

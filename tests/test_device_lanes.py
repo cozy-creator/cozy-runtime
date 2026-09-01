@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -242,13 +243,32 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
 def test_ceilings_are_measured_and_never_double_booked() -> None:
     """THE ASSIGNED CEILING. The driver's own number for the card that exists, UNREADABLE
     for the one that does not, and two executors authorized back to back on one lane can
-    never both be handed the same headroom."""
+    never both be handed the same headroom.
+
+    The reading is NVML in-process (xs-007 row 19); `nvidia-smi` is what an operator reads,
+    so the two are held to agree: NVML is the byte count and nvidia-smi its MiB rounding,
+    so free may differ by under one MiB and total not at all.
+    """
     kind = accel.host_backend_family()
     real = accel.device_memory("0", kind)
     if real.state != "measured":
         pytest.skip("no driver-readable device 0 on this host")
     assert 0 < real.free_bytes <= real.total_bytes
     assert accel.device_memory("1", kind).state == "unreadable"
+    projected = subprocess.run(
+        [
+            "nvidia-smi",
+            "--id=0",
+            "--query-gpu=memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    free_mib, total_mib = (int(part) for part in projected.split(","))
+    assert abs(real.free_bytes - free_mib * (1 << 20)) < (1 << 20), (real, projected)
+    assert real.total_bytes == total_mib * (1 << 20), (real, projected)
 
     lane = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
     first = lane.authorize("a", real.free_bytes)
