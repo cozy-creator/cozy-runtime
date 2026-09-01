@@ -3219,9 +3219,7 @@ class Worker:
         self.work.put(attempt)
 
     def await_settled(self, attempt: AttemptRecord) -> None:
-        """QUEUE behind a rebuild instead of refusing through one — for exactly as long as
-        the rebuild is MAKING PROGRESS (#434: caller deadline or observed stall, never a
-        wall-clock guess)."""
+        """QUEUE behind a rebuild until it settles or the attempt's own deadline expires."""
         if self.settled.is_set():
             return
         started = time.perf_counter()
@@ -3232,23 +3230,9 @@ class Worker:
             f"{key} reached the lane while the worker is rebuilding: waiting while the "
             "rebuild makes progress rather than refusing it",
         )
-        still = 0
-        position, burned = -1, -1
-        why = ""
+        why = "the attempt's own deadline expired while it queued"
         while not (settled := self.settled.wait(REBUILD_SAMPLE_SECONDS)):
             if deadline_ms and time.time() * 1000 > deadline_ms:
-                why = "the attempt's own deadline expired while it queued"
-                break
-            still += 1
-            (position, before_position) = (self.boot.ring.admitted, position)
-            (burned, before_burned) = (self.read_device_work(), burned)
-            if position > before_position >= 0 or burned > before_burned >= 0:
-                still = 0
-            if still >= observe.GIVE_UP_AFTER:
-                why = (
-                    f"{still} consecutive observations found the rebuild at ring position "
-                    f"{position} having burned {burned} ns: it is stalled, not slow"
-                )
                 break
         waited = (time.perf_counter() - started) * 1000
         self.note(

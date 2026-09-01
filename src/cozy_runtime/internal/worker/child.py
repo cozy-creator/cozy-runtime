@@ -39,7 +39,6 @@ from typing import Any
 from cozy_runtime.internal import accel, jit_cache, proctree, spawn
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 from cozy_runtime.internal.seam import Channel, SeamError, listener
-from cozy_runtime.internal.worker.observe import GIVE_UP_AFTER
 from cozy_runtime.internal.worker.plan import PreparedModel
 
 #: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
@@ -48,8 +47,8 @@ from cozy_runtime.internal.worker.plan import PreparedModel
 GRACE_SECONDS = 3.0
 
 #: How often the worker LOOKS while a spawned executor is dialling back. A sampling
-#: cadence, not a bound: `spawn` waits while the child is alive and burning CPU, and this
-#: only says how finely it can tell. Short because the answer is normally milliseconds away.
+#: cadence, not a bound: `spawn` waits while the child is alive, and this only says how
+#: promptly it observes either a connection or process death.
 DIAL_SAMPLE_SECONDS = 0.5
 
 #: A dialled-back child has already imported the executor and has no legitimate long work
@@ -63,31 +62,16 @@ RECLAIM_SECONDS = 10.0
 RECLAIM_SAMPLE_SECONDS = 0.25
 
 
+def work(pid: int) -> int:
+    """Monotone CPU and storage work observed for one process, or -1 if unreadable."""
+    return proctree.progress_burn(pid)
+
+
 #: `sockaddr_un.sun_path` is 108 bytes on Linux, NUL included. A COZY_HOME deep enough to
 #: pass it makes the executor's control socket unbindable, and the only symptom was a worker
 #: that exited before advertising a plan (cl-013). The cause is measurable here, so it is
 #: named here.
 SUN_PATH_MAX = 108
-
-
-def work(pid: int) -> int:
-    """How much WORK a process has done, read from `/proc` by whoever is watching it.
-
-    THE PROGRESS METER, and the only thing that separates a slow subject from a wedged one
-    (cr-011). Two monotone counters summed: CPU nanoseconds burned, and bytes actually
-    fetched from storage. Summing is exactly "either one moved", because neither ever
-    falls — and both hands are needed, because the two ways to be busy and silent are to
-    compute (a hash-bound conversion leg) and to wait on the disk (a cold-page-cache import
-    of a multi-gigabyte extension). A meter with only the first hand kills the second.
-
-    THIS PROCESS, threads included, and its unreaped children excluded — which is the right
-    reading because the trampoline EXECS the executor, so the pid that is watched is the pid
-    that does the work, and torch's own parallelism is threads.
-
-    -1 is UNREADABLE, never a zero — an unreadable meter decides nothing, so it neither
-    rescues a subject nor condemns it.
-    """
-    return proctree.progress_burn(pid)
 
 
 def socket_path_refusal(path: str) -> str:
@@ -599,13 +583,10 @@ class ExecutorSupervision:
         """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
         has no state, so every incarnation bump implies a readiness bump.
 
-        THE DIAL-BACK IS WAITED OUT BY OBSERVATION, not by a clock. It used to be
-        `DIAL_SECONDS = 60.0`, which got both ends wrong at once: a child that died on its
-        first import still cost a full minute of silence before anyone said so, and a child
-        still legitimately importing on a cold page cache past the minute was killed for it.
-        The two facts that decide are the child's own: it is GONE (nothing will ever dial
-        back — say so now), or it is alive and BURNING CPU (it is working, wait). Alive and
-        burning nothing across `GIVE_UP_AFTER` samples is a stall, and gets a named refusal.
+        THE DIAL-BACK IS WAITED OUT BY OBSERVATION, not by a clock. A child that exits can
+        never dial back, so that observed death refuses immediately. A live child keeps its
+        chance to connect: CPU, I/O and scheduler counters do not prove that a valid import
+        is stuck, and no arbitrary number of unchanged samples is allowed to kill it.
         """
         with self._lifecycle:
             if self._closed:
@@ -879,7 +860,6 @@ class ExecutorSupervision:
         assert self._listener is not None
         pid = process.pid
         self._listener.settimeout(DIAL_SAMPLE_SECONDS)
-        still, burned = 0, -1
         while True:
             try:
                 conn, _ = self._listener.accept()
@@ -892,16 +872,6 @@ class ExecutorSupervision:
                 # minute not saying so — the reason is knowable the moment the child exits.
                 raise ExecutorGone(
                     f"incarnation {self.incarnation} (pid {pid}) exited before dialling back",
-                )
-            still += 1
-            burned, before = work(pid), burned
-            if burned > before >= 0:
-                still = 0  # importing, and an import on a cold page cache takes what it takes
-            if still >= GIVE_UP_AFTER:
-                raise ExecutorGone(
-                    f"incarnation {self.incarnation} (pid {pid}) is alive and has burned no "
-                    f"CPU across {still} observations while owing a dial-back: it is stalled, "
-                    "not slow"
                 )
 
     def invalidate(self, expected: Executor, why: str) -> bool:
