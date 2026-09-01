@@ -58,7 +58,7 @@ from cozy_runtime.internal.worker.plan import (
     PreparedRequest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import artifact_limits, documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
@@ -108,9 +108,9 @@ def artifact_exchange_bytes(
 ) -> bytes:
     """Read one worker-chosen immutable spool file; the child never supplies a path."""
     cap = (
-        artifact_limits.MAX_ARTIFACT_DECLARATION_BYTES
+        weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
         if kind == "declaration"
-        else artifact_limits.MAX_ARTIFACT_RECEIPT_BYTES
+        else weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
     )
     if not 0 < expected_length <= cap:
         raise ValueError(f"artifact {kind} length is outside 1..={cap}")
@@ -305,7 +305,7 @@ class AttemptRecord:
     #: cr-009's typed publication record, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: Host-ACKed ArtifactReceipt/1 refs, one per descriptor-declared output slot.
-    artifact_receipts: dict[str, pb.ArtifactReceiptRef] = dataclasses_field(default_factory=dict)
+    weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -363,7 +363,7 @@ class AttemptRecord:
         self.caps = {}
         self.residency = {}
         self.publication = {}
-        self.artifact_receipts = {}
+        self.weights_receipts = {}
         self.job_models = {}
         self.model_leases = []
 
@@ -1393,7 +1393,7 @@ class AttemptEngine:
             }
         try:
             output_slot = str(frame.get("output_slot", ""))
-            if kind == "artifact_intent":
+            if kind == "weights_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
                 raw = artifact_exchange_bytes(attempt.spool, output_slot, "declaration", length)
                 return self.artifacts.intent(
@@ -1405,14 +1405,14 @@ class AttemptEngine:
                     declaration=raw,
                     requested_writer_generation=int(frame.get("requested_writer_generation", 0)),
                 )
-            if kind == "artifact_receipt":
+            if kind == "weights_receipt":
                 length = int(frame.get("artifact_receipt_length", 0))
                 raw = artifact_exchange_bytes(attempt.spool, output_slot, "receipt", length)
                 return self.artifacts.receipt(
                     attempt,
                     output_slot=output_slot,
-                    transaction_id=str(frame.get("artifact_transaction_id", "")),
-                    receipt_digest=documents.raw(str(frame.get("artifact_receipt_digest", ""))),
+                    transaction_id=str(frame.get("weights_transaction_id", "")),
+                    receipt_digest=documents.raw(str(frame.get("weights_receipt_digest", ""))),
                     canonical_receipt=raw,
                 )
             return {
@@ -2100,8 +2100,8 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
-        for output_slot in sorted(attempt.artifact_receipts):
-            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
+        for output_slot in sorted(attempt.weights_receipts):
+            body.weights_receipts.append(attempt.weights_receipts[output_slot])
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)
         if receipt is not None:
             body.triage_bundle.CopyFrom(
@@ -2500,8 +2500,8 @@ class AttemptEngine:
             ),
             execution_started=attempt.executions > 0,
         )
-        for output_slot in sorted(attempt.artifact_receipts):
-            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
+        for output_slot in sorted(attempt.weights_receipts):
+            body.weights_receipts.append(attempt.weights_receipts[output_slot])
         canonical_bytes, digest = documents.identity(body)
         attempt.outcome_id = f"out-{uuid.uuid4().hex[:24]}"
         attempt.outcome_digest = digest

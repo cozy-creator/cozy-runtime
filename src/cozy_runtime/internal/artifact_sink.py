@@ -32,7 +32,7 @@ from cozy_runtime.author._artifact import (
     Readable,
 )
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.protocol import artifact_limits, documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
@@ -45,7 +45,7 @@ class ArtifactHostBinding:
 
     transaction_id: str
     writer_generation: int
-    artifact_receipt_digest: bytes = b""
+    weights_receipt_digest: bytes = b""
 
 
 def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
@@ -168,8 +168,8 @@ class ArtifactTransactionHost:
                 request_id=self.request_id,
                 invocation_spec_digest=self.invocation_spec_digest,
             )
-            if binding.artifact_receipt_digest:
-                if binding.artifact_receipt_digest != protocol_digest:
+            if binding.weights_receipt_digest:
+                if binding.weights_receipt_digest != protocol_digest:
                     raise CapabilityError(
                         "the artifact host replayed another receipt digest",
                         code="artifact_receipt_mismatch",
@@ -185,7 +185,7 @@ class ArtifactTransactionHost:
                 writer=None,
                 receipt=receipt,
             )
-        if binding.artifact_receipt_digest:
+        if binding.weights_receipt_digest:
             raise CapabilityError(
                 "the artifact host replayed a receipt absent from local TensorFS",
                 code="artifact_receipt_mismatch",
@@ -358,7 +358,7 @@ class ArtifactTransactionHost:
         evidence = value.get("checkpoint_evidence_canonical_bytes")
         if (
             not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= artifact_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
+            or not 0 < len(evidence) <= weights_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
         ):
             raise CapabilityError(
                 "TensorFS receipt carries no bounded CheckpointEvidence",
@@ -503,23 +503,23 @@ def protocol_receipt(
     owner_scope: str,
     request_id: str,
     invocation_spec_digest: str,
-) -> tuple[pb.ArtifactReceiptRef, bytes, bytes]:
+) -> tuple[pb.WeightsReceiptRef, bytes, bytes]:
     """Wrap exact TensorFS receipt bytes in Worker Protocol ArtifactReceipt/1."""
-    body = pb.ArtifactReceipt(
+    body = pb.WeightsReceipt(
         owner_authority_scope=owner_scope,
         request_id=request_id,
         invocation_spec_digest=invocation_spec_digest,
         output_slot=receipt.output_slot,
-        artifact_transaction_id=receipt.artifact_transaction_id,
+        weights_transaction_id=receipt.artifact_transaction_id,
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
         checkpoint_evidence_canonical_bytes=receipt.checkpoint_evidence_canonical_bytes,
     )
     canonical_bytes, digest = documents.identity(body)
     return (
-        pb.ArtifactReceiptRef(
-            artifact_receipt_digest=digest,
-            artifact_receipt_canonical_bytes=canonical_bytes,
+        pb.WeightsReceiptRef(
+            weights_receipt_digest=digest,
+            weights_receipt_canonical_bytes=canonical_bytes,
         ),
         canonical_bytes,
         digest,

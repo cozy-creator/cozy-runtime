@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import fill, pull
-from cozy_runtime.protocol import artifact_limits, documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -35,15 +35,15 @@ class ArtifactExchangeError(Exception):
 class _Pending:
     frame: pb.WorkerFrame
     event: threading.Event
-    ack: pb.ArtifactHostAck | None = None
+    ack: pb.WeightsHostAck | None = None
 
 
 @dataclass(slots=True)
 class _Held:
     transaction_id: str
     writer_generation: int
-    receipt: pb.ArtifactReceiptRef
-    objects: dict[str, pb.ArtifactObjectSource]
+    receipt: pb.WeightsReceiptRef
+    objects: dict[str, pb.WeightsObjectSource]
     manifest_id: str
     manifest_bytes: bytes
     manifest: pb.Ref
@@ -93,14 +93,14 @@ class ArtifactExchange:
         if (
             len(declaration_digest) != 32
             or not declaration
-            or len(declaration) > artifact_limits.MAX_ARTIFACT_DECLARATION_BYTES
+            or len(declaration) > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
             or hashlib.sha256(declaration).digest() != declaration_digest
         ):
             raise ArtifactExchangeError(
                 "artifact_declaration_invalid", "declaration bytes or digest are invalid"
             )
         frame = pb.WorkerFrame(
-            artifact_intent=pb.ArtifactIntentFrame(
+            weights_intent=pb.WeightsIntentFrame(
                 request_id=attempt.request_id,
                 attempt_ordinal=attempt.attempt,
                 invocation_spec_digest=attempt.digest,
@@ -115,19 +115,19 @@ class ArtifactExchange:
                 attempt.request_id,
                 attempt.attempt,
                 output_slot,
-                pb.ARTIFACT_HOST_STAGE_INTENT,
+                pb.WEIGHTS_HOST_STAGE_INTENT,
             ),
             frame,
             canceled=lambda: bool(attempt.canceling),
         )
-        self._validate_ack(ack, frame.artifact_intent, pb.ARTIFACT_HOST_STAGE_INTENT)
-        if ack.outcome == pb.ARTIFACT_HOST_OUTCOME_REFUSED:
+        self._validate_ack(ack, frame.weights_intent, pb.WEIGHTS_HOST_STAGE_INTENT)
+        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
             raise ArtifactExchangeError(
-                pb.ArtifactHostRefusal.Name(ack.refusal).lower(), "the artifact host refused intent"
+                pb.WeightsHostRefusal.Name(ack.refusal).lower(), "the artifact host refused intent"
             )
         with self._lock:
             known = self._bindings.setdefault(
-                ack.artifact_transaction_id,
+                ack.weights_transaction_id,
                 (ack.writer_generation, declaration_digest),
             )
         if known != (ack.writer_generation, declaration_digest):
@@ -135,38 +135,38 @@ class ArtifactExchange:
                 "artifact_host_ack_mismatch", "transaction binding changed within one Runtime"
             )
         receipt_digest = b""
-        if ack.HasField("artifact_receipt"):
-            receipt_digest = self._receipt_ref(ack.artifact_receipt)
+        if ack.HasField("weights_receipt"):
+            receipt_digest = self._receipt_ref(ack.weights_receipt)
             receipt_value = documents.read(
-                ack.artifact_receipt.artifact_receipt_canonical_bytes,
-                pb.ArtifactReceipt,
+                ack.weights_receipt.weights_receipt_canonical_bytes,
+                pb.WeightsReceipt,
             )
             if (
                 receipt_value.get("request_id") != attempt.request_id
                 or receipt_value.get("owner_authority_scope") != self.owner_scope()
                 or receipt_value.get("invocation_spec_digest") != documents.spell(attempt.digest)
                 or receipt_value.get("output_slot") != output_slot
-                or receipt_value.get("artifact_transaction_id") != ack.artifact_transaction_id
+                or receipt_value.get("weights_transaction_id") != ack.weights_transaction_id
             ):
                 raise ArtifactExchangeError(
                     "artifact_receipt_identity_mismatch",
                     "replayed receipt does not bind this attempt/output",
                 )
             held = self._hold(
-                ack.artifact_transaction_id,
+                ack.weights_transaction_id,
                 ack.writer_generation,
-                ack.artifact_receipt,
+                ack.weights_receipt,
             )
             if ack.manifest != held.manifest:
                 raise ArtifactExchangeError(
                     "artifact_manifest_mismatch", "host replayed another produced Manifest"
                 )
-            attempt.artifact_receipts[output_slot] = held.receipt
+            attempt.weights_receipts[output_slot] = held.receipt
         return {
             "ok": True,
-            "artifact_transaction_id": ack.artifact_transaction_id,
+            "weights_transaction_id": ack.weights_transaction_id,
             "writer_generation": ack.writer_generation,
-            "artifact_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
+            "weights_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
         }
 
     def receipt(
@@ -181,38 +181,38 @@ class ArtifactExchange:
         if (
             len(receipt_digest) != 32
             or not canonical_receipt
-            or len(canonical_receipt) > artifact_limits.MAX_ARTIFACT_RECEIPT_BYTES
+            or len(canonical_receipt) > weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
             or hashlib.sha256(canonical_receipt).digest() != receipt_digest
         ):
             raise ArtifactExchangeError(
                 "artifact_receipt_invalid", "receipt bytes or digest are invalid"
             )
-        reference = pb.ArtifactReceiptRef(
-            artifact_receipt_digest=receipt_digest,
-            artifact_receipt_canonical_bytes=canonical_receipt,
+        reference = pb.WeightsReceiptRef(
+            weights_receipt_digest=receipt_digest,
+            weights_receipt_canonical_bytes=canonical_receipt,
         )
-        receipt = documents.read(canonical_receipt, pb.ArtifactReceipt)
+        receipt = documents.read(canonical_receipt, pb.WeightsReceipt)
         if (
             receipt.get("request_id") != attempt.request_id
             or receipt.get("owner_authority_scope") != self.owner_scope()
             or receipt.get("invocation_spec_digest") != documents.spell(attempt.digest)
             or receipt.get("output_slot") != output_slot
-            or receipt.get("artifact_transaction_id") != transaction_id
+            or receipt.get("weights_transaction_id") != transaction_id
         ):
             raise ArtifactExchangeError(
                 "artifact_receipt_identity_mismatch", "receipt does not bind this attempt/output"
             )
         held = self._hold(transaction_id, self._writer_generation(transaction_id), reference)
         frame = pb.WorkerFrame(
-            artifact_receipt=pb.ArtifactReceiptFrame(
+            weights_receipt=pb.WeightsReceiptFrame(
                 request_id=attempt.request_id,
                 attempt_ordinal=attempt.attempt,
                 invocation_spec_digest=attempt.digest,
                 output_slot=output_slot,
-                artifact_transaction_id=transaction_id,
+                weights_transaction_id=transaction_id,
                 writer_generation=held.writer_generation,
                 tensorfs_declaration_digest=self._declaration_digest(transaction_id),
-                artifact_receipt=reference,
+                weights_receipt=reference,
                 objects=[held.objects[key] for key in sorted(held.objects)],
                 manifest=held.manifest,
             )
@@ -222,21 +222,21 @@ class ArtifactExchange:
                 attempt.request_id,
                 attempt.attempt,
                 output_slot,
-                pb.ARTIFACT_HOST_STAGE_RECEIPT,
+                pb.WEIGHTS_HOST_STAGE_RECEIPT,
             ),
             frame,
             canceled=lambda: bool(attempt.canceling),
         )
-        self._validate_ack(ack, frame.artifact_receipt, pb.ARTIFACT_HOST_STAGE_RECEIPT)
-        if ack.outcome == pb.ARTIFACT_HOST_OUTCOME_REFUSED:
+        self._validate_ack(ack, frame.weights_receipt, pb.WEIGHTS_HOST_STAGE_RECEIPT)
+        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
             self._drop(transaction_id)
             raise ArtifactExchangeError(
-                pb.ArtifactHostRefusal.Name(ack.refusal).lower(),
+                pb.WeightsHostRefusal.Name(ack.refusal).lower(),
                 "the artifact host refused receipt",
             )
         if (
-            not ack.HasField("artifact_receipt")
-            or self._receipt_ref(ack.artifact_receipt) != receipt_digest
+            not ack.HasField("weights_receipt")
+            or self._receipt_ref(ack.weights_receipt) != receipt_digest
         ):
             self._drop(transaction_id)
             raise ArtifactExchangeError(
@@ -247,13 +247,13 @@ class ArtifactExchange:
             raise ArtifactExchangeError(
                 "artifact_manifest_mismatch", "receipt ACK did not echo produced Manifest"
             )
-        attempt.artifact_receipts[output_slot] = reference
+        attempt.weights_receipts[output_slot] = reference
         return {
             "ok": True,
-            "artifact_receipt_digest": documents.spell(receipt_digest),
+            "weights_receipt_digest": documents.spell(receipt_digest),
         }
 
-    def absorb_ack(self, ack: pb.ArtifactHostAck) -> None:
+    def absorb_ack(self, ack: pb.WeightsHostAck) -> None:
         key = self._key(ack.request_id, ack.attempt_ordinal, ack.output_slot, ack.stage)
         with self._lock:
             pending = self._pending.get(key)
@@ -277,41 +277,41 @@ class ArtifactExchange:
         for transaction in held:
             transaction.lease.release()
 
-    def read(self, request: pb.ArtifactReadRequest) -> pb.WorkerFrame:
-        refusal = pb.ARTIFACT_READ_REFUSAL_UNSPECIFIED
+    def read(self, request: pb.WeightsReadRequest) -> pb.WorkerFrame:
+        refusal = pb.WEIGHTS_READ_REFUSAL_UNSPECIFIED
         detail = ""
         data = b""
         with self._lock:
-            held = self._held.get(request.artifact_transaction_id)
+            held = self._held.get(request.weights_transaction_id)
         row = held.objects.get(request.object_id) if held is not None else None
         if held is None:
             refusal, detail = (
-                pb.ARTIFACT_READ_REFUSAL_UNKNOWN_TRANSACTION,
+                pb.WEIGHTS_READ_REFUSAL_UNKNOWN_TRANSACTION,
                 "artifact transaction is not held by this Runtime",
             )
         elif request.writer_generation != held.writer_generation:
             refusal, detail = (
-                pb.ARTIFACT_READ_REFUSAL_STALE_WRITER,
+                pb.WEIGHTS_READ_REFUSAL_STALE_WRITER,
                 "writer generation is stale",
             )
         elif row is None:
             refusal, detail = (
-                pb.ARTIFACT_READ_REFUSAL_UNKNOWN_OBJECT,
+                pb.WEIGHTS_READ_REFUSAL_UNKNOWN_OBJECT,
                 "object is outside the exact receipt inventory",
             )
         elif request.source_ref != row.source_ref:
             refusal, detail = (
-                pb.ARTIFACT_READ_REFUSAL_SOURCE_REF_MISMATCH,
+                pb.WEIGHTS_READ_REFUSAL_SOURCE_REF_MISMATCH,
                 "source reference does not bind this object",
             )
         elif (
             request.max_bytes <= 0
-            or request.max_bytes > artifact_limits.MAX_ARTIFACT_READ_BYTES
+            or request.max_bytes > weights_limits.MAX_WEIGHTS_READ_BYTES
             or request.offset >= row.length
             or request.offset + request.max_bytes > row.length
         ):
             refusal, detail = (
-                pb.ARTIFACT_READ_REFUSAL_RANGE_INVALID,
+                pb.WEIGHTS_READ_REFUSAL_RANGE_INVALID,
                 "requested range is outside the exact object length",
             )
         else:
@@ -330,11 +330,11 @@ class ArtifactExchange:
                     data = bytes(target)
             except Exception as exc:
                 refusal, detail = (
-                    pb.ARTIFACT_READ_REFUSAL_SOURCE_UNAVAILABLE,
+                    pb.WEIGHTS_READ_REFUSAL_SOURCE_UNAVAILABLE,
                     f"TensorFS source read refused: {type(exc).__name__}",
                 )
-        result = pb.ArtifactReadResult(
-            artifact_transaction_id=request.artifact_transaction_id,
+        result = pb.WeightsReadResult(
+            weights_transaction_id=request.weights_transaction_id,
             writer_generation=request.writer_generation,
             object_id=request.object_id,
             source_ref=request.source_ref,
@@ -342,14 +342,14 @@ class ArtifactExchange:
             offset=request.offset,
         )
         if refusal:
-            result.outcome = pb.ARTIFACT_READ_OUTCOME_REFUSED
+            result.outcome = pb.WEIGHTS_READ_OUTCOME_REFUSED
             result.refusal = refusal
             result.safe_detail = detail[:4096]
         else:
-            result.outcome = pb.ARTIFACT_READ_OUTCOME_DATA
+            result.outcome = pb.WEIGHTS_READ_OUTCOME_DATA
             result.data = data
             result.data_digest = hashlib.sha256(data).digest()
-        return pb.WorkerFrame(artifact_read_result=result)
+        return pb.WorkerFrame(weights_read_result=result)
 
     def _exchange(
         self,
@@ -357,7 +357,7 @@ class ArtifactExchange:
         frame: pb.WorkerFrame,
         *,
         canceled: Callable[[], bool],
-    ) -> pb.ArtifactHostAck:
+    ) -> pb.WeightsHostAck:
         pending = _Pending(frame=frame, event=threading.Event())
         with self._lock:
             existing = self._pending.get(key)
@@ -380,7 +380,7 @@ class ArtifactExchange:
                 self._pending.pop(key, None)
 
     @staticmethod
-    def _validate_ack(ack: pb.ArtifactHostAck, sent: Any, stage: int) -> None:
+    def _validate_ack(ack: pb.WeightsHostAck, sent: Any, stage: int) -> None:
         if (
             ack.request_id != sent.request_id
             or ack.attempt_ordinal != sent.attempt_ordinal
@@ -390,68 +390,68 @@ class ArtifactExchange:
             or ack.tensorfs_declaration_digest != sent.tensorfs_declaration_digest
             or ack.outcome
             not in (
-                pb.ARTIFACT_HOST_OUTCOME_RECORDED,
-                pb.ARTIFACT_HOST_OUTCOME_REPLAYED,
-                pb.ARTIFACT_HOST_OUTCOME_REFUSED,
+                pb.WEIGHTS_HOST_OUTCOME_RECORDED,
+                pb.WEIGHTS_HOST_OUTCOME_REPLAYED,
+                pb.WEIGHTS_HOST_OUTCOME_REFUSED,
             )
         ):
             raise ArtifactExchangeError(
                 "artifact_host_ack_mismatch", "host ACK does not echo the exact exchange"
             )
-        if ack.outcome == pb.ARTIFACT_HOST_OUTCOME_REFUSED:
+        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
             if (
                 not ack.refusal
-                or ack.artifact_transaction_id
+                or ack.weights_transaction_id
                 or ack.writer_generation
-                or ack.HasField("artifact_receipt")
+                or ack.HasField("weights_receipt")
                 or ack.HasField("manifest")
             ):
                 raise ArtifactExchangeError(
                     "artifact_host_ack_invalid", "refusal carries transaction authority"
                 )
-        elif ack.refusal or not ack.artifact_transaction_id or ack.writer_generation <= 0:
+        elif ack.refusal or not ack.weights_transaction_id or ack.writer_generation <= 0:
             raise ArtifactExchangeError(
                 "artifact_host_ack_invalid", "recorded ACK lacks transaction authority"
             )
-        if ack.HasField("artifact_receipt") != ack.HasField("manifest"):
+        if ack.HasField("weights_receipt") != ack.HasField("manifest"):
             raise ArtifactExchangeError(
                 "artifact_host_ack_invalid", "receipt and produced Manifest appear together"
             )
-        if stage == pb.ARTIFACT_HOST_STAGE_RECEIPT:
+        if stage == pb.WEIGHTS_HOST_STAGE_RECEIPT:
             if (
-                ack.artifact_transaction_id != sent.artifact_transaction_id
+                ack.weights_transaction_id != sent.weights_transaction_id
                 or ack.writer_generation != sent.writer_generation
-                or not ack.HasField("artifact_receipt")
+                or not ack.HasField("weights_receipt")
                 or ack.manifest != sent.manifest
             ):
                 raise ArtifactExchangeError(
                     "artifact_host_ack_mismatch", "receipt ACK changed transaction identity"
                 )
-        elif ack.HasField("artifact_receipt") and ack.outcome != pb.ARTIFACT_HOST_OUTCOME_REPLAYED:
+        elif ack.HasField("weights_receipt") and ack.outcome != pb.WEIGHTS_HOST_OUTCOME_REPLAYED:
             raise ArtifactExchangeError(
                 "artifact_host_ack_invalid", "a newly recorded intent cannot carry a receipt"
             )
 
     @staticmethod
-    def _receipt_ref(reference: pb.ArtifactReceiptRef) -> bytes:
-        raw = reference.artifact_receipt_canonical_bytes
+    def _receipt_ref(reference: pb.WeightsReceiptRef) -> bytes:
+        raw = reference.weights_receipt_canonical_bytes
         digest = hashlib.sha256(raw).digest()
         if (
             not raw
-            or len(raw) > artifact_limits.MAX_ARTIFACT_RECEIPT_BYTES
-            or digest != reference.artifact_receipt_digest
+            or len(raw) > weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
+            or digest != reference.weights_receipt_digest
         ):
             raise ArtifactExchangeError(
                 "artifact_receipt_invalid", "receipt ref digest does not match exact bytes"
             )
-        documents.read(raw, pb.ArtifactReceipt)
+        documents.read(raw, pb.WeightsReceipt)
         return digest
 
     def _hold(
         self,
         transaction_id: str,
         writer_generation: int,
-        reference: pb.ArtifactReceiptRef,
+        reference: pb.WeightsReceiptRef,
     ) -> _Held:
         store = self._store()
         with self._lock:
@@ -462,8 +462,8 @@ class ArtifactExchange:
                     "artifact_receipt_mismatch", "held transaction carries another receipt"
                 )
             return existing
-        value = documents.read(reference.artifact_receipt_canonical_bytes, pb.ArtifactReceipt)
-        if value.get("artifact_transaction_id") != transaction_id:
+        value = documents.read(reference.weights_receipt_canonical_bytes, pb.WeightsReceipt)
+        if value.get("weights_transaction_id") != transaction_id:
             raise ArtifactExchangeError(
                 "artifact_receipt_identity_mismatch", "receipt names another transaction"
             )
@@ -493,8 +493,8 @@ class ArtifactExchange:
             raise ArtifactExchangeError(
                 "artifact_manifest_mismatch", "TensorFS manifest bytes do not match its ObjectRef"
             )
-        rows: dict[str, pb.ArtifactObjectSource] = {
-            manifest_id: pb.ArtifactObjectSource(
+        rows: dict[str, pb.WeightsObjectSource] = {
+            manifest_id: pb.WeightsObjectSource(
                 object_id=manifest_id,
                 length=manifest_length,
                 source_ref=f"tensorfs-manifest:{manifest_id}",
@@ -508,18 +508,18 @@ class ArtifactExchange:
                 raise ArtifactExchangeError(
                     "artifact_object_conflict", "one object id carries two lengths"
                 )
-            rows[object_id] = pb.ArtifactObjectSource(
+            rows[object_id] = pb.WeightsObjectSource(
                 object_id=object_id,
                 length=length,
                 source_ref=f"tensorfs-object:{object_id}",
             )
             blobs.append((object_id, length))
-        if not rows or len(rows) > artifact_limits.MAX_ARTIFACT_OBJECTS:
+        if not rows or len(rows) > weights_limits.MAX_WEIGHTS_OBJECTS:
             raise ArtifactExchangeError(
                 "artifact_inventory_bound", "artifact object count is outside protocol bounds"
             )
         encoded = sum(row.ByteSize() for row in rows.values())
-        if encoded > artifact_limits.MAX_ARTIFACT_INVENTORY_BYTES:
+        if encoded > weights_limits.MAX_WEIGHTS_INVENTORY_BYTES:
             raise ArtifactExchangeError(
                 "artifact_inventory_bound", "artifact object inventory is over its byte cap"
             )

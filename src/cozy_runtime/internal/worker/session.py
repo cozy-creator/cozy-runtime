@@ -1988,12 +1988,12 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
-        elif kind == "artifact_host_ack":
+        elif kind == "weights_host_ack":
             try:
                 self.artifacts.absorb_ack(inner)
             except artifacts.ArtifactExchangeError as exc:
                 self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
-        elif kind == "artifact_read_request":
+        elif kind == "weights_read_request":
             self.send(self.artifacts.read(inner))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:

@@ -1472,7 +1472,7 @@ class Executor:
             ) -> artifact_sink.ArtifactHostBinding:
                 artifact_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
                 answer = self._durable(
-                    "artifact_intent",
+                    "weights_intent",
                     {
                         "output_slot": output_slot,
                         "tensorfs_declaration_digest": documents.spell(declaration_digest),
@@ -1485,11 +1485,11 @@ class Executor:
                         str(answer.get("detail", "the artifact host refused intent")),
                         code=str(answer.get("code", "artifact_host_refused")),
                     )
-                receipt_digest = str(answer.get("artifact_receipt_digest", ""))
+                receipt_digest = str(answer.get("weights_receipt_digest", ""))
                 return artifact_sink.ArtifactHostBinding(
-                    transaction_id=str(answer.get("artifact_transaction_id", "")),
+                    transaction_id=str(answer.get("weights_transaction_id", "")),
                     writer_generation=int(answer.get("writer_generation", 0)),
-                    artifact_receipt_digest=(
+                    weights_receipt_digest=(
                         documents.raw(receipt_digest) if receipt_digest else b""
                     ),
                 )
@@ -1505,15 +1505,15 @@ class Executor:
                     spool, receipt.output_slot, "receipt", canonical_receipt
                 )
                 answer = self._durable(
-                    "artifact_receipt",
+                    "weights_receipt",
                     {
                         "output_slot": receipt.output_slot,
-                        "artifact_transaction_id": receipt.artifact_transaction_id,
-                        "artifact_receipt_digest": documents.spell(receipt_digest),
+                        "weights_transaction_id": receipt.artifact_transaction_id,
+                        "weights_receipt_digest": documents.spell(receipt_digest),
                         "artifact_receipt_length": len(canonical_receipt),
                     },
                 )
-                if not answer.get("ok") or answer.get("artifact_receipt_digest") != documents.spell(
+                if not answer.get("ok") or answer.get("weights_receipt_digest") != documents.spell(
                     receipt_digest
                 ):
                     raise CapabilityError(
