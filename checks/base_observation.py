@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
 from cozy_runtime.internal import base_observation
+from cozy_runtime.internal.worker import package_prepare
 
 
 def expect_torch_refusal(metadata: str, imported: str, cuda: str | None) -> None:
@@ -30,6 +32,14 @@ def main() -> None:
     assert "python-stdlib" in observed.root_providers["json"]
     assert "cozy-runtime" in observed.root_providers["cozy_runtime"]
     assert "msgspec" in observed.root_providers["msgspec"]
+
+    planted = dataclasses.replace(
+        observed,
+        distributions=(*observed.distributions, ("cozy-weightless-package", "1.0.4")),
+    )
+    filtered = package_prepare._without_installed_project(planted, "cozy-weightless-package")
+    assert "cozy-weightless-package" not in filtered.distribution_versions
+    assert package_prepare._without_installed_project(observed, "cozy-runtime") is observed
 
     # Exact official Torch spellings exercised by Cozy's CPU wheel and CUDA base image.
     assert base_observation._torch_identity("2.13.0+cpu", "2.13.0+cpu", None) == (
