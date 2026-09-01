@@ -1509,8 +1509,7 @@ class Worker:
                 (self.accepted.mode == "job" and self.job_ready)
                 or (
                     self.placement is not None
-                    and self.placement.serving
-                    == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                    and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
                 )
             )
             if not self.supervision.invalidate(
