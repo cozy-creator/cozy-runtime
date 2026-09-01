@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import canonical, hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 
@@ -393,4 +393,87 @@ def bindings(opts: Options) -> Result:
         lines=()
         if records
         else ("note: this project declares no model binding — nothing to resolve",),
+    )
+
+
+#: The float output dtypes a device probe qualifies against. Every producer-mined case the
+#: vendored vector documents carry is at one of these, so a narrower set would report a
+#: route unqualified for a dtype nothing measured rather than for one nothing serves.
+_PROBE_DTYPES = ("bfloat16", "float16", "float32")
+
+
+def capability(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
+    """`cozy-runtime capability` — the OBSERVED (encoding, device) qualification of THIS card.
+
+    The runtime is the only component holding the device, so it is the only one that may say
+    what a card is qualified to execute. TensorFS owns the admission RULE and consumes this
+    document through `tfs capability --records`; Tensorhub joins on the answer. Nothing here
+    crosses the worker wire — this is an artifact, produced once per (card, runtime build).
+
+    `--out` writes the EXACT canonical bytes TensorFS parses. Stdout is for people: the
+    `--json` renderer appends a newline, and a canonical document with a trailing byte is
+    not the canonical encoding of its own content.
+    """
+    from cozy_runtime import __version__
+    from cozy_runtime.internal.encoding import launch_providers, measure_device
+    from cozy_runtime.internal.probe import observed_capability_records, qualify
+
+    out = ""
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag != "--out" or not rest:
+            raise CliError(
+                "usage",
+                f"capability received invalid argument {flag!r}",
+                "cozy-runtime [--json] capability [--out <path>] — it probes this host's "
+                "device and takes no other argument",
+                Exit.usage,
+            )
+        out = rest.pop(0)
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise CliError(
+            "structural",
+            "capability needs torch to run the qualification suite",
+            "install the accelerator extra: this verb MEASURES a device and cannot infer one",
+            Exit.structural,
+        ) from exc
+
+    device = measure_device(torch)
+    try:
+        _, result = qualify(torch, launch_providers(), device, _PROBE_DTYPES, release=__version__)
+    except Exception as exc:
+        raise CliError(
+            "structural",
+            f"the qualification suite did not complete: {type(exc).__name__}: {exc}",
+            "an unqualified device reports NOTHING rather than a partial table; repair the "
+            "backend or run this on the card you mean to qualify",
+            Exit.structural,
+        ) from exc
+    document = observed_capability_records(result)
+    raw = canonical.write(document)
+    if out:
+        Path(out).expanduser().write_bytes(raw)
+
+    records = document["records"]
+    rows: tuple[tuple[str, str], ...] = (
+        ("device", device.predicate),
+        ("card", f"{device.name} #{device.index}"),
+        ("runtime", __version__),
+        ("suite_ms", str(result.get("suite_ms", 0))),
+        ("observations", str(len(result.get("observations", ())))),
+        ("qualified", str(len(records))),
+        *tuple((r["encoding"][:19], r["implementation"]) for r in records),
+    )
+    return Result(
+        rows=rows,
+        canonical_json=raw,
+        lines=(f"wrote {len(raw)} canonical bytes to {out}",) if out else (),
+        next=(
+            "tfs capability <encoding> "
+            f"{device.predicate} --records <path> --json  # TensorFS owns the rule",
+        ),
     )
