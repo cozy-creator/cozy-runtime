@@ -677,7 +677,7 @@ class Loader:
         return tuple(self._records)
 
     def constructed(self) -> tuple[object, ...]:
-        """What this load built — the runtime installs guarded roots over it."""
+        """What this load built, exactly as the factory returned it — nothing wraps it."""
         return tuple(self._objects)
 
     def caches(self) -> tuple[DerivedCache, ...]:

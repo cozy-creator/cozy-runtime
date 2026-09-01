@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Concatenate,
-    NoReturn,
     ParamSpec,
     Protocol,
     Self,
@@ -339,7 +338,6 @@ class Model[PipelineT]:
 
     _cozy_ready = False
     _cozy_loading = False
-    _cozy_poison: str | None = None
     _cozy_active: tuple[str, tuple[str, ...]] | None = None
     _cozy_harness: ModelTestHarness | None = None
     _cozy_record: ConstructionRecord | None = None
@@ -347,7 +345,6 @@ class Model[PipelineT]:
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_residency: Residency | None = None
-    _cozy_derive_only = False
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
 
@@ -394,25 +391,6 @@ class Model[PipelineT]:
         cls.__stamps__ = inherited
 
     # ----------------------------------------------------------------- lifecycle
-
-    def __getattribute__(self, name: str) -> object:
-        derive_only = bool(object.__getattribute__(self, "_cozy_derive_only"))
-        if derive_only:
-            if name in {"load", "unload", "for_request", "_cozy_scope"}:
-                raise CapabilityError(
-                    f"{type(self).__name__}.{name}: this job Model is an exact Manifest "
-                    "capability for WeightsSink derivation, not a loadable generation",
-                    code="derive_model_read_only",
-                    fields=[name],
-                )
-            if name in _declared_state(type(self)):
-                raise CapabilityError(
-                    f"{type(self).__name__}.{name}: derive-only job Models expose no "
-                    "constructed component state",
-                    code="derive_model_component_unavailable",
-                    fields=[name],
-                )
-        return object.__getattribute__(self, name)
 
     def load(self, loader: Loader) -> None:
         """Construct this model from the bound artifact. The runtime owns WHEN it runs."""
@@ -510,46 +488,7 @@ class Model[PipelineT]:
                 code="no_active_scope",
             )
 
-    def _cozy_check_access(self, component: str) -> None:
-        """The guarded component root: every access checks the ACTIVE scope, resident or not."""
-        if self._cozy_active is None:
-            self._cozy_kill(f"component {component!r} was touched outside any component-use scope")
-        method, declared = self._cozy_active
-        if component not in declared:
-            self._cozy_kill(
-                f"{method} touched component {component!r}, which it does not declare "
-                f"({', '.join(declared)}) — an undeclared access poisons the executor and "
-                "never reactively loads (§1.1)"
-            )
-
-    def _cozy_kill(self, why: str) -> NoReturn:
-        # A REFUSAL NAMES WHERE IT CAME FROM (#573). This one says which component was
-        # touched and never who touched it, and the difference is not academic: a guarded
-        # root is reached through `__getattr__`, so the offender is by definition NOT in
-        # the message, and locating one cost a whole investigation that ended in "cause
-        # not located". The author frames are the interesting ones — a package reading a
-        # component outside its scope is the case this guard is FOR — so the runtime's own
-        # frames are kept too, because the other case is the runtime probing a root it
-        # installed, which is exactly what a bare message cannot distinguish.
-        import traceback
-
-        frames = [
-            f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno} {f.name}"
-            for f in traceback.extract_stack()[:-2]
-        ][-6:]
-        object.__setattr__(self, "_cozy_poison", why)
-        raise CapabilityError(
-            f"{type(self).__name__}: {why} — reached from: " + " <- ".join(reversed(frames)),
-            code="undeclared_component",
-        )
-
     def _cozy_require_ready(self, what: str) -> None:
-        if self._cozy_poison is not None:
-            raise CapabilityError(
-                f"{type(self).__name__}.{what}: this model generation is POISONED "
-                f"({self._cozy_poison})",
-                code="poisoned_generation",
-            )
         if not self._cozy_ready:
             raise CapabilityError(
                 f"{type(self).__name__}.{what}: no generation is Ready — construction is "
@@ -608,7 +547,16 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 
 
 def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
-    """Construct no package state: bind one typed Model instance to one exact Manifest."""
+    """A PLAIN RECORD carrying one exact Manifest identity, typed as the author's class.
+
+    No construction runs, so the instance carries `checkpoint_ref` and nothing else: a
+    component the load never built is simply absent, and reading one raises the ordinary
+    `AttributeError` that names it. Nothing is intercepted to say so — a `__getattribute__`
+    that tested a derive-only flag on EVERY attribute read of EVERY model, serving ones
+    included, bought a nicer message for the one case at the cost of a branch on the other
+    million, and `object.__setattr__` walked around it anyway. `load`/`for_request` refuse
+    through the ordinary `not_ready` gate, because no generation is Ready here.
+    """
     if not checkpoint_ref.startswith("sha256:") or len(checkpoint_ref) != 71:
         raise ConformanceError(
             "derive-only Model requires one lowercase sha256 Manifest identity",
@@ -628,7 +576,6 @@ def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
         )
     model = object.__new__(cls)
     object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
-    object.__setattr__(model, "_cozy_derive_only", True)
     return model
 
 
@@ -673,53 +620,6 @@ class _ComponentScope:
         residency = model._cozy_residency
         if residency is not None:
             residency.release(self._method, self._components)
-
-
-# --------------------------------------------------------------------------- guards
-
-
-@final
-class GuardedComponent:
-    """A censused component root. Every registered parameter and buffer is reachable only
-    through it, and any access checks the ACTIVE scope — regardless of whether the bytes
-    happen to be resident. cr-008b tightens this to per-parameter guards under staging."""
-
-    __slots__ = ("_cozy_model", "_cozy_name", "_cozy_target")
-
-    _cozy_name: str
-    _cozy_target: object
-    _cozy_model: Model[Any]
-
-    def __init__(self, name: str, target: object, model: Model[Any]) -> None:
-        object.__setattr__(self, "_cozy_name", name)
-        object.__setattr__(self, "_cozy_target", target)
-        object.__setattr__(self, "_cozy_model", model)
-
-    def __repr__(self) -> str:
-        return f"<guarded {self._cozy_name}>"
-
-    def __getattr__(self, name: str) -> object:
-        self._cozy_model._cozy_check_access(self._cozy_name)
-        return getattr(self._cozy_target, name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        self._cozy_model._cozy_check_access(self._cozy_name)
-        target = self._cozy_target
-        if not callable(target):
-            raise TypeError(f"component {self._cozy_name!r} is not callable")
-        return target(*args, **kwargs)
-
-
-def install_guards(obj: object, model: Model[Any], components: Sequence[str]) -> int:
-    """Replace each censused component with its guarded root. Author code reaches
-    components by name through the constructed object, so the guard is on the only path."""
-    table = getattr(obj, "components", None)
-    if not isinstance(table, dict):
-        return 0
-    guarded = [name for name in components if name in table]
-    for name in guarded:
-        table[name] = GuardedComponent(name, table[name], model)
-    return len(guarded)
 
 
 # --------------------------------------------------------------------------- identity
@@ -899,29 +799,25 @@ class ModelRegistry:
             record = records[0] if len(records) == 1 else _merge(records)
             _prove_components(cls, record)
             constructed = loader.constructed()
-            # THE SCHEDULER SCAN READS THE RAW TABLE, BEFORE THE GUARDS GO ON (#573).
+            # NOTHING IS WRAPPED HERE, AND THAT IS THE FIX (#573).
             #
-            # `Scheduler` is a @runtime_checkable Protocol, so `isinstance(member,
-            # Scheduler)` asks `hasattr` for each of its members — and `hasattr` on a
-            # GuardedComponent runs `__getattr__`, which checks the active component-use
-            # scope. There is no scope during construction, so the RUNTIME'S OWN generic
-            # probe tripped the RUNTIME'S OWN guard and poisoned the generation with
-            # `undeclared_component` naming a component no package had touched.
+            # A censused component used to be replaced by a proxy whose `__getattr__`
+            # checked the active component-use scope. `Scheduler` is a @runtime_checkable
+            # Protocol, so the RUNTIME'S OWN `isinstance(member, Scheduler)` probe below
+            # tripped the RUNTIME'S OWN proxy and poisoned the generation with
+            # `undeclared_component` naming a component no package had touched — an
+            # investigation that first ended in "cause not located". Ordering the scan
+            # before the wrap only moved the trap: a proxy is invisible to `isinstance`,
+            # un-censusable by `census`, and poisons a live generation permanently on any
+            # `hasattr` — which is every duck-type check in the ecosystem.
             #
-            # Read off the failing path itself once the refusal learned to name its caller:
-            #     __getattr__ <- typing <genexpr> <- __instancecheck__ <- _schedulers
-            #                 <- _construct <- acquire
-            #
-            # It stayed hidden because `install_guards` installs nothing unless the
-            # constructed object exposes a real `components` dict, and H3Pipeline is the
-            # first package that does — so H3 is the first construction ever to be guarded
-            # at all. Both facts are facts about the CONSTRUCTED objects, and the ordering
-            # is the whole fix: infrastructure reads them raw, and the guards go on
-            # afterwards for the author code they were built for.
-            schedulers = _schedulers(constructed, {})
-            for obj in constructed:
-                install_guards(obj, model, record.components)
-            object.__setattr__(model, "_cozy_schedulers", schedulers)
+            # The LEASE never lived in the proxy. `_ComponentScope.__enter__` admits the
+            # declared set through `Residency.admit` before the method body runs, so a
+            # method whose components cannot be materialized never executes. The proxy only
+            # added the ability to BLAME an access after the fact, and it could not even do
+            # that — the offender is reached through `__getattr__`, so it is by definition
+            # not in the message — while costing a broken `isinstance` on every component.
+            object.__setattr__(model, "_cozy_schedulers", _schedulers(constructed, {}))
             object.__setattr__(model, "_cozy_caches", loader.caches())
             object.__setattr__(model, "checkpoint_ref", artifact.snapshot)
             object.__setattr__(model, "_cozy_record", record)
