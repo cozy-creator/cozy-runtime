@@ -91,6 +91,17 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
       - run: uv sync --extra model-execution
+      # WARM THE RESOLVER CACHE. The proofs build and install wheels with the network cut
+      # (`UV_OFFLINE=1`), which is the point of them — but an offline resolve can only read
+      # the uv cache, and `uv sync` fills it straight from the lockfile without ever
+      # touching the registry index or fetching the build backend. One online build plus one
+      # online install of the runtime wheel puts both there.
+      - run: |
+          set -euo pipefail
+          warm=$(mktemp -d)
+          uv build --wheel --out-dir "$warm/dist"
+          uv venv "$warm/venv"
+          uv pip install --python "$warm/venv/bin/python" "$warm"/dist/*.whl
       - run: uv run pytest
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
