@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import pathlib
 import re
 import sys
@@ -66,6 +67,54 @@ AUTHOR_ALLOWED_LAZY: dict[str, frozenset[str]] = {
 ENV_AUTHORITY = SRC / "internal" / "config.py"
 CONFIG_SYMBOLS = ("RuntimeConfig", "read_config")
 CONFIG_NAMES = ("CONFIG", "SETTINGS")
+
+
+BASE_DISTRIBUTIONS = ROOT / "base-distributions.json"
+BASE_OBSERVATION = SRC / "internal" / "base_observation.py"
+
+
+def base_distributions_bytes() -> bytes:
+    """Render the worker-image vocabulary from its ONE source, `_PROTECTED_IMPORT_ROOTS`."""
+
+    found = _literal_assignments(
+        BASE_OBSERVATION, frozenset({"_PROTECTED_IMPORT_ROOTS", "_PROTECTED_PREFIXES"})
+    )
+    roots = found["_PROTECTED_IMPORT_ROOTS"]
+    prefixes = found["_PROTECTED_PREFIXES"]
+    if len(roots) != 1 or len(prefixes) != 1:
+        raise SystemExit("base_observation.py must assign each protected constant exactly once")
+    names = roots[0]
+    families = prefixes[0]
+    if not isinstance(names, dict) or not isinstance(families, tuple):
+        raise SystemExit("the protected constants are not a name->roots mapping and a prefix tuple")
+    # No `format` key and no kind name: this is a GENERATED CONSTANT, not a document.
+    # A `cozy.<name>/N` spelling here would mint a document kind with no boundary,
+    # storage, or digest party behind it.
+    document = {
+        "distributions": sorted(str(name) for name in names),
+        "prefixes": sorted(str(prefix) for prefix in families),
+    }
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+
+
+def fence_base_distributions() -> list[str]:
+    """`base-distributions.json` is generated, not maintained.
+
+    It is the only thing cozy-creator vendors from this repo: the client's upload-side prune
+    list is derived from these bytes, so a name added here reaches the client and a name the
+    client prunes is one the worker actually owns. Regenerate with
+    `python checks/architecture.py --write-base-distributions`.
+    """
+
+    expected = base_distributions_bytes()
+    if not BASE_DISTRIBUTIONS.is_file():
+        return [f"{BASE_DISTRIBUTIONS.name} is missing; regenerate it"]
+    if BASE_DISTRIBUTIONS.read_bytes() != expected:
+        return [
+            f"{BASE_DISTRIBUTIONS.name} is not the rendering of "
+            "base_observation._PROTECTED_IMPORT_ROOTS; regenerate it"
+        ]
+    return []
 
 
 def py_files() -> list[pathlib.Path]:
@@ -754,6 +803,7 @@ FENCES = {
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "supervised-worker-lanes": fence_supervised_worker_lanes,
+    "base-distributions": fence_base_distributions,
 }
 
 
@@ -761,7 +811,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="run the runtime's architecture fences")
     parser.add_argument("--only", action="append", choices=FENCES, default=[])
     parser.add_argument("--exclude", action="append", choices=FENCES, default=[])
+    parser.add_argument(
+        "--write-base-distributions",
+        action="store_true",
+        help="regenerate base-distributions.json from base_observation.py",
+    )
     args = parser.parse_args(argv)
+    if args.write_base_distributions:
+        BASE_DISTRIBUTIONS.write_bytes(base_distributions_bytes())
+        print(f"wrote {BASE_DISTRIBUTIONS}")
+        return 0
     if args.only and args.exclude:
         parser.error("--only and --exclude are mutually exclusive")
     selected = {
