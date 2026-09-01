@@ -3528,22 +3528,9 @@ class Worker:
 
     def reporter(self) -> None:
         """The ObservedWorkerState tick, and the liveness SAMPLE that rides it."""
-        seen: dict[str, str] = {}
         while not self.stop.wait(REPORT_SECONDS):
             for subject in list(self.monitor.cursors):
-                verdict = self.monitor.sample(subject)
-                before = seen.get(subject)
-                if verdict == "wedged" and before != verdict:
-                    self.note("liveness", f"{subject} is WEDGED by silence (no clock involved)")
-                elif before == "wedged" and verdict in ("advancing", "busy"):
-                    # THE RETRACTION (cl-025 residue). A WEDGED note is a durable fact on
-                    # the lane; a subject that moves again must say so on the same lane, or
-                    # the last word about it stays a wedge that no longer exists.
-                    self.note(
-                        "liveness",
-                        f"{subject} resumed ({verdict}): the earlier WEDGED verdict is retracted",
-                    )
-                seen[subject] = verdict
+                self.monitor.sample(subject)
             if self.connected.is_set():
                 self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 

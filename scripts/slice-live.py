@@ -1551,32 +1551,30 @@ def section_triage(args: argparse.Namespace) -> None:
     )
 
 
-def section_wedge(args: argparse.Namespace) -> None:
-    """cr-011: a wedged transfer is detected by SILENCE; a slow-but-advancing one is not."""
-    head("silence-bounded liveness — the same detector, two transfers, no clock anywhere")
+def section_progress(args: argparse.Namespace) -> None:
+    """cr-011: silence stays observable without becoming a fabricated terminal."""
+    head("progress observation — the same observer, two transfers, no failure clock")
     from cozy_runtime.author._observations import EventRing
     from cozy_runtime.internal.worker.observe import SilenceMonitor
 
-    monitor = SilenceMonitor(EventRing(subject="worker"), give_up_after=8)
+    monitor = SilenceMonitor(EventRing(subject="worker"))
     monitor.start("slow:transfer", "download")
-    monitor.start("wedged:transfer", "download")
-    verdicts: dict[str, list[str]] = {"slow": [], "wedged": []}
+    monitor.start("silent:transfer", "download")
+    verdicts: dict[str, list[str]] = {"slow": [], "silent": []}
     for position in range(1, 41):
-        # The SLOW one moves ONE MiB per observation, which is 1/4000th of the wedged one's
-        # nominal rate. The WEDGED one moved 4,096 MiB and then stopped. Nothing below reads
-        # a clock, sleeps, or measures elapsed time: the inputs are two integers.
+        # The SLOW one moves ONE MiB per observation. The other moved 4,096 MiB and then
+        # stopped. Neither observation is authority to terminate the operation.
         monitor.advance("slow:transfer", position)
-        monitor.advance("wedged:transfer", 4096)
+        monitor.advance("silent:transfer", 4096)
         verdicts["slow"].append(monitor.sample("slow:transfer"))
-        verdicts["wedged"].append(monitor.sample("wedged:transfer"))
+        verdicts["silent"].append(monitor.sample("silent:transfer"))
     check(
-        "the WEDGED transfer is called wedged, by silence",
-        verdicts["wedged"][-1] == "wedged",
-        f"{verdicts['wedged'].count('silent')} silent observations, then "
-        f"{verdicts['wedged'].count('wedged')} wedged — position never left 4096",
+        "forty unchanged observations remain silence, not a fabricated failure",
+        set(verdicts["silent"]) == {"advancing", "silent"},
+        f"{verdicts['silent'].count('silent')} silent observations; no terminal was invented",
     )
     check(
-        "the SLOW-BUT-ADVANCING transfer is NEVER called wedged, however slow",
+        "the slow-but-advancing transfer remains advancing",
         set(verdicts["slow"]) == {"advancing"},
         f"{len(verdicts['slow'])} observations, all advancing at 1 MiB each — a transfer "
         "this slow would have blown any boot timeout",
@@ -1588,9 +1586,9 @@ def section_wedge(args: argparse.Namespace) -> None:
         "in that module are in prose saying there is no boot timeout",
     )
     check(
-        "`started` is published at POSITION ZERO so a pre-first-unit wedge renders",
+        "`started` is published at POSITION ZERO so pre-first-unit silence renders",
         any(row["name"] == "started" and row["value"] == 0 for row in monitor.ring.rows()),
-        "a subject nobody ever mentioned cannot be reported as wedged",
+        "a subject nobody ever mentioned cannot report progress",
     )
     print(f"\n  cursors: {json.dumps(monitor.document())}")
 
@@ -1691,7 +1689,7 @@ def main() -> int:
             "ledger",
             "arms",
             "triage",
-            "wedge",
+            "progress",
             "witness",
             "clone",
             "bench",
@@ -1715,7 +1713,7 @@ def main() -> int:
         "ledger": section_ledger,
         "arms": section_arms,
         "triage": section_triage,
-        "wedge": section_wedge,
+        "progress": section_progress,
         "witness": section_witness,
         "clone": section_clone,
         "bench": section_bench,

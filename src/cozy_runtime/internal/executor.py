@@ -506,7 +506,7 @@ class Executor:
         checkpoints, rows = surveyed[plan.variant]
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
-        # worker can tell a wedged multi-GB load from a slow one WITHOUT a boot timeout.
+        # worker can report measured progress for a multi-GB load without inventing a timeout.
         # `started` is published at position 0 before the first byte moves, which is what
         # makes a pre-first-unit wedge render at all.
         def position(mib: int) -> None:
