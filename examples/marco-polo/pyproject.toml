@@ -15,9 +15,6 @@ dependencies = [
 [project.entry-points."cozy.application"]
 default = "marco_polo_package:app"
 
-[tool.cozy]
-organization = "paul"
-
 [tool.uv.sources]
 cozy-runtime = { path = "../..", editable = true }
 

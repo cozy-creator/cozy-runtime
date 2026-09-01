@@ -16,15 +16,16 @@ returns:
 {"message":"polo"}
 ```
 
-Set `[tool.cozy] organization` in `pyproject.toml` to an organization you can publish, then run
-Cozy from this directory:
+After Cozy has authenticated to Tensorhub and resolved your current account, run it from this
+directory:
 
 ```sh
 cozy package publish
 ```
 
-The default metadata publishes `paul/marco-polo@1.0.4`. Cozy derives the name and version
-from the built wheel and never adds a `v` prefix.
+Cozy derives the repository owner from the current authenticated Tensorhub account and derives
+`marco-polo@1.0.4` from the built wheel. Publisher ownership is not project metadata, and Cozy
+never adds a `v` prefix to the version.
 
 Cozy invokes `uv build --wheel`; this example declares `uv_build` and its existing flat module
 name and root explicitly. The published distribution is `marco-polo`; the Python import
