@@ -581,9 +581,12 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
                 )
             _schema(field["type"], source, f"{field_path}.type")
             if "constraints" in field:
-                _subset_object(
-                    field["constraints"], _CONSTRAINT_KEYS, source, f"{field_path}.constraints"
-                )
+                # msgspec constraints ride through VERBATIM: a consumer that does not
+                # understand one ignores it, and a closed list here would refuse a
+                # package over a constraint Creator has simply not learned to read.
+                constraints = field["constraints"]
+                if not isinstance(constraints, dict) or not constraints:
+                    _invalid(source, f"{field_path}.constraints", "must be a non-empty object")
             if "asset_bound" in field:
                 _subset_object(
                     field["asset_bound"], _ASSET_BOUND_KEYS, source, f"{field_path}.asset_bound"
@@ -604,6 +607,15 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
     child = exact[form]
     if form == "list":
         _schema(child, source, f"{path}.list")
+    elif form == "map":
+        entry = _closed(child, {"key", "value"}, set(), source, f"{path}.map")
+        _schema(entry["key"], source, f"{path}.map.key")
+        _schema(entry["value"], source, f"{path}.map.value")
+    elif form == "tuple":
+        if not isinstance(child, list) or not child:
+            _invalid(source, f"{path}.tuple", "must be a non-empty array")
+        for index, member in enumerate(child):
+            _schema(member, source, f"{path}.tuple[{index}]")
     elif form == "literal":
         if not isinstance(child, list):
             _invalid(source, f"{path}.literal", "must be an array")
@@ -648,8 +660,9 @@ def _invalid(source: str, path: str, detail: str) -> NoReturn:
 
 
 _SCALARS = frozenset({"bool", "float", "int", "null", "str"})
-_SCHEMA_FORMS = frozenset({"asset", "fields", "input", "list", "literal", "union"})
-_CONSTRAINT_KEYS = {"ge", "gt", "le", "max_length", "min_length"}
+_SCHEMA_FORMS = frozenset(
+    {"asset", "fields", "input", "list", "literal", "map", "opaque", "tuple", "union"}
+)
 _ASSET_BOUND_KEYS = {"max_bytes", "media_types"}
 
 

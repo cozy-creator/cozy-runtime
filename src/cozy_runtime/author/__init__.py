@@ -57,7 +57,7 @@ from cozy_runtime.author._decode import (
 )
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe
 from cozy_runtime.author._demand import RequestFeatures
-from cozy_runtime.author._describe import DELETED_SURFACES, assert_declaration_shape, describe
+from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
     NEUTRAL_ERROR_SET,
     AuthorError,
@@ -138,7 +138,6 @@ from cozy_runtime.author._signature import ModelBinding, Surface
 
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
-    "DELETED_SURFACES",
     "JOB_ONLY",
     "NEUTRAL_ERROR_SET",
     "SERVING_ONLY",

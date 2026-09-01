@@ -4,15 +4,17 @@
 surface is invalid refuses at BUILD with the same verdict class as a schema violation, so a
 mis-typed handler cannot reach a device (§1.7).
 
-This module also owns the ONE SDK-owned deleted-field list. A package asserts what IT
-declares via `assert_declaration_shape` and inherits the deletion walk — contracts packages
-rely on are exercised by conformance, never by convention.
+`assert_declaration_shape` walks a declaration for structural problems a type checker
+cannot see. It checks SHAPE, never NAMES: a field called `batch_size`, `dtype` or
+`generator` is an ordinary declaration, and a name blocklist over the author's own
+vocabulary refused legitimate packages (a training job's batch size, a quantization job's
+dtype, `class MyGan(Model): generator: nn.Module`) while preventing nothing.
 """
 
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author._artifact import MAX_ARTIFACT_OUTPUTS
@@ -29,46 +31,11 @@ from cozy_runtime.author._walker import walk
 if TYPE_CHECKING:
     from cozy_runtime.author._app import App
 
-#: Names deleted from the author surface, with WHY. One list, one owner: a package that
-#: declares any of them refuses, and `checks/architecture.py` proves the SDK never grows one back.
-DELETED_SURFACES: Mapping[str, str] = {
-    "generator": "the seeded generator is view.generator — there is no ctx.generator (§1.3)",
-    "recommended": "'runs better on newer silicon' is a measured ranking fact (§1.2)",
-    "vcpus": "vcpus are MEASURED per (lane, plan) fleet-side, never authored (§1.2)",
-    "vram": "no VRAM guess is authored in package code (§1.2)",
-    "batch_size": "one request produces one output; batch dimensions stay deleted (§1.2)",
-    "tuned": "no parallel family-defaults struct or model.tuned exists (§1.2)",
-    "callback_on_step_end": "mid-run tensor mutation is an unconfessed quality change (§1.3)",
-    "compile": "no compile surface is nameable from author code (§1.3)",
-    "retryable": "author code reports neutral FACTS; retryability is a RecordOwner "
-    "projection over them, never an observation the author writes (§2)",
-    "retry_after": "no author-raised retry command exists at any tier (§2)",
-    "fatal": "FATAL is a RecordOwner projection, not a worker or author observation (§2)",
-}
-
 
 def assert_declaration_shape(declaration: object) -> None:
-    """Refuse a declaration that names a deleted or excluded surface, anywhere in its tree.
-
-    The excluded-keyword list is the same one method wrappers are held to (§1.1): placement,
-    dtype, filesystem paths, offload, pinning and eviction are not nameable from author code,
-    and a REQUEST FIELD is exactly as much of the author surface as a method parameter is.
-    """
+    """Refuse a declaration whose SHAPE cannot be honoured, anywhere in its tree."""
     for node in walk(declaration):
         owner = getattr(node.owner, "__name__", node.owner)
-        if (why := DELETED_SURFACES.get(node.name)) is not None:
-            raise ConformanceError(
-                f"{owner}.{node.path} declares the deleted field {node.name!r}: {why}",
-                code="deleted_surface",
-                fields=[node.path],
-            )
-        if (why := EXCLUDED_KEYWORDS.get(node.name)) is not None:
-            raise ConformanceError(
-                f"{owner}.{node.path} declares {node.name!r}: {why} — the schema surface is "
-                "held to the same excluded-keyword list as a method wrapper",
-                code="excluded_keyword",
-                fields=[node.path],
-            )
         bound = node.marker(AssetBound)
         if isinstance(bound, AssetBound):
             # cr-012: a bound NARROWS a kind. Checking it at DESCRIBE rather than at
