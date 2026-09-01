@@ -954,6 +954,10 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
+        #: lane name -> its kernel thread id, recorded by the lane itself as it starts. An
+        #: observer judging this worker's PROGRESS by CPU reads the lanes that work and
+        #: leaves out the ones that tick on a clock (`pollers`).
+        self.lanes: dict[str, int] = {}
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
         self.stop = threading.Event()
         self.weights = weights.WeightsExchange(
@@ -1210,15 +1214,17 @@ class Worker:
                         )
                     scratch = self.supervision.epoch_scratch(executor.epoch)
                     output = scratch / f"package-descriptor-{uuid.uuid4().hex}.json"
-                    reply = executor.call(
-                        {
-                            "cmd": "describe_installed",
-                            "distribution": distribution,
-                            "output": str(output),
-                        },
-                        timeout=65.0,
-                        total_timeout=65.0,
-                    )
+                    # A cold import, torch included: bound by the executor's own measured
+                    # work and its death, never by a number of seconds (xs-007 row 8).
+                    with executor.watched("describe_installed"):
+                        reply = executor.call(
+                            {
+                                "cmd": "describe_installed",
+                                "distribution": distribution,
+                                "output": str(output),
+                            },
+                            timeout=None,
+                        )
                 except ExecutorGone as exc:
                     raise package_prepare.PreparationRefusal(
                         "package_prepare_executor_failed", exc.detail
@@ -1542,6 +1548,7 @@ class Worker:
         """
 
         def guarded() -> None:
+            self.lanes[name] = threading.get_native_id()
             try:
                 body(*args)
             except BaseException as exc:
@@ -1622,6 +1629,19 @@ class Worker:
         """How much work the EXECUTOR has done, read by the parent — THE meter."""
         executor = self.engine.supervision.current
         return child.work(executor.pid if executor is not None else 0)
+
+    @property
+    def pollers(self) -> set[int]:
+        """The kernel thread ids of the lanes that wake on a CLOCK — the reporter, the
+        watchdog, and the sender that delivers what the reporter ticks — whose CPU says
+        nothing about whether this worker is getting anywhere. Every other thread burns
+        only when it works, which is what makes the worker's own burn, less these, an
+        honest progress meter for an outside observer."""
+        return {
+            tid
+            for name, tid in self.lanes.items()
+            if name in ("report", "watchdog", "control-send")
+        }
 
     def applied_posture(self) -> dict[str, Any]:
         """The state the worker was in when something happened (§3.6). `readiness_epoch` is
@@ -3560,9 +3580,10 @@ class Worker:
                 )
         if self.warm and executor.alive():
             try:
-                self.ledger.observe_probe(
-                    executor.call({"cmd": "probe"}, timeout=30.0, total_timeout=30.0)
-                )
+                # The probe waits behind the warm pass's device sync backlog; a healthy
+                # executor is not retired for answering slowly (xs-007 row 20).
+                with executor.watched("probe"):
+                    self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
             except ExecutorGone:
                 self.supervision.invalidate(executor, "executor died during warmup probe")
                 try:

@@ -85,11 +85,7 @@ def _run(config: WorkerHostConfig) -> int:
     except package_environment.EnvironmentRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
     accelerator_backend = base.accelerator_backend
-    gpus = readiness.runtime_gpus(
-        config.child_base_env,
-        deadline=config.lease_expiry_unix,
-        accelerator_backend=accelerator_backend,
-    )
+    gpus = readiness.runtime_gpus(config.child_base_env, accelerator_backend=accelerator_backend)
     prepared = prepare_boot(config)
     options = _worker_options(
         config,
@@ -118,22 +114,9 @@ def _run(config: WorkerHostConfig) -> int:
         if worker.stop.is_set():
             raise LaunchRefusal("supervisor_stop_before_readiness", "fd 3 closed before ready")
         certificate_pem = host_paths.TLS_CERTIFICATE.read_bytes()
-        readiness.prove_tls_leaf(
-            config.worker_internal_port,
-            certificate_der,
-            deadline=config.lease_expiry_unix,
-            owner="worker",
-        )
-        readiness.prove_worker_foreign_refusal(
-            config.worker_internal_port,
-            certificate_pem,
-            deadline=config.lease_expiry_unix,
-        )
-        readiness.prove_media_foreign_refusal(
-            config.media_internal_port,
-            certificate_der,
-            deadline=config.lease_expiry_unix,
-        )
+        readiness.prove_tls_leaf(config.worker_internal_port, certificate_der, owner="worker")
+        readiness.prove_worker_foreign_refusal(config.worker_internal_port, certificate_pem)
+        readiness.prove_media_foreign_refusal(config.media_internal_port, certificate_der)
         payload = readiness.receipt_payload(
             control_public_key_ed25519_b64url=config.control_public_key_ed25519_b64url,
             media_token_sha256=config.media_token_sha256,

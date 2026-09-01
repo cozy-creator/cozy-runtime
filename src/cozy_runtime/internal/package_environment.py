@@ -569,7 +569,10 @@ def _qualify_native_environment(
             ),
             environment=environment,
             request=request,
-            timeout_seconds=120.0,
+            # The runaway fence for a dlopen-every-member, import-every-root probe: a spin
+            # is stopped by the kernel at this many CPU-seconds; a slow cold page-in is not
+            # a spin and is not stopped by anything but its own exit.
+            cpu_seconds=120,
         )
     except native_wheel.NativeWheelRefusal as exc:
         raise EnvironmentRefusal(exc.code, exc.detail) from exc

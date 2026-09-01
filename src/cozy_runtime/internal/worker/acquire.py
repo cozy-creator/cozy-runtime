@@ -359,7 +359,6 @@ class Acquirer:
                 trusted = self.verified_cache.record(digest, length, target)
             else:
                 location = self.plan.locations.get(digest)
-                deadline = self.plan.deadline(digest)
                 if planned is None or not location:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
@@ -367,16 +366,13 @@ class Acquirer:
                         f"{digest} is reached by PlacementSet/1 and absent locally and "
                         "from the plan",
                     )
-                if deadline <= int(time.time()):
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        "download_url_expired",
-                        f"the presigned read for {digest} expired at {deadline}",
-                    )
+                # The presign's expiry is the ORIGIN's to enforce, and it does (403). It is
+                # not a deadline on the bytes: a fetch that is landing bytes when the URL
+                # lapses is refused by the store, reported as a fetch fault, and re-planned
+                # with fresh access — never cut here by a clock read off the URL.
                 path = placement_materialization.fetch_exact(
                     {"digest": digest, "length": length, "url": location},
                     self.cache_root,
-                    deadline=deadline,
                     allow_local=self.plan.allow_local,
                 )
                 trusted = self.verified_cache.record(digest, length, path)
@@ -550,14 +546,18 @@ class Acquirer:
                                 f"{digest} is reached at {length} B and not exactly planned",
                             )
                         reads.append(pull.Read(digest, length, location))
-                    deadline = min(self.plan.deadline(digest) for digest, _ in closure)
+                    # NO DEADLINE (xs-007 row 16). The presigns' expiry used to be the pull's
+                    # deadline, which cut a 100 GB materialization at the URL lifetime and
+                    # called it a credential error. The pull is per-object resumable and
+                    # its own ledger ends a stalled stream; an expired presign is refused
+                    # by the origin, reported as a fetch fault, and the next plan carries
+                    # fresh access for exactly the objects still missing.
                     outcome = pull.pull_granted_manifest(
                         tensorfs,
                         store,
                         manifest_digest,
                         manifest_length,
                         reads,
-                        timeout=max(0.001, float(deadline) - time.time()),
                         session="placement-" + manifest_digest[7:19],
                         allow_local=self.plan.allow_local,
                     )

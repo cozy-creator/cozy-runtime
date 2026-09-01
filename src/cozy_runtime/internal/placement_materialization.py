@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-import time
 import urllib.error
 import urllib.parse
 import uuid
@@ -31,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, host_paths, package_environment, pull
+from cozy_runtime.internal import canonical, egress, host_paths, package_environment, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
@@ -60,11 +59,12 @@ def prepare_boot(
     artifact_store_root: Path = LOCAL_WEIGHTS_STORE_ROOT,
     artifact_cache_root: Path = WEIGHTS_CACHE_ROOT,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: check the deadline and lay its two CAS roots.
+    """Bring the pod to READY-BUT-EMPTY: lay its two CAS roots.
 
-    The deadline check converts a boot that is already too late into a NAMED refusal.
-    Tensorhub stops polling at the same instant either way, so all it decides is whether
-    the operator reads a reason or reads silence.
+    No lease check (xs-007 row 18). This used to refuse `worker_lease_elapsed` against
+    `COZY_WORKER_LEASE_EXPIRY_UNIX`, the rental cap tensorhub has since deleted; the
+    supervisor still sends the name with a far-future sentinel and the runtime decides
+    nothing on it. A boot ends when the supervisor cancels it or the leg exits.
 
     THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the control-Runtime wheel
     baked into the base worker image and reported the digest so "the hub learns a value".
@@ -77,8 +77,7 @@ def prepare_boot(
     publish or reconcile at boot.
     """
 
-    if time.time() >= config.lease_expiry_unix:
-        raise LaunchRefusal("worker_lease_elapsed", str(config.lease_expiry_unix))
+    del config  # the handoff carries nothing this step decides on
     # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
     # or directory writable to it.
@@ -91,10 +90,13 @@ def prepare_boot(
     )
 
 
-def fetch_exact(
-    grant: Mapping[str, Any], root: Path, *, deadline: int, allow_local: bool = False
-) -> Path:
-    """Fetch one bounded exact grant without proxy, redirect, transform, or alias."""
+def fetch_exact(grant: Mapping[str, Any], root: Path, *, allow_local: bool = False) -> Path:
+    """Fetch one bounded exact grant without proxy, redirect, transform, or alias.
+
+    No deadline: the grant's expiry is the origin's to enforce, and a socket that moves
+    nothing for `egress.SILENCE_SECONDS` is the one thing that ends the read early. The
+    bytes take as long as they take.
+    """
 
     digest = grant.get("digest")
     length = grant.get("length")
@@ -129,11 +131,10 @@ def fetch_exact(
     measured = hashlib.sha256()
     total = 0
     try:
-        timeout = max(float(deadline) - time.time(), 0.001)
         try:
             response = pull.open_guarded(
                 url,
-                pull.Deadline.after(timeout),
+                pull.Deadline(silence=egress.SILENCE_SECONDS),
                 headers={
                     "Accept-Encoding": "identity",
                     "User-Agent": "cozy-runtime-worker/1",
@@ -154,8 +155,6 @@ def fetch_exact(
             if stated is not None and stated != str(length):
                 raise LaunchRefusal("grant_length_mismatch", f"header {stated}, expected {length}")
             while True:
-                if time.time() >= deadline:
-                    raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
                 chunk = response.read(min(CHUNK_BYTES, length + 1 - total))
                 if not chunk:
                     break

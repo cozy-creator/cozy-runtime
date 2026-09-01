@@ -1117,6 +1117,15 @@ def process_state(process: ProcessIdentity) -> str | None:
         return None
 
 
+def process_state_of(pid: int) -> str | None:
+    """A NUMERIC pid's Linux state, or ``None`` when no such process exists. Only for a
+    direct child whose unreaped wait slot pins the number; everywhere else use the birth."""
+    try:
+        return _linux_stat(pid)[0]
+    except (ProcessLookupError, IndexError):
+        return None
+
+
 def reap_child(process: ProcessIdentity) -> int | None:
     """Reap one exact child zombie if it belongs to this worker."""
     if process_state(process) != "Z":
@@ -1128,28 +1137,58 @@ def reap_child(process: ProcessIdentity) -> int | None:
     return status if pid else None
 
 
-def progress_burn(pid: int) -> int:
-    """The two-handed progress meter: CPU nanoseconds PLUS bytes read from disk — a child
-    can be making progress by computing or by waiting on a cold page cache, and a meter
-    with only the first hand kills the second. THIS process, threads included, unreaped
-    children excluded. -1 is UNREADABLE, never a zero (an unreadable meter decides
-    nothing)."""
+def progress_burn(pid: int, tid: int = 0) -> int:
+    """The progress meter: CPU nanoseconds PLUS every byte moved — read from and written to
+    storage, and read from or written through any descriptor (`rchar`/`wchar`, which is how
+    a socket or a network filesystem shows up). A child can be making progress by computing,
+    by waiting on a cold page cache, by draining a socket or by writing its result, and a
+    meter missing any one hand kills that one. THIS process, threads included and exited
+    threads folded in, unreaped children excluded — or ONE thread of it when `tid` names
+    one, which is how a lane is judged apart from the pollers beside it. -1 is UNREADABLE,
+    never a zero (an unreadable meter decides nothing)."""
     _linux_only("progress_burn")
     if not pid:
         return -1
+    base = f"/proc/{pid}/task/{tid}" if tid else f"/proc/{pid}"
     try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+        fields = Path(f"{base}/stat").read_text().rsplit(") ", 1)[-1].split()
         ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
     except (OSError, IndexError, ValueError):
         return -1
     burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
     try:
         io = dict(
-            line.split(": ", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines() if line
+            line.split(": ", 1) for line in Path(f"{base}/io").read_text().splitlines() if line
         )
-        return burned + int(io["read_bytes"])
+        return burned + sum(
+            int(io[hand]) for hand in ("rchar", "wchar", "read_bytes", "write_bytes")
+        )
     except (OSError, KeyError, ValueError):
         return burned  # no `io` for this process; the CPU hand still decides
+
+
+def descendants(pid: int) -> list[int]:
+    """Every live process under `pid`, from ONE /proc census — an executor, a `uv` install,
+    a native-operator probe. Zombies included: an exited child still holds its counters
+    until it is reaped."""
+    _linux_only("descendants")
+    parents: dict[int, int] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            tail = Path(entry.path, "stat").read_text().rsplit(") ", 1)[-1].split()
+            parents[int(entry.name)] = int(tail[1])  # ppid, after `state`
+        except (OSError, IndexError, ValueError):
+            continue
+    found: list[int] = []
+    frontier = [pid]
+    while frontier:
+        parent = frontier.pop()
+        children = [child for child, above in parents.items() if above == parent]
+        found.extend(children)
+        frontier.extend(children)
+    return sorted(found)
 
 
 def rss_bytes(pid: int) -> int:

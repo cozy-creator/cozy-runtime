@@ -115,8 +115,12 @@ class WorkerHostConfig:
     control_public_key_ed25519: bytes
     control_public_key_ed25519_b64url: str
     media_token_sha256: tuple[str, ...]
-    lease_expiry_unix: int
     child_base_env: tuple[tuple[str, str], ...]
+    lease_expiry_unix: int = 0
+    """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
+    decided on (xs-007 row 18): tensorhub deleted the rental cap, the supervisor still
+    sends `COZY_WORKER_LEASE_EXPIRY_UNIX` with a far-future sentinel until it stops, and
+    nothing in the runtime refuses or deadlines against this number."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,8 +324,10 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
             )
         return value
 
-    def decimal(name: str, maximum: int) -> int:
-        raw = required(name)
+    def decimal(name: str, maximum: int, *, absent: int | None = None) -> int:
+        raw = env.get(name, "") if absent is not None else required(name)
+        if absent is not None and not raw:
+            return absent
         try:
             value = int(raw)
         except ValueError as exc:
@@ -390,7 +396,7 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         control_public_key_ed25519=public_key,
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
-        lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1),
+        lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1, absent=0),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV

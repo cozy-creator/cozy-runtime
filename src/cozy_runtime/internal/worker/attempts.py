@@ -1205,9 +1205,8 @@ class AttemptEngine:
                 return self._unavailable_reconciliation(attempt, key)
             if not executor.poisoned and attempt.spool:
                 try:
-                    self.ledger.observe_probe(
-                        executor.call({"cmd": "probe"}, timeout=30.0, total_timeout=30.0)
-                    )
+                    with executor.watched("probe"):
+                        self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
                     self.ledger.device_process = self.device_process()
                 except ExecutorGone:
                     self.ledger.device_unreadable("the executor died before the ledger was read")

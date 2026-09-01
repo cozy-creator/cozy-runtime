@@ -64,6 +64,9 @@ class Hub:
 
     def __init__(self) -> None:
         self.stall_for = 0
+        #: How long the stalled object's FIRST GET sits before answering its headers: the
+        #: origin's own time-to-first-byte, which the ledger must measure and never judge.
+        self.answer_after = 0.0
         self.served: dict[str, int] = {}
         self.release = threading.Event()
         self.lock = threading.Lock()
@@ -174,6 +177,8 @@ def handler(hub: Hub) -> type[BaseHTTPRequestHandler]:
             if object_id == "sha256:" + MANIFEST_ID:
                 return self._body(MANIFEST)
             seen = hub.asked(object_id)
+            if object_id == STALLED and seen == 0 and hub.answer_after:
+                hub.release.wait(hub.answer_after)
             self.send_response(200)
             self.send_header("Content-Length", str(len(OBJECT)))
             self.end_headers()
@@ -277,7 +282,10 @@ def test_a_stream_that_never_recovers_refuses_by_name(hub: tuple[Hub, str], tmp_
     elapsed = time.monotonic() - started
 
     assert caught.value.code == "transfer_failed"
-    assert "moved no bytes while its peers" in caught.value.message
+    # The refusal states the rule it applied — this pull's own measured pace — and not a
+    # peer comparison the ledger never makes.
+    assert "stopped moving bytes" in caught.value.message
+    assert "own measured pace" in caught.value.message
     assert STALLED in caught.value.message
     assert state.served[STALLED] == pull.FETCH_ATTEMPTS, (
         f"asked {state.served[STALLED]} times, not {pull.FETCH_ATTEMPTS}"
@@ -285,3 +293,34 @@ def test_a_stream_that_never_recovers_refuses_by_name(hub: tuple[Hub, str], tmp_
     assert elapsed < PROMPTLY, f"the refusal took {elapsed:.1f}s: it waited on the deadline"
     assert not border.completed
     assert STALLED not in border.admitted
+
+
+def test_an_origin_slow_to_answer_is_measured_not_condemned(
+    hub: tuple[Hub, str], tmp_path: Path
+) -> None:
+    """Time-to-first-byte is the origin's pace, learned into patience; it is not a stall.
+
+    The stalled object's first GET takes twice the noise floor to answer at all, then sends
+    one byte and goes silent for good. Under the old ledger the stream was stamped at
+    `open()`, so it was condemned DURING the answer wait — before it had a socket to wake —
+    and the later genuine stall was invisible: the pull sat on the deadline. Now the answer
+    latency raises the measured worst gap, the stall is judged against that raised patience,
+    and the re-ask lands the object well inside the deadline it no longer depends on.
+    """
+    state, base = hub
+    state.stall_for = 1
+    state.answer_after = 2 * pull.STALL_SAMPLES * pull.STALL_SAMPLE_SECONDS
+    border = Border()
+
+    started = time.monotonic()
+    result = pulled(base, tmp_path, border)
+    elapsed = time.monotonic() - started
+
+    assert border.completed, "a slow-to-answer origin was treated as a failure"
+    assert result.fetched == len(OBJECT_IDS) + 1
+    assert state.served[STALLED] == 2, f"the stalled object was asked for {state.served[STALLED]}x"
+    # Judged on the learned pace: later than the bare floor, far earlier than the deadline.
+    assert elapsed > pull.STALL_FACTOR * state.answer_after, (
+        f"{elapsed:.1f}s: the stall was judged on the floor, not on the measured answer latency"
+    )
+    assert elapsed < PROMPTLY, f"the recovery took {elapsed:.1f}s: it waited on the deadline"

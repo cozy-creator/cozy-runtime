@@ -19,7 +19,9 @@ hand in their `torch` module; this module imports none.
 
 from __future__ import annotations
 
+import ctypes
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -29,7 +31,11 @@ from typing import Any, Literal
 MPS_CHILD_ENV_LAW = ("PYTORCH_ENABLE_MPS_FALLBACK", "0")
 
 BACKENDS = ("cuda", "mps")
-PROCESS_QUERY_SECONDS = 2.0
+
+#: NVML's own answers, by name. `nvmlReturn_t` is an enum; these are the two this module
+#: branches on.
+_NVML_SUCCESS = 0
+_NVML_ERROR_INSUFFICIENT_SIZE = 7
 
 
 class AcceleratorUnsupported(Exception):
@@ -63,35 +69,119 @@ def process_memory(pid: int, kind: str) -> ProcessMemory:
 
 
 def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
-    """One coherent driver-table read for all requested process IDs."""
+    """One coherent driver-table read for all requested process IDs.
+
+    The ANSWER decides, never its arrival time. NVML is asked in-process first — a library
+    call that answers in milliseconds and needs no fork on a host already under load — and
+    `nvidia-smi` is the fallback where the library is absent, run to completion: a query
+    that took four seconds on a busy eight-GPU host used to be reported UNREADABLE at two,
+    and an unreadable row blocks every successor spawn. UNREADABLE now means exactly what it
+    says — no driver answered — and never "the driver was slow".
+    """
     if not pids:
         return {}
     if kind == "mps":
         return {pid: ProcessMemory("unreadable") for pid in pids}
-    try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=pid,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=PROCESS_QUERY_SECONDS,
-            check=True,
+    table = _nvml_compute_table()
+    if table is None:
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {pid: ProcessMemory("unreadable") for pid in pids}
+        table = {}
+        for line in out.stdout.strip().splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) == 2 and parts[0].isdigit():
+                try:
+                    table[int(parts[0])] = int(parts[1]) * 1024 * 1024
+                except ValueError:
+                    table[int(parts[0])] = -1
+    return {
+        pid: (
+            ProcessMemory("absent", 0)
+            if pid not in table
+            else ProcessMemory("present", table[pid])
+            if table[pid] >= 0
+            else ProcessMemory("unreadable")
         )
-    except (OSError, subprocess.SubprocessError):
-        return {pid: ProcessMemory("unreadable") for pid in pids}
-    result = {pid: ProcessMemory("absent", 0) for pid in pids}
-    for line in out.stdout.strip().splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in pids:
-            pid = int(parts[0])
-            try:
-                result[pid] = ProcessMemory("present", int(parts[1]) * 1024 * 1024)
-            except ValueError:
-                result[pid] = ProcessMemory("unreadable")
-    return result
+        for pid in pids
+    }
+
+
+class _NvmlProcessInfo(ctypes.Structure):
+    """`nvmlProcessInfo_t` as `nvmlDeviceGetComputeRunningProcesses_v3` fills it."""
+
+    _fields_ = (
+        ("pid", ctypes.c_uint),
+        ("usedGpuMemory", ctypes.c_ulonglong),
+        ("gpuInstanceId", ctypes.c_uint),
+        ("computeInstanceId", ctypes.c_uint),
+    )
+
+
+_nvml_lock = threading.Lock()
+_nvml: ctypes.CDLL | None = None
+_nvml_absent = False
+
+
+def _nvml_library() -> ctypes.CDLL | None:
+    """The driver's management library, initialized once per process, or None where the
+    host has none — a CPU box, or a container without the driver mounted."""
+    global _nvml, _nvml_absent
+    with _nvml_lock:
+        if _nvml is not None or _nvml_absent:
+            return _nvml
+        try:
+            library = ctypes.CDLL("libnvidia-ml.so.1")
+            if library.nvmlInit_v2() != _NVML_SUCCESS:
+                raise OSError("nvmlInit_v2 refused")
+        except (OSError, AttributeError):
+            _nvml_absent = True
+            return None
+        _nvml = library
+        return library
+
+
+def _nvml_compute_table() -> dict[int, int] | None:
+    """Every compute process on every device: pid -> used bytes (-1 when the driver does
+    not account it). None when NVML is unavailable, so the caller falls back."""
+    library = _nvml_library()
+    if library is None:
+        return None
+    table: dict[int, int] = {}
+    count = ctypes.c_uint(0)
+    if library.nvmlDeviceGetCount_v2(ctypes.byref(count)) != _NVML_SUCCESS:
+        return None
+    for index in range(count.value):
+        handle = ctypes.c_void_p()
+        if library.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) != _NVML_SUCCESS:
+            return None
+        rows = ctypes.c_uint(0)
+        answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), None)
+        if answer == _NVML_SUCCESS:
+            continue
+        if answer != _NVML_ERROR_INSUFFICIENT_SIZE:
+            return None
+        # The count is a snapshot; a process can start between the two calls. Ask for room.
+        rows = ctypes.c_uint(rows.value * 2 + 8)
+        infos = (_NvmlProcessInfo * rows.value)()
+        answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), infos)
+        if answer != _NVML_SUCCESS:
+            return None
+        for info in infos[: rows.value]:
+            used = int(info.usedGpuMemory)
+            # NVML reports "not available" as all bits set.
+            table[int(info.pid)] = -1 if used == (1 << 64) - 1 else used
+    return table
 
 
 def synchronize(torch: Any, kind: str) -> None:
