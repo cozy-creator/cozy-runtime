@@ -19,7 +19,7 @@ import msgspec
 from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound, Resources, _PreflightMarker
+from cozy_runtime.author._markers import Resources, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
@@ -94,7 +94,6 @@ class Surface:
     source_profiles: Mapping[str, str] = field(default_factory=dict)
     """Optional exact TensorFS source profile for every inferred model parameter."""
     resources: Resources | None = None
-    demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
@@ -194,7 +193,6 @@ def analyze(
     artifact_outputs: tuple[ArtifactOutput, ...] = (),
     source_profiles: Mapping[str, str] | None = None,
     resources: Resources | None = None,
-    demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
 ) -> Surface:
@@ -301,7 +299,6 @@ def analyze(
         artifact_outputs=artifact_outputs,
         source_profiles=dict(sorted(profiles.items())),
         resources=resources,
-        demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,
     )

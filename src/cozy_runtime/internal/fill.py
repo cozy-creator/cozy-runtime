@@ -620,7 +620,6 @@ def servability_for_script(
     """
     from cozy_runtime.internal.derive import torch_module
     from cozy_runtime.internal.encoding import measure_runtime
-    from cozy_runtime.internal.planfacts import PlanFacts
     from cozy_runtime.internal.resolution import script_plan
 
     try:
@@ -634,7 +633,6 @@ def servability_for_script(
             capabilities=capabilities,
             device=device,
             runtime=measure_runtime(torch_module(), release),
-            facts=PlanFacts(),
             objective=objective,
             encoded_leaves=encoded_leaves,
             dtype_name=dtype_name,
@@ -1122,7 +1120,6 @@ class StreamingFillBackend:
         """
         from cozy_runtime.internal.derive import torch_module
         from cozy_runtime.internal.encoding import measure_runtime
-        from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.resolution import script_plan
 
@@ -1153,7 +1150,6 @@ class StreamingFillBackend:
             capabilities=qualified[0],
             device=facts,
             runtime=measure_runtime(torch, release),
-            facts=PlanFacts(),
             objective=objective,
             placement=placement,
             encoded_leaves=encoded_leaves,

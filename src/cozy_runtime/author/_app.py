@@ -23,7 +23,7 @@ from typing import ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound, Resources
+from cozy_runtime.author._markers import Resources
 from cozy_runtime.author._signature import Kind, Surface, analyze
 
 P = ParamSpec("P")
@@ -48,7 +48,6 @@ class Registration:
     artifact_outputs: tuple[ArtifactOutput, ...] = ()
     source_profiles: Mapping[str, str] = field(default_factory=dict)
     resources: Resources | None = None
-    demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
     hidden: bool = False
     """This surface is DECLARED but NOT PUBLISHED (#572d). A hidden entrypoint stays in the
@@ -77,7 +76,6 @@ class Registration:
                 artifact_outputs=self.artifact_outputs,
                 source_profiles=self.source_profiles,
                 resources=self.resources,
-                demand_bound=self.demand_bound,
                 preflight=self.preflight,
                 hidden=self.hidden,
             )
@@ -102,7 +100,6 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         resources: Resources | None = None,
-        demand: Bound | None = None,
         hidden: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -114,7 +111,6 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         resources: Resources | None = None,
-        demand: Bound | None = None,
         hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
@@ -130,7 +126,6 @@ class App:
             source_profiles={},
             preflight=preflight,
             resources=resources,
-            demand=demand,
             hidden=hidden,
         )
 
@@ -148,7 +143,6 @@ class App:
         artifacts: tuple[ArtifactOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
-        demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def job(
@@ -162,7 +156,6 @@ class App:
         artifacts: tuple[ArtifactOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
-        demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a RUN-TO-COMPLETION callable (§2).
 
@@ -186,7 +179,6 @@ class App:
             source_profiles=dict(source_profiles or {}),
             preflight=None,
             resources=resources,
-            demand=demand,
         )
 
     def _register(
@@ -200,7 +192,6 @@ class App:
         source_profiles: Mapping[str, str],
         preflight: Callable[..., object] | None,
         resources: Resources | None,
-        demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -224,7 +215,6 @@ class App:
                 artifact_outputs=artifact_outputs,
                 source_profiles=dict(source_profiles),
                 resources=resources,
-                demand_bound=demand,
                 preflight=preflight,
                 hidden=hidden,
             )

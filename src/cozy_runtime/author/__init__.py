@@ -96,7 +96,6 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._markers import (
     AssetBound,
-    Bound,
     ModelDefault,
     Preflight,
     Resources,
@@ -159,7 +158,6 @@ __all__ = [
     "AudioAsset",
     "AuthorError",
     "Backend",
-    "Bound",
     "Budget",
     "BudgetExhausted",
     "BudgetFacts",
