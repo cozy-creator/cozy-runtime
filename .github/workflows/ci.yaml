@@ -36,6 +36,7 @@ jobs:
       # one cross-repo TensorFS registry comparison has its own pinned job below.
       - run: uv run python checks/architecture.py --exclude reviewed-specs-exist
       - run: uv run python checks/anima_cuda_capability.py
+      - run: uv run python checks/env_seal.py
       # The descriptor is a read-only publication output, never a committed repository file.
       # The architecture fence validates the closed grammar; these exact replays prove the two
       # source fixtures derive byte-identically without dirtying either repository.

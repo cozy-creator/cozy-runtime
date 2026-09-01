@@ -1700,13 +1700,15 @@ class AttemptEngine:
         if not reply.get("env_intact", True):
             if attempt.executor is not None:
                 self.supervision.invalidate(attempt.executor, "env seal broken")
+            changed = ", ".join(str(name) for name in (reply.get("env_changed") or ()))
+            names = f"; changed sealed names: {changed}" if changed else ""
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 ORIGIN.CAUSE_ORIGIN_WORKER,
                 "env_seal_broken: the executor's environment changed after CUDA init — the "
-                "allocator read it once, so the imposition was a silent no-op",
+                f"allocator read it once, so the imposition was a silent no-op{names}",
             )
         if "state_seq" in reply:
             # Monotone wire counters belong to the WORKER. A disposable process that

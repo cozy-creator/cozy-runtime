@@ -82,9 +82,20 @@ def _capture_seal() -> None:
     _SEALED.update(seal_snapshot())
 
 
-def _env_intact() -> bool:
-    """Whether the process environment still equals the seal CUDA initialized under."""
-    return seal_snapshot() == _SEALED
+def _env_changes() -> tuple[str, ...]:
+    """Names whose current values differ from the pre-Torch executor seal.
+
+    Values never cross the seam. The names are enough to diagnose which reviewed
+    imposition moved without leaking paths or future secret-bearing values into a terminal.
+    """
+    current = seal_snapshot()
+    return tuple(name for name in sorted(_SEALED) if current.get(name, "") != _SEALED[name])
+
+
+def _env_document() -> dict[str, Any]:
+    """One coherent post-CUDA seal verdict for an executor reply."""
+    changed = _env_changes()
+    return {"env_intact": not changed, "env_changed": list(changed)}
 
 
 def _cancelled(root: Path, request_id: str) -> bool:
@@ -325,6 +336,15 @@ class Executor:
         if not binding.get("model_class"):
             return self._prepare_weightless(binding, started)
 
+        changed = _env_changes()
+        if changed:
+            return {
+                "ok": False,
+                "code": "env_seal_broken",
+                "detail": "the executor environment changed before Torch import "
+                f"({', '.join(changed)}); no CUDA initialization was attempted",
+            }
+
         import torch  # the ONE torch import in the runtime, and it is in THIS process
 
         self.torch = torch
@@ -355,16 +375,24 @@ class Executor:
             resolve,
         )
 
+        if accel.initialized(torch, self.device_kind):
+            return {
+                "ok": False,
+                "code": "cuda_initialized_before_runtime",
+                "detail": "Torch CUDA was already initialized before Runtime's explicit "
+                "allocator boundary; package execution is refused",
+            }
         accel.initialize(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
         cuda_ms = (time.perf_counter() - started) * 1000
-        if not _env_intact():
+        changed = _env_changes()
+        if changed:
             return {
                 "ok": False,
                 "code": "env_seal_broken",
                 "detail": "the process environment changed between the seal and CUDA init; "
                 "the allocator read its environment once and a late imposition is a silent "
-                "no-op, so this is a refusal rather than a warning",
+                f"no-op, so this is a refusal rather than a warning ({', '.join(changed)})",
             }
 
         if self.discovered is None:
@@ -1278,7 +1306,7 @@ class Executor:
                 "fields": list(outcome.fields),
             },
             "quiescent": quiescent,
-            "env_intact": _env_intact(),
+            **_env_document(),
             "poisoned": self.poisoned,
             "outputs": outputs,
             "result_ref": result_ref,
@@ -1635,7 +1663,7 @@ class Executor:
             # A torch-free job holds no stream, so quiescence is a STRUCTURAL fact rather
             # than a device query: there is nothing that could still be moving.
             "quiescent": self._quiescent() if self.torch is not None else True,
-            "env_intact": _env_intact(),
+            **_env_document(),
             "poisoned": self.poisoned,
             "outputs": outputs,
             "result_ref": result_ref,
@@ -1805,7 +1833,7 @@ class Executor:
             "attempts": self.attempts,
             "ready": self.ready,
             "poisoned": self.poisoned,
-            "env_intact": _env_intact(),
+            **_env_document(),
         }
 
 
@@ -1820,6 +1848,7 @@ _MINIMAL_KEYS = frozenset(
         "outcome",
         "quiescent",
         "env_intact",
+        "env_changed",
         "poisoned",
         "metrics",
         "outputs",
@@ -1897,6 +1926,7 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
             "outcome": reply.get("outcome"),
             "quiescent": reply.get("quiescent"),
             "env_intact": reply.get("env_intact"),
+            "env_changed": reply.get("env_changed") or [],
             "poisoned": reply.get("poisoned"),
             "metrics": reply.get("metrics"),
             "outputs": reply.get("outputs") or [],

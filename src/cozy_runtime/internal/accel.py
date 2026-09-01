@@ -111,6 +111,15 @@ def initialize(torch: Any, kind: str) -> None:
         torch.cuda.init()
 
 
+def initialized(torch: Any, kind: str) -> bool:
+    """Whether device initialization already escaped Runtime's explicit init boundary."""
+    if kind == "mps":
+        return False
+    if kind == "cuda":
+        return bool(torch.cuda.is_initialized())
+    return False
+
+
 def is_oom(torch: Any, exc: BaseException) -> bool:
     """The OOM PRIMITIVE only — what the failure IS. What it MEANS (#418's
     accepted_envelope_breach classification) stays with the attempt lifecycle."""
