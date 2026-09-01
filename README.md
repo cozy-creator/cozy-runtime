@@ -13,11 +13,11 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.28` targets standard CPython 3.12 only. Project
+Runtime release `0.0.29` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
-Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
-delegation plus verified model files after private code preparation, and Runtime alone binds
-those facts to the exact retained private revision and authors the resulting PlacementSet.
+Wire minor 16 allows an authenticated external RecordOwner to make the existing bounded
+ArtifactSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
+WorkerControl stream without a second byte-plane listener.
 
 The distribution major is the Python compatibility major: compatible additions remain in the
 current range, breaking author changes require a new major, and candidate base worker images must
