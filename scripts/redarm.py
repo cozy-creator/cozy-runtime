@@ -201,7 +201,7 @@ OMISSION_ARMS = (
     OmissionArm(
         "model-execution-tensorfs",
         ROOT / "pyproject.toml",
-        '    "tensorfs==0.0.7",\n',
+        '    "tensorfs==0.0.8",\n',
     ),
     OmissionArm(
         "python-abi",

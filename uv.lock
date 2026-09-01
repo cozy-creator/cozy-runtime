@@ -166,7 +166,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.29"
+version = "0.0.30"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -215,7 +215,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", path = "vendor/tensorfs-0.0.7-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", path = "vendor/tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
@@ -977,10 +977,10 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.0.7"
-source = { path = "vendor/tensorfs-0.0.7-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
+version = "0.0.8"
+source = { path = "vendor/tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 wheels = [
-    { filename = "tensorfs-0.0.7-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a3296ef604061ce2984fdb74e329cf5e2daa69d7b45b924d5806b53ab9dc2521" },
+    { filename = "tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9f2591e90a362d705f679e3bc287063975116ad273db26a667e317146bf6f6f2" },
 ]
 
 [[package]]
