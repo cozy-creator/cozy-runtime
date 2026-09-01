@@ -256,17 +256,23 @@ def fence_no_interactive() -> list[str]:
 
 
 def fence_excluded_keywords() -> list[str]:
-    """No author-callable may take a device, dtype, path, offload, pin, eviction, compile or
-    source-converter keyword: every one names a decision the runtime owns (§1.1/§7).
+    """The API the runtime PUBLISHES to authors declares no device, dtype, offload, pin,
+    eviction, compile or source-converter keyword: every one names a decision it owns
+    (§1.1/§7).
+
+    Scope is `src/cozy_runtime/author/**` — the runtime's own definitions, which is a fact
+    about the surface we ship and nothing observes at runtime. A PACKAGE's model methods are
+    a different surface and need no fence: `_model._check_signature` refuses one at
+    decoration and `_describe._model_clock` again at describe, both `excluded_keyword`, and
+    `tests/test_author_surface.py` drives that refusal.
 
     Dunder and private callables are the RUNTIME's own plumbing (the runtime hands the
-    Loader its device); the fence covers exactly what author code can call.
+    Loader its device). `path=` stays out of the SCAN because `out.save_file(path)` is a
+    legitimate published surface; the in-band clock still refuses it on a model method.
     """
     from cozy_runtime.author._model import EXCLUDED_KEYWORDS
 
-    # `path=` stays out of the SCAN: `out.save_file(path)` is a legitimate author surface
-    # (a file the handler produced), and the model-method clock still refuses it in-band.
-    # `author/fakes.py` supplies the RUNTIME's side of the contract, so it is exempt too.
+    # `author/fakes.py` supplies the RUNTIME's side of the contract, so it is exempt.
     fenced = {k: v for k, v in EXCLUDED_KEYWORDS.items() if k != "path"}
     bad: list[str] = []
     for path in py_files():
@@ -286,13 +292,6 @@ def fence_excluded_keywords() -> list[str]:
                         f"{fenced[arg.arg]}"
                     )
     return bad
-
-
-#: A package module is one that builds an `App()` — the file `describe` imports.
-_MEDIA_PREFIXES = ("image/", "video/", "audio/", "text/", "application/", "model/")
-_IDENTIFIER = re.compile(r"^(hf|civitai|comfy|tensorhub):|^[a-z0-9][\w.-]*/[\w.-]+(@[\w.-]+)?$")
-#: A versioned FORMAT id (`adaln-tables/1`, `ggml-q4-k/v1`) is a schema name, not an artifact.
-_FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
 
 
 def package_modules() -> list[pathlib.Path]:
@@ -411,53 +410,6 @@ def fence_package_owns_no_media_decode() -> list[str]:
                 bad.append(
                     f"{rel}:{node.lineno}: package code calls from_file — a library path/URL "
                     "decoder is a second media authority"
-                )
-    return bad
-
-
-def fence_no_identifiers() -> list[str]:
-    """HARD RULE (§1.1): author code never names an artifact identifier of any kind — no
-    model, release, checkpoint or adapter ref, in bindings or in string literals.
-
-    Code states capability; SELECTION is a binding (package.toml, `--model`, the deploy
-    binding). Identity is exclusively deployment-side, so branching on one is unspellable.
-    """
-    bad: list[str] = []
-    for path in package_modules():
-        tree = ast.parse(path.read_text())
-        # An artifact CONTRACT is a requirement Tensorhub derives from output bytes, and an
-        # `operation_key=` is an idempotency key the author mints. Neither selects anything,
-        # and both are ordinarily spelled `a/b`, which is the identifier shape.
-        contract_values = {
-            id(value)
-            for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            for keyword in call.keywords
-            if keyword.arg == "operation_key"
-            or (
-                keyword.arg in {"topology_digest", "encodings"}
-                and (
-                    (isinstance(call.func, ast.Name) and call.func.id == "WeightsOutput")
-                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "WeightsOutput")
-                )
-            )
-            for value in ast.walk(keyword.value)
-            if isinstance(value, ast.Constant)
-        }
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            if id(node) in contract_values:
-                continue
-            text = node.value.strip()
-            if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):
-                continue
-            if _FORMAT_ID.match(text):
-                continue
-            if _IDENTIFIER.match(text):
-                bad.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno}: artifact identifier {text!r} in "
-                    "package code — selection is a binding, never a literal"
                 )
     return bad
 
@@ -586,7 +538,29 @@ ENGINE_CLASS = "AttemptEngine"
 ENGINE_BUILDER = "internal/worker/session.py"
 
 
+def _dotted(node: ast.expr) -> str:
+    """`a.b.c` as a string, or "" for anything that is not a plain dotted name."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
 def fence_one_attempt_kernel() -> list[str]:
+    """ONE invocation kernel, reachable from ONE module, so `run`, `job` and `serve` cannot
+    drift into two lifecycles.
+
+    A dependency-direction rule: nothing observes it at runtime, because the second
+    lifecycle a second caller would build works perfectly well. What it scans is REACH, not
+    a verb — an import of a kernel name, or an attribute on a binding that resolves to the
+    author package. `prepare`, `invoke` and `attempt` are ordinary words that ordinary
+    objects answer to, and matching them on any receiver is the name-for-capability
+    conflation PR #181 deleted the surface blocklists for.
+    """
     bad: list[str] = []
     for path in py_files():
         rel = path.relative_to(SRC)
@@ -595,32 +569,45 @@ def fence_one_attempt_kernel() -> list[str]:
             continue
         tree = ast.parse(path.read_text())
         allowed_caller = rel.as_posix() == KERNEL_CALLER
+        where = path.relative_to(ROOT)
+        # Names bound in THIS module to the author package itself — `import
+        # cozy_runtime.author [as x]`, `from cozy_runtime import author [as x]` — through
+        # which a kernel call is reachable without ever importing its name.
+        aliases = {"cozy_runtime.author"}
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                "cozy_runtime.author"
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "cozy_runtime.author" or alias.name.startswith(
+                        "cozy_runtime.author."
+                    ):
+                        aliases.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module == "cozy_runtime":
+                aliases.update(a.asname or a.name for a in node.names if a.name == "author")
+        if allowed_caller:
+            aliases.clear()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and (node.module or "").startswith("cozy_runtime.author")
+                and not allowed_caller
             ):
-                names = {a.name for a in node.names}
-                hit = names & set(KERNEL_CALLS)
-                if hit and not allowed_caller:
+                hit = sorted({a.name for a in node.names} & set(KERNEL_CALLS))
+                if hit:
                     bad.append(
-                        f"{path.relative_to(ROOT)}:{node.lineno}: imports the invocation "
-                        f"kernel {sorted(hit)} — only {KERNEL_CALLER} may, so that `run`, "
-                        "`job` and `serve` cannot diverge into two lifecycles"
+                        f"{where}:{node.lineno}: imports the invocation kernel {hit} — only "
+                        f"{KERNEL_CALLER} may, so that `run`, `job` and `serve` cannot "
+                        "diverge into two lifecycles"
                     )
-            if isinstance(node, ast.Call) and not allowed_caller:
-                func = node.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else ""
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in KERNEL_CALLS
+                and _dotted(node.value) in aliases
+            ):
+                bad.append(
+                    f"{where}:{node.lineno}: reaches the invocation kernel "
+                    f"{_dotted(node.value)}.{node.attr} — the ONE kernel runs in "
+                    f"{KERNEL_CALLER}"
                 )
-                if name in KERNEL_CALLS:
-                    bad.append(
-                        f"{path.relative_to(ROOT)}:{node.lineno}: calls the invocation "
-                        f"kernel {name}() — the ONE kernel runs in the device executor"
-                    )
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -628,8 +615,8 @@ def fence_one_attempt_kernel() -> list[str]:
                 and rel.as_posix() != ENGINE_BUILDER
             ):
                 bad.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno}: constructs {ENGINE_CLASS} — "
-                    f"only {ENGINE_BUILDER} may; a second engine is a second lifecycle"
+                    f"{where}:{node.lineno}: constructs {ENGINE_CLASS} — only "
+                    f"{ENGINE_BUILDER} may; a second engine is a second lifecycle"
                 )
     return bad
 
@@ -651,15 +638,15 @@ DECIDING_MODULES = (
     "cozy_runtime.author._model",
     "torch",
 )
-#: Names through which residency could be reached even without an import.
+#: Names through which residency could be reached even without an import — an object PASSED
+#: in closes no import. Only this runtime's own residency vocabulary belongs here: `reserve`
+#: and `rollback` were removed because every container and every transaction answers to
+#: them, and `commit_fill` because it names nothing that exists.
 DECIDING_NAMES = (
     "_cozy_scope",
     "_cozy_active",
     "materialize",
     "evict",
-    "reserve",
-    "rollback",
-    "commit_fill",
     "empty_cache",
 )
 
@@ -671,6 +658,16 @@ def fence_timing_decides_nothing() -> list[str]:
     proof is not a comment: the observation plane cannot import a deciding module and cannot
     name a residency operation, so a timing bracket has no reachable way to alter component
     availability, placement, or the ComponentUseContract.
+
+    A TYPE cannot hold this. `stage_ms` is a float the observation plane itself must
+    min/max/sum (`_observations.Track.add`) and round for the wire, so an opaque
+    non-comparable number would break the observer before it stopped anything — and it
+    would still leave `internal/worker/observe.py` free to import `internal.fill`. The
+    invariant is about a module's import graph, which is not a property of a value.
+
+    `author/_observations.py` is listed for completeness only: `package-imports` already
+    denies the whole author package `cozy_runtime.internal`. The two `internal/worker`
+    modules are what nothing else covers.
     """
     bad: list[str] = []
     for path in py_files():
@@ -753,7 +750,6 @@ FENCES = {
     "no-runtime-database": fence_no_runtime_database,
     "no-interactive": fence_no_interactive,
     "excluded-keywords": fence_excluded_keywords,
-    "no-identifiers-in-package-code": fence_no_identifiers,
     "timing-decides-nothing": fence_timing_decides_nothing,
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,

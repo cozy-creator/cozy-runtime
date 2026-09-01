@@ -31,8 +31,10 @@ cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
 cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 
 [tool.pytest.ini_options]
-# ONE end-to-end suite. Every test starts a real process against a real build; there are no
-# unit tests here on purpose, and there are no mocks anywhere.
+# ONE suite, FEW and REAL (decision 691, which repeals the earlier no-test ban). Most legs
+# start a real process against a real build; the rest drive the real in-process construction
+# and refusal paths. Nothing is mocked, stubbed or doubled anywhere, and a rule better held
+# by a refusal belongs here rather than in `checks/architecture.py`.
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 

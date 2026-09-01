@@ -20,6 +20,11 @@ Each arm below refuses on the commit before cr-060's corrective. What the arms c
   lease that admits before the method body runs, and the request-state-escape fence.
 * `test_a_job_model_is_a_plain_manifest_record` — the derive-only Model is a record now,
   not an instance whose every attribute read ran an interception.
+* `test_a_method_may_not_declare_a_runtime_decision` and
+  `test_a_model_may_not_name_an_artifact_identifier` — the two §1.1 refusals a PACKAGE
+  meets in band, driven through the real decorator and the real constructor. They are
+  behaviour, so they are tested here rather than scanned; `checks/architecture.py` holds
+  only the structural half, over the runtime's own published definitions.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ import pytest
 
 from cozy_runtime.author import (
     CapabilityError,
+    ConformanceError,
     Context,
     FileAsset,
     InvalidRequest,
@@ -236,3 +242,32 @@ def test_a_request_decodes_only_through_the_supported_path() -> None:
         decode_request(Request, {"document": {"ref": "file:abc", "local": "/etc/passwd"}})
     with pytest.raises(InvalidRequest):
         decode_request(Request, {"document": "file:abc", "count": "many"})
+
+
+def test_a_method_may_not_declare_a_runtime_decision() -> None:
+    """A model method that offers a placement knob is refused where it is WRITTEN (§1.1)."""
+    with pytest.raises(ConformanceError) as refused:
+
+        class Placed(Model[Pipeline]):
+            @uses_components("transformer")
+            def denoise(self, device: str = "cuda") -> str:
+                return device
+
+    assert refused.value.code == "excluded_keyword"
+    assert refused.value.fields == ("device",)
+
+
+def test_a_model_may_not_name_an_artifact_identifier() -> None:
+    """Identity is deployment-side, so the one surface that takes a ref refuses one (§1.1)."""
+    with pytest.raises(ConformanceError) as refused:
+        Denoiser.for_test(checkpoint_ref="stabilityai/stable-diffusion-xl-base-1.0")
+    assert refused.value.code == "identifier_in_code"
+
+    with pytest.raises(ConformanceError) as scheme:
+        Denoiser.for_test(checkpoint_ref="hf:org/model@v2")
+    assert scheme.value.code == "identifier_in_code"
+
+    # And the derive-only door takes a Manifest digest, never a name.
+    with pytest.raises(ConformanceError) as derived:
+        _derive_model(Denoiser, "stabilityai/stable-diffusion-xl-base-1.0")
+    assert derived.value.code == "derive_model_manifest_invalid"

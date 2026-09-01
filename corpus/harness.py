@@ -1,8 +1,10 @@
 """The adversarial-corpus harness: one hostile construct per case, three legal verdicts.
 
 Every case is a REAL package module — real torch, real `nn.Module`s, a real `Model`
-subclass whose real `load()` the derivation executes. Nothing is mocked (#160), and the
-scoreboard is produced by running them.
+subclass whose real `load()` the derivation executes. Nothing is mocked, and the scoreboard
+is produced by running them. Decision 691 allows test suites again (it repeals #160/#614);
+what it does not allow is a suite that agrees with a double, so this stays as it is — few,
+and real.
 
 The verdicts:
 
