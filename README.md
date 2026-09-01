@@ -109,7 +109,7 @@ formats. Command requests, planner values, worker records, proof-local state, an
 are typed by their command/path or storage table and carry no global format tag.
 
 The worker never imports torch, and that is proved against the RUNNING process
-(`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
+(the worker process's `/proc/<pid>/maps` and the device's compute-app
 list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
@@ -143,7 +143,7 @@ destination with no row is a SECURITY EVENT. Inputs remain local. Outputs use ei
 destination or the exact presigned HTTPS capability in `OutputAccess.url`; the worker streams
 with `Content-Length` and `If-None-Match: *`, validates every resolved address, and refuses a
 redirect-selected destination. Tensorhub holds the R2 credential; the worker never does.
-Armed by `scripts/worker-live.py grants` end to end and `scripts/assets-live.py egress` at
+Armed by the worker grant path end to end and the egress hook at
 the table.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
@@ -151,7 +151,7 @@ installs `sandbox.refuse_network`, so package or job code that dials is refused 
 the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
 rung). It is not a kernel bound: the executor runs in the worker's own network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
-hook. `scripts/lifecycle-live.py --only egress` observes both halves against one reachable
+hook. The egress arms observe both halves against one reachable
 address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
 handed over as spool paths; the executor is never given an address.
 
@@ -187,7 +187,7 @@ Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0 built with CUD
 when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs, and profiles without
 the exact native library keep the ordinary eager implementation. CPU, MPS and Windows
 profiles do not install that extra. A candidate CUDA image runs
-`python scripts/anima-optimization-live.py`; the proof compares eager and optimized real
+a hand-run comparison of eager and optimized real
 CUDA blocks at Anima's native token width, checks determinism and storage identity, and
 measures the block speedup.
 
@@ -254,9 +254,6 @@ project wheel and compares it. `package_descriptor_digest` is SHA-256 over those
     proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
     proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
     proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
-    uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
-    uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
-    uv run --extra media python scripts/media-stream-live.py # cr-029 2/8-shot RSS + kill cleanup
 
 The model-contract proof builds a Runtime wheel, installs it into a fresh driver environment,
 and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its package and
@@ -502,32 +499,17 @@ prunes it and Runtime observes the image-provided facade before execution. The v
 identity and reproducible build recipe are recorded in `vendor/TENSORFS.md` until TensorFS is
 published on PyPI.
 
-Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
-real CAS, so they are BUILDER-RUN and never CI steps):
-
-    corpus/.venv/bin/python scripts/worker-live.py attempt   # cr-007: the two-process worker
-    corpus/.venv/bin/python scripts/slice-live.py all        # cr-008a: one request, no network
-    corpus/.venv/bin/python scripts/slice-live.py triage     # cr-011: explain a killed executor from the bundle
-    corpus/.venv/bin/python scripts/slice-live.py progress   # cr-011: silence and progress are observations
-    corpus/.venv/bin/python scripts/slice-live.py witness    # cr-011: a real cgroup OOM kill, named
-    corpus/.venv/bin/python scripts/pipeline-live.py fixtures  # cr-008b: the config + bundled tokenizers
-    corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
-    corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
-    corpus/.venv/bin/python scripts/pipeline-live.py arms      # cr-008b: access + physical-floor refusals
-    corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
-    corpus/.venv/bin/python scripts/job-live.py all          # cr-009: the @job surface, services and runner
-    corpus/.venv/bin/python scripts/quant-live.py arms       # cr-006: the encoding border and its refusals
-    corpus/.venv/bin/python scripts/delivery-live.py all     # cr-008c: the delivery ladder, chosen over two real artifacts
-    corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
-    corpus/.venv/bin/python scripts/leaf-live.py all         # cr-006: the native-encoded rung — leaf replacement and the ranked chooser
+Real-GPU behaviour is verified by hand on a rented card, not by an in-tree driver corpus:
+the ~24k lines of `scripts/*-live.py` that used to sit here were hand-invoked, ran in no
+workflow, and cost a maintenance edit on every refactor. The adversarial derivation corpus
+(`corpus/`, driven by `scripts/derive-corpus.py`) is the one place that stays exhaustive.
 
 Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
 `--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
 and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a
 flat binding record or pretends the local selection carries Tensorhub's hardware evidence. The focused
 `proofs/internal/modeled_development_acceptance.py` proof builds a tiny local release and checks
-selection/acquisition plus drift refusals without claiming GPU execution; the existing
-`scripts/pipeline-live.py image/arms` runs remain the real-GPU output and floor evidence.
+selection/acquisition plus drift refusals without claiming GPU execution.
 
 On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
@@ -537,9 +519,6 @@ job-plan implementation as a published package. Its resulting Placement uses
 `DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
 masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
 authority.
-
-`scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
-735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
