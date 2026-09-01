@@ -453,7 +453,6 @@ def prepare_package(
         build_id=release_digest,
         descriptor_path=artifact_cache / descriptor_ref[0].removeprefix("sha256:"),
         installed=installed,
-        include_modeled=development is not None,
     )
     if development is None:
         selected_models, entrypoints = _entrypoints(
@@ -687,14 +686,11 @@ def _stage_job_plans(
     build_id: str,
     descriptor_path: Path,
     installed: package_environment.InstalledEnvironment,
-    include_modeled: bool = False,
 ) -> set[str]:
     rows = body.get("jobs")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_descriptor_invalid", "jobs")
-    selected = [
-        row for row in rows if isinstance(row, dict) and (include_modeled or not row.get("models"))
-    ]
+    selected = [row for row in rows if isinstance(row, dict)]
     if not selected or root is None:
         return set()
     root.mkdir(parents=True, exist_ok=True, mode=0o755)
