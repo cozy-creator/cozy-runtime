@@ -64,6 +64,16 @@ class _LeaseReader:
         self.offset += want
         return bytes(target)
 
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """Rewind for a re-send (`egress.put_from`): the lease is random-access."""
+        if whence != 0 or offset != 0:
+            raise ValueError("a lease reader rewinds to its start only")
+        self.offset = 0
+        return 0
+
 
 class WeightsExchangeError(Exception):
     def __init__(self, code: str, detail: str) -> None:

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, host_paths, package_environment, pull
+from cozy_runtime.internal import canonical, egress, host_paths, package_environment, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
@@ -91,10 +91,13 @@ def prepare_boot(
     )
 
 
-def fetch_exact(
-    grant: Mapping[str, Any], root: Path, *, deadline: int, allow_local: bool = False
-) -> Path:
-    """Fetch one bounded exact grant without proxy, redirect, transform, or alias."""
+def fetch_exact(grant: Mapping[str, Any], root: Path, *, allow_local: bool = False) -> Path:
+    """Fetch one bounded exact grant without proxy, redirect, transform, or alias.
+
+    No deadline: the grant's expiry is the origin's to enforce, and a socket that moves
+    nothing for `egress.SILENCE_SECONDS` is the one thing that ends the read early. The
+    bytes take as long as they take.
+    """
 
     digest = grant.get("digest")
     length = grant.get("length")
@@ -129,11 +132,10 @@ def fetch_exact(
     measured = hashlib.sha256()
     total = 0
     try:
-        timeout = max(float(deadline) - time.time(), 0.001)
         try:
             response = pull.open_guarded(
                 url,
-                pull.Deadline.after(timeout),
+                pull.Deadline(silence=egress.SILENCE_SECONDS),
                 headers={
                     "Accept-Encoding": "identity",
                     "User-Agent": "cozy-runtime-worker/1",
@@ -154,8 +156,6 @@ def fetch_exact(
             if stated is not None and stated != str(length):
                 raise LaunchRefusal("grant_length_mismatch", f"header {stated}, expected {length}")
             while True:
-                if time.time() >= deadline:
-                    raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
                 chunk = response.read(min(CHUNK_BYTES, length + 1 - total))
                 if not chunk:
                     break

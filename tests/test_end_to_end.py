@@ -42,9 +42,10 @@ PACKAGE = ROOT / "examples" / "marco-polo"
 TIMEOUT = 420
 
 #: A refusal is worth nothing if the process does not then END, so the refusal leg gets its
-#: own bound. The local door's readiness deadline is 1800 s — anything under that catches the
-#: hang — and this is far under it while still leaving a cold host room to build the package
-#: environment before the executor is ever reached.
+#: own bound — a TEST bound on a process that must exit on a typed refusal, and the only
+#: clock on this path: the local door itself ends a run on observed stillness, never on a
+#: deadline (xs-007 row 7). It leaves a cold host room to build the package environment
+#: before the executor is ever reached.
 REFUSAL_TIMEOUT = 300
 
 

@@ -55,8 +55,27 @@ from dataclasses import dataclass
 from typing import BinaryIO
 from urllib.parse import urljoin, urlparse
 
+from cozy_runtime.internal import liveness
+
 #: How much of a body one read() pulls. Small enough that a cap refusal happens promptly.
 CHUNK = 1 << 20
+
+#: The silence bound on ONE socket operation — a read or a write that moves nothing — and
+#: never on a transfer: a 99 GB PUT keeps its socket busy for as long as the bytes take.
+#: DERIVED, not chosen: it is the runtime's one noise floor (`liveness.noise_floor`), the
+#: smallest silence the pull ledger itself ever acts on, so an egress socket is given exactly
+#: the patience a pull stream is given before either is called stalled.
+SILENCE_SECONDS = liveness.noise_floor()
+
+#: How many times one object is re-sent. The PUT is idempotent by construction — one
+#: immutable key, `If-None-Match: *` — so a retry costs one object's bytes and never its
+#: identity: a 412 on a re-send of a body the first send completed is the first send landing.
+#: The same shape as `pull.FETCH_ATTEMPTS`, for the same reason.
+PUT_ATTEMPTS = 4
+
+#: The store answers a re-send is worth attempting for. Everything else is a fact about the
+#: request or the grant, and asking again about those is a lie about time.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 #: The redirect budget. A chain longer than this is a loop or an evasion, either way no.
 MAX_REDIRECTS = 4
@@ -292,6 +311,11 @@ def put_from(
     `accept_precondition_failed` admits HTTP 412 as an OUTCOME rather than an error. Under an
     `If-None-Match: *` grant that status means the immutable key already holds these exact
     bytes, which is a successful end state for a content-addressed write, not a failure.
+
+    The object is RE-SENT when the socket goes silent or the store answers a retryable
+    status, `PUT_ATTEMPTS` times, exactly as `pull._fetch` re-asks for one object: the
+    socket's silence bound is observed per operation and a re-send costs this object's bytes,
+    never the attempt. A source that cannot be rewound gets one send.
     """
     import http.client
 
@@ -306,8 +330,6 @@ def put_from(
     connection_type = (
         http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     )
-    connection = connection_type(host, port, timeout=30)
-    measured = _MeasuredReader(source, expected_length, what)
     headers = {
         "Accept-Encoding": "identity",
         "Content-Length": str(expected_length),
@@ -315,42 +337,70 @@ def put_from(
         "If-None-Match": "*",
     }
     headers.update(required_headers or {})
-    try:
-        connection.request("PUT", path, body=measured, headers=headers)
-        response = connection.getresponse()
+    #: The one send that streamed the WHOLE body. Its digest is the object's, whatever the
+    #: store then said; a 412 on a later re-send is that send having landed.
+    complete: _MeasuredReader | None = None
+    attempts = PUT_ATTEMPTS if source.seekable() else 1
+    for attempt in range(1, attempts + 1):
+        last = attempt == attempts
+        if attempt > 1:
+            source.seek(0)
+        measured = _MeasuredReader(source, expected_length, what)
+        connection = connection_type(host, port, timeout=SILENCE_SECONDS)
         try:
-            location = response.getheader("Location")
-            if 300 <= response.status < 400 and location:
-                redirected = urljoin(url, location)
-                # Validate the whole redirect even though we never follow it. This makes a
-                # metadata/private-address redirect a precise security refusal, while a benign
-                # same-host redirect still cannot replace the exact destination the grant named.
-                _validate(redirected, policy)
-                raise EgressRefusal(
-                    "egress_redirect_refused",
-                    f"{what}: HTTP {response.status} tried to replace the exact granted URL",
-                )
-            body = response.read(64 * 1024 + 1)
-            if len(body) > 64 * 1024:
-                raise EgressRefusal(
-                    "egress_response_over_bound", f"{what}: the PUT response exceeded 64 KiB"
-                )
-            status = response.status
-            etag = (response.getheader("ETag") or "").strip()
-            if not (
-                200 <= status < 300
-                or (accept_precondition_failed and status == HTTP_PRECONDITION_FAILED)
-            ):
-                raise EgressRefusal("egress_http_error", f"{what}: HTTP {status} from {host}")
+            connection.request("PUT", path, body=measured, headers=headers)
+            response = connection.getresponse()
+            try:
+                location = response.getheader("Location")
+                if 300 <= response.status < 400 and location:
+                    redirected = urljoin(url, location)
+                    # Validate the whole redirect even though we never follow it. This makes
+                    # a metadata/private-address redirect a precise security refusal, while a
+                    # benign same-host redirect still cannot replace the exact destination the
+                    # grant named.
+                    _validate(redirected, policy)
+                    raise EgressRefusal(
+                        "egress_redirect_refused",
+                        f"{what}: HTTP {response.status} tried to replace the exact granted URL",
+                    )
+                body = response.read(64 * 1024 + 1)
+                if len(body) > 64 * 1024:
+                    raise EgressRefusal(
+                        "egress_response_over_bound", f"{what}: the PUT response exceeded 64 KiB"
+                    )
+                status = response.status
+                etag = (response.getheader("ETag") or "").strip()
+            finally:
+                response.close()
+        except EgressRefusal:
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            if measured.length == expected_length:
+                complete = measured
+            if not last:
+                continue
+            raise EgressRefusal(
+                "egress_unreachable", f"{what}: {exc} (after {attempts} send(s))"
+            ) from exc
         finally:
-            response.close()
-    except EgressRefusal:
-        raise
-    except (http.client.HTTPException, OSError) as exc:
-        raise EgressRefusal("egress_unreachable", f"{what}: {exc}") from exc
-    finally:
-        connection.close()
-    return measured.receipt(http_status=status, etag=etag, exact=status != HTTP_PRECONDITION_FAILED)
+            connection.close()
+        if status in RETRYABLE_STATUS and not last:
+            if measured.length == expected_length:
+                complete = measured
+            continue
+        if status == HTTP_PRECONDITION_FAILED and complete is not None:
+            # An earlier send streamed every byte and then lost the answer; the key now
+            # holding bytes IS that answer, and the digest is the one that send measured.
+            return complete.receipt(http_status=status, etag=etag, exact=True)
+        if not (
+            200 <= status < 300
+            or (accept_precondition_failed and status == HTTP_PRECONDITION_FAILED)
+        ):
+            raise EgressRefusal("egress_http_error", f"{what}: HTTP {status} from {host}")
+        return measured.receipt(
+            http_status=status, etag=etag, exact=status != HTTP_PRECONDITION_FAILED
+        )
+    raise AssertionError("unreachable: the send loop returns or raises on its last attempt")
 
 
 def fetch_into(
@@ -386,7 +436,7 @@ def fetch_into(
             request = urllib.request.Request(
                 current, method="GET", headers={"Accept-Encoding": "identity"}
             )
-            response = opener.open(request, timeout=30)
+            response = opener.open(request, timeout=SILENCE_SECONDS)
         except urllib.error.HTTPError as error:
             location = error.headers.get("Location") if error.headers else None
             if error.code in (301, 302, 303, 307, 308) and location:

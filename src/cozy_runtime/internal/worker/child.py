@@ -32,12 +32,12 @@ import socket
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import accel, jit_cache, proctree, spawn
+from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.plan import PreparedModel
@@ -57,14 +57,17 @@ DIAL_SAMPLE_SECONDS = 0.5
 #: retain the lifecycle lock forever.
 HELLO_SECONDS = 10.0
 
-#: A driver allocation is allowed this long to disappear.  Both PRESENT and UNREADABLE
-#: block a successor: only a measured ABSENT row proves the device ownership was returned.
-RECLAIM_SECONDS = 10.0
+#: How often reclaim RE-READS the kernel and the driver while a killed executor is torn
+#: down. A sampling cadence, not a bound: both PRESENT and UNREADABLE block a successor, and
+#: only a measured ABSENT row proves the device ownership was returned — the wait ends on
+#: that answer, or when the whole observation (process states, resident bytes, device rows)
+#: has provably stopped moving (`liveness.Pace`, against the runtime's one noise floor). A
+#: 100 GB context whose teardown takes a minute is moving the whole time and is waited for.
 RECLAIM_SAMPLE_SECONDS = 0.25
 
 
 def work(pid: int) -> int:
-    """Monotone CPU and storage work observed for one process, or -1 if unreadable."""
+    """Monotone CPU and byte work observed for one process, or -1 if unreadable."""
     return proctree.progress_burn(pid)
 
 
@@ -117,6 +120,9 @@ class Executor:
     spawned_at: float = 0.0
     ready_at: float = 0.0
     exit_status: int | None = None
+    #: The measurement a `watched` call killed this process on, so the ExecutorGone the
+    #: waiting caller then sees names the wedge and not merely the death.
+    wedged: str = ""
     _calls: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -164,7 +170,8 @@ class Executor:
                     raise ExecutorGone(f"seam: {exc}") from exc
                 if frame is None:
                     raise ExecutorGone(
-                        f"the executor died during {name!r} (exit status {self.exit_status})",
+                        self.wedged
+                        or f"the executor died during {name!r} (exit status {self.exit_status})",
                         self.exit_status,
                     )
                 if frame.get("event") == "progress":
@@ -187,6 +194,44 @@ class Executor:
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
+
+    @contextlib.contextmanager
+    def watched(self, what: str) -> Iterator[None]:
+        """Bound a seam call by this process's OWN work, not by a clock.
+
+        A cold `describe_installed` imports the package — torch included — and a `probe`
+        after a warm pass waits on a device sync backlog; neither has a length anyone can
+        state in advance, and both used to be cut at a number of seconds a warm box happened
+        to fit inside. Inside this context the call is made with no timeout, and this
+        process is sampled on `liveness.SAMPLE_SECONDS`: it is killed — exact birth, through
+        its pidfd — only when its meter (`progress_burn`: CPU plus bytes moved) has been flat
+        for longer than `liveness.Pace` allows against the pauses it has itself shown. The
+        kill closes the seam, the blocked `call` returns, and the ExecutorGone it raises
+        carries the measurement. Process death by any other cause ends the call exactly as
+        before; an unreadable meter decides nothing.
+        """
+        stop = threading.Event()
+        pace = liveness.Pace()
+
+        def watch() -> None:
+            while not stop.wait(liveness.SAMPLE_SECONDS):
+                pace.observe(liveness.burn(self.pid))
+                if pace.wedged(liveness.noise_floor()):
+                    self.wedged = (
+                        f"the executor wedged during {what!r}: "
+                        f"{pace.verdict(liveness.noise_floor())}"
+                    )
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proctree.signal_process(self.process, signal.SIGKILL)
+                    return
+
+        thread = threading.Thread(target=watch, name=f"watch-{what}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join()
 
     def close(self) -> None:
         self.channel.close()
@@ -726,7 +771,7 @@ class ExecutorSupervision:
             )
             process = proctree.process_identity(spawned.pid)
             if isinstance(owner.scope, proctree.ProcessTreeScope):
-                proctree.wait_process_stopped(process, seconds=RECLAIM_SECONDS)
+                proctree.wait_process_stopped(process)
                 if not proctree.process_scope_contains(owner.scope, process):
                     raise ExecutorGone(
                         f"process-tree trampoline {process.pid} stopped outside its exact scope"
@@ -867,8 +912,8 @@ class ExecutorSupervision:
         except (ChildProcessError, ProcessLookupError):
             self._reclaim_owner(owner, "provisional spawn without a captured birth")
             return
-        deadline = time.monotonic() + RECLAIM_SECONDS
-        while time.monotonic() < deadline:
+        pace = liveness.Pace()
+        while True:
             try:
                 reaped, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
@@ -877,8 +922,15 @@ class ExecutorSupervision:
             if reaped:
                 self._reclaim_owner(owner, "provisional spawn without a captured birth")
                 return
+            # A killed child is reapable within milliseconds unless the kernel is still
+            # tearing it down; its state and resident bytes move while that happens.
+            pace.observe((proctree.process_state_of(pid), proctree.rss_bytes(pid)))
+            if pace.wedged(liveness.noise_floor()):
+                raise ExecutorGone(
+                    f"spawn cleanup could not reap provisional pid {pid}: "
+                    f"{pace.verdict(liveness.noise_floor())}"
+                )
             time.sleep(0.01)
-        raise ExecutorGone(f"spawn cleanup could not reap provisional pid {pid}")
 
     def _dial_back(self, process: proctree.ProcessIdentity) -> socket.socket:
         """The accepted connection from a freshly spawned child, or a NAMED reason there is
@@ -931,9 +983,7 @@ class ExecutorSupervision:
         try:
             if isinstance(owner.scope, proctree.CgroupScope):
                 if proctree.executor_scope_exists(owner.scope):
-                    known.update(
-                        proctree.freeze_executor_cgroup(owner.scope, seconds=RECLAIM_SECONDS)
-                    )
+                    known.update(proctree.freeze_executor_cgroup(owner.scope))
             else:
                 known.update(
                     proctree.freeze_process_tree(
@@ -941,7 +991,6 @@ class ExecutorSupervision:
                         owner.process,
                         known,
                         worker_pid=os.getpid(),
-                        seconds=RECLAIM_SECONDS,
                     )
                 )
             members = tuple(sorted(known, key=lambda item: (item.pid, item.started_ticks)))
@@ -951,7 +1000,7 @@ class ExecutorSupervision:
                 owner = expanded
             if isinstance(owner.scope, proctree.CgroupScope):
                 if proctree.executor_scope_exists(owner.scope):
-                    proctree.kill_frozen_executor_cgroup(owner.scope, seconds=RECLAIM_SECONDS)
+                    proctree.kill_frozen_executor_cgroup(owner.scope)
             else:
                 proctree.kill_process_tree(known)
         except (proctree.ContainmentUnavailable, TimeoutError) as exc:
@@ -960,7 +1009,7 @@ class ExecutorSupervision:
                 "ownership retained and successor spawn refused"
             ) from exc
 
-        deadline = time.monotonic() + RECLAIM_SECONDS
+        pace = liveness.Pace()
         observations: dict[int, accel.ProcessMemory] = {}
         while True:
             states = {member.pid: proctree.process_state(member) for member in known}
@@ -994,12 +1043,26 @@ class ExecutorSupervision:
                     else accel.ProcessMemory("absent", 0)
                 )
                 return owner, known, leader_device
-            if time.monotonic() >= deadline:
+            # The whole observation is the meter. Resident bytes fall while the kernel
+            # unmaps a dying process and device rows shrink while the driver frees, so a
+            # long teardown keeps moving; only one that has stopped is given up on.
+            pace.observe(
+                (
+                    tuple(sorted(states.items())),
+                    tuple(
+                        sorted((pid, item.state, item.bytes) for pid, item in observations.items())
+                    ),
+                    tuple(sorted((member.pid, proctree.rss_bytes(member.pid)) for member in known)),
+                    tuple(sorted(process.pid for process in token_leftovers)),
+                )
+            )
+            if pace.wedged(liveness.noise_floor()):
                 raise ExecutorGone(
                     f"could not prove reclaim of {owner.scope} ({why}): "
                     f"process_states={states}, device_states="
                     f"{ {pid: item.state for pid, item in observations.items()} }; "
                     f"token_leftovers={sorted(p.pid for p in token_leftovers)}; "
+                    f"{pace.verdict(liveness.noise_floor())}; "
                     "ownership retained and successor spawn refused"
                 )
             time.sleep(RECLAIM_SAMPLE_SECONDS)
@@ -1009,7 +1072,7 @@ class ExecutorSupervision:
         known: set[proctree.ProcessIdentity], leader: proctree.ProcessIdentity | None
     ) -> int:
         """Reap subreaper-owned zombies, then prove every captured birth absent."""
-        deadline = time.monotonic() + RECLAIM_SECONDS
+        pace = liveness.Pace()
         leader_status = -1
         while True:
             for process in known:
@@ -1019,11 +1082,12 @@ class ExecutorSupervision:
             states = {process.pid: proctree.process_state(process) for process in known}
             if all(state is None for state in states.values()):
                 return leader_status
-            if time.monotonic() >= deadline:
+            pace.observe(tuple(sorted(states.items())))
+            if pace.wedged(liveness.noise_floor()):
                 raise ExecutorGone(
                     f"could not reap executor subtree "
                     f"{leader.pid if leader is not None else 'without leader'}: "
-                    f"process_states={states}; "
+                    f"process_states={states}; {pace.verdict(liveness.noise_floor())}; "
                     "ownership retained and successor spawn refused"
                 )
             time.sleep(0.01)

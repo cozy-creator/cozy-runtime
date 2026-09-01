@@ -31,7 +31,7 @@ from typing import TypedDict
 
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical
+from cozy_runtime.internal import base_observation, canonical, liveness
 
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
@@ -522,32 +522,32 @@ def qualify_host(inspection: Inspection, *, gpu_sm: int | None) -> dict[str, obj
 
 
 def observe_seat(python: Path, environment: Mapping[str, str]) -> dict[str, object]:
-    """Ask the selected base interpreter to report its actual installed/runtime facts."""
+    """Ask the selected base interpreter to report its actual installed/runtime facts.
+
+    The probe imports torch, which is a cold import of a gigabyte of shared objects on a
+    first boot; it ends when the child exits, or when the child has PROVABLY stopped working
+    (`_run_working`) — never at a number of seconds a warm box happened to fit inside.
+    """
 
     try:
-        result = subprocess.run(
+        returncode, stdout, stderr = _run_working(
             [str(python), "-I", "-m", "cozy_runtime.internal.native_seat_probe"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            env=dict(environment),
-            check=False,
-            timeout=30,
+            environment,
+            "native_seat_probe",
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise NativeWheelRefusal(
             "package_environment_native_seat_probe_failed", type(exc).__name__
         ) from exc
-    if (
-        result.returncode != 0
-        or len(result.stdout) > MAX_TOOL_OUTPUT
-        or len(result.stderr) > MAX_TOOL_OUTPUT
-    ):
-        detail = result.stderr.decode("utf-8", "replace").strip()[:1000]
+    except _Wedged as exc:
+        raise NativeWheelRefusal("package_environment_native_seat_probe_wedged", str(exc)) from exc
+    if returncode != 0 or len(stdout) > MAX_TOOL_OUTPUT or len(stderr) > MAX_TOOL_OUTPUT:
+        detail = stderr.decode("utf-8", "replace").strip()[:1000]
         raise NativeWheelRefusal(
-            "package_environment_native_seat_probe_failed", detail or f"exit {result.returncode}"
+            "package_environment_native_seat_probe_failed", detail or f"exit {returncode}"
         )
     try:
-        value = canonical.parse_canonical(result.stdout)
+        value = canonical.parse_canonical(stdout)
     except canonical.CanonicalError as exc:
         raise NativeWheelRefusal("package_environment_native_seat_probe_invalid", str(exc)) from exc
     if not isinstance(value, dict) or set(value) != _SEAT_FIELDS:
@@ -658,6 +658,50 @@ def verify_seat(
     return dict(observation)
 
 
+class _Wedged(Exception):
+    """A child that provably stopped working, with the measurement that says so."""
+
+
+def _run_working(
+    command: list[str], environment: Mapping[str, str], what: str
+) -> tuple[int, bytes, bytes]:
+    """Run one disposable child to EXIT, ending it early only on a proven wedge.
+
+    No wall clock runs here. The child is sampled on `liveness.SAMPLE_SECONDS` — a poll
+    cadence, not a bound — and killed with its group only when its own work meter
+    (`proctree.progress_burn`: CPU plus bytes moved) has been flat for longer than
+    `liveness.Pace` allows against the pauses this same child has shown. A cold import that
+    is paging a gigabyte of shared objects is moving bytes and is left alone; a child stuck
+    on a lock it will never get is not, and is ended with the measurement in hand. An
+    unreadable meter decides nothing: the child then ends only by exiting.
+    """
+    pace = liveness.Pace()
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            env=dict(environment),
+            start_new_session=True,
+        )
+        try:
+            while True:
+                try:
+                    returncode = process.wait(timeout=liveness.SAMPLE_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    pace.observe(liveness.burn(process.pid))
+                    if pace.wedged(liveness.noise_floor()):
+                        raise _Wedged(f"{what}: {pace.verdict(liveness.noise_floor())}") from None
+        finally:
+            _kill_process_group(process)
+            process.wait()
+        stdout.seek(0)
+        stderr.seek(0)
+        return returncode, stdout.read(MAX_TOOL_OUTPUT + 1), stderr.read(MAX_TOOL_OUTPUT + 1)
+
+
 def qualify_operator(
     *,
     python: Path,
@@ -665,7 +709,7 @@ def qualify_operator(
     expected_result_digest: str,
     environment: Mapping[str, str],
     request: str = "",
-    timeout_seconds: float = 60.0,
+    cpu_seconds: int = 60,
     max_address_space_bytes: int = 16 << 30,
 ) -> dict[str, object]:
     """Execute one banked fixture in a bounded disposable Python process.
@@ -673,6 +717,12 @@ def qualify_operator(
     `request` is the fixture's one argument and travels in argv, not in the environment: the
     child's environment is the SEAL, and a name smuggled into it after `spawn.seal` is a name
     the allowlist never reviewed.
+
+    `cpu_seconds` and `max_address_space_bytes` are the RUNAWAY FENCE, imposed by the child on
+    itself as rlimits before the package imports (`native_operator_runner`): a fixture that
+    spins or balloons is stopped by the kernel. Neither is a clock — a fixture that is merely
+    slow, paging a cold wheel, burns few CPU-seconds and runs to its answer — and the wait for
+    that answer ends on the child's exit or on its proven wedge, never on wall time.
     """
 
     if (
@@ -680,7 +730,7 @@ def qualify_operator(
         or not python.is_file()
         or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*", fixture)
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_result_digest)
-        or not 0 < timeout_seconds <= 600
+        or not 0 < cpu_seconds <= 600
         or not 256 << 20 <= max_address_space_bytes <= 128 << 30
         or len(request.encode()) > MAX_OPERATOR_REQUEST_BYTES
         or "\x00" in request
@@ -692,38 +742,15 @@ def qualify_operator(
         "-m",
         "cozy_runtime.internal.native_operator_runner",
         fixture,
-        str(int(timeout_seconds) + 1),
+        str(cpu_seconds),
         str(max_address_space_bytes),
         str(MAX_TOOL_OUTPUT),
         request,
     ]
-    process: subprocess.Popen[bytes] | None = None
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                env=dict(environment),
-                start_new_session=True,
-            )
-            try:
-                returncode = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                _kill_process_group(process)
-                process.wait()
-                raise NativeWheelRefusal(
-                    "package_environment_native_operator_timeout", fixture
-                ) from exc
-            finally:
-                _kill_process_group(process)
-            stdout.seek(0)
-            stderr.seek(0)
-            result_stdout = stdout.read(MAX_TOOL_OUTPUT + 1)
-            result_stderr = stderr.read(MAX_TOOL_OUTPUT + 1)
-    except NativeWheelRefusal:
-        raise
+        returncode, result_stdout, result_stderr = _run_working(command, environment, fixture)
+    except _Wedged as exc:
+        raise NativeWheelRefusal("package_environment_native_operator_wedged", str(exc)) from exc
     except OSError as exc:
         raise NativeWheelRefusal(
             "package_environment_native_operator_failed", type(exc).__name__

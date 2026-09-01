@@ -124,11 +124,11 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
         output = scratch / "executor" / "descriptor.json"
-        reply = executor.call(
-            {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
-            timeout=65.0,
-            total_timeout=65.0,
-        )
+        with executor.watched("describe_installed"):
+            reply = executor.call(
+                {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
+                timeout=None,
+            )
         if not reply.get("ok"):
             raise PreparationRefusal(
                 "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))

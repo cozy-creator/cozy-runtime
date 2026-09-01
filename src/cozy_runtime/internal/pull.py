@@ -27,10 +27,12 @@ timeout is whatever is LEFT of that deadline, which is honest about patience and
 liveness: a presigned GET that accepts a connection and then stops sending held a pool slot
 until the deadline expired, so one black-holed stream cost the whole pull. `_Streams` is this
 leg's own liveness ledger — every chunk is counted where it already crosses into Python, and
-the longest gap the pull has ACTUALLY shown is what patience is measured against. A stream
-silent for far longer than that is stalled, its socket is closed, and its object is re-asked
-for, which the plan already made cost one object. A slow link teaches the ledger its own pace
-and is left alone; the sampling interval is resolution, not a verdict.
+the longest gap the pull has ACTUALLY shown, the origin's own time-to-answer included, is
+what patience is measured against. A stream silent for far longer than that is stalled, its
+socket is closed, and its object is re-asked for, which the plan already made cost one
+object. A slow link teaches the ledger its own pace and is left alone; the sampling interval
+is resolution, not a verdict. The same rule, lifted out for processes, is
+`internal/liveness.py`.
 
 **The wanted list is walked by N streams, not one.** An artifact is already cut on the
 object grid, so the objects are independent and the serial loop was leaving the whole link
@@ -57,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import egress
+from cozy_runtime.internal import egress, liveness
 
 #: How many objects are in flight by default. It is a MEASURED number, not a taste: #566b
 #: swept the same pods, the same bucket and the same presigned GETs and found the per-stream
@@ -68,18 +70,23 @@ from cozy_runtime.internal import egress
 STREAMS = 16
 
 #: How often the liveness ledger SAMPLES the per-stream byte counters. Resolution, not a
-#: verdict: nothing is killed because this many seconds passed.
-STALL_SAMPLE_SECONDS = 5.0
+#: verdict: nothing is killed because this many seconds passed. The runtime's one sampling
+#: cadence, shared with `internal/liveness.py` so a stream and a process are judged at the
+#: same resolution.
+STALL_SAMPLE_SECONDS = liveness.SAMPLE_SECONDS
 
 #: The NOISE FLOOR, in samples, below which silence is not evidence of anything. A pull whose
 #: chunks came back in milliseconds must not condemn a stream that is merely a second slow.
-STALL_SAMPLES = 6
+#: It is the smallest patience the ledger ever grants: a cold origin that takes 20 s to answer
+#: its first GET raises the measured worst gap to 20 s, and patience with it, before any
+#: stream is judged — so the floor is not a cold-start bound, only the resolution's.
+STALL_SAMPLES = liveness.STILL_SAMPLES
 
-#: How many times the pull's OWN worst measured chunk gap a stream may be silent for before it
-#: is stalled. This is the term that carries the verdict, and it is MEASURED: a link that has
-#: shown 30 s between chunks earns 30 s of patience, and one that has never paused earns the
-#: floor. Both terms must be exceeded, so neither a slow link nor a fast one is judged by the
-#: other's clock.
+#: How many times the pull's OWN worst measured gap a stream may be silent for before it is
+#: stalled. This is the term that carries the verdict, and it is MEASURED: a link that has
+#: shown 30 s between chunks — or an origin that took 30 s to start answering — earns 240 s
+#: of patience, and one that has never paused earns the floor. Both terms must be exceeded,
+#: so neither a slow link nor a fast one is judged by the other's clock.
 STALL_FACTOR = 8.0
 
 #: How many times one object may be re-asked for. A grant is finite and the plan is per-object
@@ -157,9 +164,15 @@ class Deadline:
     the pull blocks until the transport itself gives up — which is honest: a runtime that
     substituted a number here would be deciding, on the user's behalf, that a large artifact
     on a slow link is a failure.
+
+    `silence` is the other kind of bound, and the only one a deadline-less single stream
+    gets: a cap on ONE socket operation that moves nothing, never on the transfer. A stream
+    the `_Streams` ledger watches does not need it; `placement_materialization.fetch_exact`
+    has no ledger and states `egress.SILENCE_SECONDS` here instead.
     """
 
     at: float | None = None
+    silence: float | None = None
 
     @staticmethod
     def after(seconds: float | None) -> Deadline:
@@ -167,7 +180,7 @@ class Deadline:
 
     def remaining(self) -> float | None:
         if self.at is None:
-            return None
+            return self.silence
         left = self.at - time.monotonic()
         if left <= 0:
             raise PullRefusal(
@@ -176,7 +189,7 @@ class Deadline:
                 "raise --timeout, or re-run: a pull resumes per object and re-fetches only "
                 "what is still missing",
             )
-        return left
+        return left if self.silence is None else min(left, self.silence)
 
 
 # ---------------------------------------------------------------- the SSRF guard
@@ -586,10 +599,19 @@ class _Streams:
     stalled. Its socket is shut down so the blocked read returns, and `_fetch` asks for that
     one object again. A genuinely slow link teaches this ledger its own pace and is left
     alone; only a stream that has stopped, against the evidence of the same pull, is ended.
+
+    A stream is judged from its RESPONSE, not from its request. Connect plus time-to-first-
+    byte is the origin's answer latency and it is MEASURED into the worst gap — a cold bucket
+    that takes 20 s to start answering has taught the ledger that this origin pauses for 20 s
+    — but it is not silence on a stream that has nothing to be silent on yet, and counting
+    it as such was how a slow-to-answer origin tripped the floor with every byte still to
+    come. Stalls are judged per stream against the whole pull's measured pace; the ledger
+    never compares a stream to its peers, and the refusal says so.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._opened: dict[int, float] = {}
         self._advanced: dict[int, float] = {}
         self._socket: dict[int, Any] = {}
         self._stalled: set[int] = set()
@@ -600,14 +622,26 @@ class _Streams:
     # ---- the streams' side
     def open(self, key: int) -> None:
         with self._lock:
-            self._advanced[key] = time.monotonic()
+            self._opened[key] = time.monotonic()
+            self._advanced.pop(key, None)
             self._socket.pop(key, None)
             self._stalled.discard(key)
 
     def bind(self, key: int, sock: Any) -> None:
+        """The response arrived: the stream is live from here, and how long the origin took
+        to answer is the first gap it has shown."""
+        now = time.monotonic()
         with self._lock:
+            opened = self._opened.pop(key, None)
+            if opened is not None:
+                self._worst_gap = max(self._worst_gap, now - opened)
+            self._advanced[key] = now
             if sock is not None:
                 self._socket[key] = sock
+
+    def patience(self) -> float:
+        with self._lock:
+            return max(STALL_FACTOR * self._worst_gap, STALL_SAMPLES * STALL_SAMPLE_SECONDS)
 
     def moved(self, key: int, count: int) -> None:
         """One chunk of `count` bytes arrived. Its GAP is what the stall rule is judged against.
@@ -632,6 +666,7 @@ class _Streams:
 
     def done(self, key: int) -> None:
         with self._lock:
+            self._opened.pop(key, None)
             self._advanced.pop(key, None)
             self._socket.pop(key, None)
             self._stalled.discard(key)
@@ -1059,8 +1094,9 @@ def _fetch(
                 if stalled:
                     raise PullRefusal(
                         "transfer_failed",
-                        f"{object_id}: the stream moved no bytes while its peers moved theirs, "
-                        f"{FETCH_ATTEMPTS} times",
+                        f"{object_id}: the stream stopped moving bytes {FETCH_ATTEMPTS} times, "
+                        f"each time for longer than the {streams.patience():.1f} s this pull's "
+                        f"own measured pace allowed ({STALL_FACTOR:g} times its longest gap)",
                         "this link drops streams rather than slowing them; re-run the pull, "
                         "and if it repeats the route between this worker and the object store "
                         "is the subject, not the artifact",

@@ -46,7 +46,15 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from cozy_runtime.internal import bindings as binding_table
-from cozy_runtime.internal import canonical, descriptor, fill, model_config
+from cozy_runtime.internal import (
+    canonical,
+    descriptor,
+    fill,
+    liveness,
+    model_config,
+    proctree,
+    pull,
+)
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants as grants_module
@@ -67,16 +75,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 LOCAL_PLACEMENT = "plc-local"
 
 _M = TypeVar("_M")
-
-#: What an OUTPUT TRANSACTION is allowed AFTER the handler returns: read the attempt spool,
-#: write every granted destination, mint the receipt. The grant outlives the attempt by this
-#: and by nothing more — it is a tail, never a lifetime.
-#:
-#: The lifetime itself is DERIVED FROM THE ATTEMPT (`LocalRecordOwner.expiry`). It used to be
-#: a 900 s constant derived from nothing, which is not a bound but a ceiling on what a job
-#: may be: job-001's dual production ran 20:15.89, landed its 99 GB artifact intact, and died
-#: `grant_expired: the output grant expired before the write`.
-GRANT_TAIL_SECONDS = 300
 
 
 class LocalBindingError(Exception):
@@ -228,7 +226,8 @@ class SliceOutcome:
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     publication_scope: str = ""
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
-    #: `worker_error` (the worker reported it could not become ready), `ready_timeout`, or
+    #: `worker_error` (the worker reported it could not become ready), `worker_wedged` (it
+    #: provably stopped working before it was ready — `LocalRecordOwner.watch`), or
     #: `record_owner_error` (this side failed). A one-shot run that cannot say this would
     #: have to pretend a hang was a result.
     ended: str = "unstarted"
@@ -297,7 +296,6 @@ class LocalRecordOwner:
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
         on_progress: Any = None,
-        ready_timeout: float = 1800.0,
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_digest
@@ -307,7 +305,6 @@ class LocalRecordOwner:
         self.package_revision_digest = package_revision_digest
         self.placement = placement
         self.auto_ack = auto_ack
-        self.ready_timeout = ready_timeout
         self.ended = "unstarted"
         self.error = ""
         self.host = InMemoryControlHost()
@@ -343,7 +340,6 @@ class LocalRecordOwner:
             wire_minor=WIRE_MINOR,
         )
         self.host.deliver(pb.RecordOwnerFrame(claim=claim))
-        threading.Thread(target=self._deadline, daemon=True, name="ready-deadline").start()
 
     def destination(self, output_id: str) -> Path:
         """The exact granted destination for one output field path."""
@@ -355,19 +351,82 @@ class LocalRecordOwner:
         if self._on_progress is not None:
             self._on_progress(frame)
 
-    def _deadline(self) -> None:
-        # A one-shot run gets a readiness DEADLINE: a person is sitting in front of it.
-        if self.done.wait(self.ready_timeout):
-            return
-        if not self.dispatched:
-            self.ended = "ready_timeout"
-            print(
-                f"[run] the worker never reported ready within {self.ready_timeout:g} s; "
-                "ending the run rather than waiting on it",
-                flush=True,
+    def watch(self, worker: Worker) -> None:
+        """Start the READINESS WATCH: end the run only when the worker has provably stopped.
+
+        A one-shot run used to get a readiness DEADLINE — 1800 s, no flag to raise it —
+        which killed a run whose worker was still downloading or loading a large model,
+        and the person in front of it got a hang report for a boot that was working. There
+        is no number of seconds a boot may take. What there is, is observation: the
+        worker's own boot cursors (`SilenceMonitor`: download, load, warm positions) and
+        the measured work of everything the boot runs — this process's working threads,
+        its executor, a `uv` install, a native-wheel probe — which `_boot_meter` folds into
+        one reading. The run ends `worker_wedged` when that reading has not changed for
+        longer than `liveness.Pace` allows against the pauses this boot has itself shown,
+        and never before the floor below. Readiness (`dispatched`) or any other end of the
+        run stops the watch.
+
+        The floor is DERIVED, not chosen. The deepest silence a healthy boot is permitted
+        to show is the pull ledger's own stall floor (`pull.STALL_SAMPLES *
+        STALL_SAMPLE_SECONDS`): a stream that has moved nothing for that long is re-asked
+        for, and the re-ask is progress this watch can see. An outside observer must be
+        more patient than that inner one, by the same factor the inner one applies to its
+        own measurements — so the floor is `STILL_FACTOR *` the pull floor, and a boot that
+        never paused is called wedged at that and not before.
+        """
+        threading.Thread(
+            target=self._watch, args=(worker,), daemon=True, name="ready-watch"
+        ).start()
+
+    def _watch(self, worker: Worker) -> None:
+        pace = liveness.Pace()
+        while not self.done.wait(liveness.SAMPLE_SECONDS):
+            if self.dispatched:
+                return
+            floor = liveness.STILL_FACTOR * pull.STALL_SAMPLES * pull.STALL_SAMPLE_SECONDS
+            pace.observe(self._boot_meter(worker))
+            if not pace.wedged(floor):
+                continue
+            open_steps = sorted(
+                f"{cursor.step}:{cursor.subject}"
+                for cursor in list(worker.monitor.cursors.values())
+                if not cursor.ended
             )
+            self.ended = "worker_wedged"
+            self.error = (
+                f"the worker stopped working before it was ready: "
+                f"{pace.verdict(floor)}; open boot steps: {', '.join(open_steps) or 'none'}"
+            )[:400]
+            print(f"[run] {self.error}; ending the run rather than waiting on it", flush=True)
             self.done.set()
             self.host.close()
+            return
+
+    @staticmethod
+    def _boot_meter(worker: Worker) -> object:
+        """One reading of everything the boot is doing, or None when it cannot be read.
+
+        Work by each of this process's threads (`progress_burn`: CPU plus bytes moved),
+        read per thread and summed over the ones that work — the lanes that wake on a clock
+        (`Worker.pollers`) and this watch itself are left out, never subtracted, because a
+        process total less a thread's own reading is two non-atomic reads and the difference
+        jitters by the bytes the watch itself moved in between; PLUS the same for every
+        descendant process; PLUS the boot cursors' positions and ends. Any change is
+        movement — a thread or child ending lowers the sum, and an ending is progress.
+        """
+        me = os.getpid()
+        quiet = worker.pollers | {threading.get_native_id()}
+        try:
+            threads = [int(name) for name in os.listdir(f"/proc/{me}/task")]
+            working = sum(liveness.burn(me, tid) or 0 for tid in threads if tid not in quiet)
+            below = sum(liveness.burn(pid) or 0 for pid in proctree.descendants(me))
+            cursors = tuple(
+                (cursor.subject, cursor.position, cursor.ended)
+                for cursor in list(worker.monitor.cursors.values())
+            )
+        except (OSError, proctree.ProcessTreeUnsupported, RuntimeError):
+            return None
+        return (working + below, cursors)
 
     def _env(self, message: _M) -> _M:
         """The owner's half of the three-field envelope (02 §0)."""
@@ -631,17 +690,21 @@ class LocalRecordOwner:
     # ------------------------------------------------------------------ documents
 
     def expiry(self) -> int:
-        """When this run's grant stops being authority — DERIVED, never a constant.
+        """When this run's grant stops being authority: NEVER, which `grants.expired()`
+        reads as 0.
 
-        A deadline is the caller's own bound, so the grant is that plus the tail an output
-        transaction needs. A run with NO deadline has no bound to derive one from, and
-        `grants.expired()` reads 0 as "does not expire": inventing a ceiling for a
-        run-to-completion job is exactly what job-001 hit. The expiry PATH is still walked
-        on every deadlined run, so the branch stays proven on the local door.
+        The owner is this process and every destination is a local file, so an expiry on
+        this grant protects nothing and can only lose a result. It did: a 900 s constant
+        lost job-001's 99 GB artifact (`grant_expired: the output grant expired before the
+        write`), and the derived form that replaced it — the caller's deadline plus a 300 s
+        tail for the output transaction — was the same ceiling one step removed, on how many
+        bytes an attempt may write after its handler returns (xs-007 row 13). The deadline
+        is enforced where it belongs, on the attempt (`deadline_s` to the executor and the
+        worker's own watchdog); the output transaction that follows runs until its bytes
+        have landed. A hub-minted grant carries the presign's real expiry, and the store
+        enforces that one.
         """
-        if not self.request.timeout_ms:
-            return 0
-        return int(time.time()) + self.request.timeout_ms // 1000 + GRANT_TAIL_SECONDS
+        return 0
 
     def _desired_state(self) -> pb.DesiredWorkerState:
         directive = self._env(
@@ -1503,6 +1566,7 @@ def run_slice(
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
     worker = Worker(config, options, record_owner.host)
     worker.watches.tap = record_owner.tap_progress
+    record_owner.watch(worker)
     if record_owner_hook is not None:
         record_owner_hook(record_owner, worker)
     started = time.perf_counter()
