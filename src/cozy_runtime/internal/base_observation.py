@@ -20,28 +20,32 @@ from packaging.version import InvalidVersion, Version
 _NAME_RUNS = re.compile(r"[-_.]+")
 _ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _UV_VERSION = re.compile(r"uv ([0-9]+(?:\.[0-9]+){1,3})(?: \([^\n]+\))?")
-_PROTECTED = frozenset(
-    {
-        "cozy-runtime",
-        "cozy-runtime-cuda-kernels",
-        "msgspec",
-        "tensorfs",
-        "torch",
-        "torchaudio",
-        "torchvision",
-        "triton",
-    }
-)
+# The worker-image-owned families and the import roots each one owns. This mapping is the
+# ONE list; `base-distributions.json` is generated from it (checks/architecture.py) and
+# cozy-creator's upload-side prune list is generated from that, so the client and the worker
+# cannot hold two different opinions about what the image provides.
+#
+# numpy and pillow belong here for the reason msgspec already did. numpy shares a compiled
+# ABI with the torch family the image pins; pillow is cozy-runtime's own public dependency
+# (`pillow>=12,<13`), so a package copy of either is loaded by image code, not only by the
+# package. Membership is narrow on purpose: it does not promote other incidental image
+# packages, which stay package-owned.
 _PROTECTED_IMPORT_ROOTS = {
     "cozy-runtime": ("cozy", "cozy_runtime"),
     "cozy-runtime-cuda-kernels": ("cozy_runtime_cuda_kernels",),
     "msgspec": ("msgspec",),
+    "numpy": ("numpy",),
+    "pillow": ("PIL",),
     "tensorfs": ("tensorfs",),
     "torch": ("torch",),
     "torchaudio": ("torchaudio",),
     "torchvision": ("torchvision",),
     "triton": ("triton",),
 }
+_PROTECTED = frozenset(_PROTECTED_IMPORT_ROOTS)
+# The accelerator runtime subtree the image installs beside Torch. It is a prefix rather
+# than a roster because its member names carry the CUDA major in them.
+_PROTECTED_PREFIXES = ("cuda-", "nvidia-")
 
 
 class ObservationRefusal(Exception):
@@ -286,7 +290,7 @@ def _uv_version() -> str:
 
 
 def _protected(name: str) -> bool:
-    return name in _PROTECTED or name.startswith(("cuda-", "nvidia-"))
+    return name in _PROTECTED or name.startswith(_PROTECTED_PREFIXES)
 
 
 def protected_distribution(name: str) -> bool:

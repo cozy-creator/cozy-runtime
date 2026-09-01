@@ -170,6 +170,27 @@ def _write_annotated_doc(root: Path, version: str) -> None:
     (package / "__init__.py").write_text(f"VALUE = {version!r}\n")
 
 
+def _write_pure_project(
+    root: Path, name: str, version: str, module: str, requires: tuple[str, ...] = ()
+) -> None:
+    package = root / "src" / module
+    package.mkdir(parents=True)
+    dependencies = ", ".join(repr(item) for item in requires)
+    (root / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["hatchling"]\n'
+        'build-backend = "hatchling.build"\n\n'
+        "[project]\n"
+        f'name = "{name}"\n'
+        f'version = "{version}"\n'
+        'requires-python = ">=3.12,<3.13"\n'
+        f"dependencies = [{dependencies}]\n\n"
+        "[tool.hatch.build.targets.wheel]\n"
+        f'packages = ["src/{module}"]\n'
+    )
+    (package / "__init__.py").write_text(f"VALUE = {version!r}\n")
+
+
 def _download_row(kind: pb.LocalDownloadKind, path: Path) -> pb.LocalDownloadFile:
     raw = path.read_bytes()
     return pb.LocalDownloadFile(
@@ -371,6 +392,71 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
                 (dependency_one_wheel, runtime_wheel),
                 worker_shadow,
             )
+
+
+def test_worker_image_owns_pillow_and_numpy_as_peer_dependencies() -> None:
+    """Pillow and NumPy are worker-image families, so no package copy can displace them.
+
+    Pillow is cozy-runtime's own public dependency (`pillow>=12,<13`) and NumPy shares a
+    compiled ABI with the Torch family the image pins, so image code — not only package code
+    — imports whatever ends up on the venv's path. `--system-site-packages` puts the package
+    venv AHEAD of the image, so an admitted copy wins the import.
+
+    Three facts, against the real interpreter this suite runs in:
+      * a package copy of pillow is image-owned: admitted as a fact, omitted from the install;
+      * a FOREIGN distribution that installs the same `PIL` import root is refused — this is
+        the shadow the distribution name alone never caught;
+      * a package requirement the image's pillow cannot satisfy is refused typed, which is
+        what replaces the copy the package was not allowed to bring.
+    """
+
+    uv = shutil.which("uv")
+    assert uv is not None
+    base = base_observation.current()
+    pillow = base.distribution_versions.get("pillow")
+    assert pillow, "this interpreter must carry the image's pillow"
+    assert base.root_providers.get("PIL") == ("pillow",)
+
+    with tempfile.TemporaryDirectory(prefix="cozy-image-owned.") as raw:
+        root = Path(raw)
+        vendored = root / "vendored-pillow"
+        foreign = root / "foreign-pil"
+        demanding = root / "demanding"
+        _write_pure_project(vendored, "pillow", "12.99.0", "PIL")
+        _write_pure_project(foreign, "shady-imaging", "0.0.1", "PIL")
+        _write_pure_project(demanding, "demanding", "0.0.1", "demanding", ("pillow>=13",))
+        dist = root / "dist"
+        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(ROOT))
+        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(PACKAGE))
+        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(vendored))
+        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(foreign))
+        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(demanding))
+        project_wheel = next(dist.glob("marco_polo-*.whl"))
+        runtime_wheel = next(dist.glob("cozy_runtime-*.whl"))
+        vendored_wheel = next(dist.glob("pillow-12.99.0-*.whl"))
+        foreign_wheel = next(dist.glob("shady_imaging-*.whl"))
+        demanding_wheel = next(dist.glob("demanding-*.whl"))
+
+        _base, package_wheels, supplied = package_environment.preflight_environment(
+            project_wheel, (vendored_wheel, runtime_wheel), base
+        )
+        assert "pillow" in {wheel.distribution for wheel in supplied}
+        assert "pillow" not in {wheel.distribution for wheel in package_wheels}
+
+        with pytest.raises(
+            package_environment.EnvironmentRefusal,
+            match="package_environment_shadows_base_import",
+        ):
+            package_environment.preflight_environment(
+                project_wheel, (foreign_wheel, runtime_wheel), base
+            )
+
+        with pytest.raises(package_environment.EnvironmentRefusal) as conflict:
+            package_environment.preflight_environment(
+                project_wheel, (demanding_wheel, runtime_wheel), base
+            )
+        assert conflict.value.code == "package_environment_dependency_base_conflict"
+        assert "the worker image provides pillow" in conflict.value.detail
 
 
 @needs_executor

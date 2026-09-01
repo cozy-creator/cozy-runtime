@@ -1,0 +1,18 @@
+{
+  "distributions": [
+    "cozy-runtime",
+    "cozy-runtime-cuda-kernels",
+    "msgspec",
+    "numpy",
+    "pillow",
+    "tensorfs",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "triton"
+  ],
+  "prefixes": [
+    "cuda-",
+    "nvidia-"
+  ]
+}
