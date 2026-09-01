@@ -137,7 +137,6 @@ def _prepare(args: argparse.Namespace) -> None:
         "entrypoints",
         "format",
         "jobs",
-        "model_productions",
     }:
         raise ProofFailure("fixture descriptor is not one closed PackageDescriptor/1")
     _require(

@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from cozy_runtime.author import ConformanceError, ProductionStep
+from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, descriptor
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.descriptor_compat import Result, classify_bytes
@@ -75,9 +75,23 @@ def _base() -> dict[str, Json]:
                 "result": {"fields": [{"name": "stored", "type": "bool"}]},
                 "publishes": True,
                 "resources": {"gpu_count": 1},
+                "models": [
+                    {
+                        "path": "archive.models.source",
+                        "class": "ExampleModel",
+                        "stamps": {},
+                        "component_use": {},
+                    }
+                ],
+                "artifact_outputs": [
+                    {
+                        "output_id": "model",
+                        "mime_type": "application/vnd.cozy.model-manifest",
+                        "max_bytes": 4096,
+                    }
+                ],
             }
         ],
-        "model_productions": [],
     }
 
 
@@ -173,105 +187,54 @@ def main() -> int:
 
     check("new job", "minor", add_job, "added job cleanup")
 
-    def add_production(doc: dict[str, Json]) -> None:
-        rows = doc["model_productions"]
-        assert isinstance(rows, list)
-        rows.append(
-            {
-                "name": "copy-model",
-                "sources": {"source": "hf/example/model/default"},
-                "steps": [
-                    {
-                        "name": "copy",
-                        "callable": "example/model@v1/copy",
-                        "models": {"model": "source"},
-                        "outputs": ["model"],
-                    }
-                ],
-                "outputs": [
-                    {
-                        "name": "model",
-                        "source": "copy.model",
-                        "required_contract": {
-                            "topology_digest": "sha256:" + "1" * 64,
-                            "encodings": ["sha256:" + "2" * 64],
-                        },
-                    }
-                ],
-            }
-        )
+    def source_profile(doc: dict[str, Json]) -> None:
+        models = _job(doc)["models"]
+        assert isinstance(models, list) and isinstance(models[0], dict)
+        models[0]["source_profile"] = "hf/example/model/default"
 
-    check("new model production", "minor", add_production, "added model production copy-model")
+    check("job source profile", "major", source_profile, "changed model metadata")
 
-    major_selected = ProductionStep(
-        name="copy",
-        callable="example/model@v1/copy",
-        models={"model": "source"},
-        outputs=("model",),
+    def artifact_contract(doc: dict[str, Json]) -> None:
+        outputs = _job(doc)["artifact_outputs"]
+        assert isinstance(outputs, list) and isinstance(outputs[0], dict)
+        outputs[0]["required_contract"] = {
+            "topology_digest": "sha256:" + "1" * 64,
+            "encodings": ["sha256:" + "2" * 64],
+        }
+
+    check(
+        "job artifact contract",
+        "major",
+        artifact_contract,
+        "changed job artifact output metadata",
     )
-    assert major_selected.callable == "example/model@v1/copy"
-    selected = _base()
-    add_production(selected)
-    selected_productions = selected["model_productions"]
-    assert isinstance(selected_productions, list) and isinstance(selected_productions[0], dict)
-    selected_steps = selected_productions[0]["steps"]
-    assert isinstance(selected_steps, list) and isinstance(selected_steps[0], dict)
-    selected_steps[0]["callable"] = major_selected.callable
-    parsed = descriptor.read_bytes(canonical.write(selected), "major-selected production")
-    parsed_productions = parsed["model_productions"]
-    assert isinstance(parsed_productions, list) and isinstance(parsed_productions[0], dict)
-    parsed_steps = parsed_productions[0]["steps"]
-    assert isinstance(parsed_steps, list) and isinstance(parsed_steps[0], dict)
-    assert parsed_steps[0]["callable"] == "example/model@v1/copy"
-    cases += 1
 
-    stale_lane = copy.deepcopy(selected)
-    stale_productions = stale_lane["model_productions"]
-    assert isinstance(stale_productions, list) and isinstance(stale_productions[0], dict)
-    stale_outputs = stale_productions[0]["outputs"]
-    assert isinstance(stale_outputs, list) and isinstance(stale_outputs[0], dict)
-    stale_outputs[0]["lane_key"] = "bf16"
-    try:
-        descriptor.read_bytes(canonical.write(stale_lane), "stale producer lane key")
-    except ConformanceError:
-        cases += 1
-    else:
-        raise AssertionError("producer-owned lane_key survived the Descriptor/1 hardcut")
+    def bad_source_profile(doc: dict[str, Json]) -> None:
+        models = _job(doc)["models"]
+        assert isinstance(models, list) and isinstance(models[0], dict)
+        models[0]["source_profile"] = "../foreign"
 
-    for invalid in (
-        "example/model/copy",
-        "example/model@v/copy",
-        "example/model@v01/copy",
-        "example/model@v1.0/copy",
-        "example/model@1/copy",
-    ):
+    def bad_artifact_topology(doc: dict[str, Json]) -> None:
+        outputs = _job(doc)["artifact_outputs"]
+        assert isinstance(outputs, list) and isinstance(outputs[0], dict)
+        outputs[0]["required_contract"] = {
+            "topology_digest": "not-a-digest",
+            "encodings": ["sha256:" + "2" * 64],
+        }
+
+    invalid_changes: tuple[tuple[str, Callable[[dict[str, Json]], None]], ...] = (
+        ("bad source profile", bad_source_profile),
+        ("bad artifact topology", bad_artifact_topology),
+    )
+    for name, change in invalid_changes:
+        invalid = _base()
+        change(invalid)
         try:
-            ProductionStep(
-                name="copy",
-                callable=invalid,
-                models={"model": "source"},
-                outputs=("model",),
-            )
-        except ConformanceError as exc:
-            assert exc.code == "production_callable"
+            descriptor.read_bytes(canonical.write(invalid), name)
+        except ConformanceError:
+            cases += 1
         else:
-            raise AssertionError(f"invalid production callable {invalid!r} was accepted")
-        cases += 1
-
-    before_with_production = _base()
-    add_production(before_with_production)
-    changed_production = copy.deepcopy(before_with_production)
-    rows = changed_production["model_productions"]
-    assert isinstance(rows, list) and isinstance(rows[0], dict)
-    outputs = rows[0]["outputs"]
-    assert isinstance(outputs, list) and isinstance(outputs[0], dict)
-    outputs[0]["name"] = "quantized-model"
-    result = classify_bytes(
-        canonical.write(before_with_production), canonical.write(changed_production)
-    )
-    assert result.classification == "major"
-    assert "model production copy-model changed" in result.reasons
-    cases += 1
+            raise AssertionError(f"{name} passed descriptor readback")
     check(
         "optional request field",
         "minor",

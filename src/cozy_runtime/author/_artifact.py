@@ -22,7 +22,10 @@ MAX_ARTIFACT_SOURCES = 16
 MAX_ARTIFACT_COMPONENTS = 64
 MAX_ARTIFACT_ADDITIONS = 65_536
 MAX_ARTIFACT_SOURCE_READ = 64 << 20
+MAX_ARTIFACT_NEW_BYTES = (1 << 53) - 1
+MAX_ARTIFACT_ENCODINGS = 32
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 @runtime_checkable
@@ -35,22 +38,47 @@ ArtifactBytes = bytes | bytearray | memoryview | Readable
 
 @dataclass(frozen=True, slots=True)
 class ArtifactOutput:
-    """One descriptor-declared model output and its new-byte ceiling."""
+    """One descriptor-declared model output, byte ceiling, and optional exact contract."""
 
     name: str
     max_new_bytes: int
+    topology_digest: str = ""
+    encodings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if _OUTPUT_NAME.fullmatch(self.name) is None:
+        if not isinstance(self.name, str) or _OUTPUT_NAME.fullmatch(self.name) is None:
             raise ConformanceError(
                 f"artifact output {self.name!r} is not a portable name",
                 code="artifact_output_name",
                 fields=[self.name],
             )
-        if self.max_new_bytes < 0:
+        if (
+            not isinstance(self.max_new_bytes, int)
+            or isinstance(self.max_new_bytes, bool)
+            or not 0 <= self.max_new_bytes <= MAX_ARTIFACT_NEW_BYTES
+        ):
             raise ConformanceError(
-                f"artifact output {self.name} max_new_bytes must be non-negative",
+                f"artifact output {self.name} max_new_bytes must be in "
+                f"0..={MAX_ARTIFACT_NEW_BYTES}",
                 code="artifact_output_bound",
+                fields=[self.name],
+            )
+        contracted = bool(self.topology_digest or self.encodings)
+        if contracted and (
+            not isinstance(self.topology_digest, str)
+            or _DIGEST.fullmatch(self.topology_digest) is None
+            or not isinstance(self.encodings, tuple)
+            or not 1 <= len(self.encodings) <= MAX_ARTIFACT_ENCODINGS
+            or tuple(sorted(set(self.encodings))) != self.encodings
+            or any(
+                not isinstance(value, str) or _DIGEST.fullmatch(value) is None
+                for value in self.encodings
+            )
+        ):
+            raise ConformanceError(
+                f"artifact output {self.name} contract requires one exact topology digest "
+                f"and 1..={MAX_ARTIFACT_ENCODINGS} sorted unique EncodingSpec digests",
+                code="artifact_output_contract",
                 fields=[self.name],
             )
 

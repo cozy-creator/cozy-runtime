@@ -13,7 +13,7 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.27` targets standard CPython 3.12 only. Project
+Runtime release `0.0.28` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
 delegation plus verified model files after private code preparation, and Runtime alone binds
@@ -222,16 +222,15 @@ the launch and invocation facts with current readers. It carries no Runtime-glob
 inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
 no release digest, build timestamp, machine path or mutable binding reached it.
-The same `/1` document may carry bounded `model_productions`: static graphs over ordinary job
-callables with fixed named outputs and independently verifiable contracts. Public model release and
-lane names are chosen later by the repository owner. Named source slots bind reviewed TensorFS source-profile IDs, so one foreign repository
-may yield several exact converter closures without a filename heuristic or a fake aggregate model.
-Each output contract contains only the final topology digest and sorted exact TensorFS EncodingSpec
-object IDs. Tensorhub derives both from the produced header; human task, structure and stamp labels
-cannot make bytes admissible. Static recipe assets remain private importlib resources of the job,
-not Creator inputs. Job and production-step resource floors use the same descriptor shape.
-Productions execute nothing and carry no concrete source selection, destination, credential or
-exact resolved job release.
+An ordinary `@app.job` may opt into source-first model production without introducing another
+workflow language. `source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
+inferred `Model` parameter exactly; each profile is emitted on that model row, beside the class and
+component-use contract it prepares. Each `ArtifactOutput` may declare `topology_digest=` and a
+sorted `encodings=` tuple. Those exact requirements appear under the output's
+`required_contract`; Tensorhub derives both from the produced header before retention. The
+executor still receives only verified model capabilities, never the foreign source credential or
+destination authority. Multiple transformations are ordinary code inside one bounded job—there is
+no `model_productions` graph, compatibility reader, or second scheduler.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
 refusals are shared and which are deliberate profile differences.

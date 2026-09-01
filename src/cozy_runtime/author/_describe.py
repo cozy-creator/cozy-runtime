@@ -172,6 +172,12 @@ def _separation(surface: Surface) -> None:
             "declares none",
             code="artifact_source_absent",
         )
+    if surface.source_profiles and not surface.artifact_outputs:
+        raise ConformanceError(
+            f"{surface.name}: source_profiles prepare inputs for a model-artifact job, but "
+            "this job declares no ArtifactOutput",
+            code="source_profile_without_artifact",
+        )
 
 
 def check(surface: Surface) -> Surface:

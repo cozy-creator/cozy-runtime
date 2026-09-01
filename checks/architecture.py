@@ -578,11 +578,11 @@ def fence_no_identifiers() -> list[str]:
             for call in ast.walk(tree)
             if isinstance(call, ast.Call)
             and (
-                (isinstance(call.func, ast.Name) and call.func.id == "ProductionContract")
-                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ProductionContract")
+                (isinstance(call.func, ast.Name) and call.func.id == "ArtifactOutput")
+                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ArtifactOutput")
             )
             for keyword in call.keywords
-            if keyword.arg in {"structure", "encodings"}
+            if keyword.arg in {"topology_digest", "encodings"}
             for value in ast.walk(keyword.value)
             if isinstance(value, ast.Constant)
         }
@@ -590,7 +590,7 @@ def fence_no_identifiers() -> list[str]:
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                 continue
             if id(node) in contract_values:
-                # A production contract is a requirement Tensorhub independently derives
+                # An artifact contract is a requirement Tensorhub independently derives
                 # from output bytes, not a model/release/checkpoint selection.
                 continue
             text = node.value.strip()
@@ -1039,19 +1039,41 @@ def fence_descriptor_minimality() -> list[str]:
     bad: list[str] = []
     if first_bytes != second_bytes:
         bad.append("two fresh example derivations produced different canonical bytes")
-    expected = {"format", "application", "entrypoints", "jobs", "model_productions"}
+    expected = {"format", "application", "entrypoints", "jobs"}
     if set(document) != expected:
         bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
     if document.get("format") != "cozy.package.descriptor/1":
         bad.append("descriptor has the wrong format")
-    productions = document.get("model_productions")
-    if not isinstance(productions, list) or not productions:
-        bad.append("descriptor has no model production fixture")
+    jobs = document.get("jobs")
+    four_lane = (
+        next(
+            (row for row in jobs if isinstance(row, dict) and row.get("name") == "four-lane"),
+            None,
+        )
+        if isinstance(jobs, list)
+        else None
+    )
+    if not isinstance(four_lane, dict):
+        bad.append("descriptor has no ordinary four-lane job fixture")
+    elif [row.get("source_profile") for row in four_lane.get("models", [])] != [
+        "hf/minimax-h3/native-dual-bf16/1",
+        "hf/minimax-h3/shared-bf16/1",
+    ]:
+        bad.append("four-lane source profiles changed or left the inferred model slots")
     else:
-        expected_production = {"name", "sources", "steps", "outputs"}
-        if not isinstance(productions[0], dict) or set(productions[0]) != expected_production:
-            fields = sorted(productions[0]) if isinstance(productions[0], dict) else []
-            bad.append(f"model production fields are {fields}, want {sorted(expected_production)}")
+        outputs = four_lane.get("artifact_outputs")
+        contract = (
+            outputs[0].get("required_contract")
+            if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict)
+            else None
+        )
+        if contract != {
+            "topology_digest": "sha256:" + "1" * 64,
+            "encodings": [
+                "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd"
+            ],
+        }:
+            bad.append("four-lane artifact contract changed or left its output slot")
     forbidden = {
         "attribute",
         "capabilities",
@@ -1093,9 +1115,7 @@ def fence_descriptor_minimality() -> list[str]:
         if isinstance(value, dict):
             for key, item in value.items():
                 scheduling_resource = (
-                    (".model_productions[" in where or ".jobs[" in where)
-                    and ".resources" in where
-                    and key in {"placement", "requires"}
+                    ".jobs[" in where and ".resources" in where and key in {"placement", "requires"}
                 )
                 if key in forbidden and not scheduling_resource:
                     bad.append(f"{where}.{key} is an unused descriptor fact")

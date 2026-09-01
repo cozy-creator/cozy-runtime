@@ -1652,6 +1652,9 @@ def run_retired_descriptor_shapes() -> list[str]:
             return f"NOT PROVEN — {name} refused with {exc.code}, not malformed_package_descriptor"
         return f"NOT PROVEN — retired descriptor shape {name} was accepted"
 
+    def four_lane(document: dict[str, Any]) -> dict[str, Any]:
+        return next(row for row in document["jobs"] if row.get("name") == "four-lane")
+
     hidden = clone()
     hidden["entrypoints"][0]["hidden"] = False
 
@@ -1706,33 +1709,47 @@ def run_retired_descriptor_shapes() -> list[str]:
     )
 
     topology_escape = clone()
-    topology_escape["model_productions"][0]["outputs"][0]["required_contract"][
-        "topology_digest"
-    ] = "not-a-digest"
+    four_lane(topology_escape)["artifact_outputs"][0]["required_contract"]["topology_digest"] = (
+        "not-a-digest"
+    )
 
     encoding_escape = clone()
-    encoding_escape["model_productions"][0]["outputs"][0]["required_contract"]["encodings"] = [
+    four_lane(encoding_escape)["artifact_outputs"][0]["required_contract"]["encodings"] = [
         "plain/1"
     ]
 
     encoding_order = clone()
-    encoding_order["model_productions"][0]["outputs"][0]["required_contract"]["encodings"] = [
+    four_lane(encoding_order)["artifact_outputs"][0]["required_contract"]["encodings"] = [
         "sha256:" + "2" * 64,
         "sha256:" + "1" * 64,
     ]
 
     source_profile_escape = clone()
-    source_profile_escape["model_productions"][0]["sources"]["dits"] = "../foreign-profile"
+    four_lane(source_profile_escape)["models"][0]["source_profile"] = "../foreign-profile"
+
+    source_profile_incomplete = clone()
+    del four_lane(source_profile_incomplete)["models"][0]["source_profile"]
+
+    artifact_bound_escape = clone()
+    four_lane(artifact_bound_escape)["artifact_outputs"][0]["max_bytes"] = 1 << 53
+
+    artifact_contract_incomplete = clone()
+    del four_lane(artifact_contract_incomplete)["artifact_outputs"][0]["required_contract"][
+        "encodings"
+    ]
 
     return [
         refused("hidden", hidden),
         refused("param", param),
         refused("required-wire", required_wire),
         refused("repeated-tag-field", old_tag),
-        refused("production-topology-invalid", topology_escape),
-        refused("production-encoding-alias", encoding_escape),
-        refused("production-encoding-order", encoding_order),
-        refused("production-source-profile-escape", source_profile_escape),
+        refused("artifact-topology-invalid", topology_escape),
+        refused("artifact-encoding-alias", encoding_escape),
+        refused("artifact-encoding-order", encoding_order),
+        refused("job-source-profile-escape", source_profile_escape),
+        refused("job-source-profile-incomplete", source_profile_incomplete),
+        refused("artifact-byte-bound", artifact_bound_escape),
+        refused("artifact-contract-incomplete", artifact_contract_incomplete),
     ]
 
 
