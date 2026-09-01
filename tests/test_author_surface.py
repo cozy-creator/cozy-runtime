@@ -26,14 +26,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
+import msgspec
 import pytest
 
 from cozy_runtime.author import (
     CapabilityError,
     Context,
+    FileAsset,
+    InvalidRequest,
     Model,
     ModelRegistry,
+    decode_request,
     uses_components,
 )
 from cozy_runtime.author._loader import (
@@ -45,6 +50,7 @@ from cozy_runtime.author._loader import (
     census,
 )
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author.fakes import fake_attempt, fake_input, fake_outputs
 
 MANIFEST = "sha256:" + "ab" * 32
 
@@ -191,3 +197,42 @@ def test_a_job_model_is_a_plain_manifest_record() -> None:
     with pytest.raises(CapabilityError) as not_ready:
         job_model.for_request(_ctx())
     assert not_ready.value.code == "not_ready"
+
+
+def test_a_saved_output_becomes_a_granted_input(tmp_path: Path) -> None:
+    """`fake_input` is the round trip the executor performs: one attempt's OUTPUT is the
+    next attempt's granted input, hydrated through the same `bind` with the same facts."""
+    out = fake_outputs(fake_attempt("first", spool=tmp_path / "first"))
+    saved = out.save_bytes(b"payload bytes", media_type="application/octet-stream")
+
+    granted = fake_input(saved, attempt="second", input_id="document", max_decoded_bytes=1 << 20)
+
+    assert type(granted) is type(saved)
+    assert granted is not saved
+    assert granted.ref == saved.ref
+    assert granted.hydrated
+    assert granted.digest == saved.digest
+    assert granted.size_bytes == saved.size_bytes
+    assert granted.read_bytes() == b"payload bytes"
+
+    with pytest.raises(CapabilityError):
+        fake_input(FileAsset("file:never-hydrated"), attempt="second")
+
+
+def test_a_request_decodes_only_through_the_supported_path() -> None:
+    """`decode_request` is the one wire path: a ref STRING hydrates nothing, and anything
+    that does not validate arrives as `InvalidRequest` rather than a msgspec error."""
+
+    class Request(msgspec.Struct):
+        document: FileAsset
+        count: int = 1
+
+    decoded = decode_request(Request, {"document": "file:abc", "count": 3})
+    assert decoded.document.ref == "file:abc"
+    assert not decoded.document.hydrated
+    assert decoded.count == 3
+
+    with pytest.raises(InvalidRequest):
+        decode_request(Request, {"document": {"ref": "file:abc", "local": "/etc/passwd"}})
+    with pytest.raises(InvalidRequest):
+        decode_request(Request, {"document": "file:abc", "count": "many"})

@@ -45,7 +45,7 @@ from cozy_runtime.author._decode import (
     MediaDecodeError,
     MediaDecoder,
 )
-from cozy_runtime.author._defaults import Clamp, Overlay, Recipe
+from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
@@ -244,6 +244,7 @@ __all__ = [
     "attempt",
     "canonical_json",
     "classify",
+    "decode_request",
     "describe",
     "invoke",
     "prepare",
