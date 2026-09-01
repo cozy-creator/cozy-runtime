@@ -9,8 +9,9 @@ MAX_WEIGHTS_OBJECTS = 65536
 MAX_WEIGHTS_READ_BYTES = 4 << 20
 MAX_WEIGHTS_GRANT_URL_BYTES = 16 << 10
 
-# The ceiling every content-bearing bound above must respect: the control stream carries
-# control, not content. See the schema header; th-094 lands the fence.
+# The ceiling every content-bearing bound here must respect: the control stream carries control,
+# not content. It has no carve-out: the tensorhub fence in scripts/fence.py convicts any
+# content-bearing bound declared above it.
 MAX_INLINE_CONTROL_BYTES = 4 << 20
 MAX_MODEL_SOURCE_FILES = 4096
 MAX_MODEL_SOURCE_PROFILES = 16
@@ -21,7 +22,5 @@ MAX_MODEL_SOURCE_LICENSE_BYTES = 4096
 MAX_MODEL_SOURCE_URL_BYTES = 16 << 10
 MAX_CHECKPOINT_EVIDENCE_BYTES = 64 << 10
 MAX_PRIVATE_PACKAGE_FILES = 33
-MAX_PRIVATE_PACKAGE_CHUNK_BYTES = 1 << 20
 MAX_PRIVATE_PACKAGE_FILENAME_BYTES = 255
-MAX_PRIVATE_PACKAGE_FILE_BYTES = 512 << 20
-MAX_PRIVATE_PACKAGE_AGGREGATE_BYTES = 1 << 30
+MAX_PRIVATE_PACKAGE_GRANT_URL_BYTES = 16 << 10
