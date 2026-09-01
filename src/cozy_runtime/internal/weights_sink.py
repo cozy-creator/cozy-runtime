@@ -30,6 +30,9 @@ from cozy_runtime.author._weights import (
     WeightsConfig,
     WeightsHostTransaction,
     WeightsReceipt,
+    WeightsSource,
+    WeightsSourcePart,
+    WeightsSourceTensor,
     WeightsTarget,
 )
 from cozy_runtime.protocol import documents, weights_limits
@@ -214,6 +217,61 @@ class WeightsTransactionHost:
             writer=writer,
             receipt=None,
         )
+
+    def structure(self, manifest: str) -> WeightsSource:
+        """Project one granted Manifest to author-safe structural facts only."""
+        if manifest not in self.allowed_sources:
+            raise CapabilityError(
+                f"weights source {manifest} is not in the immutable grant",
+                code="weights_source_ungranted",
+            )
+        try:
+            import tensorfs
+
+            held = self.store.manifest(manifest)
+            header = tensorfs.parse_header(bytes(held["header"]))
+            configs = header.get("configs") or {}
+            components = header.get("components")
+            if not isinstance(configs, Mapping) or not isinstance(components, Mapping):
+                raise ValueError("header configs/components are not mappings")
+            tensors: list[WeightsSourceTensor] = []
+            for component, table in components.items():
+                if not isinstance(table, Mapping):
+                    raise ValueError(f"component {component!r} is not a tensor mapping")
+                for key, entry in table.items():
+                    if not isinstance(entry, Mapping):
+                        raise ValueError(f"tensor {component}/{key} is not a mapping")
+                    logical = entry.get("logical")
+                    parts = entry.get("parts")
+                    if not isinstance(logical, Mapping) or not isinstance(parts, Mapping):
+                        raise ValueError(f"tensor {component}/{key} has no logical/parts maps")
+                    tensors.append(
+                        WeightsSourceTensor(
+                            component=str(component),
+                            key=str(key),
+                            logical_dtype=str(logical["dtype"]),
+                            shape=tuple(int(value) for value in logical["shape"]),
+                            parts=tuple(
+                                WeightsSourcePart(
+                                    name=str(role),
+                                    dtype=str(part["dtype"]),
+                                    shape=tuple(int(value) for value in part["shape"]),
+                                )
+                                for role, part in parts.items()
+                            ),
+                        )
+                    )
+            return WeightsSource(
+                configs=tuple(str(name) for name in configs),
+                tensors=tuple(tensors),
+            )
+        except CapabilityError:
+            raise
+        except Exception as exc:
+            raise CapabilityError(
+                f"TensorFS source structure refused: {type(exc).__name__}: {exc}",
+                code="weights_source_refused",
+            ) from exc
 
     def transaction_id(self, output_slot: str) -> str:
         subject = canonical_json.encode(

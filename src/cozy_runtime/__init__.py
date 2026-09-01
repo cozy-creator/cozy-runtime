@@ -7,7 +7,7 @@ from cozy_runtime.protocol import WIRE_MINOR
 
 del _interpreter
 
-__version__ = "0.0.33"
+__version__ = "0.0.34"
 
 # The two independent semvers reported by `cozy-runtime version`.
 PYTHON_CONTRACT_VERSION = "0.0.2"
