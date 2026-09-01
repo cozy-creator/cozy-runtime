@@ -256,17 +256,23 @@ def fence_no_interactive() -> list[str]:
 
 
 def fence_excluded_keywords() -> list[str]:
-    """No author-callable may take a device, dtype, path, offload, pin, eviction, compile or
-    source-converter keyword: every one names a decision the runtime owns (§1.1/§7).
+    """The API the runtime PUBLISHES to authors declares no device, dtype, offload, pin,
+    eviction, compile or source-converter keyword: every one names a decision it owns
+    (§1.1/§7).
+
+    Scope is `src/cozy_runtime/author/**` — the runtime's own definitions, which is a fact
+    about the surface we ship and nothing observes at runtime. A PACKAGE's model methods are
+    a different surface and need no fence: `_model._check_signature` refuses one at
+    decoration and `_describe._model_clock` again at describe, both `excluded_keyword`, and
+    `tests/test_author_surface.py` drives that refusal.
 
     Dunder and private callables are the RUNTIME's own plumbing (the runtime hands the
-    Loader its device); the fence covers exactly what author code can call.
+    Loader its device). `path=` stays out of the SCAN because `out.save_file(path)` is a
+    legitimate published surface; the in-band clock still refuses it on a model method.
     """
     from cozy_runtime.author._model import EXCLUDED_KEYWORDS
 
-    # `path=` stays out of the SCAN: `out.save_file(path)` is a legitimate author surface
-    # (a file the handler produced), and the model-method clock still refuses it in-band.
-    # `author/fakes.py` supplies the RUNTIME's side of the contract, so it is exempt too.
+    # `author/fakes.py` supplies the RUNTIME's side of the contract, so it is exempt.
     fenced = {k: v for k, v in EXCLUDED_KEYWORDS.items() if k != "path"}
     bad: list[str] = []
     for path in py_files():

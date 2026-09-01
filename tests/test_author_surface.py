@@ -20,6 +20,10 @@ Each arm below refuses on the commit before cr-060's corrective. What the arms c
   lease that admits before the method body runs, and the request-state-escape fence.
 * `test_a_job_model_is_a_plain_manifest_record` — the derive-only Model is a record now,
   not an instance whose every attribute read ran an interception.
+* `test_a_method_may_not_declare_a_runtime_decision` — the §1.1 refusal a PACKAGE meets in
+  band, driven through the real decorator. It is behaviour, so it is tested here rather
+  than scanned; `checks/architecture.py` holds only the structural half, over the runtime's
+  own published definitions.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import pytest
 
 from cozy_runtime.author import (
     CapabilityError,
+    ConformanceError,
     Context,
     FileAsset,
     InvalidRequest,
@@ -236,3 +241,16 @@ def test_a_request_decodes_only_through_the_supported_path() -> None:
         decode_request(Request, {"document": {"ref": "file:abc", "local": "/etc/passwd"}})
     with pytest.raises(InvalidRequest):
         decode_request(Request, {"document": "file:abc", "count": "many"})
+
+
+def test_a_method_may_not_declare_a_runtime_decision() -> None:
+    """A model method that offers a placement knob is refused where it is WRITTEN (§1.1)."""
+    with pytest.raises(ConformanceError) as refused:
+
+        class Placed(Model[Pipeline]):
+            @uses_components("transformer")
+            def denoise(self, device: str = "cuda") -> str:
+                return device
+
+    assert refused.value.code == "excluded_keyword"
+    assert refused.value.fields == ("device",)
