@@ -104,9 +104,9 @@ class RuntimeConfig:
 class WorkerHostConfig:
     """The fixed product-host handoff to ``cozy-runtime-worker``.
 
-    Paths are image-contract constants from ``runtime-worker-host-paths.json`` rather than
-    environment configuration. The readiness HMAC remains supervisor-only. Desired placements,
-    accepted placements and attempts arrive after Claim over WorkerControl.
+    Fixed filesystem paths are Runtime constants, not environment configuration. The readiness
+    HMAC remains supervisor-only. Desired placements, accepted placements and attempts arrive
+    after Claim over WorkerControl.
     """
 
     worker_id: str

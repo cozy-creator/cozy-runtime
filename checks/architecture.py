@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
-import json
 import pathlib
 import re
 import sys
@@ -36,6 +35,8 @@ import zipfile
 from collections.abc import Iterator
 
 from packaging.version import InvalidVersion, Version
+
+from cozy_runtime.internal import host_paths
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
@@ -1544,16 +1545,11 @@ def fence_delivery_plan_observation() -> list[str]:
 
 
 def fence_pod_media_grant_root() -> list[str]:
-    """The host-path vector is the one pod-supervisor/Runtime media-root authority."""
+    """The worker grants media only from its fixed media root."""
 
     path = SRC / "cli" / "runtime_worker.py"
-    vector_path = SRC / "vectors" / "runtime-worker-host-paths.json"
-    vector = json.loads(vector_path.read_text())
-    if vector.get("media_root") != "/var/lib/cozy/media":
-        return [
-            f"{vector_path.relative_to(ROOT)}: media_root must equal pod-supervisor's exact "
-            "`/var/lib/cozy/media` root"
-        ]
+    if pathlib.Path("/var/lib/cozy/media") != host_paths.MEDIA_ROOT:
+        return ["src/cozy_runtime/internal/host_paths.py: MEDIA_ROOT must be /var/lib/cozy/media"]
     if "grant_roots=(str(host_paths.MEDIA_ROOT),)" not in path.read_text():
         return [
             f"{path.relative_to(ROOT)}: fixed worker no longer derives grant_roots from "
