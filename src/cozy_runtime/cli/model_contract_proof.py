@@ -730,7 +730,7 @@ def _code_topology(raw: bytes) -> bytes:
         rows = [
             tensorfs.CodeTensor(
                 component=tensor.component,
-                key=tensor.key,
+                key=_component_local_key(tensor.component, tensor.key),
                 dtype=storage_dtype[tensor.dtype or contract.DEFAULT_DTYPE],
                 shape=tensor.shape,
                 accepts="any",
@@ -740,11 +740,25 @@ def _code_topology(raw: bytes) -> bytes:
             )
         ]
         return bytes(tensorfs.code_topology(_sha(raw), rows))
+    except ProofRefusal:
+        raise
     except Exception as err:
         raise ProofRefusal(
             "model_contract_code_topology_refused",
             f"TensorFS CodeTopology projection refused: {type(err).__name__}: {err}",
         ) from err
+
+
+def _component_local_key(component: str, key: str) -> str:
+    """Project Runtime's full destination key into one TensorFS component."""
+
+    prefix = f"{component}."
+    if not key.startswith(prefix) or len(key) == len(prefix):
+        raise ProofRefusal(
+            "model_contract_component_key_invalid",
+            f"logical tensor {key!r} is not under component {component!r}",
+        )
+    return key[len(prefix) :]
 
 
 def _read_exact(ref: LocalDocumentRef, name: str) -> bytes:

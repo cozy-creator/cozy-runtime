@@ -39,6 +39,8 @@ UV_OFFLINE=1 "$uv_bin" pip install --offline --python "$proof_root/driver/bin/py
     "$runtime_wheel" "$torch_wheel" "$tensorfs_wheel"
 driver_python="$proof_root/driver/bin/python"
 
+(cd / && env -u PYTHONPATH "$driver_python" "$support" component-keys)
+
 descriptor="$proof_root/package-descriptor.json"
 (cd / && env -u PYTHONPATH UV_OFFLINE=1 PIP_NO_INDEX=1 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \

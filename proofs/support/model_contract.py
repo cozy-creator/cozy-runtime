@@ -23,6 +23,7 @@ from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
 
+from cozy_runtime.cli.model_contract_proof import ProofRefusal, _component_local_key
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -61,6 +62,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     variant_red = sub.add_parser("variant-red-request")
     variant_red.add_argument("root", type=Path)
 
+    # Component is a namespace in TensorFS, so keys below it are component-local.
+    sub.add_parser("component-keys")
+
     verify = sub.add_parser("verify")
     verify.add_argument("root", type=Path)
 
@@ -86,9 +90,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProofFailure("cold model bindings are malformed")
         bindings[0]["hardware_variants"] = ["gpu"]
         _json(args.root / "model-variant-red.json", request)
+    elif args.command == "component-keys":
+        _component_key_proof()
     else:
         _verify(args.root)
     return 0
+
+
+def _component_key_proof() -> None:
+    _require(
+        _component_local_key("transformer", "transformer.blocks.0.weight") == "blocks.0.weight",
+        "component prefix was not stripped exactly once",
+    )
+    _require(
+        _component_local_key("transformer", "transformer.transformer.weight")
+        == "transformer.weight",
+        "nested component-looking key was stripped twice",
+    )
+    for key in ("other.blocks.0.weight", "transformer"):
+        try:
+            _component_local_key("transformer", key)
+        except ProofRefusal as err:
+            _require(
+                err.code == "model_contract_component_key_invalid",
+                f"foreign component key returned {err.code}",
+            )
+        else:
+            raise ProofFailure(f"foreign component key passed: {key}")
 
 
 def _prepare(args: argparse.Namespace) -> None:
@@ -267,6 +295,22 @@ def _verify(root: Path) -> None:
         topology_refs == {_digest(raw) for raw in topologies},
         "result index does not bind every exact CodeTopology output",
     )
+    for raw in topologies:
+        topology = _parse_canonical(raw)
+        _require(
+            isinstance(topology, dict)
+            and topology.get("components")
+            == {
+                "core": {
+                    "weight": {
+                        "accepts": "any",
+                        "dtype": "bf16",
+                        "shape": [4],
+                    }
+                }
+            },
+            f"CodeTopology did not use component-local keys: {topology!r}",
+        )
     variants = {
         variant["hardware_variant"]
         for binding in index["functions"][0]["bindings"]
