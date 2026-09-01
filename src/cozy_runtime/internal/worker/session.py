@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import itertools
@@ -42,6 +43,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -943,6 +945,9 @@ class Worker:
         #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
         #: worker has stopped retrying and `converged_revision` stays behind on purpose.
         self.latched = ""
+        #: The latch this worker has already TOLD an owner about. A latch it never published
+        #: is a refusal only this process can read (cr-061); see `_publish_latch`.
+        self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
@@ -995,6 +1000,7 @@ class Worker:
         self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
         self.supervision.on_exit = self.executor_exited
+        self.supervision.on_lane_failure = self.fail_machine
         self.connected = threading.Event()
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
@@ -1030,6 +1036,7 @@ class Worker:
         )
         supervision.on_invalidate = lambda why: self._hosted_capacity_dropped(placement_id, why)
         supervision.on_exit = lambda executor: self._hosted_executor_exited(placement_id, executor)
+        supervision.on_lane_failure = self.fail_machine
         killed = supervision.sweep_orphans()
         if killed:
             self.note(
@@ -1390,6 +1397,39 @@ class Worker:
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
+    def _publish_latch(self) -> None:
+        """A LATCH IS A REFUSAL, AND A REFUSAL AN OWNER CANNOT READ IS A HANG.
+
+        `latched` is written at a dozen sites and every one of them says the same thing: this
+        worker has stopped moving for the accepted revision and dispatchability will never
+        arrive. Half of those sites also typed a `Fault`; the rest only wrote the string and
+        printed it, which is worker-local — the refusal was correct, rendered on this
+        process's own stderr, and completely invisible on the wire, so an owner waiting for
+        dispatchability waited for something no longer being produced (cr-061).
+
+        Publication belongs on the REPORT, once, and not at each site remembering to: a site
+        can forget, and eight of them had. The typed cause fault a site raises is about the
+        THING that failed; this one is about the WORKER having stopped, which is the fact an
+        owner without retry authority has to act on.
+        """
+        if self.latched == self._published_latch:
+            return
+        self._published_latch = self.latched
+        if not self.latched:
+            return
+        subject = self.options.worker_id
+        if self.accepted.mode == "serving" and self.placement is not None:
+            subject = self.placement.placement_id or subject
+        reason, _, cause = self.latched.partition(": ")
+        self.engine.fault(
+            pb.Fault(
+                kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                subject=subject,
+                reason=reason[:200] or "latched",
+                detail=safe(cause or self.latched)[:1024],
+            )
+        )
+
     def bump_admission(self, why: str) -> None:
         """The ONE worker-level admission fence moves (§6). Callers: executor respawn,
         window resize, phase change, cutover, and every serving-axis edge above."""
@@ -1452,6 +1492,8 @@ class Worker:
         the placement. The previous set keeps serving (fallback-retention, #474)."""
         self.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
         self.engine.fault(fault)
+        # This fault IS the publication; `_publish_latch` must not repeat it.
+        self._published_latch = self.latched
         self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "activation failed; LATCHED")
         self._settle()
 
@@ -1473,6 +1515,38 @@ class Worker:
             )
         )
         self.set_phase(pb.WorkerPhase.WORKER_PHASE_FAILED, why)
+
+    def _lane(self, name: str, body: Callable[..., None], *args: Any) -> Callable[[], None]:
+        """Wrap one worker lane so its DEATH is a reported fact rather than a silence.
+
+        Each lane below is the sole producer of some terminal: the device lane produces
+        attempt outcomes, convergence produces a placement's verdict, the sender is the only
+        thing that puts a frame on the stream. Nothing on the wire describes a dead Python
+        thread, so a lane that dies leaves whoever waits on that terminal waiting on a
+        producer that no longer exists — the exact shape cr-061 hit from the other direction.
+
+        The answer is the one fact every owner already reads: `WORKER_PHASE_FAILED`. And
+        where the host IS the stream — the local one-shot door, whose `persistent` is False —
+        the stream is closed too, so the process EXITS with a non-zero code instead of
+        sitting on a queue nothing will ever fill again.
+        """
+
+        def guarded() -> None:
+            try:
+                body(*args)
+            except BaseException as exc:
+                detail = f"the {name} lane died: {type(exc).__name__}: {exc}"[:400]
+                traceback.print_exc()
+                self.exit_code = int(Exit.internal)
+                with contextlib.suppress(Exception):
+                    self.note("recovery", detail)
+                with contextlib.suppress(Exception):
+                    self.fail_machine(detail)
+                if not self.host.persistent:
+                    with contextlib.suppress(Exception):
+                        self.host.stop()
+
+        return guarded
 
     def capacity_dropped(self, why: str) -> None:
         """The executor's state was invalidated: STOP ADVERTISING DISPATCHABLE, right now."""
@@ -1628,8 +1702,7 @@ class Worker:
             self._send_claim_ack(claim, generation, send)
 
         sender = threading.Thread(
-            target=self._pump_outbound,
-            args=(generation, send, outbound),
+            target=self._lane("control-send", self._pump_outbound, generation, send, outbound),
             daemon=True,
             name=f"control-send-{generation}",
         )
@@ -2156,6 +2229,7 @@ class Worker:
                 except ExecutorGone as exc:
                     self.latched = f"executor_reclaim_failed: {exc}"[:200]
                     self.note("recovery", self.latched)
+                    self._settle()
             self.placement = None
             self.pending = None
             self._retire_hosted(set())
@@ -2917,7 +2991,7 @@ class Worker:
                 )
             except ExecutorGone as exc:
                 self.note("boot", f"the serving executor could not be reclaimed: {exc}")
-                self.latched = "job_executor_reclaim_failed"
+                self.latched = f"job_executor_reclaim_failed: {exc}"[:200]
                 self._settle()
                 return
         plans = self.config.cozy_home / "job-plans"
@@ -2932,6 +3006,7 @@ class Worker:
                 )
             )
             self.latched = "unresolved_job_descriptor"
+            self._settle()
             return
         binding = JobBinding.read(json.loads(record.read_text()))
         if (
@@ -2948,6 +3023,7 @@ class Worker:
                 )
             )
             self.latched = "job_plan_mismatch"
+            self._settle()
             return
         self.supervision.use_environment(binding.python, binding.environment_content_digest)
         self.jobs[job.job_descriptor_id] = binding
@@ -2965,7 +3041,9 @@ class Worker:
             executor = self.supervision.spawn(imposed=self.imposed())
         except ExecutorGone as exc:
             self.note("boot", f"the job executor never dialled back: {exc}")
-            self.latched = "job_executor_absent"
+            # The CAUSE rides the latch. `job_executor_absent` alone names the shape and
+            # nothing an operator can act on, and the latch is what reaches the owner.
+            self.latched = f"job_executor_absent: {exc}"[:200]
             self._settle()
             return
         executor.reserved_for_job = True
@@ -3937,7 +4015,11 @@ class Worker:
         Serving truth is PER PLACEMENT; job mode reports its capacity credit. Before any
         desired state it reports NEITHER — an honest "no claim yet" rather than a fabricated
         zero.
+
+        The LATCH is folded in here rather than at the sites that set it, so that no report
+        can leave describing a worker that has stopped without saying that it has.
         """
+        self._publish_latch()
         observed = pb.ObservedWorkerState(
             accepted_desired_state_revision=self.accepted.accepted_desired_state_revision,
             converged_revision=self.converged_revision(),
@@ -4155,12 +4237,20 @@ class Worker:
             # here and not at the first claim, because a worker is online whether or not a
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
-            threading.Thread(target=self.device_lane, daemon=True, name="device-lane").start()
             threading.Thread(
-                target=self.convergence_lane, daemon=True, name="convergence-lane"
+                target=self._lane("device", self.device_lane), daemon=True, name="device-lane"
             ).start()
-            threading.Thread(target=self.reporter, daemon=True, name="report").start()
-            threading.Thread(target=self.watchdog, daemon=True, name="watchdog").start()
+            threading.Thread(
+                target=self._lane("convergence", self.convergence_lane),
+                daemon=True,
+                name="convergence-lane",
+            ).start()
+            threading.Thread(
+                target=self._lane("report", self.reporter), daemon=True, name="report"
+            ).start()
+            threading.Thread(
+                target=self._lane("watchdog", self.watchdog), daemon=True, name="watchdog"
+            ).start()
         try:
             self.host.serve(self)
         finally:

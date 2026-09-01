@@ -552,6 +552,15 @@ class LocalRecordOwner:
             self.done.set()
             self.host.close()
             return
+        refusal = self._refusal(report)
+        if refusal:
+            self.marks.setdefault("ready", time.perf_counter())
+            self.ended = "worker_error"
+            self.error = f"the worker refused to become ready: {refusal}"[:400]
+            print(f"[run] {self.error}", flush=True)
+            self.done.set()
+            self.host.close()
+            return
         open_window = (
             report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
             and report.available_attempt_slots > 0
@@ -567,35 +576,35 @@ class LocalRecordOwner:
                 and status.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
                 and binding_digest in status.dispatchable_binding_digests
             )
-            if status is not None and not self.dispatched and not ready:
-                selected_fault = next(
-                    (
-                        fault
-                        for fault in report.faults
-                        if fault.subject in {LOCAL_PLACEMENT, self._binding_digest()}
-                        and fault.kind
-                        in {
-                            pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                        }
-                    ),
-                    None,
-                )
-                if selected_fault is not None:
-                    self.marks.setdefault("ready", time.perf_counter())
-                    self.ended = "worker_error"
-                    self.error = (
-                        f"placement activation refused: {selected_fault.reason}: "
-                        f"{selected_fault.detail}"
-                    )[:400]
-                    self.done.set()
-                    self.host.close()
-                    return
         if ready and not self.dispatched:
             self.marks["ready"] = time.perf_counter()
             self.dispatched = True
             self._dispatch()
+
+    def _refusal(self, report: pb.ObservedWorkerState) -> str:
+        """Whatever the worker has published that stops THIS run from ever dispatching.
+
+        A one-shot local run holds one placement, one binding, one attempt and NO retry
+        authority: nobody is going to send a second desired revision, so a typed fault raised
+        before dispatch is, by construction, the answer. The rule used to be narrower than
+        that in two ways, and both were hangs (cr-061): it read three fault kinds in serving
+        mode, so every other typed refusal was invisible, and it did not look at all in JOB
+        mode. A `run` on a host without cgroup delegation therefore printed a correct,
+        complete diagnosis on the worker's own stderr and then sat until SIGKILL.
+
+        Reading EVERY fault is the fix, and it is not a loose one: the worker publishes a
+        fault when it has stopped, and a fault a one-shot owner cannot act on has no business
+        on the wire in the first place.
+        """
+        if self.dispatched or self.terminal is not None or self.done.is_set():
+            return ""
+        faults = list(report.faults)
+        for status in report.placements:
+            faults.extend(status.faults)
+        if not faults:
+            return ""
+        first = faults[0]
+        return f"{first.reason}: {first.detail}" if first.detail else first.reason
 
     def _on_outcome(self, outcome: pb.AttemptOutcome) -> None:
         self.terminal = outcome

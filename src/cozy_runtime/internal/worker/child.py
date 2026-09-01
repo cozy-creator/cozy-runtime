@@ -31,6 +31,7 @@ import signal
 import socket
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,6 +268,13 @@ class ExecutorSupervision:
         worker has no business publishing one. See `invalidate`."""
         self.on_change: Callable[[Executor | None], None] | None = None
         """Session-owned projection updated at the same publication/clear boundary."""
+        self.on_lane_failure: Callable[[str], None] | None = None
+        """Session-owned reaction to one of THIS object's own threads dying.
+
+        The launcher and the per-incarnation exit watcher are sole producers: nothing else
+        launches a child, and nothing else notices one dying. A thread that dies here is a
+        producer that has stopped without saying so, and the session's answer is a machine
+        failure an owner can read — never a silence (cr-061)."""
         self.on_exit: Callable[[Executor], None] | None = None
         """Session-owned reaction to an exact current child becoming waitable.
 
@@ -558,15 +566,18 @@ class ExecutorSupervision:
             if self._launcher is None:
 
                 def serve_launches() -> None:
-                    while True:
-                        request = self._launches.get()
-                        if request is None:
-                            return
-                        call, answer = request
-                        try:
-                            answer.put(("ok", spawn.spawn_executor(**call)))
-                        except BaseException as exc:  # returned to the asking thread
-                            answer.put(("raise", exc))
+                    try:
+                        while True:
+                            request = self._launches.get()
+                            if request is None:
+                                return
+                            call, answer = request
+                            try:
+                                answer.put(("ok", spawn.spawn_executor(**call)))
+                            except BaseException as exc:  # returned to the asking thread
+                                answer.put(("raise", exc))
+                    except BaseException as exc:
+                        self._lane_died("executor-launcher", exc)
 
                 self._launcher = threading.Thread(
                     target=serve_launches, daemon=True, name="executor-launcher"
@@ -794,6 +805,14 @@ class ExecutorSupervision:
                     raise ExecutorGone(f"{exc}; {cleanup}") from exc
             raise
 
+    def _lane_died(self, name: str, exc: BaseException) -> None:
+        """One of this supervision's own threads stopped producing. Say so, loudly."""
+        traceback.print_exception(exc)
+        callback = self.on_lane_failure
+        if callback is not None:
+            with contextlib.suppress(Exception):
+                callback(f"the {name} lane died: {type(exc).__name__}: {exc}"[:400])
+
     def _start_exit_watcher(self, executor: Executor) -> threading.Event:
         """Install one exact-child observer before ``current`` is published.
 
@@ -807,13 +826,16 @@ class ExecutorSupervision:
 
         def wait_for_exit() -> None:
             try:
-                observer.wait()
-            finally:
-                observer.close()
-            published.wait()
-            callback = self.on_exit
-            if callback is not None:
-                callback(executor)
+                try:
+                    observer.wait()
+                finally:
+                    observer.close()
+                published.wait()
+                callback = self.on_exit
+                if callback is not None:
+                    callback(executor)
+            except BaseException as exc:
+                self._lane_died(f"executor-exit-{executor.incarnation}", exc)
 
         try:
             threading.Thread(
