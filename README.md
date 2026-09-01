@@ -233,7 +233,9 @@ RecordOwner placement, qualification measurements, and the worker's observed mac
 descriptor reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
-workflow language. `source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
+workflow language, and an `@app.entrypoint` declares the model source it is built and tested
+against for publish-time derive evidence (cr-067). In both cases
+`source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
 inferred `Model` parameter exactly; each profile is emitted on that model row, beside the class and
 component-use contract it prepares. Each `WeightsOutput` may declare `topology_digest=` and a
 sorted `encodings=` tuple. Those exact requirements appear under the output's
@@ -390,41 +392,18 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-`cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
-Its closed local request names the direct PackageSelection, selected Environment, and every
-package wheel file by digest,
-the installed-base Python, a fresh environment root, and a fresh receipt output. `wheel_files`
-contains only the project and optional custom wheels; base wheel bytes do not travel. It
-atomically publishes the package-environment receipt bytes and prints their compact
-digest/length/generation reference. It
-does not accept an expected receipt, author release documents, fetch, resolve, or import package
-code.
-
-The request is ordinary JSON because it is a process input, not an identity document. Its field
-set is closed; every path value is a normalized absolute local path:
-
-```json
-{
-  "package": {
-    "package": "org/package",
-    "release": "1.0.0",
-    "release_digest": "sha256:<64 lowercase hex>",
-    "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}
-  },
-  "environment": "/proof/environment.json",
-  "wheel_files": {"sha256:<64 lowercase hex>": "/proof/objects/<digest>"},
-  "python": "/opt/conda/bin/python",
-  "environment_root": "/proof/fresh-environment"
-}
-```
-
-The receipt-selected package environment then exposes
-`cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
-it verifies the installed environment receipt, compares the exact descriptor with the
-installed project wheel, and double-derives every descriptor model binding under the
-offline construction sandbox. The fresh output directory appears atomically and contains the
-result in `result.json` plus exact digest-named files under `contracts/`. Tensorhub
-stores those bytes and refs; it never authors or reserializes an MCC.
+`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` is the author-side derive-evidence
+writer (cr-067). It runs on the publishing author's machine inside the project venv
+(`uv run --locked`), never on the hub: it compares the exact publishing descriptor with the
+project source and double-derives every requested model binding per declared hardware
+variant under the offline construction sandbox. The fresh output directory appears
+atomically as the derive-evidence envelope: a `cozy.package.derive-evidence/1` index in
+`result.json` plus exact digest-named documents under `contracts/` and `code-topologies/`,
+with per-contract `resources` (component resident bytes and encoding pins) in the index.
+Tensorhub stores and statically validates those bytes; it never authors, reserializes, or
+re-derives an MCC. The Candidate binds the release VERSION (`org/package@1.0.0`), never a
+release digest — the digest exists only once Tensorhub finalizes the upload the envelope
+rides in.
 
 The request is a closed local process input. Every descriptor model path appears exactly
 once; a function with no model is still recorded in the output index with `bindings: []`.
@@ -433,10 +412,8 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 
 ```json
 {
-  "environment_generation": "/proof/environment/contents/<content-identity>",
-  "environment_digest": "sha256:<64 lowercase hex>",
-  "installed_environment_receipt": {"digest": "sha256:<64 lowercase hex>", "length": 1234},
-  "package": {"package": "org/package", "release": "1.0.0", "release_digest": "sha256:<64 lowercase hex>", "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}},
+  "project": "/home/author/package",
+  "package": {"package": "org/package", "release": "1.0.0", "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}},
   "package_descriptor": {
     "path": "/proof/package.descriptor.json",
     "digest": "sha256:<64 lowercase hex>",

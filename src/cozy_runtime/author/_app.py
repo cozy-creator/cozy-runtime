@@ -100,6 +100,7 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
+        source_profiles: Mapping[str, str] | None = None,
         hidden: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -111,19 +112,25 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
+        source_profiles: Mapping[str, str] | None = None,
         hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
-        published descriptor and gets no binding staged and no traffic (§1.2, #572d)."""
+        published descriptor and gets no binding staged and no traffic (§1.2, #572d).
+
+        ``source_profiles`` declares, per inferred Model parameter, the reviewed TensorFS
+        profile this entrypoint is built and tested against. Publish-time derive evidence
+        is produced for exactly these declared pairs; it selects no provider, source
+        revision, checkpoint, destination, or placement (cr-067)."""
         return self._register(
             "entrypoint",
             fn,
             name,
             publishes=False,
             weights_outputs=(),
-            source_profiles={},
+            source_profiles=dict(source_profiles or {}),
             preflight=preflight,
             demand=demand,
             hidden=hidden,

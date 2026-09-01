@@ -26,7 +26,6 @@ dev = ["mypy>=1.13", "pytest>=8.4", "ruff>=0.16", "types-protobuf>=6.30", "av>=1
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-runtime-worker = "cozy_runtime.cli.runtime_worker:main"
-cozy-environment-proof = "cozy_runtime.cli.environment_proof:main"
 cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
 cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 

@@ -392,8 +392,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     f"{path}.models",
                     "must either omit source_profile or declare it for every model slot",
                 )
-            if kind != "job" and profiled_models:
-                _invalid(source, f"{path}.models", "source_profile is valid only on jobs")
             if kind == "job":
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
