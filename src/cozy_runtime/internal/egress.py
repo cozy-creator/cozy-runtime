@@ -50,7 +50,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import socket
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import BinaryIO
 from urllib.parse import urljoin, urlparse
@@ -60,6 +60,9 @@ CHUNK = 1 << 20
 
 #: The redirect budget. A chain longer than this is a loop or an evasion, either way no.
 MAX_REDIRECTS = 4
+
+#: An `If-None-Match: *` write that lands on an existing immutable key answers with this.
+HTTP_PRECONDITION_FAILED = 412
 
 
 #: The address classes no downloader in this runtime connects to. ONE list: `pull.guard`
@@ -108,6 +111,9 @@ class StreamReceipt:
     length: int
     sha256: bytes
     prefix: bytes
+    #: The store's own verdict on a PUT. 0 for a copy that never spoke HTTP.
+    http_status: int = 0
+    etag: str = ""
 
 
 def copy_bounded(
@@ -249,14 +255,17 @@ class _MeasuredReader:
         self.digest.update(chunk)
         return chunk
 
-    def receipt(self) -> StreamReceipt:
-        if self.length != self.expected_length:
+    def receipt(self, *, http_status: int = 0, etag: str = "", exact: bool = True) -> StreamReceipt:
+        # `exact=False` is for the one outcome where a short body is the CORRECT result: the
+        # store refused the write on a precondition, so it stopped reading. Every other path
+        # still treats a truncated upload as a refusal.
+        if exact and self.length != self.expected_length:
             raise EgressRefusal(
                 "stream_under_declared_size",
                 f"{self.what}: the upload ended at {self.length} B and the grant declares "
                 f"{self.expected_length} B",
             )
-        return StreamReceipt(self.length, self.digest.digest(), b"")
+        return StreamReceipt(self.length, self.digest.digest(), b"", http_status, etag)
 
 
 def put_from(
@@ -267,12 +276,22 @@ def put_from(
     expected_length: int,
     media_type: str,
     what: str = "output",
+    required_headers: Mapping[str, str] | None = None,
+    accept_precondition_failed: bool = False,
 ) -> StreamReceipt:
     """Stream one immutable object to an exact presigned URL.
 
     The URL is already the control plane's per-attempt capability. Responses cannot choose a
     replacement destination: a redirect target is fully validated, then refused. This is both
     simpler and stricter than replaying a PUT body to an address absent from the grant.
+
+    `required_headers` are the grant's own signed headers, sent verbatim. The caller minting
+    the grant decides what they are; this module does not invent or reinterpret them, because
+    a header this function altered would be a header the signature no longer covers.
+
+    `accept_precondition_failed` admits HTTP 412 as an OUTCOME rather than an error. Under an
+    `If-None-Match: *` grant that status means the immutable key already holds these exact
+    bytes, which is a successful end state for a content-addressed write, not a failure.
     """
     import http.client
 
@@ -289,18 +308,15 @@ def put_from(
     )
     connection = connection_type(host, port, timeout=30)
     measured = _MeasuredReader(source, expected_length, what)
+    headers = {
+        "Accept-Encoding": "identity",
+        "Content-Length": str(expected_length),
+        "Content-Type": media_type or "application/octet-stream",
+        "If-None-Match": "*",
+    }
+    headers.update(required_headers or {})
     try:
-        connection.request(
-            "PUT",
-            path,
-            body=measured,
-            headers={
-                "Accept-Encoding": "identity",
-                "Content-Length": str(expected_length),
-                "Content-Type": media_type or "application/octet-stream",
-                "If-None-Match": "*",
-            },
-        )
+        connection.request("PUT", path, body=measured, headers=headers)
         response = connection.getresponse()
         try:
             location = response.getheader("Location")
@@ -319,10 +335,13 @@ def put_from(
                 raise EgressRefusal(
                     "egress_response_over_bound", f"{what}: the PUT response exceeded 64 KiB"
                 )
-            if not 200 <= response.status < 300:
-                raise EgressRefusal(
-                    "egress_http_error", f"{what}: HTTP {response.status} from {host}"
-                )
+            status = response.status
+            etag = (response.getheader("ETag") or "").strip()
+            if not (
+                200 <= status < 300
+                or (accept_precondition_failed and status == HTTP_PRECONDITION_FAILED)
+            ):
+                raise EgressRefusal("egress_http_error", f"{what}: HTTP {status} from {host}")
         finally:
             response.close()
     except EgressRefusal:
@@ -331,7 +350,7 @@ def put_from(
         raise EgressRefusal("egress_unreachable", f"{what}: {exc}") from exc
     finally:
         connection.close()
-    return measured.receipt()
+    return measured.receipt(http_status=status, etag=etag, exact=status != HTTP_PRECONDITION_FAILED)
 
 
 def fetch_into(

@@ -24,14 +24,14 @@ this repo's CI `drift` job runs.
 
 from __future__ import annotations
 
-from cozy.worker.v1 import artifact_limits, worker_pb2, worker_pb2_grpc
+from cozy.worker.v1 import weights_limits, worker_pb2, worker_pb2_grpc
 from cozy.worker.v1.wire_version import WIRE_MINOR
 from cozy_runtime.protocol import documents
 
 __all__ = [
     "WIRE_MINOR",
-    "artifact_limits",
     "documents",
+    "weights_limits",
     "worker_pb2",
     "worker_pb2_grpc",
 ]
