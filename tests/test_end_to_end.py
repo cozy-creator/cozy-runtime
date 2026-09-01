@@ -1,8 +1,12 @@
 """The end-to-end suite: real processes, real builds, no mocks.
 
-Two runs, both against `examples/marco-polo` — a real weightless package with one
-entrypoint and one job. Nothing here is stubbed, patched, or doubled: a test that passes
-because a fake agreed with it is worse than no test.
+Everything below runs against `examples/marco-polo`, a real weightless package with one
+entrypoint and one job, built into a wheel and installed into a venv that has nothing else.
+Nothing is stubbed, patched, or doubled: a test that passes because a fake agreed with it is
+worse than no test.
+
+The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one, and say which
+host fact stopped them — see `_executor_containment`. They run on an ordinary developer box.
 
     uv run pytest
 """
@@ -23,6 +27,39 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
 TIMEOUT = 420
+
+
+def _executor_containment() -> str:
+    """Why this host cannot spawn an executor, or "" when it can.
+
+    Exactly the decision `internal/proctree.create_executor_scope` makes, read rather than
+    performed so the probe creates nothing. A worker may only start an executor inside a
+    cgroup it owns; where the unified hierarchy is writable but the worker's OWN cgroup is
+    not delegated — a GitHub-hosted runner, most locked-down CI — there is no scope to make
+    and the runtime refuses by design. The alternative process-tree backend wants the rental
+    container topology (root worker, distinct non-root executor uid, bounded memory.max),
+    which a hosted runner does not present either.
+    """
+    if sys.platform != "linux":
+        return f"executor containment is Linux-only; this is {sys.platform}"
+    root = Path("/sys/fs/cgroup")
+    if not (root / "cgroup.controllers").is_file():
+        return "no unified cgroup-v2 hierarchy is mounted"
+    if bool(os.statvfs(root).f_flag & os.ST_RDONLY):
+        return "the cgroup-v2 mount is read-only; the process-tree backend wants a rental pod"
+    try:
+        entries = Path("/proc/self/cgroup").read_text().splitlines()
+        relative = next(line.split("::", 1)[1] for line in entries if line.startswith("0::"))
+    except (OSError, StopIteration, IndexError):
+        return "this process's cgroup-v2 delegation is unreadable"
+    own = root / relative.strip("/")
+    if not os.access(own, os.W_OK, effective_ids=True):
+        return f"this process's own cgroup {own} is not delegated, so no child scope can be made"
+    return ""
+
+
+NO_EXECUTOR = _executor_containment()
+needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
 
 def _run(*argv: str, cwd: Path | str = ROOT, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -63,12 +100,12 @@ def installed_cli() -> Iterator[str]:
         yield str(root / "venv" / "bin" / "cozy-runtime")
 
 
-def test_installed_cli_describes_and_serves(installed_cli: str) -> None:
-    """describe -> exact replay -> invoke, from `/`, with no PYTHONPATH and stdin closed.
+def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
+    """describe -> exact replay -> the exit-code matrix, from `/`, no PYTHONPATH, stdin closed.
 
-    The descriptor is a PUBLICATION output, so two derivations must be byte-identical; the
-    invocation goes through the real kernel — decode, resolve, preflight, hydrate, invoke,
-    validate, finalize — and returns the package's own result.
+    The descriptor is a PUBLICATION output, so two derivations must be byte-identical, and
+    the exit codes (`internal/exits.py`) are the contract a caller actually reads. None of
+    this needs a device or an executor.
     """
     cli = (installed_cli, "--dir", str(PACKAGE))
     first = _run(*cli, "--json", "describe", cwd="/")
@@ -76,19 +113,38 @@ def test_installed_cli_describes_and_serves(installed_cli: str) -> None:
     assert first.stdout == second.stdout
     assert json.loads(first.stdout)["application"] == "marco_polo_package:app"
 
-    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
-        served = _run(*cli, "--json", "run", "marco", "message=marco", "--out", out, cwd="/")
-    body = json.loads(served.stdout)
-    assert body["result"] == {"message": "polo"}
-    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED"
-
-    # The exit-code matrix (`internal/exits.py`), which is the contract a caller reads.
     _run(*cli, "frobnicate", cwd="/", expect=2)
     _run(*cli, "run", "nosuchfn", "message=marco", "--out", "/tmp", cwd="/", expect=4)
     _run(*cli, "run", "marco", "message=nope", "--out", "/tmp", cwd="/", expect=3)
     _run(*cli, "run", "marco", "bogus=1", "--out", "/tmp", cwd="/", expect=3)
 
 
+@needs_executor
+def test_installed_cli_serves_a_request(installed_cli: str) -> None:
+    """One served request, all the way through: worker control plus a spawned executor.
+
+    decode -> resolve -> preflight -> hydrate -> invoke -> validate -> finalize, returning
+    the package's own result over the real protocol bytes.
+    """
+    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
+        served = _run(
+            installed_cli,
+            "--dir",
+            str(PACKAGE),
+            "--json",
+            "run",
+            "marco",
+            "message=marco",
+            "--out",
+            out,
+            cwd="/",
+        )
+    body = json.loads(served.stdout)
+    assert body["result"] == {"message": "polo"}
+    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED"
+
+
+@needs_executor
 def test_installed_cli_runs_a_job_through_the_local_worker(installed_cli: str) -> None:
     """A JOB, which is a real two-process run: worker control plus a spawned executor.
 
