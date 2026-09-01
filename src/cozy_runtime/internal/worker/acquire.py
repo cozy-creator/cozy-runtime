@@ -872,7 +872,7 @@ def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
         for row in rows
         if isinstance(row, dict) and isinstance(row.get("name"), str)
     }
-    if len(visible) != len(rows) or not visible:
+    if len(visible) != len(rows):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "package_descriptor_invalid",
