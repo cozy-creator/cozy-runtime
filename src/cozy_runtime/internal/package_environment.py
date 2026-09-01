@@ -289,6 +289,8 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
     or refuses the version actually provided by the worker image.
     """
 
+    if wheel.owner != "custom":
+        return False
     version = base.distribution_versions.get(wheel.distribution)
     if version is None or not base_observation.protected_distribution(wheel.distribution):
         return False
@@ -315,6 +317,33 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
             f"{version} with import roots {roots}; worker-image distributions cannot be replaced",
         )
     return True
+
+
+def _allows_observed_wheel(
+    wheel: Wheel,
+    base: base_observation.Observation,
+    *,
+    allow_base_owned: bool,
+    allow_installed_package: bool,
+) -> bool:
+    """Distinguish immutable image ownership from an already-complete package venv."""
+
+    if allow_base_owned and base_owned_wheel(wheel, base):
+        return True
+    version = base.distribution_versions.get(wheel.distribution)
+    if (
+        not allow_installed_package
+        or version is None
+        or base_observation.protected_distribution(wheel.distribution)
+    ):
+        return False
+    try:
+        return Version(version) == Version(wheel.version)
+    except InvalidVersion as exc:
+        raise EnvironmentRefusal(
+            "package_environment_base_invalid",
+            f"distribution={wheel.distribution} installed_version={version!r}",
+        ) from exc
 
 
 def materialize(
@@ -422,7 +451,12 @@ def verify_existing_environment(
 ) -> None:
     """Verify exact wheel facts against an already-complete local uv environment."""
 
-    wheels = _verify_inventory(source, base, allow_base_owned=True)
+    wheels = _verify_inventory(
+        source,
+        base,
+        allow_base_owned=True,
+        allow_installed_package=True,
+    )
     _verify_grants(
         source,
         wheels,
@@ -650,7 +684,11 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
 
 
 def _verify_inventory(
-    source: Input, base: base_observation.Observation, *, allow_base_owned: bool = False
+    source: Input,
+    base: base_observation.Observation,
+    *,
+    allow_base_owned: bool = False,
+    allow_installed_package: bool = False,
 ) -> tuple[Wheel, ...]:
     if not source.wheels or len(source.wheels) > MAX_PACKAGE_WHEELS:
         raise EnvironmentRefusal("package_environment_wheel_set_invalid", str(len(source.wheels)))
@@ -685,7 +723,12 @@ def _verify_inventory(
                 "package_environment_second_protected_family",
                 f"distribution={name} is worker-image-owned and absent from this worker",
             )
-        if base_version is not None and not (allow_base_owned and base_owned_wheel(wheel, base)):
+        if base_version is not None and not _allows_observed_wheel(
+            wheel,
+            base,
+            allow_base_owned=allow_base_owned,
+            allow_installed_package=allow_installed_package,
+        ):
             raise EnvironmentRefusal(
                 "package_environment_shadows_base_distribution",
                 f"distribution={name} package_version={wheel.version} image_version={base_version}",

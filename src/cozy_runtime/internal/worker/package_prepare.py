@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import dataclasses
 import hashlib
 import json
 import os
@@ -40,19 +39,6 @@ class PreparationRefusal(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
-
-
-def _without_installed_project(
-    observed: base_observation.Observation, distribution: str
-) -> base_observation.Observation:
-    """The completed local venv is evidence for the project, not its own worker base."""
-
-    if base_observation.protected_distribution(distribution):
-        return observed
-    return dataclasses.replace(
-        observed,
-        distributions=tuple(row for row in observed.distributions if row[0] != distribution),
-    )
 
 
 def prepare_package_set(
@@ -321,9 +307,6 @@ def prepare_package(
         observed_base = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
-    if installed_environment is not None:
-        observed_base = _without_installed_project(observed_base, expected_distribution)
-
     rows = list(files)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))

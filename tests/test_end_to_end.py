@@ -17,6 +17,8 @@ UNAVAILABLE, because that is the condition under test, and it asserts the proces
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
 import json
 import os
 import secrets
@@ -30,6 +32,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from cozy_runtime.internal import base_observation, package_environment
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
+from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
@@ -147,6 +153,34 @@ def _run(*argv: str, cwd: Path | str = ROOT, expect: int = 0) -> subprocess.Comp
     return result
 
 
+def _write_annotated_doc(root: Path, version: str) -> None:
+    package = root / "src" / "annotated_doc"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["hatchling"]\n'
+        'build-backend = "hatchling.build"\n\n'
+        "[project]\n"
+        'name = "annotated-doc"\n'
+        f'version = "{version}"\n'
+        'requires-python = ">=3.12,<3.13"\n\n'
+        "[tool.hatch.build.targets.wheel]\n"
+        'packages = ["src/annotated_doc"]\n'
+    )
+    (package / "__init__.py").write_text(f"VALUE = {version!r}\n")
+
+
+def _download_row(kind: pb.LocalDownloadKind, path: Path) -> pb.LocalDownloadFile:
+    raw = path.read_bytes()
+    return pb.LocalDownloadFile(
+        digest=hashlib.sha256(raw).digest(),
+        filename=path.name,
+        kind=kind,
+        length=len(raw),
+        path=str(path),
+    )
+
+
 @pytest.fixture(scope="session")
 def installed_cli() -> Iterator[str]:
     """The PUBLIC CLI, built into a wheel and installed into a venv that has nothing else.
@@ -213,6 +247,131 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     _run(*cli, "run", "nosuchfn", "message=marco", "--out", "/tmp", cwd="/", expect=4)
     _run(*cli, "run", "marco", "message=nope", "--out", "/tmp", cwd="/", expect=3)
     _run(*cli, "run", "marco", "bogus=1", "--out", "/tmp", cwd="/", expect=3)
+
+
+def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None:
+    """A complete local venv owns its project/dependencies; a worker image does not.
+
+    This is the exact SDXL regression shape: preparation receives the immutable wheels used
+    to create an already-complete local uv environment, observes those installed versions,
+    and must not reinterpret an identical package dependency as a worker-image shadow.
+    """
+
+    uv = shutil.which("uv")
+    assert uv is not None
+    with tempfile.TemporaryDirectory(prefix="cozy-existing-environment.") as raw:
+        root = Path(raw)
+        dependency_one = root / "annotated-doc-0.0.5"
+        dependency_two = root / "annotated-doc-0.0.6"
+        _write_annotated_doc(dependency_one, "0.0.5")
+        _write_annotated_doc(dependency_two, "0.0.6")
+
+        artifact_cache = root / "artifacts"
+        wheel_set = artifact_cache / "sets" / "package"
+        wheel_set.mkdir(parents=True)
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency_one))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency_two))
+        runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
+        dependency_one_wheel = next(wheel_set.glob("annotated_doc-0.0.5-*.whl"))
+        dependency_two_wheel = next(wheel_set.glob("annotated_doc-0.0.6-*.whl"))
+        project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
+
+        environment = root / "environment"
+        python = environment / "bin" / "python"
+        _run(uv, "venv", "--python", sys.executable, str(environment))
+        _run(
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            str(runtime_wheel),
+            str(dependency_one_wheel),
+            str(project_wheel),
+        )
+        release_digest = "sha256:" + "17" * 32
+        installed = package_environment.open_existing_environment(python, release_digest)
+        observed = package_environment.observe_base(python)
+        artifact_store = root / "artifact-store"
+        artifact_store.mkdir()
+
+        def describe_real(
+            selected: package_environment.InstalledEnvironment, distribution: str
+        ) -> bytes:
+            assert selected == installed
+            command = (
+                "from cozy_runtime.internal import descriptor; "
+                "from cozy_runtime.internal.discovery import discover_distribution; "
+                f"found=discover_distribution({distribution!r}); "
+                "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+            )
+            rendered = _run(str(selected.python), "-I", "-c", command, cwd="/")
+            return rendered.stdout.encode()
+
+        def prepare(
+            dependency: Path, base: base_observation.Observation = observed
+        ) -> pb.PreparePackageSetResult:
+            rows = [
+                _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
+                _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, dependency),
+                _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
+            ]
+            rows.sort(key=lambda row: row.digest)
+            return prepare_package(
+                package_name="paul/marco-polo",
+                release="1.0.4",
+                release_digest=release_digest,
+                files=rows,
+                placement_seed=b"existing-environment-proof",
+                artifact_cache=artifact_cache,
+                artifact_store=artifact_store,
+                environment_root=environment,
+                python=python,
+                describe=describe_real,
+                verified=lambda _digest, _length, _path: None,
+                base=base,
+                allow_native_custom=True,
+                installed_environment=installed,
+            )
+
+        prepared = prepare(dependency_one_wheel)
+        assert prepared.placement_set.placement_set_canonical_bytes
+
+        with pytest.raises(PreparationRefusal) as mismatch:
+            prepare(dependency_two_wheel)
+        assert mismatch.value.code == "package_environment_shadows_base_distribution"
+        assert "package_version=0.0.6 image_version=0.0.5" in mismatch.value.detail
+
+        package_names = {"marco-polo", "annotated-doc"}
+        rental_distributions = tuple(
+            (name, "0.0.35" if name == "cozy-runtime" else version)
+            for name, version in observed.distributions
+            if name not in package_names
+        )
+        rental_base = dataclasses.replace(observed, distributions=rental_distributions)
+        _base, package_wheels, supplied = package_environment.preflight_environment(
+            project_wheel,
+            (dependency_one_wheel, runtime_wheel),
+            rental_base,
+        )
+        assert "cozy-runtime" not in {wheel.distribution for wheel in package_wheels}
+        assert "cozy-runtime" in {wheel.distribution for wheel in supplied}
+
+        worker_shadow = dataclasses.replace(
+            rental_base,
+            distributions=(*rental_base.distributions, ("annotated-doc", "0.0.5")),
+        )
+        with pytest.raises(
+            package_environment.EnvironmentRefusal,
+            match="package_environment_shadows_base_distribution",
+        ):
+            package_environment.preflight_environment(
+                project_wheel,
+                (dependency_one_wheel, runtime_wheel),
+                worker_shadow,
+            )
 
 
 @needs_executor
