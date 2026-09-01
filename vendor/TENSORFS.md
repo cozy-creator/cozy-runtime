@@ -1,18 +1,18 @@
-# TensorFS 0.0.7 wheel provenance
+# TensorFS 0.0.8 wheel provenance
 
-`tensorfs-0.0.7-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`
+`tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`
 is the temporary exact source for Runtime's `model-execution` extra until TensorFS is published on
 PyPI.
 
 - repository: `https://github.com/cozy-creator/tensorfs-v2.git`
-- artifact source commit: `a9cfd601f3f8c0841907e2c2625021b463f0ef36`
-- merged source commit: `d284663a1cd1be556e221e554ab57d2cc756d34b`
-- tree: `3c04d60b20f478d91801ca37278b5d23d1cd7237`
-- GitHub Actions run: `33462103932`
-- job: `99714229997` (`wheels (ubuntu-latest, x86_64, true)`)
-- artifact: `9783565076` (`wheel-ubuntu-latest-x86_64`)
-- length: `2360087`
-- SHA-256: `a3296ef604061ce2984fdb74e329cf5e2daa69d7b45b924d5806b53ab9dc2521`
+- artifact source commit: `041d688a7d6feb0d7014c3501c901d95a52d31bb`
+- merged source commit: `fb61a676d9def0822416e69de2f2d075931cf48b`
+- tree: `f32a028e6c718a36319d3249649cdaea5efecda1`
+- GitHub Actions run: `33477004679`
+- job: `99758254560` (`wheels (ubuntu-latest, x86_64, true)`)
+- artifact: `9788569039` (`wheel-ubuntu-latest-x86_64`)
+- length: `2359967`
+- SHA-256: `9f2591e90a362d705f679e3bc287063975116ad273db26a667e317146bf6f6f2`
 
 The TensorFS workflow built the wheel with its native x86_64 matrix entry:
 
