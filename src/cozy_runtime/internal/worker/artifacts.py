@@ -1,10 +1,21 @@
 """Stateless Runtime side of the ArtifactSink host exchange.
 
 The supervisor is the durable authority. Runtime keeps only waiters and live TensorFS read
-leases, sends intent before the executor opens a writer, and exposes produced bytes through
-bounded ObjectRef/source-ref reads. No URL, credential, destination, or filesystem path enters
-Worker Protocol; the worker and executor share only fixed files in the already-brokered attempt
-spool for declaration/receipt bytes too large for their control seam.
+leases and sends intent before the executor opens a writer; the worker and executor share only
+fixed files in the already-brokered attempt spool for declaration/receipt bytes too large for
+their control seam.
+
+Runtime holds the produced bytes, so Runtime is what streams them. When the supervisor has
+bound a transfer to its durable receipt it hands over the presigned PUT it was given, and
+`upload` spends it through the one egress boundary (`internal/egress.py`) exactly as
+`write_output` already spends a `DeliveryGrant` output URL. The grant names ONE object, ONE
+method and ONE short expiry and is pinned to the object's own digest by its signed checksum
+header, so holding it authorizes nothing else. The alternative -- posting the object back to
+the supervisor 4 MiB at a time so IT could send the same request -- was 2,048 sequential round
+trips for an 8 GiB object and bought no authority the grant did not already carry.
+
+`read` stays: it is the authenticated owner read-back lane, a bounded range of one object the
+owner explicitly asked for, which is a different thing from moving a whole object.
 """
 
 from __future__ import annotations
@@ -12,16 +23,46 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
 import json
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
+from urllib.parse import urlparse
 
-from cozy_runtime.internal import fill, pull
+from cozy_runtime.internal import egress, fill, pull
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
+
+
+class _LeaseReader:
+    """A read-only file-like view of ONE object in a live TensorFS lease.
+
+    The uploader streams through this, so an 8 GiB object is never a bytes object: at most one
+    chunk is resident. Reads are served in whole chunks regardless of the size asked for, which
+    an HTTP body reader accepts and which keeps an 8 GiB PUT to thousands of reads, not millions.
+    """
+
+    __slots__ = ("lease", "length", "object_id", "offset")
+
+    def __init__(self, lease: Any, object_id: str, length: int) -> None:
+        self.lease = lease
+        self.object_id = object_id
+        self.length = length
+        self.offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.length - self.offset
+        if remaining <= 0:
+            return b""
+        want = egress.CHUNK if size is None or size < 0 else max(size, egress.CHUNK)
+        want = min(want, remaining)
+        target = bytearray(want)
+        self.lease.read_into(self.object_id, self.length, self.offset, want, target)
+        self.offset += want
+        return bytes(target)
 
 
 class ArtifactExchangeError(Exception):
@@ -50,6 +91,22 @@ class _Held:
     lease: Any
 
 
+#: Typed refusals this exchange can report, mapped from the code that raised them. An egress
+#: code with no entry lands on TRANSFER_FAILED, which is what an unclassified failure is.
+_UPLOAD_REFUSALS: dict[str, pb.WeightsUploadRefusal] = {
+    "unknown_transaction": pb.WEIGHTS_UPLOAD_REFUSAL_UNKNOWN_TRANSACTION,
+    "stale_writer": pb.WEIGHTS_UPLOAD_REFUSAL_STALE_WRITER,
+    "unknown_object": pb.WEIGHTS_UPLOAD_REFUSAL_UNKNOWN_OBJECT,
+    "source_ref_mismatch": pb.WEIGHTS_UPLOAD_REFUSAL_SOURCE_REF_MISMATCH,
+    "source_unavailable": pb.WEIGHTS_UPLOAD_REFUSAL_SOURCE_UNAVAILABLE,
+    "egress_host_not_allowed": pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED,
+    "egress_blocked_address": pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED,
+    "egress_scheme": pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED,
+    "egress_url": pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED,
+    "egress_redirect_refused": pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED,
+}
+
+
 class ArtifactExchange:
     """One Runtime process's memory-only bridge to its durable host."""
 
@@ -60,11 +117,16 @@ class ArtifactExchange:
         send: Callable[[pb.WorkerFrame], None],
         stop: threading.Event,
         owner_scope: Callable[[], str],
+        allow_private_egress: bool = False,
     ) -> None:
         self.send = send
         self.stop = stop
         self.owner_scope = owner_scope
         self.store_root = store_root
+        # Local proof only; production leaves this false, exactly as the supervisor's own
+        # `allowPrivateArtifactUploads` does. It widens nothing but the address classes an
+        # upload may reach, and only for a caller that constructed this object saying so.
+        self.allow_private_egress = allow_private_egress
         self.store: Any = None
         self._lock = threading.Lock()
         self._pending: dict[tuple[str, int, str, int], _Pending] = {}
@@ -350,6 +412,84 @@ class ArtifactExchange:
             result.data = data
             result.data_digest = hashlib.sha256(data).digest()
         return pb.WorkerFrame(weights_read_result=result)
+
+    def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame:
+        """Stream ONE held object to the exact presigned URL the supervisor granted."""
+        result = pb.WeightsUploadResult(
+            weights_transaction_id=request.weights_transaction_id,
+            writer_generation=request.writer_generation,
+            object_id=request.object_id,
+            operation_id=request.operation_id,
+            grant_revision=request.grant_revision,
+        )
+        try:
+            source, length = self._upload_source(request)
+        except ArtifactExchangeError as exc:
+            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
+            result.refusal = _UPLOAD_REFUSALS.get(exc.code, pb.WEIGHTS_UPLOAD_REFUSAL_UNSPECIFIED)
+            result.safe_detail = exc.detail[:4096]
+            return pb.WorkerFrame(weights_upload_result=result)
+        grant = request.grant
+        host = urlparse(grant.url).hostname or ""
+        try:
+            receipt = egress.put_from(
+                grant.url,
+                # The grant IS the allowlist: one host, the one the control plane signed.
+                egress.EgressPolicy(allowed_hosts=(host,), allow_private=self.allow_private_egress),
+                cast(BinaryIO, source),
+                expected_length=length,
+                media_type="application/octet-stream",
+                what=f"weights object {request.object_id}",
+                required_headers={header.name: header.value for header in grant.required_headers},
+                accept_precondition_failed=True,
+            )
+        except egress.EgressRefusal as exc:
+            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
+            result.refusal = _UPLOAD_REFUSALS.get(
+                exc.code, pb.WEIGHTS_UPLOAD_REFUSAL_TRANSFER_FAILED
+            )
+            result.safe_detail = exc.detail[:4096]
+            return pb.WorkerFrame(weights_upload_result=result)
+        result.transferred_bytes = receipt.length
+        result.http_status = receipt.http_status
+        result.etag = receipt.etag
+        if receipt.http_status == egress.HTTP_PRECONDITION_FAILED:
+            # The immutable key already holds these bytes. The supervisor's ledger and
+            # tensorhub's finalize pass decide what that means; this is only the status.
+            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_ALREADY_PRESENT
+        else:
+            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED
+            result.checksum_sha256 = "sha256:" + receipt.sha256.hex()
+        return pb.WorkerFrame(weights_upload_result=result)
+
+    def _upload_source(self, request: pb.WeightsUploadRequest) -> tuple[Any, int]:
+        """Bind the requested object to what this Runtime actually holds, or refuse."""
+        with self._lock:
+            held = self._held.get(request.weights_transaction_id)
+        if held is None:
+            raise ArtifactExchangeError(
+                "unknown_transaction", "weights transaction is not held by this Runtime"
+            )
+        if request.writer_generation != held.writer_generation:
+            raise ArtifactExchangeError("stale_writer", "writer generation is stale")
+        row = held.objects.get(request.object_id)
+        if row is None:
+            raise ArtifactExchangeError(
+                "unknown_object", "object is outside the exact receipt inventory"
+            )
+        if request.source_ref != row.source_ref:
+            raise ArtifactExchangeError(
+                "source_ref_mismatch", "source reference does not bind this object"
+            )
+        if request.length != row.length or request.grant.length != row.length:
+            raise ArtifactExchangeError(
+                "source_unavailable", "granted length is not the exact object length"
+            )
+        if request.grant.object_id != request.object_id:
+            raise ArtifactExchangeError("source_ref_mismatch", "the grant names a different object")
+        if row.source_ref.startswith("tensorfs-manifest:"):
+            return io.BytesIO(held.manifest_bytes), row.length
+        return _LeaseReader(held.lease, row.object_id, row.length), row.length
 
     def _exchange(
         self,

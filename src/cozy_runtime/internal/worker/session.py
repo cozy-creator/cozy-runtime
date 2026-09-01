@@ -1995,6 +1995,8 @@ class Worker:
                 self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
         elif kind == "weights_read_request":
             self.send(self.artifacts.read(inner))
+        elif kind == "weights_upload_request":
+            self.send(self.artifacts.upload(inner))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
