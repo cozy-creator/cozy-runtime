@@ -1,8 +1,8 @@
 """Signature analysis: the ONE source with two readers (mypy statically, describe at build).
 
 The signature is the capability declaration. Everything the descriptor needs — the payload
-and result schemas, the model binding paths, `gpu`, and the AuthorCapabilitySet — is a PURE
-FUNCTION of the parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
+and result schemas, model binding paths, and AuthorCapabilitySet — is a PURE FUNCTION of the
+parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import msgspec
 
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound, Resources, _PreflightMarker
+from cozy_runtime.author._markers import Bound, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
@@ -85,7 +85,6 @@ class Surface:
     payload_type: object
     result_type: object
     capabilities: frozenset[str]
-    gpu: bool
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -93,7 +92,6 @@ class Surface:
     never off the kind (§2) — a job that declares neither cannot be granted a destination."""
     source_profiles: Mapping[str, str] = field(default_factory=dict)
     """Optional exact TensorFS source profile for every inferred model parameter."""
-    resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     hidden: bool = False
@@ -193,7 +191,6 @@ def analyze(
     emits_media: bool = False,
     weights_outputs: tuple[WeightsOutput, ...] = (),
     source_profiles: Mapping[str, str] | None = None,
-    resources: Resources | None = None,
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
@@ -295,12 +292,10 @@ def analyze(
         payload_type=payloads[0].annotation,
         result_type=strip(result)[0],
         capabilities=frozenset(p.capability for p in params if p.capability),
-        gpu=any(p.role == "model" for p in params),
         publishes=publishes,
         emits_media=emits_media,
         weights_outputs=weights_outputs,
         source_profiles=dict(sorted(profiles.items())),
-        resources=resources,
         demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,

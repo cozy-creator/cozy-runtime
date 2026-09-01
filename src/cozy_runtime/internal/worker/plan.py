@@ -152,7 +152,9 @@ class AttemptPlan:
         return "sha256:" + hashlib.sha256(b"cozy.runtime.attempt-plan\0" + encoded).hexdigest()
 
     @classmethod
-    def for_job(cls, binding: JobBinding, caps: Mapping[str, int]) -> AttemptPlan:
+    def for_job(
+        cls, binding: JobBinding, caps: Mapping[str, int], *, device_count: int
+    ) -> AttemptPlan:
         """The JOB lane's plan (cr-009). One attempt, one bounded envelope, no ladder.
 
         A job has no placement ladder to walk because it has no serving residency to trade
@@ -170,8 +172,8 @@ class AttemptPlan:
             entrypoint_binding_digest=binding.job_descriptor_id,
             model_construction_digest="",
             decision_explanation=(
-                f"job_attempt: {binding.job!r} on {max(binding.gpu_count, 0)} declared device "
-                f"floor, {caps.get('rss', 0)} B host and {caps.get('disk', 0)} B disk capped, "
+                f"job_attempt: {binding.job!r} on {max(device_count, 0)} assigned device(s), "
+                f"{caps.get('rss', 0)} B host and {caps.get('disk', 0)} B disk capped, "
                 f"publishes={binding.publishes} emits_media={binding.emits_media}"
             ),
         )
@@ -200,7 +202,6 @@ class JobBinding:
     environment_content_digest: str
     job: str
     """The registered `@app.job` name this descriptor id resolves to."""
-    gpu_count: int = 0
     publishes: bool = False
     emits_media: bool = False
     gpu_rate_micro_usd_per_hour: int = 0

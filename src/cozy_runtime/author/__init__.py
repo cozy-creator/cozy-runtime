@@ -89,7 +89,6 @@ from cozy_runtime.author._markers import (
     Bound,
     ModelDefault,
     Preflight,
-    Resources,
     Shape,
 )
 from cozy_runtime.author._model import (
@@ -213,7 +212,6 @@ __all__ = [
     "RegistrationError",
     "RequestFeatures",
     "RequestView",
-    "Resources",
     "SavedAudioFacts",
     "SavedVideo",
     "Scheduler",

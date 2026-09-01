@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound, Resources
+from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._signature import Kind, Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
 
@@ -47,7 +47,6 @@ class Registration:
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
     source_profiles: Mapping[str, str] = field(default_factory=dict)
-    resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
     hidden: bool = False
@@ -66,7 +65,7 @@ class Registration:
 
     @property
     def surface(self) -> Surface:
-        """The derived surface — schemas, capabilities, `gpu`, preflight identity."""
+        """The derived surface — schemas, capabilities, models, and preflight identity."""
         if self._surface is None:
             self._surface = analyze(
                 self.fn,
@@ -76,7 +75,6 @@ class Registration:
                 emits_media=self.emits_media,
                 weights_outputs=self.weights_outputs,
                 source_profiles=self.source_profiles,
-                resources=self.resources,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
                 hidden=self.hidden,
@@ -101,7 +99,6 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
-        resources: Resources | None = None,
         demand: Bound | None = None,
         hidden: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -113,7 +110,6 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
-        resources: Resources | None = None,
         demand: Bound | None = None,
         hidden: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -129,7 +125,6 @@ class App:
             weights_outputs=(),
             source_profiles={},
             preflight=preflight,
-            resources=resources,
             demand=demand,
             hidden=hidden,
         )
@@ -147,7 +142,6 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
-        resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -161,7 +155,6 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
-        resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a RUN-TO-COMPLETION callable (§2).
@@ -185,7 +178,6 @@ class App:
             weights_outputs=weights,
             source_profiles=dict(source_profiles or {}),
             preflight=None,
-            resources=resources,
             demand=demand,
         )
 
@@ -199,7 +191,6 @@ class App:
         weights_outputs: tuple[WeightsOutput, ...],
         source_profiles: Mapping[str, str],
         preflight: Callable[..., object] | None,
-        resources: Resources | None,
         demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
@@ -223,7 +214,6 @@ class App:
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,
                 source_profiles=dict(source_profiles),
-                resources=resources,
                 demand_bound=demand,
                 preflight=preflight,
                 hidden=hidden,

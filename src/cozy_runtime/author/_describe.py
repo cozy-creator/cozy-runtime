@@ -105,8 +105,8 @@ def _separation(surface: Surface) -> None:
     if job and surface.demand_bound is not None:
         raise ConformanceError(
             f"{surface.name}: a job declares demand=Bound(…) — a demand envelope is a SERVING "
-            "admission fact used to route requests to warm capacity; a job declares structural "
-            "FLOORS through resources= and nothing else (§1.2/§2)",
+            "admission fact used to route requests to warm capacity; job placement is derived "
+            "from its selected model lane and measured execution facts (§1.2/§2)",
             code="job_serving_separation",
         )
     if not job and (surface.publishes or surface.emits_media):
@@ -172,24 +172,6 @@ def check(surface: Surface) -> Surface:
     _grantable(surface)
     _separation(surface)
     _media_decode_bounds(surface)
-
-    # A JOB's `gpu_count` is the override door's CANONICAL case (§1.2/§2): a floor is the
-    # number of devices a materialization structurally requires, and a job that shards across
-    # four cards through its own library declares no Model parameter at all. The serving rule
-    # stands unchanged — there, `gpu` derives from the signature and nothing overrides it.
-    override = surface.resources
-    if (
-        surface.kind != "job"
-        and override is not None
-        and override.gpu_count is not None
-        and not surface.gpu
-    ):
-        raise ConformanceError(
-            f"{surface.name}: resources=Resources(gpu_count=…) on a signature with no "
-            "Model parameter — gpu DERIVES from the signature; the override door is for "
-            "structural floors only (§1.2)",
-            code="resources_override",
-        )
 
     if surface.preflight is not None:
         settings = [p for p in surface.params if p.capability == "settings"]

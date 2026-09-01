@@ -234,7 +234,6 @@ def run(
                 "python": sys.executable,
                 "environment_content_digest": package_revision_digest,
                 "job": function,
-                "gpu_count": int((surface.resources.gpu_count or 0) if surface.resources else 0),
                 "publishes": bool(surface.publishes),
                 "emits_media": bool(surface.emits_media),
                 "gpu_rate_micro_usd_per_hour": 0,

@@ -421,6 +421,7 @@ class AttemptEngine:
         self.failed_bindings: dict[str, str] = {}
         self.prepared_models = dict(prepared_models)
         self.jobs = dict(jobs)
+        self.job_device_count = 0
         self.spool_root = spool_root
         #: Where a run's scratch lives. Deliberately outside the disposable worker directory
         #: so an acknowledged run can clean worker state without deleting resumable scratch.
@@ -949,6 +950,7 @@ class AttemptEngine:
                 "rss": int(caps.get("max_rss_bytes", 0)),
                 "disk": int(caps.get("max_disk_bytes", 0)),
             },
+            device_count=self.job_device_count,
         )
         attempt.plan = plan
         # The RUN's scratch, not the attempt's: `Scratch.checkpoint_dir(key=)` must hand a
@@ -1585,7 +1587,7 @@ class AttemptEngine:
                 "invocation_spec_digest": documents.spell(attempt.digest),
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
-                    "gpu_count": attempt.job.gpu_count,
+                    "gpu_count": self.job_device_count,
                     "cap_micro_usd": attempt.job.cap_micro_usd,
                 },
             }

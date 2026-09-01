@@ -111,7 +111,36 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     first = _run(*cli, "--json", "describe", cwd="/")
     second = _run(*cli, "--json", "describe", cwd="/")
     assert first.stdout == second.stdout
-    assert json.loads(first.stdout)["application"] == "marco_polo_package:app"
+    described = json.loads(first.stdout)
+    assert described["application"] == "marco_polo_package:app"
+    assert all("resources" not in job for job in described["jobs"])
+
+    # Hardware declarations were a second, author-written placement authority. The hardcut is
+    # observable from the installed public wheel: neither the value nor the decorator argument
+    # survives, and descriptor /1 has no compatibility spelling for it.
+    _run(
+        str(Path(installed_cli).with_name("python")),
+        "-c",
+        "import inspect; import cozy_runtime.author as a; "
+        "assert not hasattr(a, 'Resources'); "
+        "assert 'resources' not in inspect.signature(a.App.job).parameters; "
+        "assert 'resources' not in inspect.signature(a.App.entrypoint).parameters",
+        cwd="/",
+    )
+    _run(
+        str(Path(installed_cli).with_name("python")),
+        "-c",
+        "import json; from cozy_runtime.internal import canonical, descriptor; "
+        f"body=json.loads({first.stdout!r}); "
+        "body['jobs'][0]['resources']={'gpu_count': 1}; "
+        "raw=canonical.write(body); "
+        "caught=False; "
+        "\ntry: descriptor.read_bytes(raw)"
+        "\nexcept descriptor.StalePackageDescriptor as exc: "
+        "caught=exc.code == 'malformed_package_descriptor'"
+        "\nassert caught",
+        cwd="/",
+    )
 
     _run(*cli, "frobnicate", cwd="/", expect=2)
     _run(*cli, "run", "nosuchfn", "message=marco", "--out", "/tmp", cwd="/", expect=4)
