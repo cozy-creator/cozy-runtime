@@ -13,7 +13,7 @@ package APIs. Runtime remains pre-release: `0.0.x` may make a coordinated hardcu
 a compatibility alias for an unused or dishonest surface. Published packages declare the supported
 Runtime range and must be requalified when a hardcut removes something they used.
 
-Runtime release `0.0.34` targets standard CPython 3.12 only. Project
+Runtime release `0.0.35` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 18 allows an authenticated external RecordOwner to make the existing bounded
 WeightsSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
@@ -270,10 +270,11 @@ no-dependency, and no-build semantics. Python, Torch/CUDA, cozy-runtime, and Ten
 installed a second time inside a rental.
 
 Runtime observes the interpreter it will actually execute once per worker boot: CPython ABI,
-Linux architecture/glibc, uv, standard-library roots, and the protected Python/Torch/Triton/
-CUDA/NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public descriptor ABI.
-Ordinary base packages
-are intentionally ignored; packages may carry their own incompatible ordinary dependencies.
+Linux architecture/glibc, uv, standard-library roots, every installed distribution version for
+dependency resolution, and import-root ownership for the protected Python/Torch/Triton/CUDA/
+NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public descriptor ABI. Packages may
+still carry their own incompatible ordinary dependencies when the selected base does not own that
+distribution.
 Runtime measures each arriving wheel's real ZIP roots and rejects protected distribution/root
 shadowing, duplicate package roots, incompatible tags, and unsatisfied requirements before uv
 runs. No image inventory document or caller-authored base fact participates.
@@ -300,7 +301,10 @@ with the venv's own Python; it receives no package `PYTHONPATH` or appended impo
 Local installed packages use the same ordinary venv boundary but not the rental base policy.
 Creator resolves the full lock with uv, so two local packages may carry different Python or Torch
 families. `prepare-package --environment-python <venv>/bin/python` validates that existing venv and
-authors the descriptor and PlacementSet without installing another environment. Local `serve`
+recognizes exact non-protected project/dependency versions as contents of that completed package
+environment, not as worker-image distributions. A version disagreement or protected-family/root
+collision still refuses. It then authors the descriptor and PlacementSet without installing
+another environment. Local `serve`
 receives the same `--environment-python`; `--environment-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
 
