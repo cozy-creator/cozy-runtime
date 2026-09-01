@@ -199,6 +199,11 @@ STATIC_ARMS = (
 
 OMISSION_ARMS = (
     OmissionArm(
+        "model-execution-tensorfs",
+        ROOT / "pyproject.toml",
+        '    "tensorfs==0.0.6",\n',
+    ),
+    OmissionArm(
         "python-abi",
         SRC / "_interpreter.py",
         '    or sysconfig.get_config_var("Py_GIL_DISABLED") == 1\n',

@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.23"
+version = "0.0.24"
 source = { editable = "../../" }
 dependencies = [
     { name = "cryptography" },
@@ -49,11 +49,12 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", path = "../../vendor/tensorfs-0.0.6-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "cuda-kernels"]
+provides-extras = ["derive", "corpus", "media", "model-execution", "cuda-kernels"]
 
 [package.metadata.requires-dev]
 dev = [

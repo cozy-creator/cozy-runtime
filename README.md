@@ -13,7 +13,7 @@ package APIs. The current package declaration is `cozy-runtime>=0.0.19,<1.0.0`: 
 author behavior stays compatible throughout that range, and an incompatible author change requires
 a new distribution major rather than ordinary user-package `v0` exact-selection policy.
 
-Runtime release `0.0.23` targets standard CPython 3.12 only. Project
+Runtime release `0.0.24` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 15 adds the private-placement join: pod-supervisor supplies a model-only signed
 delegation plus verified model files after private code preparation, and Runtime alone binds
@@ -499,6 +499,14 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `describe` refuses the release if PyAV is absent. The descriptor publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
+
+A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
+That Runtime capability owns exact `tensorfs==0.0.6`; package code does not declare TensorFS
+directly. A full local package venv installs the pinned source-built wheel under `vendor/`.
+Every approved base worker image already owns the same distribution, so rental overlay export
+prunes it and Runtime observes the image-provided facade before execution. The vendored source
+identity and reproducible build recipe are recorded in `vendor/TENSORFS.md` until TensorFS is
+published on PyPI.
 
 Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
 real CAS, so they are BUILDER-RUN and never CI steps):
