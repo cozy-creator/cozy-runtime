@@ -21,13 +21,19 @@ dependencies = [
 [dependency-groups]
 # Pinned dev tooling: CI needs these on the venv, not behind an ad-hoc `--with` on
 # every invocation.
-dev = ["mypy>=1.13", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
+dev = ["mypy>=1.13", "pytest>=8.4", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-runtime-worker = "cozy_runtime.cli.runtime_worker:main"
 cozy-environment-proof = "cozy_runtime.cli.environment_proof:main"
 cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
+
+[tool.pytest.ini_options]
+# ONE end-to-end suite. Every test starts a real process against a real build; there are no
+# unit tests here on purpose, and there are no mocks anywhere.
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
 
 [build-system]
 requires = ["hatchling"]
@@ -52,6 +58,7 @@ files = [
     "src",
     "checks",
     "scripts",
+    "tests",
     "proofs/internal",
     "proofs/support",
     "proofs/fixtures/environment-project/src",
@@ -68,7 +75,7 @@ files = [
 # byte-identical. mypy needs the source roots stated for that, or it maps
 # `src/cozy/worker/v1/wire_version.py` to bare `wire_version`.
 explicit_package_bases = true
-mypy_path = "src:checks:scripts:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-package/src:proofs/fixtures/modeled-development-package/src:proofs/fixtures/tiny-models:examples/marco-polo"
+mypy_path = "src:checks:scripts:tests:proofs/internal:proofs/support:proofs/fixtures/environment-project/src:proofs/fixtures/environment-resolved/src:proofs/fixtures/cli-project/src:proofs/fixtures/model-contract-package/src:proofs/fixtures/modeled-development-package/src:proofs/fixtures/tiny-models:examples/marco-polo"
 # The two derive-* runners live with the corpus they drive: they are torch-shaped code for
 # the corpus venv, and checking them against a torch that is not installed produces
 # confident nonsense. They are exercised by RUNNING them.

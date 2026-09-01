@@ -1,11 +1,8 @@
 name: ci
 on: [push, pull_request]
 jobs:
-  # CI is BUILD + FENCE + DETERMINISM/STALENESS only (owner rule, decisions #160, tightened
-  # 2026-08-24 after audit). `scripts/verify.py`, `scripts/redarm.py` and
-  # `scripts/derive-corpus.py` are BUILDER-RUN scripts that drive the real system — their
-  # transcripts belong in the issue's execution record, not in an automated gate. Anything
-  # below either builds, scans a boundary, or refuses a stale/non-reproducing artifact.
+  # `checks` is BUILD + FENCE + DETERMINISM/STALENESS: it builds, scans a boundary, or
+  # refuses a stale/non-reproducing artifact. Behaviour is the `end-to-end` job below.
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -81,6 +78,20 @@ jobs:
       - run: uv run python checks/model_release_routes.py
       - run: uv run python checks/multi_model_binding.py
       - run: uv run cozy-runtime version
+
+  # THE BEHAVIOUR GATE. Three real runs, no mocks: the author surface through the real
+  # invocation kernel, the PUBLIC CLI from a freshly built wheel in a fresh venv with the
+  # network cut out from under it, and `materialize()` against the adversarial
+  # package-environment refusal matrix. About a minute, which is what a wheel plus two
+  # venvs costs — and that is the thing under test.
+  end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync --extra model-execution
+      - run: uv run pytest
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
   # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another

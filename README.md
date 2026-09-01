@@ -26,9 +26,13 @@ Runtime wheel digest; package admission uses the declared range and selects the 
 active Runtime/profile. The protobuf package major and additive wire minor remain their own
 worker-control compatibility contract.
 
-**No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
-deterministic contract/arithmetic/staleness checks; everything else is verified by running
-the real thing and recording what it did, plus time/memory benchmarks.
+**One end-to-end test suite, no mocks.** `uv run pytest` is three real runs — the author
+surface through the real invocation kernel, the public CLI from a freshly built wheel in a
+fresh venv with `connect(2)` cut out from under it, and `materialize()` against the
+adversarial package-environment refusal matrix — and CI runs it beside the build, the
+architecture fences and the determinism/staleness checks. Nothing here is stubbed, patched
+or doubled: a test that passes because a fake agreed with it is worse than no test.
+Hardware is verified by hand on a rented card.
 
 ## Layout
 
@@ -247,6 +251,7 @@ project wheel and compares it. `package_descriptor_digest` is SHA-256 over those
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
     uv run python checks/architecture.py # architecture fences
     uv run python checks/declared_facts.py # every public Context/service fact has a live writer
+    uv run pytest                        # the end-to-end suite: three real runs, no mocks
     uv run python scripts/verify.py      # live run of both example packages end to end
     uv run python scripts/bench.py       # time + memory benchmarks
     proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
