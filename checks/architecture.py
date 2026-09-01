@@ -145,12 +145,12 @@ def fence_model_execution_tensorfs() -> list[str]:
     """The optional model plane has one exact, source-traceable TensorFS wheel."""
 
     bad: list[str] = []
-    filename = "tensorfs-0.0.6-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
-    expected_digest = "83bbf80e3279d1f5ced912731a2a259ad557c483b8cb0123fc4795c2383d8b1f"
+    filename = "tensorfs-0.0.7-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    expected_digest = "a3296ef604061ce2984fdb74e329cf5e2daa69d7b45b924d5806b53ab9dc2521"
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     extra = project.get("project", {}).get("optional-dependencies", {}).get("model-execution")
-    if extra != ["tensorfs==0.0.6"]:
-        bad.append("pyproject.toml: model-execution must own exact tensorfs==0.0.6")
+    if extra != ["tensorfs==0.0.7"]:
+        bad.append("pyproject.toml: model-execution must own exact tensorfs==0.0.7")
     source = project.get("tool", {}).get("uv", {}).get("sources", {}).get("tensorfs")
     if source != {"path": f"vendor/{filename}"}:
         bad.append("pyproject.toml: TensorFS source must be the exact vendored CPython 3.12 wheel")
@@ -159,20 +159,23 @@ def fence_model_execution_tensorfs() -> list[str]:
     try:
         raw = wheel.read_bytes()
         with zipfile.ZipFile(wheel) as archive:
-            metadata = archive.read("tensorfs-0.0.6.dist-info/METADATA")
+            metadata = archive.read("tensorfs-0.0.7.dist-info/METADATA")
     except (OSError, KeyError, zipfile.BadZipFile) as exc:
         bad.append(f"vendor/{filename}: unreadable wheel: {type(exc).__name__}")
         return bad
-    if len(raw) != 2_347_973 or hashlib.sha256(raw).hexdigest() != expected_digest:
+    if len(raw) != 2_360_087 or hashlib.sha256(raw).hexdigest() != expected_digest:
         bad.append(f"vendor/{filename}: bytes do not match the reviewed source build")
-    for field in (b"Name: tensorfs\n", b"Version: 0.0.6\n", b"Requires-Python: >=3.12, <3.13\n"):
+    for field in (b"Name: tensorfs\n", b"Version: 0.0.7\n", b"Requires-Python: >=3.12, <3.13\n"):
         if field not in metadata:
             bad.append(f"vendor/{filename}: METADATA omits {field.decode().strip()!r}")
 
     provenance = (ROOT / "vendor" / "TENSORFS.md").read_text()
     for fact in (
-        "ba40d92bc68e33f10c92848733d407ab887d11c7",
-        "00e762f61c2e0bc01339b53b0d3ee17d8cae2567",
+        "a9cfd601f3f8c0841907e2c2625021b463f0ef36",
+        "d284663a1cd1be556e221e554ab57d2cc756d34b",
+        "3c04d60b20f478d91801ca37278b5d23d1cd7237",
+        "33462103932",
+        "9783565076",
         expected_digest,
     ):
         if fact not in provenance:
