@@ -107,7 +107,7 @@ jobs:
     if: needs.tensorfs-credential.outputs.present == 'yes'
     runs-on: ubuntu-latest
     env:
-      TENSORFS_SHA: a9cfd601f3f8c0841907e2c2625021b463f0ef36
+      TENSORFS_SHA: d284663a1cd1be556e221e554ab57d2cc756d34b
       TENSORFS_VERSION: 0.0.7
     steps:
       - uses: actions/checkout@v4

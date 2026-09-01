@@ -5,7 +5,8 @@ is the temporary exact source for Runtime's `model-execution` extra until Tensor
 PyPI.
 
 - repository: `https://github.com/cozy-creator/tensorfs-v2.git`
-- commit: `a9cfd601f3f8c0841907e2c2625021b463f0ef36`
+- artifact source commit: `a9cfd601f3f8c0841907e2c2625021b463f0ef36`
+- merged source commit: `d284663a1cd1be556e221e554ab57d2cc756d34b`
 - tree: `3c04d60b20f478d91801ca37278b5d23d1cd7237`
 - GitHub Actions run: `33462103932`
 - job: `99714229997` (`wheels (ubuntu-latest, x86_64, true)`)

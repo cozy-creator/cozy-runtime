@@ -172,6 +172,7 @@ def fence_model_execution_tensorfs() -> list[str]:
     provenance = (ROOT / "vendor" / "TENSORFS.md").read_text()
     for fact in (
         "a9cfd601f3f8c0841907e2c2625021b463f0ef36",
+        "d284663a1cd1be556e221e554ab57d2cc756d34b",
         "3c04d60b20f478d91801ca37278b5d23d1cd7237",
         "33462103932",
         "9783565076",
