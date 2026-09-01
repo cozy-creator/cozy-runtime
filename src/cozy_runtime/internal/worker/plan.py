@@ -31,6 +31,12 @@ from cozy_runtime.internal.delivery import RUNGS_BY_NAME
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
 
+UNCALIBRATED_ACTIVATION_BYTES = 1 << 30
+
+
+def shape_cell(features: Mapping[str, int]) -> str:
+    return ",".join(f"{axis}={value}" for axis, value in sorted(features.items())) or "-"
+
 
 class PlanRefusal(Exception):
     """A typed pre-acceptance refusal, carrying the structured shortfall when it has one."""
@@ -66,7 +72,7 @@ class PreparedRequest:
     def cell(self) -> str:
         """The normalized SHAPE CELL demand is banked and read per — never the whole
         request. Two 512px requests are one cell however their prompts differ."""
-        return ",".join(f"{axis}={value}" for axis, value in sorted(self.features.items())) or "-"
+        return shape_cell(self.features)
 
     @classmethod
     def unresolved(cls, entrypoint: str, features: Mapping[str, int]) -> PreparedRequest:
@@ -126,6 +132,9 @@ class AttemptPlan:
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a RecordOwner holds, and two plans that read different artifacts of one model
     are not the same plan however identical their placement."""
+    scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
+    """Measured activation scratch by component-use method. The scalar headroom is its max;
+    staged admission uses each method's own value so unrelated weight/scratch maxima never add."""
 
     def document(self) -> dict[str, Any]:
         return {
@@ -136,6 +145,7 @@ class AttemptPlan:
             "placement": self.placement,
             "reserved_vram_bytes": self.reserved_vram_bytes,
             "headroom_bytes": self.headroom_bytes,
+            "scope_headroom_bytes": dict(self.scope_headroom_bytes),
             "entrypoint_binding_digest": self.entrypoint_binding_digest,
             "model_construction_digest": self.model_construction_digest,
             "constructed_model_digest": self.constructed_model_digest,
@@ -587,7 +597,7 @@ class PlanChooser:
             # No serve has been banked on this generation, so there is no measurement. The
             # authored bound is LABELLED and cannot arm enforcement: an uncalibrated number
             # may not refuse and may not select a worse rung.
-            terms.append(Coefficient("activations", 1 << 30, "bound", ""))
+            terms.append(Coefficient("activations", UNCALIBRATED_ACTIVATION_BYTES, "bound", ""))
         if self.ledger.out_of_allocator > 0:
             terms.append(
                 Coefficient(
@@ -658,6 +668,17 @@ class PlanChooser:
         ]
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
+        cell = prepared.cell()
+        measured_scopes = self.ledger.activation_scopes_for(cell)
+        scope_headrooms = {
+            method: measured_scopes.get(method, activations.value)
+            for method in self.ledger.declared_scopes
+        }
+        scope_demands = {
+            method: sum(sizes.get(name, 0) for name in dict.fromkeys(names))
+            + scope_headrooms[method]
+            for method, names in self.ledger.declared_scopes.items()
+        }
         rows: list[dict[str, Any]] = []
         chosen = ""
         # THE CONSTRUCTION FLOOR. A generation whose deployment ceiling PARKED components
@@ -682,6 +703,16 @@ class PlanChooser:
                     }
                 )
                 continue
+            unsuitable = self.ledger.placement_refusal(placement)
+            if unsuitable:
+                rows.append(
+                    {
+                        "rung": placement,
+                        "verdict": "observed_unsuitable",
+                        "why": unsuitable,
+                    }
+                )
+                continue
             # Both rungs charge the same ACTIVATION headroom and differ in the WEIGHTS
             # they must bring back: `all_resident` needs every absent component and can
             # free nothing, so its capacity is bare allocatable; `component_staged` holds
@@ -691,7 +722,7 @@ class PlanChooser:
                 headroom = activations.value + absent_bytes
                 capacity = allocatable
             else:
-                headroom = activations.value + largest
+                headroom = max(scope_demands.values(), default=activations.value + largest)
                 capacity = allocatable + sum(resident.values())
             fits = allocatable < 0 or capacity >= headroom
             row = {
@@ -717,12 +748,32 @@ class PlanChooser:
             "parked": list(parked),
             "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
             "largest_declared_set_bytes": largest,
+            "scope_headroom_bytes": dict(scope_headrooms),
+            "scope_demand_bytes": dict(scope_demands),
             "rungs": rows,
-            "shape_cell": prepared.cell(),
+            "shape_cell": cell,
         }
         self.walks.append(walk)
         del self.walks[:-16]
         if not chosen:
+            proven = tuple(placement for placement, _why, status in RUNGS if status == "proven")
+            if proven and all(self.ledger.placement_refusal(placement) for placement in proven):
+                reasons = "; ".join(
+                    f"{placement}: {self.ledger.placement_refusal(placement)}"
+                    for placement in proven
+                )
+                raise PlanRefusal(
+                    "placement_capacity_falsified",
+                    f"every proven placement rung was falsified on this executor generation: "
+                    f"{reasons}",
+                    {
+                        "resource": "vram",
+                        "scope": "placement",
+                        "needed_bytes": activations.value,
+                        "available_bytes": max(allocatable, 0),
+                        "evidence_class": "measured",
+                    },
+                )
             chosen, confession = self._deepen(declared, activations, allocatable, walk)
         else:
             confession = ""
@@ -744,6 +795,7 @@ class PlanChooser:
             model_weight_bytes=weights,
             resident_bytes=sum(resident.values()),
             headroom_bytes=activations.value,
+            scope_headroom_bytes=tuple(sorted(scope_headrooms.items())),
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             model_construction_digest=prepared_model.logical_model_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,

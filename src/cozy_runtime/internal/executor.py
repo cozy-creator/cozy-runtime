@@ -182,22 +182,37 @@ class _CompositeResidency:
             None,
         )
 
-    def open_attempt(self, placement: str, headroom_bytes: int) -> None:
+    def open_attempt(
+        self,
+        placement: str,
+        headroom_bytes: int,
+        scope_headroom_bytes: dict[str, int] | None = None,
+    ) -> None:
         for row in self.rows.values():
-            row.open_attempt(placement, headroom_bytes)
+            row.open_attempt(placement, headroom_bytes, scope_headroom_bytes)
 
     def document(self) -> dict[str, Any]:
         documents = {name: row.document() for name, row in sorted(self.rows.items())}
+        prefix = len(documents) > 1
         resident = {
-            f"{name}/{component}": int(size)
+            f"{name}/{component}" if prefix else str(component): int(size)
             for name, document in documents.items()
             for component, size in document.get("resident", {}).items()
         }
         evicted = {
-            f"{name}/{component}": int(size)
+            f"{name}/{component}" if prefix else str(component): int(size)
             for name, document in documents.items()
             for component, size in document.get("evicted", {}).items()
         }
+        activation_peaks: dict[str, int] = {}
+        scope_headrooms: dict[str, int] = {}
+        for document in documents.values():
+            for method, value in (document.get("attempt_activation_peaks") or {}).items():
+                activation_peaks[str(method)] = max(
+                    activation_peaks.get(str(method), 0), int(value)
+                )
+            for method, value in (document.get("scope_headroom_bytes") or {}).items():
+                scope_headrooms[str(method)] = max(scope_headrooms.get(str(method), 0), int(value))
         return {
             "placement": next(
                 (document.get("placement", "") for document in documents.values()), ""
@@ -206,12 +221,22 @@ class _CompositeResidency:
                 (int(document.get("headroom_bytes", 0)) for document in documents.values()),
                 default=0,
             ),
+            "scope_headroom_bytes": scope_headrooms,
             "admissions": sum(int(row.get("admissions", 0)) for row in documents.values()),
             "stages": sum(int(row.get("stages", 0)) for row in documents.values()),
             "evictions": sum(int(row.get("evictions", 0)) for row in documents.values()),
             "attempt_stages": sum(int(row.get("attempt_stages", 0)) for row in documents.values()),
             "attempt_evictions": sum(
                 int(row.get("attempt_evictions", 0)) for row in documents.values()
+            ),
+            "attempt_activation_peak_bytes": max(
+                (int(row.get("attempt_activation_peak_bytes", 0)) for row in documents.values()),
+                default=0,
+            ),
+            "attempt_activation_peaks": activation_peaks,
+            "attempt_absolute_peak_bytes": max(
+                (int(row.get("attempt_absolute_peak_bytes", 0)) for row in documents.values()),
+                default=0,
             ),
             "allocator_delta_bytes": sum(
                 int(row.get("allocator_delta_bytes", 0)) for row in documents.values()
@@ -1206,6 +1231,10 @@ class Executor:
             self.residency.open_attempt(
                 str(command.get("placement", "all_resident")),
                 int(command.get("headroom_bytes", 0)),
+                {
+                    str(method): int(value)
+                    for method, value in (command.get("scope_headroom_bytes") or {}).items()
+                },
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
@@ -1244,6 +1273,8 @@ class Executor:
             accel.synchronize(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
+        residency_document = self.residency.document() if self.residency is not None else {}
+        peak_vram = max(peak_vram, int(residency_document.get("attempt_absolute_peak_bytes", 0)))
         # step 3: the lease releases here, and nothing after this line touches the device.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
@@ -1266,7 +1297,7 @@ class Executor:
         return {
             "ok": True,
             "shortfall": shortfall,
-            "residency": self.residency.document() if self.residency is not None else {},
+            "residency": residency_document,
             "observations": record.ring.rows(),
             "observation_caps": record.ring.caps(),
             "attribution": record.attribution.document(),
@@ -1299,6 +1330,10 @@ class Executor:
                 "device_lease_ms": round(lease_ms, 3),
                 "d2h_wait_ms": round(d2h_ms, 3),
                 "peak_vram_bytes": peak_vram,
+                "activation_peak_bytes": int(
+                    residency_document.get("attempt_activation_peak_bytes", 0)
+                ),
+                "activation_peaks": dict(residency_document.get("attempt_activation_peaks") or {}),
                 "allocated_at_start_bytes": allocated_at_start,
                 "rss_at_end_bytes": _rss(),
                 "started_unix": started_wall,
@@ -1744,6 +1779,7 @@ class Executor:
             return {
                 "ok": True,
                 "outcome": "failed",
+                "code": str(ready.get("code", "request_unresolvable")),
                 "payload": payload,
                 "reason": f"{ready.get('code')}: {str(ready.get('detail'))[:200]}",
             }
@@ -1753,20 +1789,39 @@ class Executor:
             return {
                 "ok": True,
                 "outcome": "warmed",
+                "code": "",
                 "reason": "",
+                "features": dict(ready.get("features") or {}),
                 "payload": payload,
                 "boot_warmup_observed": bool(_read_result(spool).get("warm")),
                 "handler_ms": reply.get("metrics", {}).get("handler_ms", 0),
+                "activation_peak_bytes": int(
+                    reply.get("metrics", {}).get("activation_peak_bytes", 0)
+                ),
+                "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
+                "resident_moved": bool(
+                    int(reply.get("residency", {}).get("attempt_stages", 0))
+                    or int(reply.get("residency", {}).get("attempt_evictions", 0))
+                ),
             }
-        # A failed warm pass NEVER bricks the worker: it is reported and the executor is
-        # left usable, because nothing observed under boot_warmup is correctness evidence.
+        # Generic warm failures do not brick the worker. The worker separately consumes the
+        # typed capacity code below: an allocator OOM IS evidence against this placement rung
+        # and may only be followed by a proven fallback, never the same accepted envelope.
         self.poisoned = ""
+        code = str(reply.get("code") or reply["outcome"]["code"])
         return {
             "ok": True,
             "outcome": "failed",
+            "code": code,
+            "features": dict(ready.get("features") or {}),
             "payload": payload,
-            "reason": f"{reply.get('code') or reply['outcome']['code']}: "
-            f"{(reply.get('detail') or reply['outcome']['message'])[:200]}",
+            "activation_peak_bytes": int(reply.get("metrics", {}).get("activation_peak_bytes", 0)),
+            "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
+            "resident_moved": bool(
+                int(reply.get("residency", {}).get("attempt_stages", 0))
+                or int(reply.get("residency", {}).get("attempt_evictions", 0))
+            ),
+            "reason": f"{code}: {(reply.get('detail') or reply['outcome']['message'])[:200]}",
         }
 
     def _result_schema_digest(self, surface: Any) -> str:

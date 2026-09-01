@@ -92,10 +92,12 @@ from cozy_runtime.internal.worker.control import (
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.plan import (
+    UNCALIBRATED_ACTIVATION_BYTES,
     DeclaredBinding,
     JobBinding,
     PlanChooser,
     PreparedModel,
+    shape_cell,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -103,6 +105,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
 PROGRESS_QUEUE = 256
+WARM_CAPACITY_CODES = frozenset({"device_out_of_memory", "device_shortfall"})
 
 #: Report cadence. Report is DURABLE and carries the applied baseline, so the owner can
 #: always see a directive it issued but the worker did not apply.
@@ -1085,7 +1088,9 @@ class Worker:
             self.engine.prepared_models = hosted.prepared_models
             self.engine.failed_bindings = hosted.failed_bindings
         executor = self.engine.supervision.current
-        self.ledger.begin_generation(executor.pid if executor is not None else 0)
+        executor_pid = executor.pid if executor is not None else 0
+        if self.ledger.executor_pid != executor_pid:
+            self.ledger.begin_generation(executor_pid)
 
     def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
         hosted = self.hosted.get(placement_id)
@@ -3390,7 +3395,7 @@ class Worker:
         """Run optional warm work, then publish the activation edge or its typed failure."""
 
         if not self.run_warm_pass():
-            self.latched = "executor_lost_during_warm"
+            self.latched = self.latched or "executor_lost_during_warm"
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
             self._settle()
             return
@@ -3423,30 +3428,101 @@ class Worker:
         executor = self.supervision.current
         if executor is None:
             return False
+
+        def run_one(binding: DeclaredBinding, placement: str) -> dict[str, Any]:
+            spool = self.root / "warm" / binding.entrypoint / placement
+            spool.mkdir(parents=True, exist_ok=True)
+            started = time.perf_counter()
+            reply = executor.call(
+                {
+                    "cmd": "warm",
+                    "request_id": f"warm-{binding.entrypoint}-{placement}",
+                    "entrypoint": binding.entrypoint,
+                    "placement": placement,
+                    # The same labelled bound the first request's chooser will use. It does
+                    # not decide the fallback: the observed OOM above does. The staged retry
+                    # proves whether this existing rung can actually serve the synthesized case.
+                    "headroom_bytes": UNCALIBRATED_ACTIVATION_BYTES,
+                    # NO TIME BOUND: warm is a BOOT STEP and boot is silence-bounded (§3.3).
+                    "deadline_s": None,
+                    "spool": str(spool),
+                },
+                timeout=None,
+            )
+            outcome: dict[str, Any] = {
+                "entrypoint": binding.entrypoint,
+                "placement": placement,
+                "shape_cell": shape_cell(
+                    {str(k): int(v) for k, v in (reply.get("features") or {}).items()}
+                ),
+                "outcome": str(reply.get("outcome", "failed")),
+                "code": str(reply.get("code", "")),
+                "reason": str(reply.get("reason", ""))[:200],
+                "boot_warmup_observed": bool(reply.get("boot_warmup_observed", False)),
+                "activation_peak_bytes": int(reply.get("activation_peak_bytes", 0)),
+                "activation_peaks": {
+                    str(method): int(value)
+                    for method, value in (reply.get("activation_peaks") or {}).items()
+                },
+                "resident_moved": bool(reply.get("resident_moved", False)),
+                "ms": round((time.perf_counter() - started) * 1000, 1),
+            }
+            outcome["demand_evidence"] = (
+                outcome["code"] in WARM_CAPACITY_CODES or int(outcome["activation_peak_bytes"]) > 0
+            )
+            self.boot.step(
+                "warm",
+                str(outcome["outcome"]),
+                float(outcome["ms"]),
+                entrypoint=binding.entrypoint,
+                placement=placement,
+                benchmark_override=True,
+                reason=str(outcome["reason"])[:200],
+            )
+            self.records.append("warm", dict(outcome))
+            self.warm.append(outcome)
+            self.note(
+                "warm",
+                f"{binding.entrypoint}/{placement}: {outcome['outcome']} "
+                f"({outcome['ms']} ms) {outcome['reason']}"[:200],
+            )
+            return outcome
+
         for plan_id, binding in self.bindings.items():
             if plan_id not in executor.ready_bindings:
                 continue
-            spool = self.root / "warm" / binding.entrypoint
-            spool.mkdir(parents=True, exist_ok=True)
-            started = time.perf_counter()
             try:
-                reply = executor.call(
-                    {
-                        "cmd": "warm",
-                        "request_id": f"warm-{binding.entrypoint}",
-                        "entrypoint": binding.entrypoint,
-                        # NO BOUND: warm is a BOOT STEP and boot is silence-bounded (§3.3).
-                        "deadline_s": None,
-                        "spool": str(spool),
-                    },
-                    timeout=None,
-                )
-                outcome: dict[str, Any] = {
-                    "entrypoint": binding.entrypoint,
-                    "outcome": str(reply.get("outcome", "failed")),
-                    "reason": str(reply.get("reason", ""))[:200],
-                    "boot_warmup_observed": bool(reply.get("boot_warmup_observed", False)),
-                }
+                outcome = run_one(binding, "all_resident")
+                if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
+                    self.ledger.refuse_placement(
+                        "all_resident",
+                        str(outcome["reason"]),
+                    )
+                    self.note(
+                        "warm",
+                        f"{binding.entrypoint}: observed all_resident capacity failure; "
+                        "proving component_staged before admission",
+                    )
+                    outcome = run_one(binding, "component_staged")
+                    if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
+                        self.ledger.refuse_placement(
+                            "component_staged",
+                            str(outcome["reason"]),
+                        )
+                        self.latched = (
+                            "warm_capacity_unsatisfied: every proven placement rung failed "
+                            f"for {binding.entrypoint}"
+                        )
+                        self.engine.fault(
+                            pb.Fault(
+                                kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
+                                subject=plan_id,
+                                reason="warm_capacity_unsatisfied",
+                                detail=f"boot warm capacity failed for every proven rung: "
+                                f"{outcome['reason']}",
+                            )
+                        )
+                        return False
             except ExecutorGone as exc:
                 self.supervision.invalidate(executor, "executor died during warmup")
                 try:
@@ -3455,23 +3531,15 @@ class Worker:
                     self.note("recovery", f"warmup reclaim failed: {reclaim}")
                 self.note("warm", f"{binding.entrypoint}: executor lost: {exc}"[:200])
                 return False
-            outcome["ms"] = round((time.perf_counter() - started) * 1000, 1)
-            outcome["demand_evidence"] = False
-            self.boot.step(
-                "warm",
-                str(outcome["outcome"]),
-                float(outcome["ms"]),
-                entrypoint=binding.entrypoint,
-                benchmark_override=True,
-                reason=str(outcome["reason"])[:200],
-            )
-            self.records.append("warm", dict(outcome))
-            self.warm.append(outcome)
-            self.note(
-                "warm",
-                f"{binding.entrypoint}: {outcome['outcome']} ({outcome['ms']} ms) "
-                f"{outcome['reason']}"[:200],
-            )
+            if outcome["outcome"] == "warmed" and int(outcome["activation_peak_bytes"]) > 0:
+                self.ledger.observe_attempt(
+                    {
+                        "activation_peak_bytes": int(outcome["activation_peak_bytes"]),
+                        "activation_peaks": dict(outcome["activation_peaks"]),
+                    },
+                    resident_moved=bool(outcome["resident_moved"]),
+                    cell=str(outcome["shape_cell"]),
+                )
             if outcome["outcome"] == "failed":
                 self.engine.degraded[plan_id] = str(outcome["reason"])[:160]
                 self.engine.fault(
