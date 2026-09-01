@@ -223,8 +223,8 @@ inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
 ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
 no release digest, build timestamp, machine path or mutable binding reached it.
 The same `/1` document may carry bounded `model_productions`: static graphs over ordinary job
-callables with fixed required outputs, recipe-owned lane keys and independently verifiable
-contracts. Named source slots bind reviewed TensorFS source-profile IDs, so one foreign repository
+callables with fixed named outputs and independently verifiable contracts. Public model release and
+lane names are chosen later by the repository owner. Named source slots bind reviewed TensorFS source-profile IDs, so one foreign repository
 may yield several exact converter closures without a filename heuristic or a fake aggregate model.
 Each output contract contains only the final topology digest and sorted exact TensorFS EncodingSpec
 object IDs. Tensorhub derives both from the produced header; human task, structure and stamp labels

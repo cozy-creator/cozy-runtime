@@ -138,7 +138,6 @@ def _production(production: Production) -> dict[str, Json]:
             {
                 "name": output.name,
                 "source": output.source,
-                "lane_key": output.lane_key,
                 "required_contract": _production_contract(output.required),
             }
             for output in sorted(production.outputs, key=lambda row: row.name)
@@ -545,7 +544,6 @@ def _productions(value: Json, source: str) -> None:
         if not isinstance(outputs, list) or not 1 <= len(outputs) <= 16:
             _invalid(source, f"{path}.outputs", "must contain 1 through 16 required outputs")
         output_names: set[str] = set()
-        lane_keys: set[str] = set()
         required_steps: set[str] = set()
 
         def retain(
@@ -569,17 +567,15 @@ def _productions(value: Json, source: str) -> None:
             output_path = f"{path}.outputs[{output_index}]"
             output = _closed(
                 output_raw,
-                {"name", "source", "lane_key", "required_contract"},
+                {"name", "source", "required_contract"},
                 set(),
                 source,
                 output_path,
             )
             output_name = _portable_name(output["name"], source, f"{output_path}.name")
-            lane_key = _portable_name(output["lane_key"], source, f"{output_path}.lane_key")
-            if output_name in output_names or lane_key in lane_keys:
-                _invalid(source, output_path, "repeats an output name or lane key")
+            if output_name in output_names:
+                _invalid(source, output_path, "repeats an output name")
             output_names.add(output_name)
-            lane_keys.add(lane_key)
             selected = edge(str(output["source"]), f"{output_path}.source")
             if selected is None:
                 _invalid(source, f"{output_path}.source", "must name a step output")

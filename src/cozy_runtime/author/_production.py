@@ -137,11 +137,10 @@ class ProductionStep:
 
 @dataclass(frozen=True, slots=True)
 class ProductionOutput:
-    """One required graph output and its recipe-owned stable catalog lane key."""
+    """One named checkpoint output and its required artifact contract."""
 
     name: str
     source: str
-    lane_key: str
     required: ProductionContract
 
     def __post_init__(self) -> None:
@@ -152,7 +151,6 @@ class ProductionOutput:
                 code="production_edge",
                 fields=[self.name],
             )
-        _name(self.lane_key, f"production output {self.name} lane key")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,10 +199,9 @@ class Production:
                 fields=[self.name],
             )
         output_names = [output.name for output in self.outputs]
-        lane_keys = [output.lane_key for output in self.outputs]
-        if len(set(output_names)) != len(output_names) or len(set(lane_keys)) != len(lane_keys):
+        if len(set(output_names)) != len(output_names):
             raise ConformanceError(
-                f"production {self.name} repeats an output name or lane key",
+                f"production {self.name} repeats an output name",
                 code="production_duplicate",
                 fields=[self.name],
             )
