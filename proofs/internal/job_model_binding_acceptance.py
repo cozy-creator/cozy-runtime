@@ -409,10 +409,9 @@ def main() -> None:
                 content_digest="sha256:" + "c" * 64,
                 reused=False,
             ),
-            include_modeled=True,
         )
         if staged != {descriptor_id}:
-            raise RuntimeError("private revision did not stage its modeled job")
+            raise RuntimeError("package preparation did not stage its modeled job")
         staged_binding = JobBinding.read(
             json.loads(
                 (root / "job-plans" / f"{descriptor_id.removeprefix('sha256:')}.json").read_text()
