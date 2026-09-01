@@ -288,6 +288,12 @@ def _protected(name: str) -> bool:
     return name in _PROTECTED or name.startswith(("cuda-", "nvidia-"))
 
 
+def protected_distribution(name: str) -> bool:
+    """Whether a normalized distribution belongs exclusively to the worker base."""
+
+    return _protected(_normalize(name))
+
+
 def _normalize(value: str) -> str:
     return _NAME_RUNS.sub("-", value.strip().lower())
 

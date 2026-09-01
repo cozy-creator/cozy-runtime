@@ -394,6 +394,12 @@ def materialize(
     )
 
 
+def verify_inventory(source: Input, base: base_observation.Observation) -> None:
+    """Refuse incompatible wheel facts before the worker downloads their bytes."""
+
+    _verify_inventory(source, base)
+
+
 def verify_existing_environment(
     source: Input,
     *,
@@ -660,6 +666,11 @@ def _verify_inventory(
                 f"{wheel.filename} tags={','.join(wheel.tags)}; project must be py3-none-any",
             )
         base_version = base.distribution_versions.get(name)
+        if base_version is None and base_observation.protected_distribution(name):
+            raise EnvironmentRefusal(
+                "package_environment_second_protected_family",
+                f"distribution={name} is worker-image-owned and absent from this worker",
+            )
         if base_version is not None and not (allow_base_owned and base_owned_wheel(wheel, base)):
             raise EnvironmentRefusal(
                 "package_environment_shadows_base_distribution",

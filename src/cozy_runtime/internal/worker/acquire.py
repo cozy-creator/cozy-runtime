@@ -455,6 +455,24 @@ class Acquirer:
         environment_digest = documents.spell(placement.environment_digest)
         package = placement.package or placement.development
         wheel_rows = [package["project_wheel"], *placement.environment.get("wheels", [])]
+        expected_paths: dict[str, Path] = {}
+        for row in wheel_rows:
+            digest, _length = _ref(row["ref"], "wheel.ref")
+            expected_paths[digest] = self.cache_root / digest.removeprefix("sha256:")
+        try:
+            package_environment.verify_inventory(
+                placement_materialization.package_environment_input(
+                    package=package,
+                    environment=placement.environment,
+                    environment_digest=environment_digest,
+                    wheel_paths=expected_paths,
+                ),
+                self.base,
+            )
+        except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
+            ) from exc
         wheel_paths: dict[str, Path] = {}
         verified: dict[str, package_environment.VerifiedFile] = {}
         for row in wheel_rows:
