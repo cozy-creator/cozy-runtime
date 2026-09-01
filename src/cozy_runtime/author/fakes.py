@@ -6,6 +6,10 @@ real spool through the real encode and size-limit path, plus recording accessors
 encode under test is the one production runs, so a fake cannot drift from the real thing
 by construction — there is no parallel behavioral runtime here to maintain.
 
+`fake_input()` closes the loop the other way: a saved OUTPUT asset becomes an input
+handle hydrated through the real `bind`, so one attempt's result feeds the next the way
+the executor feeds it.
+
 `Settings` and `Secrets` need no fake wrapper: they carry exactly the validated value, so
 `Settings(MyConfig(...))` IS the fake — a wrapper adding nothing is a surface to maintain.
 
@@ -27,10 +31,11 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset, GrantedInput
+from cozy_runtime.author._assets import Asset, GrantedInput, bind
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, DecodeLimits, MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Recipe
+from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
 from cozy_runtime.author._model import Model
@@ -52,10 +57,64 @@ def _spool(name: str) -> Path:
 
 
 def fake_attempt(
-    request_id: str = "fake-attempt", *, max_output_bytes: int = MAX_OUTPUT_BYTES
+    request_id: str = "fake-attempt",
+    *,
+    spool: Path | None = None,
+    max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> Attempt:
-    """A real attempt over a real temporary spool — the transaction the services share."""
-    return Attempt(request_id, _spool(request_id), max_output_bytes)
+    """A real attempt over a real spool — the transaction the services share.
+
+    `spool` names the directory (created if absent) when the caller has to LOOK at what the
+    attempt left behind: a partial-output cleanup or a spool-residue proof reads the
+    directory, and it cannot read one it was never told.
+    """
+    if spool is None:
+        return Attempt(request_id, _spool(request_id), max_output_bytes)
+    spool.mkdir(parents=True, exist_ok=True)
+    return Attempt(request_id, spool, max_output_bytes)
+
+
+def fake_input[AssetT: Asset](
+    source: AssetT,
+    *,
+    attempt: str,
+    input_id: str = "input",
+    max_decoded_bytes: int = 0,
+) -> AssetT:
+    """`source`'s bytes as a fresh INPUT handle hydrated into `attempt`.
+
+    The round trip a package author needs and cannot otherwise take: `out.save_*` returns
+    an OUTPUT asset, and feeding it back to a handler — or to `MediaDecoder` — is what the
+    executor does when one attempt's result becomes the next attempt's granted input.
+    Hydration runs through the same `bind` the executor's `_hydrate` runs, with the same
+    facts the worker established before acceptance, so a fake input cannot carry a
+    provenance the real one would not have.
+    """
+    if source._local is None:
+        raise CapabilityError(
+            f"asset {source.ref!r} has no bytes to grant: an input stands for bytes the "
+            "worker already fetched, verified and spooled",
+            code="asset_unhydrated",
+        )
+    granted = GrantedInput(
+        input_id=input_id,
+        local=source._local,
+        media_type=source.media_type,
+        digest=source.digest,
+        length=source.size_bytes,
+    )
+    bound = type(source)(source.ref)
+    bind(
+        bound,
+        local=granted.local,
+        attempt=attempt,
+        media_type=granted.media_type,
+        digest=granted.digest,
+        length=granted.length,
+        max_decoded_bytes=max_decoded_bytes,
+        input_id=granted.input_id,
+    )
+    return bound
 
 
 def fake_context(

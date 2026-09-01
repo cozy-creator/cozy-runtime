@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import msgspec
 
@@ -126,7 +126,7 @@ def resolve(
 
     # Layer 1 of the two-layer clamp: API bounds REJECT what the caller actually sent,
     # before any policy has a chance to quietly clamp it into range.
-    _decode(payload_type, wire, "the request")
+    decode_request(cast("type[Any]", payload_type), wire)
 
     for recipe in recipes:
         _validate_recipe(recipe, marked, model_params)
@@ -191,13 +191,23 @@ def resolve(
             )
 
     # ONE whole-request revalidation, cross-field constraints included.
-    payload = _decode(payload_type, merged, "the resolved request")
+    payload = decode_request(cast("type[Any]", payload_type), merged, "the resolved request")
     return Overlay(
         payload, dict(sorted(merged.items())), sources, _digest(merged, sources), tuple(rows)
     )
 
 
-def _decode(payload_type: object, data: Mapping[str, object], what: str) -> Any:
+def decode_request[T](
+    payload_type: type[T], data: Mapping[str, object], what: str = "the request"
+) -> T:
+    """Decode wire data into a request struct the way the runtime decodes it.
+
+    The ONE supported path from wire data to a payload carrying asset fields. `Asset` is
+    deliberately not a msgspec-native type, so a caller reaching for `msgspec.convert`
+    needs `asset_dec_hook` — the hook that accepts a REF STRING and nothing else — and a
+    caller who writes their own hook gets a decoder that can hydrate an asset from request
+    data. Refusals arrive as `InvalidRequest`, the typed outcome the executor raises.
+    """
     try:
         return msgspec.convert(dict(data), type=payload_type, dec_hook=asset_dec_hook)
     except msgspec.ValidationError as exc:
