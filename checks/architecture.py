@@ -1414,6 +1414,48 @@ def fence_typed_model_binding() -> list[str]:
     return bad
 
 
+def fence_proofs_public_imports() -> list[str]:
+    """A PUBLIC proof exercises the installed public surface, never a private symbol.
+
+    An AST scan, because the shell greps it replaces matched only the literal string
+    `cozy_runtime.internal` and therefore missed
+    `from cozy_runtime.cli.model_contract_proof import _component_local_key` — a private
+    symbol, imported by a public proof, invisible to a pattern looking for one module name.
+    `proofs/internal/` is the DECLARED private half and is exempt by construction.
+    """
+
+    bad: list[str] = []
+    private_root = (ROOT / "proofs" / "internal").resolve()
+    for path in sorted((ROOT / "proofs").rglob("*.py")):
+        if private_root in path.resolve().parents:
+            continue
+        tree = ast.parse(path.read_text())
+        rel = path.relative_to(ROOT)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if _private_runtime_module(alias.name):
+                        bad.append(f"{rel}:{node.lineno}: imports {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if _private_runtime_module(node.module):
+                    bad.append(f"{rel}:{node.lineno}: imports from {node.module}")
+                elif node.module.split(".")[0] == "cozy_runtime":
+                    for alias in node.names:
+                        if alias.name.startswith("_"):
+                            bad.append(
+                                f"{rel}:{node.lineno}: imports the private symbol "
+                                f"{alias.name!r} from {node.module}"
+                            )
+    return bad
+
+
+def _private_runtime_module(name: str) -> bool:
+    parts = name.split(".")
+    if parts[0] != "cozy_runtime":
+        return False
+    return "internal" in parts[1:2] or any(part.startswith("_") for part in parts[1:])
+
+
 FENCES = {
     "prelaunch-version": fence_prelaunch_version,
     "python-abi": fence_python_abi,
@@ -1427,6 +1469,7 @@ FENCES = {
     "no-installed-file-inventory": fence_no_installed_file_inventory,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
+    "proofs-public-imports": fence_proofs_public_imports,
     "author-import-boundary": fence_author_import_boundary,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,

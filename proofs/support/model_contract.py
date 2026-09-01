@@ -23,7 +23,7 @@ from proof_data import require as _require
 from proof_data import wheel as _wheel
 from proof_data import write as _write
 
-from cozy_runtime.cli.model_contract_proof import ProofRefusal, _component_local_key
+from cozy_runtime.cli.model_contract_proof import ProofRefusal, component_local_key
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -99,17 +99,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _component_key_proof() -> None:
     _require(
-        _component_local_key("transformer", "transformer.blocks.0.weight") == "blocks.0.weight",
+        component_local_key("transformer", "transformer.blocks.0.weight") == "blocks.0.weight",
         "component prefix was not stripped exactly once",
     )
     _require(
-        _component_local_key("transformer", "transformer.transformer.weight")
+        component_local_key("transformer", "transformer.transformer.weight")
         == "transformer.weight",
         "nested component-looking key was stripped twice",
     )
     for key in ("other.blocks.0.weight", "transformer"):
         try:
-            _component_local_key("transformer", key)
+            component_local_key("transformer", key)
         except ProofRefusal as err:
             _require(
                 err.code == "model_contract_component_key_invalid",

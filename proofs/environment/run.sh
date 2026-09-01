@@ -4,8 +4,6 @@ set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 support="$repo/proofs/support/environment.py"
 import_probe="$repo/proofs/support/environment_imports.py"
-shared_support="$repo/proofs/support/proof_data.py"
-red_fixture="$repo/proofs/fixtures/environment-private-import-red.txt"
 uv_bin=$(command -v uv)
 proof_root=$(mktemp -d /tmp/cozy-environment-proof.XXXXXX)
 
@@ -14,19 +12,6 @@ cleanup() {
     rm -rf -- "$proof_root"
 }
 trap cleanup EXIT HUP INT TERM
-
-private_imports() {
-    grep -R -n -E 'from cozy_runtime\.internal|import cozy_runtime\.internal' "$@"
-}
-
-if private_imports "$repo/proofs/environment" "$support" "$import_probe" "$shared_support"; then
-    echo "public environment proof imports private Runtime modules" >&2
-    exit 1
-fi
-if ! private_imports "$red_fixture" >/dev/null; then
-    echo "public proof private-import fence did not detect its planted violation" >&2
-    exit 1
-fi
 
 mkdir "$proof_root/build"
 UV_OFFLINE=1 "$uv_bin" build --offline --wheel --out-dir "$proof_root/build" "$repo"

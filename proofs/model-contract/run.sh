@@ -5,7 +5,6 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 fixture="$repo/proofs/fixtures/model-contract-package"
 fake_torch="$repo/proofs/fixtures/fake-torch"
 support="$repo/proofs/support/model_contract.py"
-shared_support="$repo/proofs/support/proof_data.py"
 uv_bin=$(command -v uv)
 tensorfs_wheel=${TENSORFS_WHEEL:?set TENSORFS_WHEEL to the exact TensorFS 0.0.8 wheel under test}
 proof_root=$(mktemp -d /tmp/cozy-model-contract-proof.XXXXXX)
@@ -16,12 +15,6 @@ cleanup() {
     rm -rf -- "$proof_root"
 }
 trap cleanup EXIT HUP INT TERM
-
-if grep -R -n -E 'from cozy_runtime\.internal|import cozy_runtime\.internal' \
-    "$repo/proofs/model-contract" "$support" "$shared_support"; then
-    echo "public model-contract proof imports private Runtime modules" >&2
-    exit 1
-fi
 
 cp -R "$fixture" "$fixture_source"
 mkdir "$proof_root/build"
