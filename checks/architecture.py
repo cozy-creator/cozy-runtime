@@ -538,7 +538,29 @@ ENGINE_CLASS = "AttemptEngine"
 ENGINE_BUILDER = "internal/worker/session.py"
 
 
+def _dotted(node: ast.expr) -> str:
+    """`a.b.c` as a string, or "" for anything that is not a plain dotted name."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
 def fence_one_attempt_kernel() -> list[str]:
+    """ONE invocation kernel, reachable from ONE module, so `run`, `job` and `serve` cannot
+    drift into two lifecycles.
+
+    A dependency-direction rule: nothing observes it at runtime, because the second
+    lifecycle a second caller would build works perfectly well. What it scans is REACH, not
+    a verb — an import of a kernel name, or an attribute on a binding that resolves to the
+    author package. `prepare`, `invoke` and `attempt` are ordinary words that ordinary
+    objects answer to, and matching them on any receiver is the name-for-capability
+    conflation PR #181 deleted the surface blocklists for.
+    """
     bad: list[str] = []
     for path in py_files():
         rel = path.relative_to(SRC)
@@ -547,32 +569,45 @@ def fence_one_attempt_kernel() -> list[str]:
             continue
         tree = ast.parse(path.read_text())
         allowed_caller = rel.as_posix() == KERNEL_CALLER
+        where = path.relative_to(ROOT)
+        # Names bound in THIS module to the author package itself — `import
+        # cozy_runtime.author [as x]`, `from cozy_runtime import author [as x]` — through
+        # which a kernel call is reachable without ever importing its name.
+        aliases = {"cozy_runtime.author"}
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                "cozy_runtime.author"
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "cozy_runtime.author" or alias.name.startswith(
+                        "cozy_runtime.author."
+                    ):
+                        aliases.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module == "cozy_runtime":
+                aliases.update(a.asname or a.name for a in node.names if a.name == "author")
+        if allowed_caller:
+            aliases.clear()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and (node.module or "").startswith("cozy_runtime.author")
+                and not allowed_caller
             ):
-                names = {a.name for a in node.names}
-                hit = names & set(KERNEL_CALLS)
-                if hit and not allowed_caller:
+                hit = sorted({a.name for a in node.names} & set(KERNEL_CALLS))
+                if hit:
                     bad.append(
-                        f"{path.relative_to(ROOT)}:{node.lineno}: imports the invocation "
-                        f"kernel {sorted(hit)} — only {KERNEL_CALLER} may, so that `run`, "
-                        "`job` and `serve` cannot diverge into two lifecycles"
+                        f"{where}:{node.lineno}: imports the invocation kernel {hit} — only "
+                        f"{KERNEL_CALLER} may, so that `run`, `job` and `serve` cannot "
+                        "diverge into two lifecycles"
                     )
-            if isinstance(node, ast.Call) and not allowed_caller:
-                func = node.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else ""
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in KERNEL_CALLS
+                and _dotted(node.value) in aliases
+            ):
+                bad.append(
+                    f"{where}:{node.lineno}: reaches the invocation kernel "
+                    f"{_dotted(node.value)}.{node.attr} — the ONE kernel runs in "
+                    f"{KERNEL_CALLER}"
                 )
-                if name in KERNEL_CALLS:
-                    bad.append(
-                        f"{path.relative_to(ROOT)}:{node.lineno}: calls the invocation "
-                        f"kernel {name}() — the ONE kernel runs in the device executor"
-                    )
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -580,8 +615,8 @@ def fence_one_attempt_kernel() -> list[str]:
                 and rel.as_posix() != ENGINE_BUILDER
             ):
                 bad.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno}: constructs {ENGINE_CLASS} — "
-                    f"only {ENGINE_BUILDER} may; a second engine is a second lifecycle"
+                    f"{where}:{node.lineno}: constructs {ENGINE_CLASS} — only "
+                    f"{ENGINE_BUILDER} may; a second engine is a second lifecycle"
                 )
     return bad
 
