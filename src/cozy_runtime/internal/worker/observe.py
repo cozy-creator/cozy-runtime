@@ -32,6 +32,7 @@ from cozy_runtime.author._observations import EventRing, Observation, Scalar
 #: measures it — an unnamed step is a cost nobody can see.
 BOOT_STEPS = ("download", "load", "warm", "derive")
 
+
 @dataclass(slots=True)
 class Cursor:
     """One monitored subject's MONOTONE position, and how often it failed to move."""
