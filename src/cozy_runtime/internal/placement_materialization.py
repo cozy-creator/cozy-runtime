@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-import time
 import urllib.error
 import urllib.parse
 import uuid
@@ -60,11 +59,12 @@ def prepare_boot(
     artifact_store_root: Path = LOCAL_WEIGHTS_STORE_ROOT,
     artifact_cache_root: Path = WEIGHTS_CACHE_ROOT,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: check the deadline and lay its two CAS roots.
+    """Bring the pod to READY-BUT-EMPTY: lay its two CAS roots.
 
-    The deadline check converts a boot that is already too late into a NAMED refusal.
-    Tensorhub stops polling at the same instant either way, so all it decides is whether
-    the operator reads a reason or reads silence.
+    No lease check (xs-007 row 18). This used to refuse `worker_lease_elapsed` against
+    `COZY_WORKER_LEASE_EXPIRY_UNIX`, the rental cap tensorhub has since deleted; the
+    supervisor still sends the name with a far-future sentinel and the runtime decides
+    nothing on it. A boot ends when the supervisor cancels it or the leg exits.
 
     THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the control-Runtime wheel
     baked into the base worker image and reported the digest so "the hub learns a value".
@@ -77,8 +77,7 @@ def prepare_boot(
     publish or reconcile at boot.
     """
 
-    if time.time() >= config.lease_expiry_unix:
-        raise LaunchRefusal("worker_lease_elapsed", str(config.lease_expiry_unix))
+    del config  # the handoff carries nothing this step decides on
     # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
     # or directory writable to it.

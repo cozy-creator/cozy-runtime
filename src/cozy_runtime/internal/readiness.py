@@ -1,4 +1,12 @@
-"""Measured bootstrap-readiness facts for the fixed Runtime worker."""
+"""Measured bootstrap-readiness facts for the fixed Runtime worker.
+
+No proof here runs under a clock (xs-007 row 18). The pod's lease expiry used to be every
+proof's deadline — a GPU inventory, a loopback TLS handshake and two negative-arm dials cut
+at the rental cap, and a boot near the cap's end refused `readiness_deadline_elapsed` for
+being late rather than wrong. The cap is gone from tensorhub; what ends a boot is the
+supervisor cancelling it (fd 3, SIGTERM) or the leg itself exiting, and the supervisor's own
+liveness rule is what notices a boot that has stopped.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,6 @@ import os
 import socket
 import ssl
 import subprocess
-import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -69,7 +76,7 @@ def certificate(path: Path) -> bytes:
 
 
 def runtime_gpus(
-    child_env: tuple[tuple[str, str], ...], *, deadline: int, accelerator_backend: str
+    child_env: tuple[tuple[str, str], ...], *, accelerator_backend: str
 ) -> list[RuntimeGPU]:
     """Measure the exact executor-visible inventory required by the baked base profile."""
 
@@ -93,7 +100,6 @@ def runtime_gpus(
             capture_output=True,
             text=True,
             env=dict(child_env),
-            timeout=_remaining(deadline),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise LaunchRefusal("runtime_gpus_unreadable", type(exc).__name__) from exc
@@ -127,7 +133,7 @@ def runtime_gpus(
     return rows
 
 
-def prove_tls_leaf(port: int, expected_der: bytes, *, deadline: int, owner: str) -> None:
+def prove_tls_leaf(port: int, expected_der: bytes, *, owner: str) -> None:
     """Compare one listener's exact TLS leaf DER, never only its trust chain or SAN."""
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -136,7 +142,7 @@ def prove_tls_leaf(port: int, expected_der: bytes, *, deadline: int, owner: str)
     context.verify_mode = ssl.CERT_NONE
     try:
         with (
-            socket.create_connection(("127.0.0.1", port), timeout=_remaining(deadline)) as raw,
+            socket.create_connection(("127.0.0.1", port)) as raw,
             context.wrap_socket(raw, server_hostname=WORKER_TLS_SERVER_NAME) as connection,
         ):
             if connection.getpeercert(binary_form=True) != expected_der:
@@ -150,7 +156,7 @@ def prove_tls_leaf(port: int, expected_der: bytes, *, deadline: int, owner: str)
         raise LaunchRefusal(f"{owner}_listener_unproven", type(exc).__name__) from exc
 
 
-def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline: int) -> None:
+def prove_worker_foreign_refusal(port: int, certificate_pem: bytes) -> None:
     """Observe a current-schema Claim rejected specifically for a foreign credential."""
 
     address = f"127.0.0.1:{port}"
@@ -170,9 +176,7 @@ def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline:
             wire_minor=WIRE_MINOR,
             proof=("foreign-" + uuid.uuid4().hex).encode(),
         )
-        call = pb_grpc.WorkerControlStub(channel).Control(
-            iter((pb.RecordOwnerFrame(claim=claim),)), timeout=_remaining(deadline)
-        )
+        call = pb_grpc.WorkerControlStub(channel).Control(iter((pb.RecordOwnerFrame(claim=claim),)))
         frame = next(call)
     except (grpc.RpcError, StopIteration) as exc:
         raise LaunchRefusal("worker_listener_unproven", type(exc).__name__) from exc
@@ -186,20 +190,18 @@ def prove_worker_foreign_refusal(port: int, certificate_pem: bytes, *, deadline:
         raise LaunchRefusal("worker_foreign_credential_unproven", "negative Claim was not refused")
 
 
-def prove_media_foreign_refusal(port: int, expected_der: bytes, *, deadline: int) -> None:
+def prove_media_foreign_refusal(port: int, expected_der: bytes) -> None:
     """Observe the media listener's authenticated health route refuse a foreign bearer."""
 
-    timeout = _remaining(deadline)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     try:
         with (
-            socket.create_connection(("127.0.0.1", port), timeout=timeout) as raw,
+            socket.create_connection(("127.0.0.1", port)) as raw,
             context.wrap_socket(raw, server_hostname=WORKER_TLS_SERVER_NAME) as connection,
         ):
-            connection.settimeout(_remaining(deadline))
             if connection.getpeercert(binary_form=True) != expected_der:
                 raise LaunchRefusal(
                     "media_tls_peer_mismatch", "media listener did not present bootstrap cert"
@@ -329,10 +331,3 @@ def publish(path: Path, payload: bytes, *, owner: tuple[int, int] | None = None)
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _remaining(deadline: int) -> float:
-    remaining = float(deadline) - time.time()
-    if remaining <= 0:
-        raise LaunchRefusal("readiness_deadline_elapsed", str(deadline))
-    return remaining
