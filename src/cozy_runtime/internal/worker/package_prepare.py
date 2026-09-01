@@ -376,6 +376,9 @@ def prepare_package(
             and owner == "custom"
             and package_environment.base_owned_wheel(wheel, observed_base)
         ):
+            # The supplied wheel proves which protected distribution the frozen package
+            # closure selected; the worker image supplies the executable bytes. The project
+            # and remaining dependency metadata below constrain the observed image version.
             verified(digest, row.length, path)
             continue
         facts.append((wheel, path, receipt))

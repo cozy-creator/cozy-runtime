@@ -282,10 +282,15 @@ def preflight_environment(
 
 
 def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
-    """Normalize an exact redundant carrier to the base or refuse a conflicting shadow."""
+    """Identify a redundant worker-image distribution by its complete import ownership.
+
+    Package metadata, not the supplied wheel version, constrains the worker-image version.
+    The caller omits a base-owned wheel and the ordinary requirement check below then admits
+    or refuses the version actually provided by the worker image.
+    """
 
     version = base.distribution_versions.get(wheel.distribution)
-    if version is None:
+    if version is None or not base_observation.protected_distribution(wheel.distribution):
         return False
     roots = tuple(
         sorted(
@@ -294,11 +299,20 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
             if wheel.distribution in providers
         )
     )
-    if Version(version) != Version(wheel.version) or roots != wheel.import_roots:
+    try:
+        Version(version)
+        Version(wheel.version)
+    except InvalidVersion as exc:
         raise EnvironmentRefusal(
-            "package_environment_base_distribution_conflict",
-            f"distribution={wheel.distribution} carrier={wheel.version}/{wheel.import_roots} "
-            f"base={version}/{roots}",
+            "package_environment_base_invalid",
+            f"distribution={wheel.distribution} worker_image_version={version!r}",
+        ) from exc
+    if roots != wheel.import_roots:
+        raise EnvironmentRefusal(
+            "package_environment_base_distribution_import_roots_conflict",
+            f"package supplied {wheel.distribution} {wheel.version} with import roots "
+            f"{wheel.import_roots}, but the worker image provides {wheel.distribution} "
+            f"{version} with import roots {roots}; worker-image distributions cannot be replaced",
         )
     return True
 
@@ -1101,8 +1115,9 @@ def _verify_python_requirements(
 ) -> None:
     environment = _marker_environment(base)
     python = Version(environment["python_full_version"])
-    versions = base.distribution_versions
-    versions.update({item.wheel.distribution: item.wheel.version for item in inspected})
+    base_versions = base.distribution_versions
+    package_versions = {item.wheel.distribution: item.wheel.version for item in inspected}
+    versions = {**base_versions, **package_versions}
     for item in inspected:
         if item.requires_python:
             try:
@@ -1139,10 +1154,19 @@ def _verify_python_requirements(
                     f"{name} has invalid version {installed!r}",
                 ) from exc
             if not accepted:
+                if name in base_versions and name not in package_versions:
+                    detail = (
+                        f"package distribution {item.wheel.distribution} requires {requirement}, "
+                        f"but the worker image provides {name} {installed}"
+                    )
+                else:
+                    detail = (
+                        f"package distribution {item.wheel.distribution} requires {requirement}, "
+                        f"but the package environment provides {name} {installed}"
+                    )
                 raise EnvironmentRefusal(
                     "package_environment_dependency_base_conflict",
-                    f"distribution={item.wheel.distribution} requirement={requirement} "
-                    f"available_version={installed}",
+                    detail,
                 )
 
 
