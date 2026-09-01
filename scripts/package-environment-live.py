@@ -14,15 +14,19 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cozy_runtime.internal import (
     base_observation,
+    canonical,
     child_env,
     jit_cache,
     package_environment,
+    placement_materialization,
 )
 from cozy_runtime.internal.worker import acquire, child, downloads
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -224,16 +228,58 @@ def main() -> int:
             owner="custom",
             version="2.0.0",
         )
-        independent = package_environment.materialize(
-            source("ordinary-v2", project, ordinary_v2),
-            root / "ordinary-v2",
-            python=Path(sys.executable),
-            base=base,
+        stack_project_one = build_wheel(
+            wheels,
+            "stack-project-one",
+            "stack_project_one",
+            "one",
+            owner="project",
+            requires_dist=("proof-custom==1.0.0",),
         )
-        assert independent.content_digest != cold.content_digest
-        assert (independent.site_packages / "proof_custom" / "__init__.py").read_text() == (
-            "VALUE = 'version-two'\n"
+        stack_project_two = build_wheel(
+            wheels,
+            "stack-project-two",
+            "stack_project_two",
+            "two",
+            owner="project",
+            requires_dist=("proof-custom==2.0.0",),
         )
+        stacked_root = root / "stacked"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            stacked = tuple(
+                future.result()
+                for future in (
+                    pool.submit(
+                        package_environment.materialize,
+                        source("ordinary-v1", stack_project_one, custom_one),
+                        stacked_root,
+                        python=Path(sys.executable),
+                        base=base,
+                    ),
+                    pool.submit(
+                        package_environment.materialize,
+                        source("ordinary-v2", stack_project_two, ordinary_v2),
+                        stacked_root,
+                        python=Path(sys.executable),
+                        base=base,
+                    ),
+                )
+            )
+        assert stacked[0].generation != stacked[1].generation
+        assert not list(stacked_root.glob(".environment-staging-*"))
+        for installed, value in zip(stacked, ("one", "version-two"), strict=True):
+            result = subprocess.run(
+                [
+                    str(installed.python),
+                    "-I",
+                    "-c",
+                    "import proof_custom; print(proof_custom.VALUE)",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert result.stdout.strip() == value
 
         protected_distribution = build_wheel(
             wheels,
@@ -258,6 +304,63 @@ def main() -> int:
             owner="custom",
             version=base.distribution_versions["msgspec"],
         )
+
+        if "torch" not in base.distribution_versions:
+            second_torch = build_wheel(
+                wheels,
+                "torch",
+                "torch",
+                "second-family",
+                owner="custom",
+                version="2.13.0",
+            )
+
+            def wheel_fact(row: package_environment.Wheel) -> dict[str, object]:
+                return {
+                    "distribution": row.distribution,
+                    "filename": row.filename,
+                    "import_roots": list(row.import_roots),
+                    "ref": {"digest": row.digest, "length": row.length},
+                    "tags": list(row.tags),
+                    "version": row.version,
+                }
+
+            environment_body = {"wheels": [wheel_fact(second_torch[0])]}
+            environment_digest = digest(
+                canonical.write(
+                    {
+                        **environment_body,
+                        "format": placement_materialization.ENVIRONMENT_FORMAT,
+                    }
+                )
+            )
+            placement = SimpleNamespace(
+                development=None,
+                environment=environment_body,
+                environment_digest=bytes.fromhex(environment_digest.removeprefix("sha256:")),
+                package={
+                    "package": "proof/proof-project",
+                    "project_wheel": wheel_fact(project[0]),
+                    "release": "1.0.0",
+                    "release_digest": digest(b"release"),
+                },
+            )
+            before_download = acquirer(
+                root / "second-family",
+                downloads.DownloadPlan(),
+                acquire.VerifiedArtifactCache(),
+            )
+            with patch.object(
+                before_download,
+                "fetch",
+                side_effect=AssertionError("protected family reached download"),
+            ):
+                try:
+                    before_download._environment(placement)
+                except acquire.AcquisitionRefusal as exc:
+                    assert exc.code == "package_environment_second_protected_family", exc.code
+                else:
+                    raise AssertionError("a second protected family reached package download")
         for code, shadow in (
             ("package_environment_shadows_base_distribution", protected_distribution),
             ("package_environment_shadows_base_import", protected_root),
@@ -648,6 +751,8 @@ def main() -> int:
                     "wrong_uv_version_refused": True,
                     "one_changed_wheel_has_distinct_environment": True,
                     "incompatible_ordinary_versions_isolated": True,
+                    "incompatible_ordinary_versions_concurrent_on_one_worker": True,
+                    "second_protected_family_refused_before_download": True,
                     "protected_distribution_shadow_refused": True,
                     "protected_import_shadow_refused": True,
                     "runtime_abi_msgspec_shadow_refused": True,

@@ -125,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Exit.validation,
             )
         # Runtime/TensorFS are image-owned. The package venv carries only the
-        # release overlay, so the proof child is the current verified control
+        # release's package-owned wheels, so the proof child is the current verified control
         # Runtime with that exact venv's site-packages appended below.
         response = _run_child(Path(sys.executable), request_path)
         index, contracts, topologies = _decode_child(response, request)
