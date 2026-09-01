@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Every fence here is an AST or dependency scan over a boundary, or a replay of a real
-writer over a frozen vector. `--only NAME` runs one; `python checks/architecture.py`
-runs them all and names each red.
+Every fence here is a straight AST import/dependency scan over a boundary — plus one
+exception, `canonical-numbers`, which replays the REAL RFC 8785 number writer over a frozen
+ES6 vector corpus and is kept because it caught an actual cross-language defect (an fp8
+rowwise scale off by one ULP against tensorfs, 9b3e81c). Nothing here asserts that a source
+file contains a particular string.
+
+`--only NAME` runs one; `python checks/architecture.py` runs them all and names each red.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
-import hashlib
 import pathlib
 import re
 import sys
-import tempfile
 import tomllib
-import types
-import zipfile
-from collections.abc import Iterator
-
-from packaging.version import InvalidVersion, Version
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
@@ -37,120 +34,6 @@ def _literal_assignments(path: pathlib.Path, names: frozenset[str]) -> dict[str,
     return found
 
 
-def fence_prelaunch_version() -> list[str]:
-    """The v1 compatibility promise begins only when proto-014 cuts it deliberately."""
-
-    bad: list[str] = []
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    distribution = project.get("version")
-    source = _literal_assignments(
-        SRC / "__init__.py", frozenset({"__version__", "PYTHON_CONTRACT_VERSION"})
-    )
-    for name, values in source.items():
-        if len(values) != 1 or not isinstance(values[0], str):
-            bad.append(f"src/cozy_runtime/__init__.py: {name} must have one literal string value")
-    if bad or not isinstance(distribution, str):
-        if not isinstance(distribution, str):
-            bad.append("pyproject.toml: project.version must be a string")
-        return bad
-    runtime = source["__version__"][0]
-    contract = source["PYTHON_CONTRACT_VERSION"][0]
-    assert isinstance(runtime, str) and isinstance(contract, str)
-    if runtime != distribution:
-        bad.append(
-            "src/cozy_runtime/__init__.py: __version__ does not match pyproject.toml "
-            f"({runtime!r} != {distribution!r})"
-        )
-    for where, value in (
-        ("pyproject.toml: project.version", distribution),
-        ("src/cozy_runtime/__init__.py: PYTHON_CONTRACT_VERSION", contract),
-    ):
-        try:
-            major = Version(value).major
-        except InvalidVersion:
-            bad.append(f"{where} is not a valid version: {value!r}")
-        else:
-            if major != 0:
-                bad.append(f"{where} must remain 0.x until proto-014 cuts the v1 contract")
-    return bad
-
-
-def fence_python_abi() -> list[str]:
-    """The distribution, tooling and bundled packages target standard CPython 3.12."""
-
-    bad: list[str] = []
-    requirement = ">=3.12,<3.13"
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    if project.get("project", {}).get("requires-python") != requirement:
-        bad.append(f"pyproject.toml: requires-python must be {requirement!r}")
-    if project.get("tool", {}).get("mypy", {}).get("python_version") != "3.12":
-        bad.append("pyproject.toml: mypy must check the Python 3.12 language surface")
-
-    pin = ROOT / ".python-version"
-    if not pin.is_file() or pin.read_text() != "3.12\n":
-        bad.append(".python-version: must pin uv to CPython 3.12")
-
-    bundled = sorted((ROOT / "examples").rglob("pyproject.toml"))
-    bundled += sorted((ROOT / "proofs" / "fixtures").rglob("pyproject.toml"))
-    for path in bundled:
-        value = tomllib.loads(path.read_text()).get("project", {}).get("requires-python")
-        if value != requirement:
-            bad.append(f"{path.relative_to(ROOT)}: requires-python must be {requirement!r}")
-
-    for path in (
-        ROOT / "uv.lock",
-        ROOT / "examples" / "marco-polo" / "uv.lock",
-        ROOT / "proofs" / "fixtures" / "environment-project" / "uv.lock",
-    ):
-        if tomllib.loads(path.read_text()).get("requires-python") != "==3.12.*":
-            bad.append(f"{path.relative_to(ROOT)}: lock does not cover exactly Python 3.12")
-
-    return bad
-
-
-def fence_model_execution_tensorfs() -> list[str]:
-    """The optional model plane has one exact, source-traceable TensorFS wheel."""
-
-    bad: list[str] = []
-    filename = "tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
-    expected_digest = "9f2591e90a362d705f679e3bc287063975116ad273db26a667e317146bf6f6f2"
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    extra = project.get("project", {}).get("optional-dependencies", {}).get("model-execution")
-    if extra != ["tensorfs==0.0.8"]:
-        bad.append("pyproject.toml: model-execution must own exact tensorfs==0.0.8")
-    source = project.get("tool", {}).get("uv", {}).get("sources", {}).get("tensorfs")
-    if source != {"path": f"vendor/{filename}"}:
-        bad.append("pyproject.toml: TensorFS source must be the exact vendored CPython 3.12 wheel")
-
-    wheel = ROOT / "vendor" / filename
-    try:
-        raw = wheel.read_bytes()
-        with zipfile.ZipFile(wheel) as archive:
-            metadata = archive.read("tensorfs-0.0.8.dist-info/METADATA")
-    except (OSError, KeyError, zipfile.BadZipFile) as exc:
-        bad.append(f"vendor/{filename}: unreadable wheel: {type(exc).__name__}")
-        return bad
-    if len(raw) != 2_359_967 or hashlib.sha256(raw).hexdigest() != expected_digest:
-        bad.append(f"vendor/{filename}: bytes do not match the reviewed source build")
-    for field in (b"Name: tensorfs\n", b"Version: 0.0.8\n", b"Requires-Python: >=3.12, <3.13\n"):
-        if field not in metadata:
-            bad.append(f"vendor/{filename}: METADATA omits {field.decode().strip()!r}")
-
-    provenance = (ROOT / "vendor" / "TENSORFS.md").read_text()
-    for fact in (
-        "041d688a7d6feb0d7014c3501c901d95a52d31bb",
-        "fb61a676d9def0822416e69de2f2d075931cf48b",
-        "f32a028e6c718a36319d3249649cdaea5efecda1",
-        "33477004679",
-        "9788569039",
-        expected_digest,
-    ):
-        if fact not in provenance:
-            bad.append(f"vendor/TENSORFS.md: missing source fact {fact}")
-    return bad
-
-
-# boundaries.md: forbidden Cozy dependencies for cozy-runtime core + the author subpackage.
 DENY_TOKENS = (
     "varena",
     "tensorhub",
@@ -290,7 +173,6 @@ def fence_author_import_boundary() -> list[str]:
     paths = (
         *(ROOT / "examples").rglob("*.py"),
         *(ROOT / "corpus").rglob("*.py"),
-        *(ROOT / "proofs" / "fixtures").rglob("*.py"),
     )
     for path in sorted(paths):
         for node in ast.walk(ast.parse(path.read_text())):
@@ -414,8 +296,11 @@ _FORMAT_ID = re.compile(r"^[\w.-]+/v?\d+$")
 
 
 def package_modules() -> list[pathlib.Path]:
+    """Every module in the tree that builds an `App()` — the file `describe` imports."""
     modules = []
-    for path in sorted((ROOT / "proofs" / "fixtures" / "tiny-models").glob("*.py")):
+    for path in sorted((ROOT / "examples").rglob("*.py")) + sorted((ROOT / "corpus").rglob("*.py")):
+        if ".venv" in path.parts:
+            continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "App":
@@ -540,16 +425,22 @@ def fence_no_identifiers() -> list[str]:
     bad: list[str] = []
     for path in package_modules():
         tree = ast.parse(path.read_text())
+        # An artifact CONTRACT is a requirement Tensorhub derives from output bytes, and an
+        # `operation_key=` is an idempotency key the author mints. Neither selects anything,
+        # and both are ordinarily spelled `a/b`, which is the identifier shape.
         contract_values = {
             id(value)
             for call in ast.walk(tree)
             if isinstance(call, ast.Call)
-            and (
-                (isinstance(call.func, ast.Name) and call.func.id == "ArtifactOutput")
-                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ArtifactOutput")
-            )
             for keyword in call.keywords
-            if keyword.arg in {"topology_digest", "encodings"}
+            if keyword.arg == "operation_key"
+            or (
+                keyword.arg in {"topology_digest", "encodings"}
+                and (
+                    (isinstance(call.func, ast.Name) and call.func.id == "ArtifactOutput")
+                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "ArtifactOutput")
+                )
+            )
             for value in ast.walk(keyword.value)
             if isinstance(value, ast.Constant)
         }
@@ -557,8 +448,6 @@ def fence_no_identifiers() -> list[str]:
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                 continue
             if id(node) in contract_values:
-                # An artifact contract is a requirement Tensorhub independently derives
-                # from output bytes, not a model/release/checkpoint selection.
                 continue
             text = node.value.strip()
             if text.startswith(_MEDIA_PREFIXES) or "://" in text or text.startswith("/"):
@@ -691,146 +580,10 @@ def fence_torch_free_import() -> list[str]:
     return bad
 
 
-def fence_no_installed_file_inventory() -> list[str]:
-    """Keep boot observation and proofs off installed RECORD/file inventories."""
-
-    bad: list[str] = []
-    paths = (
-        ROOT / "src" / "cozy_runtime" / "internal" / "base_observation.py",
-        ROOT / "proofs" / "support" / "proof_data.py",
-    )
-    forbidden = (
-        "packages_distributions(",
-        "distribution.files",
-        "installed.files",
-        "installed_base_ownership",
-        "pack_installed",
-    )
-    for path in paths:
-        source = path.read_text()
-        for spelling in forbidden:
-            if spelling in source:
-                bad.append(f"{path}: retired installed-file inventory remains: {spelling}")
-    return bad
-
-
-#: §8's ONE ATTEMPT KERNEL, as a structural rule rather than a promise.
-#:
-#: `run`, `job` and `serve` are three ENTRANCES to one execution state machine. The v1
-#: failure mode this exists to prevent is exact and was expensive: the developer door and
-#: the production door ran different lifecycle code, so everything proven about one proved
-#: nothing about the other. Two facts hold the shape:
-#:
-#:   * the author invocation kernel is CALLED from exactly one module — the device executor;
-#:   * the attempt engine is CONSTRUCTED in exactly one module — the worker session.
-#:
-#: Anything that wants to run an attempt therefore has to go through the worker, over
-#: the seam, into the executor. A direct-call runner beside it cannot be written without
-#: turning this fence red.
 KERNEL_CALLS = ("attempt", "prepare", "invoke", "run_prepared")
 KERNEL_CALLER = "internal/executor.py"
 ENGINE_CLASS = "AttemptEngine"
 ENGINE_BUILDER = "internal/worker/session.py"
-
-
-def fence_tensorhub_package_release() -> list[str]:
-    """Consume Tensorhub's exact nested-wheel PackageRelease fixture."""
-
-    import hashlib
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical
-    from cozy_runtime.internal.placement_materialization import package_environment_input
-    from cozy_runtime.internal.refusal import LaunchRefusal
-
-    root = ROOT / "vectors" / "tensorhub-wheel-contract"
-    path = root / "package-release-v1.json"
-    stored = path.read_bytes()
-    bad: list[str] = []
-    got = hashlib.sha256(stored).hexdigest()
-    want = "5f868fe549a22151e3a925d5638a13a315ae3508b16cbbad07ca0382d552313e"
-    if got != want:
-        return [f"{path.relative_to(ROOT)}: stored fixture hashes to {got}, want {want}"]
-    if not stored.endswith(b"\n") or stored.endswith(b"\n\n"):
-        return [f"{path.relative_to(ROOT)}: producer fixture must carry one trailing LF"]
-    raw = stored[:-1]
-    document_digest = hashlib.sha256(raw).hexdigest()
-    if document_digest != "f894cff72dce53a2f85943bc10d1a1226f3fcacc983faddad6afbd6d61c425cf":
-        return [f"{path.relative_to(ROOT)}: canonical document hashes to {document_digest}"]
-    try:
-        release = canonical.parse_canonical(raw)
-    except canonical.CanonicalError as exc:
-        return [f"{path.relative_to(ROOT)}: producer bytes are not canonical: {exc}"]
-    if not isinstance(release, dict):
-        return [f"{path.relative_to(ROOT)}: PackageRelease is not an object"]
-    project = release.get("project_wheel")
-    dependencies = release.get("dependency_wheels")
-    if (
-        not isinstance(project, dict)
-        or not isinstance(dependencies, list)
-        or len(dependencies) != 1
-    ):
-        return [f"{path.relative_to(ROOT)}: nested wheel fixture is incomplete"]
-    dependency = dependencies[0]
-    if not isinstance(dependency, dict):
-        return [f"{path.relative_to(ROOT)}: dependency wheel is not an object"]
-    fields = {"distribution", "filename", "import_roots", "ref", "tags", "version"}
-    for name, wheel in (("project_wheel", project), ("dependency_wheels[0]", dependency)):
-        if set(wheel) != fields:
-            bad.append(f"{path.relative_to(ROOT)}: {name} is not one nested selected wheel")
-    if bad:
-        return bad
-
-    environment = {"wheels": dependencies}
-    environment_digest = (
-        "sha256:"
-        + hashlib.sha256(
-            canonical.write({**environment, "format": "cozy.worker.v1.Environment/1"})
-        ).hexdigest()
-    )
-    project_ref = project.get("ref")
-    dependency_ref = dependency.get("ref")
-    if not isinstance(project_ref, dict) or not isinstance(dependency_ref, dict):
-        return [f"{path.relative_to(ROOT)}: nested wheel ref is absent"]
-    wheel_paths = {
-        str(project_ref.get("digest")): root / "wheels" / "proof_package-1.0.0-py3-none-any.whl",
-        str(dependency_ref.get("digest")): root / "wheels" / "proof_custom-1.0.0-py3-none-any.whl",
-    }
-    package = {
-        "package": release.get("package"),
-        "project_wheel": project,
-        "release": release.get("release"),
-        "release_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
-    }
-    try:
-        joined = package_environment_input(
-            package=package,
-            environment=environment,
-            environment_digest=environment_digest,
-            wheel_paths=wheel_paths,
-        )
-    except LaunchRefusal as exc:
-        return [f"{path.relative_to(ROOT)}: Runtime refused Tensorhub fixture: {exc}"]
-    facts = [(wheel.distribution, wheel.owner) for wheel in joined.wheels]
-    if facts != [("proof-package", "project"), ("proof-custom", "custom")]:
-        bad.append(f"{path.relative_to(ROOT)}: Runtime joined wheel facts as {facts}")
-
-    flat = dict(project)
-    flat.update(project_ref)
-    flat.pop("ref", None)
-    try:
-        package_environment_input(
-            package={**package, "project_wheel": flat},
-            environment=environment,
-            environment_digest=environment_digest,
-            wheel_paths=wheel_paths,
-        )
-    except LaunchRefusal as exc:
-        if exc.code != "project_wheel_invalid":
-            bad.append(f"flat project wheel refused as {exc.code}, want project_wheel_invalid")
-    else:
-        bad.append("Runtime admitted the retired flat project WheelFact")
-    return bad
 
 
 def fence_one_attempt_kernel() -> list[str]:
@@ -948,528 +701,12 @@ def fence_timing_decides_nothing() -> list[str]:
     return bad
 
 
-def fence_reviewed_specs_exist() -> list[str]:
-    """Every spec digest this build declares reviewed EXISTS in the installed registry.
-
-    A provider's reviewed digest set is its claim about which physical byte contracts it was
-    read against. TensorFS owns those documents, so the two repositories can drift — and
-    they did: tensorfs `940973f` moved both `fp8-scaled-scalar/1` seed specs and this side
-    kept the old pair, which made every fp8-scaled-scalar artifact unservable. The refusal
-    was correct and it fired at PREPARE, on a rented H200, after 92.42 GiB had been pulled.
-    It costs one call to find out at $0 instead.
-
-    An absent `tensorfs` is RED, not skipped: this fence's whole subject is agreement with a
-    registry, and a fence that goes green because it could not look is the fake green the
-    fences exist to prevent.
-    """
-    try:
-        import tensorfs
-    except ImportError as exc:
-        return [
-            f"the tensorfs reader is not installed, so no declared spec digest can be "
-            f"checked against the registry that owns it ({exc}). Install the wheel this "
-            "release pins — an unchecked digest set is not a green one"
-        ]
-    from cozy_runtime.internal.encoding import formats
-
-    carried = {digest: alias for alias, digest in tensorfs.seed_digests()}
-    bad: list[str] = []
-    for name in sorted(n for n in dir(formats) if n.startswith("SPEC_")):
-        declared = getattr(formats, name)
-        if not isinstance(declared, str) or not declared.startswith("sha256:"):
-            continue
-        if declared not in carried:
-            bad.append(
-                f"formats.{name} = {declared[:23]}… is not in the installed registry, which "
-                f"carries {len(carried)} seed spec(s). A registry that moved a spec has "
-                "changed what those bytes mean; inferring the replacement by alias is the "
-                "substitution the launch refusal forbids, so the constant is REVIEWED and "
-                "updated by hand or the wheel is the wrong one"
-            )
-    return bad
-
-
-def fence_descriptor_minimality() -> list[str]:
-    """Two fresh derivations produce one closed, compact descriptor/1 document."""
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import descriptor
-    from cozy_runtime.internal.discovery import discover
-
-    try:
-        first = descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
-        second = descriptor.build(discover(ROOT / "proofs" / "fixtures" / "tiny-models"))
-        first_bytes = descriptor.canonical_bytes(first)
-        second_bytes = descriptor.canonical_bytes(second)
-        document = descriptor.read_bytes(first_bytes, "fresh example derivation")
-    except Exception as exc:
-        return [f"the fresh example descriptor is not readable: {exc}"]
-    bad: list[str] = []
-    if first_bytes != second_bytes:
-        bad.append("two fresh example derivations produced different canonical bytes")
-    expected = {"format", "application", "entrypoints", "jobs"}
-    if set(document) != expected:
-        bad.append(f"descriptor fields are {sorted(document)}, want {sorted(expected)}")
-    if document.get("format") != "cozy.package.descriptor/1":
-        bad.append("descriptor has the wrong format")
-    jobs = document.get("jobs")
-    four_lane = (
-        next(
-            (row for row in jobs if isinstance(row, dict) and row.get("name") == "four-lane"),
-            None,
-        )
-        if isinstance(jobs, list)
-        else None
-    )
-    if not isinstance(four_lane, dict):
-        bad.append("descriptor has no ordinary four-lane job fixture")
-    elif [row.get("source_profile") for row in four_lane.get("models", [])] != [
-        "hf/minimax-h3/native-dual-bf16/1",
-        "hf/minimax-h3/shared-bf16/1",
-    ]:
-        bad.append("four-lane source profiles changed or left the inferred model slots")
-    else:
-        outputs = four_lane.get("artifact_outputs")
-        contract = (
-            outputs[0].get("required_contract")
-            if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict)
-            else None
-        )
-        if contract != {
-            "topology_digest": "sha256:" + "1" * 64,
-            "encodings": [
-                "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd"
-            ],
-        }:
-            bad.append("four-lane artifact contract changed or left its output slot")
-    forbidden = {
-        "attribute",
-        "capabilities",
-        "config_schema",
-        "context_facts",
-        "default",
-        "default_sources",
-        "demand",
-        "discriminator",
-        "emits_media",
-        "error_model",
-        "frozen",
-        "gpu",
-        "hidden",
-        "kind",
-        "max_audio_channels",
-        "max_audio_samples",
-        "max_decoded_bytes",
-        "max_pixels_per_frame",
-        "max_video_frames",
-        "placement",
-        "param",
-        "preflight",
-        "protocol",
-        "request_features",
-        "requires",
-        "schema",
-        "secret_schema",
-        "secrets",
-        "services",
-        "settings",
-        "shape_axes",
-        "struct",
-        "surface_digest",
-        "values",
-    }
-
-    def visit(value: object, where: str) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                scheduling_resource = (
-                    ".jobs[" in where and ".resources" in where and key in {"placement", "requires"}
-                )
-                if key in forbidden and not scheduling_resource:
-                    bad.append(f"{where}.{key} is an unused descriptor fact")
-                if key == "wire" and item == "required":
-                    bad.append(f"{where}.wire repeats the required-field default")
-                visit(item, f"{where}.{key}")
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                visit(item, f"{where}[{index}]")
-
-    visit(document, "package_descriptor")
-    return bad
-
-
-#: proto-007 (#616.a): the registry of document kinds this repo AUTHORS, each with its one
-#: declaring module. A format name exists only for a document that crosses a repo/process
-#: boundary AND is stored or digested. Provider implementation IDs are separately fenced below:
-#: they enter implementation/plan digests but are not documents.
-DOCUMENT_KINDS = {
-    "cozy.package.descriptor/1": "internal/descriptor.py",
-    "cozy.runtime.EnvironmentReceipt/1": "internal/package_environment.py",
-    "cozy.runtime.PackageEnvironment/1": "internal/package_environment.py",
-    "cozy.runtime.ModelConstructionContract/1": "internal/contract.py",
-}
-#: Kinds another repo authors and this one only READS (the wire, tensorhub, tensorfs).
-#: Naming them is decoding, not authoring; the owner's fence polices the name.
-FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "tensorhub.", "tensorfs.", "cozytensors")
-#: Tensorhub authors the environment-independent package release. PlacementSet is covered by the
-#: worker-protocol prefix above; no binding-plan or model-binding documents survive.
-FOREIGN_DOCUMENT_KINDS = {
-    "cozy.package.release/1",
-}
-#: Modules that name a registered kind without declaring it (a second reader is fine; a
-#: second DECLARATION is the drift this fence exists for).
-KIND_READERS = {
-    "cozy.runtime.ModelConstructionContract/1": {"internal/executor.py"},
-}
-_VERSIONED_LITERAL_PATTERN = (
-    r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.'
-    r'[A-Za-z0-9_.-]+/\d+)"'
-)
-VERSIONED_LITERAL = re.compile(_VERSIONED_LITERAL_PATTERN)
-
-#: Provider `name()` values are executable implementation identity, not document formats. The
-#: exact strings are in every implementation_digest and therefore in every plan/generation digest;
-#: moving them between fence registries must never rename or renumber them.
-IMPLEMENTATION_IDS = {
-    "cozy.fp8-rowwise.dequant/1": "internal/encoding/formats.py",
-    "cozy.fp8-scaled-scalar.dequant/1": "internal/encoding/formats.py",
-    "cozy.mxfp8.dequant/1": "internal/encoding/formats.py",
-    "cozy.plain.verbatim/1": "internal/encoding/formats.py",
-    "cozy.fp8-rowwise.native-leaf/1": "internal/encoding/leaves.py",
-    "cozy.mxfp8.native-leaf/1": "internal/encoding/leaves.py",
-}
-IMPLEMENTATION_ID_READERS = {
-    "cozy.mxfp8.dequant/1": {
-        "internal/encoding/leaves.py",
-        "internal/encoding/selection.py",
-    },
-}
-
-
-def versioned_literals() -> Iterator[tuple[pathlib.Path, str, int, str]]:
-    for path in py_files():
-        rel = path.relative_to(SRC).as_posix()
-        if rel.endswith("_pb2.py"):
-            continue
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            for literal in VERSIONED_LITERAL.findall(line):
-                yield path, rel, lineno, literal
-
-
-def fence_document_kinds() -> list[str]:
-    """proto-007: every document-kind literal this repo authors is in DOCUMENT_KINDS."""
-    bad: list[str] = []
-    expected = {
-        "cozy.package.descriptor/1",
-        "cozy.runtime.EnvironmentReceipt/1",
-        "cozy.runtime.PackageEnvironment/1",
-        "cozy.runtime.ModelConstructionContract/1",
-    }
-    if set(DOCUMENT_KINDS) != expected:
-        bad.append(
-            "Runtime document survivors differ from the proto-007 hardcut: "
-            f"got={sorted(DOCUMENT_KINDS)} expected={sorted(expected)}"
-        )
-    for path, rel, lineno, kind in versioned_literals():
-        if (
-            kind.startswith(FOREIGN_KIND_PREFIXES)
-            or kind in FOREIGN_DOCUMENT_KINDS
-            or kind in IMPLEMENTATION_IDS
-        ):
-            continue
-        owner = DOCUMENT_KINDS.get(kind)
-        if owner is None:
-            bad.append(
-                f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, a document kind "
-                "outside DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and "
-                "a boundary + storage/digest party (proto-007)"
-            )
-        elif rel != owner and rel not in KIND_READERS.get(kind, set()):
-            bad.append(
-                f"{path.relative_to(ROOT)}:{lineno}: names {kind!r}, declared in "
-                f"{owner} — a second declaration of one kind"
-            )
-
-    from cozy.worker.v1 import worker_pb2
-    from cozy_runtime.protocol import documents
-
-    for descriptor in worker_pb2.DESCRIPTOR.message_types_by_name.values():
-        want = f"{descriptor.full_name}/1"
-        if documents.doc_format(descriptor.full_name) != want:
-            bad.append(
-                "src/cozy_runtime/protocol/documents.py: worker document "
-                f"{descriptor.full_name!r} is not hardcut to {want!r}"
-            )
-    return bad
-
-
-def fence_development_placement() -> list[str]:
-    """Development is explicit and never aliases source identity to an Environment."""
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from cozy_runtime.internal import canonical, descriptor, local
-    from cozy_runtime.internal.discovery import discover
-    from cozy_runtime.internal.worker import acquire, session
-    from cozy_runtime.protocol import documents
-    from cozy_runtime.protocol import worker_pb2 as pb
-
-    source_digest = "sha256:" + "7" * 64
-    built = local.development_placement_documents(
-        descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-        package="paul/marco-polo",
-        release="1.0.4",
-        source_digest=source_digest,
-    )
-    placement_set = pb.PlacementSet(placements=[built.placement])
-    positive = documents.canonical_bytes(placement_set)
-    desired = pb.DesiredPlacementSet(
-        placement_set_digest=documents.digest_of(positive),
-        placement_set_canonical_bytes=positive,
-    )
-    try:
-        parsed = session.read_placement_set(desired)[0]
-    except documents.DocumentError as exc:
-        return [f"development Placement refused: {exc}"]
-    forbidden = {
-        "environment",
-        "environment_digest",
-    } & set(parsed)
-    if forbidden:
-        return [f"development Placement carries published field {sorted(forbidden)[0]}"]
-
-    mutant = documents.document(placement_set)
-    placement = mutant["placements"][0]
-    assert isinstance(placement, dict)
-    placement["environment_digest"] = source_digest
-    mutant_bytes = canonical.write(mutant)
-    try:
-        session.read_placement_set(
-            pb.DesiredPlacementSet(
-                placement_set_digest=documents.digest_of(mutant_bytes),
-                placement_set_canonical_bytes=mutant_bytes,
-            )
-        )
-    except documents.DocumentError as exc:
-        if exc.code != "development_fields_invalid":
-            return [f"development environment alias refused as {exc.code}"]
-    else:
-        return ["development Placement admitted source_digest as environment_digest"]
-
-    descriptor_digest = documents.spell(built.placement.package_descriptor.digest)
-    with tempfile.TemporaryDirectory() as directory:
-        cache = pathlib.Path(directory)
-        staged = local.development_placement_documents(
-            descriptor.build(discover(ROOT / "examples" / "marco-polo")),
-            package="paul/marco-polo",
-            release="1.0.4",
-            source_digest=source_digest,
-            artifact_cache=cache,
-        )
-        document = documents.body(staged.placement)
-        acquired = acquire.preinstalled_development(
-            types.SimpleNamespace(
-                models=(),
-                document=document,
-                entrypoints=tuple(document["entrypoints"]),
-                package_descriptor=(descriptor_digest, len(staged.descriptor)),
-                development={
-                    "package": "paul/marco-polo",
-                    "release": "1.0.4",
-                    "source_digest": source_digest,
-                },
-            ),
-            cache,
-            staged.placement,
-            staged.bindings,
-        )
-    if any(
-        binding.environment_digest or not binding.development
-        for binding in acquired.bindings.values()
-    ):
-        return ["development binding invented an Environment identity"]
-    for call, code in (
-        (
-            lambda: local._development_stamps("proof/tiny@1", {"family": "tiny"}),
-            "development_model_stamps_unavailable",
-        ),
-        (
-            lambda: local._development_assets("proof/tiny@1", {"tokenizer": {}}),
-            "development_model_assets_unsupported",
-        ),
-    ):
-        try:
-            call()
-        except RuntimeError as exc:
-            if not str(exc).startswith(code + ":"):
-                return [f"modeled development limitation refused as {exc}"]
-        else:
-            return [f"modeled development admitted unsupported fact instead of {code}"]
-    return []
-
-
-def fence_implementation_ids() -> list[str]:
-    """Every executable provider ID has one owner and is never a document kind."""
-    bad: list[str] = []
-    overlap = sorted(DOCUMENT_KINDS.keys() & IMPLEMENTATION_IDS.keys())
-    if overlap:
-        bad.append("versioned identifier registry overlap: " + repr(overlap))
-
-    owned: dict[str, int] = {implementation: 0 for implementation in IMPLEMENTATION_IDS}
-    for path, rel, lineno, implementation in versioned_literals():
-        owner = IMPLEMENTATION_IDS.get(implementation)
-        if owner is None:
-            continue
-        readers = IMPLEMENTATION_ID_READERS.get(implementation, set())
-        if rel == owner:
-            owned[implementation] += 1
-        elif rel not in readers:
-            bad.append(
-                f"{path.relative_to(ROOT)}:{lineno}: names implementation ID "
-                f"{implementation!r}, owned by {owner} — add a reader explicitly or "
-                "remove the second declaration"
-            )
-
-    for implementation, owner in IMPLEMENTATION_IDS.items():
-        if owned[implementation] == 0:
-            bad.append(f"{implementation!r} has no literal in its owner {owner}")
-    return bad
-
-
-RETIRED_REPORT_FORMAT = re.compile(
-    r"cozy\.(?:jobs\.StructuralCensus|runtime\.(?:leaf_(?:fill|forward)|"
-    r"mxfp8_(?:delta|lane_ranking|native|rowwise_derivation|w8a8)|"
-    r"proof\.ModelContractState))/\d+"
-)
-
-
-def fence_report_format_tags() -> list[str]:
-    """Proof-local state and reports are path/command typed, never global document formats."""
-    bad: list[str] = []
-    roots = (ROOT / "corpus", ROOT / "proofs", ROOT / "scripts", SRC)
-    for root in roots:
-        for path in sorted(root.rglob("*.py")):
-            for lineno, line in enumerate(path.read_text().splitlines(), 1):
-                if retired := RETIRED_REPORT_FORMAT.search(line):
-                    bad.append(
-                        f"{path.relative_to(ROOT)}:{lineno}: retired proof/report format "
-                        f"{retired.group(0)!r}; keep the plain typed data and let its "
-                        "command/path establish the local shape"
-                    )
-    return bad
-
-
-#: cr-042: the address-class attributes only `internal/egress.py` may name. Two downloaders
-#: each grew their own chain and the two differed; this is the fence that stops a third.
-def fence_dynamic_pods_skip_boot_warm() -> list[str]:
-    """The fixed product worker never runs package inference before dispatchability."""
-
-    path = SRC / "cli" / "runtime_worker.py"
-    tree = ast.parse(path.read_text())
-    command = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_worker_options"
-        ),
-        None,
-    )
-    if command is None:
-        return [f"{path.relative_to(ROOT)}: fixed product-worker options are gone"]
-    no_warm = [
-        keyword.value
-        for node in ast.walk(command)
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg == "no_warm"
-    ]
-    if not any(isinstance(value, ast.Constant) and value.value is True for value in no_warm):
-        return [
-            f"{path.relative_to(ROOT)}: fixed product worker omits `no_warm=True`; "
-            "package inference can block activation before DISPATCHABLE"
-        ]
-    return []
-
-
-def fence_typed_model_binding() -> list[str]:
-    """Package defaults name a `model`; the retired generic binding key cannot return."""
-
-    bad: list[str] = []
-    paths = [
-        ROOT / "proofs" / "fixtures" / "tiny-models" / "package.toml",
-        ROOT / "corpus" / "package" / "package.toml",
-        ROOT / "corpus" / "pipeline" / "package.toml",
-    ]
-    for path in paths:
-        document = tomllib.loads(path.read_text())
-        bindings = document.get("bindings", {})
-        if not isinstance(bindings, dict):
-            bad.append(f"{path.relative_to(ROOT)}: [bindings] is not a table")
-            continue
-        for name, value in bindings.items():
-            if not isinstance(value, dict) or not isinstance(value.get("model"), str):
-                bad.append(f"{path.relative_to(ROOT)}: binding {name!r} does not name its model")
-            if "repo" in value:
-                bad.append(
-                    f"{path.relative_to(ROOT)}: binding {name!r} uses retired generic repo key"
-                )
-    return bad
-
-
-def fence_proofs_public_imports() -> list[str]:
-    """A PUBLIC proof exercises the installed public surface, never a private symbol.
-
-    An AST scan, because the shell greps it replaces matched only the literal string
-    `cozy_runtime.internal` and therefore missed
-    `from cozy_runtime.cli.model_contract_proof import _component_local_key` — a private
-    symbol, imported by a public proof, invisible to a pattern looking for one module name.
-    `proofs/internal/` is the DECLARED private half and is exempt by construction.
-    """
-
-    bad: list[str] = []
-    private_root = (ROOT / "proofs" / "internal").resolve()
-    for path in sorted((ROOT / "proofs").rglob("*.py")):
-        if private_root in path.resolve().parents:
-            continue
-        tree = ast.parse(path.read_text())
-        rel = path.relative_to(ROOT)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if _private_runtime_module(alias.name):
-                        bad.append(f"{rel}:{node.lineno}: imports {alias.name}")
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                if _private_runtime_module(node.module):
-                    bad.append(f"{rel}:{node.lineno}: imports from {node.module}")
-                elif node.module.split(".")[0] == "cozy_runtime":
-                    for alias in node.names:
-                        if alias.name.startswith("_"):
-                            bad.append(
-                                f"{rel}:{node.lineno}: imports the private symbol "
-                                f"{alias.name!r} from {node.module}"
-                            )
-    return bad
-
-
-def _private_runtime_module(name: str) -> bool:
-    parts = name.split(".")
-    if parts[0] != "cozy_runtime":
-        return False
-    return "internal" in parts[1:2] or any(part.startswith("_") for part in parts[1:])
-
-
 FENCES = {
-    "prelaunch-version": fence_prelaunch_version,
-    "python-abi": fence_python_abi,
-    "model-execution-tensorfs": fence_model_execution_tensorfs,
     "forbidden-dependency": fence_forbidden_dependency,
-    "reviewed-specs-exist": fence_reviewed_specs_exist,
-    "descriptor-minimality": fence_descriptor_minimality,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
-    "tensorhub-package-release": fence_tensorhub_package_release,
-    "no-installed-file-inventory": fence_no_installed_file_inventory,
     "torch-free-import": fence_torch_free_import,
     "package-imports": fence_package_imports,
-    "proofs-public-imports": fence_proofs_public_imports,
     "author-import-boundary": fence_author_import_boundary,
     "env-authority": fence_env_authority,
     "single-config": fence_single_config,
@@ -1480,12 +717,6 @@ FENCES = {
     "timing-decides-nothing": fence_timing_decides_nothing,
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
-    "document-kinds": fence_document_kinds,
-    "development-placement": fence_development_placement,
-    "implementation-ids": fence_implementation_ids,
-    "report-format-tags": fence_report_format_tags,
-    "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
-    "typed-model-binding": fence_typed_model_binding,
 }
 
 

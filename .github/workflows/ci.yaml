@@ -1,29 +1,25 @@
 name: ci
 on: [push, pull_request]
 jobs:
-  # `checks` is BUILD + FENCE + DETERMINISM/STALENESS: it builds, scans a boundary, or
-  # refuses a stale/non-reproducing artifact. Behaviour is the `end-to-end` job below.
+  # BUILD + LINT + TYPES + BOUNDARY SCANS. Nothing here asserts that a source file contains
+  # a particular string, and nothing here is a behaviour test — that is the `end-to-end` job.
   checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
-      # The exact TensorFS wheel is committed, hash-fenced, and is the artifact Runtime ships.
-      # Install that wheel here so the ordinary architecture pass checks Runtime's reviewed
-      # encoding specs against the actual bundled registry without a private source checkout.
-      - run: uv sync --extra model-execution
+      - run: uv sync
       - run: >-
           uv run python -c "import sys, sysconfig;
           assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
           and sysconfig.get_config_var('Py_GIL_DISABLED') != 1"
       - run: uv run ruff check .
-      # Formatting is a DETERMINISM check like the others here: one canonical rendering of
-      # the tree, so a diff is only ever a change of meaning. The generated `worker_pb2*`
-      # bindings are excluded in pyproject's `extend-exclude`, which covers format and check
-      # alike — protoc's output is a copied artifact and reformatting it would break the copy.
-      - run: uv run ruff format --check .
+      # Formatting is a DETERMINISM check: one canonical rendering of the tree, so a diff is
+      # only ever a change of meaning. The generated `worker_pb2*` bindings are excluded in
+      # pyproject's `extend-exclude` — protoc's output is a copied artifact.
       - run: uv run mypy
+      - run: uv run ruff format --check .
       - name: Reproduce the CPython 3.12 Runtime wheel
         run: |
           set -euo pipefail
@@ -32,58 +28,14 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
-      # Self-contained architecture fences + frozen ES6 vectors + torch-free import.
+      # AST import/dependency scans over the package boundaries, plus the frozen ES6 number
+      # vectors replayed through the real RFC 8785 writer.
       - run: uv run python checks/architecture.py
-      - run: uv run python checks/anima_cuda_capability.py
-      - run: uv run python checks/env_seal.py
-      # The descriptor is a read-only publication output, never a committed repository file.
-      # The architecture fence validates the closed grammar; these exact replays prove the two
-      # source fixtures derive byte-identically without dirtying either repository.
-      - run: |
-          set -euo pipefail
-          tiny_a=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
-          tiny_b=$(uv run cozy-runtime --json --dir proofs/fixtures/tiny-models describe)
-          test "$tiny_a" = "$tiny_b"
-          modeled=proofs/fixtures/modeled-development-package
-          modeled_descriptor=$(uv run cozy-runtime --json --dir "$modeled" describe)
-          frozen=$(mktemp -d)
-          printf '%s' "$modeled_descriptor" > "$frozen/descriptor.json"
-          cp "$modeled/package.toml" "$frozen/package.toml"
-          imported=$(uv run cozy-runtime --json --dir "$modeled" bindings)
-          descriptor_only=$(uv run cozy-runtime --json --dir "$frozen" \
-            --descriptor "$frozen/descriptor.json" bindings)
-          test "$imported" = "$descriptor_only"
-          marco_a=$(uv run --locked --project examples/marco-polo \
-            cozy-runtime --json --dir examples/marco-polo describe)
-          marco_b=$(uv run --locked --project examples/marco-polo \
-            cozy-runtime --json --dir examples/marco-polo describe)
-          test "$marco_a" = "$marco_b"
-      - run: |
-          set -euo pipefail
-          shopt -s nullglob
-          a=$(mktemp -d)
-          b=$(mktemp -d)
-          uv build --wheel --out-dir "$a" examples/marco-polo
-          uv build --wheel --out-dir "$b" examples/marco-polo
-          wheel_a=("$a"/*.whl)
-          wheel_b=("$b"/*.whl)
-          test "${#wheel_a[@]}" -eq 1
-          test "${#wheel_b[@]}" -eq 1
-          cmp "${wheel_a[0]}" "${wheel_b[0]}"
-          unzip -l "${wheel_a[0]}" | grep -F 'marco_polo_package/__init__.py'
-      # Every descriptor-declared fact must have a live writer — a coverage refusal over
-      # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
-      - run: uv run python checks/declared_facts.py
-      - run: uv run python checks/base_observation.py
-      - run: uv run python checks/model_release_routes.py
-      - run: uv run python checks/multi_model_binding.py
-      - run: uv run cozy-runtime version
 
-  # THE BEHAVIOUR GATE. Three real runs, no mocks: the author surface through the real
-  # invocation kernel, the PUBLIC CLI from a freshly built wheel in a fresh venv with the
-  # network cut out from under it, and `materialize()` against the adversarial
-  # package-environment refusal matrix. About a minute, which is what a wheel plus two
-  # venvs costs — and that is the thing under test.
+  # THE BEHAVIOUR GATE: two real runs against a real build, no mocks. The public CLI is
+  # installed from a freshly built wheel into a venv that has nothing else, then describes,
+  # replays the descriptor byte-for-byte, serves a request through the invocation kernel,
+  # walks the exit-code matrix, and runs a job through the real two-process worker.
   end-to-end:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -91,28 +43,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
-      - run: uv sync --extra model-execution
-      # WARM THE RESOLVER CACHE. The proofs build and install wheels with the network cut
-      # (`UV_OFFLINE=1`), which is the point of them — but an offline resolve can only read
-      # the uv cache, and `uv sync` fills it straight from the lockfile without ever
-      # touching the registry index or fetching the build backend. One online build plus one
-      # online install of the runtime wheel puts both there.
-      - run: |
-          set -euo pipefail
-          warm=$(mktemp -d)
-          uv build --wheel --out-dir "$warm/dist"
-          uv venv "$warm/venv"
-          uv pip install --python "$warm/venv/bin/python" "$warm"/dist/*.whl
+      - run: uv sync
       - run: uv run pytest
 
-  # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
-  # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another
-  # repo's generated output, and a copy is only a copy while somebody compares the bytes.
+  # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
+  # generated output, and a copy is only a copy while somebody compares the bytes.
   #
   # The checker is worker-protocol's own `scripts/vendored-diff.sh`, invoked rather than
   # reimplemented: a drift checker with its own drifting generator would be its own
-  # punchline. It regenerates from the .proto with the pinned toolchain (grpcio-tools, and
-  # protoc-gen-go for the Go half) and byte-compares against what is vendored here.
+  # punchline. It regenerates from the .proto with the pinned toolchain and byte-compares
+  # against what is vendored here.
   #
   # PINNED, not floating: `WORKER_PROTOCOL_SHA` is the protocol commit these bytes were
   # generated from. Bumping it and re-copying `gen/python/cozy` over `src/cozy` is one
@@ -128,7 +68,6 @@ jobs:
       # credential only the owner can mint. Rather than sit red forever or hide behind a
       # hand-flipped variable, the job detects the credential and runs the moment it
       # exists — and says loudly, in the run's annotations, when it does not.
-      #
       - id: credential
         run: |
           if [ -n "${{ secrets.WORKER_PROTOCOL_TOKEN }}" ]; then

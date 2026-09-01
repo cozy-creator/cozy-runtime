@@ -26,12 +26,13 @@ Runtime wheel digest; package admission uses the declared range and selects the 
 active Runtime/profile. The protobuf package major and additive wire minor remain their own
 worker-control compatibility contract.
 
-**One end-to-end test suite, no mocks.** `uv run pytest` is three real runs — the author
-surface through the real invocation kernel, the public CLI from a freshly built wheel in a
-fresh venv with `connect(2)` cut out from under it, and `materialize()` against the
-adversarial package-environment refusal matrix — and CI runs it beside the build, the
-architecture fences and the determinism/staleness checks. Nothing here is stubbed, patched
-or doubled: a test that passes because a fake agreed with it is worse than no test.
+**One end-to-end test suite, no mocks.** `uv run pytest` is two real runs against
+`examples/marco-polo`: the public CLI installed from a freshly built wheel into a venv that
+has nothing else, describing, replaying the descriptor byte-for-byte, serving a request
+through the invocation kernel and walking the exit-code matrix; then a job through the real
+two-process worker. Nothing is stubbed, patched or doubled — a test that passes because a
+fake agreed with it is worse than no test. Beside it CI runs the build, ruff, mypy, the
+reproducible-wheel check and `checks/architecture.py`'s AST import scans, and nothing else.
 Hardware is verified by hand on a rented card.
 
 ## Layout
@@ -234,8 +235,8 @@ executor still receives only verified model capabilities, never the foreign sour
 destination authority. Multiple transformations are ordinary code inside one bounded job—there is
 no `model_productions` graph, compatibility reader, or second scheduler.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
-`scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
-refusals are shared and which are deliberate profile differences.
+`checks/architecture.py`'s `canonical-numbers` fence replays it over the frozen ES6 vector
+corpus in `vectors/es6-numbers.txt`.
 
 The descriptor is derived, not committed. `cozy-runtime --json --dir PROJECT describe` writes
 the canonical descriptor bytes to stdout without modifying the project. Creator sends those
@@ -249,26 +250,8 @@ project wheel and compares it. `package_descriptor_digest` is SHA-256 over those
     uv run cozy-runtime new <name>       # scaffold a minimal valid package
     uv run cozy-runtime describe              # human-readable surface summary
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
-    uv run python checks/architecture.py # architecture fences
-    uv run python checks/declared_facts.py # every public Context/service fact has a live writer
-    uv run pytest                        # the end-to-end suite: three real runs, no mocks
-    uv run python scripts/verify.py      # live run of both example packages end to end
-    uv run python scripts/bench.py       # time + memory benchmarks
-    proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
-    proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
-    proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
-
-The model-contract proof builds a Runtime wheel, installs it into a fresh driver environment,
-and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its package and
-fake Torch packages live as ordinary, linted projects under `proofs/fixtures/`. They exercise the
-weightless control plane only; this proof makes no claim about real Torch, GPU execution, model
-loading, or output quality.
-
-The environment proof likewise builds and installs the exact Runtime wheel before invoking its
-public command from `/` with `PYTHONPATH` unset. Its base packages are installed once in the
-driver, matching the base worker image. The command hashes and inspects only the project/custom
-wheels, asks uv to create an ordinary venv in private staging, installs the exact wheels offline,
-and atomically publishes it. Cold and independent rebuilds produce the same compact receipt.
+    uv run python checks/architecture.py # AST import/dependency scans over the boundaries
+    uv run pytest                        # the end-to-end suite: two real runs, no mocks
 
 ### Per-package uv environments
 
@@ -387,16 +370,6 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-The CLI proof builds and installs the current wheel plus an ordinary model-free source package
-fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
-`cozy-runtime` command. It proves the current process exit matrix, read-only and exact-byte
-Descriptor/1 behavior, canonical/local/strict key classification through a real job, typed
-mixed-media grants and canonical invocation identity, and `--offline` execution while every
-AF_INET/6 connect is refused. Its private companion
-`proofs/internal/local_input_acceptance.py` owns transfer and RecordOwner fault plants; those
-private hooks are not presented as CLI evidence. The full scenario census and retired claims
-are recorded in `PROOF-SCENARIOS.md`.
-
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the direct PackageSelection, selected Environment, and every
 package wheel file by digest,
@@ -474,10 +447,9 @@ prunes it and Runtime observes the image-provided facade before execution. The v
 identity and reproducible build recipe are recorded in `vendor/TENSORFS.md` until TensorFS is
 published on PyPI.
 
-Real-GPU behaviour is verified by hand on a rented card, not by an in-tree driver corpus:
-the ~24k lines of `scripts/*-live.py` that used to sit here were hand-invoked, ran in no
-workflow, and cost a maintenance edit on every refactor. The adversarial derivation corpus
-(`corpus/`, driven by `scripts/derive-corpus.py`) is the one place that stays exhaustive.
+Real-GPU behaviour is verified by hand on a rented card. `corpus/` holds the adversarial
+derivation cases and the real-torch fixtures for those runs; they are driven from a corpus
+venv, not from CI.
 
 Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
 `--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
@@ -505,19 +477,8 @@ The base package installs and type-checks without it, exactly as it does without
 fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
 `ImportError` escaping a request.
 
-Two real packages on the author surface (weightless, no GPU), both driven end to end by
-`scripts/verify.py`:
-
-| example | what it exercises |
-|---|---|
-| `proofs/fixtures/tiny-models/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
-| `proofs/fixtures/tiny-models/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, a declared `DerivedCache`, and the `@app.job` that exercises JobDescriptor |
-
-`proofs/fixtures/tiny-models/tiny_diffusers.py` stands in for the model library a package brings as
-an ordinary dependency (and registers its own construction adapter);
-`proofs/internal/tiny_artifacts.py` and
-`proofs/fixtures/tiny-models/package.toml` are the RUNTIME's side — resolved artifacts and default
-bindings. Author code never names an artifact identifier; a fence proves it.
+`examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
+— and it is what the end-to-end suite builds, installs and runs.
 
 `run` · `serve` · `job` · `ingest` · `doctor` · `fit` land in
 cr-016 over the real attempt kernel.
