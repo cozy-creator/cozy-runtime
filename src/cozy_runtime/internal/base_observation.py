@@ -93,31 +93,19 @@ def current() -> Observation:
 
     distributions, roots = _ownership()
     installed = dict(distributions)
-    torch_version = installed.get("torch")
-    if torch_version is None:
+    torch_metadata_version = installed.get("torch")
+    if torch_metadata_version is None:
         backend, build, torch_release, cuda = "none", "cpu", "none", "none"
     else:
         try:
             import torch
         except Exception as exc:
             raise ObservationRefusal(f"installed Torch cannot be imported: {exc}") from exc
-        if str(torch.__version__) != torch_version:
-            raise ObservationRefusal(
-                f"Torch metadata/import versions differ: {torch_version}/{torch.__version__}"
-            )
-        try:
-            release = Version(torch_version).release
-        except InvalidVersion as exc:
-            raise ObservationRefusal(
-                f"installed Torch version is invalid: {torch_version}"
-            ) from exc
-        torch_release = ".".join(str(part) for part in release[:3])
-        cuda = str(torch.version.cuda or "none")
-        if cuda == "none":
-            backend, build = "none", "cpu"
-        else:
-            backend = "cuda"
-            build = "cu" + cuda.replace(".", "")
+        backend, build, torch_release, cuda = _torch_identity(
+            torch_metadata_version,
+            str(torch.__version__),
+            str(torch.version.cuda) if torch.version.cuda is not None else None,
+        )
 
     return Observation(
         python_abi="cp" + match.group(1),
@@ -131,6 +119,48 @@ def current() -> Observation:
         distributions=distributions,
         import_roots=roots,
     )
+
+
+def _torch_identity(
+    metadata_version: str, import_version: str, cuda_version: str | None
+) -> tuple[str, str, str, str]:
+    """Validate Torch's public release independently from its backend build tag."""
+
+    try:
+        metadata = Version(metadata_version)
+    except InvalidVersion as exc:
+        raise ObservationRefusal(
+            f"installed Torch metadata version is invalid: {metadata_version}"
+        ) from exc
+    try:
+        imported = Version(import_version)
+    except InvalidVersion as exc:
+        raise ObservationRefusal(f"imported Torch version is invalid: {import_version}") from exc
+    if Version(metadata.public) != Version(imported.public):
+        raise ObservationRefusal(
+            f"Torch metadata/import public versions differ: {metadata.public}/{imported.public}"
+        )
+
+    cuda = cuda_version or "none"
+    if cuda == "none":
+        backend, build = "none", "cpu"
+    else:
+        if re.fullmatch(r"[0-9]+\.[0-9]+", cuda) is None:
+            raise ObservationRefusal(f"Torch CUDA version is invalid: {cuda}")
+        backend, build = "cuda", "cu" + cuda.replace(".", "")
+
+    if imported.local != build:
+        raise ObservationRefusal(
+            f"Torch import build tag does not match its backend: {import_version}/{backend}-{build}"
+        )
+    if metadata.local not in {None, build}:
+        raise ObservationRefusal(
+            "Torch metadata build tag does not match its backend: "
+            f"{metadata_version}/{backend}-{build}"
+        )
+
+    torch_release = ".".join(str(part) for part in metadata.release[:3])
+    return backend, build, torch_release, cuda
 
 
 def from_python(python: Path) -> Observation:
