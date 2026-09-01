@@ -230,6 +230,8 @@ class AttemptRecord:
     prepared_model: PreparedModel | None = None
     executor: Executor | None = None
     """The exact process incarnation this attempt was accepted against."""
+    supervision: ExecutorSupervision | None = None
+    """The placement-local owner of that executor. Never a cross-placement lookup."""
     executor_generation: int = 0
     executor_pid: int = 0
     placement_id: str = ""
@@ -349,6 +351,7 @@ class AttemptRecord:
         self.declared = None
         self.prepared_model = None
         self.executor = None
+        self.supervision = None
         self.job = None
         self.trees = {}
         self.inputs = {}
@@ -455,6 +458,11 @@ class AttemptEngine:
         #: the recorded receipt. Identity replays; the same key with different bytes is a
         #: CONFLICT and never a replacement (§2).
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def supervision_for(self, attempt: AttemptRecord) -> ExecutorSupervision:
+        """Return the exact placement slot captured before this attempt was accepted."""
+
+        return attempt.supervision or self.supervision
 
     def fault(self, row: pb.Fault) -> None:
         """Record ONE fault, bounded. Readers take the last 8; the tail past that is memory
@@ -688,7 +696,9 @@ class AttemptEngine:
                 # that names it is the supervision's one signal — invalidate HERE so the
                 # lane's rebuild pass replaces the generation instead of refusing forever
                 # (lifecycle-live §4 caught the wedge).
-                self.supervision.invalidate(executor, str(reply.get("detail", "poisoned"))[:256])
+                self.supervision_for(attempt).invalidate(
+                    executor, str(reply.get("detail", "poisoned"))[:256]
+                )
             raise AttemptRefusal(
                 code,
                 str(reply.get("detail", ""))[:1024],
@@ -729,8 +739,9 @@ class AttemptEngine:
                 max_bytes=binding.max_input_bytes if binding else 64 << 20,
                 max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
             )
-            if getattr(self.supervision, "isolated", False):
-                self.supervision.grant_directory(spool, attempt.executor_generation)
+            supervision = self.supervision_for(attempt)
+            if getattr(supervision, "isolated", False):
+                supervision.grant_directory(spool, attempt.executor_generation)
         except grants.GrantRefusal as exc:
             # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
             # absent grant entry are facts about the REQUEST; an expired grant or an
@@ -903,6 +914,7 @@ class AttemptEngine:
         attempt.job = binding
         attempt.kind = "job"
         attempt.state = "preparing"
+        attempt.supervision = self.supervision
         executor = self.supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
@@ -1077,7 +1089,8 @@ class AttemptEngine:
         # it BEFORE durable acceptance. Serving never accepts-then-cold-loads. It is checked
         # HERE, ahead of the request preparation below, because that preparation runs in the
         # executor and there is no sense resolving a request against one that cannot serve.
-        executor = self.supervision.current
+        supervision = self.supervision_for(attempt)
+        executor = supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
                 "executor_absent",
@@ -1149,7 +1162,7 @@ class AttemptEngine:
 
         plan_digest = plan.digest()
         try:
-            with self.supervision.hold(executor) as owned:
+            with supervision.hold(executor) as owned:
                 if not owned:
                     raise AttemptRefusal(
                         "executor_replaced_before_acceptance",
@@ -1216,7 +1229,8 @@ class AttemptEngine:
         # mutating the ledger without this hold lets convergence publish E2 between those two
         # operations; E1's terminal would then mark E2 unreadable or reconcile against E2's
         # freshly installed baseline.
-        with self.supervision.hold(executor) as owned:
+        supervision = self.supervision_for(attempt)
+        with supervision.hold(executor) as owned:
             if not owned:
                 return self._unavailable_reconciliation(attempt, key)
             if not executor.poisoned and attempt.spool:
@@ -1251,9 +1265,7 @@ class AttemptEngine:
             # lands the chooser refuses typed rather than pricing a rung against drift —
             # which is the difference between a typed answer before acceptance and an OOM
             # halfway through somebody's VAE decode (cl-003).
-            self.supervision.invalidate(
-                executor, f"ledger_unreconciled: {record['leaks'][0][:160]}"
-            )
+            supervision.invalidate(executor, f"ledger_unreconciled: {record['leaks'][0][:160]}")
         return record
 
     def _unavailable_reconciliation(self, attempt: AttemptRecord, key: str) -> dict[str, Any]:
@@ -1478,7 +1490,8 @@ class AttemptEngine:
         """
         job = attempt.job is not None
         executor = attempt.executor
-        if executor is None or not self.supervision.owns(executor):
+        supervision = self.supervision_for(attempt)
+        if executor is None or not supervision.owns(executor):
             return self.abandon(attempt, "its accepted executor vanished before dispatch")
         # The spool already exists — cr-012's hydration made it before acceptance. This
         # stays for the recovered-attempt path, whose acceptance was another process's.
@@ -1487,8 +1500,8 @@ class AttemptEngine:
         )
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
-        if getattr(self.supervision, "isolated", False):
-            self.supervision.grant_directory(spool, attempt.executor_generation)
+        if getattr(supervision, "isolated", False):
+            supervision.grant_directory(spool, attempt.executor_generation)
         attempt.state = "running"
         attempt.executions += 1
         self.executed += 1
@@ -1539,7 +1552,7 @@ class AttemptEngine:
             # WHICHEVER THREAD SEES THE DEATH MARKS IT: `waitpid` answers 0 for a few ms
             # on a dying process, so invalidating at the OBSERVATION removes the race with
             # the watchdog's kill instead of narrowing it (cr-007).
-            self.supervision.invalidate(executor, "the executor died during an attempt")
+            supervision.invalidate(executor, "the executor died during an attempt")
             # A cancel that ESCALATED killed this executor on purpose: the attempt's
             # terminal is CANCELED only after the watchdog proves reclaim AND aborts the
             # spool. Any other death is an invalidation the attempt did not ask for.
@@ -1652,7 +1665,8 @@ class AttemptEngine:
             # A reply can race desired-state replacement during finalization. Preserve its
             # attempt-local observations either way, but apply residency, activation and
             # demand facts only while this is still the exact generation they describe.
-            with self.supervision.hold(executor) as owned:
+            supervision = self.supervision_for(attempt)
+            with supervision.hold(executor) as owned:
                 self.absorb(attempt, reply, apply_ledger=owned)
                 if owned:
                     moved = bool(
@@ -1687,7 +1701,7 @@ class AttemptEngine:
             # No terminal is recorded while author computation might still mutate GPU or
             # output state. Unproven quiescence is an executor fault, not a success.
             if attempt.executor is not None:
-                self.supervision.invalidate(attempt.executor, "unproven quiescence")
+                self.supervision_for(attempt).invalidate(attempt.executor, "unproven quiescence")
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
@@ -1699,7 +1713,7 @@ class AttemptEngine:
             )
         if not reply.get("env_intact", True):
             if attempt.executor is not None:
-                self.supervision.invalidate(attempt.executor, "env seal broken")
+                self.supervision_for(attempt).invalidate(attempt.executor, "env seal broken")
             changed = ", ".join(str(name) for name in (reply.get("env_changed") or ()))
             names = f"; changed sealed names: {changed}" if changed else ""
             return self.outcome(
@@ -1723,7 +1737,7 @@ class AttemptEngine:
                 )
             )
         if reply.get("poisoned") and attempt.executor is not None:
-            self.supervision.invalidate(attempt.executor, str(reply["poisoned"]))
+            self.supervision_for(attempt).invalidate(attempt.executor, str(reply["poisoned"]))
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
@@ -2434,7 +2448,7 @@ class AttemptEngine:
                 # lane reads it when it reaches this attempt and terminates without dispatch.
                 return f"marked before dispatch ({held.canceling}); nothing signalled"
             executor = held.executor
-            if executor is None or not self.supervision.cooperative_cancel(
+            if executor is None or not self.supervision_for(held).cooperative_cancel(
                 executor, f"{held.request_id}#{held.attempt}"
             ):
                 return "executor already gone or cooperative marker unavailable"
@@ -2457,7 +2471,7 @@ class AttemptEngine:
             # Reclaim failure is not a cancellation result.  Let the watchdog keep the
             # worker non-dispatchable and retry; swallowing this error would disable the
             # only actor still able to finish the owned process.
-            evidence = self.supervision.retire_current(executor, "forceful cancel")
+            evidence = self.supervision_for(attempt).retire_current(executor, "forceful cancel")
         gone_at = time.perf_counter()
         aborted = grants.abort_outputs(attempt.spool) if attempt.spool else 0
         attempt.reclaim_done.set()
@@ -2550,7 +2564,7 @@ class AttemptEngine:
         if attempt.spool is not None:
             grants.abort_outputs(attempt.spool)
         if attempt.executor is not None:
-            self.supervision.invalidate(attempt.executor, "executor invalidated")
+            self.supervision_for(attempt).invalidate(attempt.executor, "executor invalidated")
         return self.outcome(
             attempt,
             STATUS.OUTCOME_STATUS_ABANDONED,

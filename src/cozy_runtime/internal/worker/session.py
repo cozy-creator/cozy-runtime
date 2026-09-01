@@ -318,6 +318,24 @@ class ExecutorDeath:
     """One exact child exit awaiting the serialized device lane's rebuild decision."""
 
     executor: child.Executor
+    placement_id: str = ""
+
+
+@dataclass(slots=True)
+class HostedPlacement:
+    """One additional weightless placement and the process that imports only its package.
+
+    The original single-placement fields remain the primary slot.  Keeping this value small
+    makes the co-fitting cut equally small: package-local bindings, failures and supervision
+    never become a second scheduler or a shared environment.
+    """
+
+    placement: Placement
+    supervision: ExecutorSupervision
+    bindings: dict[str, DeclaredBinding] = field(default_factory=dict)
+    prepared_models: dict[str, PreparedModel] = field(default_factory=dict)
+    failed_bindings: dict[str, str] = field(default_factory=dict)
+    latched: str = ""
 
 
 @dataclass(slots=True)
@@ -441,6 +459,9 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
         if not isinstance(entry, dict):
             raise documents.DocumentError("wrong_type", "a Placement is a JSON object")
         _placement_profile(entry)
+    placement_ids = [str(entry["placement_id"]) for entry in placements]
+    if len(placement_ids) != len(set(placement_ids)):
+        raise documents.DocumentError("duplicate_placement", "placement_id must be unique")
     return [entry for entry in placements if isinstance(entry, dict)]
 
 
@@ -925,6 +946,11 @@ class Worker:
         #: a separate field precisely because one field cannot hold both, which is the same
         #: reason the observed state has two axes.
         self.pending: Placement | None = None
+        #: Additional pure-Python packages hosted beside the primary placement.  Each gets
+        #: its own immutable uv environment and executor; attempts still share the existing
+        #: one-seat worker admission lane.
+        self.hosted: dict[str, HostedPlacement] = {}
+        self.pending_hosted: list[dict[str, Any]] = []
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
         self.job_ready = False
         #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
@@ -1001,6 +1027,104 @@ class Worker:
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
+    def _new_placement_supervision(self, placement_id: str) -> ExecutorSupervision:
+        """Create the one executor slot owned by an additional package placement."""
+
+        key = hashlib.sha256(placement_id.encode()).hexdigest()[:24]
+        supervision = ExecutorSupervision(
+            root=self.root / "placements" / key,
+            python=self.options.python or sys.executable,
+            base_env=self.config.child_base_env,
+            cozy_home=self.config.cozy_home,
+            executor_uid=self.options.executor_uid,
+            executor_gid=self.options.executor_gid,
+            jit_pod_scope=f"{self.fence.worker_boot_id}-{key}",
+            scratch_root=self.root.parent / "scratch" / key,
+        )
+        supervision.on_invalidate = lambda why: self._hosted_capacity_dropped(placement_id, why)
+        supervision.on_exit = lambda executor: self._hosted_executor_exited(placement_id, executor)
+        killed = supervision.sweep_orphans()
+        if killed:
+            self.note(
+                "recovery",
+                f"{placement_id!r}: reclaimed {len(killed)} prior executor(s)",
+            )
+        return supervision
+
+    def _placement_by_id(self, placement_id: str) -> Placement | None:
+        if self.placement is not None and self.placement.placement_id == placement_id:
+            return self.placement
+        hosted = self.hosted.get(placement_id)
+        return hosted.placement if hosted is not None else None
+
+    def _placement_dispatchable(self, placement_id: str) -> bool:
+        placement = self._placement_by_id(placement_id)
+        return bool(
+            placement is not None
+            and placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+        )
+
+    def _all_placements_dispatchable(self) -> bool:
+        return bool(
+            self.placement is not None
+            and self.pending is None
+            and not self.pending_hosted
+            and self._placement_dispatchable(self.placement.placement_id)
+            and all(
+                hosted.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                for hosted in self.hosted.values()
+            )
+        )
+
+    def _select_attempt_placement(self, placement_id: str) -> None:
+        """Point the serialized attempt kernel at one placement's isolated executor."""
+
+        hosted = self.hosted.get(placement_id)
+        if hosted is None:
+            self.engine.supervision = self.supervision
+            self.engine.bindings = self.bindings
+            self.engine.prepared_models = self.prepared_models
+            self.engine.failed_bindings = self.failed_bindings
+        else:
+            self.engine.supervision = hosted.supervision
+            self.engine.bindings = hosted.bindings
+            self.engine.prepared_models = hosted.prepared_models
+            self.engine.failed_bindings = hosted.failed_bindings
+        executor = self.engine.supervision.current
+        self.ledger.begin_generation(executor.pid if executor is not None else 0)
+
+    def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
+        hosted = self.hosted.get(placement_id)
+        if hosted is None or hosted.placement.serving == state:
+            return
+        hosted.placement.serving = state
+        self.bump_admission(why or f"{placement_id} serving -> {pb.ServingState.Name(state)}")
+        self._settle()
+
+    def _hosted_capacity_dropped(self, placement_id: str, why: str) -> None:
+        if not self._placement_dispatchable(placement_id):
+            return
+        self.note("serving", f"{placement_id} capacity withdrawn: {why[:180]}")
+        self._hosted_set_serving(
+            placement_id,
+            pb.ServingState.SERVING_STATE_ACTIVATING,
+            f"{placement_id} executor invalidated",
+        )
+
+    def _hosted_executor_exited(self, placement_id: str, executor: child.Executor) -> None:
+        with self.control_lock:
+            hosted = self.hosted.get(placement_id)
+            if hosted is None:
+                return
+            rebuild = self._placement_dispatchable(placement_id)
+            if not hosted.supervision.invalidate(
+                executor,
+                f"executor incarnation {executor.incarnation} pid {executor.pid} exited",
+            ):
+                return
+            if rebuild and not self.stop.is_set():
+                self.work.put(ExecutorDeath(executor, placement_id))
+
     # ------------------------------------------------------------------ plumbing
 
     def prepare_package_set(
@@ -1059,7 +1183,12 @@ class Worker:
         from cozy_runtime.internal.worker import package_prepare
 
         with self.preparation_lock:
-            if self.placement is not None or self.pending is not None or self.bindings:
+            if (
+                self.placement is not None
+                or self.pending is not None
+                or self.bindings
+                or self.hosted
+            ):
                 raise package_prepare.PreparationRefusal(
                     "package_prepare_worker_busy",
                     "replace the active package through desired state",
@@ -1281,9 +1410,15 @@ class Worker:
         `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
         if self.accepted.mode == "job":
             return self.job_ready
-        return (
-            self.placement is not None
-            and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+        return bool(
+            (
+                self.placement is not None
+                and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+            )
+            or any(
+                hosted.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                for hosted in self.hosted.values()
+            )
         )
 
     def admission_state(self) -> pb.AdmissionState:
@@ -1349,7 +1484,10 @@ class Worker:
 
     def capacity_dropped(self, why: str) -> None:
         """The executor's state was invalidated: STOP ADVERTISING DISPATCHABLE, right now."""
-        if not self.dispatchable():
+        if self.accepted.mode != "job" and (
+            self.placement is None
+            or self.placement.serving != pb.ServingState.SERVING_STATE_DISPATCHABLE
+        ):
             return
         self.note("serving", f"capacity withdrawn: {why[:200]}")
         if self.accepted.mode == "job":
@@ -1367,7 +1505,13 @@ class Worker:
         """
 
         with self.control_lock:
-            rebuild = self.dispatchable()
+            rebuild = bool(
+                (self.accepted.mode == "job" and self.job_ready)
+                or (
+                    self.placement is not None
+                    and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                )
+            )
             if not self.supervision.invalidate(
                 executor,
                 f"executor incarnation {executor.incarnation} pid {executor.pid} exited",
@@ -1392,7 +1536,7 @@ class Worker:
         The ledger's legacy scalar cannot express absence separately. Lifecycle reclaim uses
         AcceleratorOps' tri-state observation directly, where that distinction is authoritative.
         """
-        executor = self.supervision.current
+        executor = self.engine.supervision.current
         if executor is None:
             return -1
         observed = accel.process_memory(executor.pid, accel.host_backend_family())
@@ -1400,7 +1544,7 @@ class Worker:
 
     def read_device_work(self) -> int:
         """How much work the EXECUTOR has done, read by the parent — THE meter."""
-        executor = self.supervision.current
+        executor = self.engine.supervision.current
         return child.work(executor.pid if executor is not None else 0)
 
     def applied_posture(self) -> dict[str, Any]:
@@ -1904,6 +2048,26 @@ class Worker:
 
     # ------------------------------------------------------------- the desired state
 
+    @staticmethod
+    def _placement_from_entry(entry: Mapping[str, Any], placement_set_digest: bytes) -> Placement:
+        package_descriptor = dict(entry.get("package_descriptor", {}))
+        return Placement(
+            placement_id=str(entry.get("placement_id", "")),
+            placement_set_digest=placement_set_digest,
+            package=dict(entry.get("package", {})),
+            development=dict(entry.get("development", {})),
+            environment_digest=_digest_field(entry.get("environment_digest")),
+            package_descriptor=(
+                str(package_descriptor.get("digest", "")),
+                int(package_descriptor.get("length", 0)),
+            ),
+            bindings_digest=_digest_field(entry.get("bindings_digest")),
+            models=tuple(dict(row) for row in entry.get("models", [])),
+            entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
+            environment=dict(entry.get("environment", {})),
+            document=dict(entry),
+        )
+
     def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
         """FULL REPLACE. A field absent means absent, never unchanged (§3).
 
@@ -1940,23 +2104,6 @@ class Worker:
                         subject=f"revision {desired.revision}",
                         reason=exc.code,
                         detail=safe(exc.detail),
-                    )
-                )
-                return
-            if len(placements) > 1:
-                self.note(
-                    "desired_state",
-                    f"revision {desired.revision} REFUSED: {len(placements)} placements; "
-                    "launch enforces len(placements) <= 1 and the desired state is UNAPPLIED",
-                )
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_PLACEMENT_SET_UNSUPPORTED,
-                        subject=f"revision {desired.revision}",
-                        reason="placement_set_over_launch_clamp",
-                        detail=f"the desired set names {len(placements)} placements and this "
-                        "worker hosts at most one until cr-023's reconciler lands; #475 adds "
-                        "that when the clamp lifts, multi-placement serving is CO-FITTING ONLY",
                     )
                 )
                 return
@@ -2017,6 +2164,7 @@ class Worker:
                     self.note("recovery", self.latched)
             self.placement = None
             self.pending = None
+            self._retire_hosted(set())
             self.bindings = {}
             self.prepared_models = {}
             self.engine.bindings = {}
@@ -2061,6 +2209,7 @@ class Worker:
                     return
             self.placement = None
             self.pending = None
+            self._retire_hosted(set())
             self.engine.bindings = {}
             self.engine.prepared_models = {}
             self.accepted.converged_revision = desired.revision
@@ -2071,35 +2220,40 @@ class Worker:
         # Nothing below touches `self.bindings`, the prepared models, or the executor until
         # the incoming placement is materially STAGED — which is what makes the incoming's
         # every materialization failure free.
-        entry = placements[0]
+        primary_index = 0
+        if previous is not None:
+            primary_index = next(
+                (
+                    index
+                    for index, row in enumerate(placements)
+                    if str(row.get("placement_id", "")) == previous.placement_id
+                ),
+                0,
+            )
+        entry = placements[primary_index]
+        self.pending_hosted = [
+            dict(row) for index, row in enumerate(placements) if index != primary_index
+        ]
         placement_id = str(entry.get("placement_id", ""))
-        package = dict(entry.get("package", {}))
-        development = dict(entry.get("development", {}))
-        package_descriptor = dict(entry.get("package_descriptor", {}))
-        candidate = Placement(
-            placement_id=placement_id,
-            placement_set_digest=desired_set.placement_set_digest,
-            package=package,
-            development=development,
-            environment_digest=_digest_field(entry.get("environment_digest")),
-            package_descriptor=(
-                str(package_descriptor.get("digest", "")),
-                int(package_descriptor.get("length", 0)),
-            ),
-            bindings_digest=_digest_field(entry.get("bindings_digest")),
-            models=tuple(dict(row) for row in entry.get("models", [])),
-            entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-            environment=dict(entry.get("environment", {})),
-            document=dict(entry),
-            # #474/#485c: the predecessor is the rollback pin. A REPLACEMENT (same
-            # placement_id, new set digest) retains the outgoing set as the pin; a fresh
-            # placement has none, and an empty pin means replacement is PAUSED — which is
-            # why the pin is set from the PREVIOUS spec and never invented.
-            retained_fallback_placement_set_digest=(
-                previous.placement_set_digest
-                if previous is not None and previous.placement_id == placement_id
-                else b""
-            ),
+        candidate = self._placement_from_entry(entry, desired_set.placement_set_digest)
+        if (
+            previous is not None
+            and previous.placement_id == placement_id
+            and previous.document == candidate.document
+        ):
+            previous.placement_set_digest = desired_set.placement_set_digest
+            self.pending = None
+            self.note(
+                "desired_state",
+                f"revision {desired.revision} keeps {placement_id!r} warm and reconciles "
+                f"{len(self.pending_hosted)} additional placement(s)",
+            )
+            self.schedule_convergence(desired.revision)
+            return
+        candidate.retained_fallback_placement_set_digest = (
+            previous.placement_set_digest
+            if previous is not None and previous.placement_id == placement_id
+            else b""
         )
         replacement = (
             previous is not None
@@ -2173,6 +2327,9 @@ class Worker:
         `MATERIALIZATION_STATE_STAGED` asserts that the exact package environment installed
         and imported; it is unspeakable otherwise (§8).
         """
+        if self.pending is None and self.placement is not None:
+            self._reconcile_hosted(revision)
+            return
         candidate = self.pending or self.placement
         assert candidate is not None
         outgoing = self.placement if self.pending is not None else None
@@ -2234,6 +2391,189 @@ class Worker:
             f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
         self.activate_executor()
+        if self._placement_dispatchable(candidate.placement_id):
+            self._reconcile_hosted(revision)
+
+    def _retire_hosted(self, keep: set[str]) -> None:
+        """Remove only placements absent from the complete desired set."""
+
+        for placement_id in sorted(set(self.hosted) - keep):
+            hosted = self.hosted[placement_id]
+            self._hosted_set_serving(
+                placement_id,
+                pb.ServingState.SERVING_STATE_DRAINING,
+                f"placement {placement_id!r} removed from desired state",
+            )
+            for attempt in list(self.engine.history.values()):
+                while attempt.placement_id == placement_id and attempt.state in self.engine.HELD:
+                    time.sleep(0.02)
+            current = hosted.supervision.current
+            if current is not None:
+                try:
+                    hosted.supervision.retire_current(current, "placement removed")
+                except ExecutorGone as exc:
+                    hosted.latched = f"executor_reclaim_failed: {exc}"[:200]
+                    self.engine.fault(
+                        pb.Fault(
+                            kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                            subject=placement_id,
+                            reason="executor_reclaim_failed",
+                            detail=safe(str(exc)),
+                        )
+                    )
+                    continue
+            hosted.supervision.close()
+            del self.hosted[placement_id]
+            self.bump_admission(f"placement {placement_id!r} removed")
+
+    def _reconcile_hosted(self, revision: int) -> None:
+        """Converge additional weightless packages without disturbing the primary one."""
+
+        if revision != self.accepted.accepted_desired_state_revision:
+            return
+        desired = {
+            str(entry.get("placement_id", "")): self._placement_from_entry(
+                entry, self.accepted.accepted_placement_set_digest
+            )
+            for entry in self.pending_hosted
+        }
+        changed = {
+            placement_id
+            for placement_id, placement in desired.items()
+            if placement_id in self.hosted
+            and self.hosted[placement_id].placement.document != placement.document
+        }
+        self._retire_hosted(set(desired) - changed)
+        for placement_id, placement in desired.items():
+            if revision != self.accepted.accepted_desired_state_revision:
+                return
+            hosted = self.hosted.get(placement_id)
+            if hosted is not None:
+                hosted.placement.placement_set_digest = self.accepted.accepted_placement_set_digest
+                continue
+            hosted = HostedPlacement(
+                placement=placement,
+                supervision=self._new_placement_supervision(placement_id),
+            )
+            self.hosted[placement_id] = hosted
+            self._activate_hosted(hosted, revision)
+        self.pending_hosted = []
+        if (
+            self.placement is not None
+            and self._placement_dispatchable(self.placement.placement_id)
+            and all(
+                hosted.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                for hosted in self.hosted.values()
+            )
+        ):
+            self.accepted.converged_revision = revision
+        self._settle()
+
+    def _activate_hosted(self, hosted: HostedPlacement, revision: int) -> None:
+        """Acquire and start one pure-Python package in its own existing uv environment."""
+
+        placement = hosted.placement
+        placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
+        acquired = self._acquire(placement, revision)
+        if acquired is None or revision != self.accepted.accepted_desired_state_revision:
+            return
+        bindings = dict(acquired.bindings)
+        if (
+            placement.models
+            or not bindings
+            or any(not binding.weightless for binding in self.bindings.values())
+            or any(not binding.weightless for binding in bindings.values())
+        ):
+            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            hosted.latched = "multi_placement_requires_weightless"
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=placement.placement_id,
+                    reason=hosted.latched,
+                    detail="simultaneous package placement currently admits pure-Python, "
+                    "model-free bindings only",
+                )
+            )
+            self.note(
+                "materialization",
+                f"{placement.placement_id!r} refused without disturbing other placements: "
+                f"{hosted.latched}",
+            )
+            self._settle()
+            return
+        installed = acquired.installed
+        if installed is not None:
+            hosted.supervision.use_environment(str(installed.python), installed.content_digest)
+        hosted.bindings = bindings
+        hosted.prepared_models = {}
+        hosted.failed_bindings = {}
+        placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+        self._prepare_hosted_executor(hosted)
+
+    def _prepare_hosted_executor(self, hosted: HostedPlacement) -> None:
+        placement = hosted.placement
+        self._hosted_set_serving(
+            placement.placement_id,
+            pb.ServingState.SERVING_STATE_ACTIVATING,
+            f"activating placement {placement.placement_id!r}",
+        )
+        executor = hosted.supervision.current
+        try:
+            if executor is None:
+                executor = hosted.supervision.spawn(imposed=self.imposed())
+            elif not executor.alive() or executor.poisoned:
+                executor = hosted.supervision.replace(
+                    executor, imposed=self.imposed(), why="placement executor changed"
+                )
+            group = list(hosted.bindings.values())
+            first = group[0]
+            reply = executor.call(executor_prepare_command(first), timeout=None)
+            if not reply.get("ok"):
+                raise ExecutorGone(f"{reply.get('code')}: {reply.get('detail', '')}")
+            facts = reply.get("facts") or {}
+            prepared = PreparedModel(
+                logical_model_digest=str(reply.get("model_construction_digest", "")),
+                constructed_model_digest=str(reply.get("constructed_model_digest", "")),
+                delivery_rung="",
+                delivery_variant="",
+                weight_bytes=int(facts.get("filled_bytes", 0)),
+            )
+            executor.construction_key = first.construction_key()
+            executor.prepared_binding_set = frozenset(hosted.bindings)
+            executor.prepared_model = prepared
+            for binding in group:
+                executor.ready_bindings.add(binding.entrypoint_binding_digest)
+                hosted.prepared_models[binding.entrypoint_binding_digest] = prepared
+            self.note(
+                "boot",
+                f"{placement.placement_id!r} executor generation {executor.incarnation} "
+                f"pid {executor.pid} prepared {len(group)} binding(s)",
+            )
+        except Exception as exc:
+            placement.serving = pb.ServingState.SERVING_STATE_OFFLINE
+            hosted.latched = f"activation_failed: {safe(str(exc))}"[:200]
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=placement.placement_id,
+                    reason="activation_failed",
+                    detail=safe(str(exc)),
+                )
+            )
+            self.note(
+                "boot",
+                f"{placement.placement_id!r} activation failed; other placements stay live: "
+                f"{safe(str(exc))}",
+            )
+            self._settle()
+            return
+        hosted.latched = ""
+        self._hosted_set_serving(
+            placement.placement_id,
+            pb.ServingState.SERVING_STATE_DISPATCHABLE,
+            f"placement {placement.placement_id!r} dispatchable",
+        )
 
     def await_drained(self) -> None:
         """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
@@ -2504,7 +2844,10 @@ class Worker:
         """Publish observation-only partial/terminal progress; never decide convergence."""
 
         placement.acquisition.CopyFrom(value)
-        if placement is self.placement and self.connected.is_set():
+        if (
+            placement is self.placement
+            or any(hosted.placement is placement for hosted in self.hosted.values())
+        ) and self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def _materialization_failed(
@@ -2522,6 +2865,18 @@ class Worker:
             if terminal
             else pb.MaterializationState.MATERIALIZATION_STATE_ABSENT
         )
+        hosted = self.hosted.get(placement.placement_id)
+        if hosted is not None and hosted.placement is placement:
+            placement.serving = pb.ServingState.SERVING_STATE_OFFLINE
+            hosted.latched = f"{pb.FaultKind.Name(fault.kind)}: {fault.reason}"[:200]
+            self.engine.fault(fault)
+            self.note(
+                "materialization",
+                f"{placement.placement_id!r} refused ({fault.reason}); other placements "
+                "remain unchanged",
+            )
+            self._settle()
+            return
         if self.placement is placement:
             # No outgoing placement exists to keep serving: latch on this placement, which moves
             # its serving axis OFFLINE and leaves `converged_revision` behind, typed.
@@ -2558,6 +2913,7 @@ class Worker:
         self.jobs = {}
         self.placement = None
         self.pending = None
+        self._retire_hosted(set())
         self.set_job_ready(False)
         previous = self.supervision.current
         if previous is not None:
@@ -3117,15 +3473,18 @@ class Worker:
             )
             return
         if self.accepted.mode == "serving":
-            wanted = self.placement.placement_id if self.placement is not None else ""
-            if offered.placement_id != wanted:
+            selected = self._placement_by_id(offered.placement_id)
+            if selected is None:
+                hosted_ids = sorted(self.hosted)
+                if self.placement is not None:
+                    hosted_ids.insert(0, self.placement.placement_id)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_UNKNOWN_PLACEMENT,
                         subject=offered.placement_id,
                         reason="unknown_placement",
                         detail=f"the offer names placement {offered.placement_id!r} and this "
-                        f"worker hosts {wanted!r}",
+                        f"worker hosts {hosted_ids!r}",
                     )
                 )
                 self.refuse(
@@ -3135,13 +3494,15 @@ class Worker:
                     CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
                 )
                 return
-            if not self.dispatchable():
+            if not self._placement_dispatchable(offered.placement_id):
+                hosted = self.hosted.get(offered.placement_id)
+                latched = hosted.latched if hosted is not None else self.latched
                 self.refuse(
                     offered,
                     "placement_not_dispatchable",
-                    f"placement {wanted!r} is "
-                    + (pb.ServingState.Name(self.placement.serving) if self.placement else "absent")
-                    + (f" (LATCHED: {self.latched})" if self.latched else ""),
+                    f"placement {offered.placement_id!r} is "
+                    + pb.ServingState.Name(selected.serving)
+                    + (f" (LATCHED: {latched})" if latched else ""),
                     CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
                 )
                 return
@@ -3285,14 +3646,14 @@ class Worker:
             if item is None:
                 return
             if isinstance(item, ExecutorDeath):
-                self.rebuild_exited(item.executor)
+                self.rebuild_exited(item.executor, item.placement_id)
                 continue
             attempt = item
             if self.admit(attempt):
                 self.execute(attempt)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
-            self.rebuild_if_needed()
+            self.rebuild_if_needed(attempt.placement_id)
 
     def admit(self, attempt: AttemptRecord) -> bool:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
@@ -3329,23 +3690,40 @@ class Worker:
                 )
                 return False
             if self.accepted.mode == "serving":
-                wanted = self.placement.placement_id if self.placement is not None else ""
-                if attempt.placement_id != wanted:
+                selected = self._placement_by_id(attempt.placement_id)
+                if selected is None:
                     self.note(
                         "admission",
                         f"refusing queued {key}: placement {attempt.placement_id!r} is no "
-                        f"longer {wanted!r}",
+                        "longer hosted",
                     )
                     self.terminate(
                         attempt,
                         self.engine.refuse_held,
                         "unknown_placement",
                         f"the queued offer names placement {attempt.placement_id!r} and "
-                        f"this worker now hosts {wanted!r}",
+                        "this worker no longer hosts it",
                         CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
                     )
                     return False
-            if not self.dispatchable():
+                if not self._placement_dispatchable(attempt.placement_id):
+                    self.note(
+                        "admission",
+                        f"refusing queued {key}: placement {attempt.placement_id!r} is not "
+                        "dispatchable",
+                    )
+                    self.terminate(
+                        attempt,
+                        self.engine.refuse_held,
+                        "placement_not_dispatchable",
+                        f"placement {attempt.placement_id!r} stopped being dispatchable "
+                        "while this offer was queued",
+                        CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+                    )
+                    return False
+                self._select_attempt_placement(attempt.placement_id)
+                attempt.supervision = self.engine.supervision
+            if self.accepted.mode != "serving" and not self.dispatchable():
                 self.note("admission", f"refusing queued {key}: worker is not dispatchable")
                 self.terminate(
                     attempt,
@@ -3410,9 +3788,15 @@ class Worker:
             self.note("attempt", f"even the last-resort outcome failed: {inner}")
             self.fail_machine("last_resort_failed")
 
-    def rebuild_if_needed(self) -> None:
+    def rebuild_if_needed(self, placement_id: str = "") -> None:
         """The queue starts behind the rebuild because BOTH live on this lane."""
         with self.control_lock:
+            hosted = self.hosted.get(placement_id)
+            if hosted is not None:
+                current = hosted.supervision.current
+                if current is None or not current.alive() or current.poisoned:
+                    self._prepare_hosted_executor(hosted)
+                return
             current = self.supervision.current
             if current is None or not current.alive():
                 self._rebuild_locked("the executor is gone")
@@ -3424,10 +3808,16 @@ class Worker:
         with self.control_lock:
             self._rebuild_locked(why)
 
-    def rebuild_exited(self, executor: child.Executor) -> None:
+    def rebuild_exited(self, executor: child.Executor, placement_id: str = "") -> None:
         """Rebuild only if the queued death still names the owned dead incarnation."""
 
         with self.control_lock:
+            hosted = self.hosted.get(placement_id)
+            if hosted is not None:
+                if hosted.supervision.current is not executor or executor.alive():
+                    return
+                self._prepare_hosted_executor(hosted)
+                return
             if self.supervision.current is not executor or executor.alive():
                 return
             self._rebuild_locked(
@@ -3491,7 +3881,7 @@ class Worker:
                         attempt.canceling = "deadline"
                         executor = attempt.executor
                         if executor is not None:
-                            self.supervision.cooperative_cancel(
+                            (attempt.supervision or self.supervision).cooperative_cancel(
                                 executor, f"{attempt.request_id}#{attempt.attempt}"
                             )
                         attempt.cancel_started = time.perf_counter()
@@ -3519,7 +3909,12 @@ class Worker:
                                 f"forceful reclaim failed; retrying after the grace window: "
                                 f"{type(exc).__name__}: {exc}",
                             )
-                            self.capacity_dropped("executor reclaim is not proved")
+                            if attempt.placement_id in self.hosted:
+                                self._hosted_capacity_dropped(
+                                    attempt.placement_id, "executor reclaim is not proved"
+                                )
+                            else:
+                                self.capacity_dropped("executor reclaim is not proved")
                             attempt.cancel_started = time.perf_counter()
                             continue
                         self.note("cancel", f"forceful: {json.dumps(facts)}")
@@ -3568,6 +3963,8 @@ class Worker:
             observed.accepted_placement_set_digest = self.accepted.accepted_placement_set_digest
             if self.placement is not None:
                 observed.placements.append(self.placement_status())
+            for placement_id in sorted(self.hosted):
+                observed.placements.append(self.placement_status(placement_id))
         return observed
 
     def converged_revision(self) -> int:
@@ -3580,14 +3977,14 @@ class Worker:
         a placement that stops being dispatchable un-converges immediately, which is exactly
         what a RecordOwner watching a cutover needs to see.
         """
-        if self.accepted.mode == "serving" and not self.dispatchable():
+        if self.accepted.mode == "serving" and not self._all_placements_dispatchable():
             return min(
                 self.accepted.converged_revision,
                 max(0, self.accepted.accepted_desired_state_revision - 1),
             )
         return self.accepted.converged_revision
 
-    def placement_status(self) -> pb.PlacementStatus:
+    def placement_status(self, placement_id: str = "") -> pb.PlacementStatus:
         """Per-placement truth on TWO AXES (#473/#482), and `readiness_epoch` is not among
         them: it is DELETED, not renamed (#486b), because the serving axis plus
         `dispatchable_binding_digests` carry what a placement can serve and the worker-level
@@ -3599,31 +3996,35 @@ class Worker:
         registration honesty is schema). The executor-measured qualification lands with
         cr-020/cr-021's lanes.
         """
-        assert self.placement is not None
-        executor = self.supervision.current
+        hosted = self.hosted.get(placement_id)
+        placement = hosted.placement if hosted is not None else self.placement
+        supervision = hosted.supervision if hosted is not None else self.supervision
+        assert placement is not None
+        executor = supervision.current
         dispatchable = sorted(executor.ready_bindings) if executor is not None else []
         selected = {
-            str(entrypoint["entrypoint_binding_digest"])
-            for entrypoint in self.placement.entrypoints
+            str(entrypoint["entrypoint_binding_digest"]) for entrypoint in placement.entrypoints
         }
+        fault_subjects = selected | {placement.placement_id}
         # DISJOINT by construction (the proto says so): a binding is either servable now or
         # still to be materialized, never counted in both.
         materializable = sorted(selected - set(dispatchable))
         status = pb.PlacementStatus(
-            placement_id=self.placement.placement_id,
-            placement_set_digest=self.placement.placement_set_digest,
-            materialization=self.placement.materialization,
-            serving=self.placement.serving,
+            placement_id=placement.placement_id,
+            placement_set_digest=placement.placement_set_digest,
+            materialization=placement.materialization,
+            serving=placement.serving,
             retained_fallback_placement_set_digest=(
-                self.placement.retained_fallback_placement_set_digest
+                placement.retained_fallback_placement_set_digest
             ),
-            executor_generation=self.supervision.incarnation,
+            executor_generation=supervision.incarnation,
             dispatchable_binding_digests=[documents.raw(value) for value in dispatchable],
             materializable_binding_digests=[documents.raw(value) for value in materializable],
             faults=[
                 f
                 for f in self.engine.faults[-8:]
-                if f.kind
+                if (hosted is None or f.subject in fault_subjects)
+                and f.kind
                 in (
                     pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
@@ -3634,16 +4035,16 @@ class Worker:
             ],
         )
         if (
-            self.placement.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
-            and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+            placement.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            and placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
         ):
-            status.package_revision_digest = self.placement.execution_digest
+            status.package_revision_digest = placement.execution_digest
             status.environment_digest = (
-                documents.spell(self.placement.environment_digest)
-                if self.placement.environment_digest
+                documents.spell(placement.environment_digest)
+                if placement.environment_digest
                 else canonical.digest({})
             )
-            status.config_digest = self.placement.config_digest
+            status.config_digest = placement.config_digest
             if not all(
                 re.fullmatch(r"sha256:[0-9a-f]{64}", value)
                 for value in (
@@ -3653,8 +4054,8 @@ class Worker:
                 )
             ):
                 raise RuntimeError("dispatchable placement has incomplete invocation identity")
-        if self.placement.acquisition.ListFields():
-            status.acquisition.CopyFrom(self.placement.acquisition)
+        if placement.acquisition.ListFields():
+            status.acquisition.CopyFrom(placement.acquisition)
         return status
 
     def job_capacity(self) -> pb.JobCapacity:
@@ -3772,11 +4173,12 @@ class Worker:
         return self.exit_code
 
     def shutdown(self) -> None:
-        seam = (
-            self.supervision.current.channel.accounting()
-            if self.supervision.current is not None
-            else {}
-        )
+        supervisions = [self.supervision] + [hosted.supervision for hosted in self.hosted.values()]
+        seam = [
+            supervision.current.channel.accounting()
+            for supervision in supervisions
+            if supervision.current is not None
+        ]
         self.stop.set()
         self.artifacts.close()
         self.work.put(None)
@@ -3792,18 +4194,19 @@ class Worker:
                     "shutdown",
                     f"model source cleanup {operation_id} failed: {type(exc).__name__}",
                 )
-        try:
-            self.supervision.close()
-        except ExecutorGone as exc:
-            self.exit_code = int(Exit.internal)
-            self.note("shutdown", f"executor reclaim failed: {exc}")
+        for supervision in supervisions:
+            try:
+                supervision.close()
+            except ExecutorGone as exc:
+                self.exit_code = int(Exit.internal)
+                self.note("shutdown", f"executor reclaim failed: {exc}")
         print(
             "[worker] summary "
             + json.dumps(
                 {
                     "worker_boot_id": self.fence.worker_boot_id,
                     "control_generation": self.fence.control_stream_generation,
-                    "executor_generations": self.supervision.spawns,
+                    "executor_generations": sum(supervision.spawns for supervision in supervisions),
                     "admission_generation": self.admission_generation,
                     "executed": self.engine.executed,
                     "record_count": self.records.appends,
