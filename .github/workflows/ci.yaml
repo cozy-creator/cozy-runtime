@@ -86,6 +86,7 @@ jobs:
   # venvs costs — and that is the thing under test.
   end-to-end:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7

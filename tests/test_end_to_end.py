@@ -19,10 +19,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-TIMEOUT = 900
+#: Locally the three take ~55 s in total. A generous ceiling that still fails the job in
+#: minutes rather than hours, since a hang here is a bug and not a slow runner.
+TIMEOUT = 420
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess[str]:
+    """Run one proof to completion. `sh -x` on the shell proofs so that a failure prints the
+    exact command it died on rather than the last thing that happened to flush."""
     return subprocess.run(
         argv,
         cwd=ROOT,
@@ -64,7 +68,7 @@ def test_installed_cli_exits_and_refuses() -> None:
     refusals, and an offline invocation with `connect(2)` cut out from under the process.
     """
     _green(
-        _run("sh", "proofs/cli/run.sh"),
+        _run("sh", "-x", "proofs/cli/run.sh"),
         "CLI proof: installed-wheel exits",
     )
 
@@ -78,6 +82,6 @@ def test_package_environment_materializes_and_refuses() -> None:
     no-partial-output rule.
     """
     _green(
-        _run("sh", "proofs/environment/run.sh"),
+        _run("sh", "-x", "proofs/environment/run.sh"),
         "environment proof: installed public CLI produced byte-identical",
     )
