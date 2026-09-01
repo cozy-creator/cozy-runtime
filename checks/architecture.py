@@ -4,6 +4,7 @@
 Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
   forbidden-dependency · canonical-numbers · torch-free-import
   package-imports · author-import-boundary · prelaunch-version · python-abi
+  model-execution-tensorfs
   env-authority · single-config · no-interactive · excluded-keywords
   document-kinds · implementation-ids · report-format-tags
   no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import pathlib
 import re
@@ -30,6 +32,7 @@ import sys
 import tempfile
 import tomllib
 import types
+import zipfile
 from collections.abc import Iterator
 
 from packaging.version import InvalidVersion, Version
@@ -134,6 +137,45 @@ def fence_python_abi() -> list[str]:
     ):
         if expected not in runtime:
             bad.append(f"src/cozy_runtime/_interpreter.py: runtime ABI guard omits {expected!r}")
+    return bad
+
+
+def fence_model_execution_tensorfs() -> list[str]:
+    """The optional model plane has one exact, source-traceable TensorFS wheel."""
+
+    bad: list[str] = []
+    filename = "tensorfs-0.0.6-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    expected_digest = "83bbf80e3279d1f5ced912731a2a259ad557c483b8cb0123fc4795c2383d8b1f"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    extra = project.get("project", {}).get("optional-dependencies", {}).get("model-execution")
+    if extra != ["tensorfs==0.0.6"]:
+        bad.append("pyproject.toml: model-execution must own exact tensorfs==0.0.6")
+    source = project.get("tool", {}).get("uv", {}).get("sources", {}).get("tensorfs")
+    if source != {"path": f"vendor/{filename}"}:
+        bad.append("pyproject.toml: TensorFS source must be the exact vendored CPython 3.12 wheel")
+
+    wheel = ROOT / "vendor" / filename
+    try:
+        raw = wheel.read_bytes()
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = archive.read("tensorfs-0.0.6.dist-info/METADATA")
+    except (OSError, KeyError, zipfile.BadZipFile) as exc:
+        bad.append(f"vendor/{filename}: unreadable wheel: {type(exc).__name__}")
+        return bad
+    if len(raw) != 2_347_973 or hashlib.sha256(raw).hexdigest() != expected_digest:
+        bad.append(f"vendor/{filename}: bytes do not match the reviewed source build")
+    for field in (b"Name: tensorfs\n", b"Version: 0.0.6\n", b"Requires-Python: >=3.12, <3.13\n"):
+        if field not in metadata:
+            bad.append(f"vendor/{filename}: METADATA omits {field.decode().strip()!r}")
+
+    provenance = (ROOT / "vendor" / "TENSORFS.md").read_text()
+    for fact in (
+        "ba40d92bc68e33f10c92848733d407ab887d11c7",
+        "00e762f61c2e0bc01339b53b0d3ee17d8cae2567",
+        expected_digest,
+    ):
+        if fact not in provenance:
+            bad.append(f"vendor/TENSORFS.md: missing source fact {fact}")
     return bad
 
 
@@ -1617,6 +1659,7 @@ def fence_typed_model_binding() -> list[str]:
 FENCES = {
     "prelaunch-version": fence_prelaunch_version,
     "python-abi": fence_python_abi,
+    "model-execution-tensorfs": fence_model_execution_tensorfs,
     "forbidden-dependency": fence_forbidden_dependency,
     "reviewed-specs-exist": fence_reviewed_specs_exist,
     "descriptor-minimality": fence_descriptor_minimality,
