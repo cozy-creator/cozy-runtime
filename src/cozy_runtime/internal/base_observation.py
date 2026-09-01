@@ -205,10 +205,10 @@ def _ownership() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[st
     grouped: dict[str, list[importlib.metadata.Distribution]] = {}
     for distribution in importlib.metadata.distributions():
         name = _normalize(distribution.metadata.get("Name", ""))
-        if not _protected(name):
+        if not name:
             continue
         if not distribution.version:
-            raise ObservationRefusal(f"protected distribution {name} has no version")
+            raise ObservationRefusal(f"base distribution {name} has no version")
         grouped.setdefault(name, []).append(distribution)
     for name, candidates in grouped.items():
         ranked = sorted(
@@ -221,8 +221,9 @@ def _ownership() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[st
         ):
             raise ObservationRefusal(f"protected distribution {name} has conflicting versions")
         versions[name] = selected.version
-        for root in _distribution_roots(name):
-            providers.setdefault(root, set()).add(name)
+        if _protected(name):
+            for root in _distribution_roots(name):
+                providers.setdefault(root, set()).add(name)
     for root in sys.stdlib_module_names:
         if _ROOT.fullmatch(root):
             providers.setdefault(root, set()).add("python-stdlib")
