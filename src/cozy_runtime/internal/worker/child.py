@@ -610,14 +610,20 @@ class ExecutorSupervision:
         return True
 
     def _prepare_jit_cache(self) -> dict[str, str]:
-        """Create/reuse one worker-boot/content cache without publishing its bytes."""
+        """Impose every upstream cache path before Python can import Torch.
 
-        if not self.environment_content_digest:
-            return {}
+        A package environment gets worker-boot/exact-content reuse. A Runtime-only or
+        otherwise unbound executor gets a fresh unpredictable scope on every spawn: it may
+        not reuse compiler bytes without a content identity, but leaving the variables
+        absent is also wrong. PyTorch lazily writes ``TORCHINDUCTOR_CACHE_DIR`` when a
+        scheduler first imports its compile helpers; that post-CUDA write broke the env
+        seal in local SDXL. The fresh scope fixes the ordering without inventing reuse.
+        """
+        content_digest = self.environment_content_digest or f"sha256:{secrets.token_hex(32)}"
         try:
             prepared = jit_cache.scope(
                 self.cozy_home,
-                self.environment_content_digest,
+                content_digest,
                 pod_scope=self.jit_pod_scope,
                 uid=self.executor_uid,
                 gid=self.executor_gid,
