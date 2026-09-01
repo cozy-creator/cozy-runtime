@@ -7,7 +7,7 @@ fake_torch="$repo/proofs/fixtures/fake-torch"
 support="$repo/proofs/support/model_contract.py"
 shared_support="$repo/proofs/support/proof_data.py"
 uv_bin=$(command -v uv)
-tensorfs_wheel=${TENSORFS_WHEEL:?set TENSORFS_WHEEL to the exact TensorFS 0.0.6 wheel under test}
+tensorfs_wheel=${TENSORFS_WHEEL:?set TENSORFS_WHEEL to the exact TensorFS 0.0.7 wheel under test}
 proof_root=$(mktemp -d /tmp/cozy-model-contract-proof.XXXXXX)
 fixture_source="$proof_root/package-source"
 
