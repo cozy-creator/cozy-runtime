@@ -1216,23 +1216,28 @@ class Worker:
                             "distribution": distribution,
                             "output": str(output),
                         },
-                        timeout=1.0,
+                        timeout=65.0,
                         total_timeout=65.0,
                     )
                 except ExecutorGone as exc:
                     raise package_prepare.PreparationRefusal(
                         "package_prepare_executor_failed", exc.detail
                     ) from exc
+                if not reply.get("ok"):
+                    raise package_prepare.PreparationRefusal(
+                        "package_prepare_descriptor_failed",
+                        f"{reply.get('code', 'invalid reply')}: {reply.get('detail', '')}",
+                    )
                 try:
                     raw = output.read_bytes()
+                except OSError as exc:
+                    raise package_prepare.PreparationRefusal(
+                        "package_prepare_descriptor_failed", "descriptor output is absent"
+                    ) from exc
                 finally:
                     output.unlink(missing_ok=True)
                 digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-                if (
-                    not reply.get("ok")
-                    or reply.get("digest") != digest
-                    or reply.get("length") != len(raw)
-                ):
+                if reply.get("digest") != digest or reply.get("length") != len(raw):
                     raise package_prepare.PreparationRefusal(
                         "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))
                     )

@@ -126,7 +126,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         output = scratch / "executor" / "descriptor.json"
         reply = executor.call(
             {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
-            timeout=1.0,
+            timeout=65.0,
             total_timeout=65.0,
         )
         if not reply.get("ok"):
