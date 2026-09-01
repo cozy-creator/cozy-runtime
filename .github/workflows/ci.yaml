@@ -12,7 +12,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
-      - run: uv sync
+      # The exact TensorFS wheel is committed, hash-fenced, and is the artifact Runtime ships.
+      # Install that wheel here so the ordinary architecture pass checks Runtime's reviewed
+      # encoding specs against the actual bundled registry without a private source checkout.
+      - run: uv sync --extra model-execution
       - run: >-
           uv run python -c "import sys, sysconfig;
           assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
@@ -32,9 +35,8 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
-      # Self-contained architecture fences + frozen ES6 vectors + torch-free import. The
-      # one cross-repo TensorFS registry comparison has its own pinned job below.
-      - run: uv run python checks/architecture.py --exclude reviewed-specs-exist
+      # Self-contained architecture fences + frozen ES6 vectors + torch-free import.
+      - run: uv run python checks/architecture.py
       - run: uv run python checks/anima_cuda_capability.py
       - run: uv run python checks/env_seal.py
       # The descriptor is a read-only publication output, never a committed repository file.
@@ -82,50 +84,6 @@ jobs:
       - run: uv run python checks/model_release_routes.py
       - run: uv run python checks/multi_model_binding.py
       - run: uv run cozy-runtime version
-
-  # The provider's reviewed spec digests must exist in TensorFS's exact pinned registry.
-  # TensorFS is a private sibling, so this fence arms as soon as the repository read token
-  # is installed; local release validation still runs the same fence against the built
-  # wheel. Split into a gate + a gated job (cr-037) so a tokenless run renders the drift
-  # job SKIPPED — visibly distinct from green — instead of a warning that reads as pass.
-  # (`secrets` is not readable in a job-level `if`, hence the gate job.)
-  tensorfs-credential:
-    runs-on: ubuntu-latest
-    outputs:
-      present: ${{ steps.credential.outputs.present }}
-    steps:
-      - id: credential
-        run: |
-          if [ -n "${{ secrets.TENSORFS_TOKEN }}" ]; then
-            echo "present=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=no" >> "$GITHUB_OUTPUT"
-            echo "::warning title=TensorFS registry fence not run::TENSORFS_TOKEN is not set, so the pinned private TensorFS wheel cannot be built and tensorfs-registry-drift is SKIPPED. Release validation must retain a recorded local fence run."
-          fi
-  tensorfs-registry-drift:
-    needs: tensorfs-credential
-    if: needs.tensorfs-credential.outputs.present == 'yes'
-    runs-on: ubuntu-latest
-    env:
-      TENSORFS_SHA: fb61a676d9def0822416e69de2f2d075931cf48b
-      TENSORFS_VERSION: 0.0.8
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: cozy-creator/tensorfs-v2
-          ref: ${{ env.TENSORFS_SHA }}
-          path: .tensorfs
-          token: ${{ secrets.TENSORFS_TOKEN }}
-      - uses: astral-sh/setup-uv@v7
-      - uses: dtolnay/rust-toolchain@1.91.1
-      - run: uv sync
-      - run: uv pip install .tensorfs
-      - run: >-
-          test "$(uv run python -c
-          'import importlib.metadata; print(importlib.metadata.version("tensorfs"))')"
-          = "$TENSORFS_VERSION"
-      - run: uv run python checks/architecture.py --only reviewed-specs-exist
 
   # THE VENDORED-DRIFT GATE (#536d). A staleness check like every other job here, and the
   # one this repo could not previously make: `src/cozy/worker/v1/` is a COPY of another

@@ -47,15 +47,10 @@ def create(
     manifest_length = int(receipt["manifest"]["length"])
     selected = store.manifest(manifest)
     closure = store.walk(manifest)
-    operation = store.begin_operation("modeled-development-proof", "proof", "tiny-core", 1)
+    operation = store.begin_operation("modeled-development-proof", "proof", "tiny-core")
     operation.hold_manifest(manifest, manifest_length)
     for reached in closure:
         operation.hold_blob(str(reached["id"]), int(reached["length"]))
-    operation.progress(
-        2,
-        len(closure) + 1,
-        manifest_length + sum(int(reached["length"]) for reached in closure),
-    )
     evidence = json.dumps(
         {"classification_digest": tensorfs.topology_digest(bytes(selected["header"]))},
         sort_keys=True,

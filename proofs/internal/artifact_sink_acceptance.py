@@ -199,7 +199,7 @@ def source(tfs: Path, root: Path) -> tuple[tensorfs.Store, str, int, dict[str, A
     store = tensorfs.Store.open(str(root))
     held = store.manifest(manifest_id)
     manifest_bytes = held["manifest"]
-    operation = store.begin_operation("artifact-source", "proof", "source", 1)
+    operation = store.begin_operation("artifact-source", "proof", "source")
     operation.hold_manifest(manifest_id, len(manifest_bytes))
     for reached in store.walk(manifest_id):
         operation.hold_blob(reached["id"], reached["length"])
