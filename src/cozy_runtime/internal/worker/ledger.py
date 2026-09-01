@@ -180,6 +180,9 @@ class Ledger:
     #: 2026-08-25). `activations_for` reads this and falls back, LABELLED, when a cell has
     #: no serve behind it yet.
     activations_by_cell: dict[str, int] = field(default_factory=dict)
+    #: shape cell -> component-use method -> measured scratch peak while that method's
+    #: declared component set was resident. Staged admission prices matching pairs only.
+    activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -228,6 +231,9 @@ class Ledger:
     #: card holding one component (cl-003). It clears only when the ledger is re-established
     #: from a real construction — never by another attempt agreeing with itself.
     unreconciled: str = ""
+    #: Placement rungs this executor generation falsified with measured capacity evidence.
+    #: The fact dies with the generation; a different construction/device proves itself.
+    unsuitable_placements: dict[str, str] = field(default_factory=dict)
 
     @property
     def out_of_allocator(self) -> int:
@@ -270,6 +276,7 @@ class Ledger:
         self.activations_peak = 0
         self.accelerator = ""
         self.activations_by_cell.clear()
+        self.activation_scopes_by_cell.clear()
         self.activations_moved = False
         self.closed_since_baseline = 0
         self.executor_pid = executor_pid
@@ -282,6 +289,7 @@ class Ledger:
         self.baseline_paid = False
         self.residency_delta = 0
         self.unreconciled = ""
+        self.unsuitable_placements.clear()
 
     def observe_construction(self, facts: dict[str, Any]) -> None:
         """The generation's resident baseline, from the fill that just committed."""
@@ -313,26 +321,36 @@ class Ledger:
     ) -> None:
         """What one attempt's kernel allocated ON TOP of the resident weights.
 
-        `resident_moved` makes the number UNREADABLE rather than wrong. The figure is
-        `peak_allocated - the post-fill baseline`, and that baseline is only a line to
-        measure against while the resident set STANDS STILL. Under a staged rung the
-        attempt evicts and re-stages gigabytes underneath itself, so the same subtraction
-        produced 2,048 B for a 1024px pipeline — a number that is not small, it is
-        meaningless. A measurement whose basis moved is named absent (§3.6), never printed.
+        A residency-aware executor supplies `activation_peak_bytes` from a fresh allocator
+        high-water mark inside each component-use scope. That measurement survives staging.
+        Without it, `peak_allocated - the post-fill baseline` is valid only while the resident
+        set stands still; a moved basis is named absent rather than reported as a small number.
         """
-        if resident_moved:
+        scopes = {
+            str(method): int(value)
+            for method, value in (metrics.get("activation_peaks") or {}).items()
+            if int(value) > 0
+        }
+        direct = max(scopes.values(), default=int(metrics.get("activation_peak_bytes", 0)))
+        if direct > 0:
+            measured = direct
+        elif resident_moved:
             self.activations_moved = True
             if "activations_scratch" not in self.unreadable:
                 self.unreadable.append("activations_scratch")
             return
-        peak = int(metrics.get("peak_vram_bytes", 0))
-        if peak and self.device_baseline >= 0:
-            measured = peak - self.device_baseline
+        else:
+            peak = int(metrics.get("peak_vram_bytes", 0))
+            measured = peak - self.device_baseline if peak and self.device_baseline >= 0 else 0
+        if measured > 0:
             self.activations_peak = max(self.activations_peak, measured)
             if cell:
                 self.activations_by_cell[cell] = max(
                     self.activations_by_cell.get(cell, 0), measured
                 )
+                held = self.activation_scopes_by_cell.setdefault(cell, {})
+                for method, value in scopes.items():
+                    held[method] = max(held.get(method, 0), value)
 
     def activations_for(self, cell: str) -> tuple[int, str]:
         """The activation envelope for ONE shape cell, and where the number came from.
@@ -343,7 +361,10 @@ class Ledger:
         """
         exact = self.activations_by_cell.get(cell, 0)
         if exact:
-            return exact, f"max_memory_allocated() minus the post-fill baseline, on cell {cell}"
+            return exact, (
+                f"scope-local max_memory_allocated() minus its resident component baseline, "
+                f"on cell {cell}"
+            )
         if self.activations_by_cell:
             widest = max(self.activations_by_cell, key=lambda k: self.activations_by_cell[k])
             return self.activations_by_cell[widest], (
@@ -351,6 +372,18 @@ class Ledger:
                 f"generation ({widest}) is the upper bound this request is priced against"
             )
         return 0, ""
+
+    def activation_scopes_for(self, cell: str) -> dict[str, int]:
+        exact = self.activation_scopes_by_cell.get(cell)
+        if exact:
+            return dict(exact)
+        if self.activation_scopes_by_cell:
+            widest = max(
+                self.activation_scopes_by_cell,
+                key=lambda key: max(self.activation_scopes_by_cell[key].values(), default=0),
+            )
+            return dict(self.activation_scopes_by_cell[widest])
+        return {}
 
     def observe_residency(self, residency: dict[str, Any]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
@@ -366,6 +399,14 @@ class Ledger:
         if isinstance(residency, dict):
             self.resident = {k: int(v) for k, v in (residency.get("resident") or {}).items()}
             self.evicted = {k: int(v) for k, v in (residency.get("evicted") or {}).items()}
+
+    def refuse_placement(self, placement: str, reason: str) -> None:
+        """Bank one measured generation/rung capacity falsification."""
+
+        self.unsuitable_placements[placement] = reason[:400]
+
+    def placement_refusal(self, placement: str) -> str:
+        return self.unsuitable_placements.get(placement, "")
 
     def rebaseline(self, why: str) -> int:
         """Re-establish the resident baseline after real work that is NOT an attempt.
@@ -442,6 +483,11 @@ class Ledger:
             "classes": [counter.document() for counter in self.counters()],
             "unreadable": sorted(self.unreadable),
             "unreconciled": self.unreconciled,
+            "unsuitable_placements": dict(self.unsuitable_placements),
+            "activation_scopes_by_cell": {
+                cell: dict(scopes)
+                for cell, scopes in sorted(self.activation_scopes_by_cell.items())
+            },
         }
 
     def rows(self) -> dict[str, Any]:
@@ -456,10 +502,15 @@ class Ledger:
                 "out_of_allocator": self.out_of_allocator,
                 "allocatable": self.allocatable,
                 "activations_peak": self.activations_peak,
+                "activation_scopes_by_cell": {
+                    cell: dict(scopes)
+                    for cell, scopes in sorted(self.activation_scopes_by_cell.items())
+                },
                 "free": self.device_free,
             },
             "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
             "unreconciled": self.unreconciled,
+            "unsuitable_placements": dict(self.unsuitable_placements),
         }
 
     # ------------------------------------------------------------------ reconciliation

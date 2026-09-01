@@ -308,6 +308,12 @@ another environment. Local `serve`
 receives the same `--environment-python`; `--environment-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
 
+The local boot warm pass is also capacity evidence. A typed device OOM falsifies only that
+executor generation's attempted placement rung and normalized shape cell. Runtime retries the same
+synthetic request through the existing component-staged rung and publishes DISPATCHABLE only when
+that fallback is viable; if every proven rung fails capacity, activation stays offline with a typed
+fault. Other optional warm failures remain degraded observations rather than placement decisions.
+
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying
 package, semantic release, and source digest, then launches Runtime with the matching local path
