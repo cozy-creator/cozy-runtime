@@ -39,8 +39,8 @@ ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
 MAX_PACKAGE_ENVIRONMENT_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
 ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
-LOCAL_ARTIFACT_STORE_ROOT = host_paths.ARTIFACT_STORE
-ARTIFACT_CACHE_ROOT = host_paths.ARTIFACT_CACHE
+LOCAL_WEIGHTS_STORE_ROOT = host_paths.WEIGHTS_STORE
+WEIGHTS_CACHE_ROOT = host_paths.WEIGHTS_CACHE
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20
 
@@ -57,8 +57,8 @@ def prepare_boot(
     config: WorkerHostConfig,
     *,
     boot_root: Path = BOOT_ROOT,
-    artifact_store_root: Path = LOCAL_ARTIFACT_STORE_ROOT,
-    artifact_cache_root: Path = ARTIFACT_CACHE_ROOT,
+    artifact_store_root: Path = LOCAL_WEIGHTS_STORE_ROOT,
+    artifact_cache_root: Path = WEIGHTS_CACHE_ROOT,
 ) -> PreparedBoot:
     """Bring the pod to READY-BUT-EMPTY: check the deadline and lay its two CAS roots.
 

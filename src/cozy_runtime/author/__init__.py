@@ -14,16 +14,6 @@ fakes live in `cozy_runtime.author.fakes`.
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
-from cozy_runtime.author._artifact import (
-    ArtifactConfig,
-    ArtifactOutput,
-    ArtifactPart,
-    ArtifactReceipt,
-    ArtifactSink,
-    ArtifactTarget,
-    ArtifactTensor,
-    ArtifactTransaction,
-)
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -135,6 +125,16 @@ from cozy_runtime.author._services import (
     Telemetry,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
+from cozy_runtime.author._weights import (
+    WeightsConfig,
+    WeightsOutput,
+    WeightsPart,
+    WeightsReceipt,
+    WeightsSink,
+    WeightsTarget,
+    WeightsTensor,
+    WeightsTransaction,
+)
 
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
@@ -146,14 +146,6 @@ __all__ = [
     "Adjustments",
     "App",
     "Artifact",
-    "ArtifactConfig",
-    "ArtifactOutput",
-    "ArtifactPart",
-    "ArtifactReceipt",
-    "ArtifactSink",
-    "ArtifactTarget",
-    "ArtifactTensor",
-    "ArtifactTransaction",
     "Asset",
     "AssetBound",
     "AudioAsset",
@@ -236,6 +228,14 @@ __all__ = [
     "Tree",
     "UnsupportedInput",
     "VideoAsset",
+    "WeightsConfig",
+    "WeightsOutput",
+    "WeightsPart",
+    "WeightsReceipt",
+    "WeightsSink",
+    "WeightsTarget",
+    "WeightsTensor",
+    "WeightsTransaction",
     "assert_declaration_shape",
     "attempt",
     "canonical_json",

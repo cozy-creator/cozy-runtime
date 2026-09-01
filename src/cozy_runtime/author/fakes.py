@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._artifact import ArtifactCommit, ArtifactHostTransaction
 from cozy_runtime.author._assets import Asset, GrantedInput
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, DecodeLimits, MediaDecoder
@@ -45,6 +44,7 @@ from cozy_runtime.author._services import (
     Outputs,
     Telemetry,
 )
+from cozy_runtime.author._weights import WeightsCommit, WeightsHostTransaction
 
 
 def _spool(name: str) -> Path:
@@ -167,7 +167,7 @@ def invoke_with_fakes(
     seconds: float = 300.0,
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
-    artifacts: Callable[[ArtifactCommit], ArtifactHostTransaction] | None = None,
+    weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None,
     assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> InvocationResult:
@@ -189,7 +189,7 @@ def invoke_with_fakes(
             secrets=secrets,
             adapters=adapters,
             egress_broker=egress_broker,
-            artifacts=artifacts,
+            weights=weights,
             assets=assets or {},
             max_output_bytes=max_output_bytes,
         ),

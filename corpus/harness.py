@@ -77,7 +77,7 @@ def ground_truth_census(case: Case) -> RichCensus:
     return walk(component_members([built]))
 
 
-def artifact_for(case: Case, truth: RichCensus) -> Artifact:
+def weights_for(case: Case, truth: RichCensus) -> Artifact:
     """A checkpoint that supplies exactly what the real construction demands.
 
     Built from ground truth on purpose: the corpus is testing DERIVATION, so the match must

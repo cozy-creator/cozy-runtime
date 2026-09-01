@@ -1,7 +1,7 @@
 """Direct weights upload: a real PUT to a real store, under one presigned grant.
 
 Runtime holds produced weights, so Runtime streams them. These tests exercise that path the
-way it actually runs — a real `ArtifactExchange`, a real HTTP object store on a real socket,
+way it actually runs — a real `WeightsExchange`, a real HTTP object store on a real socket,
 the real `internal/egress.py` boundary — and assert the things that would silently corrupt
 or over-authorize a transfer: that the store receives the exact bytes, that the grant's own
 signed headers arrive verbatim, that HTTP 412 reads as already-present rather than failure,
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal.worker import artifacts
+from cozy_runtime.internal.worker import weights
 from cozy_runtime.protocol import worker_pb2 as pb
 
 TRANSACTION = "sha256:" + "a" * 64
@@ -74,16 +74,16 @@ def serving(store: ObjectStore) -> Iterator[str]:
         thread.join(timeout=5)
 
 
-def exchange(tmp_path: Path, *, allow_private: bool) -> artifacts.ArtifactExchange:
+def exchange(tmp_path: Path, *, allow_private: bool) -> weights.WeightsExchange:
     """One exchange already holding a committed receipt for the manifest object."""
-    made = artifacts.ArtifactExchange(
+    made = weights.WeightsExchange(
         store_root=tmp_path,
         send=lambda _frame: None,
         stop=threading.Event(),
         owner_scope=lambda: "test-owner",
         allow_private_egress=allow_private,
     )
-    made._held[TRANSACTION] = artifacts._Held(
+    made._held[TRANSACTION] = weights._Held(
         transaction_id=TRANSACTION,
         writer_generation=WRITER_GENERATION,
         receipt=pb.WeightsReceiptRef(),

@@ -21,10 +21,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
-from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources
 from cozy_runtime.author._signature import Kind, Surface, analyze
+from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -45,7 +45,7 @@ class Registration:
     fn: Callable[..., object]
     publishes: bool = False
     emits_media: bool = False
-    artifact_outputs: tuple[ArtifactOutput, ...] = ()
+    weights_outputs: tuple[WeightsOutput, ...] = ()
     source_profiles: Mapping[str, str] = field(default_factory=dict)
     resources: Resources | None = None
     demand_bound: Bound | None = None
@@ -74,7 +74,7 @@ class Registration:
                 kind=self.kind,
                 publishes=self.publishes,
                 emits_media=self.emits_media,
-                artifact_outputs=self.artifact_outputs,
+                weights_outputs=self.weights_outputs,
                 source_profiles=self.source_profiles,
                 resources=self.resources,
                 demand_bound=self.demand_bound,
@@ -126,7 +126,7 @@ class App:
             fn,
             name,
             publishes=False,
-            artifact_outputs=(),
+            weights_outputs=(),
             source_profiles={},
             preflight=preflight,
             resources=resources,
@@ -145,7 +145,7 @@ class App:
         name: str | None = None,
         publishes: bool = False,
         emits_media: bool = False,
-        artifacts: tuple[ArtifactOutput, ...] = (),
+        weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
@@ -159,7 +159,7 @@ class App:
         name: str | None = None,
         publishes: bool = False,
         emits_media: bool = False,
-        artifacts: tuple[ArtifactOutput, ...] = (),
+        weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
@@ -182,7 +182,7 @@ class App:
             name,
             publishes=publishes,
             emits_media=emits_media,
-            artifact_outputs=artifacts,
+            weights_outputs=weights,
             source_profiles=dict(source_profiles or {}),
             preflight=None,
             resources=resources,
@@ -196,7 +196,7 @@ class App:
         name: str | None,
         *,
         publishes: bool,
-        artifact_outputs: tuple[ArtifactOutput, ...],
+        weights_outputs: tuple[WeightsOutput, ...],
         source_profiles: Mapping[str, str],
         preflight: Callable[..., object] | None,
         resources: Resources | None,
@@ -221,7 +221,7 @@ class App:
                 fn=target,
                 publishes=publishes,
                 emits_media=emits_media,
-                artifact_outputs=artifact_outputs,
+                weights_outputs=weights_outputs,
                 source_profiles=dict(source_profiles),
                 resources=resources,
                 demand_bound=demand,

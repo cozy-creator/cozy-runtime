@@ -437,8 +437,8 @@ def fence_no_identifiers() -> list[str]:
             or (
                 keyword.arg in {"topology_digest", "encodings"}
                 and (
-                    (isinstance(call.func, ast.Name) and call.func.id == "ArtifactOutput")
-                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "ArtifactOutput")
+                    (isinstance(call.func, ast.Name) and call.func.id == "WeightsOutput")
+                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "WeightsOutput")
                 )
             )
             for value in ast.walk(keyword.value)

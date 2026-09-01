@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-ARTIFACT_CACHE: Final = Path("/var/lib/cozy/artifacts")
-ARTIFACT_STORE: Final = Path("/var/lib/cozy/store")
+WEIGHTS_CACHE: Final = Path("/var/lib/cozy/artifacts")
+WEIGHTS_STORE: Final = Path("/var/lib/cozy/store")
 BOOT_DATA: Final = Path("/var/lib/cozy/boot")
 BOOT_ID: Final = Path("/run/cozy/bootstrap/pod-boot-id")
 ENVIRONMENT_ROOT: Final = Path("/var/lib/cozy/environments")
