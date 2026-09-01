@@ -68,7 +68,7 @@ REFUSALS: tuple[str, ...] = (
     "source_not_allowed",
     "transfer_failed",
     "deadline_exceeded",
-    "artifact_incomplete",
+    "weights_incomplete",
     "border_refused",
 )
 
@@ -439,7 +439,7 @@ def manifest(base: str, at: Resolved, deadline: Deadline, max_bytes: int) -> byt
                     claimed_bytes = -1
                 if claimed_bytes < 0 or claimed_bytes > max_bytes:
                     raise PullRefusal(
-                        "artifact_incomplete",
+                        "weights_incomplete",
                         f"the hub declared a {claimed!r}-byte Manifest; the TensorFS cap is "
                         f"{max_bytes}",
                         "repair the released Manifest; model metadata is bounded",
@@ -447,7 +447,7 @@ def manifest(base: str, at: Resolved, deadline: Deadline, max_bytes: int) -> byt
             body = bytes(resp.read(max_bytes + 1))
             if len(body) > max_bytes:
                 raise PullRefusal(
-                    "artifact_incomplete",
+                    "weights_incomplete",
                     f"the hub served a Manifest larger than the TensorFS cap of {max_bytes} bytes",
                     "repair the released Manifest; model metadata is bounded",
                 )
@@ -634,14 +634,14 @@ def pull_granted_manifest(
         or manifest_length <= 0
     ):
         raise PullRefusal(
-            "artifact_incomplete",
+            "weights_incomplete",
             f"{manifest_id}: not one bounded Manifest reference",
             "supply the exact sha256 digest and positive stored-byte length from the binding",
         )
     rows = list(granted)
     if not rows or [row.object_id for row in rows] != sorted(row.object_id for row in rows):
         raise PullRefusal(
-            "artifact_incomplete",
+            "weights_incomplete",
             f"{root_id}: direct grants are absent or not sorted by object id",
             "derive one sorted, unique grant list for this Manifest closure",
         )
@@ -663,7 +663,7 @@ def pull_granted_manifest(
             or bool(location.fragment)
         ):
             raise PullRefusal(
-                "artifact_incomplete",
+                "weights_incomplete",
                 f"{row.object_id}: invalid or duplicate direct grant identity",
                 "author one positive-length HTTPS grant for every exact object id",
             )
@@ -671,7 +671,7 @@ def pull_granted_manifest(
     root_row = by_id.get(root_id)
     if root_row is None or root_row.length != manifest_length:
         raise PullRefusal(
-            "artifact_incomplete",
+            "weights_incomplete",
             f"{root_id}: root grant length does not equal {manifest_length}",
             "grant the exact Manifest bytes named by the resolved binding",
         )
@@ -754,7 +754,7 @@ def _execute_plan(
             url = urls.get(object_id)
             if url is None:
                 raise PullRefusal(
-                    "artifact_incomplete",
+                    "weights_incomplete",
                     f"{object_id}: the Manifest reaches it and no exact grant exists",
                     "repair the closed grant plane; Runtime never resolves an ungranted object",
                 )
@@ -795,7 +795,7 @@ def _execute_plan(
     try:
         tensorfs.fetch_complete(store, plan["document"])
     except Exception as exc:
-        raise _border(exc, "artifact_incomplete") from exc
+        raise _border(exc, "weights_incomplete") from exc
 
 
 class _Bytes:
@@ -915,9 +915,9 @@ def _border(exc: BaseException, code: str, subject: str = "") -> PullRefusal:
     """
     detail = f"{type(exc).__name__}: {exc}"
     cause = str(getattr(exc, "code", ""))
-    if code == "artifact_incomplete":
+    if code == "weights_incomplete":
         return PullRefusal(
-            "artifact_incomplete",
+            "weights_incomplete",
             f"the pull did not land every declared object — {detail}",
             "re-run the pull: it re-plans against the store and asks only for what is "
             "still missing",

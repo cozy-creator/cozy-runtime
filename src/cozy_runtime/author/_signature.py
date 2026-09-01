@@ -16,13 +16,13 @@ from typing import Any, Literal, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
+from cozy_runtime.author._weights import WeightsOutput
 
 Role = Literal["context", "payload", "preflight", "model", "service"]
 Kind = Literal["entrypoint", "job"]
@@ -88,7 +88,7 @@ class Surface:
     gpu: bool
     publishes: bool = False
     emits_media: bool = False
-    artifact_outputs: tuple[ArtifactOutput, ...] = ()
+    weights_outputs: tuple[WeightsOutput, ...] = ()
     """What a JOB body may write, as its own declaration. Grants mint off the declaration,
     never off the kind (§2) — a job that declares neither cannot be granted a destination."""
     source_profiles: Mapping[str, str] = field(default_factory=dict)
@@ -191,7 +191,7 @@ def analyze(
     kind: Kind,
     publishes: bool = False,
     emits_media: bool = False,
-    artifact_outputs: tuple[ArtifactOutput, ...] = (),
+    weights_outputs: tuple[WeightsOutput, ...] = (),
     source_profiles: Mapping[str, str] | None = None,
     resources: Resources | None = None,
     demand_bound: Bound | None = None,
@@ -298,7 +298,7 @@ def analyze(
         gpu=any(p.role == "model" for p in params),
         publishes=publishes,
         emits_media=emits_media,
-        artifact_outputs=artifact_outputs,
+        weights_outputs=weights_outputs,
         source_profiles=dict(sorted(profiles.items())),
         resources=resources,
         demand_bound=demand_bound,

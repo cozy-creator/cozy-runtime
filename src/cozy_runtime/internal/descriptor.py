@@ -78,9 +78,9 @@ def _callable(surface: Surface) -> dict[str, Json]:
         doc["models"] = models
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
-        if surface.artifact_outputs:
+        if surface.weights_outputs:
             outputs: list[Json] = []
-            for output in sorted(surface.artifact_outputs, key=lambda row: row.name):
+            for output in sorted(surface.weights_outputs, key=lambda row: row.name):
                 declared: dict[str, Json] = {
                     "output_id": output.name,
                     "mime_type": "application/vnd.cozy.model-manifest",
@@ -92,7 +92,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                         "encodings": list(output.encodings),
                     }
                 outputs.append(declared)
-            doc["artifact_outputs"] = outputs
+            doc["weights_outputs"] = outputs
         if surface.resources is not None:
             resources = _resources(surface.resources)
             if resources:
@@ -354,7 +354,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             optional = {"models"}
             if kind == "job":
                 required.add("publishes")
-                optional.update(("resources", "artifact_outputs"))
+                optional.update(("resources", "weights_outputs"))
             item = _closed(row, required, optional, source, path)
             name = item["name"]
             if not isinstance(name, str) or not name or name in names:
@@ -413,7 +413,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             if kind == "job":
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
-                if profiled_models and "artifact_outputs" not in item:
+                if profiled_models and "weights_outputs" not in item:
                     _invalid(
                         source,
                         path,
@@ -421,20 +421,17 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     )
                 if "resources" in item:
                     _resources_value(item["resources"], source, f"{path}.resources")
-                if "artifact_outputs" in item:
-                    artifact_outputs = item["artifact_outputs"]
-                    if (
-                        not isinstance(artifact_outputs, list)
-                        or not 1 <= len(artifact_outputs) <= 16
-                    ):
+                if "weights_outputs" in item:
+                    weights_outputs = item["weights_outputs"]
+                    if not isinstance(weights_outputs, list) or not 1 <= len(weights_outputs) <= 16:
                         _invalid(
                             source,
-                            f"{path}.artifact_outputs",
+                            f"{path}.weights_outputs",
                             "must contain 1 through 16 outputs",
                         )
-                    artifact_names: set[str] = set()
-                    for output_index, output_raw in enumerate(artifact_outputs):
-                        output_path = f"{path}.artifact_outputs[{output_index}]"
+                    weights_names: set[str] = set()
+                    for output_index, output_raw in enumerate(weights_outputs):
+                        output_path = f"{path}.weights_outputs[{output_index}]"
                         output = _closed(
                             output_raw,
                             {"output_id", "mime_type", "max_bytes"},
@@ -445,9 +442,9 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                         output_id = _portable_name(
                             output["output_id"], source, f"{output_path}.output_id"
                         )
-                        if output_id in artifact_names:
+                        if output_id in weights_names:
                             _invalid(source, f"{output_path}.output_id", "must be unique")
-                        artifact_names.add(output_id)
+                        weights_names.add(output_id)
                         if output["mime_type"] != "application/vnd.cozy.model-manifest":
                             _invalid(source, f"{output_path}.mime_type", "is not the model MIME")
                         maximum = output["max_bytes"]

@@ -772,8 +772,8 @@ def _service_arms() -> None:
     )
     note = envelope.result.note if envelope else f"{outcome.code}: {outcome.message}"
     check(
-        "Checkpoints.save() REFUSES checkpoint_sink_unbuilt and names the ArtifactSink",
-        "CheckpointSinkUnbuilt:checkpoint_sink_unbuilt:" in note and "ArtifactSink" in note,
+        "Checkpoints.save() REFUSES checkpoint_sink_unbuilt and names the WeightsSink",
+        "CheckpointSinkUnbuilt:checkpoint_sink_unbuilt:" in note and "WeightsSink" in note,
         note[:190],
     )
     check(

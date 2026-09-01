@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact job Model binding -> attempt hold -> executor -> ArtifactSink handoff proof."""
+"""Exact job Model binding -> attempt hold -> executor -> WeightsSink handoff proof."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ from cozy.worker.v1.wire_version import WIRE_MINOR
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
     App,
-    ArtifactOutput,
-    ArtifactSink,
-    ArtifactTarget,
     CapabilityError,
     Model,
+    WeightsOutput,
+    WeightsSink,
+    WeightsTarget,
 )
 from cozy_runtime.author._describe import describe
 from cozy_runtime.internal import canonical, descriptor, package_environment
@@ -69,12 +69,12 @@ app = App()
 PRIVATE_REVISION = "sha256:" + "a" * 64
 
 
-@app.job(artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
+@app.job(weights=(WeightsOutput("model", max_new_bytes=4096),))
 def join(
     payload: Request,
     left: LeftModel,
     right: RightModel,
-    artifacts: ArtifactSink,
+    weights: WeightsSink,
 ) -> Result:
     try:
         left.load(None)
@@ -86,14 +86,14 @@ def join(
         component_refusal = "component-visible"
     except CapabilityError as exc:
         component_refusal = exc.code
-    receipt = artifacts.derive(
+    receipt = weights.derive(
         "model",
         sources={"left": left, "right": right},
         targets={
-            payload.prefix + "left": ArtifactTarget(
+            payload.prefix + "left": WeightsTarget(
                 source="left", source_component=payload.left_component
             ),
-            payload.prefix + "right": ArtifactTarget(
+            payload.prefix + "right": WeightsTarget(
                 source="right", source_component=payload.right_component
             ),
         },
@@ -102,11 +102,11 @@ def join(
             (payload.prefix + "right", "weight"),
         ),
     )
-    return Result(receipt.artifact_transaction_id, load_refusal, component_refusal)
+    return Result(receipt.weights_transaction_id, load_refusal, component_refusal)
 
 
 class HostChannel:
-    """The supervisor host answers durable ArtifactSink frames, never source reads itself."""
+    """The supervisor host answers durable WeightsSink frames, never source reads itself."""
 
     def __init__(self, *, owner_scope: str, request_id: str, invocation_digest: str) -> None:
         self.owner_scope = owner_scope
@@ -119,7 +119,7 @@ class HostChannel:
             return
         kind = str(frame.get("kind", ""))
         answer: dict[str, Any] = {"event": "answer", "seq": int(frame["seq"]), "ok": True}
-        if kind == "artifact_intent":
+        if kind == "weights_intent":
             subject = canonical_json.encode(
                 {
                     "owner_authority_scope": self.owner_scope,
@@ -129,13 +129,13 @@ class HostChannel:
                 }
             )
             answer.update(
-                artifact_transaction_id="sha256:"
+                weights_transaction_id="sha256:"
                 + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest(),
                 writer_generation=1,
-                artifact_receipt_digest="",
+                weights_receipt_digest="",
             )
-        elif kind == "artifact_receipt":
-            answer["artifact_receipt_digest"] = str(frame["artifact_receipt_digest"])
+        elif kind == "weights_receipt":
+            answer["weights_receipt_digest"] = str(frame["weights_receipt_digest"])
         else:
             raise RuntimeError(f"unexpected durable exchange {kind!r}")
         self.answers.append(answer)
@@ -272,7 +272,7 @@ def run_node(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     channel = HostChannel(
         owner_scope="record-owner/proof",
-        request_id=str(command["artifact_request_id"]),
+        request_id=str(command["weights_request_id"]),
         invocation_digest=str(command["invocation_spec_digest"]),
     )
     executor = Executor(
@@ -457,7 +457,7 @@ def main() -> None:
         _reply2, result2 = run_node(found, command2, request_id="node-two#1")
         produced2 = receipt_manifest(store, str(result2["transaction_id"]))
         if produced2 in {source, produced1}:
-            raise RuntimeError("multi-node ArtifactSink handoff collapsed a Manifest identity")
+            raise RuntimeError("multi-node WeightsSink handoff collapsed a Manifest identity")
         engine2.last_resort(attempt2, "proof terminal after node two")
 
         wrong_class = dict(command1)
@@ -479,7 +479,7 @@ def main() -> None:
         print(
             f"JOB MODEL BINDING PASS protocol_minor={WIRE_MINOR} exact_descriptor_params=2 "
             "host_capability=model:// attempt_manifest_holds=dedup terminal_release=1 "
-            "derive_only=1 artifact_sink_nodes=2 manifest_handoff=1 serving=refused "
+            "derive_only=1 weights_sink_nodes=2 manifest_handoff=1 serving=refused "
             "private_revision=1 param_class_digest_length_scheme_store_absence=refused"
         )
 

@@ -826,7 +826,7 @@ sys.path.insert(0, 'proofs/fixtures/tiny-models')
 sys.path.insert(0, 'proofs/internal')
 from typing import Annotated, Any
 import msgspec
-import tiny_artifacts as art
+import tiny_weights as art
 import tiny_diffusers as td
 import tiny_h3 as h3
 import tiny_sdxl as sd
@@ -1709,17 +1709,15 @@ def run_retired_descriptor_shapes() -> list[str]:
     )
 
     topology_escape = clone()
-    four_lane(topology_escape)["artifact_outputs"][0]["required_contract"]["topology_digest"] = (
+    four_lane(topology_escape)["weights_outputs"][0]["required_contract"]["topology_digest"] = (
         "not-a-digest"
     )
 
     encoding_escape = clone()
-    four_lane(encoding_escape)["artifact_outputs"][0]["required_contract"]["encodings"] = [
-        "plain/1"
-    ]
+    four_lane(encoding_escape)["weights_outputs"][0]["required_contract"]["encodings"] = ["plain/1"]
 
     encoding_order = clone()
-    four_lane(encoding_order)["artifact_outputs"][0]["required_contract"]["encodings"] = [
+    four_lane(encoding_order)["weights_outputs"][0]["required_contract"]["encodings"] = [
         "sha256:" + "2" * 64,
         "sha256:" + "1" * 64,
     ]
@@ -1730,11 +1728,11 @@ def run_retired_descriptor_shapes() -> list[str]:
     source_profile_incomplete = clone()
     del four_lane(source_profile_incomplete)["models"][0]["source_profile"]
 
-    artifact_bound_escape = clone()
-    four_lane(artifact_bound_escape)["artifact_outputs"][0]["max_bytes"] = 1 << 53
+    weights_bound_escape = clone()
+    four_lane(weights_bound_escape)["weights_outputs"][0]["max_bytes"] = 1 << 53
 
-    artifact_contract_incomplete = clone()
-    del four_lane(artifact_contract_incomplete)["artifact_outputs"][0]["required_contract"][
+    weights_contract_incomplete = clone()
+    del four_lane(weights_contract_incomplete)["weights_outputs"][0]["required_contract"][
         "encodings"
     ]
 
@@ -1748,8 +1746,8 @@ def run_retired_descriptor_shapes() -> list[str]:
         refused("artifact-encoding-order", encoding_order),
         refused("job-source-profile-escape", source_profile_escape),
         refused("job-source-profile-incomplete", source_profile_incomplete),
-        refused("artifact-byte-bound", artifact_bound_escape),
-        refused("artifact-contract-incomplete", artifact_contract_incomplete),
+        refused("artifact-byte-bound", weights_bound_escape),
+        refused("artifact-contract-incomplete", weights_contract_incomplete),
     ]
 
 

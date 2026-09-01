@@ -14,7 +14,7 @@ from pathlib import Path
 
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.refusal import LaunchRefusal
-from cozy_runtime.protocol import artifact_limits, documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
@@ -83,7 +83,7 @@ def _request(
         or len(request.source_selection_digest) != 32
         or not _source_uri(request.source_uri)
         or not _printable(
-            request.declared_license, artifact_limits.MAX_MODEL_SOURCE_LICENSE_BYTES, empty=True
+            request.declared_license, weights_limits.MAX_MODEL_SOURCE_LICENSE_BYTES, empty=True
         )
     ):
         raise ModelSourceRefusal(
@@ -91,20 +91,20 @@ def _request(
         )
 
     profiles = [(row.slot, row.profile) for row in request.profiles]
-    if not 1 <= len(profiles) <= artifact_limits.MAX_MODEL_SOURCE_PROFILES:
+    if not 1 <= len(profiles) <= weights_limits.MAX_MODEL_SOURCE_PROFILES:
         raise ModelSourceRefusal("model_source_profile_count", "source profile count is invalid")
     if [slot for slot, _ in profiles] != sorted({slot for slot, _ in profiles}):
         raise ModelSourceRefusal("model_source_profile_order", "source profiles are not sorted")
     if any(
         _IDENTIFIER.fullmatch(slot) is None
-        or len(profile.encode()) > artifact_limits.MAX_MODEL_SOURCE_PROFILE_BYTES
+        or len(profile.encode()) > weights_limits.MAX_MODEL_SOURCE_PROFILE_BYTES
         or _PROFILE.fullmatch(profile) is None
         for slot, profile in profiles
     ):
         raise ModelSourceRefusal("model_source_profile_invalid", "source profile is invalid")
 
     rows = list(request.files)
-    if not 1 <= len(rows) <= artifact_limits.MAX_MODEL_SOURCE_FILES:
+    if not 1 <= len(rows) <= weights_limits.MAX_MODEL_SOURCE_FILES:
         raise ModelSourceRefusal("model_source_file_count", "source file count is invalid")
     if [row.member for row in rows] != sorted({row.member for row in rows}):
         raise ModelSourceRefusal("model_source_file_order", "source files are not sorted")
@@ -176,7 +176,7 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
             or isinstance(length, bool)
             or length <= 0
             or not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= artifact_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
+            or not 0 < len(evidence) <= weights_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
         ):
             raise ModelSourceRefusal(
                 "model_source_tensorfs_result_invalid", "TensorFS returned an invalid row"
@@ -216,7 +216,7 @@ def _member(value: str) -> bool:
     except UnicodeError:
         return False
     return (
-        0 < len(encoded) <= artifact_limits.MAX_MODEL_SOURCE_MEMBER_BYTES
+        0 < len(encoded) <= weights_limits.MAX_MODEL_SOURCE_MEMBER_BYTES
         and _MEMBER.fullmatch(value) is not None
         and not value.startswith((".", "/"))
         and "\\" not in value
@@ -225,7 +225,7 @@ def _member(value: str) -> bool:
 
 
 def _source_uri(value: str) -> bool:
-    if not _printable(value, artifact_limits.MAX_MODEL_SOURCE_URI_BYTES, empty=False):
+    if not _printable(value, weights_limits.MAX_MODEL_SOURCE_URI_BYTES, empty=False):
         return False
     try:
         parsed = urllib.parse.urlsplit(value)

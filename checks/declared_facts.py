@@ -439,7 +439,7 @@ def _service_arms(spool: Path) -> Mapping[str, Callable[[], Observation]]:
         return (
             f"declare -> {facts.declaration}, and the same identity REPLAYED it; "
             f"save() refuses {facts.save_refusal} "
-            "(#553a — checkpoint ArtifactSink lifecycle absent)"
+            "(#553a — checkpoint WeightsSink lifecycle absent)"
         )
 
     def budget() -> Observation:

@@ -61,13 +61,13 @@ from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker import (
     acquire,
-    artifacts,
     child,
     downloads,
     grants,
     model_source_prepare,
     observe,
     triage,
+    weights,
 )
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
@@ -960,7 +960,7 @@ class Worker:
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
         self.stop = threading.Event()
-        self.artifacts = artifacts.ArtifactExchange(
+        self.weights = weights.WeightsExchange(
             store_root=options.artifact_store,
             send=self.send,
             stop=self.stop,
@@ -984,7 +984,7 @@ class Worker:
             monitor=self.monitor,
             posture=self.applied_posture,
             device_process=self.read_device_process,
-            artifacts=self.artifacts,
+            weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             artifact_store=options.artifact_store,
         )
@@ -1958,7 +1958,7 @@ class Worker:
             self.connected.set()
             self.bump_admission(f"snapshot {inner.snapshot_id} acknowledged; dispatch opens")
             self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
-            self.artifacts.replay_pending()
+            self.weights.replay_pending()
             for attempt in self.engine.pending_outcomes():
                 self.note(
                     "outcome",
@@ -2001,13 +2001,13 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
-        elif kind == "artifact_host_ack":
+        elif kind == "weights_host_ack":
             try:
-                self.artifacts.absorb_ack(inner)
-            except artifacts.ArtifactExchangeError as exc:
+                self.weights.absorb_ack(inner)
+            except weights.WeightsExchangeError as exc:
                 self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
-        elif kind == "artifact_read_request":
-            self.send(self.artifacts.read(inner))
+        elif kind == "weights_read_request":
+            self.send(self.weights.read(inner))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
@@ -2037,7 +2037,7 @@ class Worker:
 
     def shutdown_from_stream(self) -> None:
         self.stop.set()
-        self.artifacts.close()
+        self.weights.close()
         self.outbound.put(None)
         self.work.put(None)
         self.watches.end_all()
@@ -4185,7 +4185,7 @@ class Worker:
             if supervision.current is not None
         ]
         self.stop.set()
-        self.artifacts.close()
+        self.weights.close()
         self.work.put(None)
         self.convergences.put(None)
         self.outbound.put(None)

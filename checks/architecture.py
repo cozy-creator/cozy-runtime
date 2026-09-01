@@ -578,8 +578,8 @@ def fence_no_identifiers() -> list[str]:
             for call in ast.walk(tree)
             if isinstance(call, ast.Call)
             and (
-                (isinstance(call.func, ast.Name) and call.func.id == "ArtifactOutput")
-                or (isinstance(call.func, ast.Attribute) and call.func.attr == "ArtifactOutput")
+                (isinstance(call.func, ast.Name) and call.func.id == "WeightsOutput")
+                or (isinstance(call.func, ast.Attribute) and call.func.attr == "WeightsOutput")
             )
             for keyword in call.keywords
             if keyword.arg in {"topology_digest", "encodings"}
@@ -1061,7 +1061,7 @@ def fence_descriptor_minimality() -> list[str]:
     ]:
         bad.append("four-lane source profiles changed or left the inferred model slots")
     else:
-        outputs = four_lane.get("artifact_outputs")
+        outputs = four_lane.get("weights_outputs")
         contract = (
             outputs[0].get("required_contract")
             if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict)

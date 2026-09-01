@@ -1456,7 +1456,7 @@ class Executor:
                     "code": "job_model_store_unavailable",
                     "detail": f"TensorFS store refused ({type(exc).__name__})",
                 }
-        elif surface.artifact_outputs:
+        elif surface.weights_outputs:
             from cozy_runtime.internal import fill, pull
 
             store_value = str(command.get("artifact_store", ""))
@@ -1464,7 +1464,7 @@ class Executor:
                 return {
                     "ok": False,
                     "code": "artifact_store_unavailable",
-                    "detail": "this artifact-producing job has no verified TensorFS store",
+                    "detail": "this weights-producing job has no verified TensorFS store",
                 }
             try:
                 store = pull.open_store(fill.tensorfs_module(), Path(store_value))
@@ -1475,31 +1475,31 @@ class Executor:
         except CapabilityError as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
 
-        artifact_open = None
-        if surface.artifact_outputs:
-            from cozy_runtime.internal import artifact_sink
+        weights_open = None
+        if surface.weights_outputs:
+            from cozy_runtime.internal import weights_sink
 
             if store is None:
                 return {
                     "ok": False,
                     "code": "artifact_store_unavailable",
-                    "detail": "this artifact-producing job has no verified TensorFS store",
+                    "detail": "this weights-producing job has no verified TensorFS store",
                 }
             allowed_sources = {
                 model.checkpoint_ref: int(command["models"][parameter]["length"])
                 for parameter, model in job_models.items()
             }
 
-            owner_scope = str(command.get("artifact_owner_scope", ""))
-            artifact_request_id = str(command.get("artifact_request_id", ""))
+            owner_scope = str(command.get("weights_owner_scope", ""))
+            weights_request_id = str(command.get("weights_request_id", ""))
             invocation_spec_digest = str(command.get("invocation_spec_digest", ""))
 
             def bind_intent(
                 output_slot: str, declaration_digest: bytes, declaration: bytes
-            ) -> artifact_sink.ArtifactHostBinding:
-                artifact_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
+            ) -> weights_sink.WeightsHostBinding:
+                weights_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
                 answer = self._durable(
-                    "artifact_intent",
+                    "weights_intent",
                     {
                         "output_slot": output_slot,
                         "tensorfs_declaration_digest": documents.spell(declaration_digest),
@@ -1509,59 +1509,59 @@ class Executor:
                 )
                 if not answer.get("ok"):
                     raise CapabilityError(
-                        str(answer.get("detail", "the artifact host refused intent")),
-                        code=str(answer.get("code", "artifact_host_refused")),
+                        str(answer.get("detail", "the weights host refused intent")),
+                        code=str(answer.get("code", "weights_host_refused")),
                     )
-                receipt_digest = str(answer.get("artifact_receipt_digest", ""))
-                return artifact_sink.ArtifactHostBinding(
-                    transaction_id=str(answer.get("artifact_transaction_id", "")),
+                receipt_digest = str(answer.get("weights_receipt_digest", ""))
+                return weights_sink.WeightsHostBinding(
+                    transaction_id=str(answer.get("weights_transaction_id", "")),
                     writer_generation=int(answer.get("writer_generation", 0)),
-                    artifact_receipt_digest=(
+                    weights_receipt_digest=(
                         documents.raw(receipt_digest) if receipt_digest else b""
                     ),
                 )
 
             def record_receipt(receipt: Any) -> None:
-                _, canonical_receipt, receipt_digest = artifact_sink.protocol_receipt(
+                _, canonical_receipt, receipt_digest = weights_sink.protocol_receipt(
                     receipt,
                     owner_scope=owner_scope,
-                    request_id=artifact_request_id,
+                    request_id=weights_request_id,
                     invocation_spec_digest=invocation_spec_digest,
                 )
-                artifact_sink.write_exchange_file(
+                weights_sink.write_exchange_file(
                     spool, receipt.output_slot, "receipt", canonical_receipt
                 )
                 answer = self._durable(
-                    "artifact_receipt",
+                    "weights_receipt",
                     {
                         "output_slot": receipt.output_slot,
-                        "artifact_transaction_id": receipt.artifact_transaction_id,
-                        "artifact_receipt_digest": documents.spell(receipt_digest),
-                        "artifact_receipt_length": len(canonical_receipt),
+                        "weights_transaction_id": receipt.weights_transaction_id,
+                        "weights_receipt_digest": documents.spell(receipt_digest),
+                        "weights_receipt_length": len(canonical_receipt),
                     },
                 )
-                if not answer.get("ok") or answer.get("artifact_receipt_digest") != documents.spell(
+                if not answer.get("ok") or answer.get("weights_receipt_digest") != documents.spell(
                     receipt_digest
                 ):
                     raise CapabilityError(
-                        str(answer.get("detail", "the artifact host refused receipt")),
-                        code=str(answer.get("code", "artifact_host_refused")),
+                        str(answer.get("detail", "the weights host refused receipt")),
+                        code=str(answer.get("code", "weights_host_refused")),
                     )
 
-            artifact_host = artifact_sink.ArtifactTransactionHost(
+            weights_host = weights_sink.WeightsTransactionHost(
                 store=store,
                 owner_scope=owner_scope,
-                request_id=artifact_request_id,
+                request_id=weights_request_id,
                 invocation_spec_digest=invocation_spec_digest,
                 writer_session_id=1,
                 allowed_sources=allowed_sources,
                 output_bounds={
-                    output.name: output.max_new_bytes for output in surface.artifact_outputs
+                    output.name: output.max_new_bytes for output in surface.weights_outputs
                 },
                 bind_intent=bind_intent,
                 record_receipt=record_receipt,
             )
-            artifact_open = artifact_host.open
+            weights_open = weights_host.open
 
         from cozy_runtime.author._services import (
             BudgetFacts,
@@ -1625,7 +1625,7 @@ class Executor:
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
-                artifacts=artifact_open,
+                weights=weights_open,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),

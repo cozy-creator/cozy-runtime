@@ -34,8 +34,6 @@ from tiny_diffusers import MiniMaxH3ModularPipeline, build_h3_pipeline
 
 from cozy_runtime.author import (
     App,
-    ArtifactOutput,
-    ArtifactSink,
     AudioAsset,
     Budget,
     Checkpoints,
@@ -60,6 +58,8 @@ from cozy_runtime.author import (
     Tree,
     UnsupportedInput,
     VideoAsset,
+    WeightsOutput,
+    WeightsSink,
     uses_components,
 )
 
@@ -721,8 +721,8 @@ class FourLaneResult(msgspec.Struct):
 
 @app.job(
     name="four-lane",
-    artifacts=(
-        ArtifactOutput(
+    weights=(
+        WeightsOutput(
             "bf16-full",
             max_new_bytes=128 << 10,
             topology_digest="sha256:" + "1" * 64,
@@ -739,7 +739,7 @@ def four_lane(
     payload: DistillInput,
     dits: Fl2VAModel,
     shared: Ref2VAModel,
-    artifacts: ArtifactSink,
+    weights: WeightsSink,
 ) -> FourLaneResult:
-    del payload, dits, shared, artifacts
+    del payload, dits, shared, weights
     return FourLaneResult(outputs=1)

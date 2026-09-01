@@ -54,7 +54,7 @@ def _classify(previous: dict[str, Json], candidate: dict[str, Json]) -> Result:
             ("result", "result schema"),
             ("publishes", "job publication metadata"),
             ("resources", "job resource metadata"),
-            ("artifact_outputs", "job artifact output metadata"),
+            ("weights_outputs", "job artifact output metadata"),
         ):
             if old.get(key) != new.get(key):
                 major.append(f"{old_kind} {name} changed {label}")

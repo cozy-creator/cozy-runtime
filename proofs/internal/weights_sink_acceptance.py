@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-kernel + real-TensorFS acceptance for Runtime ArtifactSink.
+"""Real-kernel + real-TensorFS acceptance for Runtime WeightsSink.
 
 The proof creates a TensorFS checkpoint with the shipping ``tfs`` binary, roots it through
 the Python facade, invokes an ordinary typed job through the author kernel, and drives the
@@ -26,23 +26,23 @@ import tensorfs
 from cozy.worker.v1 import worker_pb2 as pb
 from cozy_runtime.author import (
     App,
-    ArtifactOutput,
-    ArtifactPart,
-    ArtifactSink,
-    ArtifactTarget,
-    ArtifactTensor,
     Model,
+    WeightsOutput,
+    WeightsPart,
+    WeightsSink,
+    WeightsTarget,
+    WeightsTensor,
     describe,
 )
 from cozy_runtime.author.fakes import invoke_with_fakes
 from cozy_runtime.internal import descriptor
-from cozy_runtime.internal.artifact_sink import (
-    ArtifactHostBinding,
-    ArtifactTransactionHost,
+from cozy_runtime.internal.discovery import Discovered
+from cozy_runtime.internal.weights_sink import (
+    WeightsHostBinding,
+    WeightsTransactionHost,
     protocol_receipt,
 )
-from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.internal.worker.artifacts import ArtifactExchange
+from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.protocol import documents
 
 
@@ -96,21 +96,21 @@ app = App()
 STREAMS: list[Chunks] = []
 
 
-def produce(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
+def produce(payload: Request, model: SourceModel, weights: WeightsSink) -> Result:
     stream = Chunks(b"x" * (2049 if payload.overlong else 2048))
-    receipt = artifacts.derive(
+    receipt = weights.derive(
         "model",
         sources={"full": model},
         targets={
-            "derived": ArtifactTarget(
+            "derived": WeightsTarget(
                 source="full",
                 source_component="unet",
                 add={
-                    payload.marker: ArtifactTensor(
+                    payload.marker: WeightsTensor(
                         logical_dtype="bf16",
                         shape=(32, 32),
                         encoding=PLAIN,
-                        parts={"value": ArtifactPart("bf16", (32, 32), stream)},
+                        parts={"value": WeightsPart("bf16", (32, 32), stream)},
                     )
                 },
             )
@@ -119,32 +119,32 @@ def produce(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Re
     )
     if not receipt.replayed and stream.reads < 2:
         raise RuntimeError("TensorFS did not stream the produced value")
-    return Result(receipt.artifact_transaction_id, receipt.tensorfs_receipt_digest)
+    return Result(receipt.weights_transaction_id, receipt.tensorfs_receipt_digest)
 
 
-@app.job(artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
-def derive(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
-    return produce(payload, model, artifacts)
+@app.job(weights=(WeightsOutput("model", max_new_bytes=4096),))
+def derive(payload: Request, model: SourceModel, weights: WeightsSink) -> Result:
+    return produce(payload, model, weights)
 
 
-@app.job(name="derive-tight", artifacts=(ArtifactOutput("model", max_new_bytes=1024),))
-def derive_tight(payload: Request, model: SourceModel, artifacts: ArtifactSink) -> Result:
-    return produce(payload, model, artifacts)
+@app.job(name="derive-tight", weights=(WeightsOutput("model", max_new_bytes=1024),))
+def derive_tight(payload: Request, model: SourceModel, weights: WeightsSink) -> Result:
+    return produce(payload, model, weights)
 
 
-@app.job(name="derive-read", artifacts=(ArtifactOutput("model", max_new_bytes=4096),))
-def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSink) -> ReadResult:
+@app.job(name="derive-read", weights=(WeightsOutput("model", max_new_bytes=4096),))
+def derive_read(payload: ReadRequest, model: SourceModel, weights: WeightsSink) -> ReadResult:
     targets = {
-        "derived": ArtifactTarget(
+        "derived": WeightsTarget(
             source="full",
             source_component="unet",
             drop=(SOURCE_KEY,),
             add={
-                SOURCE_KEY: ArtifactTensor(
+                SOURCE_KEY: WeightsTensor(
                     logical_dtype="bf16",
                     shape=(32, 32),
                     encoding=PLAIN,
-                    parts={"value": ArtifactPart("bf16", (32, 32))},
+                    parts={"value": WeightsPart("bf16", (32, 32))},
                 )
             },
         )
@@ -153,13 +153,13 @@ def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSin
         *(("derived", key) for key in SOURCE_KEYS if key != SOURCE_KEY),
         ("derived", SOURCE_KEY),
     )
-    with artifacts.open(
+    with weights.open(
         "model", sources={"full": model}, targets=targets, order=order
     ) as transaction:
         if transaction.replayed:
             receipt = transaction.receipt
             assert receipt is not None
-            return ReadResult(receipt.artifact_transaction_id, EXPECTED_SOURCE_DIGEST)
+            return ReadResult(receipt.weights_transaction_id, EXPECTED_SOURCE_DIGEST)
         writable = bytes(payload.size) if payload.readonly else bytearray(payload.size)
         transaction.source_read_into(
             payload.alias,
@@ -173,7 +173,7 @@ def derive_read(payload: ReadRequest, model: SourceModel, artifacts: ArtifactSin
         digest = hashlib.sha256(raw).hexdigest()
         transaction.add_part("derived", SOURCE_KEY, "value", raw)
         receipt = transaction.commit()
-        return ReadResult(receipt.artifact_transaction_id, digest)
+        return ReadResult(receipt.weights_transaction_id, digest)
 
 
 PLAIN = ""
@@ -199,7 +199,7 @@ def source(tfs: Path, root: Path) -> tuple[tensorfs.Store, str, int, dict[str, A
     store = tensorfs.Store.open(str(root))
     held = store.manifest(manifest_id)
     manifest_bytes = held["manifest"]
-    operation = store.begin_operation("artifact-source", "proof", "source")
+    operation = store.begin_operation("weights-source", "proof", "source")
     operation.hold_manifest(manifest_id, len(manifest_bytes))
     for reached in store.walk(manifest_id):
         operation.hold_blob(reached["id"], reached["length"])
@@ -224,23 +224,23 @@ def main() -> None:
     args = parser.parse_args()
     found = Discovered(
         app=app,
-        application="artifact_sink_acceptance:app",
+        application="weights_sink_acceptance:app",
         project=Path(__file__).parent,
         module=sys.modules[__name__],
         surfaces=describe(app),
         bindings={},
     )
     described = descriptor.build(found)
-    artifact_outputs = described["jobs"][0].get("artifact_outputs")
-    if artifact_outputs != [
+    weights_outputs = described["jobs"][0].get("weights_outputs")
+    if weights_outputs != [
         {
             "output_id": "model",
             "mime_type": "application/vnd.cozy.model-manifest",
             "max_bytes": 4096,
         }
     ]:
-        raise RuntimeError(f"descriptor artifact outputs changed: {artifact_outputs!r}")
-    with tempfile.TemporaryDirectory(prefix="cozy-artifact-sink-") as temporary:
+        raise RuntimeError(f"descriptor weights outputs changed: {weights_outputs!r}")
+    with tempfile.TemporaryDirectory(prefix="cozy-weights-sink-") as temporary:
         root = Path(temporary)
         store, manifest_id, manifest_length, header = source(args.tfs, root / "store")
         component = header["components"]["unet"]
@@ -257,13 +257,13 @@ def main() -> None:
         ORDER = (*(("derived", key) for key in component), ("derived", "table"))
         chosen = model(manifest_id)
 
-        def run(writer_session: int) -> tuple[Result, ArtifactTransactionHost]:
+        def run(writer_session: int) -> tuple[Result, WeightsTransactionHost]:
             spool = root / f"spool-{writer_session}"
             spool.mkdir()
-            host = ArtifactTransactionHost(
+            host = WeightsTransactionHost(
                 store=store,
                 owner_scope="proof-owner",
-                request_id="artifact-proof",
+                request_id="weights-proof",
                 invocation_spec_digest="sha256:" + "1" * 64,
                 writer_session_id=writer_session,
                 allowed_sources={manifest_id: manifest_length},
@@ -272,10 +272,10 @@ def main() -> None:
             result = invoke_with_fakes(
                 app.get("derive"),
                 {"marker": "table"},
-                request_id="artifact-proof",
+                request_id="weights-proof",
                 spool=spool,
                 models={"model": chosen},
-                artifacts=host.open,
+                weights=host.open,
             ).result
             assert isinstance(result, Result)
             return result, host
@@ -283,13 +283,13 @@ def main() -> None:
         first, host = run(1)
         second, _ = run(2)
         if first != second:
-            raise RuntimeError("identical retry returned a different artifact receipt")
+            raise RuntimeError("identical retry returned a different weights receipt")
         if any(any((root / f"spool-{writer}").iterdir()) for writer in (1, 2)):
-            raise RuntimeError("ArtifactSink made a model-sized attempt-spool copy")
+            raise RuntimeError("WeightsSink made a model-sized attempt-spool copy")
         lookup = store.derived_lookup(first.transaction)
         receipt = lookup.get("receipt")
         if lookup.get("state") != "committed" or not isinstance(receipt, dict):
-            raise RuntimeError("TensorFS did not retain the committed artifact transaction")
+            raise RuntimeError("TensorFS did not retain the committed weights transaction")
         manifest = receipt["manifest"]
         manifest_id_out = "sha256:" + manifest["sha256"]
         verified = store.manifest(manifest_id_out)
@@ -300,40 +300,40 @@ def main() -> None:
         reference, canonical, digest = protocol_receipt(
             author_receipt,
             owner_scope="proof-owner",
-            request_id="artifact-proof",
+            request_id="weights-proof",
             invocation_spec_digest="sha256:" + "1" * 64,
         )
-        parsed = documents.read(canonical, pb.ArtifactReceipt)
-        if reference.artifact_receipt_digest != digest or parsed["output_slot"] != "model":
-            raise RuntimeError("Worker Protocol ArtifactReceipt did not preserve identity")
+        parsed = documents.read(canonical, pb.WeightsReceipt)
+        if reference.weights_receipt_digest != digest or parsed["output_slot"] != "model":
+            raise RuntimeError("Worker Protocol WeightsReceipt did not preserve identity")
 
         order: list[str] = []
         durable_digest = b""
-        ordered_host: ArtifactTransactionHost
+        ordered_host: WeightsTransactionHost
 
         def bind_ordered(
             output_slot: str, declaration_digest: bytes, declaration: bytes
-        ) -> ArtifactHostBinding:
+        ) -> WeightsHostBinding:
             del declaration_digest, declaration
             state = store.derived_lookup(ordered_host.transaction_id(output_slot))["state"]
             order.append(f"intent:{state}")
-            return ArtifactHostBinding(ordered_host.transaction_id(output_slot), 11)
+            return WeightsHostBinding(ordered_host.transaction_id(output_slot), 11)
 
         def record_ordered(value: Any) -> None:
             nonlocal durable_digest
-            state = store.derived_lookup(value.artifact_transaction_id)["state"]
+            state = store.derived_lookup(value.weights_transaction_id)["state"]
             order.append(f"receipt:{state}")
             durable_digest = protocol_receipt(
                 value,
                 owner_scope="proof-owner",
-                request_id="artifact-host-order",
+                request_id="weights-host-order",
                 invocation_spec_digest="sha256:" + "3" * 64,
             )[2]
 
-        ordered_host = ArtifactTransactionHost(
+        ordered_host = WeightsTransactionHost(
             store=store,
             owner_scope="proof-owner",
-            request_id="artifact-host-order",
+            request_id="weights-host-order",
             invocation_spec_digest="sha256:" + "3" * 64,
             writer_session_id=1,
             allowed_sources={manifest_id: manifest_length},
@@ -344,10 +344,10 @@ def main() -> None:
         ordered_result = invoke_with_fakes(
             app.get("derive"),
             {"marker": "table"},
-            request_id="artifact-host-order",
+            request_id="weights-host-order",
             spool=root / "spool-host-order",
             models={"model": chosen},
-            artifacts=ordered_host.open,
+            weights=ordered_host.open,
         ).result
         if order != ["intent:absent", "receipt:committed"] or not durable_digest:
             raise RuntimeError(f"host durability order was {order}")
@@ -355,19 +355,19 @@ def main() -> None:
 
         def bind_committed(
             output_slot: str, declaration_digest: bytes, declaration: bytes
-        ) -> ArtifactHostBinding:
+        ) -> WeightsHostBinding:
             del declaration_digest, declaration
-            return ArtifactHostBinding(ordered_host.transaction_id(output_slot), 12, durable_digest)
+            return WeightsHostBinding(ordered_host.transaction_id(output_slot), 12, durable_digest)
 
         def record_replay(value: Any) -> None:
             nonlocal replay_records
             del value
             replay_records += 1
 
-        replay_host = ArtifactTransactionHost(
+        replay_host = WeightsTransactionHost(
             store=store,
             owner_scope="proof-owner",
-            request_id="artifact-host-order",
+            request_id="weights-host-order",
             invocation_spec_digest="sha256:" + "3" * 64,
             writer_session_id=1,
             allowed_sources={manifest_id: manifest_length},
@@ -378,67 +378,67 @@ def main() -> None:
         replayed_result = invoke_with_fakes(
             app.get("derive"),
             {"marker": "table"},
-            request_id="artifact-host-order",
+            request_id="weights-host-order",
             spool=root / "spool-host-replay",
             models={"model": chosen},
-            artifacts=replay_host.open,
+            weights=replay_host.open,
         ).result
         if replayed_result != ordered_result or replay_records:
-            raise RuntimeError("committed host replay rewrote or re-recorded the artifact")
+            raise RuntimeError("committed host replay rewrote or re-recorded the weights")
 
         sent: list[pb.WorkerFrame] = []
-        exchange: ArtifactExchange
+        exchange: WeightsExchange
 
         def host_send(frame: pb.WorkerFrame) -> None:
             sent.append(frame)
             kind = frame.WhichOneof("msg")
-            if kind == "artifact_intent":
-                intent = frame.artifact_intent
+            if kind == "weights_intent":
+                intent = frame.weights_intent
                 exchange.absorb_ack(
-                    pb.ArtifactHostAck(
+                    pb.WeightsHostAck(
                         request_id=intent.request_id,
                         attempt_ordinal=intent.attempt_ordinal,
                         invocation_spec_digest=intent.invocation_spec_digest,
                         output_slot=intent.output_slot,
-                        artifact_transaction_id=first.transaction,
+                        weights_transaction_id=first.transaction,
                         writer_generation=9,
                         tensorfs_declaration_digest=intent.tensorfs_declaration_digest,
-                        stage=pb.ARTIFACT_HOST_STAGE_INTENT,
-                        outcome=pb.ARTIFACT_HOST_OUTCOME_RECORDED,
+                        stage=pb.WEIGHTS_HOST_STAGE_INTENT,
+                        outcome=pb.WEIGHTS_HOST_OUTCOME_RECORDED,
                     )
                 )
-            elif kind == "artifact_receipt":
-                carried = frame.artifact_receipt
+            elif kind == "weights_receipt":
+                carried = frame.weights_receipt
                 exchange.absorb_ack(
-                    pb.ArtifactHostAck(
+                    pb.WeightsHostAck(
                         request_id=carried.request_id,
                         attempt_ordinal=carried.attempt_ordinal,
                         invocation_spec_digest=carried.invocation_spec_digest,
                         output_slot=carried.output_slot,
-                        artifact_transaction_id=carried.artifact_transaction_id,
+                        weights_transaction_id=carried.weights_transaction_id,
                         writer_generation=carried.writer_generation,
                         tensorfs_declaration_digest=carried.tensorfs_declaration_digest,
-                        stage=pb.ARTIFACT_HOST_STAGE_RECEIPT,
-                        outcome=pb.ARTIFACT_HOST_OUTCOME_RECORDED,
-                        artifact_receipt=carried.artifact_receipt,
+                        stage=pb.WEIGHTS_HOST_STAGE_RECEIPT,
+                        outcome=pb.WEIGHTS_HOST_OUTCOME_RECORDED,
+                        weights_receipt=carried.weights_receipt,
                         manifest=carried.manifest,
                     )
                 )
             else:
                 raise RuntimeError(f"unexpected host frame {kind!r}")
 
-        exchange = ArtifactExchange(
+        exchange = WeightsExchange(
             store_root=root / "store",
             send=host_send,
             stop=threading.Event(),
             owner_scope=lambda: "proof-owner",
         )
         attempt_record = SimpleNamespace(
-            request_id="artifact-proof",
+            request_id="weights-proof",
             attempt=1,
             digest=documents.raw("sha256:" + "1" * 64),
             canceling="",
-            artifact_receipts={},
+            weights_receipts={},
         )
         declaration = json.dumps(
             receipt["declaration"], separators=(",", ":"), sort_keys=True
@@ -450,7 +450,7 @@ def main() -> None:
             declaration=declaration,
             requested_writer_generation=0,
         )
-        if bound["artifact_transaction_id"] != first.transaction or bound["writer_generation"] != 9:
+        if bound["weights_transaction_id"] != first.transaction or bound["writer_generation"] != 9:
             raise RuntimeError(f"host intent did not bind exact transaction: {bound}")
         recorded = exchange.receipt(
             attempt_record,
@@ -459,9 +459,9 @@ def main() -> None:
             receipt_digest=digest,
             canonical_receipt=canonical,
         )
-        receipt_frame = sent[-1].artifact_receipt
+        receipt_frame = sent[-1].weights_receipt
         if (
-            recorded["artifact_receipt_digest"] != documents.spell(digest)
+            recorded["weights_receipt_digest"] != documents.spell(digest)
             or not receipt_frame.objects
             or not receipt_frame.HasField("manifest")
             or list(receipt_frame.objects)
@@ -472,8 +472,8 @@ def main() -> None:
         if manifest_id_from_frame != manifest_id_out:
             raise RuntimeError("typed produced Manifest does not match TensorFS receipt")
         first_object = receipt_frame.objects[0]
-        read = pb.ArtifactReadRequest(
-            artifact_transaction_id=first.transaction,
+        read = pb.WeightsReadRequest(
+            weights_transaction_id=first.transaction,
             writer_generation=9,
             object_id=first_object.object_id,
             source_ref=first_object.source_ref,
@@ -481,17 +481,16 @@ def main() -> None:
             offset=0,
             max_bytes=min(64, first_object.length),
         )
-        artifact_read_result = exchange.read(read).artifact_read_result
+        weights_read_result = exchange.read(read).weights_read_result
         if (
-            artifact_read_result.outcome != pb.ARTIFACT_READ_OUTCOME_DATA
-            or hashlib.sha256(artifact_read_result.data).digest()
-            != artifact_read_result.data_digest
+            weights_read_result.outcome != pb.WEIGHTS_READ_OUTCOME_DATA
+            or hashlib.sha256(weights_read_result.data).digest() != weights_read_result.data_digest
         ):
             raise RuntimeError("host object read did not return digest-bound bytes")
         read.source_ref = "tensorfs-object:sha256:" + "0" * 64
         if (
-            exchange.read(read).artifact_read_result.refusal
-            != pb.ARTIFACT_READ_REFUSAL_SOURCE_REF_MISMATCH
+            exchange.read(read).weights_read_result.refusal
+            != pb.WEIGHTS_READ_REFUSAL_SOURCE_REF_MISMATCH
         ):
             raise RuntimeError("foreign source ref did not refuse")
         exchange.close()
@@ -502,10 +501,10 @@ def main() -> None:
 
         refused_spool = root / "spool-overlong"
         refused_spool.mkdir()
-        refused_host = ArtifactTransactionHost(
+        refused_host = WeightsTransactionHost(
             store=store,
             owner_scope="proof-owner",
-            request_id="artifact-overlong",
+            request_id="weights-overlong",
             invocation_spec_digest="sha256:" + "2" * 64,
             writer_session_id=1,
             allowed_sources={manifest_id: manifest_length},
@@ -515,13 +514,13 @@ def main() -> None:
             invoke_with_fakes(
                 app.get("derive"),
                 {"marker": "table", "overlong": True},
-                request_id="artifact-overlong",
+                request_id="weights-overlong",
                 spool=refused_spool,
                 models={"model": chosen},
-                artifacts=refused_host.open,
+                weights=refused_host.open,
             )
         except Exception as exc:
-            if getattr(exc, "code", "") != "artifact_tensorfs_refused":
+            if getattr(exc, "code", "") != "weights_tensorfs_refused":
                 raise RuntimeError(f"overlong stream refused as {exc!r}") from exc
         else:
             raise RuntimeError("overlong produced stream committed")
@@ -530,10 +529,10 @@ def main() -> None:
             raise RuntimeError(f"overlong stream did not fence its writer: {refused_state}")
         refused_host.abandon("model")
 
-        bounded_host = ArtifactTransactionHost(
+        bounded_host = WeightsTransactionHost(
             store=store,
             owner_scope="proof-owner",
-            request_id="artifact-bounded",
+            request_id="weights-bounded",
             invocation_spec_digest="sha256:" + "3" * 64,
             writer_session_id=1,
             allowed_sources={manifest_id: manifest_length},
@@ -543,15 +542,15 @@ def main() -> None:
             invoke_with_fakes(
                 app.get("derive-tight"),
                 {"marker": "table"},
-                request_id="artifact-bounded",
+                request_id="weights-bounded",
                 models={"model": chosen},
-                artifacts=bounded_host.open,
+                weights=bounded_host.open,
             )
         except Exception as exc:
-            if getattr(exc, "code", "") != "artifact_tensorfs_refused":
+            if getattr(exc, "code", "") != "weights_tensorfs_refused":
                 raise RuntimeError(f"over-bound declaration refused as {exc!r}") from exc
         else:
-            raise RuntimeError("over-bound artifact declaration reached its stream")
+            raise RuntimeError("over-bound weights declaration reached its stream")
         if STREAMS[-1].reads != 0:
             raise RuntimeError("TensorFS read bytes before enforcing the aggregate output cap")
         if store.derived_lookup(bounded_host.transaction_id("model")).get("state") != "absent":
@@ -564,8 +563,8 @@ def main() -> None:
             *,
             writer_session: int = 1,
             cancelled: bool = False,
-        ) -> tuple[ReadResult, ArtifactTransactionHost]:
-            host = ArtifactTransactionHost(
+        ) -> tuple[ReadResult, WeightsTransactionHost]:
+            host = WeightsTransactionHost(
                 store=store,
                 owner_scope="proof-owner",
                 request_id=request_id,
@@ -579,16 +578,16 @@ def main() -> None:
                 payload,
                 request_id=request_id,
                 models={"model": chosen},
-                artifacts=host.open,
+                weights=host.open,
                 cancelled=cancelled,
             ).result
             assert isinstance(result, ReadResult)
             return result, host
 
-        read_result, read_host = read_run("artifact-read", "4", {"offset": 128})
+        read_result, read_host = read_run("weights-read", "4", {"offset": 128})
         if read_result.source_digest != EXPECTED_SOURCE_DIGEST:
             raise RuntimeError("transaction source read returned different bytes")
-        replay, _ = read_run("artifact-read", "4", {"offset": 128}, writer_session=2)
+        replay, _ = read_run("weights-read", "4", {"offset": 128}, writer_session=2)
         if replay != read_result:
             raise RuntimeError("source-read transaction replay changed its result")
         read_host.release("model")
@@ -598,35 +597,35 @@ def main() -> None:
                 "foreign-source",
                 "5",
                 {"alias": "foreign", "offset": 128},
-                "artifact_source_ungranted",
+                "weights_source_ungranted",
                 False,
             ),
             (
                 "offset-bound",
                 "6",
                 {"offset": 1 << 30},
-                "artifact_tensorfs_refused",
+                "weights_tensorfs_refused",
                 False,
             ),
             (
                 "readonly-buffer",
                 "7",
                 {"offset": 128, "readonly": True},
-                "artifact_source_buffer",
+                "weights_source_buffer",
                 False,
             ),
             (
                 "empty-buffer",
                 "8",
                 {"offset": 128, "size": 0},
-                "artifact_source_buffer",
+                "weights_source_buffer",
                 False,
             ),
             (
                 "oversize-buffer",
                 "9",
                 {"offset": 128, "size": (64 << 20) + 1},
-                "artifact_source_buffer",
+                "weights_source_buffer",
                 False,
             ),
             (
@@ -639,14 +638,14 @@ def main() -> None:
         )
         for name, seed, payload, expected, canceled in refusal_cases:
             try:
-                _, failed_host = read_run(f"artifact-{name}", seed, payload, cancelled=canceled)
+                _, failed_host = read_run(f"weights-{name}", seed, payload, cancelled=canceled)
             except Exception as exc:
                 if getattr(exc, "code", "") != expected:
                     raise RuntimeError(f"{name} refused as {exc!r}, want {expected}") from exc
-                failed_host = ArtifactTransactionHost(
+                failed_host = WeightsTransactionHost(
                     store=store,
                     owner_scope="proof-owner",
-                    request_id=f"artifact-{name}",
+                    request_id=f"weights-{name}",
                     invocation_spec_digest="sha256:" + seed * 64,
                     writer_session_id=1,
                     allowed_sources={manifest_id: manifest_length},
@@ -659,7 +658,7 @@ def main() -> None:
                 raise RuntimeError(f"{name} did not fence its writer: {state}")
             failed_host.abandon("model")
         print(
-            "ARTIFACT SINK PASS",
+            "WEIGHTS SINK PASS",
             manifest_id_out,
             first.transaction,
             first.receipt,

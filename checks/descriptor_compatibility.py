@@ -83,7 +83,7 @@ def _base() -> dict[str, Json]:
                         "component_use": {},
                     }
                 ],
-                "artifact_outputs": [
+                "weights_outputs": [
                     {
                         "output_id": "model",
                         "mime_type": "application/vnd.cozy.model-manifest",
@@ -194,8 +194,8 @@ def main() -> int:
 
     check("job source profile", "major", source_profile, "changed model metadata")
 
-    def artifact_contract(doc: dict[str, Json]) -> None:
-        outputs = _job(doc)["artifact_outputs"]
+    def weights_contract(doc: dict[str, Json]) -> None:
+        outputs = _job(doc)["weights_outputs"]
         assert isinstance(outputs, list) and isinstance(outputs[0], dict)
         outputs[0]["required_contract"] = {
             "topology_digest": "sha256:" + "1" * 64,
@@ -205,7 +205,7 @@ def main() -> int:
     check(
         "job artifact contract",
         "major",
-        artifact_contract,
+        weights_contract,
         "changed job artifact output metadata",
     )
 
@@ -215,7 +215,7 @@ def main() -> int:
         models[0]["source_profile"] = "../foreign"
 
     def bad_artifact_topology(doc: dict[str, Json]) -> None:
-        outputs = _job(doc)["artifact_outputs"]
+        outputs = _job(doc)["weights_outputs"]
         assert isinstance(outputs, list) and isinstance(outputs[0], dict)
         outputs[0]["required_contract"] = {
             "topology_digest": "not-a-digest",

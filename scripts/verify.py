@@ -31,9 +31,9 @@ RESULTS = ROOT / "results"
 sys.path.insert(0, str(ROOT / "proofs" / "internal"))
 sys.path.insert(0, str(ROOT / "proofs" / "fixtures" / "tiny-models"))
 
-import tiny_artifacts as art  # noqa: E402
 import tiny_h3 as h3  # noqa: E402
 import tiny_sdxl as ep  # noqa: E402
+import tiny_weights as art  # noqa: E402
 from tiny_diffusers import MiniMaxH3ModularPipeline, TinyScheduler  # noqa: E402
 
 from cozy_runtime.author import (  # noqa: E402
@@ -700,7 +700,7 @@ def descriptor_sections() -> None:
         "published surface removed": lambda d: d["entrypoints"].pop(),
         "artifact contract changed": lambda d: next(
             row for row in d["jobs"] if row["name"] == "four-lane"
-        )["artifact_outputs"][0]["required_contract"].update(topology_digest="sha256:" + "2" * 64),
+        )["weights_outputs"][0]["required_contract"].update(topology_digest="sha256:" + "2" * 64),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))

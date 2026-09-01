@@ -41,12 +41,11 @@ from typing import Any, cast
 
 from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import artifact_sink as artifact_bridge
 from cozy_runtime.internal import canonical, fill, seam
 from cozy_runtime.internal import descriptor as package_descriptor
+from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
-from cozy_runtime.internal.worker.artifacts import ArtifactExchange
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
 from cozy_runtime.internal.worker.plan import (
@@ -58,7 +57,8 @@ from cozy_runtime.internal.worker.plan import (
     PreparedRequest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import artifact_limits, documents
+from cozy_runtime.internal.worker.weights import WeightsExchange
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
@@ -103,24 +103,22 @@ PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_device_memory_bytes")
 
 
-def artifact_exchange_bytes(
-    spool: Path, output_slot: str, kind: str, expected_length: int
-) -> bytes:
+def weights_exchange_bytes(spool: Path, output_slot: str, kind: str, expected_length: int) -> bytes:
     """Read one worker-chosen immutable spool file; the child never supplies a path."""
     cap = (
-        artifact_limits.MAX_ARTIFACT_DECLARATION_BYTES
+        weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
         if kind == "declaration"
-        else artifact_limits.MAX_ARTIFACT_RECEIPT_BYTES
+        else weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
     )
     if not 0 < expected_length <= cap:
-        raise ValueError(f"artifact {kind} length is outside 1..={cap}")
-    path = artifact_bridge.exchange_file(spool, output_slot, kind)
+        raise ValueError(f"weights {kind} length is outside 1..={cap}")
+    path = weights_bridge.exchange_file(spool, output_slot, kind)
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size != expected_length:
-            raise ValueError(f"artifact {kind} spool file is not an exact regular file")
+            raise ValueError(f"weights {kind} spool file is not an exact regular file")
         chunks: list[bytes] = []
         remaining = expected_length + 1
         while remaining:
@@ -136,7 +134,7 @@ def artifact_exchange_bytes(
             after.st_ino,
             after.st_size,
         ):
-            raise ValueError(f"artifact {kind} spool file changed while being read")
+            raise ValueError(f"weights {kind} spool file changed while being read")
         return raw
     finally:
         os.close(descriptor)
@@ -304,8 +302,8 @@ class AttemptRecord:
     prepared: PreparedRequest | None = None
     #: cr-009's typed publication record, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
-    #: Host-ACKed ArtifactReceipt/1 refs, one per descriptor-declared output slot.
-    artifact_receipts: dict[str, pb.ArtifactReceiptRef] = dataclasses_field(default_factory=dict)
+    #: Host-ACKed WeightsReceipt/1 refs, one per descriptor-declared output slot.
+    weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -363,7 +361,7 @@ class AttemptRecord:
         self.caps = {}
         self.residency = {}
         self.publication = {}
-        self.artifact_receipts = {}
+        self.weights_receipts = {}
         self.job_models = {}
         self.model_leases = []
 
@@ -407,7 +405,7 @@ class AttemptEngine:
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
         device_process: Callable[[], int],
-        artifacts: ArtifactExchange | None = None,
+        weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         artifact_store: Path | None = None,
     ) -> None:
@@ -444,7 +442,7 @@ class AttemptEngine:
         self.posture = posture
         #: the NVML per-process reader, so the out-of-allocator meter has a real producer
         self.device_process = device_process
-        self.artifacts = artifacts
+        self.weights = weights
         self.owner_scope = owner_scope
         self.artifact_store = artifact_store
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
@@ -1325,7 +1323,7 @@ class AttemptEngine:
         either side ever copies the checkpoint. `Checkpoints.save()` used to report success
         on this answer; it now refuses `checkpoint_sink_unbuilt`, and `Checkpoints.declare()`
         is what reaches here. The row keeps landing because it is TRUE — an attempt declared
-        a checkpoint with this digest and this length — and it is what the ArtifactSink will
+        a checkpoint with this digest and this length — and it is what the WeightsSink will
         attach real object references to when #552's transaction lands.
 
         Three answers and no fourth:
@@ -1384,7 +1382,7 @@ class AttemptEngine:
         self.receipts[key] = record
         # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
         # record, at-least-once like every other control message. `artifact` stays
-        # UNSET, and that is the honest state of this frame: no ArtifactSink exists to fill
+        # UNSET, and that is the honest state of this frame: no WeightsSink exists to fill
         # it, so the RecordOwner is being told an attempt DECLARED a checkpoint and nothing
         # more (#552/#553a).
         # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
@@ -1403,7 +1401,7 @@ class AttemptEngine:
         )
         attempt.ring.emit(
             "log",
-            f"checkpoint {logical_key!r} DECLARED (bytes not stored: no artifact sink)",
+            f"checkpoint {logical_key!r} DECLARED (bytes not stored: no weights sink)",
             "info",
             declaration=receipt_id,
             bytes=int(frame.get("length", 0)),
@@ -1415,18 +1413,18 @@ class AttemptEngine:
         kind = str(frame.get("kind", ""))
         if kind == "checkpoint":
             return self.checkpoint_exchange(attempt, frame)
-        if self.artifacts is None or attempt.spool is None:
+        if self.weights is None or attempt.spool is None:
             return {
                 "ok": False,
-                "code": "artifact_host_unavailable",
-                "detail": "this worker has no ArtifactSink host",
+                "code": "weights_host_unavailable",
+                "detail": "this worker has no WeightsSink host",
             }
         try:
             output_slot = str(frame.get("output_slot", ""))
-            if kind == "artifact_intent":
+            if kind == "weights_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
-                raw = artifact_exchange_bytes(attempt.spool, output_slot, "declaration", length)
-                return self.artifacts.intent(
+                raw = weights_exchange_bytes(attempt.spool, output_slot, "declaration", length)
+                return self.weights.intent(
                     attempt,
                     output_slot=output_slot,
                     declaration_digest=documents.raw(
@@ -1435,14 +1433,14 @@ class AttemptEngine:
                     declaration=raw,
                     requested_writer_generation=int(frame.get("requested_writer_generation", 0)),
                 )
-            if kind == "artifact_receipt":
-                length = int(frame.get("artifact_receipt_length", 0))
-                raw = artifact_exchange_bytes(attempt.spool, output_slot, "receipt", length)
-                return self.artifacts.receipt(
+            if kind == "weights_receipt":
+                length = int(frame.get("weights_receipt_length", 0))
+                raw = weights_exchange_bytes(attempt.spool, output_slot, "receipt", length)
+                return self.weights.receipt(
                     attempt,
                     output_slot=output_slot,
-                    transaction_id=str(frame.get("artifact_transaction_id", "")),
-                    receipt_digest=documents.raw(str(frame.get("artifact_receipt_digest", ""))),
+                    transaction_id=str(frame.get("weights_transaction_id", "")),
+                    receipt_digest=documents.raw(str(frame.get("weights_receipt_digest", ""))),
                     canonical_receipt=raw,
                 )
             return {
@@ -1453,7 +1451,7 @@ class AttemptEngine:
         except Exception as exc:
             return {
                 "ok": False,
-                "code": str(getattr(exc, "code", "artifact_host_refused")),
+                "code": str(getattr(exc, "code", "weights_host_refused")),
                 "detail": str(getattr(exc, "detail", exc))[:1024],
             }
 
@@ -1612,8 +1610,8 @@ class AttemptEngine:
                 },
                 "max_input_bytes": 64 << 20,
                 "artifact_store": str(self.artifact_store) if self.artifact_store else "",
-                "artifact_owner_scope": self.owner_scope(),
-                "artifact_request_id": attempt.request_id,
+                "weights_owner_scope": self.owner_scope(),
+                "weights_request_id": attempt.request_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
@@ -2134,8 +2132,8 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
-        for output_slot in sorted(attempt.artifact_receipts):
-            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
+        for output_slot in sorted(attempt.weights_receipts):
+            body.weights_receipts.append(attempt.weights_receipts[output_slot])
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)
         if receipt is not None:
             body.triage_bundle.CopyFrom(
@@ -2535,8 +2533,8 @@ class AttemptEngine:
             ),
             execution_started=attempt.executions > 0,
         )
-        for output_slot in sorted(attempt.artifact_receipts):
-            body.artifact_receipts.append(attempt.artifact_receipts[output_slot])
+        for output_slot in sorted(attempt.weights_receipts):
+            body.weights_receipts.append(attempt.weights_receipts[output_slot])
         canonical_bytes, digest = documents.identity(body)
         attempt.outcome_id = f"out-{uuid.uuid4().hex[:24]}"
         attempt.outcome_digest = digest
