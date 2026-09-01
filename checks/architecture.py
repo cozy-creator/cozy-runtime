@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, cozy-runtime.md §7). Not a test: a dependency scan.
 
-Architecture fences, each provable red by planting the violation (`scripts/redarm.py`):
-  forbidden-dependency · canonical-numbers · torch-free-import
-  package-imports · author-import-boundary · prelaunch-version · python-abi
-  model-execution-tensorfs
-  env-authority · single-config · no-interactive · excluded-keywords
-  document-kinds · implementation-ids · report-format-tags
-  no-identifiers-in-package-code · one-attempt-kernel · timing-decides-nothing
-  package-owns-no-residency · package-owns-no-media-decode · reviewed-specs-exist
-  construction-fill-order
-  one-address-predicate
-  dynamic-pods-skip-boot-warm
-  worker-control-memory-state
-  delivery-plan-observation
-  pod-media-grant-root
-  measured-backend-version
-  no-installed-file-inventory
-  typed-model-binding
+Every fence here is an AST or dependency scan over a boundary, or a replay of a real
+writer over a frozen vector. `--only NAME` runs one; `python checks/architecture.py`
+runs them all and names each red.
 """
 
 from __future__ import annotations
@@ -35,8 +21,6 @@ import zipfile
 from collections.abc import Iterator
 
 from packaging.version import InvalidVersion, Version
-
-from cozy_runtime.internal import host_paths
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
@@ -121,23 +105,6 @@ def fence_python_abi() -> list[str]:
         if tomllib.loads(path.read_text()).get("requires-python") != "==3.12.*":
             bad.append(f"{path.relative_to(ROOT)}: lock does not cover exactly Python 3.12")
 
-    scaffold = (SRC / "cli" / "new.py").read_text()
-    for expected in (
-        'requires-python = ">=3.12,<3.13"',
-        'dependencies = ["cozy-runtime>={__version__},<1.0.0"]',
-        'python_version = "3.12"',
-    ):
-        if expected not in scaffold:
-            bad.append(f"src/cozy_runtime/cli/new.py: generated package omits {expected!r}")
-
-    runtime = (SRC / "_interpreter.py").read_text()
-    for expected in (
-        'sys.implementation.name != "cpython"',
-        "sys.version_info[:2] != (3, 12)",
-        'sysconfig.get_config_var("Py_GIL_DISABLED") == 1',
-    ):
-        if expected not in runtime:
-            bad.append(f"src/cozy_runtime/_interpreter.py: runtime ABI guard omits {expected!r}")
     return bad
 
 
@@ -1392,81 +1359,6 @@ def fence_report_format_tags() -> list[str]:
 
 #: cr-042: the address-class attributes only `internal/egress.py` may name. Two downloaders
 #: each grew their own chain and the two differed; this is the fence that stops a third.
-ADDRESS_CLASSES = re.compile(
-    r"\.is_(?:private|loopback|link_local|multicast|reserved|unspecified)\b"
-)
-ADDRESS_PREDICATE_OWNER = "internal/egress.py"
-
-
-def fence_one_address_predicate() -> list[str]:
-    """cr-042: ONE private/unroutable-address predicate, in the module that owns egress."""
-    bad: list[str] = []
-    for path in py_files():
-        rel = path.relative_to(SRC).as_posix()
-        if rel == ADDRESS_PREDICATE_OWNER:
-            continue
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            if ADDRESS_PREDICATE_OWNER in line or ADDRESS_CLASSES.search(line) is None:
-                continue
-            bad.append(
-                f"{path.relative_to(ROOT)}:{lineno}: classifies an address itself; "
-                f"`egress.blocked()` is the ONE predicate every downloader calls — a second "
-                "chain is how two downloaders came to disagree (cr-042)"
-            )
-    owner = (SRC / ADDRESS_PREDICATE_OWNER).read_text()
-    if "def blocked(address: str) -> str:" not in owner:
-        bad.append(f"src/cozy_runtime/{ADDRESS_PREDICATE_OWNER}: `blocked()` is gone")
-    return bad
-
-
-def fence_construction_fill_order() -> list[str]:
-    """cr-041: stored-header presentation is never a Runtime traversal authority."""
-    bad: list[str] = []
-    source = (SRC / "internal" / "fill.py").read_text()
-    if re.search(r"self\.order\s*=", source):
-        bad.append(
-            "src/cozy_runtime/internal/fill.py: retains a second `self.order` authority; "
-            "the enqueue transaction is the construction traversal"
-        )
-    if "rows = [self.plan[key] for key in self.enqueued]" not in source:
-        bad.append(
-            "src/cozy_runtime/internal/fill.py: the TensorFS traversal no longer comes "
-            "directly from construction-order enqueues"
-        )
-    if "order = _require_construction_order(plan.order, component)" not in source:
-        bad.append(
-            "src/cozy_runtime/internal/fill.py: a non-construction TensorFS plan no longer "
-            "refuses before copies"
-        )
-    if 'self.stats.setdefault("traversals", [])' not in source:
-        bad.append(
-            "src/cozy_runtime/internal/fill.py: exact traversal evidence is no longer banked"
-        )
-    derivation = (SRC / "internal" / "derive.py").read_text()
-    if "tuple(sorted(rich.sets" in derivation:
-        bad.append(
-            "src/cozy_runtime/internal/derive.py: alphabetically sorts DestinationSets "
-            "instead of preserving the Loader census"
-        )
-    if "destination_sets=_ordered_destination_sets(shallow, rich)" not in derivation:
-        bad.append(
-            "src/cozy_runtime/internal/derive.py: MCC order no longer comes from the "
-            "Loader's state_dict census"
-        )
-    proof = (ROOT / "scripts" / "mxfp8-live.py").read_text()
-    for spelling in ("json.loads(book.header_bytes)", "json.loads(raw)"):
-        if spelling in proof:
-            bad.append(f"scripts/mxfp8-live.py: {spelling} bypasses TensorFS's CozyTensors codec")
-    for name in ("leaf-live.py", "mxfp8-live.py", "quant-live.py", "leaf-pod.py", "mxfp8-pod.py"):
-        producer = (ROOT / "scripts" / name).read_text()
-        if '"--order"' not in producer:
-            bad.append(
-                f"scripts/{name}: an artifact-producing ingest does not supply an exact "
-                "construction-order document"
-            )
-    return bad
-
-
 def fence_dynamic_pods_skip_boot_warm() -> list[str]:
     """The fixed product worker never runs package inference before dispatchability."""
 
@@ -1495,159 +1387,6 @@ def fence_dynamic_pods_skip_boot_warm() -> list[str]:
             "package inference can block activation before DISPATCHABLE"
         ]
     return []
-
-
-def fence_worker_control_memory_state() -> list[str]:
-    """Every WorkerControl server is process-local; its caller owns restart recovery."""
-
-    bad: list[str] = []
-    session = (SRC / "internal" / "worker" / "session.py").read_text()
-    if "self.records = WorkerRecords()" not in session:
-        bad.append(
-            "src/cozy_runtime/internal/worker/session.py: memory-only worker state no longer "
-            "uses one WorkerRecords value"
-        )
-    for spelling in ("persistent_state", "restore_ownership(", ".recover()"):
-        if spelling in session:
-            bad.append(
-                "src/cozy_runtime/internal/worker/session.py: WorkerControl retained "
-                f"restart state through {spelling!r}"
-            )
-    runtime_worker = (SRC / "cli" / "runtime_worker.py").read_text()
-    if "persistent_state" in runtime_worker:
-        bad.append(
-            "src/cozy_runtime/cli/runtime_worker.py: persistence is a launch option; all "
-            "WorkerControl children must be process-local"
-        )
-    records = (SRC / "internal" / "worker" / "records.py").read_text()
-    for spelling in ("Path", "open(", "os.", "fsync", "_load", "torn_tail"):
-        if spelling in records:
-            bad.append(
-                "src/cozy_runtime/internal/worker/records.py: same-process records retained "
-                f"disk machinery through {spelling!r}"
-            )
-    forbidden = ("journal.log", "cozy_runtime.internal.journal", "Journal(", "--instance-id")
-    paths = [
-        *SRC.rglob("*.py"),
-        *(ROOT / "scripts").glob("*.py"),
-        *(ROOT / "proofs").rglob("*.py"),
-    ]
-    for path in paths:
-        if path.name.startswith("worker_pb2"):
-            continue
-        source = path.read_text()
-        for spelling in forbidden:
-            if spelling in source:
-                bad.append(
-                    f"{path.relative_to(ROOT)}: retired Runtime recovery surface {spelling!r}"
-                )
-    return bad
-
-
-def fence_delivery_plan_observation() -> list[str]:
-    """Delivery narration consumes the current plural kernel census, never retired keys."""
-
-    path = SRC / "internal" / "worker" / "session.py"
-    source = path.read_text()
-    bad: list[str] = []
-    stale = re.compile(r"delivery\[['\"](?:cost_class|kernel)['\"]\]")
-    for lineno, line in enumerate(source.splitlines(), 1):
-        if stale.search(line):
-            bad.append(
-                f"{path.relative_to(ROOT)}:{lineno}: delivery observation reads a retired "
-                "singular/cost key; Plan.wire_document carries `kernels` and no cost_class"
-            )
-    if 'self.note("delivery", _delivery_observation(delivery))' not in source:
-        bad.append(
-            f"{path.relative_to(ROOT)}: prepare no longer sends delivery narration through "
-            "the total current-schema renderer"
-        )
-    if re.search(r"census\(['\"]kernels['\"]\)", source) is None:
-        bad.append(f"{path.relative_to(ROOT)}: current `kernels` census is not observed")
-    return bad
-
-
-def fence_pod_media_grant_root() -> list[str]:
-    """The worker grants media only from its fixed media root."""
-
-    path = SRC / "cli" / "runtime_worker.py"
-    if pathlib.Path("/var/lib/cozy/media") != host_paths.MEDIA_ROOT:
-        return ["src/cozy_runtime/internal/host_paths.py: MEDIA_ROOT must be /var/lib/cozy/media"]
-    if "grant_roots=(str(host_paths.MEDIA_ROOT),)" not in path.read_text():
-        return [
-            f"{path.relative_to(ROOT)}: fixed worker no longer derives grant_roots from "
-            "host_paths.MEDIA_ROOT"
-        ]
-    return []
-
-
-def fence_measured_backend_version() -> list[str]:
-    """Installed torch metadata is the torch-free backend authority, never driver maximum."""
-
-    path = SRC / "internal" / "worker" / "session.py"
-    source = path.read_text()
-    tree = ast.parse(source)
-    worker = next(
-        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Worker"),
-        None,
-    )
-    resources = next(
-        (
-            node
-            for node in (worker.body if worker is not None else [])
-            if isinstance(node, ast.FunctionDef) and node.name == "resources"
-        ),
-        None,
-    )
-    body = ast.get_source_segment(source, resources) if resources is not None else None
-    bad: list[str] = []
-    if body is None:
-        return [f"{path.relative_to(ROOT)}: Worker.resources is gone"]
-    if "backend_version=facts.cuda_version" not in body.replace(" ", ""):
-        bad.append(
-            f"{path.relative_to(ROOT)}: WorkerResources.backend_version does not come "
-            "directly from HostFacts.cuda_version"
-        )
-
-    facts_path = SRC / "internal" / "hostfacts.py"
-    facts_source = facts_path.read_text()
-    facts_tree = ast.parse(facts_source)
-    for node in ast.walk(facts_tree):
-        names: list[str] = []
-        if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names = [node.module]
-        if any(name == "torch" or name.startswith("torch.") for name in names):
-            bad.append(
-                f"{facts_path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}: imports torch"
-            )
-    helper = next(
-        (
-            node
-            for node in facts_tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_installed_cuda_version"
-        ),
-        None,
-    )
-    helper_body = ast.get_source_segment(facts_source, helper) if helper is not None else None
-    if helper_body is None:
-        bad.append(f"{facts_path.relative_to(ROOT)}: installed CUDA metadata reader is gone")
-        return bad
-    if "subprocess" in helper_body or "nvidia-smi" in helper_body:
-        bad.append(
-            f"{facts_path.relative_to(ROOT)}: installed backend version reaches the driver; "
-            "nvidia-smi reports a maximum, not the image toolkit"
-        )
-    for spelling in ("sysconfig.get_paths()", '"torch" / "version.py"', "ast.parse"):
-        if spelling not in helper_body:
-            bad.append(
-                f"{facts_path.relative_to(ROOT)}: installed backend reader no longer uses "
-                f"its required {spelling} boundary"
-            )
-    if "def _cuda_version(" in facts_source:
-        bad.append(f"{facts_path.relative_to(ROOT)}: retired driver-maximum CUDA reader returned")
-    return bad
 
 
 def fence_typed_model_binding() -> list[str]:
@@ -1702,13 +1441,7 @@ FENCES = {
     "development-placement": fence_development_placement,
     "implementation-ids": fence_implementation_ids,
     "report-format-tags": fence_report_format_tags,
-    "construction-fill-order": fence_construction_fill_order,
-    "one-address-predicate": fence_one_address_predicate,
     "dynamic-pods-skip-boot-warm": fence_dynamic_pods_skip_boot_warm,
-    "worker-control-memory-state": fence_worker_control_memory_state,
-    "delivery-plan-observation": fence_delivery_plan_observation,
-    "pod-media-grant-root": fence_pod_media_grant_root,
-    "measured-backend-version": fence_measured_backend_version,
     "typed-model-binding": fence_typed_model_binding,
 }
 

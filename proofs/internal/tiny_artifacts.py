@@ -5,7 +5,7 @@ topology table is derived by censusing a REFERENCE construction, which is what a
 header supplies to the match at exact binding; the dual artifact is the union of both role
 graphs plus the shared components, exactly as job-001 packages it.
 
-Not a package: this is fixture plumbing for `scripts/verify.py` and `scripts/redarm.py`.
+Not a package: this is fixture plumbing for `scripts/verify.py`.
 """
 
 from __future__ import annotations

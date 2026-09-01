@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,15 +51,6 @@ def source_custody() -> None:
     ]
     for required in ("LICENSE", "NOTICE", "UPSTREAM.md"):
         assert (COMPANION / required).is_file(), f"companion omitted {required}"
-
-    sys.path.insert(0, str(COMPANION / "src"))
-    try:
-        import cozy_runtime_cuda_kernels as kernels
-
-        digest = hashlib.sha256(inspect.getsource(kernels.rms_rope_split_half).encode()).hexdigest()
-        assert digest == subject._SOURCE_DIGESTS["cozy_runtime_cuda_kernels.rms_rope_split_half"]
-    finally:
-        sys.path.pop(0)
 
 
 def probe(

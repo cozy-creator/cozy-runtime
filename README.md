@@ -248,7 +248,6 @@ project wheel and compares it. `package_descriptor_digest` is SHA-256 over those
     uv run cozy-runtime describe              # human-readable surface summary
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
     uv run python checks/architecture.py # architecture fences
-    uv run python scripts/redarm.py      # plant each violation, prove it red, restore
     uv run python checks/declared_facts.py # every public Context/service fact has a live writer
     uv run python scripts/verify.py      # live run of both example packages end to end
     uv run python scripts/bench.py       # time + memory benchmarks

@@ -19,8 +19,8 @@ dependencies = [
 ]
 
 [dependency-groups]
-# Pinned dev tooling: CI and scripts/redarm.py both need these on the venv, not behind
-# an ad-hoc `--with` on every invocation.
+# Pinned dev tooling: CI needs these on the venv, not behind an ad-hoc `--with` on
+# every invocation.
 dev = ["mypy>=1.13", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
 
 [project.scripts]
