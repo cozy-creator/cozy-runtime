@@ -26,14 +26,15 @@ Runtime wheel digest; package admission uses the declared range and selects the 
 active Runtime/profile. The protobuf package major and additive wire minor remain their own
 worker-control compatibility contract.
 
-**One end-to-end test suite, no mocks.** `uv run pytest` is two real runs against
-`examples/marco-polo`: the public CLI installed from a freshly built wheel into a venv that
-has nothing else, describing, replaying the descriptor byte-for-byte, serving a request
-through the invocation kernel and walking the exit-code matrix; then a job through the real
-two-process worker. Nothing is stubbed, patched or doubled — a test that passes because a
-fake agreed with it is worse than no test. Beside it CI runs the build, ruff, mypy, the
-reproducible-wheel check and `checks/architecture.py`'s AST import scans, and nothing else.
-Hardware is verified by hand on a rented card.
+**One end-to-end test suite, no mocks.** `uv run pytest` runs against
+`examples/marco-polo` through the public CLI installed from a freshly built wheel into a venv
+that has nothing else: describe, an exact byte-identical descriptor replay, the exit-code
+matrix, one served request, and one job through the real two-process worker. Nothing is
+stubbed, patched or doubled — a test that passes because a fake agreed with it is worse than
+no test. The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one (a
+runner whose own cgroup is not delegated) and name that host fact as the reason. Beside them
+CI runs the build, ruff, mypy, the reproducible-wheel check and `checks/architecture.py`'s
+AST import scans, and nothing else. Hardware is verified by hand on a rented card.
 
 ## Layout
 
