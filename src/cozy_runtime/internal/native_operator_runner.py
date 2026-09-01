@@ -11,13 +11,14 @@ from cozy_runtime.internal import canonical
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 4:
+    if len(args) != 5:
         print(
-            "native fixture runner requires MODULE:CALLABLE CPU_SECONDS AS_BYTES OUTPUT_BYTES",
+            "native fixture runner requires "
+            "MODULE:CALLABLE CPU_SECONDS AS_BYTES OUTPUT_BYTES REQUEST",
             file=sys.stderr,
         )
         return 2
-    fixture, cpu_raw, address_raw, output_raw = args
+    fixture, cpu_raw, address_raw, output_raw, request = args
     module_name, separator, callable_name = fixture.partition(":")
     if not separator or not module_name or not callable_name or "." in callable_name:
         print("invalid native fixture name", file=sys.stderr)
@@ -44,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate = getattr(importlib.import_module(module_name), callable_name)
         if not callable(candidate):
             raise TypeError("registered fixture is not callable")
-        result = candidate()
+        result = candidate(request) if request else candidate()
         sys.stdout.buffer.write(canonical.write(result))
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)

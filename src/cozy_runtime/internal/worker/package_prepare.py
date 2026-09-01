@@ -52,6 +52,8 @@ def prepare_package_set(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> pb.PreparePackageSetResult:
     """Parse one signed delegation, then use the shared package preparation path."""
 
@@ -101,6 +103,8 @@ def prepare_package_set(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
+        native_environment=native_environment,
+        native_device_index=native_device_index,
     )
 
 
@@ -114,6 +118,8 @@ def prepare_private_package(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact private wheel revision without inventing Hub provenance."""
 
@@ -157,6 +163,8 @@ def prepare_private_package(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
+        native_environment=native_environment,
+        native_device_index=native_device_index,
         development=package,
     )
 
@@ -287,14 +295,18 @@ def prepare_package(
     models: Sequence[Any] = (),
     artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
-    allow_native_custom: bool = False,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
     installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
 
-    The pod session uses the closed default. Creator's private same-user command alone opts
-    into native dependency wheels after the same digest, tag, RECORD, and collision checks.
+    A native dependency wheel is admitted on evidence, not on the caller's identity: the
+    installed bytes are statically inspected, joined to this host's interpreter/libc/loader/GPU
+    seat, and loaded and imported in the bounded operator child under `native_environment` —
+    the caller's own sealed execution environment. Without one there is no qualification host,
+    so the wheel refuses rather than installs.
     """
 
     try:
@@ -347,7 +359,6 @@ def prepare_package(
                 path,
                 owner,
                 observed_base,
-                allow_native_custom=allow_native_custom,
                 allow_base_owned=installed_environment is not None or owner == "custom",
             )
         except package_environment.EnvironmentRefusal as exc:
@@ -406,13 +417,16 @@ def prepare_package(
                 environment_root,
                 python=python,
                 base=observed_base,
-                allow_native_custom=allow_native_custom,
+                native_environment=native_environment,
+                native_device_index=native_device_index,
             )
         else:
             package_environment.verify_existing_environment(
                 source,
                 base=observed_base,
-                allow_native_custom=allow_native_custom,
+                installed=installed_environment,
+                native_environment=native_environment,
+                native_device_index=native_device_index,
             )
             installed = installed_environment
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:

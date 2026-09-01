@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, package_environment
+from cozy_runtime.internal import canonical, package_environment, spawn
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -157,7 +157,10 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             verified=lambda _digest, _length, _path: None,
             artifact_store=artifact_store,
             models=models,
-            allow_native_custom=True,
+            # The same seal the descriptor executor above runs under: a native dependency
+            # wheel is qualified against THIS seat, not waved through because the caller
+            # happens to be the local same-user command.
+            native_environment=spawn.seal(config.child_base_env, {}),
             installed_environment=installed_environment,
         )
     except (PreparationRefusal, ExecutorGone, OSError) as exc:

@@ -13,7 +13,7 @@ package APIs. Runtime remains pre-release: `0.0.x` may make a coordinated hardcu
 a compatibility alias for an unused or dishonest surface. Published packages declare the supported
 Runtime range and must be requalified when a hardcut removes something they used.
 
-Runtime release `0.0.36` targets standard CPython 3.12 only. Project
+Runtime release `0.0.37` targets standard CPython 3.12 only. Project
 tooling pins `3.12`; no other Python interpreter or ABI is supported.
 Wire minor 18 allows an authenticated external RecordOwner to make the existing bounded
 WeightsSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
@@ -307,6 +307,12 @@ collision still refuses. It then authors the descriptor and PlacementSet without
 another environment. Local `serve`
 receives the same `--environment-python`; `--environment-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
+
+The local boot warm pass is also capacity evidence. A typed device OOM falsifies only that
+executor generation's attempted placement rung and normalized shape cell. Runtime retries the same
+synthetic request through the existing component-staged rung and publishes DISPATCHABLE only when
+that fallback is viable; if every proven rung fails capacity, activation stays offline with a typed
+fault. Other optional warm failures remain degraded observations rather than placement decisions.
 
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying

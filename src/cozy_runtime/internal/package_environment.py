@@ -40,7 +40,7 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical
+from cozy_runtime.internal import base_observation, canonical, native_wheel
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 CONTENT_IDENTITY_NAME = "package-environment-content.json"
@@ -209,15 +209,9 @@ def measure_wheel(
     owner: str,
     base: base_observation.Observation,
     *,
-    allow_native_custom: bool = False,
     allow_base_owned: bool = False,
 ) -> tuple[Wheel, VerifiedFile]:
-    """Derive one local wheel fact, then run the ordinary full wheel inspection once.
-
-    Native custom wheels stay closed by default. The same-user local preparation command
-    opts in because installing a package already authorizes its Python code to execute with
-    that user's authority; the pod worker never opts in.
-    """
+    """Derive one local wheel fact, then run the ordinary full wheel inspection once."""
 
     if owner not in {"project", "custom"} or not path.is_absolute():
         raise EnvironmentRefusal("package_environment_wheel_invalid", str(path))
@@ -244,7 +238,6 @@ def measure_wheel(
         wheel,
         path,
         base,
-        allow_native_custom=allow_native_custom,
         allow_base_owned=allow_base_owned,
     )
     return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
@@ -277,7 +270,7 @@ def preflight_environment(
         ),
     )
     ordered = _verify_inventory(source, base)
-    _verify_grants(source, ordered, base, allow_native_custom=False)
+    _verify_grants(source, ordered, base)
     return base, ordered, tuple(observed)
 
 
@@ -352,15 +345,17 @@ def materialize(
     *,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
-    allow_native_custom: bool = False,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
     Content identity is the interpreter ABI/platform, uv version, and sorted package-owned
     wheel digests. The actual base is re-observed for admission and is not part of that identity.
 
-    ``allow_native_custom`` belongs to the local same-user lane. Its default is the rented-pod
-    boundary, where native dependency wheels require separate hardware-class proof.
+    A native dependency wheel has no bypass. Its exact installed bytes are statically inspected,
+    joined to the observed interpreter/libc/loader/GPU seat, then loaded and imported in the
+    bounded native operator child before the generation can be published or reused.
     """
 
     _require_digest(source.environment_digest, "environment_digest")
@@ -384,20 +379,23 @@ def materialize(
     receipts = root / "receipts"
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
-    inspected = _verify_grants(
-        source,
-        wheels,
-        observed,
-        allow_native_custom=allow_native_custom,
-    )
+    inspected = _verify_grants(source, wheels, observed)
     if receipt_path.exists():
-        return open_generation(
+        installed = open_generation(
             root,
             receipt_digest=receipt_digest,
             environment_digest=source.environment_digest,
             reused=True,
             python=python,
         )
+        _qualify_native_environment(
+            installed,
+            inspected,
+            observed,
+            native_environment,
+            native_device_index,
+        )
+        return installed
     reused = final.exists()
     _require_owned_root(root)
     _remove_dead_staging(root)
@@ -411,6 +409,21 @@ def materialize(
         staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             _install_with_uv(uv, python, staging, inspected)
+            staged = _installed_at(
+                staging,
+                content_digest=content_digest,
+                receipt_bytes=receipt_bytes,
+                receipt_digest=receipt_digest,
+                reused=False,
+                base=observed,
+            )
+            _qualify_native_environment(
+                staged,
+                inspected,
+                observed,
+                native_environment,
+                native_device_index,
+            )
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
             _fsync_dir(staging)
@@ -428,13 +441,22 @@ def materialize(
                 _remove_tree(staging)
             raise
     _publish_receipt(receipt_path, receipt_bytes, receipts)
-    return open_generation(
+    installed = open_generation(
         root,
         receipt_digest=receipt_digest,
         environment_digest=source.environment_digest,
         reused=reused,
         python=python,
     )
+    if reused:
+        _qualify_native_environment(
+            installed,
+            inspected,
+            observed,
+            native_environment,
+            native_device_index,
+        )
+    return installed
 
 
 def verify_inventory(source: Input, base: base_observation.Observation) -> None:
@@ -447,7 +469,9 @@ def verify_existing_environment(
     source: Input,
     *,
     base: base_observation.Observation,
-    allow_native_custom: bool,
+    installed: InstalledEnvironment,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> None:
     """Verify exact wheel facts against an already-complete local uv environment."""
 
@@ -457,13 +481,98 @@ def verify_existing_environment(
         allow_base_owned=True,
         allow_installed_package=True,
     )
-    _verify_grants(
+    inspected = _verify_grants(
         source,
         wheels,
         base,
-        allow_native_custom=allow_native_custom,
         allow_base_owned=True,
     )
+    _qualify_native_environment(
+        installed,
+        inspected,
+        base,
+        native_environment,
+        native_device_index,
+    )
+
+
+def _installed_at(
+    generation: Path,
+    *,
+    content_digest: str,
+    receipt_bytes: bytes,
+    receipt_digest: str,
+    reused: bool,
+    base: base_observation.Observation,
+) -> InstalledEnvironment:
+    major, minor = _target_python(base)
+    site_packages = generation / "lib" / f"python{major}.{minor}" / "site-packages"
+    python = generation / "bin" / "python"
+    if not site_packages.is_dir() or not python.is_file():
+        raise EnvironmentRefusal("package_environment_incomplete", str(generation))
+    return InstalledEnvironment(
+        generation=generation,
+        site_packages=site_packages,
+        python=python,
+        receipt_bytes=receipt_bytes,
+        receipt_digest=receipt_digest,
+        content_digest=content_digest,
+        reused=reused,
+    )
+
+
+def _qualify_native_environment(
+    installed: InstalledEnvironment,
+    inspected: Sequence[_Inspected],
+    base: base_observation.Observation,
+    environment: Mapping[str, str] | None,
+    device_index: int,
+) -> None:
+    native = tuple(item for item in inspected if item.native_members)
+    if not native:
+        return
+    if not environment:
+        raise EnvironmentRefusal(
+            "package_environment_native_proof_environment_absent",
+            "native dependency wheels require the worker's sealed execution environment",
+        )
+    members = tuple(sorted({member for item in native for member in item.native_members}))
+    roots = tuple(sorted({root for item in native for root in item.import_roots}))
+    if not roots:
+        raise EnvironmentRefusal(
+            "package_environment_native_import_roots_absent",
+            ",".join(item.wheel.filename for item in native),
+        )
+    try:
+        inspection = native_wheel.inspect_tree(installed.site_packages, members)
+        gpu = native_wheel.observe_gpu(device_index) if base.accelerator_backend != "none" else None
+        seat = native_wheel.observe_seat(installed.python, environment)
+        native_wheel.verify_seat(base, seat, gpu=gpu)
+        native_wheel.qualify_host(
+            inspection,
+            gpu_sm=gpu["sm"] if gpu is not None else None,
+        )
+        request = json.dumps(
+            {
+                "members": list(members),
+                "roots": list(roots),
+                "site_packages": str(installed.site_packages),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        native_wheel.qualify_operator(
+            python=installed.python,
+            fixture="cozy_runtime.internal.native_dependency_probe:probe",
+            expected_result_digest=canonical.digest(
+                {"members": list(members), "roots": list(roots)}
+            ),
+            environment=environment,
+            request=request,
+            timeout_seconds=120.0,
+        )
+    except native_wheel.NativeWheelRefusal as exc:
+        raise EnvironmentRefusal(exc.code, exc.detail) from exc
 
 
 def open_existing_environment(python: Path, content_digest: str) -> InstalledEnvironment:
@@ -762,7 +871,6 @@ def _verify_grants(
     wheels: Sequence[Wheel],
     base: base_observation.Observation,
     *,
-    allow_native_custom: bool,
     allow_base_owned: bool = False,
 ) -> tuple[_Inspected, ...]:
     grants = {grant.digest: grant for grant in source.grants}
@@ -802,7 +910,6 @@ def _verify_grants(
                 wheel,
                 grant.path,
                 base,
-                allow_native_custom=allow_native_custom,
                 allow_base_owned=allow_base_owned,
             )
         )
@@ -825,7 +932,6 @@ def _inspect(
     path: Path,
     base: base_observation.Observation,
     *,
-    allow_native_custom: bool = False,
     allow_base_owned: bool = False,
 ) -> _Inspected:
     try:
@@ -948,11 +1054,6 @@ def _inspect(
                     "package_environment_native_wheel_metadata_invalid",
                     f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
                 )
-            if wheel.owner == "custom" and native_members and not allow_native_custom:
-                raise EnvironmentRefusal(
-                    "package_environment_custom_wheel_native_unsupported",
-                    f"{wheel.filename}: custom native wheels are not admitted yet",
-                )
             if native_members and any(
                 tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
                 for tag in declared_tags
@@ -961,6 +1062,11 @@ def _inspect(
                     "package_environment_native_wheel_tag_not_concrete",
                     f"{wheel.filename}: native custom wheels require concrete CPython ABI and "
                     "platform tags",
+                )
+            if native_members and any(".data/" in name for name in names):
+                raise EnvironmentRefusal(
+                    "package_environment_native_install_scheme_forbidden",
+                    f"{wheel.filename}: native wheels may not use a .data install scheme",
                 )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:

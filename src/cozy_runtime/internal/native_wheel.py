@@ -39,6 +39,7 @@ MAX_STRING_TABLE_BYTES = 64 << 20
 MAX_SYMBOLS = 2_000_000
 MAX_HOST_LIBRARIES = 200_000
 MAX_TOOL_OUTPUT = 4 << 20
+MAX_OPERATOR_REQUEST_BYTES = 1 << 20
 _SEAT_FIELDS = {
     "cuda_available",
     "distributions",
@@ -663,10 +664,16 @@ def qualify_operator(
     fixture: str,
     expected_result_digest: str,
     environment: Mapping[str, str],
+    request: str = "",
     timeout_seconds: float = 60.0,
     max_address_space_bytes: int = 16 << 30,
 ) -> dict[str, object]:
-    """Execute one banked no-argument fixture in a bounded disposable Python process."""
+    """Execute one banked fixture in a bounded disposable Python process.
+
+    `request` is the fixture's one argument and travels in argv, not in the environment: the
+    child's environment is the SEAL, and a name smuggled into it after `spawn.seal` is a name
+    the allowlist never reviewed.
+    """
 
     if (
         not python.is_absolute()
@@ -675,6 +682,8 @@ def qualify_operator(
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_result_digest)
         or not 0 < timeout_seconds <= 600
         or not 256 << 20 <= max_address_space_bytes <= 128 << 30
+        or len(request.encode()) > MAX_OPERATOR_REQUEST_BYTES
+        or "\x00" in request
     ):
         raise NativeWheelRefusal("package_environment_native_operator_request_invalid", fixture)
     command = [
@@ -686,6 +695,7 @@ def qualify_operator(
         str(int(timeout_seconds) + 1),
         str(max_address_space_bytes),
         str(MAX_TOOL_OUTPUT),
+        request,
     ]
     process: subprocess.Popen[bytes] | None = None
     try:

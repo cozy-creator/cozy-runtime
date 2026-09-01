@@ -92,6 +92,9 @@ class ComponentResidency:
     #: `all_resident` it is recorded and nothing is freed, because that rung's whole claim
     #: is that it did not have to.
     headroom: int = 0
+    #: The same demand split by authored component-use method. A staged rung never combines
+    #: one method's resident set with another method's scratch peak.
+    scope_headrooms: dict[str, int] = field(default_factory=dict)
     #: THE ACTIVE SCOPE — (method, its declared set) — or None between scopes. Serial by
     #: law 8: a component is in this set or it is evictable (its fence permitting).
     active: tuple[str, frozenset[str]] | None = None
@@ -123,6 +126,11 @@ class ComponentResidency:
     attempt_evictions: int = 0
     attempt_staged_ms: float = 0.0
     attempt_evicted_ms: float = 0.0
+    #: Per-component-use activation measurement. A staged attempt moves the resident baseline,
+    #: so only a scope-local baseline can separate its kernels from the weights it currently holds.
+    scope_baseline_bytes: int = -1
+    attempt_activation_peaks: dict[str, int] = field(default_factory=dict)
+    attempt_absolute_peak_bytes: int = 0
 
     @property
     def kind(self) -> str:
@@ -133,7 +141,9 @@ class ComponentResidency:
 
     # ------------------------------------------------------------------ the contract
 
-    def open_attempt(self, placement: str, headroom: int) -> None:
+    def open_attempt(
+        self, placement: str, headroom: int, scope_headrooms: dict[str, int] | None = None
+    ) -> None:
         """Apply the attempt's rung and ZERO the per-attempt transition counters.
 
         The cumulative counters stay cumulative — they are the generation's history — but a
@@ -144,12 +154,16 @@ class ComponentResidency:
         """
         self.placement = placement
         self.headroom = headroom
+        self.scope_headrooms = dict(scope_headrooms or {})
         self.last_shortfall = None
         self.allocator_delta_bytes = 0
         self.attempt_stages = 0
         self.attempt_evictions = 0
         self.attempt_staged_ms = 0.0
         self.attempt_evicted_ms = 0.0
+        self.scope_baseline_bytes = -1
+        self.attempt_activation_peaks.clear()
+        self.attempt_absolute_peak_bytes = 0
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         """Make the declared set resident BEFORE the method body runs, or refuse typed.
@@ -180,21 +194,25 @@ class ComponentResidency:
         # rung that exists and one that helps — a 1024px VAE decode next to 6.46 GiB of
         # resident weights runs out of memory INSIDE the kernel, where nothing can decide.
         self._make_headroom(components)
+        headroom = self.scope_headrooms.get(method, self.headroom)
         for name in components:
             fence = self.fences.setdefault(name, Fence())
             self.clock += 1
             fence.last_used = self.clock
             if name in self.backend.components:
                 continue
-            self._make_room(name, components)
+            self._make_room(name, components, headroom)
             # THE PRE-MUTATION CAPACITY CHECK. Everything evictable is already gone; if the
             # measured allocatable room still does not fit this component plus the attempt's
             # headroom, the answer is a typed shortfall with nothing to undo — the executor
             # stays Ready and the ladder chooses a deeper rung. Past this line, a failure is
             # a surprise the arithmetic did not predict, and surprises poison.
-            if not self._fits(self._size(name) + self.headroom):
+            if not self._fits(self._size(name) + headroom):
                 refusal = self._shortfall(
-                    method, name, "refused on measured capacity before any byte moved"
+                    method,
+                    name,
+                    headroom,
+                    "refused on measured capacity before any byte moved",
                 )
                 self.last_shortfall = refusal.shortfall
                 self.refusals.append(refusal.detail[:400])
@@ -213,7 +231,7 @@ class ComponentResidency:
                     "(#613); no in-process unwind repairs a half-arrived component",
                 ) from exc
             except accel.oom_error(self.torch, self.kind) as exc:
-                refusal = self._shortfall(method, name, str(exc))
+                refusal = self._shortfall(method, name, headroom, str(exc))
                 self.last_shortfall = refusal.shortfall
                 self.refusals.append(refusal.detail[:400])
                 self.poisoned = self.poisoned or (
@@ -228,6 +246,8 @@ class ComponentResidency:
             took = (time.perf_counter() - started) * 1000
             self.staged_ms += took
             self.attempt_staged_ms += took
+        self.scope_baseline_bytes = self._allocated()
+        accel.reset_peak(self.torch, self.kind)
         self.active = (method, frozenset(components))
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
@@ -262,6 +282,14 @@ class ComponentResidency:
                 f"{method}() releases {unknown} and this generation does not hold "
                 f"{'it' if len(unknown) == 1 else 'them'} resident",
             )
+        peak = accel.peak_allocated(self.torch, self.kind)
+        self.attempt_absolute_peak_bytes = max(self.attempt_absolute_peak_bytes, peak)
+        if self.scope_baseline_bytes >= 0:
+            self.attempt_activation_peaks[method] = max(
+                self.attempt_activation_peaks.get(method, 0),
+                max(peak - self.scope_baseline_bytes, 0),
+            )
+        self.scope_baseline_bytes = -1
         event = accel.completion_event(self.torch, self.kind)
         for name in components:
             if name in self.backend.components:
@@ -347,7 +375,7 @@ class ComponentResidency:
         ]
         return sorted(candidates, key=lambda n: self.fences.get(n, Fence()).last_used)
 
-    def _make_room(self, wanted: str, declared: tuple[str, ...]) -> None:
+    def _make_room(self, wanted: str, declared: tuple[str, ...], headroom: int) -> None:
         """Demand-pull eviction, LRU over evictable components whose fences have fired.
 
         `all_resident` evicts NOTHING: it is the rung that promised everything fits, and a
@@ -361,7 +389,7 @@ class ComponentResidency:
             # promise. If a component is not resident under it, admission checks the room
             # that is actually there and a shortage is a typed refusal with numbers.
             return
-        while not self._fits(need + self.headroom):
+        while not self._fits(need + headroom):
             victim = self._victim(declared)
             if victim is None:
                 return  # nothing left to give; the pre-mutation check refuses with numbers
@@ -405,23 +433,26 @@ class ComponentResidency:
         victims = self._victims(declared)
         return victims[0] if victims else None
 
-    def _shortfall(self, method: str, name: str, detail: str) -> ResidencyRefusal:
+    def _shortfall(self, method: str, name: str, headroom: int, detail: str) -> ResidencyRefusal:
         need = sum(row.nbytes for row in self.backend.plan.values() if row.component == name)
         rows = accel.allocation(self.torch, self.kind)
         free, total = rows["driver_free_bytes"], rows["driver_total_bytes"]
+        allocatable = int(free) + max(int(rows["reserved_bytes"]) - int(rows["allocated_bytes"]), 0)
+        required = int(need) + headroom
         resident = {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components}
         return ResidencyRefusal(
             "device_shortfall",
-            f"{method}() declares component {name!r} needing {need} B; {free} B of "
-            f"{total} B are free with {sorted(resident)} resident, short by "
-            f"{max(need - int(free), 0)} B. Every evictable component was already freed, so "
+            f"{method}() declares component {name!r} needing {need} B plus "
+            f"{headroom} B of scope headroom; {allocatable} B are allocatable "
+            f"({free} B driver-free of {total} B) with {sorted(resident)} resident, short by "
+            f"{max(required - allocatable, 0)} B. Every evictable component was already freed, so "
             "this is a capacity fact, not an allocation to retry - the ladder chooses a "
             f"deeper rung or the request refuses. ({detail[:160]})",
             {
                 "resource": "vram",
                 "scope": "component_use",
-                "needed_bytes": int(need),
-                "available_bytes": int(free),
+                "needed_bytes": required,
+                "available_bytes": allocatable,
                 "evidence_class": "measured",
                 "request_shape": method,
             },
@@ -433,6 +464,7 @@ class ComponentResidency:
         return {
             "placement": self.placement,
             "headroom_bytes": self.headroom,
+            "scope_headroom_bytes": dict(self.scope_headrooms),
             "admissions": self.admissions,
             "stages": self.stages,
             "evictions": self.evictions,
@@ -440,6 +472,9 @@ class ComponentResidency:
             "attempt_evictions": self.attempt_evictions,
             "attempt_staged_ms": round(self.attempt_staged_ms, 2),
             "attempt_evicted_ms": round(self.attempt_evicted_ms, 2),
+            "attempt_activation_peak_bytes": max(self.attempt_activation_peaks.values(), default=0),
+            "attempt_activation_peaks": dict(self.attempt_activation_peaks),
+            "attempt_absolute_peak_bytes": self.attempt_absolute_peak_bytes,
             "allocator_delta_bytes": self.allocator_delta_bytes,
             "staged_ms": round(self.staged_ms, 2),
             "evicted_ms": round(self.evicted_ms, 2),
