@@ -1,0 +1,12 @@
+.git
+.worktrees
+.venv
+**/.venv
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.artifacts
+build
+dist
+*.pyc
