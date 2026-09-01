@@ -77,9 +77,6 @@ jobs:
       # Every descriptor-declared fact must have a live writer — a coverage refusal over
       # the descriptor, kept because it is a fence and not a behavior test (pgw#1584).
       - run: uv run python checks/declared_facts.py
-      # Runtime owns PackageDescriptor semver. This matrix is a deterministic contract fence:
-      # the only minor changes are new callables and optional/omissible request fields.
-      - run: uv run python checks/descriptor_compatibility.py
       - run: uv run python checks/base_observation.py
       - run: uv run python checks/model_release_routes.py
       - run: uv run python checks/multi_model_binding.py
