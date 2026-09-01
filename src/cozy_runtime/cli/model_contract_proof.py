@@ -730,7 +730,7 @@ def _code_topology(raw: bytes) -> bytes:
         rows = [
             tensorfs.CodeTensor(
                 component=tensor.component,
-                key=_component_local_key(tensor.component, tensor.key),
+                key=component_local_key(tensor.component, tensor.key),
                 dtype=storage_dtype[tensor.dtype or contract.DEFAULT_DTYPE],
                 shape=tensor.shape,
                 accepts="any",
@@ -749,7 +749,7 @@ def _code_topology(raw: bytes) -> bytes:
         ) from err
 
 
-def _component_local_key(component: str, key: str) -> str:
+def component_local_key(component: str, key: str) -> str:
     """Project Runtime's full destination key into one TensorFS component."""
 
     prefix = f"{component}."

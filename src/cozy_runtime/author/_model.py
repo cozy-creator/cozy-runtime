@@ -101,16 +101,6 @@ ENCODED_LEAVES: Mapping[str, str] = {
 #: the next one is a reviewed addition rather than an accident of `__init_subclass__`.
 RUNTIME_KEYWORDS: Mapping[str, Mapping[str, str]] = {"encoded_leaves": ENCODED_LEAVES}
 
-#: Names a `Model` subclass may not declare. `model.adapters` is the one people reach for:
-#: the applied stack is REQUEST-local state and lives on `RequestView` (§1.4).
-DELETED_MODEL_MEMBERS: Mapping[str, str] = {
-    "adapters": "the applied stack is request-local: view.adapters, never model.adapters (§1.4)",
-    "artifacts": "no artifacts= dict exists — selection is a binding, never code (§1.1)",
-    "current_transformer": "residency state is never author-visible (§1.1.2)",
-    "adaln_mode": "the modulation source is a CONSTRUCTION fact, not a request mode (§1.1.2)",
-    "generator": "the seeded generator is view.generator (§1.3)",
-}
-
 #: Keyword names an author-facing model method may not declare. Every one of them names a
 #: residency, placement or conversion decision the runtime owns (§1.1/§7).
 EXCLUDED_KEYWORDS: Mapping[str, str] = {
@@ -402,13 +392,6 @@ class Model[PipelineT]:
                 )
             inherited[key] = value
         cls.__stamps__ = inherited
-        for name in (*vars(cls), *getattr(cls, "__annotations__", {})):
-            if (why := DELETED_MODEL_MEMBERS.get(name)) is not None:
-                raise ConformanceError(
-                    f"class {cls.__name__}.{name}: {why}",
-                    code="deleted_model_member",
-                    fields=[name],
-                )
 
     # ----------------------------------------------------------------- lifecycle
 

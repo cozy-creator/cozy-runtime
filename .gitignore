@@ -11,3 +11,4 @@ corpus/pipeline/imports/
 # tokenizer vocabularies: bundled package assets, staged by the harness, not committed
 corpus/pipeline/tokenizer/
 corpus/pipeline/tokenizer_2/
+outputs/

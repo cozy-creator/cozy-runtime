@@ -14,7 +14,7 @@ from __future__ import annotations
 import enum
 import types
 import typing
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence, Set
 from typing import Literal, get_args, get_origin
 
 import msgspec
@@ -69,14 +69,23 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
         return {"literal": sorted_union([_literal(a) for a in get_args(tp)])}
     if origin is typing.Union or origin is types.UnionType:
         return _union(get_args(tp), seen)
-    if origin in (list, Sequence):
+    if origin in (list, Sequence, set, frozenset, Set):
         args = get_args(tp)
         if not args:
-            raise ConformanceError(
-                "an untyped list has no interoperable descriptor spelling",
-                code="unrenderable_type",
-            )
+            return {"list": _opaque(tp)}
         return {"list": _render(args[0], seen)}
+    if origin in (dict, Mapping):
+        args = get_args(tp)
+        if len(args) != 2:
+            return _opaque(tp)
+        return {"map": {"key": _render(args[0], seen), "value": _render(args[1], seen)}}
+    if origin is tuple:
+        args = get_args(tp)
+        if not args:
+            return {"list": _opaque(tp)}
+        if len(args) == 2 and args[1] is Ellipsis:
+            return {"list": _render(args[0], seen)}
+        return {"tuple": [_render(arg, seen) for arg in args]}
     if isinstance(tp, type):
         for asset, kind in _ASSET_KINDS:
             if issubclass(tp, asset):
@@ -93,11 +102,16 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
                 seen,
                 union_owns_tag_field=union_owns_tag_field,
             )
-    raise ConformanceError(
-        f"{tp!r} has no descriptor spelling — the request/result surface is primitives, "
-        "enums, literals, containers, typed Assets, input Trees and msgspec structs",
-        code="unrenderable_type",
-    )
+    # ANYTHING ELSE IS OPAQUE, NOT A BUILD FAILURE. `bytes`, `datetime`, a third-party
+    # value type — msgspec still codes it and JSON still carries it. The descriptor says
+    # "this field exists and Creator cannot introspect it" instead of refusing the package.
+    return _opaque(tp)
+
+
+def _opaque(tp: object) -> Json:
+    """A field whose type has no interoperable spelling, named by its Python spelling."""
+    name = getattr(tp, "__name__", None)
+    return {"opaque": name if isinstance(name, str) and name else repr(tp)}
 
 
 def _literal(value: object) -> Json:
@@ -156,10 +170,7 @@ def _struct(
     union_owns_tag_field: bool = False,
 ) -> Json:
     if tp in seen:
-        raise ConformanceError(
-            "recursive structs have no interoperable descriptor spelling",
-            code="unrenderable_type",
-        )
+        return _opaque(tp)
     nested = seen | {tp}
     config = tp.__struct_config__
     fields = [_field(f, nested) for f in msgspec.structs.fields(tp)]
@@ -202,8 +213,20 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
     return doc
 
 
-_CONSTRAINTS = ("gt", "ge", "le", "min_length", "max_length")
-_UNSUPPORTED_CONSTRAINTS = ("lt", "multiple_of", "pattern", "tz")
+#: Every `msgspec.Meta` constraint, passed through VERBATIM. A consumer that does not
+#: understand one ignores it; refusing the build over a constraint Creator has not learned
+#: to read yet made the descriptor the narrower of the two surfaces for no reason.
+_CONSTRAINTS = (
+    "gt",
+    "ge",
+    "lt",
+    "le",
+    "multiple_of",
+    "pattern",
+    "min_length",
+    "max_length",
+    "tz",
+)
 
 
 def _constraints(markers: Sequence[object]) -> dict[str, Json]:
@@ -211,14 +234,6 @@ def _constraints(markers: Sequence[object]) -> dict[str, Json]:
     for marker in markers:
         if not isinstance(marker, msgspec.Meta):
             continue
-        unsupported = [
-            name for name in _UNSUPPORTED_CONSTRAINTS if getattr(marker, name, None) is not None
-        ]
-        if unsupported:
-            raise ConformanceError(
-                "descriptor constraint(s) are not consumed by Creator: " + ", ".join(unsupported),
-                code="unrenderable_constraint",
-            )
         for name in _CONSTRAINTS:
             value = getattr(marker, name, None)
             if value is not None:

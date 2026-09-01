@@ -743,7 +743,6 @@ class Acquirer:
                 snapshots=first.snapshots,
                 stamps=first.stamps,
                 model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
-                vram_floor_bytes=sum(member.vram_floor_bytes for member in model_set),
                 expected_logical_model_digest="",
                 development=bool(development),
             )

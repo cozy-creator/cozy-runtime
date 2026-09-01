@@ -1,1 +1,0 @@
-VALUE = "forbidden-package-shadow"

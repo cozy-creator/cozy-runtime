@@ -28,7 +28,7 @@ from typing import Any
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME
-from cozy_runtime.internal.resolution import ROUTE_KERNEL, Variant
+from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
 
 
@@ -98,8 +98,6 @@ class AttemptPlan:
     """The wire's word for the generation's WEIGHT bytes (th-024 owns the field name). It is
     not the resident set and it is not this attempt's activation envelope — `resident_bytes`
     and `headroom_bytes` are those, named separately because they are different facts."""
-    reserved_host_bytes: int
-    reserved_pinned_bytes: int
     headroom_bytes: int
     entrypoint_binding_digest: str
     model_construction_digest: str
@@ -137,8 +135,6 @@ class AttemptPlan:
             "compute_dtype": self.compute_dtype,
             "placement": self.placement,
             "reserved_vram_bytes": self.reserved_vram_bytes,
-            "reserved_host_bytes": self.reserved_host_bytes,
-            "reserved_pinned_bytes": self.reserved_pinned_bytes,
             "headroom_bytes": self.headroom_bytes,
             "entrypoint_binding_digest": self.entrypoint_binding_digest,
             "model_construction_digest": self.model_construction_digest,
@@ -170,8 +166,6 @@ class AttemptPlan:
             compute_dtype="",
             placement="job_attempt",
             reserved_vram_bytes=int(caps.get("vram", 0)),
-            reserved_host_bytes=int(caps.get("rss", 0)),
-            reserved_pinned_bytes=0,
             headroom_bytes=0,
             entrypoint_binding_digest=binding.job_descriptor_id,
             model_construction_digest="",
@@ -269,12 +263,9 @@ class ModelBinding:
     components: tuple[str, ...]
     snapshots: Mapping[str, str]
     stamps: Mapping[str, tuple[str, ...]]
-    offered: tuple[Variant, ...] = ()
     objective: str = "latency"
     steps_basis: int = 20
     model_weight_bytes: int = 0
-    vram_floor_bytes: int = 0
-    resident_budget_bytes: int | None = None
     custody: str = "canonical"
     strict_keys: bool = False
     expected_logical_model_digest: str = ""
@@ -295,21 +286,9 @@ class ModelBinding:
             "components": list(self.components),
             "snapshots": dict(self.snapshots),
             "stamps": {key: list(values) for key, values in self.stamps.items()},
-            "variants": [
-                {
-                    "name": value.name,
-                    "store": value.store,
-                    "snapshot": value.snapshot,
-                    "snapshots": dict(value.snapshots),
-                    "reference": value.reference,
-                }
-                for value in self.offered
-            ],
             "objective": self.objective,
             "steps_basis": self.steps_basis,
             "model_weight_bytes": self.model_weight_bytes,
-            "vram_floor_bytes": self.vram_floor_bytes,
-            "resident_budget_bytes": self.resident_budget_bytes,
             "custody": self.custody,
             "strict_keys": self.strict_keys,
             "expected_logical_model_digest": self.expected_logical_model_digest,
@@ -373,10 +352,6 @@ class DeclaredBinding:
     objects dedup so it costs nothing."""
     stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
     """The checkpoint's stamped-fact set (#567d), resolved with the rest of it."""
-    offered: tuple[Variant, ...] = ()
-    """cr-008c: the artifact variants this deployment OFFERS for one logical model. Never
-    empty after `resolve` — a record naming none offers exactly the bytes the ref resolved
-    to, and that one IS the reference because there is nothing to compare it against."""
     package_revision_digest: str = ""
     """Published release.json provenance or explicit development source identity."""
     development: bool = False
@@ -394,24 +369,6 @@ class DeclaredBinding:
     index row on the machine that holds it. A launcher constant here was the ninth field of
     the same mistake — `vramBudget = 7 * gib` priced every model ever bound, and the fill
     of a 92.42 GiB artifact refused `budget_overrun` against it."""
-    host_bytes: int = 0
-    pinned_bytes: int = 0
-    vram_floor_bytes: int = 0
-    """The PHYSICAL FLOOR: activations + scratch + one component chunk. Below it there is no
-    rung, and a local capacity refusal is the honest answer. RESOLUTION — the border
-    measured it and the index row carries it, so it comes from the resolver's own index
-    with the rest of the artifact's facts; 0 takes the conservative default."""
-    resident_budget_bytes: int | None = None
-    """The construction's RESIDENCE CEILING: components past it are parked and staged in on
-    first declared use. None — the provisioned default since cl-027, when the creator stopped
-    authoring it — means the executor DERIVES it at prepare from measured device capacity,
-    the artifact's destination bytes and `vram_floor_bytes`; an explicit 0 means every
-    component stays resident. Whatever value is APPLIED is stamped into the
-    executor's domain-separated constructed-generation digest (cr-025)."""
-    tenancy: str = "local"
-    """`local` (single-tenant: capacity never refuses above the floor, it deepens the ladder
-    and confesses) or `shared` (a shortfall is a RESCHEDULE for the RecordOwner, never a
-    structural-incompatibility claim)."""
     custody: str = "canonical"
     """`canonical` (the border classified every key: a serve-time extra is drift and
     refuses) or `local` (an un-bordered local bind: markers transcribe or refuse, unknown
@@ -459,12 +416,9 @@ class DeclaredBinding:
                 components=self.components,
                 snapshots=self.snapshots,
                 stamps=self.stamps,
-                offered=self.offered,
                 objective=self.objective,
                 steps_basis=self.steps_basis,
                 model_weight_bytes=self.model_weight_bytes,
-                vram_floor_bytes=self.vram_floor_bytes,
-                resident_budget_bytes=self.resident_budget_bytes,
                 custody=self.custody,
                 strict_keys=self.strict_keys,
                 expected_logical_model_digest=self.expected_logical_model_digest,
@@ -675,54 +629,6 @@ class PlanChooser:
                     "evidence_class": "measured",
                 },
             )
-        free_host = self.ledger.host_budget - self.ledger.host_charged
-        if declared.host_bytes > free_host:
-            raise PlanRefusal(
-                "constraint_infeasible",
-                f"no proven plan fits: host_ram needs {declared.host_bytes} B and "
-                f"{free_host} B are free",
-                {
-                    "resource": "host_ram",
-                    "scope": "plan",
-                    "needed_bytes": declared.host_bytes,
-                    "available_bytes": free_host,
-                    "evidence_class": "measured",
-                },
-            )
-        # THE PHYSICAL FLOOR, before the ladder rather than after it. The floor is the
-        # minimum device room ANY rung needs — activations plus scratch plus one component
-        # chunk — so a device that cannot provide it admits no rung, and walking a ladder to
-        # discover that is walking it for nothing. Checking it here is also what makes the
-        # refusal reachable: `_deepen` only runs when nothing fits, and an UNCALIBRATED
-        # coefficient never gets that far (#293, and correctly — it may not refuse). The
-        # floor is not a coefficient: it is a DECLARED deployment fact compared against a
-        # MEASURED allocatable, so nothing uncalibrated participates in it.
-        floor = declared.vram_floor_bytes
-        allocatable_now = self.ledger.allocatable
-        # Against the DEEPEST rung's capacity, not against bare allocatable. Once the
-        # weights are resident, `allocatable` is only what is left beside them — but the
-        # staged rung can free the largest component, so "no rung exists" means "not even
-        # after evicting everything evictable". Comparing against the bare number refused a
-        # run that the ladder serves perfectly well, which is what running it showed.
-        deepest_capacity = allocatable_now + sum((self.ledger.resident or {}).values())
-        if floor and allocatable_now >= 0 and deepest_capacity < floor:
-            raise PlanRefusal(
-                "capacity_floor",
-                f"below the PHYSICAL FLOOR: this deployment declares {floor} B for "
-                f"activations plus scratch plus one component chunk, and the deepest rung "
-                f"can raise {deepest_capacity} B ({allocatable_now} B allocatable plus every "
-                f"resident component it may free; short by {floor - deepest_capacity} B). "
-                f"There is no rung "
-                "below the floor, so this exits with a quantified capacity code rather "
-                "than a plan that cannot run",
-                {
-                    "resource": "vram",
-                    "scope": "physical_floor",
-                    "needed_bytes": floor,
-                    "available_bytes": max(deepest_capacity, 0),
-                    "evidence_class": "measured",
-                },
-            )
         terms = {c.name: c for c in self.demand(declared, prepared)}
         resident = self.ledger.resident or {}
         # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
@@ -811,7 +717,6 @@ class PlanChooser:
             "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
             "largest_declared_set_bytes": largest,
             "rungs": rows,
-            "tenancy": declared.tenancy,
             "shape_cell": prepared.cell(),
         }
         self.walks.append(walk)
@@ -837,8 +742,6 @@ class PlanChooser:
             reserved_vram_bytes=weights,
             model_weight_bytes=weights,
             resident_bytes=sum(resident.values()),
-            reserved_host_bytes=declared.host_bytes,
-            reserved_pinned_bytes=declared.pinned_bytes,
             headroom_bytes=activations.value,
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             model_construction_digest=prepared_model.logical_model_digest,
@@ -949,23 +852,6 @@ class PlanChooser:
                 f"deepen placement (which changes no bits) and it may NOT refuse, so the "
                 f"ladder goes to {deepest} and the first serve banks the measurement"
             )
-        if declared.tenancy == "shared":
-            raise PlanRefusal(
-                "capacity_shortfall",
-                f"no proven rung fits on THIS worker: {activations.value} B of headroom "
-                f"needed and {allocatable} B allocatable. This is a capacity fact about one "
-                "worker, not a structural incompatibility - a retry must select a different "
-                "declared plan, and another worker may fit this one exactly",
-                {
-                    "resource": "vram",
-                    "scope": "worker",
-                    "needed_bytes": activations.value,
-                    "available_bytes": max(allocatable, 0),
-                    "evidence_class": "measured",
-                },
-            )
-        # The floor was already checked at the top of `choose`: reaching here means the
-        # device HAS the floor and the ladder still does not fit, which is the degrade case.
         deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
         walk["deepened_to"] = deepest
         return deepest, (

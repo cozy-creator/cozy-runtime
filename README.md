@@ -26,9 +26,15 @@ Runtime wheel digest; package admission uses the declared range and selects the 
 active Runtime/profile. The protobuf package major and additive wire minor remain their own
 worker-control compatibility contract.
 
-**No behavior test suite** (decisions.md #160, #533): CI runs build, fences, and
-deterministic contract/arithmetic/staleness checks; everything else is verified by running
-the real thing and recording what it did, plus time/memory benchmarks.
+**One end-to-end test suite, no mocks.** `uv run pytest` runs against
+`examples/marco-polo` through the public CLI installed from a freshly built wheel into a venv
+that has nothing else: describe, an exact byte-identical descriptor replay, the exit-code
+matrix, one served request, and one job through the real two-process worker. Nothing is
+stubbed, patched or doubled — a test that passes because a fake agreed with it is worse than
+no test. The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one (a
+runner whose own cgroup is not delegated) and name that host fact as the reason. Beside them
+CI runs the build, ruff, mypy, the reproducible-wheel check and `checks/architecture.py`'s
+AST import scans, and nothing else. Hardware is verified by hand on a rented card.
 
 ## Layout
 
@@ -92,7 +98,7 @@ header, or authentication fallback.
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
 | `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
-| `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death |
+| `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death (DECLARED, not yet wired — the pod launcher does not start it) |
 | `internal/local.py` | the ephemeral local worker: one request, no network |
 | `internal/worker/records.py` | bounded same-process worker facts; callers own restart recovery |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
@@ -109,7 +115,7 @@ formats. Command requests, planner values, worker records, proof-local state, an
 are typed by their command/path or storage table and carry no global format tag.
 
 The worker never imports torch, and that is proved against the RUNNING process
-(`scripts/worker-live.py nocuda` reads its `/proc/<pid>/maps` and the device's compute-app
+(the worker process's `/proc/<pid>/maps` and the device's compute-app
 list), not against the import graph.
 
 **One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
@@ -125,10 +131,10 @@ ONE record shape, a ring bounded by count AND bytes that sheds oldest first and 
 shed, and an O(1) time accumulator (`Attribution`) that makes inference step time attributable
 without one retained row per step — 324 ns per step against a ~100 ms handler leg. Progress
 frames are never retained; their durable form is that accumulator plus the monotone position
-the silence detector reads. A credential-shaped field is REFUSED at the emit boundary, not
-redacted downstream — where `token` and `signature`, which are also ordinary telemetry nouns,
-are credential-shaped only bare or directly qualified (`access_token`), so `tokens_per_second`
-and `output_tokens` are admitted.
+the silence detector reads. Credential-shaped VALUES — signed URLs, bearer and key
+spellings — are redacted at the emit boundary and counted. Nothing is refused: observability
+may not fail the thing it observes, and field NAMES are not inspected at all, because the
+name regex that used to be here false-positived on `output_tokens` and `eos_token`.
 
 **Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
@@ -143,7 +149,7 @@ destination with no row is a SECURITY EVENT. Inputs remain local. Outputs use ei
 destination or the exact presigned HTTPS capability in `OutputAccess.url`; the worker streams
 with `Content-Length` and `If-None-Match: *`, validates every resolved address, and refuses a
 redirect-selected destination. Tensorhub holds the R2 credential; the worker never does.
-Armed by `scripts/worker-live.py grants` end to end and `scripts/assets-live.py egress` at
+Armed by the worker grant path end to end and the egress hook at
 the table.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
@@ -151,7 +157,7 @@ installs `sandbox.refuse_network`, so package or job code that dials is refused 
 the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
 rung). It is not a kernel bound: the executor runs in the worker's own network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
-hook. `scripts/lifecycle-live.py --only egress` observes both halves against one reachable
+hook. The egress arms observe both halves against one reachable
 address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
 handed over as spool paths; the executor is never given an address.
 
@@ -187,7 +193,7 @@ Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0 built with CUD
 when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs, and profiles without
 the exact native library keep the ordinary eager implementation. CPU, MPS and Windows
 profiles do not install that extra. A candidate CUDA image runs
-`python scripts/anima-optimization-live.py`; the proof compares eager and optimized real
+a hand-run comparison of eager and optimized real
 CUDA blocks at Anima's native token width, checks determinism and storage identity, and
 measures the block speedup.
 
@@ -200,9 +206,8 @@ on each invocation, and eager execution remains the fallback.
 **The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
 coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming
 `measured` without a source refuses. An uncalibrated coefficient may DEEPEN placement —
-which changes weight placement only, never the bits — and may never refuse. Capacity splits
-by tenancy: shared reschedules, local deepens to the deepest rung with a quantified
-confession and exits only below the declared physical floor.
+which changes weight placement only, never the bits — and may never refuse. A shortfall
+deepens to the deepest rung with a quantified confession rather than refusing.
 
 **The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
 worker's own bookkeeping, `measured` for a named device or kernel interface,
@@ -232,20 +237,13 @@ executor still receives only verified model capabilities, never the foreign sour
 destination authority. Multiple transformations are ordinary code inside one bounded job—there is
 no `model_productions` graph, compatibility reader, or second scheduler.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
-`scripts/verify.py` runs this codec over tensorfs's own vector corpus and reports which
-refusals are shared and which are deliberate profile differences.
+`checks/architecture.py`'s `canonical-numbers` fence replays it over the frozen ES6 vector
+corpus in `vectors/es6-numbers.txt`.
 
 The descriptor is derived, not committed. `cozy-runtime --json --dir PROJECT describe` writes
 the canonical descriptor bytes to stdout without modifying the project. Creator sends those
 bytes with the source release; Tensorhub independently derives the descriptor from the installed
 project wheel and compares it. `package_descriptor_digest` is SHA-256 over those canonical bytes.
-
-Runtime also owns the descriptor's semantic-version comparison. Tensorhub invokes the narrow
-process boundary below with two exact descriptors; it prints one compact JSON result whose
-classification is `patch`, `minor`, or `major`. It imports no package code and authors no document.
-Runtime classifies interface change only; Tensorhub retains package-version and v0 policy.
-
-    python -m cozy_runtime.cli.descriptor_compat previous.json candidate.json
 
 ## Commands
 
@@ -254,29 +252,8 @@ Runtime classifies interface change only; Tensorhub retains package-version and 
     uv run cozy-runtime new <name>       # scaffold a minimal valid package
     uv run cozy-runtime describe              # human-readable surface summary
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
-    uv run python checks/architecture.py # architecture fences
-    uv run python scripts/redarm.py      # plant each violation, prove it red, restore
-    uv run python checks/declared_facts.py # every public Context/service fact has a live writer
-    uv run python scripts/verify.py      # live run of both example packages end to end
-    uv run python scripts/bench.py       # time + memory benchmarks
-    proofs/cli/run.sh # installed CLI exits, Descriptor/1, offline, keys and media proof
-    proofs/environment/run.sh # installed environment cold/rebuild/reuse/refusal proof
-    proofs/model-contract/run.sh # installed public-CLI MCC cold/rebuild/red proof
-    uv run --extra media python scripts/media-live.py        # real FLAC/MP4 output codecs
-    uv run --extra media python scripts/media-decode-live.py # bounded image/audio/video inputs
-    uv run --extra media python scripts/media-stream-live.py # cr-029 2/8-shot RSS + kill cleanup
-
-The model-contract proof builds a Runtime wheel, installs it into a fresh driver environment,
-and invokes only that wheel's public commands from `/` with `PYTHONPATH` unset. Its package and
-fake Torch packages live as ordinary, linted projects under `proofs/fixtures/`. They exercise the
-weightless control plane only; this proof makes no claim about real Torch, GPU execution, model
-loading, or output quality.
-
-The environment proof likewise builds and installs the exact Runtime wheel before invoking its
-public command from `/` with `PYTHONPATH` unset. Its base packages are installed once in the
-driver, matching the base worker image. The command hashes and inspects only the project/custom
-wheels, asks uv to create an ordinary venv in private staging, installs the exact wheels offline,
-and atomically publishes it. Cold and independent rebuilds produce the same compact receipt.
+    uv run python checks/architecture.py # AST import/dependency scans over the boundaries
+    uv run pytest                        # the end-to-end suite: two real runs, no mocks
 
 ### Per-package uv environments
 
@@ -361,7 +338,10 @@ The ordinary package lane admits only pure dependency wheels. A dependency wheel
 `package_environment_custom_wheel_native_unsupported` before
 installation. Shared native libraries belong in the base worker image. A package-specific native
 wheel lane remains absent until a real package requires it and can justify actual loader, SM/PTX,
-operator, and isolation checks; the dormant inspection helpers are not publication authority.
+operator, and isolation checks. `internal/native_wheel.py` and its
+`cozy-native-wheel-proof REQUEST.json EVIDENCE.json` door are that lane's inspection and
+host-qualification half, built and DORMANT: nothing calls them until the lane opens, and they
+are not publication authority.
 
 PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation, but those
 keys are never treated as a same-UID security boundary. Runtime scopes cache reuse by unpredictable
@@ -395,16 +375,6 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-The CLI proof builds and installs the current wheel plus an ordinary model-free source package
-fixture, changes to `/`, removes `PYTHONPATH`, closes stdin, and invokes only the installed
-`cozy-runtime` command. It proves the current process exit matrix, read-only and exact-byte
-Descriptor/1 behavior, canonical/local/strict key classification through a real job, typed
-mixed-media grants and canonical invocation identity, and `--offline` execution while every
-AF_INET/6 connect is refused. Its private companion
-`proofs/internal/local_input_acceptance.py` owns transfer and RecordOwner fault plants; those
-private hooks are not presented as CLI evidence. The full scenario census and retired claims
-are recorded in `PROOF-SCENARIOS.md`.
-
 `cozy-environment-proof REQUEST.json RECEIPT.json` is the trusted th-046 build-seat door.
 Its closed local request names the direct PackageSelection, selected Environment, and every
 package wheel file by digest,
@@ -432,34 +402,6 @@ set is closed; every path value is a normalized absolute local path:
   "environment_root": "/proof/fresh-environment"
 }
 ```
-
-A package environment containing native custom-wheel bytes must additionally pass
-`cozy-native-wheel-proof REQUEST.json EVIDENCE.json` on every claimed hardware class. The request
-does not carry a caller-asserted OCI realization identity: Runtime cannot measure an OCI manifest,
-and echoing one is not proof. Tensorhub joins Runtime's measured evidence to provider OCI readback.
-
-```json
-{
-  "device_index": 0,
-  "environment_digest": "sha256:<64 lowercase hex>",
-  "environment_root": "/proof/installed-environment",
-  "installed_environment_receipt_digest": "sha256:<64 lowercase hex>",
-  "python": "/opt/conda/bin/python",
-  "fixture": "qualified_fixture:run",
-  "expected_result_digest": "sha256:<64 lowercase hex>"
-}
-```
-
-Runtime asks both its running proof interpreter and the selected `python` to report the actual
-CPython ABI, OS/CPU, glibc, protected distribution versions, Torch release, and CUDA build. It
-compares Torch metadata and imports by their PEP 440 public release because official CUDA images
-may expose `2.13.0` metadata for an import identified as `2.13.0+cu130`; the import local tag must
-still match the separately measured CPU or exact CUDA runtime build. Runtime requires both reports
-to agree with the boot observation. GPU name, driver and SM are measured through
-`nvidia-smi`; cubin/PTX compatibility and the operator result are then proven on that device. The
-command emits a bounded result DTO containing those measured facts. Tensorhub normalizes the
-result into its own rows and alone decides whether the measured evidence qualifies the package
-for that hardware class. Runtime authors no second qualification document.
 
 The receipt-selected package environment then exposes
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR`. This is the only public MCC writer:
@@ -510,32 +452,14 @@ prunes it and Runtime observes the image-provided facade before execution. The v
 identity and reproducible build recipe are recorded in `vendor/TENSORFS.md` until TensorFS is
 published on PyPI.
 
-Real-GPU drivers, run from a venv with the `corpus` extra (they need an 8 GiB card and the
-real CAS, so they are BUILDER-RUN and never CI steps):
-
-    corpus/.venv/bin/python scripts/worker-live.py attempt   # cr-007: the two-process worker
-    corpus/.venv/bin/python scripts/slice-live.py all        # cr-008a: one request, no network
-    corpus/.venv/bin/python scripts/slice-live.py triage     # cr-011: explain a killed executor from the bundle
-    corpus/.venv/bin/python scripts/slice-live.py progress   # cr-011: silence and progress are observations
-    corpus/.venv/bin/python scripts/slice-live.py witness    # cr-011: a real cgroup OOM kill, named
-    corpus/.venv/bin/python scripts/pipeline-live.py fixtures  # cr-008b: the config + bundled tokenizers
-    corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
-    corpus/.venv/bin/python scripts/pipeline-live.py image     # cr-008b: cold disk -> first image
-    corpus/.venv/bin/python scripts/pipeline-live.py arms      # cr-008b: access + physical-floor refusals
-    corpus/.venv/bin/python scripts/pipeline-live.py bandwidth # cr-008b: the disk-bandwidth ladder
-    corpus/.venv/bin/python scripts/job-live.py all          # cr-009: the @job surface, services and runner
-    corpus/.venv/bin/python scripts/quant-live.py arms       # cr-006: the encoding border and its refusals
-    corpus/.venv/bin/python scripts/delivery-live.py all     # cr-008c: the delivery ladder, chosen over two real artifacts
-    corpus/.venv/bin/python scripts/assets-live.py all       # cr-012: typed input assets, hydration, egress
-    corpus/.venv/bin/python scripts/leaf-live.py all         # cr-006: the native-encoded rung — leaf replacement and the ranked chooser
+Real-GPU behaviour is verified by hand on a rented card. `corpus/` holds the adversarial
+derivation cases and the real-torch fixtures for those runs; they are driven from a corpus
+venv, not from CI.
 
 Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
 `--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
 and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a
-flat binding record or pretends the local selection carries Tensorhub's hardware evidence. The focused
-`proofs/internal/modeled_development_acceptance.py` proof builds a tiny local release and checks
-selection/acquisition plus drift refusals without claiming GPU execution; the existing
-`scripts/pipeline-live.py image/arms` runs remain the real-GPU output and floor evidence.
+flat binding record or pretends the local selection carries Tensorhub's hardware evidence.
 
 On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
@@ -545,9 +469,6 @@ job-plan implementation as a published package. Its resulting Placement uses
 `DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
 masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
 authority.
-
-`scripts/leaf-pod.py` is the same rung on REAL H3 weights and is POD-SIDE ONLY: it fetches
-735 MiB of a 40.2 GB checkpoint by HTTP range, so it never runs on a dev box.
 
 **TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
 extension that is not on an index yet, so the GPU venvs install a locally built wheel:
@@ -561,19 +482,8 @@ The base package installs and type-checks without it, exactly as it does without
 fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
 `ImportError` escaping a request.
 
-Two real packages on the author surface (weightless, no GPU), both driven end to end by
-`scripts/verify.py`:
-
-| example | what it exercises |
-|---|---|
-| `proofs/fixtures/tiny-models/tiny_sdxl.py` | the MINIMUM: `loader.load(T)` sugar, one coarse `@uses_components` set, four entrypoints covering both spellings, the derived capability set, `ModelDefault` overlay, typed preflight, the output transaction |
-| `proofs/fixtures/tiny-models/tiny_h3.py` | the component-staged path: one `_H3Base` with two task-stamped role classes, role-scoped factories, granular component scopes, an ordered discriminated reference union, a declared `DerivedCache`, and the `@app.job` that exercises JobDescriptor |
-
-`proofs/fixtures/tiny-models/tiny_diffusers.py` stands in for the model library a package brings as
-an ordinary dependency (and registers its own construction adapter);
-`proofs/internal/tiny_artifacts.py` and
-`proofs/fixtures/tiny-models/package.toml` are the RUNTIME's side — resolved artifacts and default
-bindings. Author code never names an artifact identifier; a fence proves it.
+`examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
+— and it is what the end-to-end suite builds, installs and runs.
 
 `run` · `serve` · `job` · `ingest` · `doctor` · `fit` land in
 cr-016 over the real attempt kernel.
@@ -598,7 +508,6 @@ worker sends exact declaration intent before TensorFS opens, waits for the host'
 ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves bounded object
 ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
 Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;
-pod-supervisor owns durability. The real boundary is exercised by
-`proofs/internal/artifact_sink_acceptance.py` against TensorFS 0.0.5 and its `tfs` binary. Both
+pod-supervisor owns durability. Both
 source-preparation results and derived Artifact receipts forward TensorFS canonical
 `ReleaseEvidence/1` bytes exactly; Runtime never reconstructs provenance.

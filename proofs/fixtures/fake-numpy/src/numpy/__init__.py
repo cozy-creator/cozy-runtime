@@ -1,1 +1,0 @@
-VALUE = "base-owned-numpy"
