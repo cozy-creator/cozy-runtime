@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -17,7 +18,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-from cozy_runtime.internal import canonical, descriptor, discovery, package_environment
+from cozy_runtime.internal import (
+    base_observation,
+    canonical,
+    descriptor,
+    discovery,
+    package_environment,
+)
 from cozy_runtime.internal.worker import acquire, downloads, package_prepare
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding
 from cozy_runtime.internal.worker.session import (
@@ -77,11 +84,22 @@ def main(argv: list[str] | None = None) -> int:
             wheels = args.wheel_dir
         wheel = next(wheels.glob("marco_polo-*.whl"))
         digest = hashlib.sha256(wheel.read_bytes()).digest()
+        runtime_wheels = root / "runtime-built"
+        subprocess.run(
+            ["uv", "build", "--wheel", "--out-dir", str(runtime_wheels), "."],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        runtime_wheel = next(runtime_wheels.glob("cozy_runtime-*.whl"))
+        runtime_digest = hashlib.sha256(runtime_wheel.read_bytes()).digest()
         cache = root / "artifacts"
         view = cache / "sets" / "marco"
         view.mkdir(parents=True)
         local_wheel = view / wheel.name
         local_wheel.write_bytes(wheel.read_bytes())
+        local_runtime_wheel = view / runtime_wheel.name
+        local_runtime_wheel.write_bytes(runtime_wheel.read_bytes())
         release_digest = "sha256:" + hashlib.sha256(b"marco release").hexdigest()
         delegation = canonical.write(
             {
@@ -109,6 +127,13 @@ def main(argv: list[str] | None = None) -> int:
                 length=wheel.stat().st_size,
                 path=str(local_wheel),
             ),
+            pb.LocalDownloadFile(
+                digest=runtime_digest,
+                filename=runtime_wheel.name,
+                kind=pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+                length=runtime_wheel.stat().st_size,
+                path=str(local_runtime_wheel),
+            ),
         ]
         files.sort(key=lambda row: row.digest)
         verified: list[str] = []
@@ -123,6 +148,20 @@ def main(argv: list[str] | None = None) -> int:
         ) -> bytes:
             return _describe_with_environment(installed, distribution)
 
+        actual_base = base_observation.current()
+        runtime_version = actual_base.distribution_versions["cozy-runtime"]
+        major, minor, patch = (int(part) for part in runtime_version.split("."))
+        compatible_base = dataclasses.replace(
+            actual_base,
+            distributions=tuple(
+                sorted(
+                    {
+                        **actual_base.distribution_versions,
+                        "cozy-runtime": f"{major}.{minor}.{patch + 1}",
+                    }.items()
+                )
+            ),
+        )
         result = package_prepare.prepare_package_set(
             request,
             artifact_cache=cache,
@@ -132,13 +171,14 @@ def main(argv: list[str] | None = None) -> int:
             describe=describe,
             verified=lambda digest, _length, _path: verified.append(digest),
             job_plan_root=root / "job-plans",
+            base=compatible_base,
         )
         value = documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)
         placement = value["placements"][0]
         assert placement["package"]["release_digest"] == release_digest
         assert placement["models"] == []
         assert placement["environment"]["wheels"] == []
-        assert len(verified) == 1
+        assert len(verified) == 2
         assert [row["name"] for row in placement["entrypoints"]] == ["marco"]
         assert placement["entrypoints"][0]["slots"] == []
         weightless = executor_prepare_command(

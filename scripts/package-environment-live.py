@@ -169,7 +169,7 @@ def main() -> int:
         root = Path(raw)
         wheels = root / "wheels"
         wheels.mkdir()
-        base = fixture_base()
+        base = fixture_base(runtime_version="0.0.31")
         project = build_wheel(
             wheels,
             "proof-project",
@@ -178,6 +178,43 @@ def main() -> int:
             owner="project",
             requires_dist=("cozy-runtime>=0.0.19,<1.0.0",),
         )
+        supplied_runtime = build_wheel(
+            wheels,
+            "cozy-runtime",
+            "cozy_runtime",
+            "package-supplied",
+            owner="custom",
+            version="0.0.29",
+            extra_entries={"cozy/__init__.py": b""},
+        )
+        observed_base, rental_wheels, supplied_wheels = package_environment.preflight_environment(
+            project[1], [supplied_runtime[1]], base
+        )
+        assert observed_base is base
+        assert [wheel.distribution for wheel in supplied_wheels] == [
+            "proof-project",
+            "cozy-runtime",
+        ]
+        assert [wheel.distribution for wheel in rental_wheels] == ["proof-project"]
+
+        incomplete_runtime_roots = build_wheel(
+            wheels,
+            "cozy-runtime",
+            "cozy_runtime",
+            "incomplete-roots",
+            owner="custom",
+            version="0.0.29",
+        )
+        try:
+            package_environment.preflight_environment(
+                project[1], [incomplete_runtime_roots[1]], base
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            assert exc.code == "package_environment_base_distribution_import_roots_conflict"
+            assert "package supplied cozy-runtime 0.0.29" in exc.detail
+            assert "worker image provides cozy-runtime 0.0.31" in exc.detail
+        else:
+            raise AssertionError("incomplete worker-image import ownership was admitted")
         custom_one = build_wheel(wheels, "proof-custom", "proof_custom", "one", owner="custom")
         custom_two = build_wheel(wheels, "proof-custom", "proof_custom", "two", owner="custom")
         environment = root / "installed"
@@ -415,6 +452,7 @@ def main() -> int:
         except package_environment.EnvironmentRefusal as exc:
             assert exc.code == "package_environment_dependency_base_conflict"
             assert "cozy-runtime<1.0.0,>=0.0.19" in exc.detail
+            assert "worker image provides cozy-runtime 1.0.0" in exc.detail
         else:
             raise AssertionError("an incompatible Runtime major reused the package environment")
 
@@ -746,6 +784,7 @@ def main() -> int:
                     "trusted_reuse_bytes": second.trusted_reuse_bytes,
                     "same_wheels_different_spec_one_content": True,
                     "existing_uv_venv_opened_without_install": True,
+                    "compatible_package_supplied_runtime_omitted": True,
                     "compatible_runtime_patch_reused": True,
                     "incompatible_runtime_major_refused": True,
                     "wrong_uv_version_refused": True,
@@ -754,6 +793,7 @@ def main() -> int:
                     "incompatible_ordinary_versions_concurrent_on_one_worker": True,
                     "second_protected_family_refused_before_download": True,
                     "protected_distribution_shadow_refused": True,
+                    "incomplete_base_import_ownership_refused": True,
                     "protected_import_shadow_refused": True,
                     "runtime_abi_msgspec_shadow_refused": True,
                     "interrupted_staging_removed_before_reuse": True,
