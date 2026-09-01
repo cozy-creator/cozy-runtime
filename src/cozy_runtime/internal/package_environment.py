@@ -290,7 +290,7 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
     """
 
     version = base.distribution_versions.get(wheel.distribution)
-    if version is None:
+    if version is None or not base_observation.protected_distribution(wheel.distribution):
         return False
     roots = tuple(
         sorted(
