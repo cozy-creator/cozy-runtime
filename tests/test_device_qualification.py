@@ -1,0 +1,214 @@
+"""The OBSERVED (encoding, device) qualification this runtime reports to TensorFS.
+
+Executability is two independent questions. Whether bytes can be READ is the format axis and
+TensorFS answers it from the encoding rule. Whether an encoding is QUALIFIED on a card is
+this axis, and only the process holding the card can answer it -- so TensorFS owns the
+admission rule, this runtime owns the observation, and the hub joins them. A COMPATIBLE
+format grade is not executability.
+
+The document `observed_capability_records` emits is TensorFS's input shape and it is strict:
+four keys per record, canonical bytes, printable ASCII, no trailing byte. A document that
+misses any of those is refused WHOLE at the border, so one bad record hides every good one,
+and the failure reads to the hub as "this card cannot run anything".
+
+The input here is a RECORDED REAL PROBE, not a fixture anybody wrote: `tests/observations/`
+holds the exact result document `probe.qualify` returned on an NVIDIA RTX 4070 Laptop (sm89,
+driver 595.84, torch 2.13.0+cu130), 27 observations, 19 of them passing. That is the same
+discipline `internal/encoding/vectors/` already uses -- real bytes, recorded once, replayed
+by the suite -- and it is what lets this run in every `uv run pytest`, on CI, with no GPU and
+no torch. Nothing here skips: a skip is indistinguishable from a pass.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from cozy_runtime.internal import canonical
+from cozy_runtime.internal.probe import observed_capability_records
+
+#: The exact keys TensorFS's `CapabilityRecords::parse_observed` requires, all of them, on
+#: every record. It reads with unknown fields refused, so a surplus key and a missing key are
+#: the same refusal.
+RECORD_KEYS = {"device", "encoding", "implementation", "note"}
+
+OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
+
+
+def probe_result() -> dict[str, Any]:
+    result: dict[str, Any] = json.loads(OBSERVATION.read_text())
+    return result
+
+
+def test_the_recorded_observation_is_a_real_measured_probe() -> None:
+    """The input is evidence, so it has to carry what it was measured on."""
+    result = probe_result()
+    assert result["device_predicate"] == "cuda.sm89"
+    assert result["device"]["sm"] == 89
+    assert result["device"]["kind"] == "cuda"
+    # Both halves of a capability claim have an identity: the card, and the build that ran on
+    # it. A digest here proves the recording came out of `runtime_source_digest`, which is
+    # computed from installed bytes -- it is NOT compared to this build's, because the
+    # recording is of the build that measured, not of the one replaying it.
+    assert result["runtime"]["source_digest"].startswith("sha256:")
+    assert result["runtime"]["torch_build"].startswith("2.")
+    assert len(result["observations"]) == 27
+    assert sum(1 for o in result["observations"] if o["evidence"]["passed"]) == 19
+
+
+def test_every_record_carries_exactly_the_four_keys() -> None:
+    document = observed_capability_records(probe_result())
+    assert set(document) == {"records"}
+    assert document["records"], "the recorded probe qualified something"
+    for record in document["records"]:
+        assert set(record) == RECORD_KEYS
+        assert record["device"] and record["implementation"], "both are required non-empty"
+        assert record["encoding"].startswith("sha256:") and len(record["encoding"]) == 71
+
+
+def test_the_bytes_are_canonical_with_no_trailing_byte() -> None:
+    """TensorFS parses these bytes with `parse_canonical`: a trailing newline refuses."""
+    raw = canonical.write(observed_capability_records(probe_result()))
+    assert raw[-1:] == b"}"
+    assert raw.isascii()
+    # The whole definition of canonical: the bytes are the encoding of their own content.
+    assert canonical.write(canonical.parse(raw)) == raw
+    assert canonical.parse_canonical(raw) == observed_capability_records(probe_result())
+
+
+def test_one_record_per_encoding_and_device() -> None:
+    """The suite mints a record per output dtype and implementation; the RULE admits on the
+    pair, so the projection collapses to it and names every implementation that earned it."""
+    result = probe_result()
+    document = observed_capability_records(result)
+    pairs = [(r["encoding"], r["device"]) for r in document["records"]]
+    assert len(pairs) == len(set(pairs))
+    assert pairs == sorted(pairs), "records are ordered by the pair, not by probe order"
+    minted = {
+        (o["encoding_spec_id"], o["device_predicate"])
+        for o in result["observations"]
+        if o["evidence"]["passed"]
+    }
+    # Every collapsed pair traces back to a passing observation, and every implementation
+    # named in a record is one that actually minted for that pair.
+    assert set(pairs) <= minted
+    for record in document["records"]:
+        for named in record["implementation"].split(" "):
+            assert named.split("@")[-1] in {
+                o["implementation_digest"]
+                for o in result["observations"]
+                if (o["encoding_spec_id"], o["device_predicate"])
+                == (
+                    record["encoding"],
+                    record["device"],
+                )
+                and o["evidence"]["passed"]
+            }
+
+
+def test_a_failed_observation_is_never_reported() -> None:
+    """The recorded probe carries a real failure: mxfp8 decoded to float16, whose range
+    cannot hold the MX domain (442 normal and 420 subnormal elements wrong). The encoding is
+    still reported for the dtypes that DID pass, and float16 is not among them -- so the
+    dtype set a record names is exactly the reportable passing set, never the attempted one.
+    """
+    result = probe_result()
+    assert [o for o in result["observations"] if not o["evidence"]["passed"]], (
+        "the recording includes failures on purpose"
+    )
+    for record in observed_capability_records(result)["records"]:
+        pair = (record["encoding"], record["device"])
+        assert _note_dtypes(record) == {
+            str(o["output_dtype"])
+            for o in result["observations"]
+            if (o["encoding_spec_id"], o["device_predicate"]) == pair and _reportable(o)
+        }
+    mxfp8 = _mxfp8(result)
+    reported = {r["encoding"]: r for r in observed_capability_records(result)["records"]}
+    assert "float16" not in _note_dtypes(reported[mxfp8]), "float16 mxfp8 decode FAILED here"
+    assert "bfloat16" in _note_dtypes(reported[mxfp8])
+
+
+def test_only_evidence_that_actually_ran_crosses_the_boundary() -> None:
+    """A `verbatim` route's evidence is byte identity and travels. Any other route must have
+    RUN the spec's producer-mined vectors: `_spec_vectors` passes a spec with no vendored
+    document as SKIPPED, which is right for a local table built beside the synthetic oracle
+    that did run, and is not a claim to hand another process -- and it is what keeps a spec
+    TensorFS carries vectorless out of a document it would refuse whole."""
+    result = probe_result()
+    reported = {
+        (r["encoding"], r["device"]) for r in observed_capability_records(result)["records"]
+    }
+    for observation in result["observations"]:
+        evidence = observation["evidence"]
+        if not evidence["passed"]:
+            continue
+        pair = (observation["encoding_spec_id"], observation["device_predicate"])
+        if not _reportable(observation):
+            assert pair not in reported or _also_ran(result, pair), (
+                f"{pair} was reported on evidence that did not run"
+            )
+
+
+def test_the_cli_verb_refuses_an_unknown_argument() -> None:
+    done = subprocess.run(
+        [sys.executable, "-m", "cozy_runtime.cli.main", "capability", "--devices", "0"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode != 0
+    assert "invalid argument" in done.stderr, done.stderr
+
+
+def _note_dtypes(record: dict[str, Any]) -> set[str]:
+    """The output dtypes a record's note names. Parsed rather than matched: `bfloat16`
+    CONTAINS `float16`, and a substring test here silently passed the one case this file
+    exists to catch."""
+    body = record["note"].split("output dtypes ", 1)[1].split(";", 1)[0]
+    return {token.strip() for token in body.split(",") if token.strip()}
+
+
+def _reportable(observation: dict[str, Any]) -> bool:
+    evidence = observation["evidence"]
+    if not evidence["passed"]:
+        return False
+    vectors = evidence.get("spec_vectors") or {}
+    return evidence.get("kind") == "verbatim" or bool(vectors and not vectors.get("skipped"))
+
+
+def _mxfp8(result: dict[str, Any]) -> str:
+    for observation in result["observations"]:
+        if "mxfp8" in observation["implementation"]:
+            return str(observation["encoding_spec_id"])
+    raise AssertionError("the recording carries an mxfp8 observation")
+
+
+def _also_ran(result: dict[str, Any], pair: tuple[str, str]) -> bool:
+    """Another observation for the same pair whose evidence DID run. One dtype skipping its
+    vectors does not unqualify a pair another dtype measured."""
+    return any(
+        (o["encoding_spec_id"], o["device_predicate"]) == pair and _reportable(o)
+        for o in result["observations"]
+    )
+
+
+def test_the_document_carries_no_per_run_measurement() -> None:
+    """A registered artifact that churns without a change of meaning is one nobody can diff.
+
+    The probe's `evidence_digest` covers the micro-benchmark and therefore moves on every
+    run; the document must depend only on the card class, the runtime build and which dtypes
+    passed. Every digest it carries is an encoding's or an implementation's -- both of which
+    are over structure and over no timing.
+    """
+    result = probe_result()
+    document = observed_capability_records(result)
+    stable = {r["encoding"] for r in document["records"]} | {
+        str(o["implementation_digest"]) for o in result["observations"]
+    }
+    found = set(re.findall(r"sha256:[0-9a-f]{64}", canonical.write(document).decode()))
+    assert found and found <= stable, f"a per-run digest reached the document: {found - stable}"

@@ -998,3 +998,104 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
             )
         )
     return caps
+
+
+class UnreportableObservation(Exception):
+    """A record would have crossed the process boundary carrying a byte TensorFS refuses.
+
+    Loud rather than dropped: a silently omitted record reads to the hub as "this card
+    cannot run it", which is the wrong answer with the wrong remedy.
+    """
+
+
+def observed_capability_records(result: Mapping[str, Any]) -> dict[str, Any]:
+    """This probe result, projected into TensorFS's OBSERVED capability-records document.
+
+    The sibling of `_table`, over the same observation and for the other consumer. `_table`
+    builds the admission table this process fills against; this builds the document another
+    process joins against, because TensorFS owns the admission RULE and holds no card while
+    this process holds one and owns the OBSERVATION.
+
+    The document states what was qualified and WHERE, and deliberately not which vector set
+    qualified it: the spec pins that, and an observer free to name it could qualify a spec
+    against bytes the spec never carried. TensorFS binds the vector set itself and refuses a
+    record whose spec has none.
+
+    One record per (encoding, device), because that pair is what the rule admits on. The
+    suite mints one per output dtype and implementation, so several collapse into one and
+    every implementation that earned it is named.
+
+    REPRODUCIBLE for a given card class, runtime build and provider set. The observation's
+    `evidence_digest` is deliberately absent: it covers the micro-benchmark, so it moves on
+    every run, and a registered artifact that churns without a change of meaning is one
+    nobody can diff. What was qualified is carried WHOLE by `implementation_digest`, which is
+    over the implementation's name, route, floor, oracle, roles, revision and reviewed specs
+    and over no timing at all.
+    """
+    records: dict[tuple[str, str], dict[str, set[str]]] = {}
+    fallback = str(result.get("device_predicate") or "")
+    for observation in result.get("observations", ()):
+        evidence = observation.get("evidence") or {}
+        if not evidence.get("passed") or not _reportable(evidence):
+            continue
+        key = (
+            str(observation["encoding_spec_id"]),
+            str(observation.get("device_predicate") or fallback),
+        )
+        into = records.setdefault(key, {"implementations": set(), "dtypes": set()})
+        into["implementations"].add(
+            f"{observation['implementation']}[{observation['delivery_route']}]"
+            f"@{observation['implementation_digest']}"
+        )
+        into["dtypes"].add(str(observation["output_dtype"]))
+    out = []
+    for (encoding, device), parts in sorted(records.items()):
+        out.append(
+            {
+                "device": device,
+                "encoding": encoding,
+                "implementation": " ".join(sorted(parts["implementations"])),
+                "note": (
+                    "qualified by the cozy-runtime probe suite for output dtypes "
+                    + ",".join(sorted(parts["dtypes"]))
+                ),
+            }
+        )
+    document = {"records": out}
+    _ascii_only(document)
+    return document
+
+
+def _reportable(evidence: Mapping[str, Any]) -> bool:
+    """May this passing observation be REPORTED, not merely believed here?
+
+    A `verbatim` route decodes nothing and its evidence is the fill plane's byte-identity
+    proof, which is evidence anywhere. Any other route must have actually RUN the spec's
+    producer-mined vectors: `_spec_vectors` reports a spec with no vendored document as
+    SKIPPED and passes it, which is right for a local table built beside the synthetic
+    oracle that did run, and is not a claim to hand another component. It is also the fence
+    that keeps a spec TensorFS carries vectorless out of the document, where it would refuse
+    the whole thing rather than one record.
+    """
+    if evidence.get("kind") == "verbatim":
+        return True
+    vectors = evidence.get("spec_vectors") or {}
+    return bool(vectors) and not vectors.get("skipped")
+
+
+def _ascii_only(value: Any, path: str = "") -> None:
+    """TensorFS's canonical layer is printable-ASCII only. A stray character would refuse
+    the document at the border with an error that points at bytes, not at the provider that
+    wrote them."""
+    if isinstance(value, str):
+        if not value.isascii() or not value.isprintable():
+            raise UnreportableObservation(
+                f"{path or 'document'} carries a non-printable-ASCII character: {value!r}"
+            )
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            _ascii_only(str(key), f"{path}.{key}")
+            _ascii_only(item, f"{path}.{key}")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for index, item in enumerate(value):
+            _ascii_only(item, f"{path}[{index}]")

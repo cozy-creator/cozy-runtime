@@ -1,0 +1,1215 @@
+{
+ "device": {
+  "configuration": "[N/A]W/[N/A]",
+  "cuda_runtime": "13.0",
+  "driver": "595.84/apiunreadable",
+  "index": 0,
+  "kind": "cuda",
+  "name": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "os_arch": "Linux/x86_64",
+  "predicate": "cuda.sm89",
+  "sm": 89
+ },
+ "device_predicate": "cuda.sm89",
+ "observations": [
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 87211,
+     "gb_per_s": 144.281,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.015625
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.003060384545420238,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-wonly-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar-weight-only.json",
+      "sha256": "sha256:2326cbd4a1ccaac484792bba04f07e19bc59d61fd913cbe5a4a9a66e469a9374"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 82971,
+     "gb_per_s": 151.654,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.001953125
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0004718878505739444,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-wonly-16x32-f16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar-weight-only.json",
+      "sha256": "sha256:2326cbd4a1ccaac484792bba04f07e19bc59d61fd913cbe5a4a9a66e469a9374"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 211436,
+     "gb_per_s": 99.186,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 2.384185791015625e-07
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 3.116557590916084e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-wonly-16x32-f32",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar-weight-only.json",
+      "sha256": "sha256:2326cbd4a1ccaac484792bba04f07e19bc59d61fd913cbe5a4a9a66e469a9374"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:0ed56cd13697813ff80fff6cffddb10adb59aedd2c4c16a57af2d548932926ca",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:0ed56cd13697813ff80fff6cffddb10adb59aedd2c4c16a57af2d548932926ca",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:0ed56cd13697813ff80fff6cffddb10adb59aedd2c4c16a57af2d548932926ca",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 114724,
+     "gb_per_s": 110.822,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 766,
+      "normal": 63132,
+      "overflow": 560,
+      "subnormal": 1070,
+      "underflow": 8
+     },
+     "first_wrong": "",
+     "max_abs_error": 4.591774807899561e-41,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.8367099231598242e-40,
+     "tolerance": 0.015625,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0016640098681429353,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 256,
+       "name": "mxfp8-4x64-bf16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "mxfp8.json",
+      "sha256": "sha256:9950f32248a14b37267c17d8d8e1fd9c8a281c8291183ee390908e2f00326a22"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.dequant/1",
+   "implementation_digest": "sha256:af47e1e796f78d9a37a0ce0f1f8a35b81155d9b2bd0a4a395a37b055165d5d46",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 112952,
+     "gb_per_s": 112.56,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 766,
+      "normal": 7560,
+      "overflow": 28342,
+      "subnormal": 3282,
+      "underflow": 25586
+     },
+     "first_wrong": "element 0x79 x scale 0x60: 0.0 != 1.341104507446289e-07 (abs 1.341e-07 > 1.192e-07)",
+     "max_abs_error": Infinity,
+     "max_rel_error": Infinity,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": false,
+     "subnormal_tolerance": 1.1920928955078125e-07,
+     "tolerance": 0.001953125,
+     "wrong": {
+      "nan": 0,
+      "normal": 442,
+      "overflow": 0,
+      "subnormal": 420,
+      "underflow": 0
+     }
+    },
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    },
+    "spec_vectors": {
+     "kind": "spec-vectors",
+     "note": "the vendored document carries no float16 case",
+     "passed": true,
+     "skipped": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.dequant/1",
+   "implementation_digest": "sha256:af47e1e796f78d9a37a0ce0f1f8a35b81155d9b2bd0a4a395a37b055165d5d46",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 224209,
+     "gb_per_s": 94.12,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 766,
+      "normal": 63132,
+      "overflow": 560,
+      "subnormal": 1078,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 2.802596928649634e-45,
+     "tolerance": 2.384185791015625e-07,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 3.1138999693686516e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 256,
+       "name": "mxfp8-4x64-f32",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "mxfp8.json",
+      "sha256": "sha256:9950f32248a14b37267c17d8d8e1fd9c8a281c8291183ee390908e2f00326a22"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.dequant/1",
+   "implementation_digest": "sha256:af47e1e796f78d9a37a0ce0f1f8a35b81155d9b2bd0a4a395a37b055165d5d46",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.native-leaf/1",
+   "implementation_digest": "sha256:5c5ddf26cf70c1871948d43fdcc4750e057d589d7f44cd93863751a1a9171abd",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.native-leaf/1",
+   "implementation_digest": "sha256:5c5ddf26cf70c1871948d43fdcc4750e057d589d7f44cd93863751a1a9171abd",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.mxfp8.native-leaf/1",
+   "implementation_digest": "sha256:5c5ddf26cf70c1871948d43fdcc4750e057d589d7f44cd93863751a1a9171abd",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 97317,
+     "gb_per_s": 129.382,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.8367099231598242e-40,
+     "tolerance": 0.015625,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.002333710140041133,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-rowwise.json",
+      "sha256": "sha256:e7a1264e4b60ac9f800736b23b3e3c50bb3e6ed506bdc30a2769abfc850ef2ba"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 96174,
+     "gb_per_s": 130.92,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 30800,
+      "overflow": 14584,
+      "subnormal": 13480,
+      "underflow": 6160
+     },
+     "first_wrong": "",
+     "max_abs_error": 2.9802322387695312e-08,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.1920928955078125e-07,
+     "tolerance": 0.001953125,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0002937023017871147,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "kind": "spec-vectors",
+     "note": "the vendored document carries no float16 case",
+     "passed": true,
+     "skipped": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 209196,
+     "gb_per_s": 100.287,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 2.802596928649634e-45,
+     "tolerance": 2.384185791015625e-07,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 3.119113593484282e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-16x32-f32",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-rowwise.json",
+      "sha256": "sha256:e7a1264e4b60ac9f800736b23b3e3c50bb3e6ed506bdc30a2769abfc850ef2ba"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "native",
+    "micro_bench": {
+     "float_gemm_ns": 73953,
+     "leaf_ns": 120798,
+     "reps": 8,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "speedup_x": 0.6122
+    },
+    "numerics": {
+     "deviation_rel": 0.03747722162316281,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "bfloat16",
+     "out_dtype_is_contract": true,
+     "passed": true,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.03747722162316281,
+     "resident_bits_per_element": 8.015625
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "native",
+    "numerics": {
+     "deviation_rel": 0.9001569092711322,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "float16",
+     "out_dtype_is_contract": true,
+     "passed": false,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "evidence": {
+    "kind": "native",
+    "numerics": {
+     "kernel": "builtins.ValueError: Only bf16 and fp16 high precision output types are supported for row-wise scaling.",
+     "kind": "native",
+     "note": "the native kernel refused on this device; no record is minted, and the encoding falls to whichever decode provider this card DID qualify",
+     "passed": false
+    },
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 90433,
+     "gb_per_s": 139.231,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.8367099231598242e-40,
+     "tolerance": 0.015625,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.002333710140041133,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-rowwise-keepdim.json",
+      "sha256": "sha256:55e4b815d169c5b6959decdb54a89a7af94c26f9f4ac7339c25d6b365582dd27"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 90441,
+     "gb_per_s": 139.218,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 30800,
+      "overflow": 14584,
+      "subnormal": 13480,
+      "underflow": 6160
+     },
+     "first_wrong": "",
+     "max_abs_error": 2.9802322387695312e-08,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.1920928955078125e-07,
+     "tolerance": 0.001953125,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0002937023017871147,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "kind": "spec-vectors",
+     "note": "the vendored document carries no float16 case",
+     "passed": true,
+     "skipped": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 187346,
+     "gb_per_s": 111.984,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 2.802596928649634e-45,
+     "tolerance": 2.384185791015625e-07,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 3.119113593484282e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-f32",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-rowwise-keepdim.json",
+      "sha256": "sha256:55e4b815d169c5b6959decdb54a89a7af94c26f9f4ac7339c25d6b365582dd27"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:ee3d4c580c0060bd4630ebcc20d3018eaf81e670fc0f3a25e6f23ce19ea111c8",
+   "implementation_revision": "2",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "native",
+    "micro_bench": {
+     "float_gemm_ns": 73809,
+     "leaf_ns": 96065,
+     "reps": 8,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "speedup_x": 0.7683
+    },
+    "numerics": {
+     "deviation_rel": 0.03747722162316281,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "bfloat16",
+     "out_dtype_is_contract": true,
+     "passed": true,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.03747722162316281,
+     "resident_bits_per_element": 8.015625
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "native",
+    "numerics": {
+     "deviation_rel": 0.9001569092711322,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "float16",
+     "out_dtype_is_contract": true,
+     "passed": false,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "evidence": {
+    "kind": "native",
+    "numerics": {
+     "kernel": "builtins.ValueError: Only bf16 and fp16 high precision output types are supported for row-wise scaling.",
+     "kind": "native",
+     "note": "the native kernel refused on this device; no record is minted, and the encoding falls to whichever decode provider this card DID qualify",
+     "passed": false
+    },
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:859c53f63f99517163197a075566a0e6ff763c49723fab34d57aa23f49e6c31a",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 87160,
+     "gb_per_s": 144.364,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.015625
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.003060384545420238,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar.json",
+      "sha256": "sha256:ed0ee586675b05cfff658e61a8f46712e679be3cfac350b878c5e0b69e5732d4"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 81220,
+     "gb_per_s": 154.923,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.001953125
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0004718878505739444,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f16",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar.json",
+      "sha256": "sha256:ed0ee586675b05cfff658e61a8f46712e679be3cfac350b878c5e0b69e5732d4"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "float16"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm89",
+   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 182656,
+     "gb_per_s": 114.814,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 2.384185791015625e-07
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 3.116557590916084e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f32",
+       "passed": true
+      }
+     ],
+     "document": {
+      "filename": "fp8-scaled-scalar.json",
+      "sha256": "sha256:ed0ee586675b05cfff658e61a8f46712e679be3cfac350b878c5e0b69e5732d4"
+     },
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-scaled-scalar.dequant/1",
+   "implementation_digest": "sha256:899741abc9343491943c94ed47105fd157d600e399df71883b6dfc829b7993f4",
+   "implementation_revision": "1",
+   "output_dtype": "float32"
+  }
+ ],
+ "runtime": {
+  "release": "0.0.36",
+  "source_digest": "sha256:ecd04cd2d3d1640415a30c5edf3e208bf952dff8495b3da2cf1be5b962c20c23",
+  "torch_build": "2.13.0+cu130"
+ },
+ "runtime_release": "0.0.36",
+ "suite_ms": 1936,
+ "tuple": "cuda/NVIDIA GeForce RTX 4070 Laptop GPU/dev0/[N/A]W/[N/A]/driver=595.84/apiunreadable/cudart=13.0/Linux/x86_64"
+}

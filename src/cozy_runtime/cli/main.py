@@ -26,6 +26,7 @@ BUILT = (
     "describe",
     "bindings",
     "doctor",
+    "capability",
     "fit",
     "new",
     "version",
@@ -42,6 +43,7 @@ verbs:
   describe [<fn>]                the PackageDescriptor, without loading weights
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/credential facts
+  capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
@@ -79,6 +81,7 @@ _OWNS_ARGS = (
     "run",
     "job",
     "fit",
+    "capability",
     "serve",
     "development-placement",
     "prepare-package",
@@ -185,6 +188,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return package_prepare_verbs.prepare_local_package(config, args, opts)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
+    if verb == "capability":
+        return host_verbs.capability(config, args, opts)
     if verb == "doctor":
         if args:
             raise CliError(
