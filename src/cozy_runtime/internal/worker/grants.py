@@ -291,7 +291,7 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
     bound = BoundGrant(
         file_base_url=grant.file_base_url,
         expires_at_unix=int(grant.expires_at_unix),
-        credential_epoch=int(grant.credential.epoch),
+        credential_epoch=int(grant.credential.credential_epoch),
     )
     for input_id, row in spec_inputs.items():
         spelled = str(row.get("digest", ""))

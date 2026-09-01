@@ -292,7 +292,7 @@ The rented-pod worker stays root and non-dumpable; the exec-first trampoline set
 and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
 pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and worker credentials
 remain root-only. Content is root-owned/read-only, and executor scratch/probe state is private to
-one incarnation and deleted before the fixed uid is reused. A worker that cannot perform the
+one epoch and deleted before the fixed uid is reused. A worker that cannot perform the
 identity split refuses before binding. Native/local development keeps its explicit same-user lane.
 Base bytecode is baked in the image and uv compiles package bytecode during installation. Any later
 bytecode is directed to the worker-boot/content cache outside the read-only venv. The executor starts
@@ -309,7 +309,7 @@ receives the same `--environment-python`; `--environment-root` is reserved for r
 materialization and the two flags are mutually exclusive.
 
 The local boot warm pass is also capacity evidence. A typed device OOM falsifies only that
-executor generation's attempted placement rung and normalized shape cell. Runtime retries the same
+executor epoch's attempted placement rung and normalized shape cell. Runtime retries the same
 synthetic request through the existing component-staged rung and publishes DISPATCHABLE only when
 that fallback is viable; if every proven rung fails capacity, activation stays offline with a typed
 fault. Other optional warm failures remain degraded observations rather than placement decisions.
@@ -519,7 +519,7 @@ An opened transaction may read exact source-part ranges into caller-owned contig
 buffers (at most one 64 MiB TensorFS grid window); TensorFS validates alias/component/key/role,
 offset and length under the same pinned source lease before any added value commits.
 The job receives only the exact receipt—never a store, path, publisher or destination. The
-worker sends exact declaration intent before TensorFS opens, waits for the host's writer-generation
+worker sends exact declaration intent before TensorFS opens, waits for the host's writer-epoch
 ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves bounded object
 ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
 Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;

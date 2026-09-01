@@ -2,7 +2,7 @@
 
 This is the ONLY process in the worker that imports torch or touches a device. It is
 disposable in the strong sense: `kill -9` at any instant is a supported input, and the
-worker converges to a typed terminal and a fresh incarnation from what it recorded.
+worker converges to a typed terminal and a fresh epoch from what it recorded.
 Nothing durable lives here — no records, no credential, no monotone wire counter.
 
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
@@ -67,7 +67,7 @@ from cozy_runtime.protocol import documents
 #: a receipt for bytes nobody wrote is the fabrication class this runtime exists to prevent.
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
-#: How many PREPARED requests this incarnation holds at once. A serving lane admits and
+#: How many PREPARED requests this epoch holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
 #: worker prepared and then never dispatched.
 PREPARED_HELD = 8
@@ -250,7 +250,7 @@ class _CompositeResidency:
 
 
 class Executor:
-    """One incarnation's mutable state. Everything here dies with the process."""
+    """One epoch's mutable state. Everything here dies with the process."""
 
     def __init__(self, channel: Channel, root: Path, fill_forensics_dir: str = "") -> None:
         self.channel = channel
@@ -259,7 +259,7 @@ class Executor:
         #: snapshot at process entry and passed down — never read ambiently.
         self.fill_forensics_dir = fill_forensics_dir
         self.torch: Any = None
-        #: The BACKEND this incarnation serves. Every device operation below goes through
+        #: The BACKEND this epoch serves. Every device operation below goes through
         #: `accel` with it, so the whole process holds exactly one backend conditional and
         #: it is this line (#447). A weightless executor never reaches a device at all.
         self.device_kind = accel.host_backend_family()
@@ -310,10 +310,10 @@ class Executor:
         }
 
     def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Consume this incarnation's one construction attempt.
+        """Consume this epoch's one construction attempt.
 
         The latch moves before the first operation deliberately. A preparation that raises
-        after reserving or allocating state is just as terminal for this incarnation as a
+        after reserving or allocating state is just as terminal for this epoch as a
         successful fill: no later command may enter the construction body and stack another
         generation on whatever the failed attempt retained.
         """
@@ -336,7 +336,7 @@ class Executor:
         return reply
 
     def _prepare_first(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Construct and fill the incarnation's one binding."""
+        """Construct and fill the epoch's one binding."""
         if self.poisoned:
             return {
                 "ok": False,
@@ -1209,7 +1209,7 @@ class Executor:
                 "code": "prepared_request_absent",
                 "detail": f"nothing was prepared for {command['request_id']!r}: an attempt "
                 "runs the record its plan was priced against, and this executor holds none "
-                "(a fresh incarnation holds nothing at all)",
+                "(a fresh epoch holds nothing at all)",
             }
         spool = Path(command["spool"])
         deadline = _deadline(command["deadline_s"])
@@ -1513,7 +1513,7 @@ class Executor:
                         "output_slot": output_slot,
                         "tensorfs_declaration_digest": documents.spell(declaration_digest),
                         "tensorfs_declaration_length": len(declaration),
-                        "requested_writer_generation": 0,
+                        "requested_writer_epoch": 0,
                     },
                 )
                 if not answer.get("ok"):
@@ -1524,7 +1524,7 @@ class Executor:
                 receipt_digest = str(answer.get("weights_receipt_digest", ""))
                 return weights_sink.WeightsHostBinding(
                     transaction_id=str(answer.get("weights_transaction_id", "")),
-                    writer_generation=int(answer.get("writer_generation", 0)),
+                    writer_epoch=int(answer.get("writer_epoch", 0)),
                     weights_receipt_digest=(
                         documents.raw(receipt_digest) if receipt_digest else b""
                     ),

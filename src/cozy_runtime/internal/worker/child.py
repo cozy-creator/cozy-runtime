@@ -1,12 +1,12 @@
 """The disposable device executor, from the worker's side.
 
-ONE ordinal over one execution context: `executor_incarnation`, the TRANSPORT fence, which
-bumps on child respawn and rides `PlacementStatus.executor_generation`.
+ONE ordinal over one execution context: the executor EPOCH, the TRANSPORT fence, which bumps
+on child respawn and rides `PlacementStatus.executor_epoch`.
 
 `readiness_epoch` is GONE — DELETED, not renamed (#482/#486b). It was a second counter for
 in-place state invalidation (an orphan sweep + reload leaves the process alive and its state
 worthless), and rev-2 answers that with the two facts that were actually wanted: the
-placement's SERVING axis says what it can serve, and the worker-level `admission_generation`
+placement's SERVING axis says what it can serve, and the worker-level `admission_epoch`
 says whether an offer is admissible. One fence, not two to keep consistent. `invalidate()`
 still exists and still withdraws dispatchability; what it no longer does is mint an ordinal
 nobody could reconcile against the other one.
@@ -90,7 +90,7 @@ def socket_path_refusal(path: str) -> str:
 
 
 class ExecutorGone(Exception):
-    """The executor died. Always a fact about the incarnation, never about the attempt."""
+    """The executor died. Always a fact about the epoch, never about the attempt."""
 
     def __init__(self, detail: str, status: int | None = None) -> None:
         super().__init__(detail)
@@ -100,9 +100,9 @@ class ExecutorGone(Exception):
 
 @dataclass(slots=True)
 class Executor:
-    """One incarnation: a pid, a seam, and the facts it reported."""
+    """One epoch: a pid, a seam, and the facts it reported."""
 
-    incarnation: int
+    epoch: int
     process: proctree.ProcessIdentity
     scope: proctree.ExecutorScope
     channel: Channel
@@ -211,7 +211,7 @@ class OwnerRecord:
 
 
 class ExecutorSupervision:
-    """Owns the worker's one disposable executor process and incarnation fence."""
+    """Owns the worker's one disposable executor process and epoch fence."""
 
     def __init__(
         self,
@@ -250,9 +250,9 @@ class ExecutorSupervision:
             raise ExecutorGone(
                 f"worker root {self.root} is already supervised by another live worker"
             ) from exc
-        # The incarnation starts at 1 (02 §0): a worker that has not spawned yet already
+        # The epoch starts at 1 (02 §0): a worker that has not spawned yet already
         # carries a valid fence rather than a zero.
-        self.incarnation = 1
+        self.epoch = 1
         self.current: Executor | None = None
         self.spawns = 0
         self.socket_path = str(root / "executor.sock")
@@ -271,7 +271,7 @@ class ExecutorSupervision:
         self.on_lane_failure: Callable[[str], None] | None = None
         """Session-owned reaction to one of THIS object's own threads dying.
 
-        The launcher and the per-incarnation exit watcher are sole producers: nothing else
+        The launcher and the per-epoch exit watcher are sole producers: nothing else
         launches a child, and nothing else notices one dying. A thread that dies here is a
         producer that has stopped without saying so, and the session's answer is a machine
         failure an owner can read — never a silence (cr-061)."""
@@ -279,7 +279,7 @@ class ExecutorSupervision:
         """Session-owned reaction to an exact current child becoming waitable.
 
         The watcher never reaps.  It reports the exact :class:`Executor` handle so the
-        session can invalidate only that incarnation and serialize any rebuild with device
+        session can invalidate only that epoch and serialize any rebuild with device
         work; a stale watcher has no authority over a successor.
         """
         self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]] | None] = queue.Queue()
@@ -290,27 +290,25 @@ class ExecutorSupervision:
     def isolated(self) -> bool:
         return self.executor_uid >= 0 and self.executor_gid >= 0
 
-    def grant_directory(self, path: Path, generation: int) -> None:
+    def grant_directory(self, path: Path, epoch: int) -> None:
         """Hand one already-populated attempt/scratch directory to the current child."""
 
         if not self.isolated:
             return
         current = self.current
-        if current is None or current.incarnation != generation:
-            raise ExecutorGone(
-                f"cannot grant {path}: executor generation {generation} is not current"
-            )
+        if current is None or current.epoch != epoch:
+            raise ExecutorGone(f"cannot grant {path}: executor epoch {epoch} is not current")
         os.chown(path, self.executor_uid, self.executor_gid)
         path.chmod(0o700)
 
-    def generation_scratch(self, generation: int) -> Path:
+    def epoch_scratch(self, epoch: int) -> Path:
         if self.scratch_root is None:
             raise ExecutorGone("executor scratch root is absent")
         if not self.isolated:
             return self.scratch_root
-        return self.scratch_root / f"generation-{generation}"
+        return self.scratch_root / f"epoch-{epoch}"
 
-    def _prepare_generation_scratch(self) -> None:
+    def _prepare_epoch_scratch(self) -> None:
         if not self.isolated:
             return
         if self.scratch_root is None:
@@ -319,15 +317,15 @@ class ExecutorSupervision:
         os.chown(self.scratch_root, 0, 0)
         self.scratch_root.chmod(0o711)
         # No old executor exists while _spawn_locked holds the lifecycle lock. Remove every
-        # retired generation before making the successor reachable; a fixed uid therefore
-        # cannot read a previous incarnation's scratch even though the numeric uid is reused.
+        # retired epoch before making the successor reachable; a fixed uid therefore
+        # cannot read a previous epoch's scratch even though the numeric uid is reused.
         for entry in self.scratch_root.iterdir():
             if entry.is_symlink() or not entry.is_dir():
                 raise ExecutorGone(f"unexpected entry in executor scratch root: {entry}")
             shutil.rmtree(entry)
-        generation = self.generation_scratch(self.incarnation)
-        generation.mkdir(mode=0o700)
-        os.chown(generation, self.executor_uid, self.executor_gid)
+        scratch = self.epoch_scratch(self.epoch)
+        scratch.mkdir(mode=0o700)
+        os.chown(scratch, self.executor_uid, self.executor_gid)
 
     @property
     def _owner_path(self) -> Path:
@@ -591,8 +589,8 @@ class ExecutorSupervision:
         return value  # type: ignore[no-any-return]
 
     def spawn(self, *, imposed: dict[str, str]) -> Executor:
-        """EXEC-FIRST spawn of a fresh incarnation. Bumps BOTH ordinals: a fresh executor
-        has no state, so every incarnation bump implies a readiness bump.
+        """EXEC-FIRST spawn of a fresh epoch. Bumps BOTH ordinals: a fresh executor
+        has no state, so every epoch bump implies a readiness bump.
 
         THE DIAL-BACK IS WAITED OUT BY OBSERVATION, not by a clock. A child that exits can
         never dial back, so that observed death refuses immediately. A live child keeps its
@@ -604,7 +602,7 @@ class ExecutorSupervision:
                 raise ExecutorGone("executor supervision is closed")
             if self.current is not None:
                 raise ExecutorGone(
-                    f"spawn refused: incarnation {self.current.incarnation} pid "
+                    f"spawn refused: epoch {self.current.epoch} pid "
                     f"{self.current.pid} is still owned; retire or replace that exact child"
                 )
             return self._spawn_locked(imposed=imposed)
@@ -659,8 +657,8 @@ class ExecutorSupervision:
                 f"spawn refused: durable executor owner {recorded} remains; restart "
                 "reclamation must prove OS and driver absence first"
             )
-        # Cancellation is scoped to one executor generation as well as one attempt. A
-        # marker from the retired generation cannot become authority in its successor.
+        # Cancellation is scoped to one executor epoch as well as one attempt. A marker
+        # from the retired epoch cannot become authority in its successor.
         self.cancel_path.unlink(missing_ok=True)
         if self._listener is None:
             refusal = socket_path_refusal(self.socket_path)
@@ -673,9 +671,9 @@ class ExecutorSupervision:
                 os.chmod(self.socket_path, 0o660)
         if self.spawns:
             # A RESPAWN bumps the transport fence, and with it the readiness fence: a fresh
-            # executor has no state, so no incarnation bump can leave readiness unmoved.
-            self.incarnation += 1
-        self._prepare_generation_scratch()
+            # executor has no state, so no epoch bump can leave readiness unmoved.
+            self.epoch += 1
+        self._prepare_epoch_scratch()
         self.spawns += 1
         started = time.perf_counter()
         spawned: spawn.Spawned | None = None
@@ -738,7 +736,7 @@ class ExecutorSupervision:
                 proctree.signal_process(process, signal.SIGCONT)
             conn = self._dial_back(process)
             executor = Executor(
-                incarnation=self.incarnation,
+                epoch=self.epoch,
                 process=process,
                 scope=owner.scope,
                 channel=Channel(conn),
@@ -766,7 +764,7 @@ class ExecutorSupervision:
                 or spawn.seal_digest(sealed) != spawned.seal_digest
             ):
                 raise ExecutorGone(
-                    f"executor hello identity mismatch for incarnation {self.incarnation}: "
+                    f"executor hello identity mismatch for epoch {self.epoch}: "
                     f"expected pid/group {spawned.pid}, parent {os.getpid()}, seal "
                     f"{spawned.seal_digest}; received pid {executor.hello.get('pid')}, "
                     f"parent {executor.hello.get('ppid')}"
@@ -835,13 +833,13 @@ class ExecutorSupervision:
                 if callback is not None:
                     callback(executor)
             except BaseException as exc:
-                self._lane_died(f"executor-exit-{executor.incarnation}", exc)
+                self._lane_died(f"executor-exit-{executor.epoch}", exc)
 
         try:
             threading.Thread(
                 target=wait_for_exit,
                 daemon=True,
-                name=f"executor-exit-{executor.incarnation}",
+                name=f"executor-exit-{executor.epoch}",
             ).start()
         except BaseException:
             observer.close()
@@ -899,7 +897,7 @@ class ExecutorSupervision:
                 # GONE. Nothing will ever dial back, and the old constant spent a full
                 # minute not saying so — the reason is knowable the moment the child exits.
                 raise ExecutorGone(
-                    f"incarnation {self.incarnation} (pid {pid}) exited before dialling back",
+                    f"epoch {self.epoch} (pid {pid}) exited before dialling back",
                 )
 
     def invalidate(self, expected: Executor, why: str) -> bool:
@@ -1068,7 +1066,7 @@ class ExecutorSupervision:
         owner = self._read_owner()
         if owner is None or owner.scope != expected.scope or owner.process != expected.process:
             raise ExecutorGone(
-                f"durable executor owner does not match incarnation {expected.incarnation} "
+                f"durable executor owner does not match epoch {expected.epoch} "
                 f"pid {expected.pid}: {owner}"
             )
         evidence = self._reclaim_owner(owner, why)
@@ -1081,11 +1079,11 @@ class ExecutorSupervision:
         return evidence
 
     def replace(self, expected: Executor, *, imposed: dict[str, str], why: str) -> Executor:
-        """Retire one exact incarnation and publish at most one successor."""
+        """Retire one exact epoch and publish at most one successor."""
         with self._lifecycle:
             if self.current is not expected:
                 raise ExecutorGone(
-                    f"replacement refused: incarnation {expected.incarnation} pid "
+                    f"replacement refused: epoch {expected.epoch} pid "
                     f"{expected.pid} is no longer the owned executor; re-evaluate current state"
                 )
             self._retire_locked(expected, why)

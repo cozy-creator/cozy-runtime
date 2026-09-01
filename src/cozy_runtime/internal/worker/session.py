@@ -11,7 +11,7 @@ durability attributes are the whole design:
 
 The conversation on every accepted stream is fixed (02): Claim -> ClaimAck -> ONE
 `WorkerSnapshot` -> the RecordOwner's `SnapshotAck` -> dispatch opens. The ownership fence is
-`(record_owner_epoch, control_stream_generation, worker_boot_id)`, checked on every frame
+`(record_owner_epoch, control_stream_epoch, worker_boot_id)`, checked on every frame
 before any body field is read. LAUNCH TIER (single-owner): the epoch is a provisioned
 constant — a claim with a strictly higher epoch supersedes, an equal epoch from the same
 RecordOwner is a reconnect, anything else refuses typed.
@@ -346,15 +346,15 @@ class OwnershipFence:
     """WHO may drive this worker, and on WHICH stream (02 §0/§4).
 
     Split out of the old single `Fences` bag (#484): ownership and accepted intent are two
-    unrelated lifetimes — a reconnect mints a new `control_stream_generation` and touches no
+    unrelated lifetimes — a reconnect mints a new `control_stream_epoch` and touches no
     accepted revision at all, and #494a's reconnect defect was exactly that confusion made
     structural. `activity` lives in NEITHER of the two halves; it is the worker's own
     narration lane and now sits on the worker.
 
-    `record_owner_epoch` is authority-granter-minted; `control_stream_generation` is
+    `record_owner_epoch` is authority-granter-minted; `control_stream_epoch` is
     WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at worker
     boot and never reused. The caller owns recovery across worker processes. The executor
-    generation is PLACEMENT truth (#454) and deliberately not here.
+    epoch is PLACEMENT truth (#454) and deliberately not here.
     """
 
     worker_boot_id: str = ""
@@ -362,7 +362,7 @@ class OwnershipFence:
     record_owner_id: str = ""
     #: TRUE once this process accepted a (record_owner_epoch, record_owner_id) pair.
     record_owner_recorded: bool = False
-    control_stream_generation: int = 0  # worker-minted; 0 = never claimed
+    control_stream_epoch: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
     snapshot_digest: bytes = b""  # ...bound by BOTH; an ack naming either alone is not one
     dispatch_open: bool = False
@@ -400,7 +400,7 @@ class AcceptedDesiredState:
 #: no constructor can forget one (the fence is checked before any body field is read).
 def _stamped(message: Any, fence: OwnershipFence) -> Any:
     message.record_owner_epoch = fence.record_owner_epoch
-    message.control_stream_generation = fence.control_stream_generation
+    message.control_stream_epoch = fence.control_stream_epoch
     message.worker_boot_id = fence.worker_boot_id
     return message
 
@@ -410,10 +410,10 @@ def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
 
     A DesiredWorkerState carries two unrelated things: what the RecordOwner wants this worker
     to be (revision, posture, wire minor, drain grace, the mode's set or job), and the
-    per-stream envelope that routes it (record_owner_epoch, control_stream_generation,
+    per-stream envelope that routes it (record_owner_epoch, control_stream_epoch,
     worker_boot_id). Only the first is the body §3's same-revision rule is about.
 
-    Hashing the whole message made `control_stream_generation` — which the WORKER mints
+    Hashing the whole message made `control_stream_epoch` — which the WORKER mints
     afresh for every accepted stream, by design — part of the body, so the identical desired
     revision re-sent after an ordinary reconnect classified as `same_revision_changed_body`
     and took a permanent CONFIG_REFUSED fault. Same revision + same desired state is now the
@@ -423,7 +423,7 @@ def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     body = pb.DesiredWorkerState()
     body.CopyFrom(desired)
     body.record_owner_epoch = 0
-    body.control_stream_generation = 0
+    body.control_stream_epoch = 0
     body.worker_boot_id = ""
     return documents.canonical_bytes(body)
 
@@ -896,7 +896,7 @@ class Worker:
         #: an `AttemptOffer` echoing anything else refuses DETERMINISTICALLY. Per-placement
         #: `attempt_credits` are deleted: N counters over ONE serialized device advertise
         #: N x the real capacity, which is an arithmetic defect, not a tuning problem.
-        self.admission_generation = 1
+        self.admission_epoch = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.records = WorkerRecords()
@@ -915,7 +915,7 @@ class Worker:
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
-        # from the superseded stream cannot finish under its successor's generation.
+        # from the superseded stream cannot finish under its successor's epoch.
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
@@ -989,9 +989,9 @@ class Worker:
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
         #: for the live stream. A single process-wide queue made that theft routine: the dead
-        #: generation's pump sits in `get(timeout=REPORT_SECONDS)`, and for up to that long
+        #: epoch's pump sits in `get(timeout=REPORT_SECONDS)`, and for up to that long
         #: after a reconnect it woke on the NEXT frame — a live AttemptTerminal — saw the
-        #: generation had moved, and dropped it. The terminal was recorded, so it replayed on
+        #: epoch had moved, and dropped it. The terminal was recorded, so it replayed on
         #: the following claim and the replay law held; live delivery on the stream that
         #: dispatched it did not.
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
@@ -1119,7 +1119,7 @@ class Worker:
             rebuild = self._placement_dispatchable(placement_id)
             if not hosted.supervision.invalidate(
                 executor,
-                f"executor incarnation {executor.incarnation} pid {executor.pid} exited",
+                f"executor epoch {executor.epoch} pid {executor.pid} exited",
             ):
                 return
             if rebuild and not self.stop.is_set():
@@ -1208,7 +1208,7 @@ class Worker:
                         executor = self.supervision.replace(
                             executor, imposed=self.imposed(), why="prepared package changed"
                         )
-                    scratch = self.supervision.generation_scratch(executor.incarnation)
+                    scratch = self.supervision.epoch_scratch(executor.epoch)
                     output = scratch / f"package-descriptor-{uuid.uuid4().hex}.json"
                     reply = executor.call(
                         {
@@ -1360,7 +1360,7 @@ class Worker:
         unacknowledged terminal is replayed after a reconnect.
 
         STAMP AND ENQUEUE ARE ONE STEP, under the same lock claim acceptance takes: the
-        envelope a frame carries and the stream it is queued on are then the same generation
+        envelope a frame carries and the stream it is queued on are then the same epoch
         by construction, with no window where a frame is stamped for one stream and handed to
         another's sender.
         """
@@ -1379,8 +1379,8 @@ class Worker:
         "staged on disk but offline", which is exactly the state an outgoing placement holds under
         fallback-retention.
 
-        ADMISSION MEANING MOVES WITH IT, so `admission_generation` bumps here (§6): an offer
-        minted against the old generation refuses deterministically rather than racing a
+        ADMISSION MEANING MOVES WITH IT, so `admission_epoch` bumps here (§6): an offer
+        minted against the old epoch refuses deterministically rather than racing a
         placement that stopped being dispatchable while it was in flight.
         """
         if self.placement is None or state == self.placement.serving:
@@ -1443,8 +1443,8 @@ class Worker:
     def bump_admission(self, why: str) -> None:
         """The ONE worker-level admission fence moves (§6). Callers: executor respawn,
         window resize, phase change, cutover, and every serving-axis edge above."""
-        self.admission_generation += 1
-        self.note("admission", f"generation {self.admission_generation}: {why}"[:256])
+        self.admission_epoch += 1
+        self.note("admission", f"epoch {self.admission_epoch}: {why}"[:256])
 
     def dispatchable(self) -> bool:
         """Can this worker take an offer AT ALL right now? Serving asks the placement's
@@ -1572,7 +1572,7 @@ class Worker:
             self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
 
     def executor_exited(self, executor: child.Executor) -> None:
-        """Withdraw an exact dead incarnation and ask the device lane to rebuild it.
+        """Withdraw an exact dead epoch and ask the device lane to rebuild it.
 
         The pidfd watcher does not reap.  Invalidation clears the ready-plan set and moves
         admission before this callback returns; replacement remains queued behind whichever
@@ -1590,7 +1590,7 @@ class Worker:
             )
             if not self.supervision.invalidate(
                 executor,
-                f"executor incarnation {executor.incarnation} pid {executor.pid} exited",
+                f"executor epoch {executor.epoch} pid {executor.pid} exited",
             ):
                 return
             if rebuild and not self.stop.is_set():
@@ -1626,7 +1626,7 @@ class Worker:
     def applied_posture(self) -> dict[str, Any]:
         """The state the worker was in when something happened (§3.6). `readiness_epoch` is
         NOT here: it is DELETED, not renamed (#486b) — the serving axis says what the
-        placement can serve and `admission_generation` says whether an offer is admissible,
+        placement can serve and `admission_epoch` says whether an offer is admissible,
         which is one fence instead of two to keep consistent."""
         return {
             "posture": pb.Posture.Name(self.accepted.posture),
@@ -1644,10 +1644,10 @@ class Worker:
             "accepted_desired_state_revision": self.accepted.accepted_desired_state_revision,
             "converged_revision": self.converged_revision(),
             "record_owner_epoch": self.fence.record_owner_epoch,
-            "control_stream_generation": self.fence.control_stream_generation,
+            "control_stream_epoch": self.fence.control_stream_epoch,
             "applied_wire_minor": self.fence.wire_minor,
-            "admission_generation": self.admission_generation,
-            "executor_generation": self.supervision.incarnation,
+            "admission_epoch": self.admission_epoch,
+            "executor_epoch": self.supervision.epoch,
             "placement_id": self.placement.placement_id if self.placement else "",
             "worker_id": self.options.worker_id,
             "worker_release_id": self.options.release_id,
@@ -1684,7 +1684,7 @@ class Worker:
         """ONE control stream: Claim -> ClaimAck -> WorkerSnapshot -> (SnapshotAck) -> frames.
 
         Runs on the host's thread. The first frame MUST be a Claim; acceptance fences any
-        previous stream by minting the next `control_stream_generation`, so the superseded
+        previous stream by minting the next `control_stream_epoch`, so the superseded
         stream's sender exits on its next frame and its watches end.
         """
         try:
@@ -1698,8 +1698,8 @@ class Worker:
         # Acceptance and the snapshot are one control transition. In particular, the claim
         # cannot snapshot half of a desired-state replacement running on another stream.
         with self.control_lock:
-            generation, outbound = self.accept_claim(claim, send)
-            if generation == 0:
+            epoch, outbound = self.accept_claim(claim, send)
+            if epoch == 0:
                 return  # refused; the rejection already went out and the stream ends
             if self.boot_fatal is not None:
                 # The boot-fatal verdict INSTEAD of ClaimAck (01, #494c): the claim was
@@ -1709,20 +1709,20 @@ class Worker:
                 self.note("boot", "boot failure delivered INSTEAD of ClaimAck; stopping")
                 self.shutdown_from_stream()
                 return
-            self._send_claim_ack(claim, generation, send)
+            self._send_claim_ack(claim, epoch, send)
 
         sender = threading.Thread(
-            target=self._lane("control-send", self._pump_outbound, generation, send, outbound),
+            target=self._lane("control-send", self._pump_outbound, epoch, send, outbound),
             daemon=True,
-            name=f"control-send-{generation}",
+            name=f"control-send-{epoch}",
         )
         sender.start()
         try:
             for frame in inbound:
-                if self.fence.control_stream_generation != generation or self.stop.is_set():
+                if self.fence.control_stream_epoch != epoch or self.stop.is_set():
                     self.note("fence", "a frame arrived on a superseded stream; ending it")
                     return
-                self._dispatch_frame(frame, generation)
+                self._dispatch_frame(frame, epoch)
         except Exception as exc:
             # THE MESSAGE, not the class name. A typed refusal carries the one sentence that
             # says what to do about it, and reducing it to `PlanRefusal` produced a log that
@@ -1730,7 +1730,7 @@ class Worker:
             # off the record to find out which key it was about.
             self.note("session", f"the control stream ended: {type(exc).__name__}: {exc}")
         finally:
-            if self.fence.control_stream_generation == generation:
+            if self.fence.control_stream_epoch == epoch:
                 self.connected.clear()
                 self.fence.dispatch_open = False
 
@@ -1738,7 +1738,7 @@ class Worker:
         self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]
     ) -> tuple[int, queue.Queue[pb.WorkerFrame | None]]:
         """The ownership fence (02 §4). AUTHENTICATE, fence, RECORD the authority durably,
-        mint the generation. Returns `(generation, this stream's outbound queue)`, or
+        mint the epoch. Returns `(epoch, this stream's outbound queue)`, or
         `(0, …)` on refusal — the ClaimAck carrying the rejection has already gone out.
 
         Nothing is acknowledged here. The caller decides what the accepted claim is owed: a
@@ -1753,7 +1753,7 @@ class Worker:
                 wire_minor=WIRE_MINOR,
             )
             ack.record_owner_epoch = claim.record_owner_epoch
-            ack.control_stream_generation = self.fence.control_stream_generation
+            ack.control_stream_epoch = self.fence.control_stream_epoch
             ack.worker_boot_id = self.fence.worker_boot_id
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
@@ -1795,7 +1795,7 @@ class Worker:
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
-            # `record_owner_recorded`, not the generation: the high-water authority this worker
+            # `record_owner_recorded`, not the epoch: the high-water authority this worker
             # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
             # before the restart instead of welcoming it back as the first claim of a fresh
             # process.
@@ -1820,14 +1820,14 @@ class Worker:
             # RECORD BEFORE ACKNOWLEDGING so a reconnect to this process cannot race the
             # ownership fence. The caller owns recovery across worker processes.
             self.record_ownership(claim)
-            superseded = self.fence.control_stream_generation
+            superseded = self.fence.control_stream_epoch
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
             self.fence.record_owner_recorded = True
-            self.fence.control_stream_generation += 1
+            self.fence.control_stream_epoch += 1
             self.fence.dispatch_open = False
             self.fence.wire_minor = min(WIRE_MINOR, claim.wire_minor)
-            generation = self.fence.control_stream_generation
+            epoch = self.fence.control_stream_epoch
             # A FRESH queue for this stream. The superseded sender keeps its own and drains
             # into a dead call; nothing it still holds was ever this stream's to deliver, and
             # everything the law owes regenerates — unacked terminals replay after
@@ -1835,13 +1835,13 @@ class Worker:
             outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
             self.outbound = outbound
         if superseded:
-            self.watches.end_generation(superseded)
+            self.watches.end_epoch(superseded)
             self.note(
                 "claim",
-                f"stream generation {superseded} fenced; generation {generation} claims "
-                f"under epoch {claim.record_owner_epoch}",
+                f"stream epoch {superseded} fenced; stream epoch {epoch} claims "
+                f"under owner epoch {claim.record_owner_epoch}",
             )
-        return generation, outbound
+        return epoch, outbound
 
     def mark_claim_ready(self) -> None:
         """Open Claim only after fixed-host listener proof and readiness publication."""
@@ -1864,7 +1864,7 @@ class Worker:
         )
 
     def _send_claim_ack(
-        self, claim: pb.Claim, generation: int, send: Callable[[pb.WorkerFrame], None]
+        self, claim: pb.Claim, epoch: int, send: Callable[[pb.WorkerFrame], None]
     ) -> None:
         """ClaimAck + the convergence snapshot, for a claim this worker can actually serve.
 
@@ -1885,8 +1885,8 @@ class Worker:
         self._send_snapshot(send)
         self.note(
             "session",
-            f"claimed by {claim.record_owner_id or 'an unnamed RecordOwner'} at epoch "
-            f"{claim.record_owner_epoch}, generation {generation} "
+            f"claimed by {claim.record_owner_id or 'an unnamed RecordOwner'} at owner epoch "
+            f"{claim.record_owner_epoch}, stream epoch {epoch} "
             f"(wire_minor effective {self.fence.wire_minor})",
         )
 
@@ -1904,7 +1904,7 @@ class Worker:
             accepted_placement_set_digest=self.accepted.accepted_placement_set_digest,
             worker_phase=self.phase,
             converged_revision=self.converged_revision(),
-            admission_generation=self.admission_generation,
+            admission_epoch=self.admission_epoch,
             admission_state=self.admission_state(),
             available_attempt_slots=self.available_attempt_slots(),
         )
@@ -1947,7 +1947,7 @@ class Worker:
 
     def _pump_outbound(
         self,
-        generation: int,
+        epoch: int,
         send: Callable[[pb.WorkerFrame], None],
         outbound: queue.Queue[pb.WorkerFrame | None],
     ) -> None:
@@ -1956,11 +1956,11 @@ class Worker:
         The queue is passed in rather than read off `self`: a superseded pump that keeps
         looping for a moment must drain the queue it was born with, never the live stream's.
         """
-        while not self.stop.is_set() and self.fence.control_stream_generation == generation:
+        while not self.stop.is_set() and self.fence.control_stream_epoch == epoch:
             try:
                 frame = outbound.get(timeout=REPORT_SECONDS)
             except queue.Empty:
-                continue  # the generation check above is this thread's fence
+                continue  # the epoch check above is this thread's fence
             if frame is None:
                 return
             try:
@@ -1973,10 +1973,10 @@ class Worker:
         if message.record_owner_epoch != self.fence.record_owner_epoch:
             self.note("fence", f"dropped: epoch {message.record_owner_epoch}")
             return True
-        if message.control_stream_generation != self.fence.control_stream_generation:
+        if message.control_stream_epoch != self.fence.control_stream_epoch:
             self.note(
                 "fence",
-                f"dropped: superseded generation {message.control_stream_generation}",
+                f"dropped: superseded stream epoch {message.control_stream_epoch}",
             )
             return True
         if message.worker_boot_id != self.fence.worker_boot_id:
@@ -1984,16 +1984,16 @@ class Worker:
             return True
         return False
 
-    def _dispatch_frame(self, frame: pb.RecordOwnerFrame, generation: int) -> None:
+    def _dispatch_frame(self, frame: pb.RecordOwnerFrame, epoch: int) -> None:
         """Apply one frame while its stream still owns the worker.
 
-        The stream generation is checked inside the same lock claims take. Trusting only the
+        The stream epoch is checked inside the same lock claims take. Trusting only the
         frame envelope left a check/use window in which a new claim could supersede this
         stream and the old handler could then mutate state and stamp replies as the new one.
         """
         with self.control_lock:
-            if generation != self.fence.control_stream_generation:
-                self.note("fence", f"dropped a frame from superseded stream {generation}")
+            if epoch != self.fence.control_stream_epoch:
+                self.note("fence", f"dropped a frame from superseded stream {epoch}")
                 return
             self._dispatch_current_frame(frame)
 
@@ -2083,14 +2083,14 @@ class Worker:
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
-        a change in admission MEANING, so it does NOT bump `admission_generation` (§6).
+        a change in admission MEANING, so it does NOT bump `admission_epoch` (§6).
 
-        The distinction is load-bearing and it cost a live run to find. `admission_generation`
+        The distinction is load-bearing and it cost a live run to find. `admission_epoch`
         moves when the meaning of an offer changes — executor respawn, window resize, phase
         change, cutover — and a RecordOwner dispatching against a stale one is refused
         deterministically. Freeing a seat changes neither: bumping here made EVERY
-        steady-state dispatch refuse ADMISSION_GENERATION_STALE, because the ack that freed
-        the seat invalidated the generation the RecordOwner was about to dispatch against.
+        steady-state dispatch refuse ADMISSION_EPOCH_STALE, because the ack that freed the
+        seat invalidated the epoch the RecordOwner was about to dispatch against.
         `available_attempt_slots` is the field that carries this, and it is recomputed on
         every tick.
         """
@@ -2116,10 +2116,10 @@ class Worker:
         self.host.stop()
 
     def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
-        """One WatchProgress call: bound to the fenced control generation (#436)."""
+        """One WatchProgress call: bound to the fenced control-stream epoch (#436)."""
         if self.fenced(opened):
             return iter(())
-        return self.watches.open(opened.request_id, opened.control_stream_generation).frames(
+        return self.watches.open(opened.request_id, opened.control_stream_epoch).frames(
             self.watches
         )
 
@@ -2381,7 +2381,7 @@ class Worker:
         self.convergences.put(revision)
 
     def convergence_lane(self) -> None:
-        """One non-control lane for slow, generation-fenced placement convergence."""
+        """One non-control lane for slow, epoch-fenced placement convergence."""
 
         while (revision := self.convergences.get()) is not None:
             if revision != self.accepted.accepted_desired_state_revision:
@@ -2625,7 +2625,7 @@ class Worker:
                 hosted.prepared_models[binding.entrypoint_binding_digest] = prepared
             self.note(
                 "boot",
-                f"{placement.placement_id!r} executor generation {executor.incarnation} "
+                f"{placement.placement_id!r} executor epoch {executor.epoch} "
                 f"pid {executor.pid} prepared {len(group)} binding(s)",
             )
         except Exception as exc:
@@ -3061,7 +3061,7 @@ class Worker:
         executor.reserved_for_job = True
         self.note(
             "boot",
-            f"job executor generation {executor.incarnation} pid {executor.pid} dialled "
+            f"job executor epoch {executor.epoch} pid {executor.pid} dialled "
             f"back in {(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
             f"(torch_loaded={executor.hello.get('torch_loaded')})",
         )
@@ -3169,7 +3169,7 @@ class Worker:
             self.engine.prepared_models = self.prepared_models
             self.note(
                 "boot",
-                f"reused generation {executor.incarnation} pid {executor.pid} for the same "
+                f"reused epoch {executor.epoch} pid {executor.pid} for the same "
                 f"construction ({len(executor.ready_bindings)} binding(s))",
             )
             if executor.ready_bindings:
@@ -3198,7 +3198,7 @@ class Worker:
             ):
                 self.note(
                     "boot",
-                    f"preparing fresh generation {executor.incarnation} pid {executor.pid}",
+                    f"preparing fresh epoch {executor.epoch} pid {executor.pid}",
                 )
             else:
                 self.note("boot", "replacing the device executor for a new construction")
@@ -3209,7 +3209,7 @@ class Worker:
                 )
             self.note(
                 "boot",
-                f"generation {executor.incarnation} pid {executor.pid} dialled back in "
+                f"epoch {executor.epoch} pid {executor.pid} dialled back in "
                 f"{(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
                 f"(no_new_privs={executor.hello.get('no_new_privs')}, "
                 f"oom_score_adj={executor.hello.get('oom_score_adj')}, "
@@ -3622,16 +3622,16 @@ class Worker:
         dispatch it elsewhere.
         """
         # THE ADMISSION FENCE FIRST (§6), because it is the cheapest deterministic verdict
-        # and because a stale generation means the RecordOwner dispatched against a picture
+        # and because a stale epoch means the RecordOwner dispatched against a picture
         # of this worker that no longer holds.
-        if offered.admission_generation != self.admission_generation:
+        if offered.admission_epoch != self.admission_epoch:
             self.refuse(
                 offered,
-                "admission_generation_stale",
-                f"the offer echoes admission generation {offered.admission_generation} and "
-                f"this worker is at {self.admission_generation}; the verdict is the same on "
+                "admission_epoch_stale",
+                f"the offer echoes admission epoch {offered.admission_epoch} and "
+                f"this worker is at {self.admission_epoch}; the verdict is the same on "
                 "every replay of these bytes, and the ordinal is consumed with no budget draw",
-                CAUSE.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+                CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
             )
             return
         if self.accepted.mode == "serving":
@@ -3824,7 +3824,7 @@ class Worker:
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance
         # A queued offer cannot be accepted on the far side of a placement or
-        # admission-generation change merely because it passed `on_offer()` earlier.
+        # admission-epoch change merely because it passed `on_offer()` earlier.
         with self.control_lock:
             if attempt.canceling:
                 self.note("cancel", f"{key} was cancelled before admission")
@@ -3835,20 +3835,20 @@ class Worker:
                 self.note("cancel", f"{key} reached the lane past its deadline")
                 self.terminate(attempt, self.engine.finish_cancel, "deadline")
                 return False
-            if attempt.admission_generation != self.admission_generation:
+            if attempt.admission_epoch != self.admission_epoch:
                 self.note(
                     "admission",
-                    f"refusing queued {key}: offered generation "
-                    f"{attempt.admission_generation}, current {self.admission_generation}",
+                    f"refusing queued {key}: offered epoch "
+                    f"{attempt.admission_epoch}, current {self.admission_epoch}",
                 )
                 self.terminate(
                     attempt,
                     self.engine.refuse_held,
-                    "admission_generation_stale",
-                    f"the queued offer echoes admission generation "
-                    f"{attempt.admission_generation} and this worker is now at "
-                    f"{self.admission_generation}",
-                    CAUSE.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+                    "admission_epoch_stale",
+                    f"the queued offer echoes admission epoch "
+                    f"{attempt.admission_epoch} and this worker is now at "
+                    f"{self.admission_epoch}",
+                    CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
                 )
                 return False
             if self.accepted.mode == "serving":
@@ -3971,7 +3971,7 @@ class Worker:
             self._rebuild_locked(why)
 
     def rebuild_exited(self, executor: child.Executor, placement_id: str = "") -> None:
-        """Rebuild only if the queued death still names the owned dead incarnation."""
+        """Rebuild only if the queued death still names the owned dead epoch."""
 
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
@@ -3983,7 +3983,7 @@ class Worker:
             if self.supervision.current is not executor or executor.alive():
                 return
             self._rebuild_locked(
-                f"observed exit of executor incarnation {executor.incarnation} pid {executor.pid}"
+                f"observed exit of executor epoch {executor.epoch} pid {executor.pid}"
             )
 
     def _rebuild_locked(self, why: str) -> None:
@@ -4021,8 +4021,8 @@ class Worker:
         self.note(
             "recovery",
             f"dispatchable again in {(time.perf_counter() - started) * 1000:.0f} ms at "
-            f"executor generation {self.supervision.incarnation} / admission generation "
-            f"{self.admission_generation}",
+            f"executor epoch {self.supervision.epoch} / admission epoch "
+            f"{self.admission_epoch}",
         )
 
     def watchdog(self) -> None:
@@ -4119,7 +4119,7 @@ class Worker:
             applied_wire_minor=self.fence.wire_minor,
             # THE ONE WORKER-LEVEL ADMISSION FENCE (§6). Not per placement: N counters over
             # ONE serialized device advertise N x the real capacity.
-            admission_generation=self.admission_generation,
+            admission_epoch=self.admission_epoch,
             admission_state=self.admission_state(),
             available_attempt_slots=self.available_attempt_slots(),
         )
@@ -4154,7 +4154,7 @@ class Worker:
         """Per-placement truth on TWO AXES (#473/#482), and `readiness_epoch` is not among
         them: it is DELETED, not renamed (#486b), because the serving axis plus
         `dispatchable_binding_digests` carry what a placement can serve and the worker-level
-        `admission_generation` carries whether an offer is admissible. `attempt_credits` is
+        `admission_epoch` carries whether an offer is admissible. `attempt_credits` is
         gone for the same reason, one level up.
 
         The accelerator qualification is deliberately ABSENT: this torch-free process cannot
@@ -4183,7 +4183,7 @@ class Worker:
             retained_fallback_placement_set_digest=(
                 placement.retained_fallback_placement_set_digest
             ),
-            executor_generation=supervision.incarnation,
+            executor_epoch=supervision.epoch,
             dispatchable_binding_digests=[documents.raw(value) for value in dispatchable],
             materializable_binding_digests=[documents.raw(value) for value in materializable],
             faults=[
@@ -4379,9 +4379,9 @@ class Worker:
             + json.dumps(
                 {
                     "worker_boot_id": self.fence.worker_boot_id,
-                    "control_generation": self.fence.control_stream_generation,
-                    "executor_generations": sum(supervision.spawns for supervision in supervisions),
-                    "admission_generation": self.admission_generation,
+                    "control_stream_epoch": self.fence.control_stream_epoch,
+                    "executor_epochs": sum(supervision.spawns for supervision in supervisions),
+                    "admission_epoch": self.admission_epoch,
                     "executed": self.engine.executed,
                     "record_count": self.records.appends,
                     "progress_sent": self.watches.sent,

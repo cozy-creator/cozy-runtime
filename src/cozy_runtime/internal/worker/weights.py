@@ -82,7 +82,7 @@ class _Pending:
 @dataclass(slots=True)
 class _Held:
     transaction_id: str
-    writer_generation: int
+    writer_epoch: int
     receipt: pb.WeightsReceiptRef
     objects: dict[str, pb.WeightsObjectSource]
     manifest_id: str
@@ -146,7 +146,7 @@ class WeightsExchange:
         output_slot: str,
         declaration_digest: bytes,
         declaration: bytes,
-        requested_writer_generation: int,
+        requested_writer_epoch: int,
     ) -> dict[str, Any]:
         if self.store_root is None:
             raise WeightsExchangeError(
@@ -168,7 +168,7 @@ class WeightsExchange:
                 invocation_spec_digest=attempt.digest,
                 output_slot=output_slot,
                 tensorfs_declaration_digest=declaration_digest,
-                requested_writer_generation=requested_writer_generation,
+                requested_writer_epoch=requested_writer_epoch,
                 tensorfs_declaration_canonical_bytes=declaration,
             )
         )
@@ -190,9 +190,9 @@ class WeightsExchange:
         with self._lock:
             known = self._bindings.setdefault(
                 ack.weights_transaction_id,
-                (ack.writer_generation, declaration_digest),
+                (ack.writer_epoch, declaration_digest),
             )
-        if known != (ack.writer_generation, declaration_digest):
+        if known != (ack.writer_epoch, declaration_digest):
             raise WeightsExchangeError(
                 "weights_host_ack_mismatch", "transaction binding changed within one Runtime"
             )
@@ -216,7 +216,7 @@ class WeightsExchange:
                 )
             held = self._hold(
                 ack.weights_transaction_id,
-                ack.writer_generation,
+                ack.writer_epoch,
                 ack.weights_receipt,
             )
             if ack.manifest != held.manifest:
@@ -227,7 +227,7 @@ class WeightsExchange:
         return {
             "ok": True,
             "weights_transaction_id": ack.weights_transaction_id,
-            "writer_generation": ack.writer_generation,
+            "writer_epoch": ack.writer_epoch,
             "weights_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
         }
 
@@ -264,7 +264,7 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "receipt does not bind this attempt/output"
             )
-        held = self._hold(transaction_id, self._writer_generation(transaction_id), reference)
+        held = self._hold(transaction_id, self._writer_epoch(transaction_id), reference)
         frame = pb.WorkerFrame(
             weights_receipt=pb.WeightsReceiptFrame(
                 request_id=attempt.request_id,
@@ -272,7 +272,7 @@ class WeightsExchange:
                 invocation_spec_digest=attempt.digest,
                 output_slot=output_slot,
                 weights_transaction_id=transaction_id,
-                writer_generation=held.writer_generation,
+                writer_epoch=held.writer_epoch,
                 tensorfs_declaration_digest=self._declaration_digest(transaction_id),
                 weights_receipt=reference,
                 objects=[held.objects[key] for key in sorted(held.objects)],
@@ -351,10 +351,10 @@ class WeightsExchange:
                 pb.WEIGHTS_READ_REFUSAL_UNKNOWN_TRANSACTION,
                 "weights transaction is not held by this Runtime",
             )
-        elif request.writer_generation != held.writer_generation:
+        elif request.writer_epoch != held.writer_epoch:
             refusal, detail = (
                 pb.WEIGHTS_READ_REFUSAL_STALE_WRITER,
-                "writer generation is stale",
+                "writer epoch is stale",
             )
         elif row is None:
             refusal, detail = (
@@ -397,7 +397,7 @@ class WeightsExchange:
                 )
         result = pb.WeightsReadResult(
             weights_transaction_id=request.weights_transaction_id,
-            writer_generation=request.writer_generation,
+            writer_epoch=request.writer_epoch,
             object_id=request.object_id,
             source_ref=request.source_ref,
             read_id=request.read_id,
@@ -417,7 +417,7 @@ class WeightsExchange:
         """Stream ONE held object to the exact presigned URL the supervisor granted."""
         result = pb.WeightsUploadResult(
             weights_transaction_id=request.weights_transaction_id,
-            writer_generation=request.writer_generation,
+            writer_epoch=request.writer_epoch,
             object_id=request.object_id,
             operation_id=request.operation_id,
             grant_revision=request.grant_revision,
@@ -470,8 +470,8 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "unknown_transaction", "weights transaction is not held by this Runtime"
             )
-        if request.writer_generation != held.writer_generation:
-            raise WeightsExchangeError("stale_writer", "writer generation is stale")
+        if request.writer_epoch != held.writer_epoch:
+            raise WeightsExchangeError("stale_writer", "writer epoch is stale")
         row = held.objects.get(request.object_id)
         if row is None:
             raise WeightsExchangeError(
@@ -542,14 +542,14 @@ class WeightsExchange:
             if (
                 not ack.refusal
                 or ack.weights_transaction_id
-                or ack.writer_generation
+                or ack.writer_epoch
                 or ack.HasField("weights_receipt")
                 or ack.HasField("manifest")
             ):
                 raise WeightsExchangeError(
                     "weights_host_ack_invalid", "refusal carries transaction authority"
                 )
-        elif ack.refusal or not ack.weights_transaction_id or ack.writer_generation <= 0:
+        elif ack.refusal or not ack.weights_transaction_id or ack.writer_epoch <= 0:
             raise WeightsExchangeError(
                 "weights_host_ack_invalid", "recorded ACK lacks transaction authority"
             )
@@ -560,7 +560,7 @@ class WeightsExchange:
         if stage == pb.WEIGHTS_HOST_STAGE_RECEIPT:
             if (
                 ack.weights_transaction_id != sent.weights_transaction_id
-                or ack.writer_generation != sent.writer_generation
+                or ack.writer_epoch != sent.writer_epoch
                 or not ack.HasField("weights_receipt")
                 or ack.manifest != sent.manifest
             ):
@@ -590,14 +590,14 @@ class WeightsExchange:
     def _hold(
         self,
         transaction_id: str,
-        writer_generation: int,
+        writer_epoch: int,
         reference: pb.WeightsReceiptRef,
     ) -> _Held:
         store = self._store()
         with self._lock:
             existing = self._held.get(transaction_id)
         if existing is not None:
-            if existing.writer_generation != writer_generation or existing.receipt != reference:
+            if existing.writer_epoch != writer_epoch or existing.receipt != reference:
                 raise WeightsExchangeError(
                     "weights_receipt_mismatch", "held transaction carries another receipt"
                 )
@@ -665,7 +665,7 @@ class WeightsExchange:
             )
         held = _Held(
             transaction_id=transaction_id,
-            writer_generation=writer_generation,
+            writer_epoch=writer_epoch,
             receipt=reference,
             objects=rows,
             manifest_id=manifest_id,
@@ -698,7 +698,7 @@ class WeightsExchange:
             self.store = pull.open_store(fill.tensorfs_module(), self.store_root)
         return self.store
 
-    def _writer_generation(self, transaction_id: str) -> int:
+    def _writer_epoch(self, transaction_id: str) -> int:
         with self._lock:
             binding = self._bindings.get(transaction_id)
         if binding is not None:

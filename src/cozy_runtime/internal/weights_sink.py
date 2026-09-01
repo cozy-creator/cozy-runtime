@@ -47,7 +47,7 @@ class WeightsHostBinding:
     """The supervisor's durable answer to one exact TensorFS declaration."""
 
     transaction_id: str
-    writer_generation: int
+    writer_epoch: int
     weights_receipt_digest: bytes = b""
 
 
@@ -151,12 +151,12 @@ class WeightsTransactionHost:
             if self.bind_intent is not None
             else WeightsHostBinding(transaction_id, self.writer_session_id)
         )
-        if binding.transaction_id != transaction_id or binding.writer_generation <= 0:
+        if binding.transaction_id != transaction_id or binding.writer_epoch <= 0:
             raise CapabilityError(
-                "the weights host bound another transaction or an invalid writer generation",
+                "the weights host bound another transaction or an invalid writer epoch",
                 code="weights_host_identity",
             )
-        self.writer_session_id = binding.writer_generation
+        self.writer_session_id = binding.writer_epoch
         existing = self.store.derived_lookup(transaction_id)
         if existing.get("state") == "committed":
             facts = self._receipt(existing.get("receipt"), transaction_id, expected_declaration)
@@ -197,7 +197,7 @@ class WeightsTransactionHost:
         try:
             writer = self.store.begin_derived(
                 transaction_id,
-                binding.writer_generation,
+                binding.writer_epoch,
                 sources,
                 targets,
                 configs,
