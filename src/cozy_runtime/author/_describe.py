@@ -156,7 +156,10 @@ def _separation(surface: Surface) -> None:
             "declares none",
             code="weights_source_absent",
         )
-    if surface.source_profiles and not surface.weights_outputs:
+    if surface.kind == "job" and surface.source_profiles and not surface.weights_outputs:
+        # On a job, source_profiles prepare inputs for weights production. On an
+        # entrypoint they declare the tested model source for publish-time derive
+        # evidence (cr-067) and need no output declaration.
         raise ConformanceError(
             f"{surface.name}: source_profiles prepare inputs for a weights-producing job, but "
             "this job declares no WeightsOutput",

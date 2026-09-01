@@ -30,6 +30,10 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 MAX_FILES = 4096
 MAX_FILE_BYTES = 8 << 30
+MAX_MANIFEST_BYTES = 64 << 20
+MANIFEST_FORMAT = "cozy.package.manifest/1"
+MANIFEST_FILENAME = "package-manifest.json"
+PUBLISHED_DESCRIPTOR_FILENAME = "package-descriptor.json"
 _DISTRIBUTION = re.compile(r"[-_.]+")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 
@@ -87,11 +91,19 @@ def prepare_package_set(
         documents.raw(release_digest)
     except (documents.DocumentError, ValueError) as exc:
         raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
+    published_descriptor = _published_descriptor(
+        request.files,
+        artifact_cache=artifact_cache,
+        package_name=package_name,
+        release=release,
+        release_digest=release_digest,
+    )
 
     return prepare_package(
         package_name=package_name,
         release=release,
         release_digest=release_digest,
+        published_descriptor=published_descriptor,
         files=request.files,
         placement_seed=request.download_delegation,
         artifact_cache=artifact_cache,
@@ -106,6 +118,89 @@ def prepare_package_set(
         native_environment=native_environment,
         native_device_index=native_device_index,
     )
+
+
+def _published_descriptor(
+    files: Sequence[pb.LocalDownloadFile],
+    *,
+    artifact_cache: Path,
+    package_name: str,
+    release: str,
+    release_digest: str,
+) -> bytes:
+    """Read and prove the hub-committed manifest + descriptor staged beside the set.
+
+    The published descriptor is the pod's authoritative wiring (cr-067). The manifest's
+    identity IS the delegation's wire-trusted `release_digest` (the sha256 of the
+    committed `cozy.package.manifest/1` bytes), and the descriptor ref is taken only
+    from inside the proven manifest -- the same trust pattern the private lane uses.
+    `LocalDownloadKind` is a closed wire enum, so both documents ride at conventional
+    filenames in the set directory rather than as `files` rows.
+    """
+
+    parents = {Path(row.path).parent for row in files}
+    if len(parents) != 1:
+        raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")
+    parent = parents.pop()
+    if not parent.is_absolute() or not parent.is_relative_to(artifact_cache / "sets"):
+        raise PreparationRefusal("package_prepare_file_path_invalid", str(parent))
+    manifest_raw = _read_beside(parent / MANIFEST_FILENAME, "package_prepare_manifest_missing")
+    if documents.spell(hashlib.sha256(manifest_raw).digest()) != release_digest:
+        raise PreparationRefusal(
+            "package_prepare_manifest_invalid",
+            "staged manifest bytes do not hash to the delegated release digest",
+        )
+    try:
+        manifest = json.loads(manifest_raw)
+    except ValueError as exc:
+        raise PreparationRefusal("package_prepare_manifest_invalid", str(exc)) from exc
+    descriptor_ref = manifest.get("package_descriptor") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format") != MANIFEST_FORMAT
+        or manifest.get("package") != package_name
+        or manifest.get("release") != release
+        or not isinstance(descriptor_ref, dict)
+    ):
+        raise PreparationRefusal(
+            "package_prepare_manifest_invalid", "manifest identity or descriptor ref"
+        )
+    digest = descriptor_ref.get("digest")
+    length = descriptor_ref.get("length")
+    if (
+        not isinstance(digest, str)
+        or not isinstance(length, int)
+        or isinstance(length, bool)
+        or length <= 0
+    ):
+        raise PreparationRefusal("package_prepare_manifest_invalid", "descriptor ref shape")
+    try:
+        documents.raw(digest)
+    except (documents.DocumentError, ValueError) as exc:
+        raise PreparationRefusal("package_prepare_manifest_invalid", digest) from exc
+    raw = _read_beside(
+        parent / PUBLISHED_DESCRIPTOR_FILENAME, "package_prepare_published_descriptor_invalid"
+    )
+    if len(raw) != length or documents.spell(hashlib.sha256(raw).digest()) != digest:
+        raise PreparationRefusal(
+            "package_prepare_published_descriptor_invalid",
+            "staged descriptor bytes do not match the manifest ref",
+        )
+    try:
+        descriptor.read_bytes(raw, "published package descriptor")
+    except descriptor.StalePackageDescriptor as exc:
+        raise PreparationRefusal("package_prepare_published_descriptor_invalid", str(exc)) from exc
+    return raw
+
+
+def _read_beside(path: Path, refusal: str) -> bytes:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_MANIFEST_BYTES:
+            raise PreparationRefusal(refusal, str(path))
+        return path.read_bytes()
+    except OSError as exc:
+        raise PreparationRefusal(refusal, f"{path}: {type(exc).__name__}") from exc
 
 
 def prepare_private_package(
@@ -299,6 +394,7 @@ def prepare_package(
     native_device_index: int = 0,
     installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
+    published_descriptor: bytes | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
 
@@ -436,7 +532,23 @@ def prepare_package(
     for wheel, path, _receipt in facts:
         verified(wheel.digest, wheel.length, path)
 
-    descriptor_raw = describe(installed, project.distribution)
+    if published_descriptor is None:
+        descriptor_raw = describe(installed, project.distribution)
+    else:
+        # The PUBLISHED descriptor is the authoritative wiring (cr-067). Import-time
+        # enumeration still runs -- it is a free cross-check -- but a disagreement
+        # falsifies the release rather than silently rewiring the pod: refuse, and the
+        # record owner relays the defect (th-106).
+        descriptor_raw = published_descriptor
+        derived_raw = describe(installed, project.distribution)
+        if derived_raw != published_descriptor:
+            raise PreparationRefusal(
+                "package_prepare_descriptor_disagrees",
+                "published "
+                + documents.spell(hashlib.sha256(published_descriptor).digest())
+                + " != derived "
+                + documents.spell(hashlib.sha256(derived_raw).digest()),
+            )
     try:
         descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared package descriptor")
     except descriptor.StalePackageDescriptor as exc:

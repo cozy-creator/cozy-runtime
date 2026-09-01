@@ -1,10 +1,13 @@
-"""Public build-seat author for exact ModelConstructionContract documents.
+"""Author-side writer of publish-time derive evidence (cr-067).
 
-The command runs from a receipt-selected package venv over the base worker image.
-It verifies the package-environment receipt, then delegates package import and
+Runs on the author's machine inside the project venv (`uv run --locked`), at publish.
+Per declared (model source x hardware variant) pair it delegates package import and
 derive-mode execution to one bounded child whose audit hooks allow no network, weight
-reads, writes, or subprocesses. The parent is the only writer and publishes one complete
-digest-addressed result directory by atomic rename.
+reads, writes, or subprocesses, and publishes one complete digest-addressed envelope --
+`result.json` index plus `contracts/` and `code-topologies/` sibling documents -- by
+atomic rename. The envelope binds the release VERSION, never a release digest: the
+digest only exists once tensorhub finalizes the upload this envelope rides in.
+The hub validates these documents statically and never executes package code (th-106).
 """
 
 from __future__ import annotations
@@ -26,12 +29,12 @@ from typing import Any
 
 from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, contract, package_environment, sandbox
+from cozy_runtime.internal import canonical, contract, sandbox
 from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StalePackageDescriptor
-from cozy_runtime.internal.discovery import discover_installed
-from cozy_runtime.internal.encoding import TORCH_DTYPES
+from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.encoding import TORCH_DTYPES, launch_providers
 from cozy_runtime.internal.exits import Exit
 
 INDEX_NAME = "result.json"
@@ -43,13 +46,13 @@ CPU_CAP_SECONDS = 600
 WALL_CAP_SECONDS = 900
 _VARIANT = re.compile(r"^(?:cpu|sm[0-9]{2,})$")
 
+INDEX_FORMAT = "cozy.package.derive-evidence/1"
+
 REQUEST_FIELDS = {
     "bindings",
     "package_descriptor",
     "package",
-    "environment_generation",
-    "environment_digest",
-    "installed_environment_receipt",
+    "project",
 }
 REF_FIELDS = {"digest", "length"}
 LOCAL_REF_FIELDS = {"digest", "length", "path"}
@@ -89,12 +92,15 @@ class BindingRequest:
 
 @dataclass(frozen=True, slots=True)
 class ProofRequest:
-    environment_generation: Path
-    environment_digest: str
-    installed_environment_receipt: DocumentRef
+    project: Path
     package: Mapping[str, Any]
     package_descriptor: LocalDocumentRef
     bindings: tuple[BindingRequest, ...]
+
+    @property
+    def release_identity(self) -> str:
+        """The version-bound identity every derived Candidate carries."""
+        return f"{self.package['package']}@{self.package['release']}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -116,17 +122,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         request_path = _cli_input_path(args[0])
         output = _cli_output_path(args[1])
         request = _read_request(request_path)
-        installed = _verify_installed_generation(request)
-        if output.is_relative_to(installed.generation):
+        if output.is_relative_to(request.project):
             raise CliError(
                 "model_contract_output_invalid",
-                "the proof output must be outside the immutable environment generation",
-                "choose a separate fresh output directory owned by the build seat",
+                "the evidence output must be outside the project tree",
+                "choose a separate fresh output directory",
                 Exit.validation,
             )
-        # Runtime/TensorFS are image-owned. The package venv carries only the
-        # release's package-owned wheels, so the proof child is the current verified control
-        # Runtime with that exact venv's site-packages appended below.
+        # The author's own venv is the derivation environment: the parent runs inside
+        # `uv run --locked`, so sys.executable resolves the exact locked interpreter.
         response = _run_child(Path(sys.executable), request_path)
         index, contracts, topologies = _decode_child(response, request)
         index_bytes = canonical.write(index)
@@ -154,17 +158,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 err.code,
                 err.detail,
                 "repair the exact release descriptor/config inputs and run a fresh proof",
-                Exit.structural,
-            ),
-            opts,
-        )
-        return int(Exit.structural)
-    except package_environment.EnvironmentRefusal as err:
-        emit_error(
-            CliError(
-                err.code,
-                err.detail,
-                "repair or rematerialize the exact installed environment before derivation",
                 Exit.structural,
             ),
             opts,
@@ -210,13 +203,7 @@ def _read_request(path: Path) -> ProofRequest:
     if len(paths) != len(set(paths)):
         raise _request_error("bindings contains a duplicate descriptor model path")
     return ProofRequest(
-        environment_generation=_existing_directory(
-            value["environment_generation"], "environment_generation"
-        ),
-        environment_digest=_digest(value["environment_digest"], "environment_digest"),
-        installed_environment_receipt=_ref(
-            value["installed_environment_receipt"], "installed_environment_receipt"
-        ),
+        project=_existing_directory(value["project"], "project"),
         package=_package(value["package"]),
         package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
         bindings=bindings,
@@ -249,12 +236,13 @@ def _binding(value: object, index: int) -> BindingRequest:
 
 
 def _package(value: object) -> Mapping[str, Any]:
-    fields = {"package", "project_wheel", "release", "release_digest"}
+    # No release_digest: evidence is derived BEFORE finalize mints the manifest digest,
+    # so the Candidate binds `<org>/<name>@<version>` (cr-067's circularity fix).
+    fields = {"package", "project_wheel", "release"}
     if not isinstance(value, dict) or set(value) != fields:
-        raise _request_error("package is not one closed PackageSelection")
+        raise _request_error("package is not one closed package/release/project_wheel triple")
     identity = value.get("package")
     release = value.get("release")
-    release_digest = value.get("release_digest")
     wheel = value.get("project_wheel")
     if (
         not isinstance(identity, str)
@@ -262,12 +250,10 @@ def _package(value: object) -> Mapping[str, Any]:
         or not all(identity.split("/"))
         or not isinstance(release, str)
         or not release
-        or not isinstance(release_digest, str)
-        or canonical.DIGEST_RE.fullmatch(release_digest) is None
         or not isinstance(wheel, dict)
         or not isinstance(wheel.get("ref"), dict)
     ):
-        raise _request_error("package identity, release, provenance, or project wheel is invalid")
+        raise _request_error("package identity, release, or project wheel is invalid")
     _ref(wheel["ref"], "package.project_wheel.ref")
     if wheel.get("distribution") != identity.split("/", 1)[1] or wheel.get("version") != release:
         raise _request_error("project wheel does not match package release")
@@ -374,40 +360,6 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _verify_installed_generation(request: ProofRequest) -> package_environment.InstalledEnvironment:
-    if request.environment_generation.parent.name != "contents":
-        raise ProofRefusal(
-            "model_contract_environment_generation_invalid",
-            "installed content is not below the environment root's contents directory",
-        )
-    installed = package_environment.open_generation(
-        request.environment_generation.parent.parent,
-        receipt_digest=request.installed_environment_receipt.digest,
-        environment_digest=request.environment_digest,
-        reused=True,
-    )
-    if installed.generation != request.environment_generation:
-        raise ProofRefusal(
-            "model_contract_environment_generation_mismatch",
-            "placement receipt resolves to different installed content",
-        )
-    if len(installed.receipt_bytes) != request.installed_environment_receipt.length:
-        raise ProofRefusal(
-            "model_contract_environment_receipt_mismatch",
-            "verified receipt length differs from the request",
-        )
-    receipt = canonical.parse_canonical(installed.receipt_bytes)
-    project_wheel = request.package.get("project_wheel")
-    project_ref = project_wheel.get("ref") if isinstance(project_wheel, dict) else None
-    project_digest = project_ref.get("digest") if isinstance(project_ref, dict) else None
-    if not isinstance(receipt, dict) or receipt.get("project_wheel_digest") != project_digest:
-        raise ProofRefusal(
-            "model_contract_project_wheel_mismatch",
-            "verified environment receipt names a different project wheel",
-        )
-    return installed
-
-
 def _run_child(python: Path, request: Path) -> dict[str, Any]:
     child_env = sandbox.child_environment({})
     child_env.update(
@@ -471,8 +423,6 @@ def _child_entry(args: Sequence[str]) -> int:
     try:
         request_path = _existing_file(args[0], "request")
         request = _read_request(request_path)
-        installed = _verify_installed_generation(request)
-        sys.path.append(str(installed.site_packages))
         descriptor_doc = _read_descriptor(request.package_descriptor)
         application = descriptor_doc.get("application")
         if not isinstance(application, str) or not application:
@@ -481,21 +431,23 @@ def _child_entry(args: Sequence[str]) -> int:
         _warm_tensorfs()
         sandbox.install(allow_write_prefixes=())
         sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
-        found = discover_installed(application)
-        installed_descriptor = package_descriptor.build(found)
+        found = discover(request.project)
+        derived_descriptor = package_descriptor.build(found)
         package_descriptor.compare(
             descriptor_doc,
-            installed_descriptor,
-            ("the exact release descriptor", "the installed project wheel"),
+            derived_descriptor,
+            ("the publishing descriptor", "the project source"),
         )
-        response = _derive_all(request, found, installed_descriptor)
+        if found.application != application:
+            raise ProofRefusal(
+                "model_contract_package_descriptor_invalid",
+                "descriptor application does not name the discovered application",
+            )
+        response = _derive_all(request, found, derived_descriptor)
     except CliError as err:
         _emit_child({"error": err.name, "detail": err.message})
         return int(err.code)
     except ProofRefusal as err:
-        _emit_child({"error": err.code, "detail": err.detail})
-        return int(Exit.structural)
-    except package_environment.EnvironmentRefusal as err:
         _emit_child({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
     except (ConformanceError, StalePackageDescriptor, contract.ContractError) as err:
@@ -575,6 +527,7 @@ def _derive_all(
 
     documents: dict[str, bytes] = {}
     topologies: dict[str, bytes] = {}
+    resources: dict[str, dict[str, Any]] = {}
     functions: list[dict[str, Any]] = []
     for collection in ("entrypoints", "jobs"):
         entries = descriptor_doc[collection]
@@ -617,7 +570,7 @@ def _derive_all(
                         binding,
                         source,
                         config,
-                        release=str(request.package["release_digest"]),
+                        release=request.release_identity,
                         application=found.application,
                         variant=variant,
                     )
@@ -625,6 +578,8 @@ def _derive_all(
                     previous = documents.setdefault(digest, raw)
                     if previous != raw:
                         raise ProofRefusal("model_contract_digest_collision", digest)
+                    if digest not in resources:
+                        resources[digest] = _resource_projection(raw)
                     topology = _code_topology(raw)
                     topology_digest = _sha(topology)
                     previous_topology = topologies.setdefault(topology_digest, topology)
@@ -679,6 +634,7 @@ def _derive_all(
             for digest, raw in sorted(topologies.items())
         ],
         "functions": functions,
+        "resources": resources,
     }
 
 
@@ -717,6 +673,26 @@ def _derive_twice(
             f"{binding.path} for {variant} did not retain the exact config document identity",
         )
     return first
+
+
+def _resource_projection(raw: bytes) -> dict[str, Any]:
+    """Per-contract resident-byte and encoding-pin facts (was the hub's third container)."""
+
+    import tensorfs
+
+    parsed = contract.read_contract(raw)
+    widths = contract.tensorfs_destination_widths(tensorfs)
+    components: dict[str, int] = {}
+    tensors: list[contract.LogicalTensor | contract.DerivedTensor] = [
+        *parsed.logical_tensors,
+        *parsed.derived,
+    ]
+    for tensor in tensors:
+        count = widths[tensor.dtype or contract.DEFAULT_DTYPE]
+        for dimension in tensor.shape:
+            count *= dimension
+        components[tensor.component] = components.get(tensor.component, 0) + count
+    return {"components": components, "encoding_pins": sorted(launch_providers())}
 
 
 def _code_topology(raw: bytes) -> bytes:
@@ -793,7 +769,7 @@ def _decode_child(
     response: Mapping[str, Any],
     request: ProofRequest,
 ) -> tuple[dict[str, Any], dict[str, bytes], dict[str, bytes]]:
-    if set(response) != {"application", "code_topologies", "contracts", "functions"}:
+    if set(response) != {"application", "code_topologies", "contracts", "functions", "resources"}:
         raise ProofRefusal("model_contract_child_invalid", "child result has an open field set")
     if not isinstance(response["application"], str):
         raise ProofRefusal("model_contract_child_invalid", "child result application")
@@ -823,7 +799,7 @@ def _decode_child(
         if len(raw) != length or _sha(raw) != digest:
             raise ProofRefusal("model_contract_child_invalid", "contract stored-byte identity")
         parsed = contract.read_contract(raw)
-        if parsed.candidate.release != request.package["release_digest"]:
+        if parsed.candidate.release != request.release_identity:
             raise ProofRefusal("model_contract_child_invalid", "contract release identity")
         documents[digest] = raw
     topology_rows = response["code_topologies"]
@@ -857,15 +833,39 @@ def _decode_child(
     functions = response["functions"]
     if not isinstance(functions, list):
         raise ProofRefusal("model_contract_child_invalid", "functions is not an array")
+    resources = response["resources"]
+    if not isinstance(resources, dict) or set(resources) != set(documents):
+        raise ProofRefusal(
+            "model_contract_child_invalid", "resources are not exactly one row per contract"
+        )
+    for projected in resources.values():
+        if (
+            not isinstance(projected, dict)
+            or set(projected) != {"components", "encoding_pins"}
+            or not isinstance(projected["components"], dict)
+            or not projected["components"]
+            or any(
+                not isinstance(name, str)
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count <= 0
+                for name, count in projected["components"].items()
+            )
+            or not isinstance(projected["encoding_pins"], list)
+            or not projected["encoding_pins"]
+            or any(not isinstance(pin, str) or not pin for pin in projected["encoding_pins"])
+            or projected["encoding_pins"] != sorted(set(projected["encoding_pins"]))
+        ):
+            raise ProofRefusal("model_contract_child_invalid", "resource projection shape")
     evidence = {
+        "format": INDEX_FORMAT,
         "application": response["application"],
         "package_descriptor": DocumentRef(
             request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
         "package": dict(request.package),
-        "environment_digest": request.environment_digest,
         "functions": functions,
-        "installed_environment_receipt": request.installed_environment_receipt.render(),
+        "resources": resources,
     }
     return evidence, documents, topologies
 

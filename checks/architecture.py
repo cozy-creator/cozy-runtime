@@ -787,6 +787,29 @@ def fence_supervised_worker_lanes() -> list[str]:
     return bad
 
 
+#: cr-067 hard guard: topology derivation must NEVER run on pod prep. The worker's
+#: preparation plane may not import the derive machinery or TensorFS's author facade —
+#: cold boot pays for staging and venv materialization, never for a meta-device load.
+WORKER_DERIVE_FORBIDDEN = ("cozy_runtime.internal.derive", "tensorfs")
+
+
+def worker_derive_free_violations(worker_dir: pathlib.Path) -> list[str]:
+    problems: list[str] = []
+    for path in sorted(worker_dir.glob("*.py")):
+        for name in imports(ast.parse(path.read_text())):
+            for banned in WORKER_DERIVE_FORBIDDEN:
+                if name == banned or name.startswith(banned + "."):
+                    problems.append(
+                        f"{path.relative_to(worker_dir.parent.parent.parent)}: imports {name} — "
+                        "worker prep modules may not reach derive/code-topology (cr-067)"
+                    )
+    return problems
+
+
+def fence_worker_derive_free() -> list[str]:
+    return worker_derive_free_violations(SRC / "internal" / "worker")
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "one-attempt-kernel": fence_one_attempt_kernel,
@@ -804,6 +827,7 @@ FENCES = {
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "supervised-worker-lanes": fence_supervised_worker_lanes,
     "base-distributions": fence_base_distributions,
+    "worker-derive-free": fence_worker_derive_free,
 }
 
 
