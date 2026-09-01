@@ -700,6 +700,47 @@ def fence_timing_decides_nothing() -> list[str]:
     return bad
 
 
+SESSION = pathlib.Path("src/cozy_runtime/internal/worker/session.py")
+
+
+def fence_supervised_worker_lanes() -> list[str]:
+    """A WORKER LANE NEVER DIES SILENTLY (cr-061).
+
+    Every long-lived thread in the worker session is the sole producer of some terminal: the
+    device lane produces attempt outcomes, convergence produces a placement's verdict, the
+    sender is the only thing that puts a frame on the stream. Nothing on the wire describes a
+    dead Python thread, so a lane that dies leaves whoever waits on that terminal waiting on
+    a producer that no longer exists — and the owner's only remaining escape is a timeout.
+
+    `SessionState._lane` is the one answer: it turns any lane death into
+    `WORKER_PHASE_FAILED`, which every owner already reads, and closes a non-persistent
+    host's stream so a one-shot run EXITS. This fence says no thread may be started around
+    it — `target=` in the session is a `self._lane(...)` call or it is a hole.
+    """
+    bad: list[str] = []
+    path = ROOT / SESSION
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        named = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if named != "Thread":
+            continue
+        target = next((kw.value for kw in node.keywords if kw.arg == "target"), None)
+        supervised = (
+            isinstance(target, ast.Call)
+            and isinstance(target.func, ast.Attribute)
+            and target.func.attr == "_lane"
+        )
+        if not supervised:
+            bad.append(
+                f"{SESSION}:{node.lineno}: a worker lane is started outside `self._lane(...)` "
+                "— a thread that dies here stops producing a terminal and says nothing"
+            )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "one-attempt-kernel": fence_one_attempt_kernel,
@@ -716,6 +757,7 @@ FENCES = {
     "timing-decides-nothing": fence_timing_decides_nothing,
     "package-owns-no-residency": fence_package_owns_no_residency,
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
+    "supervised-worker-lanes": fence_supervised_worker_lanes,
 }
 
 

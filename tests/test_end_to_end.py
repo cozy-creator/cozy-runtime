@@ -8,25 +8,38 @@ worse than no test.
 The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one, and say which
 host fact stopped them — see `_executor_containment`. They run on an ordinary developer box.
 
+The REFUSAL leg is their mirror image and never skips: it runs WHERE CONTAINMENT IS
+UNAVAILABLE, because that is the condition under test, and it asserts the process EXITS.
+
     uv run pytest
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
 TIMEOUT = 420
+
+#: A refusal is worth nothing if the process does not then END, so the refusal leg gets its
+#: own bound. The local door's readiness deadline is 1800 s — anything under that catches the
+#: hang — and this is far under it while still leaving a cold host room to build the package
+#: environment before the executor is ever reached.
+REFUSAL_TIMEOUT = 300
 
 
 def _executor_containment() -> str:
@@ -60,6 +73,60 @@ def _executor_containment() -> str:
 
 NO_EXECUTOR = _executor_containment()
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+
+
+@contextlib.contextmanager
+def _containment_unavailable() -> Iterator[Callable[[], None] | None]:
+    """Put a child process somewhere `create_executor_scope` cannot make a scope.
+
+    On a host that already lacks delegation — a GitHub-hosted runner, a plain container —
+    this is a no-op, because the condition under test is the host's own. On a delegated host
+    it is produced honestly and with the kernel, not with a patch: a real child cgroup of
+    this process's own delegation, mode 0500, so `path.mkdir()` under it gets the same EACCES
+    a non-delegated hierarchy gives. `cgroup.procs` stays writable, which is how the child
+    walks in; the directory does not, which is what the worker trips over.
+    """
+    if NO_EXECUTOR:
+        yield None
+        return
+    relative = next(
+        line.split("::", 1)[1]
+        for line in Path("/proc/self/cgroup").read_text().splitlines()
+        if line.startswith("0::")
+    )
+    scope = (
+        Path("/sys/fs/cgroup") / relative.strip("/") / f"cozy-nodelegation-{secrets.token_hex(4)}"
+    )
+    try:
+        scope.mkdir(mode=0o700)
+    except OSError as exc:  # pragma: no cover - a delegated host that will not delegate
+        pytest.skip(f"cannot build a non-delegated cgroup under {scope.parent}: {exc}")
+    procs = scope / "cgroup.procs"
+
+    def enter() -> None:
+        procs.write_text("0\n")
+
+    try:
+        scope.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        yield enter
+    finally:
+        scope.chmod(stat.S_IRWXU)
+        with contextlib.suppress(OSError):
+            scope.rmdir()
+
+
+def _trailing_json(text: str) -> dict[str, Any]:
+    """The structured refusal `--json` writes last, past whatever the worker narrated.
+
+    The worker's own narration shares this stream by design (`run`'s stdout IS the result
+    document), so the refusal is the trailing object, not the whole stream.
+    """
+    lines = text.splitlines()
+    start = max((i for i, line in enumerate(lines) if line == "{"), default=-1)
+    assert start >= 0, f"no structured refusal was emitted:\n{text[-4000:]}"
+    body = json.loads("\n".join(lines[start:]))
+    assert isinstance(body, dict)
+    return body
 
 
 def _run(*argv: str, cwd: Path | str = ROOT, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -198,3 +265,51 @@ def test_installed_cli_runs_a_job_through_the_local_worker(installed_cli: str) -
     body = json.loads(done.stdout)
     assert body["status"] == "OUTCOME_STATUS_SUCCEEDED", body
     assert body["result"] == {"message": "polo"}
+
+
+def test_a_refusal_terminates_the_process(installed_cli: str) -> None:
+    """CONTAINMENT UNAVAILABLE -> a typed refusal AND AN EXIT, for `run` and for `job`.
+
+    This is the arm cr-061 was missing, and the shape of the assertion is the whole point.
+    The refusal was never broken: on a host whose worker cgroup is not delegated the runtime
+    computed the right diagnosis and printed it. It then sat on a control stream nobody was
+    going to close, until SIGKILL — on any plain container, CI runner or developer box with a
+    different cgroup layout. An arm that asserted only that the refusal was PRINTED is
+    exactly the arm that would have passed against the bug.
+
+    So: a bounded wait, a non-zero status, and the typed error token on stdout. The wait is
+    the assertion.
+    """
+    with _containment_unavailable() as enter_scope:
+        for verb, function in (("run", "marco"), ("job", "marco_job")):
+            with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
+                refused = subprocess.run(
+                    (
+                        installed_cli,
+                        "--dir",
+                        str(PACKAGE),
+                        "--json",
+                        verb,
+                        function,
+                        "message=marco",
+                        "--out",
+                        out,
+                    ),
+                    cwd="/",
+                    capture_output=True,
+                    text=True,
+                    timeout=REFUSAL_TIMEOUT,
+                    stdin=subprocess.DEVNULL,
+                    env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+                    preexec_fn=enter_scope,
+                )
+            assert refused.returncode != 0, (
+                f"`{verb}` exited 0 with no executor: it cannot have run anything\n"
+                f"--- stdout ---\n{refused.stdout[-4000:]}"
+            )
+            error = _trailing_json(refused.stderr)["error"]
+            assert (error["name"], error["code"], refused.returncode) == ("unavailable", 9, 9), (
+                error,
+                refused.returncode,
+            )
+            assert "containment unavailable" in error["message"], error
