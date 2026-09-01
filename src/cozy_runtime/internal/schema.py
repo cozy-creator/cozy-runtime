@@ -66,7 +66,7 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
         return name
     origin = get_origin(tp)
     if origin is Literal:
-        return {"literal": sorted_union([_literal(a) for a in get_args(tp)])}
+        return _enumeration(tp, get_args(tp))
     if origin is typing.Union or origin is types.UnionType:
         return _union(get_args(tp), seen)
     if origin in (list, Sequence, set, frozenset, Set):
@@ -95,7 +95,7 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
             # exactly like an asset — the local path is never schema content (§2).
             return {"input": "tree"}
         if issubclass(tp, enum.Enum):
-            return {"literal": sorted_union([_literal(m.value) for m in tp])}
+            return _enumeration(tp, [member.value for member in tp])
         if is_struct(tp):
             return _struct(
                 typing.cast(type[msgspec.Struct], tp),
@@ -109,15 +109,52 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
 
 
 def _opaque(tp: object) -> Json:
-    """A field whose type has no interoperable spelling, named by its Python spelling."""
-    name = getattr(tp, "__name__", None)
+    """A field whose type has no interoperable spelling, named by its Python spelling.
+
+    A bare class spells as its name; anything else — a subscripted alias, whose `__name__`
+    is the bare constructor and drops exactly the part that identified it — spells as its
+    repr, so `Literal[b"x"]` does not read as `Literal`.
+    """
+    name = getattr(tp, "__name__", None) if isinstance(tp, type) else None
     return {"opaque": name if isinstance(name, str) and name else repr(tp)}
 
 
+class _Unspellable(Exception):
+    """One enumeration member the wire grammar cannot name. Never a build refusal."""
+
+
 def _literal(value: object) -> Json:
+    """One admissible value as the wire carries it. An enum member spells as its VALUE,
+    which is the thing msgspec actually encodes and Creator actually matches on."""
+    if isinstance(value, enum.Enum):
+        value = value.value
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-    raise ConformanceError(f"literal {value!r} is not JSON-representable", code="unrenderable_type")
+    raise _Unspellable(value)
+
+
+def _enumeration(tp: object, values: Sequence[object]) -> Json:
+    """A closed value set, or `opaque` when one member has no interoperable spelling.
+
+    msgspec codes a tuple-valued enum and a `Literal[b"..."]` perfectly well, so refusing
+    the BUILD over one made the descriptor narrower than the runtime it describes. The node
+    degrades instead: the field exists, and Creator cannot enumerate it.
+    """
+    try:
+        return {"literal": sorted_union([_literal(value) for value in values])}
+    except _Unspellable:
+        return _opaque(tp)
+
+
+def _tag(value: object) -> Json:
+    """A tagged struct's discriminator. msgspec already refuses anything but `str`/`int`
+    at class creation; this is the fail-closed reading of that, not a second policy."""
+    if isinstance(value, (str, int)):
+        return value
+    raise ConformanceError(
+        f"tag {value!r} is not a string or integer discriminator",
+        code="tagged_union_incoherent",
+    )
 
 
 def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
@@ -148,7 +185,7 @@ def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
             "a tagged union's member tags must all have the same scalar type",
             code="tagged_union_incoherent",
         )
-    tags = [_literal(tag) for _, _, tag in structs]
+    tags = [_tag(tag) for _, _, tag in structs]
     if len({write(value) for value in tags}) != len(tags):
         raise ConformanceError(
             "a tagged union's member tags must be unique",
@@ -181,7 +218,7 @@ def _struct(
         )
     doc: dict[str, Json] = {"fields": fields}
     if config.tag is not None:
-        doc["tag"] = _literal(config.tag)
+        doc["tag"] = _tag(config.tag)
         if not union_owns_tag_field:
             doc["tag_field"] = typing.cast(str, config.tag_field)
     return doc

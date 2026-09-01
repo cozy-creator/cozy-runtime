@@ -23,7 +23,7 @@ from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
-from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY
+from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY, UNGRANTABLE
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._walker import walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
@@ -52,6 +52,23 @@ def assert_declaration_shape(declaration: object) -> None:
                 )
             for kind in kinds:
                 bound.check_kind(kind)
+
+
+def _grantable(surface: Surface) -> None:
+    """A capability nothing can grant refuses at BUILD, not at the first request.
+
+    `net: Egress` passed describe, passed deploy, and then raised
+    `egress_broker_unavailable` the first time a real request reached the handler — the one
+    clock on which a package author can do nothing about it and a caller pays for it. A
+    declaration the platform cannot honour is a conformance fact about the package, so it
+    belongs in the same verdict class as a schema violation (§1.7), and the refusal names
+    what has to land rather than only that something is missing.
+    """
+    for capability in sorted(surface.capabilities & set(UNGRANTABLE)):
+        raise ConformanceError(
+            f"{surface.name} declares the {capability!r} capability: {UNGRANTABLE[capability]}",
+            code="ungrantable_capability",
+        )
 
 
 def _separation(surface: Surface) -> None:
@@ -152,6 +169,7 @@ def check(surface: Surface) -> Surface:
     assert_declaration_shape(surface.payload_type)
     assert_declaration_shape(surface.result_type)
     specs = feature_specs(surface.payload_type)
+    _grantable(surface)
     _separation(surface)
     _media_decode_bounds(surface)
 

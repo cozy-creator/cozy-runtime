@@ -655,7 +655,6 @@ DECIDING_MODULES = (
 DECIDING_NAMES = (
     "_cozy_scope",
     "_cozy_active",
-    "_cozy_check_access",
     "materialize",
     "evict",
     "reserve",

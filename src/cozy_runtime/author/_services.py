@@ -732,10 +732,12 @@ class EgressResponse:
 class Egress(_Bound):
     """Worker-brokered outbound HTTP (`net`) — connector endpoints only (§1.3).
 
-    Injection and capability derivation are this issue's; the BROKER is cr-012's and its
-    consumer is se-006. With no broker installed the call refuses typed, and the executor's
-    own `sandbox.refuse_network` fence (cr-042) refuses a direct dial in its place, so
-    there is nothing here to fall back to.
+    NOT GRANTABLE YET, and `UNGRANTABLE` is where that is stated: a package declaring
+    `net: Egress` refuses at DESCRIBE rather than passing every gate and raising on its
+    first real request. The type, the injection and the capability derivation stand so that
+    cr-012 lands the broker and the control-plane allowlist together and nothing else has
+    to move. `fakes.fake_egress` drives this class directly, which is the only way an
+    `Egress` is reachable today; the refusal below is its fail-closed floor.
     """
 
     __slots__ = ("_broker",)
@@ -756,7 +758,8 @@ class Egress(_Bound):
         if self._broker is None:
             raise CapabilityError(
                 f"no egress broker is installed for {method} {url}: the worker-side "
-                "broker, allowlist and SSRF fail-closed path are cr-012",
+                "broker, the control-plane host allowlist and the SSRF fail-closed path "
+                "are cr-012, and a package cannot declare `net` until they land",
                 code="egress_broker_unavailable",
             )
         result = self._broker(url, method, dict(headers or {}), body)
@@ -1076,3 +1079,19 @@ JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget", "weigh
 #: which is a fact about serving one request; a run-to-completion job has no caller to
 #: confess to and no envelope to write into.
 SERVING_ONLY: frozenset[str] = frozenset({"adjust"})
+
+#: capability name -> why NOTHING can grant it yet. A capability with no grant path refuses
+#: at BUILD, naming what has to land, rather than passing describe and deploy and failing on
+#: the first real request — which is the worst clock to learn it on.
+UNGRANTABLE: Mapping[str, str] = {
+    "egress": "no deployment can grant outbound HTTP yet. The broker needs a "
+    "CONTROL-PLANE-MINTED host allowlist, and there is none: cr-042 removed "
+    "`DeclaredBinding.egress_allowed_hosts` because it never had a writer and its "
+    "per-binding shape was unioned across deployments, which decision #451 forbids. "
+    "Deriving the allowlist from the URL instead would grant whatever the package asked "
+    "for, since a `net:` URL comes from package code — every other destination the worker "
+    "opens is control-plane-minted and passes the CLOSED authorization table in "
+    "`internal/worker/grants.py`. cr-012 lands the allowlist writer, the grant row and the "
+    "broker together; until then this declaration is refused here rather than at the first "
+    "request that needs it",
+}
