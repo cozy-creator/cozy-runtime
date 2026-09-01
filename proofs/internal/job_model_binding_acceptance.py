@@ -305,7 +305,7 @@ def receipt_manifest(store: tensorfs.Store, transaction_id: str) -> tuple[str, i
 def adopt_handoff(store: tensorfs.Store, manifest: tuple[str, int]) -> None:
     selected = store.manifest(manifest[0])
     closure = store.walk(manifest[0])
-    operation = store.begin_operation("job-node-handoff", "proof", "node-one", 1)
+    operation = store.begin_operation("job-node-handoff", "proof", "node-one")
     operation.hold_manifest(manifest[0], manifest[1])
     for reached in closure:
         operation.hold_blob(str(reached["id"]), int(reached["length"]))
