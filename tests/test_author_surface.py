@@ -36,7 +36,14 @@ from cozy_runtime.author import (
     ModelRegistry,
     uses_components,
 )
-from cozy_runtime.author._loader import Artifact, Config, ModuleLike, Scheduler, census
+from cozy_runtime.author._loader import (
+    Artifact,
+    Config,
+    Loader,
+    ModuleLike,
+    Scheduler,
+    census,
+)
 from cozy_runtime.author._model import _derive_model
 
 MANIFEST = "sha256:" + "ab" * 32
@@ -82,11 +89,8 @@ class Pipeline:
 class Denoiser(Model[Pipeline]):
     pipeline: Pipeline
 
-    def load(self, loader: object) -> None:
-        assert hasattr(loader, "construct")
-        self.pipeline = loader.construct(  # type: ignore[attr-defined]
-            Pipeline, factory=lambda config: Pipeline()
-        )
+    def load(self, loader: Loader) -> None:
+        self.pipeline = loader.construct(Pipeline, factory=lambda config: Pipeline())
 
     @uses_components("transformer")
     def denoise(self) -> str:
@@ -163,11 +167,11 @@ def test_a_declared_scope_still_leases_and_still_fences() -> None:
 
     view = model.for_request(_ctx())
     with pytest.raises(CapabilityError) as escape:
-        model.leaked = view  # type: ignore[attr-defined]
+        model.leaked = view
     assert escape.value.code == "request_state_escape"
 
     with pytest.raises(CapabilityError) as frozen:
-        model.extra = object()  # type: ignore[attr-defined]
+        model.extra = object()
     assert frozen.value.code == "persistent_allocation"
 
 
