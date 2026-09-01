@@ -192,7 +192,6 @@ def main() -> int:
                     {
                         "name": "model",
                         "source": "copy.model",
-                        "lane_key": "bf16",
                         "required_contract": {
                             "topology_digest": "sha256:" + "1" * 64,
                             "encodings": ["sha256:" + "2" * 64],
@@ -226,6 +225,19 @@ def main() -> int:
     assert parsed_steps[0]["callable"] == "example/model@v1/copy"
     cases += 1
 
+    stale_lane = copy.deepcopy(selected)
+    stale_productions = stale_lane["model_productions"]
+    assert isinstance(stale_productions, list) and isinstance(stale_productions[0], dict)
+    stale_outputs = stale_productions[0]["outputs"]
+    assert isinstance(stale_outputs, list) and isinstance(stale_outputs[0], dict)
+    stale_outputs[0]["lane_key"] = "bf16"
+    try:
+        descriptor.read_bytes(canonical.write(stale_lane), "stale producer lane key")
+    except ConformanceError:
+        cases += 1
+    else:
+        raise AssertionError("producer-owned lane_key survived the Descriptor/1 hardcut")
+
     for invalid in (
         "example/model/copy",
         "example/model@v/copy",
@@ -253,7 +265,7 @@ def main() -> int:
     assert isinstance(rows, list) and isinstance(rows[0], dict)
     outputs = rows[0]["outputs"]
     assert isinstance(outputs, list) and isinstance(outputs[0], dict)
-    outputs[0]["lane_key"] = "fp8"
+    outputs[0]["name"] = "quantized-model"
     result = classify_bytes(
         canonical.write(before_with_production), canonical.write(changed_production)
     )

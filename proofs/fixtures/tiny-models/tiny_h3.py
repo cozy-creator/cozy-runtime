@@ -737,7 +737,6 @@ app.production(
         ProductionOutput(
             name="bf16-full",
             source="distill-full.bf16-full",
-            lane_key="bf16-full",
             required=ProductionContract(
                 topology_digest="sha256:" + "1" * 64,
                 encodings=(
