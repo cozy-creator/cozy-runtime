@@ -1,4 +1,4 @@
-"""The worker's observation surface: boot steps, confessions, and SILENCE-BOUNDED liveness.
+"""The worker's observation surface: boot steps, confessions, and measured progress.
 
 Three things live here because they are one idea — what the worker knows about itself, kept
 bounded and kept honest.
@@ -9,13 +9,10 @@ first unit still renders, and it ends with an outcome. A compile/derive slice is
 its own step even though nothing measures it yet: leaving it unnamed is how the cache door's
 cost became invisible in v1.
 
-**Liveness is silence-bounded and there is NO CLOCK in the detection.** Progress means an
-advancing MONOTONE position — integral units moved, or an advancing sequence. A wedge is
-SILENCE: consecutive observations that find the position where the previous one left it.
-`give_up_after` counts observations, not seconds, so a slow-but-advancing transfer is never
-mistaken for a wedged one however slow it is, and no boot timeout exists here to be tuned.
-The cadence that drives sampling is a scheduling choice; the VERDICT is a comparison of two
-positions and nothing else.
+**Progress is observed and never promoted into a timer-driven failure.** An advancing
+MONOTONE position or measured process work is progress. An unchanged sample is reported as
+silent; no arbitrary count of samples fabricates a WEDGED verdict. Process exit, a typed
+operation result, explicit cancellation, or an enclosing caller deadline decides lifecycle.
 
 **A confession is typed and quantified.** Whenever the worker serves something other than
 the plain reading of the request — a degraded plan, a substitution, an engaged kernel arm, a
@@ -35,10 +32,6 @@ from cozy_runtime.author._observations import EventRing, Observation, Scalar
 #: measures it — an unnamed step is a cost nobody can see.
 BOOT_STEPS = ("download", "load", "warm", "derive")
 
-#: Consecutive non-advancing observations before a subject is called WEDGED. A count, never
-#: a duration: that is what makes the detection clock-free.
-GIVE_UP_AFTER = 8
-
 
 @dataclass(slots=True)
 class Cursor:
@@ -52,7 +45,6 @@ class Cursor:
     samples: int = 0
     still: int = 0
     advanced: int = 0
-    wedged: bool = False
     ended: str = ""
 
     def document(self) -> dict[str, Scalar]:
@@ -63,26 +55,23 @@ class Cursor:
             "samples": self.samples,
             "advances": self.advanced,
             "consecutive_still": self.still,
-            "verdict": "wedged" if self.wedged else ("ended:" + self.ended if self.ended else ""),
+            "verdict": "ended:" + self.ended if self.ended else "active",
         }
 
 
 class SilenceMonitor:
-    """Advance versus silence over monotone positions. It never reads a clock."""
+    """Report advance versus silence over monotone positions. It never decides failure."""
 
     def __init__(
         self,
         ring: EventRing,
-        give_up_after: int = GIVE_UP_AFTER,
         busy: Callable[[], int] | None = None,
     ) -> None:
         self.ring = ring
-        self.give_up_after = give_up_after
         self.cursors: dict[str, Cursor] = {}
         #: CPU nanoseconds the device process has burned, read by the WORKER. A subject
-        #: that emits nothing while its process burns CPU is BUSY, not wedged: a 20-minute
-        #: hash-bound conversion leg has nothing to say and is working the whole time, and
-        #: calling it wedged every tick is a flood that describes nothing (job-001).
+        #: that emits nothing while its process burns CPU is BUSY, not silent: a 20-minute
+        #: hash-bound conversion leg has nothing to say and is still working.
         #: Absent (None) means unreadable, and an unreadable meter decides nothing.
         self.busy = busy
         self.cpu: dict[str, int] = {}
@@ -104,7 +93,7 @@ class SilenceMonitor:
             cursor.position = position
 
     def sample(self, subject: str) -> str:
-        """One VERDICT: `advancing`, `silent`, or `wedged`. Two integers, no clock."""
+        """One observation: `advancing`, `busy`, `silent`, or `closed`."""
         cursor = self.cursors.get(subject)
         if cursor is None or cursor.ended:
             return "closed"
@@ -113,8 +102,6 @@ class SilenceMonitor:
             cursor.sampled = cursor.position
             cursor.still = 0
             cursor.advanced += 1
-            # A wedge that moved again is over; a later one must be a NEW verdict.
-            cursor.wedged = False
             return "advancing"
         cursor.still += 1
         burned = self.busy() if self.busy is not None else -1
@@ -122,29 +109,10 @@ class SilenceMonitor:
             before = self.cpu.get(subject, -1)
             self.cpu[subject] = burned
             if before >= 0 and burned > before:
-                # WORKING, not wedged. Silence is the absence of narration; a wedge is the
-                # absence of PROGRESS, and a process burning CPU is making some.
+                # WORKING, not silent. A process burning CPU is making measurable progress.
                 cursor.still = 0
-                cursor.wedged = False
                 return "busy"
-        if cursor.still < self.give_up_after:
-            return "silent"
-        if not cursor.wedged:
-            cursor.wedged = True
-            self.ring.emit(
-                "liveness",
-                "wedged",
-                cursor.position,
-                subject=subject,
-                step=cursor.step,
-                still=cursor.still,
-                detail=(
-                    f"{cursor.still} consecutive observations found position "
-                    f"{cursor.position} unchanged: this subject is wedged by SILENCE, not by "
-                    "an expired clock - there is no boot timeout and there will not be one"
-                ),
-            )
-        return "wedged"
+        return "silent"
 
     def end(self, subject: str, outcome: str) -> Cursor | None:
         cursor = self.cursors.get(subject)

@@ -2499,8 +2499,8 @@ class AttemptEngine:
         `terminal()` builds a rich body — a reconciliation, a triage bundle, attested
         metrics, an inline result — and every one of those can fail on its own. When one
         does, the attempt used to end in SILENCE: the lane returned, the RecordOwner held an
-        accepted attempt with no terminal, and the liveness detector printed WEDGED and did
-        nothing (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
+        accepted attempt with no terminal. Progress observation cannot honestly invent that
+        terminal (job-001). An accepted attempt ALWAYS produces a terminal; this is the body
         that has nothing left to fail on.
 
         It is recorded before it is sent so same-process reconnects replay identical bytes.

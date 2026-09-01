@@ -155,10 +155,10 @@ hook. `scripts/lifecycle-live.py --only egress` observes both halves against one
 address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
 handed over as spool paths; the executor is never given an address.
 
-**Liveness is silence-bounded, never clocked.** Progress means an advancing monotone position;
-a wedge is consecutive observations that find the position unchanged. `give_up_after` counts
-observations, not seconds — there is no boot timeout and there will not be one — and the
-`timing-decides-nothing` fence proves the observation plane cannot reach residency or placement.
+**Progress is observed, never promoted into a timer-driven failure.** Advancing monotone
+positions and measured process work are reported; an unchanged sample stays `silent`. Process
+exit, typed outcomes, explicit cancellation and enclosing caller deadlines decide lifecycle.
+The `timing-decides-nothing` fence proves observation cannot reach residency or placement.
 
 **Component residency is the runtime's, and the package has no vocabulary for it.** An
 package declares the possible heavyweight set of each public model operation with
@@ -514,7 +514,7 @@ real CAS, so they are BUILDER-RUN and never CI steps):
     corpus/.venv/bin/python scripts/worker-live.py attempt   # cr-007: the two-process worker
     corpus/.venv/bin/python scripts/slice-live.py all        # cr-008a: one request, no network
     corpus/.venv/bin/python scripts/slice-live.py triage     # cr-011: explain a killed executor from the bundle
-    corpus/.venv/bin/python scripts/slice-live.py wedge      # cr-011: silence vs slow, with no clock
+    corpus/.venv/bin/python scripts/slice-live.py progress   # cr-011: silence and progress are observations
     corpus/.venv/bin/python scripts/slice-live.py witness    # cr-011: a real cgroup OOM kill, named
     corpus/.venv/bin/python scripts/pipeline-live.py fixtures  # cr-008b: the config + bundled tokenizers
     corpus/.venv/bin/python scripts/pipeline-live.py stage     # cr-008b: four components, one card
