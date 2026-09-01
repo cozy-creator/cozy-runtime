@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import dataclasses
 import hashlib
 import hmac
 import itertools
@@ -238,8 +237,6 @@ class WorkerOptions:
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
-    host_budget: int = 8 << 30
-    pinned_budget: int = 512 << 20
     no_warm: bool = False
     claim_ready: bool = True
     """False only for fixed product-host boot until listener/readiness proof commits."""
@@ -810,7 +807,7 @@ def executor_prepare_command(binding: DeclaredBinding) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape."""
 
     models = []
-    for index, model in enumerate(binding.model_bindings()):
+    for model in binding.model_bindings():
         models.append(
             {
                 "binding": {
@@ -832,16 +829,10 @@ def executor_prepare_command(binding: DeclaredBinding) -> dict[str, Any]:
                     "stamps": {key: list(value) for key, value in model.stamps.items()},
                     "custody": model.custody,
                     "strict_keys": model.strict_keys,
-                    "variants": [dataclasses.asdict(offer) for offer in model.offered],
                     "objective": model.objective,
                     "steps_basis": model.steps_basis,
                 },
-                "budgets": {
-                    "declared_weight_bytes": model.model_weight_bytes,
-                    "pinned": binding.pinned_bytes if index == 0 else 0,
-                    "resident": model.resident_budget_bytes,
-                    "vram_floor": model.vram_floor_bytes,
-                },
+                "budgets": {"declared_weight_bytes": model.model_weight_bytes},
                 "expect_construction_digest": model.expected_logical_model_digest,
             }
         )
@@ -903,11 +894,7 @@ class Worker:
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.records = WorkerRecords()
-        self.ledger = Ledger(
-            host_budget=options.host_budget,
-            pinned_budget=options.pinned_budget,
-            worker_pid=os.getpid(),
-        )
+        self.ledger = Ledger(worker_pid=os.getpid())
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         self.supervision = ExecutorSupervision(
             root=self.root,
@@ -4284,8 +4271,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
-    parser.add_argument("--host-budget", type=int, default=8 << 30)
-    parser.add_argument("--pinned-budget", type=int, default=512 << 20)
     parser.add_argument("--no-warm", action="store_true")
     parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
@@ -4368,8 +4353,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,
-        host_budget=args.host_budget,
-        pinned_budget=args.pinned_budget,
         no_warm=args.no_warm,
         executor_uid=args.executor_uid,
         executor_gid=args.executor_gid,

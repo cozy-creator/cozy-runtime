@@ -200,9 +200,8 @@ on each invocation, and eager execution remains the fallback.
 **The PlanChooser walks a closed ordered rung set against MEASURED free VRAM.** Every
 coefficient declares its provenance (`uncalibrated | bound | measured | ledger`); claiming
 `measured` without a source refuses. An uncalibrated coefficient may DEEPEN placement —
-which changes weight placement only, never the bits — and may never refuse. Capacity splits
-by tenancy: shared reschedules, local deepens to the deepest rung with a quantified
-confession and exits only below the declared physical floor.
+which changes weight placement only, never the bits — and may never refuse. A shortfall
+deepens to the deepest rung with a quantified confession rather than refusing.
 
 **The ledger** carries one row per byte class, each declaring its KIND (`arithmetic` for the
 worker's own bookkeeping, `measured` for a named device or kernel interface,

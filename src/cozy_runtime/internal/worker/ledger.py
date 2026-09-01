@@ -14,11 +14,6 @@ kernel interface, named exactly. `unreadable` is the honest third state: a class
 worker could not read right now, kept as a NAMED absence instead of a zero (§3.6's
 present/absent/unreadable rule — a killed executor's device numbers are unreadable, not 0).
 
-**Host grants are atomic over classes.** Host RAM and pinned memory are shared by every
-executor on the worker, so the torch-free worker grants each attempt's host needs whole,
-before anything moves. No incremental cross-executor acquisition exists, so no hold-and-wait
-cycle can form, and `allocated` and `registered` stay two numbers (the v1 hostslab lesson).
-
 **An attempt closes by RECONCILING, not by dropping a reference.** `open_attempt` snapshots
 every class; `close_attempt` re-reads them and refuses to call the difference zero unless it
 is. A leak is a typed fact on the terminal path, on success and on failure alike — cr-005's
@@ -40,9 +35,7 @@ from cozy_runtime.internal import proctree
 #: Every byte class this ledger carries, in report order. A class is added here only when a
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
 CLASSES = (
-    "host_ram",
     "host_available",
-    "pinned_allocated",
     "pinned_registered",
     "active_weights",
     "activations_scratch",
@@ -58,15 +51,6 @@ CLASSES = (
 #: How each class's number is produced. This table IS the "declares how it was measured"
 #: requirement — one sentence per counter, naming the interface, never the intent.
 METHODS: dict[str, tuple[str, str]] = {
-    "host_ram": (
-        "arithmetic",
-        "worker grant arithmetic over accepted attempt envelopes; no host allocation "
-        "is observed, so this is bookkeeping and says so",
-    ),
-    "pinned_allocated": (
-        "arithmetic",
-        "the executor staging ring's own slot arithmetic - page-locked bytes IN FLIGHT",
-    ),
     "pinned_registered": (
         "measured",
         "the staging ring's page-locked PEAK, the bytes actually handed to the driver; "
@@ -106,8 +90,9 @@ METHODS: dict[str, tuple[str, str]] = {
     "host_available": (
         "measured",
         "the LIVE host budget: cgroup memory.max minus memory.current when this process is "
-        "in a bounded cgroup, else /proc/meminfo MemAvailable - re-read at every grant, "
-        "because a host budget fixed at boot is a claim about a machine nobody else is on",
+        "in a bounded cgroup, else /proc/meminfo MemAvailable - re-read every time it is "
+        "reported, because a host budget fixed at boot is a claim about a machine nobody "
+        "else is on",
     ),
     "device_reserved": (
         "measured",
@@ -130,7 +115,7 @@ METHODS: dict[str, tuple[str, str]] = {
 
 
 def read_host_available() -> int:
-    """The LIVE host budget — §3.2's host-RAM rule, re-read at every grant, -1 UNREADABLE.
+    """The LIVE host budget — §3.2's host-RAM rule, -1 UNREADABLE.
 
     The measurement lives behind the ProcessTree boundary (#447): the ledger's SEMANTICS
     are platform-neutral, the reader is not.
@@ -141,16 +126,6 @@ def read_host_available() -> int:
 def read_vmrss(pid: int) -> int:
     """Current resident bytes for one pid, or -1 when the process is gone (UNREADABLE)."""
     return proctree.rss_bytes(pid)
-
-
-class LedgerRefusal(Exception):
-    """A class cannot be granted. Carries the structured shortfall the terminal reports."""
-
-    def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
-        super().__init__(f"{code}: {detail}")
-        self.code = code
-        self.detail = detail
-        self.shortfall = shortfall
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,12 +156,6 @@ class Counter:
 @dataclass(slots=True)
 class Ledger:
     """The worker's one ledger. Worker-owned, torch-free, atomic over host classes."""
-
-    host_budget: int
-    pinned_budget: int
-    #: charged host bytes per attempt key, so a release can never guess an amount
-    grants: dict[str, dict[str, int]] = field(default_factory=dict)
-    peak_host: int = 0
 
     #: measured facts, refreshed from the executor's replies and from /proc
     registered: int = 0
@@ -260,8 +229,6 @@ class Ledger:
     #: from a real construction — never by another attempt agreeing with itself.
     unreconciled: str = ""
 
-    # ------------------------------------------------------------------ host grants
-
     @property
     def out_of_allocator(self) -> int:
         """CUDA context + library workspaces: what the allocator's own numbers cannot see."""
@@ -280,88 +247,13 @@ class Ledger:
             slack = 0
         return self.device_free + slack
 
-    @property
-    def host_charged(self) -> int:
-        return sum(row["host"] for row in self.grants.values())
-
-    @property
-    def pinned_charged(self) -> int:
-        return sum(row["pinned"] for row in self.grants.values())
-
-    #: A host move at or above this size is checked against LIVE availability before it is
-    #: attempted. Below it the check costs more than the move (§3.2's ">= 1 GiB" rule).
-    GUARD_FLOOR = 1 << 30
-    #: What must stay for the rest of the machine. A move that would consume the floor is
-    #: doomed: the OOM killer is the alternative, and it does not name its victim.
-    HOST_FLOOR = 512 << 20
-
-    def host_move_guard(self, nbytes: int, why: str) -> None:
-        """Refuse a DOOMED host move BEFORE the OOM killer, not after (§3.2).
-
-        The v1 shape this replaces detected growth AFTER the fact: RSS climbed, the kernel
-        picked a victim, and the postmortem was a dmesg line naming a process nobody chose.
-        This reads cgroup-derived availability at the moment of the grant — the same number
-        `host_available` reports — and refuses with both numbers while there is still
-        something to refuse with.
-        """
-        if nbytes < self.GUARD_FLOOR:
-            return
-        available = read_host_available()
-        if available < 0:
-            return  # UNREADABLE is not "plenty", but it is also not evidence to refuse on
-        if nbytes > available - self.HOST_FLOOR:
-            raise LedgerRefusal(
-                "host_move_doomed",
-                f"{why}: a {nbytes} B host move against {available} B available leaves "
-                f"less than the {self.HOST_FLOOR} B floor. This move is doomed and the "
-                "alternative is the OOM killer, which picks a victim nobody chose and "
-                "explains itself in dmesg - so it refuses HERE, with both numbers",
-                {
-                    "resource": "host_ram",
-                    "scope": "host_move",
-                    "needed_bytes": nbytes + self.HOST_FLOOR,
-                    "available_bytes": available,
-                    "evidence_class": "measured",
-                },
-            )
-
-    def grant(self, key: str, host: int, pinned: int, why: str) -> None:
-        """All classes or none — the envelope is granted whole, before anything moves."""
-        if key in self.grants:
-            raise LedgerRefusal("double_grant", f"{key} already holds a host grant")
-        self.host_move_guard(host, why)
-        free_host = self.host_budget - self.host_charged
-        free_pinned = self.pinned_budget - self.pinned_charged
-        for name, need, free, budget in (
-            ("host_ram", host, free_host, self.host_budget),
-            ("pinned_allocated", pinned, free_pinned, self.pinned_budget),
-        ):
-            if need > free:
-                raise LedgerRefusal(
-                    "host_shortfall",
-                    f"{why}: {name} needs {need} B, {free} B free of {budget} B "
-                    f"(short by {need - free} B)",
-                    {
-                        "resource": name,
-                        "scope": "attempt_envelope",
-                        "needed_bytes": need,
-                        "available_bytes": free,
-                        "evidence_class": "measured",
-                    },
-                )
-        self.grants[key] = {"host": host, "pinned": pinned}
-        self.peak_host = max(self.peak_host, self.host_charged)
-
-    def release(self, key: str) -> None:
-        self.grants.pop(key, None)
-
     # ------------------------------------------------------------------ observation
 
     def begin_generation(self, executor_pid: int) -> None:
         """Discard every fact owned by the previous executor generation.
 
-        Host grants and reconciliation history belong to the worker, so they survive an
-        executor replacement. Everything below is either reported by one executor or
+        Reconciliation history belongs to the worker, so it survives an executor
+        replacement. Everything below is either reported by one executor or
         derived from its resident set and must start unknown or empty. ``executor_pid == 0``
         represents the interval after retirement and before a successor is published.
         """
@@ -509,10 +401,8 @@ class Ledger:
 
     def counters(self) -> list[Counter]:
         values = {
-            "host_ram": (self.host_charged, self.host_budget, self.peak_host),
             "host_available": (read_host_available(), -1, -1),
-            "pinned_allocated": (self.pinned_charged, self.pinned_budget, -1),
-            "pinned_registered": (self.registered, self.pinned_budget, -1),
+            "pinned_registered": (self.registered, -1, -1),
             "active_weights": (self.weights_bytes, -1, -1),
             "activations_scratch": (
                 -1
@@ -552,22 +442,12 @@ class Ledger:
             "classes": [counter.document() for counter in self.counters()],
             "unreadable": sorted(self.unreadable),
             "unreconciled": self.unreconciled,
-            "grants": len(self.grants),
         }
 
     def rows(self) -> dict[str, Any]:
         """The compact projection carried by the worker summary and process records."""
         return {
-            "host_ram": {
-                "charged": self.host_charged,
-                "budget": self.host_budget,
-                "peak": self.peak_host,
-            },
-            "pinned": {
-                "allocated": self.pinned_charged,
-                "registered": self.registered,
-                "budget": self.pinned_budget,
-            },
+            "pinned": {"registered": self.registered},
             "device": {
                 "active_weights": self.weights_bytes,
                 "baseline": self.device_baseline,
@@ -580,7 +460,6 @@ class Ledger:
             },
             "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
             "unreconciled": self.unreconciled,
-            "grants": len(self.grants),
         }
 
     # ------------------------------------------------------------------ reconciliation
@@ -593,10 +472,9 @@ class Ledger:
         """Reconcile EVERY class against the snapshot taken BEFORE the attempt was accepted.
 
         The claim, and the only one: an attempt that reached a terminal holds no byte it did
-        not hold before it started — where "started" means before its envelope was granted,
-        not after. `host_ram` and `pinned_allocated` return to their opening values because
-        the grant was released; `device_allocated` returns to the resident baseline because
-        the kernel's activations were freed. RSS is reported and NOT reconciled: an allocator
+        not hold before it started. `device_allocated` returns to the resident baseline
+        because the kernel's activations were freed. RSS is reported and NOT reconciled: an
+        allocator
         legitimately retains freed pages, so a higher RSS is a fact to look at rather than a
         leak to claim.
 
@@ -620,7 +498,7 @@ class Ledger:
         A transition is a reconciliation, never a leak — and never a silence either.
         """
         after = self.snapshot()
-        reconciled = ("host_ram", "pinned_allocated", "device_allocated")
+        reconciled = ("device_allocated",)
         classes: list[dict[str, Any]] = []
         leaks: list[str] = []
         shifts: list[str] = []

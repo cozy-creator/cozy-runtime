@@ -294,7 +294,7 @@ def main() -> int:
         _require(
             serving.ended == "terminal"
             and serving.accepted.get("request_id") == "serving"
-            and "reserved_host_bytes" in serving.accepted,
+            and "reserved_device_memory_bytes" in serving.accepted,
             f"unmodified serving acceptance failed: {serving.ended}",
         )
 

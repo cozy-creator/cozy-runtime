@@ -130,7 +130,6 @@ class _DevelopmentModel:
     variant: str
     custody: str
     model_weight_bytes: int
-    vram_floor_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1126,7 +1125,6 @@ def development_placement_documents(
                     },
                     stamps=selected.stamps,
                     model_weight_bytes=selected.model_weight_bytes,
-                    vram_floor_bytes=selected.vram_floor_bytes,
                     custody=selected.custody,
                 )
             )
@@ -1163,7 +1161,6 @@ def development_placement_documents(
             config_digest=model_binding_set_digest(model_set),
             development=True,
             model_weight_bytes=sum(model.model_weight_bytes for model in model_set),
-            vram_floor_bytes=sum(model.vram_floor_bytes for model in model_set),
             custody=first.custody if first is not None else "canonical",
         )
     entrypoint_bodies = [documents.body(entrypoint) for entrypoint in entrypoints]
@@ -1301,7 +1298,6 @@ def _resolve_development_models(
             variant="",
             custody="canonical",
             model_weight_bytes=model_weight_bytes,
-            vram_floor_bytes=0,
         )
     return resolved
 
@@ -1559,7 +1555,6 @@ def _collect(
             "placement": accepted.plan.placement,
             "compute_dtype": accepted.plan.compute_dtype,
             "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
-            "reserved_host_bytes": accepted.plan.reserved_host_bytes,
             "decision_explanation": accepted.plan.decision_explanation,
             "placement_id": accepted.placement_id,
             "executor_generation": accepted.executor_generation,

@@ -48,7 +48,7 @@ from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.artifacts import ArtifactExchange
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
-from cozy_runtime.internal.worker.ledger import Ledger, LedgerRefusal
+from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     AttemptPlan,
     DeclaredBinding,
@@ -970,18 +970,6 @@ class AttemptEngine:
         opened = self.ledger.snapshot()
         self._hold_job_models(attempt, binding, descriptor_id)
         attempt.opened = opened
-        try:
-            self.ledger.grant(
-                f"{attempt.request_id}#{attempt.attempt}",
-                plan.reserved_host_bytes,
-                plan.reserved_pinned_bytes,
-                f"job {binding.job} {attempt.request_id}#{attempt.attempt}",
-            )
-        except LedgerRefusal as exc:
-            self._release_job_models(attempt)
-            raise AttemptRefusal(
-                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
-            ) from exc
 
         plan_digest = plan.digest()
         try:
@@ -1012,7 +1000,6 @@ class AttemptEngine:
                     },
                 )
         except Exception:
-            self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             self._release_job_models(attempt)
             raise
         return self._accepted(attempt)
@@ -1148,17 +1135,6 @@ class AttemptEngine:
         self._hydrate_inputs(attempt)
 
         attempt.opened = self.ledger.snapshot()
-        try:
-            self.ledger.grant(
-                f"{attempt.request_id}#{attempt.attempt}",
-                plan.reserved_host_bytes,
-                plan.reserved_pinned_bytes,
-                f"attempt {attempt.request_id}#{attempt.attempt}",
-            )
-        except LedgerRefusal as exc:
-            raise AttemptRefusal(
-                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
-            ) from exc
 
         plan_digest = plan.digest()
         try:
@@ -1190,9 +1166,6 @@ class AttemptEngine:
                     },
                 )
         except Exception:
-            # The envelope was granted a moment ago and nothing will ever run under it:
-            # an unrecorded acceptance must not leave the worker's host ledger charged.
-            self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
             raise
         return self._accepted(attempt)
 
@@ -2094,10 +2067,6 @@ class AttemptEngine:
         that a crash between the two leaves an unreferenced bundle (harmless, readable)
         rather than a terminal pointing at nothing.
         """
-        # The grant is released FIRST because reconciliation is a claim about the whole
-        # envelope: the opening line was taken before the grant, so the closing one must be
-        # taken after its release or every attempt reports its own grant as a leak.
-        self.ledger.release(f"{attempt.request_id}#{attempt.attempt}")
         if attempt.opened:
             self.reconcile(attempt)
             # ONE ENVELOPE, ONE CLOSE. The opening line is spent here; a second terminal for
@@ -2297,7 +2266,6 @@ class AttemptEngine:
                 compute_dtype=plan.compute_dtype,
                 placement=plan.placement,
                 reserved_device_memory_bytes=plan.reserved_vram_bytes,
-                reserved_host_bytes=plan.reserved_host_bytes,
                 decision_explanation=plan.decision_explanation,
             ),
             # ROUTING plus the generation fence the attempt runs under, fixed at

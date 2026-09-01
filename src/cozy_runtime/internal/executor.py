@@ -146,24 +146,15 @@ def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
     }
 
 
-def residence_ceiling(
-    declared: int | None, *, destinations: int, allocatable: int, floor: int
-) -> tuple[int, str]:
-    """The construction's residence ceiling and where it came from (cl-027 / cr-025).
+def residence_ceiling(*, destinations: int, allocatable: int) -> int:
+    """The construction's residence ceiling, DERIVED from the card (cl-027 / cr-025).
 
-    A declared value is applied as declared: an explicit 0 is ALL-RESIDENT (no ceiling), a
-    positive value parks components past it. `None` — what a provisioned binding carries
-    now that the creator no longer authors this field — is DERIVED from the card: the
-    measured allocatable capacity minus the physical floor (activations, scratch, one
-    component chunk), capped at the artifact's own complete destination bytes so a card
-    with room reports the artifact's size rather than its own. The derived value is never
-    0 by accident: a floor that leaves no room at all is a typed shortfall at the caller.
-
-    Returns `(ceiling_bytes, basis)` with basis `declared` or `derived`.
+    Nothing authors this: it is the measured allocatable capacity, capped at the artifact's
+    own complete destination bytes so a card with room reports the artifact's size rather
+    than its own. Whatever it comes to is what the generation's digest carries. Zero means
+    the card has no room at all, which is a typed shortfall at the caller.
     """
-    if declared is not None:
-        return max(int(declared), 0), "declared"
-    return min(int(destinations), max(int(allocatable) - int(floor), 0)), "derived"
+    return min(int(destinations), max(int(allocatable), 0))
 
 
 # --------------------------------------------------------------------------- state
@@ -423,9 +414,9 @@ class Executor:
         # route and validated geometry, the device and runtime identity, the placement and
         # the objective — and its digest is what enters identity. The LABEL derives from it.
         #
-        # Every candidate is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
-        # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so offering
-        # four variants costs four header reads and no load.
+        # The artifact is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
+        # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so this
+        # costs one header read and no load.
         # Package installation carries no pre-qualified hardware variant. Derive it from
         # the executor's selected device; a repository lane is never a hardware claim.
         device_index = int(binding.get("device_index") or 0)
@@ -441,25 +432,18 @@ class Executor:
                     "caller-authored hardware variant is accepted",
                 }
             hardware_variant = f"sm{device_facts.sm}"
-        offered = [
-            v if isinstance(v, Variant) else Variant.read(v)
-            for v in (binding.get("variants") or ())
-        ] or [
-            Variant(
-                name=hardware_variant,
-                store=binding["store"],
-                snapshot=binding["snapshot"],
-                snapshots=dict(per_component),
-                reference=True,
-            )
-        ]
-        surveyed: dict[str, tuple[dict[str, Any], list[Any]]] = {}
-        for variant in offered:
-            vmap = variant.snapshot_map()
-            books = {
-                name: Checkpoint(variant.store, vmap.get(name, variant.snapshot)) for name in names
-            }
-            surveyed[variant.name] = (books, [r for name in names for r in books[name].rows(name)])
+        reference = Variant(
+            name=hardware_variant,
+            store=binding["store"],
+            snapshot=binding["snapshot"],
+            snapshots=dict(per_component),
+            reference=True,
+        )
+        vmap = reference.snapshot_map()
+        checkpoints = {
+            name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
+        }
+        rows = [r for name in names for r in checkpoints[name].rows(name)]
         # THE SELECTED DEVICE, not card zero (#549.9). `device_index` is the binding's, and
         # NVML is queried with it — a multi-GPU pod used to mint every record against GPU 0's
         # power cap and MIG profile whatever card the fill was about to use.
@@ -469,7 +453,7 @@ class Executor:
             torch,
             providers,
             device_facts,
-            sorted({dtype_name(r.dtype) for _, rs in surveyed.values() for r in rs}),
+            sorted({dtype_name(r.dtype) for r in rows}),
             release=binding["release"],
             runtime=runtime_identity,
         )
@@ -495,7 +479,7 @@ class Executor:
             topology_digest=canonical.digest(
                 {
                     key: [list(spec.shape), spec.dtype, spec.encoding]
-                    for key, spec in sorted(topology_of(surveyed[offered[0].name][1]).items())
+                    for key, spec in sorted(topology_of(rows).items())
                 }
             ),
             components=tuple(names),
@@ -509,8 +493,8 @@ class Executor:
         facts = PlanFacts()
         try:
             plan = resolve(
-                variants=offered,
-                rows_for={name: rows for name, (_, rows) in surveyed.items()},
+                variants=[reference],
+                rows_for={reference.name: rows},
                 providers=providers,
                 capabilities=qualified[0],
                 device=device_facts,
@@ -531,7 +515,6 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:900],
                 "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
-        checkpoints, rows = surveyed[plan.variant]
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
         # worker can report measured progress for a multi-GB load without inventing a timeout.
@@ -578,32 +561,26 @@ class Executor:
         allocatable = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
-        # THE RESIDENCE CEILING (cl-027 / cr-025). Declared by the binding, or DERIVED here
-        # from measured capacity, the artifact's complete destination bytes and the floor —
-        # and whichever it was, the APPLIED value is what the generation's digest carries.
-        # A staging generation re-reads the store after construction, so its GC-safe hold
-        # must outlive the first commit; that is what `hold_lease` is.
+        # THE RESIDENCE CEILING (cl-027 / cr-025). DERIVED here from measured capacity and
+        # the artifact's complete destination bytes; the APPLIED value is what the
+        # generation's digest carries. A staging generation re-reads the store after
+        # construction, so its GC-safe hold must outlive the first commit; that is
+        # `hold_lease`.
         destinations = max(int(envelope["destination_bytes"]), declared)
-        resident_budget, resident_basis = residence_ceiling(
-            budgets.get("resident"),
-            destinations=destinations,
-            allocatable=int(allocatable),
-            floor=int(budgets.get("vram_floor") or 0),
-        )
-        if resident_basis == "derived" and resident_budget <= 0:
+        resident_budget = residence_ceiling(destinations=destinations, allocatable=int(allocatable))
+        if resident_budget <= 0:
             self.poisoned = "fill refused: device_shortfall"
             return {
                 "ok": False,
                 "code": "device_shortfall",
                 "detail": (
-                    f"the declared floor of {int(budgets.get('vram_floor') or 0)} B leaves "
-                    f"no residence ceiling on {allocatable} B allocatable — nothing of this "
-                    "construction can stay resident, so there is no plan to derive"
+                    f"{allocatable} B allocatable leaves no residence ceiling — nothing of "
+                    "this construction can stay resident, so there is no plan to derive"
                 ),
                 "shortfall": {
                     "resource": "vram",
                     "scope": "component_generation",
-                    "needed_bytes": int(budgets.get("vram_floor") or 0),
+                    "needed_bytes": destinations,
                     "available_bytes": int(allocatable),
                     "evidence_class": "measured",
                 },
@@ -624,7 +601,6 @@ class Executor:
             **envelope,
             "resident_destination_bytes": resident_destinations,
             "resident_budget_bytes": resident_budget,
-            "resident_budget_basis": resident_basis,
             "required_bytes": required,
         }
         if required > allocatable:
@@ -635,7 +611,7 @@ class Executor:
                 "detail": (
                     f"this fill will hold {required} B on the device "
                     f"({resident_destinations} B of resident destinations under a "
-                    f"{resident_basis} ceiling of {resident_budget} B; "
+                    f"derived ceiling of {resident_budget} B; "
                     f"{envelope['destination_bytes']} B of logical destinations, "
                     f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
                     "destinations, "
@@ -657,7 +633,7 @@ class Executor:
                 },
             }
         artifact = Artifact(
-            next(v for v in offered if v.name == plan.variant).snapshot,
+            reference.snapshot,
             topology_of(rows),
             Config._verified(
                 config_document,
@@ -769,12 +745,10 @@ class Executor:
         # TWO IDENTITIES, because there are two questions and one digest could only answer
         # one of them (codex audit, adopted 2026-08-25).
         #
-        # The LOGICAL MODEL is the REFERENCE variant's snapshot and the topology around it.
+        # The LOGICAL MODEL is the reference snapshot and the topology around it.
         # cr-006 proved on real bytes that an encoding rung changes no logical keyset and
-        # shares its `topology_digest`, so every delivery variant of one model is one
-        # logical model — which is what keeps `expect_construction_digest` a usable fence
-        # for a deployment that offers several variants.
-        reference = next((v for v in offered if v.reference), offered[0])
+        # shares its `topology_digest`, which is what keeps `expect_construction_digest` a
+        # usable fence.
         self.logical_model_digest = canonical.digest(
             {
                 "format": "cozy.runtime.ModelConstructionContract/1",
@@ -808,7 +782,7 @@ class Executor:
                 "plan_digest": plan.digest(),
                 "topology_digest": record.topology_digest,
                 "config_digest": record.config_digest,
-                # THE APPLIED CEILING — derived or declared — never the wire's absent 0 (cl-027).
+                # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
             }
@@ -847,7 +821,6 @@ class Executor:
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
             "resident_budget_bytes": resident_budget,
-            "resident_budget_basis": resident_basis,
             "rss_bytes": _rss(),
             "pinned": dict(backend.pinned),
             "store": backend.stats.get("store", {}),
