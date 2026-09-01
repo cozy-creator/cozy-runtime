@@ -24,7 +24,6 @@ from typing import ParamSpec, TypeVar, overload
 from cozy_runtime.author._artifact import ArtifactOutput
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, Resources
-from cozy_runtime.author._production import Production, ProductionOutput, ProductionStep
 from cozy_runtime.author._signature import Kind, Surface, analyze
 
 P = ParamSpec("P")
@@ -47,6 +46,7 @@ class Registration:
     publishes: bool = False
     emits_media: bool = False
     artifact_outputs: tuple[ArtifactOutput, ...] = ()
+    source_profiles: Mapping[str, str] = field(default_factory=dict)
     resources: Resources | None = None
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
@@ -75,6 +75,7 @@ class Registration:
                 publishes=self.publishes,
                 emits_media=self.emits_media,
                 artifact_outputs=self.artifact_outputs,
+                source_profiles=self.source_profiles,
                 resources=self.resources,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
@@ -88,32 +89,7 @@ class App:
     """The one registry a package module exports as `app = App()`."""
 
     _registry: dict[str, Registration] = field(default_factory=dict)
-    _productions: dict[str, Production] = field(default_factory=dict)
     _frozen: bool = False
-
-    def production(
-        self,
-        name: str,
-        *,
-        sources: Mapping[str, str],
-        steps: tuple[ProductionStep, ...],
-        outputs: tuple[ProductionOutput, ...],
-    ) -> None:
-        """Register one static graph over ordinary installed jobs.
-
-        A production is descriptor data only. It cannot execute, resolve a package,
-        acquire capacity, or publish a release.
-        """
-        if self._frozen:
-            raise RegistrationError(
-                f"production {name!r}: the registry is frozen — after describe, "
-                "registration is immutable (§1.0)"
-            )
-        if name in self._productions:
-            raise RegistrationError(f"duplicate production {name!r}: names are unique per app")
-        if len(self._productions) >= 16:
-            raise RegistrationError("an app declares at most 16 model productions")
-        self._productions[name] = Production(name, sources, steps, outputs)
 
     @overload
     def entrypoint(self, fn: Callable[P, R], /) -> Callable[P, R]: ...
@@ -151,6 +127,7 @@ class App:
             name,
             publishes=False,
             artifact_outputs=(),
+            source_profiles={},
             preflight=preflight,
             resources=resources,
             demand=demand,
@@ -169,6 +146,7 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         artifacts: tuple[ArtifactOutput, ...] = (),
+        source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -182,6 +160,7 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         artifacts: tuple[ArtifactOutput, ...] = (),
+        source_profiles: Mapping[str, str] | None = None,
         resources: Resources | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -192,6 +171,10 @@ class App:
         off the declaration, never off the kind — and everything else about the job is
         derived from the signature exactly as it is for an entrypoint. There is no
         JobContext, no second kernel and no serving loop.
+
+        ``source_profiles`` is the narrow source-first door: when present it maps every
+        inferred Model parameter to one reviewed TensorFS profile. It selects no provider,
+        source revision, checkpoint, destination, or placement.
         """
         return self._register(
             "job",
@@ -200,6 +183,7 @@ class App:
             publishes=publishes,
             emits_media=emits_media,
             artifact_outputs=artifacts,
+            source_profiles=dict(source_profiles or {}),
             preflight=None,
             resources=resources,
             demand=demand,
@@ -213,6 +197,7 @@ class App:
         *,
         publishes: bool,
         artifact_outputs: tuple[ArtifactOutput, ...],
+        source_profiles: Mapping[str, str],
         preflight: Callable[..., object] | None,
         resources: Resources | None,
         demand: Bound | None,
@@ -237,6 +222,7 @@ class App:
                 publishes=publishes,
                 emits_media=emits_media,
                 artifact_outputs=artifact_outputs,
+                source_profiles=dict(source_profiles),
                 resources=resources,
                 demand_bound=demand,
                 preflight=preflight,
@@ -251,10 +237,6 @@ class App:
     def registrations(self) -> tuple[Registration, ...]:
         """Registered callables in declaration order."""
         return tuple(self._registry.values())
-
-    def productions(self) -> tuple[Production, ...]:
-        """Registered production graphs in declaration order."""
-        return tuple(self._productions.values())
 
     def get(self, name: str) -> Registration:
         try:

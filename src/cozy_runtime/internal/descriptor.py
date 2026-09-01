@@ -13,7 +13,6 @@ from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
 from cozy_runtime.author._markers import Resources
-from cozy_runtime.author._production import Production, ProductionContract, ProductionStep
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -28,7 +27,6 @@ TOP_LEVEL_KEYS = frozenset(
         "application",
         "entrypoints",
         "jobs",
-        "model_productions",
     }
 )
 
@@ -56,9 +54,6 @@ def build(found: Discovered) -> dict[str, Json]:
         "application": found.application,
         "entrypoints": sorted(entrypoints, key=_by_name),
         "jobs": sorted(jobs, key=_by_name),
-        "model_productions": sorted(
-            (_production(production) for production in found.app.productions()), key=_by_name
-        ),
     }
     assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
     _fixed_point(body, _binding_values(found.bindings))
@@ -84,14 +79,20 @@ def _callable(surface: Surface) -> dict[str, Json]:
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
         if surface.artifact_outputs:
-            doc["artifact_outputs"] = [
-                {
+            outputs: list[Json] = []
+            for output in sorted(surface.artifact_outputs, key=lambda row: row.name):
+                declared: dict[str, Json] = {
                     "output_id": output.name,
                     "mime_type": "application/vnd.cozy.model-manifest",
                     "max_bytes": output.max_new_bytes,
                 }
-                for output in sorted(surface.artifact_outputs, key=lambda row: row.name)
-            ]
+                if output.topology_digest:
+                    declared["required_contract"] = {
+                        "topology_digest": output.topology_digest,
+                        "encodings": list(output.encodings),
+                    }
+                outputs.append(declared)
+            doc["artifact_outputs"] = outputs
         if surface.resources is not None:
             resources = _resources(surface.resources)
             if resources:
@@ -113,6 +114,8 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
             method: sorted(names) for method, names in sorted(binding.components.items())
         },
     }
+    if binding.source_profile is not None:
+        doc["source_profile"] = binding.source_profile
     return doc
 
 
@@ -125,43 +128,6 @@ def _resources(resources: Resources) -> dict[str, Json]:
     if resources.requires is not None:
         out["requires"] = resources.requires
     return out
-
-
-def _production(production: Production) -> dict[str, Json]:
-    return {
-        "name": production.name,
-        "sources": dict(sorted(production.sources.items())),
-        "steps": [
-            _production_step(step) for step in sorted(production.steps, key=lambda row: row.name)
-        ],
-        "outputs": [
-            {
-                "name": output.name,
-                "source": output.source,
-                "required_contract": _production_contract(output.required),
-            }
-            for output in sorted(production.outputs, key=lambda row: row.name)
-        ],
-    }
-
-
-def _production_step(step: ProductionStep) -> dict[str, Json]:
-    doc: dict[str, Json] = {
-        "name": step.name,
-        "callable": step.callable,
-        "models": dict(sorted(step.models.items())),
-        "outputs": sorted(step.outputs),
-    }
-    if step.resources is not None:
-        doc["resources"] = _resources(step.resources)
-    return doc
-
-
-def _production_contract(contract: ProductionContract) -> dict[str, Json]:
-    return {
-        "topology_digest": contract.topology_digest,
-        "encodings": sorted(contract.encodings),
-    }
 
 
 # -------------------------------------------------------------------- fixed-point scan
@@ -225,7 +191,7 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
         for index, item in enumerate(value):
             _fixed_point(item, bindings, f"{path}[{index}]")
     elif isinstance(value, str):
-        # A production output declares the exact byte-level result the package promises to
+        # An artifact output declares the exact byte-level result the package promises to
         # derive. Those two digest-shaped values are SOURCE facts, unlike a selected release,
         # model, build, or candidate. The contract's closed parser below is the only place
         # this exception exists and validates both values as exact sha256 identities.
@@ -377,7 +343,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
     application = body["application"]
     if not isinstance(application, str) or not application:
         _invalid(source, "application", "must be a non-empty string")
-    _productions(body["model_productions"], source)
     for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
         rows = body[collection]
         if not isinstance(rows, list):
@@ -400,12 +365,13 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             models = item.get("models", [])
             if not isinstance(models, list) or len(models) > 16:
                 _invalid(source, f"{path}.models", "must be an array of at most 16 slots")
+            profiled_models = 0
             for model_index, model in enumerate(models):
                 model_path = f"{path}.models[{model_index}]"
                 slot = _closed(
                     model,
                     {"class", "component_use", "path", "stamps"},
-                    set(),
+                    {"source_profile"},
                     source,
                     model_path,
                 )
@@ -418,6 +384,9 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     _invalid(source, f"{model_path}.path", f"must start with {prefix!r}")
                 if not isinstance(slot["class"], str) or not slot["class"]:
                     _invalid(source, f"{model_path}.class", "must be a non-empty string")
+                if "source_profile" in slot:
+                    _contract_value(slot["source_profile"], source, f"{model_path}.source_profile")
+                    profiled_models += 1
                 _string_map(slot["stamps"], source, f"{model_path}.stamps")
                 uses = slot["component_use"]
                 if not isinstance(uses, dict):
@@ -433,11 +402,25 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                             f"{model_path}.component_use",
                             "must map method names to component-name arrays",
                         )
+            if profiled_models not in (0, len(models)):
+                _invalid(
+                    source,
+                    f"{path}.models",
+                    "must either omit source_profile or declare it for every model slot",
+                )
+            if kind != "job" and profiled_models:
+                _invalid(source, f"{path}.models", "source_profile is valid only on jobs")
             if kind == "job":
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
+                if profiled_models and "artifact_outputs" not in item:
+                    _invalid(
+                        source,
+                        path,
+                        "source_profile requires descriptor-declared artifact outputs",
+                    )
                 if "resources" in item:
-                    _production_resources(item["resources"], source, f"{path}.resources")
+                    _resources_value(item["resources"], source, f"{path}.resources")
                 if "artifact_outputs" in item:
                     artifact_outputs = item["artifact_outputs"]
                     if (
@@ -455,7 +438,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                         output = _closed(
                             output_raw,
                             {"output_id", "mime_type", "max_bytes"},
-                            set(),
+                            {"required_contract"},
                             source,
                             output_path,
                         )
@@ -468,169 +451,45 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                         if output["mime_type"] != "application/vnd.cozy.model-manifest":
                             _invalid(source, f"{output_path}.mime_type", "is not the model MIME")
                         maximum = output["max_bytes"]
-                        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
-                            _invalid(source, f"{output_path}.max_bytes", "must be non-negative")
+                        if (
+                            not isinstance(maximum, int)
+                            or isinstance(maximum, bool)
+                            or not 0 <= maximum <= (1 << 53) - 1
+                        ):
+                            _invalid(
+                                source,
+                                f"{output_path}.max_bytes",
+                                "must be an integer in 0..=2^53-1",
+                            )
+                        if "required_contract" in output:
+                            _artifact_contract(
+                                output["required_contract"],
+                                source,
+                                f"{output_path}.required_contract",
+                            )
 
 
-def _productions(value: Json, source: str) -> None:
-    if not isinstance(value, list) or len(value) > 16:
-        _invalid(source, "model_productions", "must be an array of at most 16 entries")
-    names: set[str] = set()
-    for index, raw in enumerate(value):
-        path = f"model_productions[{index}]"
-        production = _closed(raw, {"name", "sources", "steps", "outputs"}, set(), source, path)
-        name = _portable_name(production["name"], source, f"{path}.name")
-        if name in names:
-            _invalid(source, f"{path}.name", "must be unique")
-        names.add(name)
-        roots = _string_map_value(production["sources"], source, f"{path}.sources", 16)
-        if not roots:
-            _invalid(source, f"{path}.sources", "must contain at least one source slot")
-        for slot, profile in roots.items():
-            _contract_value(profile, source, f"{path}.sources.{slot}")
-        steps = production["steps"]
-        if not isinstance(steps, list) or not 1 <= len(steps) <= 64:
-            _invalid(source, f"{path}.steps", "must contain 1 through 64 steps")
-        step_outputs: dict[str, set[str]] = {}
-        dependencies: dict[str, set[str]] = {}
-        for step_index, step_raw in enumerate(steps):
-            step_path = f"{path}.steps[{step_index}]"
-            step = _closed(
-                step_raw,
-                {"name", "callable", "models", "outputs"},
-                {"resources"},
-                source,
-                step_path,
-            )
-            step_name = _portable_name(step["name"], source, f"{step_path}.name")
-            if step_name in step_outputs:
-                _invalid(source, f"{step_path}.name", "must be unique")
-            callable_name = step["callable"]
-            if not isinstance(callable_name, str) or _CALLABLE.fullmatch(callable_name) is None:
-                _invalid(source, f"{step_path}.callable", "must be org/package@vN/function")
-            outputs = _portable_names(step["outputs"], source, f"{step_path}.outputs", 8)
-            step_outputs[step_name] = set(outputs)
-            dependencies[step_name] = set()
-            models = _string_map_value(step["models"], source, f"{step_path}.models", 16)
-            if not models:
-                _invalid(source, f"{step_path}.models", "must not be empty")
-            if "resources" in step:
-                _production_resources(step["resources"], source, f"{step_path}.resources")
-
-        def edge(
-            reference: str,
-            edge_path: str,
-            root_names: frozenset[str] = frozenset(roots),
-            outputs_by_step: dict[str, set[str]] = step_outputs,
-        ) -> str | None:
-            if reference in root_names:
-                return None
-            step_name, separator, output = reference.partition(".")
-            if not separator or output not in outputs_by_step.get(step_name, set()):
-                _invalid(source, edge_path, f"references unknown edge {reference!r}")
-            return step_name
-
-        for step_index, step_raw in enumerate(steps):
-            assert isinstance(step_raw, dict)
-            step_name = str(step_raw["name"])
-            models = step_raw["models"]
-            assert isinstance(models, dict)
-            for model_name, reference in models.items():
-                dependency = edge(str(reference), f"{path}.steps[{step_index}].models.{model_name}")
-                if dependency is not None:
-                    dependencies[step_name].add(dependency)
-
-        outputs = production["outputs"]
-        if not isinstance(outputs, list) or not 1 <= len(outputs) <= 16:
-            _invalid(source, f"{path}.outputs", "must contain 1 through 16 required outputs")
-        output_names: set[str] = set()
-        required_steps: set[str] = set()
-
-        def retain(
-            step_name: str,
-            visiting: set[str],
-            production_path: str = path,
-            graph: dict[str, set[str]] = dependencies,
-            retained: set[str] = required_steps,
-        ) -> None:
-            if step_name in visiting:
-                _invalid(source, production_path, f"contains a cycle through {step_name}")
-            if step_name in retained:
-                return
-            visiting.add(step_name)
-            for dependency in graph[step_name]:
-                retain(dependency, visiting)
-            visiting.remove(step_name)
-            retained.add(step_name)
-
-        for output_index, output_raw in enumerate(outputs):
-            output_path = f"{path}.outputs[{output_index}]"
-            output = _closed(
-                output_raw,
-                {"name", "source", "required_contract"},
-                set(),
-                source,
-                output_path,
-            )
-            output_name = _portable_name(output["name"], source, f"{output_path}.name")
-            if output_name in output_names:
-                _invalid(source, output_path, "repeats an output name")
-            output_names.add(output_name)
-            selected = edge(str(output["source"]), f"{output_path}.source")
-            if selected is None:
-                _invalid(source, f"{output_path}.source", "must name a step output")
-            retain(selected, set())
-            _production_contract_value(
-                output["required_contract"], source, f"{output_path}.required_contract"
-            )
-        disconnected = sorted(set(step_outputs) - required_steps)
-        if disconnected:
-            _invalid(source, path, f"contains disconnected steps {disconnected}")
-
-
-_PRODUCTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_PORTABLE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
-_CALLABLE = re.compile(
-    r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}"
-    r"@v(?:0|[1-9][0-9]*)/"
-    r"[a-z][a-z0-9_-]{0,63}$"
-)
 
 
 def _portable_name(value: Json, source: str, path: str) -> str:
-    if not isinstance(value, str) or _PRODUCTION_NAME.fullmatch(value) is None:
+    if not isinstance(value, str) or _PORTABLE_NAME.fullmatch(value) is None:
         _invalid(source, path, "must be a portable lowercase name")
     return value
 
 
-def _portable_names(value: Json, source: str, path: str, cap: int) -> list[str]:
-    if not isinstance(value, list) or not 1 <= len(value) <= cap:
-        _invalid(source, path, f"must contain 1 through {cap} names")
-    out = [_portable_name(item, source, path) for item in value]
-    if len(set(out)) != len(out):
-        _invalid(source, path, "must be unique")
-    return out
-
-
 def _contract_value(value: Json, source: str, path: str) -> str:
-    if not isinstance(value, str) or _CONTRACT_VALUE.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or len(value.encode("utf-8")) > 256
+        or _CONTRACT_VALUE.fullmatch(value) is None
+    ):
         _invalid(source, path, "is not a bounded contract token")
     return value
 
 
-def _string_map_value(value: Json, source: str, path: str, cap: int) -> dict[str, str]:
-    if not isinstance(value, dict) or len(value) > cap:
-        _invalid(source, path, f"must be an object with at most {cap} entries")
-    out: dict[str, str] = {}
-    for key, item in value.items():
-        _portable_name(key, source, path)
-        if not isinstance(item, str) or not item:
-            _invalid(source, f"{path}.{key}", "must be a non-empty string")
-        out[key] = item
-    return out
-
-
-def _production_resources(value: Json, source: str, path: str) -> None:
+def _resources_value(value: Json, source: str, path: str) -> None:
     resources = _closed(value, set(), {"gpu_count", "placement", "requires"}, source, path)
     if not resources:
         _invalid(source, path, "must not be empty")
@@ -646,7 +505,7 @@ def _production_resources(value: Json, source: str, path: str) -> None:
         _invalid(source, f"{path}.requires", "must be a non-empty string")
 
 
-def _production_contract_value(value: Json, source: str, path: str) -> None:
+def _artifact_contract(value: Json, source: str, path: str) -> None:
     contract = _closed(value, {"topology_digest", "encodings"}, set(), source, path)
     topology = contract["topology_digest"]
     encodings = contract["encodings"]
@@ -805,11 +664,8 @@ def counts(body: Mapping[str, Json]) -> dict[str, int]:
         models = doc.get("models", [])
         assert isinstance(models, list)
         slots += len(models)
-    productions = body.get("model_productions", [])
-    assert isinstance(productions, list)
     return {
         "entrypoints": len(entrypoints),
         "jobs": len(jobs),
         "model_bindings": slots,
-        "model_productions": len(productions),
     }

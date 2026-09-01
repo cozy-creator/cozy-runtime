@@ -110,11 +110,6 @@ from cozy_runtime.author._model import (
     ScopeCall,
     uses_components,
 )
-from cozy_runtime.author._production import (
-    ProductionContract,
-    ProductionOutput,
-    ProductionStep,
-)
 from cozy_runtime.author._services import (
     JOB_ONLY,
     SERVING_ONLY,
@@ -222,9 +217,6 @@ __all__ = [
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
-    "ProductionContract",
-    "ProductionOutput",
-    "ProductionStep",
     "Recipe",
     "Registration",
     "RegistrationError",

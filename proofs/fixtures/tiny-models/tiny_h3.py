@@ -34,6 +34,8 @@ from tiny_diffusers import MiniMaxH3ModularPipeline, build_h3_pipeline
 
 from cozy_runtime.author import (
     App,
+    ArtifactOutput,
+    ArtifactSink,
     AudioAsset,
     Budget,
     Checkpoints,
@@ -48,9 +50,6 @@ from cozy_runtime.author import (
     ModelDefault,
     Outputs,
     Preflight,
-    ProductionContract,
-    ProductionOutput,
-    ProductionStep,
     RequestView,
     Resources,
     Scheduler,
@@ -716,33 +715,31 @@ def distill(
     )
 
 
-# Descriptor-only orchestration over an ordinary installed job. The fixture deliberately
-# keeps this separate from ``distill``: registering the graph executes nothing.
-app.production(
-    "four-lane",
-    sources={
+class FourLaneResult(msgspec.Struct):
+    outputs: int
+
+
+@app.job(
+    name="four-lane",
+    artifacts=(
+        ArtifactOutput(
+            "bf16-full",
+            max_new_bytes=128 << 10,
+            topology_digest="sha256:" + "1" * 64,
+            encodings=("sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",),
+        ),
+    ),
+    source_profiles={
         "dits": "hf/minimax-h3/native-dual-bf16/1",
         "shared": "hf/minimax-h3/shared-bf16/1",
     },
-    steps=(
-        ProductionStep(
-            name="distill-full",
-            callable="tensorhub/h3@v1/distill",
-            models={"base": "dits", "shared": "shared"},
-            outputs=("bf16-full",),
-            resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),
-        ),
-    ),
-    outputs=(
-        ProductionOutput(
-            name="bf16-full",
-            source="distill-full.bf16-full",
-            required=ProductionContract(
-                topology_digest="sha256:" + "1" * 64,
-                encodings=(
-                    "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
-                ),
-            ),
-        ),
-    ),
+    resources=Resources(gpu_count=2, placement="single_node", requires="ram64g"),
 )
+def four_lane(
+    payload: DistillInput,
+    dits: Fl2VAModel,
+    shared: Ref2VAModel,
+    artifacts: ArtifactSink,
+) -> FourLaneResult:
+    del payload, dits, shared, artifacts
+    return FourLaneResult(outputs=1)

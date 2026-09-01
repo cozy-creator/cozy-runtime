@@ -73,17 +73,6 @@ def _classify(previous: dict[str, Json], candidate: dict[str, Json]) -> Result:
         kind, _ = after[name]
         minor.append(f"added {kind} {name}")
 
-    before_productions = _named(previous["model_productions"])
-    after_productions = _named(candidate["model_productions"])
-    for name, production in before_productions.items():
-        candidate_production = after_productions.get(name)
-        if candidate_production is None:
-            major.append(f"removed model production {name}")
-        elif candidate_production != production:
-            major.append(f"model production {name} changed")
-    for name in sorted(set(after_productions) - set(before_productions)):
-        minor.append(f"added model production {name}")
-
     if major:
         return Result("major", _bounded(major))
     if minor:
@@ -107,16 +96,6 @@ def _callables(
                 )
             found[name] = (cast(Literal["entrypoint", "job"], kind), row)
     return found
-
-
-def _named(value: Json) -> dict[str, dict[str, Json]]:
-    rows = cast(list[Json], value)
-    return {
-        cast(str, row["name"]): row
-        for item in rows
-        if isinstance(item, dict)
-        for row in [cast(dict[str, Json], item)]
-    }
 
 
 def _request_additions(previous: Json, candidate: Json, path: str) -> tuple[list[str], str | None]:

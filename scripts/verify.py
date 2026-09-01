@@ -115,7 +115,13 @@ def main() -> int:
             print(f"  {'':<13} features: {axes or '(none)'}")
             for binding in surface.model_bindings:
                 stamps = ", ".join(f"{k}={v}" for k, v in binding.stamps.items()) or "(none)"
-                print(f"  {'':<13} slot {binding.path} -> {binding.class_key} stamps: {stamps}")
+                source = (
+                    f" source-profile={binding.source_profile}" if binding.source_profile else ""
+                )
+                print(
+                    f"  {'':<13} slot {binding.path} -> {binding.class_key} "
+                    f"stamps: {stamps}{source}"
+                )
                 for method, names in binding.components.items():
                     print(f"  {'':<15}   {method}: {', '.join(names)}")
 
@@ -632,7 +638,7 @@ def descriptor_sections() -> None:
         size = len(raw)
         print(
             f"  {module:15} {counts['entrypoints']}e/{counts['jobs']}j/"
-            f"{counts['model_bindings']} slots/{counts['model_productions']} productions · "
+            f"{counts['model_bindings']} model slots · "
             f"{size:>6,} B canonical · {elapsed_ms:6.1f} ms · "
             f"{descriptor.package_descriptor_digest(body)[:26]}…"
         )
@@ -692,9 +698,9 @@ def descriptor_sections() -> None:
             "component_use"
         ].update(denoise=["fl2va_transformer", "smuggled"]),
         "published surface removed": lambda d: d["entrypoints"].pop(),
-        "production contract changed": lambda d: d["model_productions"][0]["outputs"][0][
-            "required_contract"
-        ].update(topology_digest="sha256:" + "2" * 64),
+        "artifact contract changed": lambda d: next(
+            row for row in d["jobs"] if row["name"] == "four-lane"
+        )["artifact_outputs"][0]["required_contract"].update(topology_digest="sha256:" + "2" * 64),
     }
     for what, mutate in mutations.items():
         mutated = json.loads(json.dumps(bodies["tiny_h3"]))
