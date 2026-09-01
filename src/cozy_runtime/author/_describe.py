@@ -85,6 +85,13 @@ def _separation(surface: Surface) -> None:
             "admitted); a job is submitted, accepted once, and runs to completion (§2)",
             code="job_serving_separation",
         )
+    if job and surface.demand_bound is not None:
+        raise ConformanceError(
+            f"{surface.name}: a job declares demand=Bound(…) — a demand envelope is a SERVING "
+            "admission fact used to route requests to warm capacity; a job declares structural "
+            "FLOORS through resources= and nothing else (§1.2/§2)",
+            code="job_serving_separation",
+        )
     if not job and (surface.publishes or surface.emits_media):
         raise ConformanceError(
             f"{surface.name}: publishes=/emits_media= on an entrypoint — a publication "

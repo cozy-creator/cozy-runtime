@@ -356,6 +356,7 @@ class Executor:
             dtype_name,
             topology_of,
         )
+        from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
@@ -489,6 +490,7 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
+        facts = PlanFacts()
         try:
             plan = resolve(
                 variants=[reference],
@@ -498,6 +500,7 @@ class Executor:
                 device=device_facts,
                 runtime=runtime_identity,
                 construction=construction,
+                facts=facts,
                 objective=objective,
                 placement=str(binding.get("placement") or "all_resident"),
                 encoded_leaves=consent,

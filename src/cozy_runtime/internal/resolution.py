@@ -62,6 +62,7 @@ from cozy_runtime.internal.encoding import (
     device_line,
     geometry_class,
 )
+from cozy_runtime.internal.planfacts import PlanFact, PlanFacts
 
 #: WHICH KERNEL each route computes with. The two float routes compute in the destination's
 #: own dtype through the ordinary library GEMM — that is what "kernel-neutral" means, and it
@@ -280,6 +281,7 @@ class ResolvedModelPlan:
     construction: ConstructionFacts
     encoded_leaves: str
     steps_basis: int = 20
+    measurements: PlanFact | None = None
     confession: str = ""
     walk: tuple[dict[str, Any], ...] = ()
 
@@ -367,6 +369,7 @@ class ResolvedModelPlan:
             "routes": self.route_census(),
             "kernels": self.kernels(),
             "objective": self.objective,
+            "calibrated": self.measurements is not None,
             "confession": self.confession,
         }
 
@@ -496,6 +499,8 @@ class ResolvedModelPlan:
             "stored_bytes": self.stored_bytes(),
             "derived_resident_bytes": self.derived_resident_bytes(),
             "derived_kernel_numeric_error": self.derived_kernel_numeric_error(),
+            "calibrated": self.measurements is not None and self.measurements.samples > 0,
+            "measured": self.measurements.document() if self.measurements else None,
             "confession": self.confession,
             "tensors": [row.document() for row in self.tensors],
             "walk": list(self.walk),
@@ -503,9 +508,10 @@ class ResolvedModelPlan:
 
     def summary(self) -> str:
         census = ", ".join(f"{r} x{n}" for r, n in sorted(self.route_census().items()))
+        samples = self.measurements.samples if self.measurements else 0
         return (
             f"{self.label()} [{self.digest()[:19]}…] over {self.variant!r}: {census}; "
-            f"objective {self.objective}, policy {self.policy}"
+            f"objective {self.objective}, policy {self.policy}, {samples} banked sample(s)"
         )
 
 
@@ -515,15 +521,35 @@ class ResolvedModelPlan:
 def score(plan: ResolvedModelPlan, objective: str) -> tuple[float, str]:
     """Lower is better. Returns `(score, provenance)`; `(-1.0, why)` means UNSCORABLE.
 
-    Provenance is returned WITH the number because the two are not separable, and a walk
-    that printed only the number would let a reader mistake one claim for the other.
+    Provenance is returned WITH the number because the two are not separable: a footprint
+    score derived from capability records and one folded from four banked prepares are both
+    honest and they are not the same claim, and a walk that printed only the number would let
+    a reader mistake one for the other.
     """
+    fact = plan.measurements
     if objective == "latency":
-        # A fill wall and a per-step wall are properties of a whole plan on a whole device,
-        # not of one provider, and nothing in this process has run this plan. Latency is
-        # UNSCORABLE here rather than guessed at.
-        return -1.0, ("latency is a WHOLE-PLAN measurement and this process has not run this plan")
+        # THE AXIS THAT USED TO REFUSE. It is measurable here and nowhere else: a fill wall
+        # and a per-step wall are properties of a whole plan on a whole device, not of one
+        # provider, which is exactly why `Capabilities.admit` had nothing to rank on and was
+        # wrong to refuse instead of deferring (#549.3).
+        if fact is None or not fact.timed or fact.fill_ms < 0:
+            return -1.0, (
+                "no banked fill+step wall for this plan digest; latency is a WHOLE-PLAN "
+                "measurement and this plan has not run"
+            )
+        return (
+            float(fact.fill_ms) + fact.step_ms * plan.steps_basis,
+            f"{fact.fill_ms} ms cold fill + {fact.step_ms:.3f} ms/step x {plan.steps_basis} "
+            f"declared steps, median of {fact.samples} run(s)",
+        )
     if objective == "footprint":
+        if fact is not None and fact.resident_bytes >= 0:
+            scratch = max(fact.scratch_bytes, 0)
+            return (
+                float(fact.resident_bytes + scratch),
+                f"{fact.resident_bytes} B resident + {scratch} B scratch, MEASURED, median "
+                f"of {fact.samples} run(s)",
+            )
         derived = plan.derived_resident_bytes()
         if derived <= 0:
             return -1.0, "no measured resident_bits_per_element on any of this plan's tensors"
@@ -568,6 +594,7 @@ def resolve(
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     construction: ConstructionFacts,
+    facts: PlanFacts,
     objective: str = "latency",
     placement: str = "all_resident",
     encoded_leaves: str = "refuse",
@@ -683,6 +710,7 @@ def resolve(
                 # keeps the walk honest about how many DISTINCT plans there were.
                 continue
             seen.add(digest)
+            plan = _with_facts(plan, facts)
             if policy == "decode_floor" or not plan.route_census().get("encoded_gemm"):
                 floors.setdefault(variant.name, plan)
             value, provenance = score(plan, objective)
@@ -692,6 +720,7 @@ def resolve(
                 "plan": digest,
                 "label": plan.label(),
                 "routes": plan.route_census(),
+                "samples": plan.measurements.samples if plan.measurements else 0,
             }
             if value < 0.0:
                 row["verdict"] = "unscored"
@@ -711,10 +740,16 @@ def resolve(
                 row["verdict"] = "chosen"
         confession = ""
         if best.variant != reference[0].name:
+            deviation = best.measurements.reference_deviation_rel_l2 if best.measurements else -1.0
             confession = (
                 f"PLAN: served from the {best.variant!r} variant rather than the "
                 f"{reference[0].name!r} reference, chosen on the {objective} axis "
-                f"({provenance}); deviation from the reference is NOT MEASURED"
+                f"({provenance}); measured deviation from the reference is "
+                + (
+                    f"{deviation:.5f} relative L2 on one denoise step"
+                    if deviation >= 0.0
+                    else "NOT MEASURED"
+                )
             )
         return _replace(best, confession=confession, walk=tuple(walk))
 
@@ -765,6 +800,7 @@ def script_plan(
     capabilities: Any,
     device: DeviceFacts,
     runtime: RuntimeIdentity,
+    facts: PlanFacts,
     dtype_name: Any,
     snapshots: Mapping[str, str] | None = None,
     objective: str = "latency",
@@ -807,6 +843,7 @@ def script_plan(
         device=device,
         runtime=runtime,
         construction=construction,
+        facts=facts,
         objective=objective,
         placement=placement,
         encoded_leaves=encoded_leaves,
@@ -906,6 +943,11 @@ def _reason(selection: Selection, found: Any, policy: str) -> str:
             "policy did not take it"
         )
     return "; ".join(p for p in parts if p)
+
+
+def _with_facts(plan: ResolvedModelPlan, facts: PlanFacts) -> ResolvedModelPlan:
+    fact = facts.get(plan.digest())
+    return _replace(plan, measurements=fact if fact.samples else None)
 
 
 def _replace(plan: ResolvedModelPlan, **changes: Any) -> ResolvedModelPlan:

@@ -1,5 +1,5 @@
 """Annotation markers and the override doors: `Shape`, `ModelDefault`, `Preflight`,
-`Resources`.
+`Bound`, `Resources`.
 
 Every one of these is an ORDINARY TYPED VALUE — `ModelDefault[int]` is `int` to mypy,
 `Shape(...)` is a frozen record inside `Annotated`. There is no mypy plugin and no DSL
@@ -89,6 +89,34 @@ class Shape[K]:
         if self.frames is not None:
             out["frames"] = self.frames[key]
         return out
+
+
+@dataclass(frozen=True, slots=True)
+class Bound:
+    """The ONE authored demand number surviving at launch: a hard safety bound.
+
+    Labeled `bound` forever and NEVER rendered as measured demand (§1.2). Measured rows
+    live outside the release keyed by exact (profile, plan, runtime, device class); an
+    package is not generally routable until its first measured row exists. `reason` is
+    mandatory falsifier-first discipline: state the physical fact measurement cannot
+    safely discover.
+    """
+
+    reason: str
+    vram_bytes: int | None = None
+    host_ram_bytes: int | None = None
+
+    provenance = "bound"
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConformanceError("Bound(reason=...) is mandatory: name the physical fact")
+        if self.vram_bytes is None and self.host_ram_bytes is None:
+            raise ConformanceError("Bound() declares no number: give vram_bytes or host_ram_bytes")
+        for name in ("vram_bytes", "host_ram_bytes"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ConformanceError(f"Bound({name}=) must be positive", fields=[name])
 
 
 @dataclass(frozen=True, slots=True)

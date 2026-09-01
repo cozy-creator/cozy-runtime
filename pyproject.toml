@@ -28,6 +28,7 @@ cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-runtime-worker = "cozy_runtime.cli.runtime_worker:main"
 cozy-environment-proof = "cozy_runtime.cli.environment_proof:main"
 cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
+cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 
 [tool.pytest.ini_options]
 # ONE end-to-end suite. Every test starts a real process against a real build; there are no
