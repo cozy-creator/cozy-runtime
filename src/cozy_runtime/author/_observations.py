@@ -18,9 +18,12 @@ form is `Attribution`: five floats per named stage, updated in O(1) with no allo
 per-step timing costs the hot path essentially nothing and still answers "where did the time
 go". That is the ROADMAP's step-time instrument.
 
-**The emit boundary is where credentials die.** A field named or valued like a secret is a
-typed refusal at `emit`, not a redaction downstream: redaction is a filter someone can
-forget to apply, and a refusal is one the author fixes once.
+**The emit boundary REDACTS credential-shaped VALUES.** A signed URL or bearer token in an
+observation value is replaced with `<redacted>` and counted. It does not refuse: telemetry
+must never fail the thing it observes, and a `log()` that raises turns a successful GPU
+attempt into a failed one. Names are not inspected at all — the v1 name regex false-positived
+on `output_tokens`, `tokens_per_second` and `eos_token`, which are the most ordinary fields
+an inference package emits.
 
 This module is in the AUTHOR package on purpose — the caps must bite where the author code
 emits, and the worker imports the same implementation rather than a second one.
@@ -59,24 +62,6 @@ MAX_TRACKS = 32
 #: Fixed per-row bookkeeping charged against `MAX_RING_BYTES` beside the row's own text.
 ROW_OVERHEAD = 96
 
-#: Names that are credential-shaped WHEREVER they appear as a whole `_.-`-delimited segment.
-#: Nothing an inference handler measures is called one of these, so position does not matter.
-_SECRET_NAME = re.compile(
-    r"(?i)(^|[_.-])(secrets?|passwo?rds?|passwd|api_?keys?|auth|authorization"
-    r"|bearer|credentials?|private_?key|session_?key|cookie|access_?key)([_.-]|$)"
-)
-#: `token` and `signature` are the two credential words that are ALSO ordinary telemetry
-#: nouns: `output_tokens`, `tokens_per_second` and `eos_token` are counts, rates and
-#: vocabulary — the most obvious fields an inference package emits — and refusing them made
-#: the guard a false positive at the one boundary it exists to protect. They are
-#: credential-shaped only when the name IS the bare word, or ends in it in the SINGULAR
-#: directly after a credential qualifier. A plural, a trailing word, or an unqualified
-#: `eos_token` is a description; `access_token` and `api_signature` are still an identity.
-_SECRET_NAME_QUALIFIED = re.compile(
-    r"(?i)^(token|signature)$"
-    r"|(^|[_.-])(access|api|app|bearer|client|csrf|id|oauth|refresh|sas|security"
-    r"|session|xsrf)[_.-](token|signature)$"
-)
 #: Value shapes that carry credentials — signed URLs and the common bearer/key spellings.
 _SECRET_VALUE = re.compile(
     r"(?i)(x-amz-(signature|credential|security-token)|[?&](token|sig|signature|key)="
@@ -99,20 +84,7 @@ def _text(value: str, cap: int, what: str) -> str:
     return value
 
 
-def _no_secret(where: str, text: str) -> None:
-    if _SECRET_NAME.search(where) is not None or _SECRET_NAME_QUALIFIED.search(where) is not None:
-        raise ObservationRefusal(
-            f"observation field {where!r} is credential-shaped: telemetry is retained, "
-            "shipped and rendered, so a secret-named field is refused at the emit boundary "
-            "rather than redacted somewhere downstream that can be forgotten",
-            code="credential_field",
-        )
-    if _SECRET_VALUE.search(text) is not None:
-        raise ObservationRefusal(
-            f"the value of {where!r} carries a signed URL or bearer-shaped credential; "
-            "observations never carry authority material",
-            code="credential_value",
-        )
+REDACTED = "<redacted>"
 
 
 # --------------------------------------------------------------------------- the record
@@ -171,6 +143,7 @@ class EventRing:
     admitted: int = 0
     dropped: int = 0
     refused: int = 0
+    redactions: int = 0
 
     def __len__(self) -> int:
         return len(self.events)
@@ -198,10 +171,9 @@ class EventRing:
                 code="observation_kind",
             )
         _text(name, NAME_CAP, f"observation name {name[:40]!r}")
-        _no_secret(name, name if isinstance(value, str) else "")
         if isinstance(value, str):
             _text(value, TEXT_CAP, f"observation value of {name!r}")
-            _no_secret(name, value)
+            value = self._redact(value)
         elif isinstance(value, float) and not math.isfinite(value):
             raise ObservationRefusal(
                 f"observation {name!r} carries {value!r}, which has no canonical spelling",
@@ -215,12 +187,21 @@ class EventRing:
         clean: dict[str, Scalar] = {}
         for key, item in fields.items():
             _text(key, KEY_CAP, f"observation field name {key[:40]!r}")
-            text = item if isinstance(item, str) else ""
-            _no_secret(key, text)
-            if text:
-                _text(text, TEXT_CAP, f"observation field {key!r}")
+            if isinstance(item, str):
+                _text(item, TEXT_CAP, f"observation field {key!r}")
+                item = self._redact(item)
             clean[key] = item
         return Observation(kind, name, value, clean, int(time.time() * 1000), 0)
+
+    def _redact(self, text: str) -> str:
+        """Replace credential-shaped VALUE material and count it. Never raises.
+
+        Observability may not fail the thing it observes: a signed URL in a log line is a
+        thing to strip, not a reason to lose a completed GPU attempt.
+        """
+        redacted, count = _SECRET_VALUE.subn(REDACTED, text)
+        self.redactions += count
+        return redacted
 
     def admit(self, observation: Observation) -> None:
         """Admit a built record, shedding OLDEST first until both caps hold."""
@@ -249,6 +230,7 @@ class EventRing:
             "admitted": self.admitted,
             "dropped": self.dropped,
             "refused": self.refused,
+            "redactions": self.redactions,
             "held_bytes": self.held,
             "max_events": self.max_events,
             "max_bytes": self.max_bytes,

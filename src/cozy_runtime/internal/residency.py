@@ -163,12 +163,17 @@ class ComponentResidency:
         self.admissions += 1
         self._require_clean(method)
         if self.active is not None:
-            raise self._poison(
+            # UNREACHABLE BY CONSTRUCTION: the only caller (`author/_model._Scope`) refuses
+            # `concurrent_scope` before it ever gets here. Reaching it means a Runtime bug,
+            # and a Runtime bug is not a reason to latch poison and make the worker respawn
+            # and refill multiple GB of weights. It is recorded as a fault and the stale
+            # scope is closed.
+            self._fault(
                 "scope_overlap",
                 f"{method}() entered while {self.active[0]}() holds the active "
-                "component-use scope — scopes are serial (law 8), and a second admission "
-                "against an open one is a structural violation, not a queue",
+                "component-use scope — scopes are serial (law 8)",
             )
+            self.active = None
         # Under a staged rung, admission first frees ROOM FOR THE WORK, not just room for
         # the weights: every evictable component this method does not declare goes, so the
         # scope gets the whole card minus its own set. That is the difference between a
@@ -228,42 +233,51 @@ class ComponentResidency:
     def release(self, method: str, components: tuple[str, ...]) -> None:
         """Record the fence and close the active scope. Nothing is evicted here.
 
-        The release must name EXACTLY the active scope. A release with no scope open is a
-        double release; a release of a different method or set is a caller whose idea of
-        the scope diverged from this plane's; a release naming a component the generation
-        does not hold is accounting that no longer matches the card. Each poisons — the
-        counter-clamping that used to paper over these is deleted with the counters (#613).
+        The three scope-bookkeeping conditions below — no scope open, a scope naming a
+        different method or set, a component the generation does not hold — are all
+        UNREACHABLE given the only caller (`author/_model._Scope`, whose `__enter__` and
+        `__exit__` pass the same method and set and cannot nest). They used to latch poison,
+        which forced a full worker respawn and a multi-GB refill: an impossible internal bug
+        turned into a production outage. They are recorded as faults on the residency
+        observation and the release completes.
         """
         self._require_clean(method)
         if self.active is None:
-            raise self._poison(
+            self._fault(
                 "scope_over_release",
-                f"{method}() released with no component-use scope active — a double "
-                "release means this plane's accounting no longer matches the caller's, "
-                "and the generation is poisoned rather than clamped",
+                f"{method}() released with no component-use scope active",
             )
-        held_method, held_set = self.active
-        if held_method != method or held_set != frozenset(components):
-            raise self._poison(
-                "scope_release_mismatch",
-                f"{method}({', '.join(components)}) released while the active scope is "
-                f"{held_method}({', '.join(sorted(held_set))}) — the release must name "
-                "exactly the scope that was admitted",
-            )
+        else:
+            held_method, held_set = self.active
+            if held_method != method or held_set != frozenset(components):
+                self._fault(
+                    "scope_release_mismatch",
+                    f"{method}({', '.join(components)}) released while the active scope is "
+                    f"{held_method}({', '.join(sorted(held_set))})",
+                )
         unknown = sorted(n for n in components if n not in self.backend.components)
         if unknown:
-            raise self._poison(
+            self._fault(
                 "scope_release_unknown",
                 f"{method}() releases {unknown} and this generation does not hold "
-                f"{'it' if len(unknown) == 1 else 'them'} resident — a component that "
-                "vanished inside its own scope is a card this plane no longer describes",
+                f"{'it' if len(unknown) == 1 else 'them'} resident",
             )
         event = accel.completion_event(self.torch, self.kind)
         for name in components:
-            self.fences.setdefault(name, Fence()).event = event
+            if name in self.backend.components:
+                self.fences.setdefault(name, Fence()).event = event
         self.active = None
 
     # ------------------------------------------------------------------ poison
+
+    def _fault(self, code: str, detail: str) -> None:
+        """An impossible-by-construction bookkeeping violation: RECORD it, do not refuse.
+
+        It rides `document()["refusals"]` into the residency observation and the triage
+        bundle, so it is visible to whoever reads the attempt — without evicting a live
+        generation over a condition its own caller makes unreachable.
+        """
+        self.refusals.append(f"fault {code}: {detail}"[:400])
 
     def _poison(self, code: str, detail: str) -> ResidencyRefusal:
         """Mark this plane poisoned and hand back the typed refusal to raise.

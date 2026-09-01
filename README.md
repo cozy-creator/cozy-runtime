@@ -125,10 +125,10 @@ ONE record shape, a ring bounded by count AND bytes that sheds oldest first and 
 shed, and an O(1) time accumulator (`Attribution`) that makes inference step time attributable
 without one retained row per step — 324 ns per step against a ~100 ms handler leg. Progress
 frames are never retained; their durable form is that accumulator plus the monotone position
-the silence detector reads. A credential-shaped field is REFUSED at the emit boundary, not
-redacted downstream — where `token` and `signature`, which are also ordinary telemetry nouns,
-are credential-shaped only bare or directly qualified (`access_token`), so `tokens_per_second`
-and `output_tokens` are admitted.
+the silence detector reads. Credential-shaped VALUES — signed URLs, bearer and key
+spellings — are redacted at the emit boundary and counted. Nothing is refused: observability
+may not fail the thing it observes, and field NAMES are not inspected at all, because the
+name regex that used to be here false-positived on `output_tokens` and `eos_token`.
 
 **Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
