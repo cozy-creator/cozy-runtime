@@ -33,7 +33,7 @@ from cozy_runtime.internal.worker import weights
 from cozy_runtime.protocol import worker_pb2 as pb
 
 TRANSACTION = "sha256:" + "a" * 64
-WRITER_GENERATION = 9
+WRITER_EPOCH = 9
 OBJECT = b"produced-manifest-bytes" * 512
 OBJECT_ID = "sha256:" + hashlib.sha256(OBJECT).hexdigest()
 SOURCE_REF = "tensorfs-manifest:" + OBJECT_ID
@@ -85,7 +85,7 @@ def exchange(tmp_path: Path, *, allow_private: bool) -> weights.WeightsExchange:
     )
     made._held[TRANSACTION] = weights._Held(
         transaction_id=TRANSACTION,
-        writer_generation=WRITER_GENERATION,
+        writer_epoch=WRITER_EPOCH,
         receipt=pb.WeightsReceiptRef(),
         objects={
             OBJECT_ID: pb.WeightsObjectSource(
@@ -103,7 +103,7 @@ def exchange(tmp_path: Path, *, allow_private: bool) -> weights.WeightsExchange:
 def request(base: str, **overrides: object) -> pb.WeightsUploadRequest:
     fields: dict[str, object] = {
         "weights_transaction_id": TRANSACTION,
-        "writer_generation": WRITER_GENERATION,
+        "writer_epoch": WRITER_EPOCH,
         "object_id": OBJECT_ID,
         "source_ref": SOURCE_REF,
         "length": len(OBJECT),
@@ -154,7 +154,7 @@ def test_precondition_failure_is_already_present_not_failure(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("overrides", "want"),
     [
-        ({"writer_generation": 8}, pb.WEIGHTS_UPLOAD_REFUSAL_STALE_WRITER),
+        ({"writer_epoch": 8}, pb.WEIGHTS_UPLOAD_REFUSAL_STALE_WRITER),
         (
             {"source_ref": "tensorfs-object:sha256:" + "0" * 64},
             pb.WEIGHTS_UPLOAD_REFUSAL_SOURCE_REF_MISMATCH,

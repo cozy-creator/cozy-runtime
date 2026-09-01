@@ -249,8 +249,8 @@ def explain(document: dict[str, Any]) -> list[str]:
         f"outcome   {terminal.get('status')} / {terminal.get('cause_code')} "
         f"from {terminal.get('cause_origin')}",
         f"because   {terminal.get('safe_message', '')[:300]}",
-        f"executor  generation {attempt.get('executor_generation')} "
-        f"admission generation {document.get('posture', {}).get('admission_generation')}",
+        f"executor  epoch {attempt.get('executor_epoch')} "
+        f"admission epoch {document.get('posture', {}).get('admission_epoch')}",
     ]
     for fault in document.get("faults", ()):
         lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")

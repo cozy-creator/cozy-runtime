@@ -253,7 +253,7 @@ class SliceOutcome:
 PRE_EXECUTION_REFUSALS = frozenset(
     {
         pb.CauseCode.CAUSE_CODE_NO_CAPACITY,
-        pb.CauseCode.CAUSE_CODE_ADMISSION_GENERATION_STALE,
+        pb.CauseCode.CAUSE_CODE_ADMISSION_EPOCH_STALE,
         pb.CauseCode.CAUSE_CODE_UNKNOWN_PLACEMENT,
         pb.CauseCode.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
     }
@@ -283,7 +283,7 @@ class LocalRecordOwner:
     It is a real RecordOwner in every way the worker can observe: it claims first, speaks
     only `cozy.worker.v1` frames under the three-field
     envelope, RECOMPUTES the snapshot digest before acknowledging it, dispatches against the
-    admission generation it last saw, and learns dispatchability the way a hub does — from a
+    admission epoch it last saw, and learns dispatchability the way a hub does — from a
     durable ObservedWorkerState's per-placement axes, not from a Python attribute.
     """
 
@@ -316,11 +316,11 @@ class LocalRecordOwner:
         self.progress_frames: list[pb.AttemptProgress] = []
         #: the accepted envelope this RecordOwner speaks under, learned from ClaimAck
         self.record_owner_epoch = 1
-        self.generation = 0
+        self.control_stream_epoch = 0
         self.boot_id = ""
         self.held_attempts: list[pb.HeldAttempt] = []
         #: the fence the worker last advertised; every offer ECHOES it (§6)
-        self.admission_generation = 0
+        self.admission_epoch = 0
         self.dispatched = False
         self.accepted: pb.AttemptAccepted | None = None
         self.terminal: pb.AttemptOutcome | None = None
@@ -373,7 +373,7 @@ class LocalRecordOwner:
         """The owner's half of the three-field envelope (02 §0)."""
         inner: Any = message
         inner.record_owner_epoch = self.record_owner_epoch
-        inner.control_stream_generation = self.generation
+        inner.control_stream_epoch = self.control_stream_epoch
         inner.worker_boot_id = self.boot_id
         return message
 
@@ -433,8 +433,8 @@ class LocalRecordOwner:
         if len(bytes(accepted.plan_digest)) != hashlib.sha256().digest_size:
             raise RuntimeError("accepted plan digest is not one SHA-256 identity")
         construction = bytes(accepted.model_construction_digest)
-        if accepted.executor_generation <= 0:
-            raise RuntimeError("accepted executor generation is not positive")
+        if accepted.executor_epoch <= 0:
+            raise RuntimeError("accepted executor epoch is not positive")
         if self.request.kind == "job":
             if accepted.placement_id:
                 raise RuntimeError("a job acceptance carries a serving placement")
@@ -480,7 +480,7 @@ class LocalRecordOwner:
             self.done.set()
             self.host.close()
             return
-        self.generation = ack.control_stream_generation
+        self.control_stream_epoch = ack.control_stream_epoch
         self.boot_id = ack.worker_boot_id
         self.worker_resources.CopyFrom(ack.resources)
         self.marks["registered"] = time.perf_counter()
@@ -503,7 +503,7 @@ class LocalRecordOwner:
         body = pb.WorkerSnapshotBody()
         document = documents.read(snapshot.snapshot_canonical_bytes, pb.WorkerSnapshotBody)
         self.snapshot_document = document
-        self.admission_generation = int(document.get("admission_generation", 0))
+        self.admission_epoch = int(document.get("admission_epoch", 0))
         del body
         self._send(
             pb.RecordOwnerFrame(
@@ -540,9 +540,9 @@ class LocalRecordOwner:
         """DISPATCHABILITY is learned from the worker's own durable ObservedWorkerState: the
         placement's SERVING axis plus `dispatchable_binding_digests` in serving mode, job capacity
         in job mode — and, in BOTH, the one worker-level admission fence (§6). The owner
-        dispatches against the generation it last saw, and echoes it on the offer."""
+        dispatches against the epoch it last saw, and echoes it on the offer."""
         self.reports.append(report)
-        self.admission_generation = report.admission_generation
+        self.admission_epoch = report.admission_epoch
         if report.worker_phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
             # The worker said it cannot serve. That is an answer, and a one-shot run ends on
             # it instead of waiting for a dispatchability that will never come.
@@ -812,9 +812,9 @@ class LocalRecordOwner:
                         invocation_spec_canonical_bytes=canonical_bytes,
                         grant=self._grant(body, digest),
                         placement_id="" if self.request.kind == "job" else LOCAL_PLACEMENT,
-                        # The generation this owner OBSERVED when it dispatched (§6). A
+                        # The admission epoch this owner OBSERVED when it dispatched (§6). A
                         # stale echo refuses deterministically.
-                        admission_generation=self.admission_generation,
+                        admission_epoch=self.admission_epoch,
                     )
                 )
             )
@@ -859,7 +859,7 @@ class LocalRecordOwner:
             credential=pb.DeliveryAccessCredential(
                 issuer="cozy-runtime-local",
                 key_id="local",
-                epoch=1,
+                credential_epoch=1,
                 expires_at_unix=expires,
                 token=b"local",
             ),
@@ -1566,7 +1566,7 @@ def _collect(
             "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
             "decision_explanation": accepted.plan.decision_explanation,
             "placement_id": accepted.placement_id,
-            "executor_generation": accepted.executor_generation,
+            "executor_epoch": accepted.executor_epoch,
         }
     if record_owner.terminal is not None:
         outcome.terminal_digest = _spell(record_owner.terminal.outcome_digest)

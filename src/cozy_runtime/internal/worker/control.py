@@ -39,7 +39,7 @@ from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 class ControlPlane(Protocol):
     """What the worker exposes to a host: one conversation per accepted stream, and the
-    lossy watch. The worker's fence (owner_epoch / control_generation / worker_boot_id)
+    lossy watch. The worker's fence (record_owner_epoch / control_stream_epoch / worker_boot_id)
     lives behind `serve_stream`; hosts route bytes and decide nothing."""
 
     def serve_stream(
@@ -360,7 +360,7 @@ class WatchFanout:
     """The lossy lane's registry: per-watch bounded rings, oldest shed first.
 
     Publishing never blocks — a slow watcher sheds ITS OWN oldest frames and nobody
-    else's; a watcher bound to a fenced control generation ends. The counters are the
+    else's; a watcher bound to a fenced control epoch ends. The counters are the
     worker's own accounting (`progress_sent` / `progress_shed`), read at shutdown.
     """
 
@@ -390,17 +390,17 @@ class WatchFanout:
                     watch.ring.append(frame)
                     watch.cond.notify()
 
-    def open(self, request_id: str, generation: int) -> _Watch:
-        watch = _Watch(request_id=request_id, generation=generation, depth=self.depth)
+    def open(self, request_id: str, epoch: int) -> _Watch:
+        watch = _Watch(request_id=request_id, epoch=epoch, depth=self.depth)
         with self.lock:
             self.watchers.append(watch)
         return watch
 
-    def end_generation(self, generation: int) -> None:
+    def end_epoch(self, epoch: int) -> None:
         """Fence: every watch bound to a superseded control stream ends."""
         with self.lock:
             for watch in self.watchers:
-                if watch.generation <= generation:
+                if watch.epoch <= epoch:
                     watch.end()
 
     def end_all(self) -> None:
@@ -410,9 +410,9 @@ class WatchFanout:
 
 
 class _Watch:
-    def __init__(self, *, request_id: str, generation: int, depth: int) -> None:
+    def __init__(self, *, request_id: str, epoch: int, depth: int) -> None:
         self.request_id = request_id
-        self.generation = generation
+        self.epoch = epoch
         self.ring: collections.deque[pb.AttemptProgress] = collections.deque(maxlen=depth)
         self.cond = threading.Condition()
         self.ended = threading.Event()

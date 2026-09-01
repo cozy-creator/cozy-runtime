@@ -227,15 +227,15 @@ class AttemptRecord:
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
     executor: Executor | None = None
-    """The exact process incarnation this attempt was accepted against."""
+    """The exact process epoch this attempt was accepted against."""
     supervision: ExecutorSupervision | None = None
     """The placement-local owner of that executor. Never a cross-placement lookup."""
-    executor_generation: int = 0
+    executor_epoch: int = 0
     executor_pid: int = 0
     placement_id: str = ""
     """The immutable routing identity this attempt was accepted against."""
-    admission_generation: int = 0
-    """The worker admission generation echoed by the offer that created this record."""
+    admission_epoch: int = 0
+    """The worker admission epoch echoed by the offer that created this record."""
     kind: str = "serving"
     """`serving` or `job`. It SURVIVES compaction, because what an attempt was is still a
     fact about it after its heavy state is gone — the run-once recycle disposition and the
@@ -534,7 +534,7 @@ class AttemptEngine:
             # Capture the offered value itself; rereading the worker's live placement during
             # admission can observe a concurrently converging successor placement.
             placement_id=offered.placement_id,
-            admission_generation=offered.admission_generation,
+            admission_epoch=offered.admission_epoch,
         )
 
     def _bind(self, spec: Mapping[str, Any], offered: pb.AttemptOffer) -> grants.BoundGrant:
@@ -740,7 +740,7 @@ class AttemptEngine:
             )
             supervision = self.supervision_for(attempt)
             if getattr(supervision, "isolated", False):
-                supervision.grant_directory(spool, attempt.executor_generation)
+                supervision.grant_directory(spool, attempt.executor_epoch)
         except grants.GrantRefusal as exc:
             # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
             # absent grant entry are facts about the REQUEST; an expired grant or an
@@ -923,7 +923,7 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         attempt.executor = executor
-        attempt.executor_generation = executor.incarnation
+        attempt.executor_epoch = executor.epoch
         attempt.executor_pid = executor.pid
         attempt.placement_id = ""  # job attempts are not placement-routed
         self._fetch_payload(attempt)
@@ -958,14 +958,14 @@ class AttemptEngine:
         # before acceptance, so a job never discovers at step 40,000 that it has nowhere
         # durable to write.
         scratch_root = (
-            self.supervision.generation_scratch(attempt.executor_generation)
+            self.supervision.epoch_scratch(attempt.executor_epoch)
             if getattr(self.supervision, "isolated", False)
             else self.scratch_root
         )
         attempt.scratch = scratch_root / opaque_key("job-scratch", attempt.request_id)
         attempt.scratch.mkdir(parents=True, exist_ok=True)
         if getattr(self.supervision, "isolated", False):
-            self.supervision.grant_directory(attempt.scratch, attempt.executor_generation)
+            self.supervision.grant_directory(attempt.scratch, attempt.executor_epoch)
 
         opened = self.ledger.snapshot()
         self._hold_job_models(attempt, binding, descriptor_id)
@@ -993,7 +993,7 @@ class AttemptEngine:
                         "job_descriptor_id": descriptor_id,
                         "build_id": binding.build_id,
                         "grant_epoch": attempt.grant.credential_epoch,
-                        "executor_generation": attempt.executor_generation,
+                        "executor_epoch": attempt.executor_epoch,
                         "executor_pid": attempt.executor_pid,
                         "placement_id": attempt.placement_id,
                         "input_trees": ",".join(sorted(attempt.trees)),
@@ -1112,7 +1112,7 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         attempt.executor = executor
-        attempt.executor_generation = executor.incarnation
+        attempt.executor_epoch = executor.epoch
         attempt.executor_pid = executor.pid
 
         prepared = self._prepare_request(attempt, executor, declared)
@@ -1159,7 +1159,7 @@ class AttemptEngine:
                     "preflight_facts_digest": plan.preflight_facts_digest,
                     "grant_epoch": attempt.grant.credential_epoch,
                     "placement_id": attempt.placement_id,
-                    "executor_generation": attempt.executor_generation,
+                    "executor_epoch": attempt.executor_epoch,
                     "executor_pid": attempt.executor_pid,
                     "entrypoint_binding_digest": plan_id,
                 },
@@ -1248,12 +1248,12 @@ class AttemptEngine:
         measurement exists.
         """
         reason = (
-            f"executor generation {attempt.executor_generation} pid {attempt.executor_pid} "
+            f"executor epoch {attempt.executor_epoch} pid {attempt.executor_pid} "
             "was replaced before reconciliation; successor telemetry was left untouched"
         )
         record = {
             "attempt": key,
-            "executor_generation": attempt.executor_generation,
+            "executor_epoch": attempt.executor_epoch,
             "executor_pid": attempt.executor_pid,
             "classes": [
                 {
@@ -1264,7 +1264,7 @@ class AttemptEngine:
                     "before": before,
                     "after": -1,
                     "reconciled": False,
-                    "verdict": "executor_generation_replaced",
+                    "verdict": "executor_epoch_replaced",
                 }
                 for name, before in attempt.opened.items()
             ],
@@ -1403,7 +1403,7 @@ class AttemptEngine:
                         str(frame.get("tensorfs_declaration_digest", ""))
                     ),
                     declaration=raw,
-                    requested_writer_generation=int(frame.get("requested_writer_generation", 0)),
+                    requested_writer_epoch=int(frame.get("requested_writer_epoch", 0)),
                 )
             if kind == "weights_receipt":
                 length = int(frame.get("weights_receipt_length", 0))
@@ -1471,7 +1471,7 @@ class AttemptEngine:
         spool.mkdir(parents=True, exist_ok=True)
         attempt.spool = spool
         if getattr(supervision, "isolated", False):
-            supervision.grant_directory(spool, attempt.executor_generation)
+            supervision.grant_directory(spool, attempt.executor_epoch)
         attempt.state = "running"
         attempt.executions += 1
         self.executed += 1
@@ -1499,7 +1499,7 @@ class AttemptEngine:
             "dispatched to the executor",
             "info",
             subject=self._subject(attempt),
-            incarnation=attempt.executor_generation,
+            epoch=attempt.executor_epoch,
             deadline_s=round(seconds, 3) if seconds is not None else None,
         )
         try:
@@ -1515,7 +1515,7 @@ class AttemptEngine:
                 "fault",
                 "the executor died during this attempt",
                 str(exc)[:400],
-                incarnation=attempt.executor_generation,
+                epoch=attempt.executor_epoch,
                 canceling=attempt.canceling or "no",
             )
             self.monitor.end(key, "executor_died")
@@ -1651,7 +1651,7 @@ class AttemptEngine:
                 else:
                     attempt.confess(
                         "unavailable",
-                        f"executor generation {attempt.executor_generation} was replaced "
+                        f"executor epoch {attempt.executor_epoch} was replaced "
                         "before its terminal telemetry could be applied; successor telemetry "
                         "was left untouched",
                     )
@@ -2161,7 +2161,7 @@ class AttemptEngine:
                 "attempt": attempt.attempt,
                 "worker_boot_id": self.boot_id,
                 "instance_id": self.instance_id,
-                "executor_generation": attempt.executor_generation,
+                "executor_epoch": attempt.executor_epoch,
                 "invocation_spec_digest": documents.spell(attempt.digest),
                 "entrypoint": attempt.declared.entrypoint if attempt.declared else "",
                 "executions": attempt.executions,
@@ -2266,10 +2266,10 @@ class AttemptEngine:
                 reserved_device_memory_bytes=plan.reserved_vram_bytes,
                 decision_explanation=plan.decision_explanation,
             ),
-            # ROUTING plus the generation fence the attempt runs under, fixed at
-            # acceptance (#446/#454): the attempt never survives its executor generation.
+            # ROUTING plus the epoch fence the attempt runs under, fixed at
+            # acceptance (#446/#454): the attempt never survives its executor epoch.
             placement_id=attempt.placement_id,
-            executor_generation=attempt.executor_generation,
+            executor_epoch=attempt.executor_epoch,
         )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
@@ -2431,7 +2431,7 @@ class AttemptEngine:
             return {
                 "grace_s": grace,
                 "skipped": "natural finalization already owns completion",
-                "executor_generation": attempt.executor_generation,
+                "executor_epoch": attempt.executor_epoch,
             }
         if executor is not None:
             # Reclaim failure is not a cancellation result.  Let the watchdog keep the
@@ -2447,7 +2447,7 @@ class AttemptEngine:
             "exit_status": evidence.exit_status if evidence is not None else None,
             "kill_to_gone_ms": round((gone_at - started) * 1000, 2),
             "aborted_outputs": aborted,
-            "executor_generation": attempt.executor_generation,
+            "executor_epoch": attempt.executor_epoch,
             "device_reclaim": evidence.device.state if evidence is not None else "stale",
         }
 
@@ -2582,7 +2582,7 @@ class AttemptEngine:
         """One placement-aware `HeldAttempt` (#481: the set holds unacked OUTCOMES too, and
         those are not active — which is what the old `ActiveAttempt` name got wrong).
 
-        Every held attempt names the immutable placement and executor generation captured by
+        Every held attempt names the immutable placement and executor epoch captured by
         acceptance.
         """
         row = record or {}
@@ -2596,8 +2596,7 @@ class AttemptEngine:
             else pb.AttemptState.ATTEMPT_STATE_RUNNING,
             invocation_spec_digest=attempt.digest,
             placement_id=str(row.get("placement_id", "")) or attempt.placement_id,
-            executor_generation=int(row.get("executor_generation", 0))
-            or attempt.executor_generation,
+            executor_epoch=int(row.get("executor_epoch", 0)) or attempt.executor_epoch,
         )
         if pending:
             # Set IFF the state is OUTCOME_PENDING_ACK, so the RecordOwner can reconcile the
