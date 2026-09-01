@@ -210,6 +210,29 @@ class JobModel:
     length: int
 
 
+@dataclass(frozen=True, slots=True)
+class AttemptSlot:
+    """The PLACEMENT SLOT an attempt was admitted against, captured once (cr-066).
+
+    One worker hosts several placements on several lanes, and lanes run concurrently. The
+    engine used to hold ONE `supervision`/`bindings`/`ledger` that the session re-pointed
+    at whichever placement the current attempt named — correct while one thread admitted
+    one attempt at a time, and a race the moment two lanes admit at once. Everything an
+    attempt reads about its placement is therefore bound HERE, under the session's lock,
+    and read from the record afterwards. Never a cross-placement lookup.
+    """
+
+    supervision: ExecutorSupervision
+    ledger: Ledger
+    chooser: Any
+    bindings: Mapping[str, DeclaredBinding]
+    prepared_models: Mapping[str, PreparedModel]
+    failed_bindings: Mapping[str, str]
+    lane_id: str
+    #: what the executor on this slot was sealed to see (`CUDA_VISIBLE_DEVICES`)
+    devices: str = ""
+
+
 @dataclass(slots=True)
 class AttemptRecord:
     """ONE attempt, as this worker holds it. Named for what it is: the worker's RECORD
@@ -228,8 +251,10 @@ class AttemptRecord:
     prepared_model: PreparedModel | None = None
     executor: Executor | None = None
     """The exact process epoch this attempt was accepted against."""
-    supervision: ExecutorSupervision | None = None
-    """The placement-local owner of that executor. Never a cross-placement lookup."""
+    slot: AttemptSlot | None = None
+    """The placement slot — supervision, ledger, bindings, lane — bound at admission."""
+    lane_id: str = ""
+    """The lane whose seat this attempt holds, fixed when the offer was queued."""
     executor_epoch: int = 0
     executor_pid: int = 0
     placement_id: str = ""
@@ -349,7 +374,7 @@ class AttemptRecord:
         self.declared = None
         self.prepared_model = None
         self.executor = None
-        self.supervision = None
+        self.slot = None
         self.job = None
         self.trees = {}
         self.inputs = {}
@@ -389,12 +414,7 @@ class AttemptEngine:
         self,
         *,
         records: WorkerRecords,
-        ledger: Ledger,
-        chooser: Any,
-        supervision: ExecutorSupervision,
         authorizer: grants.Authorizer,
-        bindings: Mapping[str, DeclaredBinding],
-        prepared_models: Mapping[str, PreparedModel],
         jobs: Mapping[str, JobBinding],
         spool_root: Path,
         scratch_root: Path,
@@ -404,22 +424,13 @@ class AttemptEngine:
         bundles: triage.BundleStore,
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
-        device_process: Callable[[], int],
+        device_process: Callable[[int], int],
         weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         artifact_store: Path | None = None,
     ) -> None:
         self.records = records
-        self.ledger = ledger
-        self.chooser = chooser
-        self.supervision = supervision
         self.authorizer = authorizer
-        self.bindings = dict(bindings)
-        #: plan id -> why that binding could not be prepared (#572d). A faulted binding
-        #: refuses its OWN entrypoints, naming the fault it earned, and denies its working
-        #: siblings nothing.
-        self.failed_bindings: dict[str, str] = {}
-        self.prepared_models = dict(prepared_models)
         self.jobs = dict(jobs)
         self.job_device_count = 0
         self.spool_root = spool_root
@@ -441,7 +452,8 @@ class AttemptEngine:
         #: the worker's applied posture, read at bundle time — a triage bundle that cannot
         #: say which directive was applied when it ran explains half of what went wrong.
         self.posture = posture
-        #: the NVML per-process reader, so the out-of-allocator meter has a real producer
+        #: the NVML per-process reader BY PID, so the out-of-allocator meter has a real
+        #: producer for whichever lane's executor an attempt ran on
         self.device_process = device_process
         self.weights = weights
         self.owner_scope = owner_scope
@@ -458,10 +470,23 @@ class AttemptEngine:
         #: CONFLICT and never a replacement (§2).
         self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+    def slot_of(self, attempt: AttemptRecord) -> AttemptSlot:
+        """The placement slot bound at admission. An attempt with none is a defect: the
+        session binds one before anything below `hold` runs, and nothing reads a slot
+        after compaction."""
+        if attempt.slot is None:
+            raise RuntimeError(
+                f"{attempt.request_id}#{attempt.attempt} has no placement slot bound"
+            )
+        return attempt.slot
+
     def supervision_for(self, attempt: AttemptRecord) -> ExecutorSupervision:
         """Return the exact placement slot captured before this attempt was accepted."""
 
-        return attempt.supervision or self.supervision
+        return self.slot_of(attempt).supervision
+
+    def ledger_for(self, attempt: AttemptRecord) -> Ledger:
+        return self.slot_of(attempt).ledger
 
     def fault(self, row: pb.Fault) -> None:
         """Record ONE fault, bounded. Readers take the last 8; the tail past that is memory
@@ -913,8 +938,9 @@ class AttemptEngine:
         attempt.job = binding
         attempt.kind = "job"
         attempt.state = "preparing"
-        attempt.supervision = self.supervision
-        executor = self.supervision.current
+        slot = self.slot_of(attempt)
+        supervision = slot.supervision
+        executor = supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
                 "executor_absent",
@@ -958,22 +984,22 @@ class AttemptEngine:
         # before acceptance, so a job never discovers at step 40,000 that it has nowhere
         # durable to write.
         scratch_root = (
-            self.supervision.epoch_scratch(attempt.executor_epoch)
-            if getattr(self.supervision, "isolated", False)
+            supervision.epoch_scratch(attempt.executor_epoch)
+            if supervision.isolated
             else self.scratch_root
         )
         attempt.scratch = scratch_root / opaque_key("job-scratch", attempt.request_id)
         attempt.scratch.mkdir(parents=True, exist_ok=True)
-        if getattr(self.supervision, "isolated", False):
-            self.supervision.grant_directory(attempt.scratch, attempt.executor_epoch)
+        if supervision.isolated:
+            supervision.grant_directory(attempt.scratch, attempt.executor_epoch)
 
-        opened = self.ledger.snapshot()
+        opened = slot.ledger.snapshot()
         self._hold_job_models(attempt, binding, descriptor_id)
         attempt.opened = opened
 
         plan_digest = plan.digest()
         try:
-            with self.supervision.hold(executor) as owned:
+            with supervision.hold(executor) as owned:
                 if not owned:
                     raise AttemptRefusal(
                         "executor_replaced_before_acceptance",
@@ -1031,8 +1057,9 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
         plan_id = serving["entrypoint_binding_digest"]
-        declared = self.bindings.get(plan_id)
-        prepared_model = self.prepared_models.get(plan_id)
+        slot = self.slot_of(attempt)
+        declared = slot.bindings.get(plan_id)
+        prepared_model = slot.prepared_models.get(plan_id)
         if declared is None or prepared_model is None:
             raise AttemptRefusal(
                 "unknown_binding",
@@ -1076,7 +1103,7 @@ class AttemptEngine:
         # it BEFORE durable acceptance. Serving never accepts-then-cold-loads. It is checked
         # HERE, ahead of the request preparation below, because that preparation runs in the
         # executor and there is no sense resolving a request against one that cannot serve.
-        supervision = self.supervision_for(attempt)
+        supervision = slot.supervision
         executor = supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
@@ -1088,7 +1115,7 @@ class AttemptEngine:
             # A binding that FAILED to prepare says so in its own words (#572d). "the
             # executor is ready for nothing" is true of a faulted binding and tells the
             # caller nothing about why THIS one cannot serve, while its siblings can.
-            fault = self.failed_bindings.get(plan_id)
+            fault = slot.failed_bindings.get(plan_id)
             if fault is not None:
                 raise AttemptRefusal(
                     "binding_faulted",
@@ -1118,7 +1145,7 @@ class AttemptEngine:
         prepared = self._prepare_request(attempt, executor, declared)
         attempt.prepared = prepared
         try:
-            plan = self.chooser.choose(declared, prepared_model, prepared)
+            plan = slot.chooser.choose(declared, prepared_model, prepared)
         except PlanRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -1134,7 +1161,7 @@ class AttemptEngine:
         # fetched under a lease would pin staged weights for its whole duration.
         self._hydrate_inputs(attempt)
 
-        attempt.opened = self.ledger.snapshot()
+        attempt.opened = slot.ledger.snapshot()
 
         plan_digest = plan.digest()
         with supervision.hold(executor) as owned:
@@ -1200,19 +1227,20 @@ class AttemptEngine:
         # operations; E1's terminal would then mark E2 unreadable or reconcile against E2's
         # freshly installed baseline.
         supervision = self.supervision_for(attempt)
+        ledger = self.ledger_for(attempt)
         with supervision.hold(executor) as owned:
             if not owned:
                 return self._unavailable_reconciliation(attempt, key)
             if not executor.poisoned and attempt.spool:
                 try:
                     with executor.watched("probe"):
-                        self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
-                    self.ledger.device_process = self.device_process()
+                        ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
+                    ledger.device_process = self.device_process(executor.pid)
                 except ExecutorGone:
-                    self.ledger.device_unreadable("the executor died before the ledger was read")
+                    ledger.device_unreadable("the executor died before the ledger was read")
             else:
-                self.ledger.device_unreadable("the executor died before the ledger was read")
-            record = self.ledger.close_attempt(key, attempt.opened)
+                ledger.device_unreadable("the executor died before the ledger was read")
+            record = ledger.close_attempt(key, attempt.opened)
             attempt.reconciliation = record
             self.records.append("ledger", record)
         if record["leaks"]:
@@ -1643,7 +1671,7 @@ class AttemptEngine:
                         attempt.residency.get("attempt_stages")
                         or attempt.residency.get("attempt_evictions")
                     )
-                    self.ledger.observe_attempt(
+                    self.ledger_for(attempt).observe_attempt(
                         reply.get("metrics", {}), resident_moved=moved, cell=cell
                     )
                     self.bank_demand(attempt, reply.get("metrics", {}), moved)
@@ -1856,7 +1884,7 @@ class AttemptEngine:
             # rung the attempt moved gigabytes on purpose; the reconciliation subtracts
             # exactly this and holds the remainder to zero.
             if apply_ledger:
-                self.ledger.observe_residency(attempt.residency)
+                self.ledger_for(attempt).observe_residency(attempt.residency)
             if residency.get("attempt_stages"):
                 attempt.confess(
                     "degraded",
@@ -1923,7 +1951,7 @@ class AttemptEngine:
         lane = " x ".join(
             (
                 plan.delivery_variant or "default",
-                self.ledger.accelerator or "unknown-accelerator",
+                self.ledger_for(attempt).accelerator or "unknown-accelerator",
                 f"{plan.delivery}/{plan.materialization or 'verbatim'}/{plan.placement}",
                 plan.shape_cell or "-",
             )
@@ -2188,7 +2216,14 @@ class AttemptEngine:
                 "residency": attempt.residency,
                 "demand": self.demand.document(),
                 "ledger": attempt.reconciliation
-                or {"classes": [c.document() for c in self.ledger.counters()]},
+                or {
+                    "classes": [
+                        c.document()
+                        for c in (
+                            attempt.slot.ledger.counters() if attempt.slot is not None else ()
+                        )
+                    ]
+                },
                 "attribution": attempt.attribution,
                 "windows_ms": {
                     "queue_ms": round(

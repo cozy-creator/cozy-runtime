@@ -190,6 +190,11 @@ class Ledger:
     closed_since_baseline: int = 0
     executor_pid: int = 0
     worker_pid: int = 0
+    #: the residence ceiling the WORKER assigned this generation before its prepare (cr-025's
+    #: `authorized_device_limit_bytes`; cr-066 assigns it from the lane's measured free
+    #: bytes). -1 until assigned. It is a policy fact the executor is handed, never one it
+    #: derives: the executor fits its prepare under the smaller of this and what it measures.
+    authorized_device_limit_bytes: int = -1
     #: classes this worker could not read, by name. Never silently zero.
     unreadable: list[str] = field(default_factory=list)
     #: per-component RESIDENT device bytes, by component name. The staging plane's own
@@ -280,6 +285,7 @@ class Ledger:
         self.activations_moved = False
         self.closed_since_baseline = 0
         self.executor_pid = executor_pid
+        self.authorized_device_limit_bytes = -1
         self.unreadable.clear()
         self.resident.clear()
         self.evicted.clear()
@@ -496,6 +502,7 @@ class Ledger:
             "pinned": {"registered": self.registered},
             "device": {
                 "active_weights": self.weights_bytes,
+                "authorized_limit": self.authorized_device_limit_bytes,
                 "baseline": self.device_baseline,
                 "allocated": self.device_allocated,
                 "reserved": self.device_reserved,

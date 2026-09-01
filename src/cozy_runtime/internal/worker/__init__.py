@@ -1,9 +1,10 @@
 """The no-CUDA worker: protocol session, records, grants, arbitration, supervision.
 
-Five modules, one process:
+Six modules, one process:
 
 | module | owns |
 |---|---|
+| `lanes.py` | device LANES: the serialized per-device resource, ledger rows, assigned ceilings |
 | `plan.py` | the worker-scoped host/pinned ledger, the PlanChooser, the ExecutorPreparer |
 | `grants.py` | DeliveryGrant reads/writes and the CLOSED hub-call authorization table |
 | `child.py` | the disposable executor: spawn, seal, epochs, cooperative -> forceful kill |

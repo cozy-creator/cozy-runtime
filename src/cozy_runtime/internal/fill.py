@@ -847,6 +847,10 @@ class StreamingFillBackend:
         rows: Sequence[PlanRow],
         *,
         plan: ResolvedModelPlan,
+        # THE CURRENT DEVICE OF A SEALED PROCESS (cr-066): the worker sealed this executor
+        # to its lane's devices, so "cuda" resolves to the lane's card and no ordinal is
+        # chosen here. A driver script that constructs this backend directly inherits the
+        # same rule from its own environment.
         device: str = "cuda",
         window_bytes: int = 16 << 20,
         slots: int = 16,

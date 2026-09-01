@@ -17,11 +17,11 @@ constant — a claim with a strictly higher epoch supersedes, an equal epoch fro
 RecordOwner is a reconnect, anything else refuses typed.
 
 Threads, and why each exists: each accepted STREAM runs its conversation on the host's
-thread and must never do slow work (a cancel has to arrive while an attempt runs); the
-DEVICE LANE holds the single device lease and serializes attempts in arrival order — the
-whole of worker-local arbitration; the REPORTER ticks the durable Report; the WATCHDOG owns
-the deadline and the grace clock, because the deadline is worker-enforced and never merely
-handed to author code.
+thread and must never do slow work (a cancel has to arrive while an attempt runs); ONE
+DEVICE LANE PER DEVICE of the envelope (`worker/lanes.py`, cr-066) holds that device's lease
+and serializes its attempts in arrival order — the whole of worker-local arbitration, per
+lane; the REPORTER ticks the durable Report; the WATCHDOG owns the deadline and the grace
+clock, because the deadline is worker-enforced and never merely handed to author code.
 
 This process never imports torch. `scripts/worker-live.py nocuda` proves that against the
 RUNNING process's loaded modules and mapped libraries, not against the import graph.
@@ -78,6 +78,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptEngine,
     AttemptRecord,
     AttemptRefusal,
+    AttemptSlot,
     safe,
 )
 from cozy_runtime.internal.worker.child import (
@@ -91,12 +92,18 @@ from cozy_runtime.internal.worker.control import (
     GrpcControlHost,
     WatchFanout,
 )
+from cozy_runtime.internal.worker.lanes import (
+    LANE_SEATS,
+    DeviceLane,
+    ExecutorDeath,
+    LaneRefusal,
+    LaneSet,
+)
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.plan import (
     UNCALIBRATED_ACTIVATION_BYTES,
     DeclaredBinding,
     JobBinding,
-    PlanChooser,
     PreparedModel,
     shape_cell,
 )
@@ -121,24 +128,27 @@ RECYCLE_EXIT = 75
 #: already the rate at which this worker's non-attempt facts move.
 REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 
-#: The worker's accepted-attempt WINDOW — the ONE shared acceptance window behind
-#: `available_attempt_slots` (#472e/#494f). ONE.
+#: The worker's accepted-attempt WINDOW behind `available_attempt_slots` (#472e/#494f) is
+#: `lanes.LANE_SEATS` PER LANE, summed over the lanes with a dispatchable placement — ONE on
+#: the one-device worker every deployment produces today, byte-identical on the wire.
 #:
-#: It was 2, on the claim that attempt N+1's CPU phase overlaps attempt N's device phase.
-#: That overlap does not exist: `device_lane()` is a single thread that admits, executes and
+#: It was 2 per worker, on the claim that attempt N+1's CPU phase overlaps attempt N's device
+#: phase. That overlap does not exist: a lane is a single thread that admits, executes and
 #: reconciles one attempt at a time, so a second admitted attempt could only WAIT — and it
 #: waited in a state (`queued`) the wire cannot spell, invisible to the snapshot and to the
 #: held-attempt set. A worker holding work the RecordOwner cannot see breaks the
 #: snapshot-is-complete law, so the false state is DELETED rather than surfaced: an offer
-#: arriving while this worker already holds one is a JOURNALED REFUSED outcome the
+#: arriving while its placement's lane already holds one is a JOURNALED REFUSED outcome the
 #: RecordOwner reads, never a silent hold.
 #:
 #: rev-2 makes the SHAPE of the bound structural rather than advisory (§6): per-placement
 #: `attempt_credits` are gone — N counters over ONE serialized device advertised N x the real
-#: capacity — and the seats here are consumed by running attempts AND by outcomes awaiting
-#: `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own admission instead
-#: of growing this worker's held set.
-ADMISSION_WINDOW = 1
+#: capacity. The principle is one counter per SERIALIZED RESOURCE, and with cr-066 that
+#: resource is the device LANE: one seat per lane, consumed by a running attempt AND by an
+#: outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own
+#: admission instead of growing this worker's held set. The dual defect — one count of N
+#: over N lanes, where an offer can use only its placement's — is why a multi-lane worker
+#: REFUSES to serve until proto-024 puts the seats on the wire (`device_lanes_unsupported`).
 
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -281,6 +291,10 @@ class Placement:
     #: #474/#485c: the predecessor kept for restore. EMPTY means replacement is PAUSED —
     #: fallback capability is a PRECONDITION of replacement, not a nicety.
     retained_fallback_placement_set_digest: bytes = b""
+    #: The lane this placement's executor is sealed to (cr-066): assigned by the worker by
+    #: measured fit before activation, empty while unassigned. proto-024 carries it as
+    #: `PlacementStatus.device_lane_id`; at this wire minor it is worker-local truth.
+    lane_id: str = ""
 
     @property
     def execution_digest(self) -> str:
@@ -314,14 +328,6 @@ class Placement:
                 ]
             }
         )
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutorDeath:
-    """One exact child exit awaiting the serialized device lane's rebuild decision."""
-
-    executor: child.Executor
-    placement_id: str = ""
 
 
 @dataclass(slots=True)
@@ -809,8 +815,17 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         )
 
 
-def executor_prepare_command(binding: DeclaredBinding) -> dict[str, Any]:
-    """Translate one resolved callable binding into the executor's closed prepare shape."""
+def executor_prepare_command(
+    binding: DeclaredBinding, *, devices: str, authorized_device_limit_bytes: int = 0
+) -> dict[str, Any]:
+    """Translate one resolved callable binding into the executor's closed prepare shape.
+
+    `devices` is what the executor's seal must say (`CUDA_VISIBLE_DEVICES`), so the executor
+    can refuse `env_seal_broken` if it is preparing under any other seal than its lane's.
+    `authorized_device_limit_bytes` is the ceiling the worker ASSIGNED for this prepare
+    (cr-025/cr-066); the executor fits under the smaller of it and what it measures, and
+    never derives one of its own.
+    """
 
     models = []
     for model in binding.model_bindings():
@@ -842,7 +857,11 @@ def executor_prepare_command(binding: DeclaredBinding) -> dict[str, Any]:
                 "expect_construction_digest": model.expected_logical_model_digest,
             }
         )
-    command: dict[str, Any] = {"cmd": "prepare"}
+    command: dict[str, Any] = {
+        "cmd": "prepare",
+        "devices": devices,
+        "authorized_device_limit_bytes": int(authorized_device_limit_bytes),
+    }
     if not models:
         command.update(
             {
@@ -900,7 +919,11 @@ class Worker:
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
         self.records = WorkerRecords()
-        self.ledger = Ledger(worker_pid=os.getpid())
+        #: THE LANES (cr-066): one serialized device lane per envelope entry, in envelope
+        #: order, plus the whole-envelope lane a job's executor is sealed under. Each lane
+        #: owns its attempt thread, its work queue, its `settled` gate and one ledger row per
+        #: resident executor generation — nothing device-scoped lives on the worker any more.
+        self.lanes = LaneSet.from_envelope(options.devices, worker_pid=os.getpid())
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         self.supervision = ExecutorSupervision(
             root=self.root,
@@ -927,7 +950,6 @@ class Worker:
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
-        self.chooser = PlanChooser(self.ledger)
         self.bindings: dict[str, DeclaredBinding] = {}
         #: plan id -> why THIS binding could not be prepared (#572d). A faulted binding
         #: refuses its own entrypoints and denies its siblings nothing.
@@ -940,8 +962,8 @@ class Worker:
         #: reason the observed state has two axes.
         self.pending: Placement | None = None
         #: Additional pure-Python packages hosted beside the primary placement.  Each gets
-        #: its own immutable uv environment and executor; attempts still share the existing
-        #: one-seat worker admission lane.
+        #: its own immutable uv environment and executor, sealed to the lane the worker
+        #: assigned it; an attempt takes its own placement's lane seat and no other.
         self.hosted: dict[str, HostedPlacement] = {}
         self.pending_hosted: list[dict[str, Any]] = []
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
@@ -954,10 +976,12 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
-        #: lane name -> its kernel thread id, recorded by the lane itself as it starts. An
-        #: observer judging this worker's PROGRESS by CPU reads the lanes that work and
-        #: leaves out the ones that tick on a clock (`pollers`).
-        self.lanes: dict[str, int] = {}
+        #: thread name -> its kernel thread id, recorded by each `_lane`-wrapped thread as
+        #: it starts (every device lane, convergence, report, watchdog, sender). An observer
+        #: judging this worker's PROGRESS by CPU reads the threads that work and leaves out
+        #: the ones that tick on a clock (`pollers`). Not the device lanes: those are
+        #: `self.lanes`, the resource the threads serve.
+        self.lane_threads: dict[str, int] = {}
         self.bundles = triage.BundleStore(self.root / "triage", self.records)
         self.stop = threading.Event()
         self.weights = weights.WeightsExchange(
@@ -968,12 +992,7 @@ class Worker:
         )
         self.engine = AttemptEngine(
             records=self.records,
-            ledger=self.ledger,
-            chooser=self.chooser,
-            supervision=self.supervision,
             authorizer=self.authorizer,
-            bindings={},
-            prepared_models={},
             jobs={},
             spool_root=self.root / "spool",
             scratch_root=self.root.parent / "scratch",
@@ -1000,12 +1019,10 @@ class Worker:
         #: dispatched it did not.
         self.outbound: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
         self.watches = WatchFanout(PROGRESS_QUEUE)
-        self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
         # Slow source/custom-wheel and model-document acquisition never runs on a control
         # stream thread. One lane serializes revisions; the revision check after every slow
         # leg discards a superseded result before it can move serving state.
         self.convergences: queue.Queue[int | None] = queue.Queue()
-        self.settled = threading.Event()
         self.supervision.on_invalidate = self.capacity_dropped
         self.supervision.on_exit = self.executor_exited
         self.supervision.on_lane_failure = self.fail_machine
@@ -1044,6 +1061,7 @@ class Worker:
         )
         supervision.on_invalidate = lambda why: self._hosted_capacity_dropped(placement_id, why)
         supervision.on_exit = lambda executor: self._hosted_executor_exited(placement_id, executor)
+        supervision.on_change = lambda executor: self._row_changed(placement_id, executor)
         supervision.on_lane_failure = self.fail_machine
         killed = supervision.sweep_orphans()
         if killed:
@@ -1078,24 +1096,177 @@ class Worker:
             )
         )
 
-    def _select_attempt_placement(self, placement_id: str) -> None:
-        """Point the serialized attempt kernel at one placement's isolated executor."""
+    # ------------------------------------------------------------------ lanes
 
-        hosted = self.hosted.get(placement_id)
-        if hosted is None:
-            self.engine.supervision = self.supervision
-            self.engine.bindings = self.bindings
-            self.engine.prepared_models = self.prepared_models
-            self.engine.failed_bindings = self.failed_bindings
+    def _primary_lane(self) -> DeviceLane:
+        """The lane the PRIMARY slot's executor (`self.supervision`) is sealed to.
+
+        A job takes the envelope lane; a serving placement takes the lane the worker
+        assigned it; before either exists (package describe, boot) it is the first lane.
+        """
+        if self.accepted.mode == "job":
+            return self.lanes.envelope
+        if self.placement is not None and self.placement.lane_id:
+            return self.lanes.by_id[self.placement.lane_id]
+        return self.lanes.lanes[0]
+
+    def _primary_slot(self) -> str:
+        """The primary slot's row key on its lane: the placement id, or "" for a job."""
+        if self.accepted.mode != "job" and self.placement is not None:
+            return self.placement.placement_id
+        return ""
+
+    def _primary_row(self) -> Ledger:
+        return self._primary_lane().row(self._primary_slot()).ledger
+
+    def primary_ledger(self) -> Ledger:
+        """The primary slot's ledger row, for the one-shot door's result document."""
+        return self._primary_row()
+
+    def _lane_of(self, placement_id: str) -> DeviceLane:
+        """The lane a HOSTED placement was assigned; a hosted placement is never unassigned
+        by the time anything asks (assignment precedes activation)."""
+        lane = self.lanes.lane_of(placement_id)
+        if lane is None:
+            raise RuntimeError(f"placement {placement_id!r} has no device lane")
+        return lane
+
+    def _assign_lane(self, placement: Placement, bindings: Mapping[str, DeclaredBinding]) -> bool:
+        """Assign one placement to a lane by MEASURED fit (cr-066 R2), or latch it typed.
+
+        The declared bytes are the placement's model weight bytes from its bindings' MCC
+        census; the measured side is each lane's driver-reported free bytes, read now. A
+        placement that fits nowhere refuses `device_lane_infeasible` and leaves every other
+        placement where it is — never a silent over-commit onto some lane.
+        """
+        model_bearing = any(not binding.weightless for binding in bindings.values())
+        declared = sum(binding.model_weight_bytes for binding in bindings.values())
+        measured: dict[str, int] = {}
+        if model_bearing:
+            kind = accel.host_backend_family()
+            for lane in self.lanes.lanes:
+                memory = accel.device_memory(lane.devices, kind)
+                if memory.state == "measured":
+                    measured[lane.lane_id] = memory.free_bytes
+        try:
+            lane = self.lanes.assign(
+                placement.placement_id,
+                model_bearing=model_bearing,
+                declared_bytes=declared,
+                measured_free=measured,
+            )
+        except LaneRefusal as exc:
+            placement.lane_id = ""
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=placement.placement_id,
+                    reason=exc.code,
+                    detail=safe(exc.detail)[:1024],
+                )
+            )
+            self.note("materialization", f"{placement.placement_id!r} refused: {exc}"[:256])
+            return False
+        placement.lane_id = lane.lane_id
+        lane.row(placement.placement_id).model_bearing = model_bearing
+        self.note(
+            "materialization",
+            f"{placement.placement_id!r} assigned to {lane.lane_id} "
+            f"(CUDA_VISIBLE_DEVICES={lane.devices!r}; "
+            + ("model-bearing" if model_bearing else "weightless")
+            + ")",
+        )
+        return True
+
+    def _release_lane(self, placement_id: str) -> None:
+        placement = self._placement_by_id(placement_id)
+        if placement is not None:
+            placement.lane_id = ""
+        self.lanes.release(placement_id)
+
+    def _bind_attempt_slot(self, attempt: AttemptRecord) -> AttemptSlot:
+        """Capture the placement slot an attempt is admitted against — once, under the lock.
+
+        Nothing on the engine is re-pointed any more: lanes admit concurrently, and the
+        slot is what makes an attempt on lane B unable to observe lane A's placement. The
+        ledger row is the placement's own on its lane; switching between two placements
+        wipes nothing (cr-066's red arm: it used to `begin_generation` the one ledger).
+        """
+        if attempt.spec.get("job") is not None or self.accepted.mode == "job":
+            lane = self.lanes.envelope
+            supervision = self.supervision
+            row = lane.row("")
+            bindings: Mapping[str, DeclaredBinding] = {}
+            prepared: Mapping[str, PreparedModel] = {}
+            failed: Mapping[str, str] = {}
         else:
-            self.engine.supervision = hosted.supervision
-            self.engine.bindings = hosted.bindings
-            self.engine.prepared_models = hosted.prepared_models
-            self.engine.failed_bindings = hosted.failed_bindings
-        executor = self.engine.supervision.current
+            hosted = self.hosted.get(attempt.placement_id)
+            if hosted is None:
+                lane = self._primary_lane()
+                supervision = self.supervision
+                row = lane.row(self._primary_slot())
+                bindings = self.bindings
+                prepared = self.prepared_models
+                failed = self.failed_bindings
+            else:
+                lane = self._lane_of(attempt.placement_id)
+                supervision = hosted.supervision
+                row = lane.row(attempt.placement_id)
+                bindings = hosted.bindings
+                prepared = hosted.prepared_models
+                failed = hosted.failed_bindings
+        if attempt.lane_id and attempt.lane_id != lane.lane_id:
+            raise AttemptRefusal(
+                "placement_lane_moved",
+                f"the offer took a seat on {attempt.lane_id} and placement "
+                f"{attempt.placement_id!r} is now on {lane.lane_id}; the RecordOwner "
+                "re-dispatches against the current snapshot",
+                cause=CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+            )
+        executor = supervision.current
         executor_pid = executor.pid if executor is not None else 0
-        if self.ledger.executor_pid != executor_pid:
-            self.ledger.begin_generation(executor_pid)
+        if row.ledger.executor_pid != executor_pid:
+            # This ROW's generation moved under it (a respawn this row's `on_change` already
+            # announced, or a slot that never saw one): re-key the row, touching no other.
+            row.ledger.begin_generation(executor_pid)
+        slot = AttemptSlot(
+            supervision=supervision,
+            ledger=row.ledger,
+            chooser=row.chooser,
+            bindings=bindings,
+            prepared_models=prepared,
+            failed_bindings=failed,
+            lane_id=lane.lane_id,
+            devices=lane.devices,
+        )
+        attempt.slot = slot
+        attempt.lane_id = lane.lane_id
+        return slot
+
+    def _row_changed(self, placement_id: str, executor: child.Executor | None) -> None:
+        """A HOSTED placement's executor was published or cleared: move ITS row only."""
+        lane = self.lanes.lane_of(placement_id)
+        if lane is not None:
+            lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
+
+    def _lane_held(self, lane: DeviceLane) -> int:
+        return sum(
+            1
+            for held in list(self.engine.history.values())
+            if held.state in self.engine.HELD and held.lane_id == lane.lane_id
+        )
+
+    def _lane_dispatchable(self, lane: DeviceLane) -> bool:
+        """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
+        if self.accepted.mode == "job":
+            return lane is self.lanes.envelope and self.job_ready
+        return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
+
+    def _lane_slots(self, lane: DeviceLane) -> int:
+        """Free seats on ONE lane, now: `LANE_SEATS` less what its held attempts occupy."""
+        if not self._lane_dispatchable(lane):
+            return 0
+        return max(0, LANE_SEATS - self._lane_held(lane))
 
     def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
         hosted = self.hosted.get(placement_id)
@@ -1127,7 +1298,7 @@ class Worker:
             ):
                 return
             if rebuild and not self.stop.is_set():
-                self.work.put(ExecutorDeath(executor, placement_id))
+                self._lane_of(placement_id).work.put(ExecutorDeath(executor, placement_id))
 
     # ------------------------------------------------------------------ plumbing
 
@@ -1205,12 +1376,13 @@ class Worker:
                     str(installed.python), installed.content_digest
                 )
                 executor = self.supervision.current
+                lane = self._primary_lane()
                 try:
                     if executor is None:
-                        executor = self.supervision.spawn(imposed=self.imposed())
+                        executor = self.supervision.spawn(imposed=self.imposed(lane))
                     elif changed or not executor.alive():
                         executor = self.supervision.replace(
-                            executor, imposed=self.imposed(), why="prepared package changed"
+                            executor, imposed=self.imposed(lane), why="prepared package changed"
                         )
                     scratch = self.supervision.epoch_scratch(executor.epoch)
                     output = scratch / f"package-descriptor-{uuid.uuid4().hex}.json"
@@ -1404,14 +1576,27 @@ class Worker:
         self._settle()
 
     def _settle(self) -> None:
-        """`settled` is the device lane's gate: has this worker STOPPED moving? A latched
-        activation failure settles too — the lane must refuse through it, not wait forever."""
-        if self.dispatchable() or self.latched:
-            self.settled.set()
-        else:
-            self.settled.clear()
+        """Each lane's `settled` is that lane's gate: has IT stopped moving? A latched
+        activation failure settles too — the lane must refuse through it, not wait forever.
+        A rebuild on lane A clears A's gate and no other, which is what keeps B's queued
+        attempts from waiting on a rebuild they did not cause (cr-066)."""
+        for lane in self.lanes:
+            if self._lane_dispatchable(lane) or self.latched or self._lane_latched(lane):
+                lane.settled.set()
+            else:
+                lane.settled.clear()
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def _lane_latched(self, lane: DeviceLane) -> bool:
+        """Every placement on the lane has stopped moving for the accepted revision."""
+        if not lane.placements:
+            return False
+        for placement_id in list(lane.placements):
+            hosted = self.hosted.get(placement_id)
+            if not (hosted.latched if hosted is not None else self.latched):
+                return False
+        return True
 
     def _publish_latch(self) -> None:
         """A LATCH IS A REFUSAL, AND A REFUSAL AN OWNER CANNOT READ IS A HANG.
@@ -1484,16 +1669,18 @@ class Worker:
         return pb.AdmissionState.ADMISSION_STATE_OPEN
 
     def available_attempt_slots(self) -> int:
-        """Free seats in the ONE shared acceptance window, NOW.
+        """Free seats across this worker's lanes, NOW — the SUM of each lane's free seat.
 
         BOUNDEDNESS IS STRUCTURAL, NOT A PROMISE (§5): a seat is held by a running attempt
         AND by an outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking
-        runs itself out of admission instead of growing this worker's held set.
+        runs itself out of admission instead of growing this worker's held set. On the
+        one-lane worker this is exactly the old single window; on a multi-lane worker the
+        sum is honest only once the owner can read which lane an offer draws from
+        (proto-024), which is why serving on more than one lane refuses until then.
         """
         if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
             return 0
-        held = sum(1 for a in self.engine.history.values() if a.state in self.engine.HELD)
-        return max(0, ADMISSION_WINDOW - held)
+        return sum(self._lane_slots(lane) for lane in self.lanes)
 
     def set_phase(self, phase: pb.WorkerPhase, why: str) -> None:
         if phase == self.phase:
@@ -1548,7 +1735,7 @@ class Worker:
         """
 
         def guarded() -> None:
-            self.lanes[name] = threading.get_native_id()
+            self.lane_threads[name] = threading.get_native_id()
             try:
                 body(*args)
             except BaseException as exc:
@@ -1601,34 +1788,42 @@ class Worker:
             ):
                 return
             if rebuild and not self.stop.is_set():
-                self.work.put(ExecutorDeath(executor))
+                self._primary_lane().work.put(ExecutorDeath(executor))
 
     def executor_changed(self, executor: child.Executor | None) -> None:
-        """Move the ledger at the same boundary that publishes executor ownership.
+        """Move the PRIMARY slot's ledger row at the boundary that publishes its executor.
 
         A job generation has no construction report, so resetting only in the serving fill
         path lets it inherit the previous serving process's baseline and residency. The
         supervision callback covers every spawn and retirement before either can be
-        observed through the session.
+        observed through the session. Only this slot's row moves: a hosted placement on the
+        same or another lane keeps its facts (cr-066).
         """
-        self.ledger.begin_generation(executor.pid if executor is not None else 0)
+        self._primary_row().begin_generation(executor.pid if executor is not None else 0)
 
-    def read_device_process(self) -> int:
-        """NVML bytes for the current executor; -1 remains UNREADABLE/ABSENT here.
+    def read_device_process(self, pid: int) -> int:
+        """NVML bytes for one executor pid; -1 remains UNREADABLE/ABSENT here.
 
         The ledger's legacy scalar cannot express absence separately. Lifecycle reclaim uses
         AcceleratorOps' tri-state observation directly, where that distinction is authoritative.
         """
-        executor = self.engine.supervision.current
-        if executor is None:
+        if pid <= 0:
             return -1
-        observed = accel.process_memory(executor.pid, accel.host_backend_family())
+        observed = accel.process_memory(pid, accel.host_backend_family())
         return observed.bytes if observed.state == "present" else -1
 
     def read_device_work(self) -> int:
-        """How much work the EXECUTOR has done, read by the parent — THE meter."""
-        executor = self.engine.supervision.current
-        return child.work(executor.pid if executor is not None else 0)
+        """How much work EVERY live executor has done, read by the parent — THE meter.
+
+        Summed over the lanes: the silence monitor asks whether the device side is moving
+        at all, and with one executor per lane any of them advancing is the answer.
+        """
+        supervisions = [self.supervision, *(h.supervision for h in self.hosted.values())]
+        return sum(
+            child.work(supervision.current.pid)
+            for supervision in supervisions
+            if supervision.current is not None
+        )
 
     @property
     def pollers(self) -> set[int]:
@@ -1639,7 +1834,7 @@ class Worker:
         honest progress meter for an outside observer."""
         return {
             tid
-            for name, tid in self.lanes.items()
+            for name, tid in self.lane_threads.items()
             if name in ("report", "watchdog", "control-send")
         }
 
@@ -2127,11 +2322,16 @@ class Worker:
             self.exit_code = RECYCLE_EXIT
             self.shutdown_from_stream()
 
-    def shutdown_from_stream(self) -> None:
+    def request_stop(self) -> None:
+        """Wake every lane and the sender so the worker can leave; the host is the caller's."""
         self.stop.set()
-        self.weights.close()
         self.outbound.put(None)
-        self.work.put(None)
+        for lane in self.lanes:
+            lane.work.put(None)
+
+    def shutdown_from_stream(self) -> None:
+        self.request_stop()
+        self.weights.close()
         self.watches.end_all()
         self.host.stop()
 
@@ -2245,6 +2445,8 @@ class Worker:
         # implement; an older owner's lower minor remains visible as the effective level.
         self.fence.wire_minor = min(WIRE_MINOR, desired.wire_minor)
         self.accepted.drain_grace_ms = desired.drain_grace_ms
+        if self.accepted.mode == "job" and mode != "job":
+            self.lanes.envelope.forget("")  # the job generation's row leaves with the job
         self.accepted.mode = "serving" if mode == "placement_set" else mode
         self.latched = ""  # a NEW revision un-latches: the latch is per desired revision
         if mode == "job":
@@ -2260,13 +2462,13 @@ class Worker:
                     self.latched = f"executor_reclaim_failed: {exc}"[:200]
                     self.note("recovery", self.latched)
                     self._settle()
+            if self.placement is not None:
+                self._release_lane(self.placement.placement_id)
             self.placement = None
             self.pending = None
             self._retire_hosted(set())
             self.bindings = {}
             self.prepared_models = {}
-            self.engine.bindings = {}
-            self.engine.prepared_models = {}
             self.set_job_ready(False)
             return
 
@@ -2288,6 +2490,40 @@ class Worker:
         )
         self.accepted.accepted_placement_set_digest = desired_set.placement_set_digest
         self.accepted.placement_set_canonical_bytes = desired_set.placement_set_canonical_bytes
+        if len(self.lanes) > 1:
+            # THE FENCE (cr-066 step 0, ruling R3). This worker drives one lane per device
+            # of its envelope, but the wire at this minor carries ONE `available_attempt_slots`
+            # and no lane per placement: an owner reading the sum over lanes would offer
+            # seats a placement cannot use, and an owner reading one lane would leave the
+            # paid cards idle — silently, since nothing on the wire says a card is idle.
+            # Refusing typed is the "never advertise capacity it cannot use" rule applied
+            # to the silent-GPU-0 defect; jobs keep the whole envelope and are untouched.
+            # proto-024 (`ObservedWorkerState.lanes`, `PlacementStatus.device_lane_id`,
+            # `Placement.device_pin`) is what lifts this, by making the lanes readable.
+            self.latched = "device_lanes_unsupported"
+            self._published_latch = self.latched  # this fault IS the publication
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    subject=f"revision {desired.revision}",
+                    reason=self.latched,
+                    detail=(
+                        f"this worker's envelope {self.options.devices!r} is "
+                        f"{len(self.lanes)} device lanes and wire minor {WIRE_MINOR} can "
+                        "report one; a serving set here would idle every card but one, "
+                        "so it is refused until proto-024 puts per-lane seats on the wire "
+                        "(jobs still take the whole envelope)"
+                    ),
+                )
+            )
+            self.note(
+                "desired_state",
+                f"revision {desired.revision} REFUSED: {self.latched} ({len(self.lanes)} "
+                f"lanes over {self.options.devices!r}); the worker stays ONLINE",
+            )
+            self.bump_admission(f"revision {desired.revision} refused: {self.latched}")
+            self._settle()
+            return
 
         previous = self.placement
         self.jobs = {}
@@ -2305,11 +2541,11 @@ class Worker:
                     self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
                     self._settle()
                     return
+            if self.placement is not None:
+                self._release_lane(self.placement.placement_id)
             self.placement = None
             self.pending = None
             self._retire_hosted(set())
-            self.engine.bindings = {}
-            self.engine.prepared_models = {}
             self.accepted.converged_revision = desired.revision
             self.bump_admission("the accepted set is EMPTY; nothing is dispatchable")
             self.note("desired_state", f"revision {desired.revision} accepted: an EMPTY set")
@@ -2470,12 +2706,22 @@ class Worker:
                 f"draining {outgoing.placement_id or '(unnamed)'} and handing off the device",
             )
             self.await_drained()
+            if outgoing.placement_id != candidate.placement_id:
+                self._release_lane(outgoing.placement_id)
+        # THE LANE, before the executor exists to be sealed to it (cr-066): the same
+        # placement id keeps its lane across a replacement; a new one is placed by fit.
+        if not self._assign_lane(candidate, bindings):
+            candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            self.placement = candidate
+            self.pending = None
+            self.latched = "device_lane_infeasible"
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+            self._settle()
+            return
         self.placement = candidate
         self.pending = None
         self.bindings = bindings
         self.prepared_models = {}
-        self.engine.bindings = self.bindings
-        self.engine.prepared_models = {}
         self.bump_admission(
             f"placement {candidate.placement_id or '(unnamed)'} moved to set "
             f"{documents.spell(candidate.placement_set_digest)[:23]}…"
@@ -2522,6 +2768,7 @@ class Worker:
                     continue
             hosted.supervision.close()
             del self.hosted[placement_id]
+            self._release_lane(placement_id)
             self.bump_admission(f"placement {placement_id!r} removed")
 
     def _reconcile_hosted(self, revision: int) -> None:
@@ -2606,6 +2853,11 @@ class Worker:
         hosted.bindings = bindings
         hosted.prepared_models = {}
         hosted.failed_bindings = {}
+        if not self._assign_lane(placement, bindings):
+            placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            hosted.latched = "device_lane_infeasible"
+            self._settle()
+            return
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
         self._prepare_hosted_executor(hosted)
 
@@ -2617,16 +2869,19 @@ class Worker:
             f"activating placement {placement.placement_id!r}",
         )
         executor = hosted.supervision.current
+        lane = self._lane_of(placement.placement_id)
         try:
             if executor is None:
-                executor = hosted.supervision.spawn(imposed=self.imposed())
+                executor = hosted.supervision.spawn(imposed=self.imposed(lane))
             elif not executor.alive() or executor.poisoned:
                 executor = hosted.supervision.replace(
-                    executor, imposed=self.imposed(), why="placement executor changed"
+                    executor, imposed=self.imposed(lane), why="placement executor changed"
                 )
             group = list(hosted.bindings.values())
             first = group[0]
-            reply = executor.call(executor_prepare_command(first), timeout=None)
+            reply = executor.call(
+                executor_prepare_command(first, devices=lane.devices), timeout=None
+            )
             if not reply.get("ok"):
                 raise ExecutorGone(f"{reply.get('code')}: {reply.get('detail', '')}")
             facts = reply.get("facts") or {}
@@ -3008,16 +3263,12 @@ class Worker:
         """
         self.bindings = {}
         self.prepared_models = {}
-        self.engine.bindings = {}
-        self.engine.prepared_models = {}
         self.jobs = {}
-        self.placement = None
-        self.pending = None
-        self._retire_hosted(set())
-        self.set_job_ready(False)
         previous = self.supervision.current
         if previous is not None:
             try:
+                # Retired while the serving placement still names its lane, so the
+                # retirement clears THAT slot's row; the envelope lane's row starts clean.
                 self.supervision.retire_current(
                     previous, "entering job mode retires the serving generation"
                 )
@@ -3026,6 +3277,12 @@ class Worker:
                 self.latched = f"job_executor_reclaim_failed: {exc}"[:200]
                 self._settle()
                 return
+        if self.placement is not None:
+            self._release_lane(self.placement.placement_id)
+        self.placement = None
+        self.pending = None
+        self._retire_hosted(set())
+        self.set_job_ready(False)
         plans = self.config.cozy_home / "job-plans"
         record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
         if not record.is_file():
@@ -3070,7 +3327,9 @@ class Worker:
             f"reclaim_on_terminal={job.reclaim_on_terminal}",
         )
         try:
-            executor = self.supervision.spawn(imposed=self.imposed())
+            # A JOB IS SEALED TO THE WHOLE ENVELOPE: the group lane, one seat (cr-018's
+            # door; `device_count` is a floor, never concurrency).
+            executor = self.supervision.spawn(imposed=self.imposed(self.lanes.envelope))
         except ExecutorGone as exc:
             self.note("boot", f"the job executor never dialled back: {exc}")
             # The CAUSE rides the latch. `job_executor_absent` alone names the shape and
@@ -3185,8 +3444,6 @@ class Worker:
                     continue
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
                 self.prepared_models[binding.entrypoint_binding_digest] = executor.prepared_model
-            self.engine.bindings = self.bindings
-            self.engine.prepared_models = self.prepared_models
             self.note(
                 "boot",
                 f"reused epoch {executor.epoch} pid {executor.pid} for the same "
@@ -3205,10 +3462,15 @@ class Worker:
                 self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
             return
 
+        lane = self._primary_lane()
+        slot = self._primary_slot()
         try:
             if executor is None:
-                self.note("boot", "spawning the device executor (exec-first trampoline)")
-                executor = self.supervision.spawn(imposed=self.imposed())
+                self.note(
+                    "boot",
+                    f"spawning the device executor (exec-first trampoline) on {lane.lane_id}",
+                )
+                executor = self.supervision.spawn(imposed=self.imposed(lane))
             elif (
                 executor.alive()
                 and not executor.poisoned
@@ -3224,7 +3486,7 @@ class Worker:
                 self.note("boot", "replacing the device executor for a new construction")
                 executor = self.supervision.replace(
                     executor,
-                    imposed=self.imposed(),
+                    imposed=self.imposed(lane),
                     why="desired construction changed",
                 )
             self.note(
@@ -3246,16 +3508,36 @@ class Worker:
             first = group[0]
             started = time.perf_counter()
             subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
+            try:
+                authorized = self._authorize_prepare(lane, slot, first)
+            except LaneRefusal as exc:
+                # No byte moved and the executor is untouched: the BINDINGS fault, typed,
+                # and the placement reports what the driver would not say.
+                for member in group:
+                    self.failed_bindings[member.entrypoint_binding_digest] = str(exc)
+                    self.engine.fault(
+                        pb.Fault(
+                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                            subject=member.entrypoint_binding_digest,
+                            reason=exc.code,
+                            detail=safe(exc.detail),
+                        )
+                    )
+                self.note("boot", f"prepare REFUSED before the executor: {exc}"[:256])
+                continue
             self.monitor.start(subject, "load")
             try:
                 reply = executor.call(
-                    executor_prepare_command(first),
+                    executor_prepare_command(
+                        first, devices=lane.devices, authorized_device_limit_bytes=authorized
+                    ),
                     timeout=None,
                     on_progress=lambda frame: self.monitor.advance(
                         f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
                     ),
                 )
             except ExecutorGone as exc:
+                lane.settle(slot)
                 self.monitor.end(subject, "executor_gone")
                 detail = f"executor disappeared during prepare: {exc}"[:1024]
                 for member in group:
@@ -3274,6 +3556,9 @@ class Worker:
                     self.note("recovery", f"prepare-loss reclaim failed: {reclaim}")
                 continue
             took = (time.perf_counter() - started) * 1000
+            # The authorization SETTLED with this reply, refused or filled: whatever the
+            # process holds is the driver's to see now, and a refused one is replaced.
+            lane.settle(slot)
             if not reply.get("ok"):
                 self.monitor.end(subject, str(reply.get("code")))
                 self.boot.step(
@@ -3368,9 +3653,7 @@ class Worker:
                     continue
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
                 self.prepared_models[binding.entrypoint_binding_digest] = resolved
-            self.engine.bindings = self.bindings
-            self.engine.prepared_models = self.prepared_models
-            self.ledger.observe_construction(reply["facts"])
+            self._primary_row().observe_construction(reply["facts"])
             self.monitor.end(subject, "filled")
             self.boot.step(
                 "load",
@@ -3521,7 +3804,7 @@ class Worker:
             try:
                 outcome = run_one(binding, "all_resident")
                 if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
-                    self.ledger.refuse_placement(
+                    self._primary_row().refuse_placement(
                         "all_resident",
                         str(outcome["reason"]),
                     )
@@ -3532,7 +3815,7 @@ class Worker:
                     )
                     outcome = run_one(binding, "component_staged")
                     if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
-                        self.ledger.refuse_placement(
+                        self._primary_row().refuse_placement(
                             "component_staged",
                             str(outcome["reason"]),
                         )
@@ -3559,7 +3842,7 @@ class Worker:
                 self.note("warm", f"{binding.entrypoint}: executor lost: {exc}"[:200])
                 return False
             if outcome["outcome"] == "warmed" and int(outcome["activation_peak_bytes"]) > 0:
-                self.ledger.observe_attempt(
+                self._primary_row().observe_attempt(
                     {
                         "activation_peak_bytes": int(outcome["activation_peak_bytes"]),
                         "activation_peaks": dict(outcome["activation_peaks"]),
@@ -3579,11 +3862,12 @@ class Worker:
                     )
                 )
         if self.warm and executor.alive():
+            row = self._primary_row()
             try:
                 # The probe waits behind the warm pass's device sync backlog; a healthy
                 # executor is not retired for answering slowly (xs-007 row 20).
                 with executor.watched("probe"):
-                    self.ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
+                    row.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
             except ExecutorGone:
                 self.supervision.invalidate(executor, "executor died during warmup probe")
                 try:
@@ -3591,14 +3875,20 @@ class Worker:
                 except ExecutorGone as reclaim:
                     self.note("recovery", f"warmup probe reclaim failed: {reclaim}")
                 return False
-            shift = self.ledger.rebaseline("boot warm pass")
+            shift = row.rebaseline("boot warm pass")
             self.note("warm", f"the resident device baseline moved {shift:+d} B on the warm pass")
         return self.supervision.owns(executor)
 
-    def imposed(self) -> dict[str, str]:
-        """The IMPOSE half of the seal. Every name here is in the reviewed allowlist."""
+    def imposed(self, lane: DeviceLane) -> dict[str, str]:
+        """The IMPOSE half of the seal, for ONE lane. Every name is in the reviewed allowlist.
+
+        `CUDA_VISIBLE_DEVICES` is the LANE's entries, not the worker's envelope (cr-066):
+        the seal IS the device selection, so ordinal 0 inside the executor is the lane's
+        device and nothing downstream picks a card. It used to be the whole envelope, which
+        put every executor on card 0 of everything the worker was given.
+        """
         imposed = {
-            "CUDA_VISIBLE_DEVICES": self.options.devices,
+            "CUDA_VISIBLE_DEVICES": lane.devices,
             "PYTORCH_CUDA_ALLOC_CONF": self.options.alloc_conf,
             "OMP_NUM_THREADS": str(self.options.threads),
         }
@@ -3616,13 +3906,45 @@ class Worker:
         Exactly the executor's own seal, because the question the qualification answers is
         whether these bytes load and import in the process that will actually run them. A
         wheel proved under some other environment has been proved about some other host.
+        Qualification is measured on the first lane; a lane is a card like any other.
         """
-        return spawn.seal(self.config.child_base_env, self.imposed())
+        return spawn.seal(self.config.child_base_env, self.imposed(self.lanes.lanes[0]))
 
     def native_device_index(self) -> int:
-        """The device the GPU seat is measured on: the first this worker was given."""
-        first = self.options.devices.split(",")[0].strip()
+        """The device the GPU seat is measured on: the first lane's, as the driver names it."""
+        first = self.lanes.lanes[0].devices
         return int(first) if first.isdigit() else 0
+
+    def _authorize_prepare(self, lane: DeviceLane, slot: str, binding: DeclaredBinding) -> int:
+        """ASSIGN the residence ceiling for one prepare from the lane's MEASURED free bytes.
+
+        The worker, not the executor, hands out headroom (cr-025's
+        `authorized_device_limit_bytes`; cr-066 assigns it per lane): the lane subtracts what
+        it already authorized to executors that have not settled, so the same bytes are
+        never promised twice. A weightless binding holds no device memory and is authorized
+        nothing. A device the driver cannot read is refused typed (`LaneRefusal`), never
+        authorized zero: unreadable is not a number, and a prepare against it would be this
+        worker guessing what the card can hold.
+        """
+        if binding.weightless:
+            return 0
+        memory = accel.device_memory(lane.devices, accel.host_backend_family())
+        if memory.state != "measured":
+            raise LaneRefusal(
+                "device_capacity_unreadable",
+                f"{lane.lane_id}: the driver could not report free bytes for "
+                f"{lane.devices!r}, so no residence ceiling can be assigned (nvidia-smi "
+                "--query-gpu=memory.free is the reading)",
+            )
+        free = memory.free_bytes
+        granted = lane.authorize(slot, free)
+        self.note(
+            "boot",
+            f"{lane.lane_id}: authorized {granted} B for {slot!r} from {free} B measured "
+            f"free on {lane.devices!r} ({lane.outstanding_bytes() - granted} B outstanding "
+            "to other executors)",
+        )
+        return granted
 
     # ------------------------------------------------------------------ dispatch
 
@@ -3729,26 +4051,32 @@ class Worker:
             )
             self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
             return
-        # THE WINDOW IS ONE, AND OVER IT THE ANSWER IS A JOURNALED OUTCOME (#494f/§7). The
-        # device lane is a single serialized state machine, so a second held attempt could
-        # only wait — and it would wait in a state the wire cannot spell, absent from the
-        # snapshot and from the held-attempt set. A refusal the RecordOwner can read and
-        # re-dispatch is strictly more informative than a hold it cannot see.
-        if self.available_attempt_slots() < 1:
+        # THE SEAT IS THE PLACEMENT'S LANE'S, AND OVER IT THE ANSWER IS A JOURNALED
+        # OUTCOME (#494f/§7). A lane is a single serialized state machine, so a second held
+        # attempt on it could only wait — and it would wait in a state the wire cannot
+        # spell, absent from the snapshot and from the held-attempt set. A refusal the
+        # RecordOwner can read and re-dispatch is strictly more informative than a hold it
+        # cannot see. An attempt for placement P may take P's lane's seat and no other.
+        lane = self._offer_lane(offered.placement_id)
+        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN or (
+            self._lane_slots(lane) < 1
+        ):
             busy = [
                 held
                 for held in self.engine.history.values()
-                if held is not attempt and held.state in self.engine.HELD
+                if held is not attempt
+                and held.state in self.engine.HELD
+                and held.lane_id == lane.lane_id
             ]
             other = busy[0] if busy else None
             self.note(
                 "attempt",
-                f"{offered.request_id}#{offered.attempt_ordinal} over the admission window",
+                f"{offered.request_id}#{offered.attempt_ordinal} over {lane.lane_id}'s seat",
             )
             self.refuse(
                 offered,
                 "no_capacity",
-                f"this worker admits {ADMISSION_WINDOW} attempt at a time and the window is "
+                f"{lane.lane_id} admits {LANE_SEATS} attempt at a time and its seat is "
                 + (
                     f"held by {other.request_id}#{other.attempt} ({other.state})"
                     if other is not None
@@ -3759,12 +4087,25 @@ class Worker:
                 CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
+        attempt.lane_id = lane.lane_id
         self.engine.hold(attempt)
-        self.work.put(attempt)
+        lane.work.put(attempt)
+
+    def _offer_lane(self, placement_id: str) -> DeviceLane:
+        """The lane an offer draws its seat from: the placement's, or the envelope for a job.
+        Called after the placement is known to be hosted, so an unassigned placement here
+        is one that is not dispatchable, and its lane is whichever its slot would take."""
+        if self.accepted.mode == "job":
+            return self.lanes.envelope
+        if placement_id in self.hosted:
+            return self.lanes.lane_of(placement_id) or self.lanes.lanes[0]
+        return self._primary_lane()
 
     def await_settled(self, attempt: AttemptRecord) -> None:
-        """QUEUE behind a rebuild until it settles or the attempt's own deadline expires."""
-        if self.settled.is_set():
+        """QUEUE behind THIS LANE's rebuild until it settles or the attempt's own deadline
+        expires. Another lane's rebuild is not this lane's wait (cr-066)."""
+        settled_gate = self.lanes.by_id[attempt.lane_id].settled
+        if settled_gate.is_set():
             return
         started = time.perf_counter()
         key = f"{attempt.request_id}#{attempt.attempt}"
@@ -3775,7 +4116,7 @@ class Worker:
             "rebuild makes progress rather than refusing it",
         )
         why = "the attempt's own deadline expired while it queued"
-        while not (settled := self.settled.wait(REBUILD_SAMPLE_SECONDS)):
+        while not (settled := settled_gate.wait(REBUILD_SAMPLE_SECONDS)):
             if deadline_ms and time.time() * 1000 > deadline_ms:
                 break
         waited = (time.perf_counter() - started) * 1000
@@ -3822,10 +4163,15 @@ class Worker:
 
     # ------------------------------------------------------------------ the device lane
 
-    def device_lane(self) -> None:
-        """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild."""
+    def device_lane(self, lane: DeviceLane) -> None:
+        """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild.
+
+        One thread per lane (cr-066). Lanes share nothing but the worker's control state:
+        an attempt on lane B admits and runs while lane A rebuilds, and A's rebuild queues
+        only A's attempts behind it.
+        """
         while not self.stop.is_set():
-            item = self.work.get()
+            item = lane.work.get()
             if item is None:
                 return
             if isinstance(item, ExecutorDeath):
@@ -3904,8 +4250,6 @@ class Worker:
                         CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
                     )
                     return False
-                self._select_attempt_placement(attempt.placement_id)
-                attempt.supervision = self.engine.supervision
             if self.accepted.mode != "serving" and not self.dispatchable():
                 self.note("admission", f"refusing queued {key}: worker is not dispatchable")
                 self.terminate(
@@ -3927,6 +4271,7 @@ class Worker:
                 )
                 return False
             try:
+                self._bind_attempt_slot(attempt)
                 accepted = self.engine.prepare_and_accept(attempt)
             except AttemptRefusal as exc:
                 self.note("attempt", f"{key} refused: {exc.code}")
@@ -3972,24 +4317,31 @@ class Worker:
             self.fail_machine("last_resort_failed")
 
     def rebuild_if_needed(self, placement_id: str = "") -> None:
-        """The queue starts behind the rebuild because BOTH live on this lane."""
+        """The lane's queue starts behind the rebuild because BOTH live on this lane.
+
+        The DECISION is taken under the control lock; the rebuild itself is not (cr-066
+        step 5). A rebuild is a spawn plus a prepare — minutes for a real model — and a
+        worker-wide lock held for that long stalled every other lane's admission and every
+        stream frame behind one placement's refill. The convergence lane already prepares
+        without the lock, fenced by the accepted revision; the rebuild takes the same
+        posture, and `ExecutorSupervision._lifecycle` keeps replacement single-flight.
+        """
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
             if hosted is not None:
                 current = hosted.supervision.current
-                if current is None or not current.alive() or current.poisoned:
-                    self._prepare_hosted_executor(hosted)
-                return
-            current = self.supervision.current
-            if current is None or not current.alive():
-                self._rebuild_locked("the executor is gone")
-            elif current.poisoned:
-                self._rebuild_locked(f"poisoned: {current.poisoned}")
-
-    def rebuild(self, why: str) -> None:
-        """Replace the executor and RELOAD before the placement is dispatchable again."""
-        with self.control_lock:
-            self._rebuild_locked(why)
+                rebuild = current is None or not current.alive() or bool(current.poisoned)
+            else:
+                current = self.supervision.current
+                rebuild = current is None or not current.alive() or bool(current.poisoned)
+        if not rebuild:
+            return
+        if hosted is not None:
+            self._prepare_hosted_executor(hosted)
+        elif current is None or not current.alive():
+            self._rebuild("the executor is gone")
+        else:
+            self._rebuild(f"poisoned: {current.poisoned}")
 
     def rebuild_exited(self, executor: child.Executor, placement_id: str = "") -> None:
         """Rebuild only if the queued death still names the owned dead epoch."""
@@ -3999,16 +4351,20 @@ class Worker:
             if hosted is not None:
                 if hosted.supervision.current is not executor or executor.alive():
                     return
-                self._prepare_hosted_executor(hosted)
+            elif self.supervision.current is not executor or executor.alive():
                 return
-            if self.supervision.current is not executor or executor.alive():
-                return
-            self._rebuild_locked(
-                f"observed exit of executor epoch {executor.epoch} pid {executor.pid}"
-            )
+        if hosted is not None:
+            self._prepare_hosted_executor(hosted)
+            return
+        self._rebuild(f"observed exit of executor epoch {executor.epoch} pid {executor.pid}")
 
-    def _rebuild_locked(self, why: str) -> None:
-        """Rebuild while desired-state convergence is excluded."""
+    def _rebuild(self, why: str) -> None:
+        """Replace the PRIMARY slot's executor and RELOAD before it is dispatchable again.
+
+        Runs on the primary slot's lane thread with the control lock RELEASED (see
+        `rebuild_if_needed`): the spawn is single-flight under the supervision's own
+        lifecycle lock, and the prepare reads the bindings the accepted revision holds now.
+        """
         job = self.accepted.mode == "job"
         if job:
             self.set_job_ready(False)
@@ -4017,11 +4373,12 @@ class Worker:
         started = time.perf_counter()
         self.note("recovery", f"rebuilding the executor: {why}")
         current = self.supervision.current
+        lane = self._primary_lane()
         try:
             if current is None:
-                self.supervision.spawn(imposed=self.imposed())
+                self.supervision.spawn(imposed=self.imposed(lane))
             else:
-                self.supervision.replace(current, imposed=self.imposed(), why=why)
+                self.supervision.replace(current, imposed=self.imposed(lane), why=why)
         except ExecutorGone as exc:
             self.note("recovery", f"respawn failed: {exc}")
             self.latched = f"executor_respawn_failed: {exc}"[:200]
@@ -4064,7 +4421,7 @@ class Worker:
                         attempt.canceling = "deadline"
                         executor = attempt.executor
                         if executor is not None:
-                            (attempt.supervision or self.supervision).cooperative_cancel(
+                            self.engine.supervision_for(attempt).cooperative_cancel(
                                 executor, f"{attempt.request_id}#{attempt.attempt}"
                             )
                         attempt.cancel_started = time.perf_counter()
@@ -4347,9 +4704,12 @@ class Worker:
             # here and not at the first claim, because a worker is online whether or not a
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
-            threading.Thread(
-                target=self._lane("device", self.device_lane), daemon=True, name="device-lane"
-            ).start()
+            for lane in self.lanes:
+                threading.Thread(
+                    target=self._lane(lane.lane_id, self.device_lane, lane),
+                    daemon=True,
+                    name=f"device-{lane.lane_id}",
+                ).start()
             threading.Thread(
                 target=self._lane("convergence", self.convergence_lane),
                 daemon=True,
@@ -4374,11 +4734,9 @@ class Worker:
             for supervision in supervisions
             if supervision.current is not None
         ]
-        self.stop.set()
+        self.request_stop()
         self.weights.close()
-        self.work.put(None)
         self.convergences.put(None)
-        self.outbound.put(None)
         self.watches.end_all()
         self.host.stop()
         for operation_id in sorted(self.model_source_operations):
@@ -4410,7 +4768,7 @@ class Worker:
                     "hub_calls_allowed": self.authorizer.allowed,
                     "hub_calls_refused": len(self.authorizer.refusals),
                     "seam": seam,
-                    "ledger": self.ledger.rows(),
+                    "lanes": [lane.summary() for lane in self.lanes],
                     "warm": self.warm,
                     "rss_bytes": read_vmrss(os.getpid()),
                 }
@@ -4597,9 +4955,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     worker = Worker(config, options, host)
 
     def terminate(signum: int, frame: object) -> None:
-        worker.stop.set()
-        worker.outbound.put(None)
-        worker.work.put(None)
+        worker.request_stop()
         host.stop()
 
     signal.signal(signal.SIGTERM, terminate)

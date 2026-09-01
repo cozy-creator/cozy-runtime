@@ -184,6 +184,96 @@ def _nvml_compute_table() -> dict[int, int] | None:
     return table
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceMemory:
+    """The driver's view of ONE device's memory, read from outside any CUDA context."""
+
+    state: Literal["measured", "unreadable"]
+    free_bytes: int = -1
+    total_bytes: int = -1
+
+
+class _NvmlMemory(ctypes.Structure):
+    """`nvmlMemory_t` as `nvmlDeviceGetMemoryInfo` fills it: bytes, not MiB."""
+
+    _fields_ = (
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    )
+
+
+def _nvml_device_memory(device: str) -> DeviceMemory | None:
+    """One envelope entry's free/total through NVML, or None where NVML is absent.
+
+    An index resolves by index, anything else (`GPU-…`, `MIG-…`) by UUID — the two
+    spellings `CUDA_VISIBLE_DEVICES` admits. An entry the driver does not have is
+    UNREADABLE, not None: NVML answered, and its answer is that there is no such device.
+    """
+    library = _nvml_library()
+    if library is None:
+        return None
+    handle = ctypes.c_void_p()
+    try:
+        if device.isdigit():
+            answer = library.nvmlDeviceGetHandleByIndex_v2(int(device), ctypes.byref(handle))
+        else:
+            answer = library.nvmlDeviceGetHandleByUUID(device.encode(), ctypes.byref(handle))
+    except (OverflowError, ctypes.ArgumentError, UnicodeEncodeError):
+        return DeviceMemory("unreadable")
+    if answer != _NVML_SUCCESS:
+        return DeviceMemory("unreadable")
+    memory = _NvmlMemory()
+    if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != _NVML_SUCCESS:
+        return DeviceMemory("unreadable")
+    return _device_memory_of(int(memory.free), int(memory.total))
+
+
+def _device_memory_of(free: int, total: int) -> DeviceMemory:
+    if total <= 0 or free < 0 or free > total:
+        return DeviceMemory("unreadable")
+    return DeviceMemory("measured", free, total)
+
+
+def device_memory(device: str, kind: str) -> DeviceMemory:
+    """Free and total bytes of one envelope entry, measured by the DRIVER, torch-free.
+
+    The worker assigns residence ceilings from this number (cr-066): it is the only view
+    that sees every process on the device, and it is readable before any executor exists.
+    `device` is one `CUDA_VISIBLE_DEVICES` entry verbatim — an index or a GPU UUID.
+
+    NVML in-process first (xs-007 row 19's rule: the ANSWER decides, never its arrival
+    time): `nvmlDeviceGetMemoryInfo` is the exact byte count `nvidia-smi` rounds to MiB,
+    measured at 0.02 ms against the subprocess's 22 ms on the 4070. `nvidia-smi --id` is
+    the fallback where the library is absent, run to completion. UNREADABLE means neither
+    answered, or the driver has no such device — never a zero and never a guess: a lane
+    whose capacity cannot be read cannot be shown to fit anything. MPS has no per-device
+    driver query.
+    """
+    if kind == "mps" or not device:
+        return DeviceMemory("unreadable")
+    through_nvml = _nvml_device_memory(device)
+    if through_nvml is not None:
+        return through_nvml
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={device}",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        line = out.stdout.strip().splitlines()[0]
+        free, total = (int(part.strip()) * 1024 * 1024 for part in line.split(","))
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return DeviceMemory("unreadable")
+    return _device_memory_of(free, total)
+
+
 def synchronize(torch: Any, kind: str) -> None:
     """A device-order fence for `kind`. `cpu` is a no-op (host code is already ordered)."""
     if kind == "mps":

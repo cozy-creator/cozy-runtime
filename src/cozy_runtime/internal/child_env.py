@@ -79,8 +79,12 @@ JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
 CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     ProjectedVar(
         "CUDA_VISIBLE_DEVICES",
-        "plan.device_selection",
-        "the executor sees exactly the devices the admitted plan grants",
+        "worker.device_lane",
+        "the executor sees exactly its LANE's devices (cr-066): the worker assigns a "
+        "placement to one lane of its envelope and seals the executor to that lane's "
+        "entries, so ordinal 0 inside the executor IS the selected device. A job's lane is "
+        "the whole envelope. The row used to claim `plan.device_selection`; no plan ever "
+        "selected a device, and every executor saw the whole envelope and used card 0",
     ),
     ProjectedVar(
         "PYTORCH_CUDA_ALLOC_CONF",
