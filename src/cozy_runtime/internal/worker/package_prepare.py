@@ -198,6 +198,8 @@ def _published_descriptor(
         )
     try:
         descriptor.read_bytes(raw, "published package descriptor")
+    except descriptor.RetiredDescriptorMember as exc:
+        raise PreparationRefusal(exc.code, str(exc)) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_published_descriptor_invalid", str(exc)) from exc
     return raw, parent
@@ -352,6 +354,8 @@ def prepare_private_placement(
         raise PreparationRefusal("private_placement_descriptor_invalid", digest)
     try:
         descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared private descriptor")
+    except descriptor.RetiredDescriptorMember as exc:
+        raise PreparationRefusal(exc.code, str(exc)) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("private_placement_descriptor_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
@@ -595,6 +599,8 @@ def prepare_package(
             )
     try:
         descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared package descriptor")
+    except descriptor.RetiredDescriptorMember as exc:
+        raise PreparationRefusal(exc.code, str(exc)) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
@@ -778,11 +784,7 @@ def _entrypoints(
         for row in described:
             path = str(row["path"])
             prefix = f"{value['name']}.models."
-            if (
-                not path.startswith(prefix)
-                or path not in selected
-                or row.get("stamps") not in ({}, None)
-            ):
+            if not path.startswith(prefix) or path not in selected:
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", path)
             described_slots.add(path)
             model = selected[path]
@@ -802,7 +804,6 @@ def _entrypoints(
                         pb.Component(component=component, model_id=model_id)
                         for component in model["components"]
                     ],
-                    stamps=[],
                 )
             )
         slots.sort(key=lambda row: row.slot)

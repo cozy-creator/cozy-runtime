@@ -131,8 +131,7 @@ def _overrides(values: Sequence[str], slots: Sequence[Any]) -> dict[str, str]:
                 )
             out[slots[0].path] = value
             continue
-        known = {s.path for s in slots} | {s.class_key for s in slots}
-        if path not in known:
+        if path not in {s.path for s in slots}:
             raise CliError(
                 "usage",
                 f"--model {path}=… names no binding path on this function",

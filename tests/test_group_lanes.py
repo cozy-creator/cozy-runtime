@@ -262,7 +262,6 @@ def _worker_slot(degrees: tuple[int, ...]) -> WorkerSlot:
         reference_snapshot="",
         components=("unet",),
         snapshots={},
-        stamps={},
         sequence_parallel_degrees=degrees,
     )
 
@@ -657,7 +656,6 @@ def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
         path="serve.models.m",
         param="m",
         model_class=Sharded,
-        stamps={},
         components={},
         sequence_parallel=Sharded.__sequence_parallel__,
     )
@@ -684,7 +682,6 @@ def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
             {
                 "path": "marco.models.m",
                 "class": "Sharded",
-                "stamps": {},
                 "component_use": {},
                 **slot,
             }
@@ -731,7 +728,6 @@ def _weightless_prepare(body: dict[str, Any], descriptor: Path, **extra: Any) ->
             "model_class": "",
         },
         "budgets": {},
-        "expect_construction_digest": "",
         "authorized_device_limit_bytes": 0,
         **extra,
     }
@@ -916,13 +912,12 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
                 "model_class": "",
             },
             "budgets": {},
-            "expect_construction_digest": "",
         }
         plan = GroupPlan(
             degree=3,
             devices=("0", "1", "2"),
             plan_digest="sha256:" + "a" * 64,
-            logical_model_digest="c/t",
+            construction_digest="c/t",
             authorized_device_limit_bytes=1,
         )
         assert GroupPlan.read(plan.document()) == plan

@@ -52,8 +52,6 @@ class Case:
     wrong reason — cr-003 learned that when a red arm refused over a struct field order."""
     config: Mapping[str, object] = field(default_factory=dict)
     component_use: Mapping[str, Sequence[str]] = field(default_factory=dict)
-    variant: str = "sm89"
-    declared_variants: tuple[str, ...] = ()
     ground_truth: bool = True
     """False when the construct cannot be built for real either (a CUDA-only case on a
     fenced box) — the diff is then skipped and the case says so."""

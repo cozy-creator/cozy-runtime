@@ -1211,7 +1211,6 @@ class AttemptEngine:
                     "instance_id": self.instance_id,
                     "invocation_spec_digest": documents.spell(attempt.digest),
                     "plan_digest": plan_digest,
-                    "model_construction_digest": plan.model_construction_digest,
                     "constructed_model_digest": plan.constructed_model_digest,
                     "request_features_digest": plan.request_features_digest,
                     "preflight_facts_digest": plan.preflight_facts_digest,
@@ -2427,13 +2426,9 @@ class AttemptEngine:
             attempt_ordinal=attempt.attempt,
             invocation_spec_digest=attempt.digest,
             plan_digest=documents.raw(plan.digest()),
-            # A JOB has no model construction, and an empty digest is the honest answer:
-            # spelling one for a construction that never happened would invent an identity.
-            model_construction_digest=(
-                documents.raw(plan.model_construction_digest)
-                if plan.model_construction_digest
-                else b""
-            ),
+            # `model_construction_digest` (9) is left EMPTY: the MCC's logical-model digest
+            # is deleted (model-code-fit D12) and worker-protocol reserves the slot at
+            # minor 23. What was built is `constructed_model_digest`, in the journal.
             plan=pb.AttemptPlanSummary(
                 delivery=plan.delivery,
                 materialization=plan.materialization,

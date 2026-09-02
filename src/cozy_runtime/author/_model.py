@@ -1,18 +1,16 @@
-"""The `Model` boundary: role classes, class-keyword stamps, component-use scopes, the
+"""The `Model` boundary: role classes, the one class keyword, component-use scopes, the
 construction transaction, and construction-identity coalescing.
 
 THE SIGNATURE IS THE SLOT (§1.1): a bare typed parameter (`model: Fl2VAModel`) is the whole
 declaration and its derived canonical path (`generate.models.model`) is the binding point.
 There is no slot object, no `artifacts=` dict, and the `Annotated` override-marker plane is
-EMPTY at launch. The CLASS carries the admissibility stamps — one keyword per REQUIRED
-stamp from the family's OPEN uploader-minted vocabulary, stated once per role class.
+EMPTY at launch. The CLASS carries exactly one keyword, `encoded_leaves`; there are no
+stamps, no `task=`/`objective=`/`structure=`, and no model or release name anywhere in code
+(model-code-fit §1, D1). A semantic twin is a component name or a config fact.
 
 Construction identity is (package release, model class, exact artifact snapshot + immutable
 config, construction/provider variant). Equal identities coalesce ONE single-flight model
 generation; unequal ones stay distinct instances with independent lifecycle and admission.
-
-The engine-hosted tier (`self_loading=`, `Loader.engine`) rides cr-018 and lands with
-se-007's milestone: the keyword refuses here rather than silently becoming a stamp.
 """
 
 from __future__ import annotations
@@ -57,15 +55,6 @@ P = ParamSpec("P")
 R = TypeVar("R")
 ModelT = TypeVar("ModelT", bound="Model[Any]")
 
-#: Class keywords that are NOT stamps. `self_loading=` is the engine-hosted tier's pinned
-#: receiver (§1.5) and its implementation rides cr-018/se-007 — it refuses rather than
-#: silently entering the open stamp vocabulary.
-RESERVED_KEYWORDS: Mapping[str, str] = {
-    "self_loading": "the engine-hosted tier lands with se-007's milestone (cr-018's door)",
-    "structure": "structure admissibility is DOCUMENT MATCHING, derived from the code "
-    "topology — a structure split enters only on measured need (§1.1)",
-}
-
 #: THE ENCODED-LEAF CONSENT, and the whole of the author's say in the delivery plane.
 #:
 #: Every other rung the runtime can choose is invisible to author code by construction: the
@@ -84,9 +73,9 @@ RESERVED_KEYWORDS: Mapping[str, str] = {
 #: rules meet exactly here: the author never picks the encoding, and the runtime never
 #: replaces a leaf in a package that did not say it could take one.
 #:
-#: A string rather than a bool, and a closed vocabulary rather than an open one, because the
-#: class-keyword plane is uniformly string-valued (the stamps are) and because "refuse" then
-#: has a spelling — an author can state the conservative answer instead of only implying it.
+#: A string rather than a bool, and a closed vocabulary rather than an open one, because
+#: "refuse" then has a spelling — an author can state the conservative answer instead of
+#: only implying it.
 ENCODED_LEAVES: Mapping[str, str] = {
     "refuse": "the runtime fills float destinations and never replaces a module; an "
     "artifact whose only qualified route on this device is native refuses typed",
@@ -94,11 +83,6 @@ ENCODED_LEAVES: Mapping[str, str] = {
     "no `.weight` read, no per-module dtype walk, no submodule rebuilt from one — so a "
     "linear op may be replaced by a module whose weight is the stored role set",
 }
-
-#: Class keywords that are neither stamps nor refusals: the runtime reads them. One entry,
-#: deliberately — the plane exists because `encoded_leaves` needed it, and it is a LIST so
-#: the next one is a reviewed addition rather than an accident of `__init_subclass__`.
-RUNTIME_KEYWORDS: Mapping[str, Mapping[str, str]] = {"encoded_leaves": ENCODED_LEAVES}
 
 #: Keyword names an author-facing model method may not declare. Every one of them names a
 #: residency, placement or conversion decision the runtime owns (§1.1/§7).
@@ -400,8 +384,6 @@ class Model[PipelineT]:
     a signature is what derives `gpu`.
     """
 
-    __stamps__: Mapping[str, str] = {}
-
     __sequence_parallel__: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)`: the degrees this class shards at. Empty is the
     honest default - a class that said nothing is never sharded."""
@@ -432,47 +414,32 @@ class Model[PipelineT]:
     _cozy_group: GroupMirror | None = None
     """Runtime-installed under a group lane only (cr-068): the sequence-parallel mirror."""
 
-    def __init_subclass__(cls, /, **stamps: str) -> None:
-        """The class-keyword plane: one keyword per REQUIRED stamp, open vocabulary.
+    def __init_subclass__(cls, /, **keywords: str) -> None:
+        """The class-keyword plane is exactly `encoded_leaves` (model-code-fit §1).
 
-        Plus the `RUNTIME_KEYWORDS`, which are read by the runtime rather than matched
-        against a checkpoint. They are taken FIRST and out of the stamp dict, so a runtime
-        keyword can never be mistaken for a stamp the platform would then look for in a
-        checkpoint's uploader-minted map and refuse for missing.
+        Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
+        `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
+        read is not a fact anyone else would look for.
         """
         super().__init_subclass__()
-        for key, vocabulary in RUNTIME_KEYWORDS.items():
-            if key not in stamps:
-                continue
-            value = stamps.pop(key)
-            if value not in vocabulary:
+        if "encoded_leaves" in keywords:
+            value = keywords.pop("encoded_leaves")
+            if value not in ENCODED_LEAVES:
                 raise ConformanceError(
-                    f"class {cls.__name__}({key}={value!r}): the vocabulary is CLOSED — "
-                    + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
-                    code=f"{key}_value",
+                    f"class {cls.__name__}(encoded_leaves={value!r}): the vocabulary is CLOSED — "
+                    + " | ".join(f"{k!r}: {why}" for k, why in ENCODED_LEAVES.items()),
+                    code="encoded_leaves_value",
                 )
-            setattr(cls, f"__{key}__", value)
-        inherited = dict(getattr(cls, "__stamps__", {}))
-        for key, value in stamps.items():
-            if (why := RESERVED_KEYWORDS.get(key)) is not None:
-                raise ConformanceError(
-                    f"class {cls.__name__}({key}=…): {why}", code="reserved_keyword"
-                )
-            if not isinstance(value, str) or not value.strip():
-                raise ConformanceError(
-                    f"class {cls.__name__}({key}=…): a stamp is a non-empty string naming one "
-                    "value in the checkpoint's uploader-minted, family-scoped map — the "
-                    "platform blesses no keys and interprets none (§1.1)",
-                    code="stamp_value",
-                )
-            if key in inherited:
-                raise ConformanceError(
-                    f"class {cls.__name__}({key}={value!r}): {key!r} is already stamped "
-                    f"{inherited[key]!r} by a base — a stamp is stated ONCE per role class",
-                    code="restamped",
-                )
-            inherited[key] = value
-        cls.__stamps__ = inherited
+            cls.__encoded_leaves__ = value
+        if keywords:
+            names = ", ".join(f"{key}=…" for key in keywords)
+            raise ConformanceError(
+                f"class {cls.__name__}({names}): a Model class carries exactly one keyword, "
+                "encoded_leaves — stamps, task=, objective= and structure= are deleted "
+                "(model-code-fit D1); a semantic twin is a component name or a config fact",
+                code="class_keyword",
+                fields=sorted(keywords),
+            )
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -857,7 +824,6 @@ class ModelRegistry:
     def _construct(
         self, identity: ConstructionIdentity, cls: type[Model[Any]], artifact: Artifact, mode: Mode
     ) -> Generation:
-        _admit(cls, artifact)
         model = cls()
         loader = self._loader(model, artifact, mode)
         object.__setattr__(model, "_cozy_loading", True)
@@ -939,41 +905,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled=sum(r.filled for r in records),
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
-        transcribed_markers=tuple(m for r in records for m in r.transcribed_markers),
     )
-
-
-def _admit(cls: type[Model[Any]], artifact: Artifact) -> None:
-    """The class's stamps JOIN THE CHECKPOINT'S VERIFIED STAMP SET BY MEMBERSHIP, fail-closed.
-
-    A stamp key carries a SET of values, not a scalar, and that is not a loosening — it is
-    the ratified law (tensorhub.md §lane: "a package `task=` requirement joins by set
-    membership"), and the N-ARY PACKAGING RULE cannot be served without it. Stamps are a
-    CHECKPOINT fact: the dual H3 artifact carries one `transformer` stamped `task=fl2va` and
-    one `transformer_ref` stamped `task=ref2va`, so its lane contract is
-    `task=fl2va+ref2va`. Under scalar equality that artifact — the canonical production
-    packaging for every multi-task family — admits NEITHER role class, which is the shape
-    the serving path actually refused on real H3 weights (#567d).
-
-    Absence still fails closed, and a present-but-wrong value still refuses: unstamped means
-    "nobody looked", never "false". What the membership reading does NOT check is that the
-    matching value was evidenced on the component THIS class binds — the hub's stamp rows
-    carry that component and the lane contract drops it. Binding the wrong transformer is
-    already refused one clock earlier by exact-binding topology validation (the class's
-    factory constructs only the components it declares), so the per-component tightening is
-    a recorded door, not a hole: it needs the evidence rows carried down beside the contract.
-    """
-    for key, value in cls.__stamps__.items():
-        actual = artifact.stamp_set(key)
-        if value not in actual:
-            carried = "+".join(actual) if actual else "nothing"
-            raise ConformanceError(
-                f"{cls.__name__} requires stamp {key}={value!r}; {artifact.snapshot} "
-                f"carries {key}={carried} — a class keyword joins the checkpoint's stamp "
-                "set by membership and fails closed on absence (§1.1)",
-                code="stamp_mismatch",
-                fields=[key],
-            )
 
 
 def _prove_components(cls: type, record: ConstructionRecord) -> None:

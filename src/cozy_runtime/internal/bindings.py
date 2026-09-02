@@ -7,9 +7,9 @@ side does.
 
 `package.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
 speaks (a bare-venv `run` with no `--model`). Production authority is the hub-side binding
-alone. Two spellings, one schema: `[bindings."<ModelClass>"]` covers every parameter of that
-class, `[bindings."<callable>.models.<param>"]` names one parameter specifically, and the
-path spelling wins where both speak.
+alone. ONE grammar, the slot path: `[bindings."<callable>.models.<param>"]` (model-code-fit
+§1, th-116). The class-keyed spelling `[bindings."<ModelClass>"]` is deleted and refuses
+typed, naming the paths it would have covered.
 """
 
 from __future__ import annotations
@@ -69,27 +69,30 @@ def resolve(
 ) -> dict[str, Binding]:
     """Resolve every declared slot, or refuse naming the slot nothing binds."""
     ladder = ((overrides or {}, "--model"), (deploy or {}, "deploy binding"))
-    known = {s.path for s in slots} | {s.class_key for s in slots}
-    unknown = sorted(set(table) - known)
-    if unknown:
+    paths = {s.path for s in slots}
+    for key in sorted(set(table) - paths):
+        covered = sorted(s.path for s in slots if s.class_key == key)
+        if covered:
+            raise ConformanceError(
+                f"[bindings.{key!r}] is the deleted class-keyed grammar; bind the slot path "
+                f"instead: {', '.join(covered)}",
+                code="binding_class_key_retired",
+                fields=[key, *covered],
+            )
         raise ConformanceError(
-            f"package.toml binds {', '.join(unknown)}, which this release declares no slot "
-            f"for (slots: {', '.join(sorted(s.path for s in slots))})",
+            f"package.toml binds {key}, which this release declares no slot for "
+            f"(slots: {', '.join(sorted(paths))})",
             code="unknown_binding",
-            fields=unknown,
+            fields=[key],
         )
     resolved: dict[str, Binding] = {}
     for slot in slots:
         chosen: Binding | None = None
-        for key, source in (
-            (slot.class_key, "package.toml:class"),
-            (slot.path, "package.toml:path"),
-        ):
-            entry = table.get(key)
-            if entry is not None:
-                chosen = Binding(slot.path, _ref(entry, key), _lane(entry), source)
+        entry = table.get(slot.path)
+        if entry is not None:
+            chosen = Binding(slot.path, _ref(entry, slot.path), _lane(entry), "package.toml")
         for override, source in ladder:
-            ref = override.get(slot.path) or override.get(slot.class_key)
+            ref = override.get(slot.path)
             if ref is not None:
                 chosen = Binding(slot.path, ref, chosen.lane if chosen else None, source)
         if chosen is None:

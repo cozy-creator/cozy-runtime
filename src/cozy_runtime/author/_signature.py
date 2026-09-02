@@ -53,21 +53,25 @@ class PreflightSpec:
 @dataclass(frozen=True, slots=True)
 class ModelBinding:
     """One model slot as the descriptor sees it. The derived canonical PATH is the binding
-    point; the CLASS carries the admissibility stamps and the component-use contract."""
+    point; the CLASS carries `encoded_leaves` and the component-use contract."""
 
     path: str
     """`<callable>.models.<param>` — renaming a parameter is a breaking descriptor change."""
     param: str
     model_class: type[Model[Any]]
-    stamps: Mapping[str, str]
     components: Mapping[str, tuple[str, ...]]
     sequence_parallel: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)` on the class: the degrees it shards at (cr-068)."""
 
     @property
     def class_key(self) -> str:
-        """The by-class binding key: `[bindings."SdxlModel"]` covers every parameter of it."""
+        """The class name, for messages and for the publish memo's per-class seed. It is
+        NOT a binding key: `package.toml` binds slot paths only (model-code-fit §1)."""
         return self.model_class.__name__
+
+    @property
+    def encoded_leaves(self) -> str:
+        return str(getattr(self.model_class, "__encoded_leaves__", "refuse"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +116,6 @@ class Surface:
                     path=f"{self.name}.models.{p.name}",
                     param=p.name,
                     model_class=annotation,
-                    stamps=annotation.__stamps__,
                     components=component_use(annotation),
                     sequence_parallel=tuple(annotation.__sequence_parallel__),
                 )
@@ -162,8 +165,8 @@ def _classify(name: str, annotation: object, where: str) -> Param:
                 raise ConformanceError(
                     f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
                     "override-marker plane is EMPTY at launch: a bare typed parameter is "
-                    "unconditionally the whole declaration, and the class carries the "
-                    "admissibility stamps (§1.1). Future markers enter through cr-018's door",
+                    "unconditionally the whole declaration (§1.1). Future markers enter "
+                    "through cr-018's door",
                     code="empty_marker_plane",
                     fields=[name],
                 )

@@ -139,10 +139,10 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
     lines += _fields(doc["result"])
     for slot in _as_list(doc.get("models", [])):
         assert isinstance(slot, dict)
-        stamps = slot["stamps"]
-        assert isinstance(stamps, dict)
-        rendered = ",".join(f"{k}={v}" for k, v in sorted(stamps.items())) or "none"
-        lines.append(f"model {slot['path']} -> {slot['class']}  stamps: {rendered}")
+        lines.append(
+            f"model {slot['path']} -> {slot['class']}  "
+            f"encoded_leaves: {slot.get('encoded_leaves', 'refuse')}"
+        )
         components = slot["component_use"]
         assert isinstance(components, dict)
         for method, names in sorted(components.items()):

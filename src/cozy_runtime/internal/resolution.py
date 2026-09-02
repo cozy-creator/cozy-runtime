@@ -179,7 +179,6 @@ class ConstructionFacts:
     topology_digest: str
     components: tuple[str, ...]
     custody: str = "canonical"
-    strict_keys: bool = False
 
     def document(self) -> dict[str, Any]:
         return {
@@ -189,7 +188,6 @@ class ConstructionFacts:
             "topology_digest": self.topology_digest,
             "components": list(self.components),
             "custody": self.custody,
-            "strict_keys": self.strict_keys,
         }
 
 

@@ -106,17 +106,13 @@ class AttemptPlan:
     and `headroom_bytes` are those, named separately because they are different facts."""
     headroom_bytes: int
     entrypoint_binding_digest: str
-    model_construction_digest: str
-    """The LOGICAL model: reference variant, topology, config, factory. Identical across
-    every delivery variant of one model, which is what makes it a usable deployment fence."""
     decision_explanation: str
     """WHY this plan, in numbers, for a person reading a terminal. It rides the wire as
     `AttemptPlanSummary.quantified_choice`, which is th-024's name for the field."""
     constructed_model_digest: str = ""
-    """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them and the
-    configuration the fill ran under. The logical digest cannot answer "which bytes are
-    resident", so two generations over different artifacts were indistinguishable without
-    this (codex audit, adopted 2026-08-25)."""
+    """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them, the
+    construction (config + topology) and the configuration the fill ran under. The one
+    construction identity — the MCC's "logical model" digest beside it is deleted (D12)."""
     request_features_digest: str = ""
     """The exact PreparedRequest this plan was priced against, bound into the plan document
     so `plan_digest` covers it. cr-002a claimed this end to end; it is true now."""
@@ -147,7 +143,6 @@ class AttemptPlan:
             "headroom_bytes": self.headroom_bytes,
             "scope_headroom_bytes": dict(self.scope_headroom_bytes),
             "entrypoint_binding_digest": self.entrypoint_binding_digest,
-            "model_construction_digest": self.model_construction_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "request_features_digest": self.request_features_digest,
             "preflight_facts_digest": self.preflight_facts_digest,
@@ -180,7 +175,6 @@ class AttemptPlan:
             reserved_vram_bytes=int(caps.get("vram", 0)),
             headroom_bytes=0,
             entrypoint_binding_digest=binding.job_descriptor_id,
-            model_construction_digest="",
             decision_explanation=(
                 f"job_attempt: {binding.job!r} on {max(device_count, 0)} assigned device(s), "
                 f"{caps.get('rss', 0)} B host and {caps.get('disk', 0)} B disk capped, "
@@ -244,8 +238,6 @@ class PreparedModel:
     the record's closed key set no longer admits a resolved field at all.
     """
 
-    logical_model_digest: str = ""
-    """The LOGICAL model the fill constructed — identical across every delivery variant."""
     constructed_model_digest: str = ""
     """WHAT WAS BUILT: selected bytes, route, materialization, topology, configuration."""
     delivery_rung: str = ""
@@ -273,13 +265,10 @@ class ModelBinding:
     reference_snapshot: str
     components: tuple[str, ...]
     snapshots: Mapping[str, str]
-    stamps: Mapping[str, tuple[str, ...]]
     objective: str = "latency"
     steps_basis: int = 20
     model_weight_bytes: int = 0
     custody: str = "canonical"
-    strict_keys: bool = False
-    expected_logical_model_digest: str = ""
     sequence_parallel_degrees: tuple[int, ...] = ()
     """The descriptor slot's `sequence_parallel.degrees` (cr-068): what the author said the
     class shards at. A placement pinned to K devices needs K here."""
@@ -299,13 +288,10 @@ class ModelBinding:
             "model_parameter_name": self.model_parameter_name,
             "components": list(self.components),
             "snapshots": dict(self.snapshots),
-            "stamps": {key: list(values) for key, values in self.stamps.items()},
             "objective": self.objective,
             "steps_basis": self.steps_basis,
             "model_weight_bytes": self.model_weight_bytes,
             "custody": self.custody,
-            "strict_keys": self.strict_keys,
-            "expected_logical_model_digest": self.expected_logical_model_digest,
         }
 
 
@@ -328,7 +314,7 @@ def model_binding_set_digest(models: tuple[ModelBinding, ...]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DeclaredBinding:
-    """Runtime's private resolved value for one canonical Plan -> RMB -> MCC chain.
+    """Runtime's private resolved value for one canonical entrypoint binding.
 
     This is not a document or wire schema. Only the shared provisioned-release reader
     constructs it after following stored-byte references; paths below are machine resolution.
@@ -358,14 +344,12 @@ class DeclaredBinding:
     """The RESOLVED reference snapshot: the artifact the `variant` names, and the fallback
     for any component the snapshot map omits. Resolution, not identity."""
     components: tuple[str, ...] = ()
-    """The exact MCC destination order this binding constructs."""
+    """The components this binding constructs, in construction order."""
     snapshots: Mapping[str, str] = dataclasses.field(default_factory=dict)
     """component -> snapshot digest. A read plan is COMPLETE over its header (tfs-007), so a
     component cannot be read out of a whole-pipeline snapshot without reading the pipeline;
     per-component snapshots make a partial fill the store's ordinary complete read, and the
     objects dedup so it costs nothing."""
-    stamps: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
-    """The checkpoint's stamped-fact set (#567d), resolved with the rest of it."""
     package_revision_digest: str = ""
     """Published release.json provenance or explicit development source identity."""
     development: bool = False
@@ -385,15 +369,10 @@ class DeclaredBinding:
     of a 92.42 GiB artifact refused `budget_overrun` against it."""
     custody: str = "canonical"
     """`canonical` (the border classified every key: a serve-time extra is drift and
-    refuses) or `local` (an un-bordered local bind: markers transcribe or refuse, unknown
-    extras warn, are ignored and are confessed — §1.1's custody tier). RESOLUTION: custody
-    is how THIS machine came to hold these bytes, which is exactly what an index row
-    records and what a record-writer on another machine cannot know."""
-    strict_keys: bool = False
-    """`--strict-keys`: a local bind's unknown extras refuse instead of confessing."""
-    expected_logical_model_digest: str = ""
-    """The deployment's FENCE: the logical model it prices against. A prepare that builds a
-    different one refuses rather than serving it."""
+    refuses) or `local` (an un-bordered local bind: extras are listed, ignored and
+    confessed — model-code-fit D5). RESOLUTION: custody is how THIS machine came to hold
+    these bytes, which is exactly what an index row records and what a record-writer on
+    another machine cannot know."""
     max_input_bytes: int = 64 << 20
     """cr-012: the DEPLOYMENT's per-input-asset ceiling, checked pre-accept against the
     grant's declared length. A field's own `AssetBound` narrows it and never widens it."""
@@ -429,13 +408,10 @@ class DeclaredBinding:
                 reference_snapshot=self.reference_snapshot,
                 components=self.components,
                 snapshots=self.snapshots,
-                stamps=self.stamps,
                 objective=self.objective,
                 steps_basis=self.steps_basis,
                 model_weight_bytes=self.model_weight_bytes,
                 custody=self.custody,
-                strict_keys=self.strict_keys,
-                expected_logical_model_digest=self.expected_logical_model_digest,
             ),
         )
 
@@ -843,7 +819,6 @@ class PlanChooser:
             headroom_bytes=activations.value,
             scope_headroom_bytes=tuple(sorted(scope_headrooms.items())),
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
-            model_construction_digest=prepared_model.logical_model_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,
             preflight_facts_digest=prepared.facts_digest,

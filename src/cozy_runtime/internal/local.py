@@ -123,7 +123,6 @@ class _DevelopmentModel:
     config_bytes: bytes
     components: tuple[str, ...]
     assets: Mapping[str, Mapping[str, Any]]
-    stamps: Mapping[str, tuple[str, ...]]
     store: Path
     variant: str
     custody: str
@@ -491,14 +490,13 @@ class LocalRecordOwner:
             raise RuntimeError("accepted invocation digest differs from the offered spec")
         if len(bytes(accepted.plan_digest)) != hashlib.sha256().digest_size:
             raise RuntimeError("accepted plan digest is not one SHA-256 identity")
-        construction = bytes(accepted.model_construction_digest)
+        if bytes(accepted.model_construction_digest):
+            raise RuntimeError("an acceptance carries the deleted model-construction identity")
         if accepted.executor_epoch <= 0:
             raise RuntimeError("accepted executor epoch is not positive")
         if self.request.kind == "job":
             if accepted.placement_id:
                 raise RuntimeError("a job acceptance carries a serving placement")
-            if construction:
-                raise RuntimeError("a job acceptance carries a model-construction identity")
             if (
                 accepted.plan.delivery != "job"
                 or accepted.plan.materialization != "run_to_completion"
@@ -517,12 +515,7 @@ class LocalRecordOwner:
                     for entrypoint in self.placement.entrypoints
                 )
             )
-            if modeled:
-                if len(construction) != hashlib.sha256().digest_size:
-                    raise RuntimeError("a local modeled acceptance lacks its construction identity")
-            elif construction:
-                raise RuntimeError("a local weightless acceptance invents model construction")
-            elif (
+            if not modeled and (
                 accepted.plan.delivery != "native"
                 or accepted.plan.materialization
                 or accepted.plan.placement != "all_resident"
@@ -1143,7 +1136,6 @@ def development_placement_documents(
         for selected_path in selected_paths:
             selected = resolved_models[selected_path]
             model_id = model_ids[selected.slot.path]
-            first_component = selected.components[0]
             assets = [
                 pb.Asset(
                     name=asset_name,
@@ -1154,10 +1146,6 @@ def development_placement_documents(
                     ),
                 )
                 for asset_name, asset in sorted(selected.assets.items())
-            ]
-            stamps = [
-                pb.Stamp(component=first_component, key=key, values=list(values))
-                for key, values in sorted(selected.stamps.items())
             ]
             slots.append(
                 pb.Slot(
@@ -1174,7 +1162,6 @@ def development_placement_documents(
                         pb.Component(component=component, model_id=model_id)
                         for component in selected.components
                     ],
-                    stamps=stamps,
                 )
             )
             config_path = ""
@@ -1195,7 +1182,6 @@ def development_placement_documents(
                     snapshots={
                         component: selected.manifest_digest for component in selected.components
                     },
-                    stamps=selected.stamps,
                     model_weight_bytes=selected.model_weight_bytes,
                     custody=selected.custody,
                     sequence_parallel_degrees=tuple(selected.slot.sequence_parallel),
@@ -1229,7 +1215,6 @@ def development_placement_documents(
             reference_snapshot=first.reference_snapshot if first is not None else "",
             components=first.components if first is not None else (),
             snapshots=first.snapshots if first is not None else {},
-            stamps=first.stamps if first is not None else {},
             package_revision_digest=source_digest,
             config_digest=model_binding_set_digest(model_set),
             development=True,
@@ -1344,7 +1329,6 @@ def _resolve_development_models(
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         components = tuple(sorted(str(component) for component in components_value))
         selected_assets = _development_assets(binding.ref, header.get("assets", {}))
-        actual_stamps = _development_stamps(binding.ref, slot.stamps)
         try:
             model_weight_bytes = sum(int(row["length"]) for row in store.walk(manifest_digest))
         except Exception as exc:
@@ -1363,7 +1347,6 @@ def _resolve_development_models(
             config_bytes=config_bytes,
             components=components,
             assets=selected_assets,
-            stamps=actual_stamps,
             store=store_root,
             # Repository lane and accelerator hardware are independent facts. Development
             # carries no caller-authored hardware variant; the executor derives smNN from
@@ -1382,18 +1365,6 @@ def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping
         raise RuntimeError(
             "development_model_assets_unsupported: local modeled development does not "
             f"yet stream TensorFS logical assets for {binding_ref}"
-        )
-    return {}
-
-
-def _development_stamps(
-    binding_ref: str, required_stamps: Mapping[str, str]
-) -> Mapping[str, tuple[str, ...]]:
-    if required_stamps:
-        required = ", ".join(f"{key}={value}" for key, value in sorted(required_stamps.items()))
-        raise RuntimeError(
-            "development_model_stamps_unavailable: local TensorFS Repository releases "
-            f"carry no uploader/catalog stamp set for {binding_ref}: {required}"
         )
     return {}
 
@@ -1619,10 +1590,6 @@ def _collect(
             "attempt_ordinal": accepted.attempt_ordinal,
             "invocation_spec_digest": _spell(accepted.invocation_spec_digest),
             "plan_digest": _spell(accepted.plan_digest),
-            # A JOB attempt has NO model construction: no warm pool, no serving pointer, no
-            # retained generation. The empty digest is the honest answer and spelling it as
-            # one would be inventing an identity for a construction that never happened.
-            "model_construction_digest": _spell(accepted.model_construction_digest),
             "delivery": accepted.plan.delivery,
             "materialization": accepted.plan.materialization,
             "placement": accepted.plan.placement,
