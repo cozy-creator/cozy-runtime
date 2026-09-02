@@ -3044,14 +3044,15 @@ class Worker:
                     terminal=True,
                 )
                 return None
-            if self.options.artifact_cache is None:
+            if self.options.artifact_cache is None or self.options.artifact_store is None:
                 self._materialization_failed(
                     placement,
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=placement.placement_id,
                         reason="artifact_cache_absent",
-                        detail="source-checkout selection bytes require --artifact-cache",
+                        detail="source-checkout selection bytes require --artifact-cache and "
+                        "--artifact-store",
                     ),
                     terminal=False,
                 )
@@ -3068,8 +3069,9 @@ class Worker:
                     package=self.options.development_package,
                     release=self.options.development_release,
                     source_digest=self.options.development_source_digest,
-                    found=found,
+                    artifact_cache=self.options.artifact_cache,
                     artifact_store=self.options.artifact_store,
+                    found=found,
                     binding_overrides=self.options.development_binding_overrides,
                 )
                 return acquire.preinstalled_development(

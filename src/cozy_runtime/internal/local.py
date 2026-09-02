@@ -998,17 +998,23 @@ def stage_development_placement(
     package: str,
     release: str,
     source_digest: str,
+    artifact_cache: Path,
+    artifact_store: Path,
     found: Any = None,
-    artifact_store: Path | None = None,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
-    """Stage one exact PlacementSet/1 plus its launch-local descriptor/config bytes."""
+    """Stage one exact PlacementSet/1 plus its launch-local descriptor/config bytes.
+
+    The descriptor and config bytes the executor reads land in `artifact_cache` — the
+    launcher's install-owned, content-addressed document store (cozy-creator's
+    `installs/<id>/artifact-cache/`, a run's workspace), never under `cozy_home`: the home
+    root holds what has a reason to be there, and a launch's derived documents are the
+    launcher's to place and reclaim. `artifact_store` is named, never created here.
+    """
 
     home = cozy_home.resolve()
-    cache = home / "artifact-cache"
-    selected_store = (artifact_store or home / "store").resolve()
-    if artifact_store is None:
-        selected_store.mkdir(parents=True, exist_ok=True)
+    cache = artifact_cache.resolve()
+    selected_store = artifact_store.resolve()
     documents_ = development_placement_documents(
         package_descriptor,
         package=package,
@@ -1020,7 +1026,6 @@ def stage_development_placement(
         artifact_cache=cache,
         binding_overrides=binding_overrides,
     )
-    _stage_exact(cache, documents_.descriptor)
     bindings = {
         entrypoint.name: documents.spell(entrypoint.entrypoint_binding_digest)
         for entrypoint in documents_.placement.entrypoints
@@ -1478,8 +1483,9 @@ def run_slice(
             package="local/development-package",
             release="0.0.0",
             source_digest=source_digest,
+            artifact_cache=workspace / "artifact-cache",
+            artifact_store=development_artifact_store or workspace / "store",
             found=found,
-            artifact_store=development_artifact_store,
             binding_overrides=development_binding_overrides,
         )
         bindings.update(staged.bindings)
