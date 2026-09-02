@@ -50,6 +50,8 @@ def test_an_optional_result_field_may_be_none(tmp_path: Path) -> None:
 def test_a_required_result_field_still_refuses_none(tmp_path: Path) -> None:
     with pytest.raises(OutputError) as caught:
         _validate_result(
-            _surface(), _Result(digest=None, master_audio_digest="x"), _attempt(tmp_path)  # type: ignore[arg-type]
+            _surface(),
+            _Result(digest=None, master_audio_digest="x"),
+            _attempt(tmp_path),  # type: ignore[arg-type]
         )
     assert caught.value.code == "result_schema"
