@@ -147,9 +147,17 @@ WORKER_HOST_ENV = {
 # variables never cross.
 # Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d); keep equal to that
 # row. PATH is deliberately absent: every pod exec is by absolute path.
+# The pod executor's base environment (spawn-allowlists.md class D -> class B): the
+# supervisor-authored fixed PATH plus the platform names the supervisor let through.
+# PATH is here because the executor compiles: Triton builds its launcher stub with the
+# image's gcc, and gcc's collect2 finds `ld` through PATH alone — with none, every
+# Triton kernel on a pod failed as `CalledProcessError: … -l:libcuda.so.1 … exit status 1`
+# while the same seal on a local worker inherited a PATH and passed (cl-101). The value is
+# never the provider's: pod-supervisor replaced it before this process started.
 WORKER_CHILD_PLATFORM_ENV = {
     "LANG",
     "LC_ALL",
+    "PATH",
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
     "TZ",

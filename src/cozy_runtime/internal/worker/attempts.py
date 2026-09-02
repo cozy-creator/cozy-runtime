@@ -353,6 +353,8 @@ class AttemptRecord:
     forwarded_seq: int = 0
     #: the opaque triage handle. Minted at the terminal, and the ONLY way to read the bundle.
     subject_id: str = ""
+    #: The executor's formatted exception behind a FAILED terminal (bundle-only, cl-101).
+    traceback: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
 
@@ -1795,6 +1797,7 @@ class AttemptEngine:
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
+        attempt.traceback = str(outcome.get("traceback") or "")[-16384:]
         breach = outcome["code"] == DEVICE_OOM
         if breach:
             # THE ACCEPTED ENVELOPE WAS BREACHED. `_TERMINAL["failed"]` defaults to
@@ -2332,6 +2335,10 @@ class AttemptEngine:
                 "cause_origin": pb.CauseOrigin.Name(origin),
                 "safe_message": safe(detail, 4096),
                 "outcome_id": attempt.outcome_id,
+                # The frames behind a FAILED terminal, as the executor formatted them. Not
+                # `safe()`d: a traceback is quoted source and file paths, and the whole
+                # point of keeping it is reading it whole after the pod is gone.
+                "traceback": attempt.traceback,
             },
             faults=[
                 {

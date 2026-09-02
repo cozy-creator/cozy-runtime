@@ -1668,6 +1668,7 @@ class Executor:
                 "code": outcome.code,
                 "message": outcome.message[:2048],
                 "fields": list(outcome.fields),
+                "traceback": outcome.traceback,
             },
             "quiescent": quiescent,
             **_env_document(),

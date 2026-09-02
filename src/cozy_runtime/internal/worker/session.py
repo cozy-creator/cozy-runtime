@@ -269,6 +269,16 @@ class WorkerOptions:
     executor_uid: int = -1
     executor_gid: int = -1
     """Fixed package identity, or ``-1/-1`` for the native same-user development lane."""
+    triage_root: Path | None = None
+    """Where terminal triage bundles are committed; absent means ``<root>/triage``.
+
+    A pod worker commits them under the media plane's subtree so the owner can fetch one by
+    its opaque subject over the same plane the outputs cross (cl-101); a local worker's
+    owner reads them from the worker root directly."""
+    triage_owner: tuple[int, int] | None = None
+    """The uid/gid each committed bundle is handed to — the pod media plane's, so a plane
+    that runs as its own uid can open a file the root worker wrote. Absent keeps the
+    writer's identity."""
 
 
 @dataclass(slots=True)
@@ -1045,7 +1055,11 @@ class Worker:
         #: the ones that tick on a clock (`pollers`). Not the device lanes: those are
         #: `self.lanes`, the resource the threads serve.
         self.lane_threads: dict[str, int] = {}
-        self.bundles = triage.BundleStore(self.root / "triage", self.records)
+        self.bundles = triage.BundleStore(
+            options.triage_root or self.root / "triage",
+            self.records,
+            owner=options.triage_owner,
+        )
         self.stop = threading.Event()
         self.weights = weights.WeightsExchange(
             store_root=options.artifact_store,
