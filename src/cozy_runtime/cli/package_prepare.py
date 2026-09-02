@@ -162,6 +162,9 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             # happens to be the local same-user command.
             native_environment=spawn.seal(config.child_base_env, {}),
             installed_environment=installed_environment,
+            # The same job-plan root the worker session stages into: without it a
+            # job-only package has no runnable callable and local install refuses.
+            job_plan_root=config.cozy_home / "job-plans",
         )
     except (PreparationRefusal, ExecutorGone, OSError) as exc:
         name = getattr(exc, "code", "package_prepare_failed")
