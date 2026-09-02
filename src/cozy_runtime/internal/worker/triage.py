@@ -157,16 +157,26 @@ class Assembly:
 
 
 class BundleStore:
-    """Bundle bytes on disk plus a same-process write receipt."""
+    """Bundle bytes on disk plus a same-process write receipt.
 
-    def __init__(self, root: Path, records: WorkerRecords) -> None:
+    `owner` is who may READ what this store writes, when that is not the writer: a pod's
+    root worker commits under the media plane's subtree and hands each bundle to the
+    plane's uid, so the owner's fetch (`GET /v1/triage/{subject}`) opens a 0600 file the
+    plane owns. The handoff happens on the staged file, before the rename that makes the
+    bundle visible, so a visible bundle is always a readable one.
+    """
+
+    def __init__(
+        self, root: Path, records: WorkerRecords, *, owner: tuple[int, int] | None = None
+    ) -> None:
         self.root = root
         self.records = records
+        self.owner = owner
         self.written = 0
         self.bytes = 0
 
     def commit(self, assembly: Assembly) -> Receipt:
-        """Write, fsync, then record the receipt."""
+        """Write, fsync, hand over, then record the receipt."""
         self.root.mkdir(parents=True, exist_ok=True)
         _, data = assembly.build()
         path = self.root / f"{assembly.subject_id}.json"
@@ -176,6 +186,8 @@ class BundleStore:
             if os.write(handle, data) != len(data):
                 raise TriageError("bundle_short_write", f"{path.name} did not write whole")
             os.fsync(handle)
+            if self.owner is not None:
+                os.fchown(handle, *self.owner)
         finally:
             os.close(handle)
         os.replace(tmp, path)
@@ -252,6 +264,9 @@ def explain(document: dict[str, Any]) -> list[str]:
         f"executor  epoch {attempt.get('executor_epoch')} "
         f"admission epoch {document.get('posture', {}).get('admission_epoch')}",
     ]
+    trace = str(terminal.get("traceback") or "").rstrip().splitlines()
+    for row in trace[-4:]:
+        lines.append(f"trace     {row.strip()[:300]}")
     for fault in document.get("faults", ()):
         lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")
     for row in document.get("confessions", ()):

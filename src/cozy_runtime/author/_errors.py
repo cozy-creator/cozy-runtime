@@ -114,6 +114,23 @@ class Outcome:
     code: str
     message: str = ""
     fields: tuple[str, ...] = ()
+    #: The formatted exception that produced a FAILED terminal, tail-bounded. An
+    #: OBSERVATION for the triage bundle only (cl-101): it decides nothing, the wire never
+    #: carries it, and a message alone ("CalledProcessError: … exit status 1") has already
+    #: cost a rented-pod round trip that the frames under it would have answered.
+    traceback: str = ""
+
+
+#: Tail bound on `Outcome.traceback`. The innermost frames and the exception line are at
+#: the end, so the tail is the half that explains.
+TRACEBACK_CAP = 16 * 1024
+
+
+def _trace(exc: BaseException) -> str:
+    import traceback as _tb
+
+    text = "".join(_tb.format_exception(exc))
+    return text[-TRACEBACK_CAP:] if len(text) > TRACEBACK_CAP else text
 
 
 #: The frozen vocabulary the descriptor publishes and the refusal layer maps.
@@ -161,9 +178,18 @@ def classify(exc: BaseException | None) -> Outcome:
     if isinstance(exc, InvalidRequest):
         return Outcome("refused", "request", exc.code, exc.message, exc.fields)
     if isinstance(exc, RuntimeFailure):
-        return Outcome("failed", "runtime", exc.code, exc.message, exc.fields)
+        return Outcome("failed", "runtime", exc.code, exc.message, exc.fields, _trace(exc))
     if isinstance(exc, AuthorError):
-        return Outcome("failed", "author", exc.code, exc.message, exc.fields)
+        return Outcome("failed", "author", exc.code, exc.message, exc.fields, _trace(exc))
     if _is_device_oom(exc):
-        return Outcome("failed", "runtime", DEVICE_OOM, str(exc).splitlines()[0][:400])
-    return Outcome("failed", "author", "unhandled_exception", f"{type(exc).__name__}: {exc}")
+        return Outcome(
+            "failed", "runtime", DEVICE_OOM, str(exc).splitlines()[0][:400], (), _trace(exc)
+        )
+    return Outcome(
+        "failed",
+        "author",
+        "unhandled_exception",
+        f"{type(exc).__name__}: {exc}",
+        (),
+        _trace(exc),
+    )

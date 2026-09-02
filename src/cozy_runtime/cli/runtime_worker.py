@@ -189,6 +189,12 @@ def _worker_options(
         claim_ready=False,
         executor_uid=POD_EXECUTOR_UID,
         executor_gid=POD_EXECUTOR_GID,
+        # Triage bundles are committed under the media plane's subtree and handed to its
+        # uid, so the owner fetches one over the plane the outputs already cross
+        # (`GET /v1/triage/{subject}`, cl-101) instead of reading a path on a machine
+        # it cannot reach.
+        triage_root=host_paths.MEDIA_ROOT / "triage",
+        triage_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
     )
 
 
