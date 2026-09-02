@@ -831,7 +831,9 @@ def observe_gpu(device_index: int) -> GPUObservation:
         )
     name, driver, capability = (item.strip() for item in rows[0])
     match = re.fullmatch(r"([0-9]+)\.([0-9]+)", capability)
-    if not name or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", driver) is None or match is None:
+    # NVIDIA driver versions are two OR three components (595.84 and 580.126.20
+    # are both real); requiring three refused every two-component driver series.
+    if not name or re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", driver) is None or match is None:
         raise NativeWheelRefusal("package_environment_native_gpu_unavailable", output[:500])
     return {
         "device_index": device_index,
