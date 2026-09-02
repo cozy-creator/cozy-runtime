@@ -163,19 +163,26 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "Creator supplies project, package, release, and source digest together",
             Exit.usage,
         )
-    artifact_flags = ("--artifact-store",)
+    artifact_flags = ("--artifact-store", "--artifact-cache")
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
     forbidden_development = [
-        flag
-        for flag in ("--environment-root", "--environment-python", "--artifact-cache")
-        if flag in values
+        flag for flag in ("--environment-root", "--environment-python") if flag in values
     ]
     if all(development.values()) and forbidden_development:
         raise CliError(
             "usage",
             f"--development-project cannot be combined with {', '.join(forbidden_development)}",
-            "a source checkout has no published Environment; Creator supplies only the local "
-            "TensorFS --artifact-store when the package binds models",
+            "a source checkout has no published Environment; Creator supplies the local "
+            "TensorFS --artifact-store and the install's --artifact-cache",
+            Exit.usage,
+        )
+    if all(development.values()) and len(supplied_artifacts) != len(artifact_flags):
+        missing = [flag for flag in artifact_flags if flag not in values]
+        raise CliError(
+            "usage",
+            "development launch is missing " + " and ".join(missing),
+            "the launcher names where the checkout's derived documents live (its install's "
+            "artifact cache) and the local TensorFS store; nothing is written under COZY_HOME",
             Exit.usage,
         )
     if all(development.values()):
@@ -192,12 +199,9 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
                 package=development["--development-package"],
                 release=development["--development-release"],
                 source_digest=development["--development-source-digest"],
+                artifact_cache=Path(values["--artifact-cache"]).expanduser().resolve(),
+                artifact_store=Path(values["--artifact-store"]).expanduser().resolve(),
                 found=found,
-                artifact_store=(
-                    Path(values["--artifact-store"]).expanduser().resolve()
-                    if "--artifact-store" in values
-                    else None
-                ),
             )
         except ConformanceError as exc:
             raise CliError(
