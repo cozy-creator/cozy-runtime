@@ -182,7 +182,7 @@ def stores(tmp_path_factory: pytest.TempPathFactory) -> dict[str, TenantStore]:
     """Two tenant releases: one the card holds two of, one it does not (beside a neighbour)."""
     if NO_TENANT:
         pytest.skip(NO_TENANT)
-    base = Path(tempfile.mkdtemp(prefix="cz-tenant.", dir="/tmp"))
+    base = tmp_path_factory.mktemp("tenant")
     return {
         "small": write_tenant_store(base / "small", blocks=2, scale=4),
         "large": write_tenant_store(base / "large", blocks=48),
