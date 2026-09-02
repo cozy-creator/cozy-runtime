@@ -18,6 +18,7 @@ from cozy_runtime.internal import (
     canonical,
     descriptor,
     fill,
+    image_inventory,
     model_config,
     package_environment,
     placement_materialization,
@@ -91,13 +92,21 @@ def prepare_package_set(
         documents.raw(release_digest)
     except (documents.DocumentError, ValueError) as exc:
         raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
-    published_descriptor = _published_descriptor(
+    published_descriptor, set_directory = _published_descriptor(
         request.files,
         artifact_cache=artifact_cache,
         package_name=package_name,
         release=release,
         release_digest=release_digest,
     )
+    inventory_raw = _read_beside(
+        set_directory / image_inventory.INVENTORY_FILENAME,
+        "package_prepare_image_inventory_missing",
+    )
+    try:
+        inventory = image_inventory.read_bytes(inventory_raw)
+    except image_inventory.ImageInventoryRefusal as exc:
+        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
 
     return prepare_package(
         package_name=package_name,
@@ -117,6 +126,7 @@ def prepare_package_set(
         base=base,
         native_environment=native_environment,
         native_device_index=native_device_index,
+        inventory=inventory,
     )
 
 
@@ -127,7 +137,7 @@ def _published_descriptor(
     package_name: str,
     release: str,
     release_digest: str,
-) -> bytes:
+) -> tuple[bytes, Path]:
     """Read and prove the hub-committed manifest + descriptor staged beside the set.
 
     The published descriptor is the pod's authoritative wiring (cr-067). The manifest's
@@ -190,7 +200,7 @@ def _published_descriptor(
         descriptor.read_bytes(raw, "published package descriptor")
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_published_descriptor_invalid", str(exc)) from exc
-    return raw
+    return raw, parent
 
 
 def _read_beside(path: Path, refusal: str) -> bytes:
@@ -393,6 +403,7 @@ def prepare_package(
     installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
     published_descriptor: bytes | None = None,
+    inventory: image_inventory.Inventory | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
 
@@ -413,11 +424,21 @@ def prepare_package(
         observed_base = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
+    image_owned: dict[str, str] = {}
+    if inventory is not None:
+        # The delivered inventory is the authority on what the image provides; the live
+        # observation is its cross-check (cr-070). A disagreement falsifies the inventory
+        # rather than silently preparing against an image that is not what was registered.
+        lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
+        if lie is not None:
+            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
+        image_owned = inventory.versions
     rows = list(files)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
     model_files: dict[str, tuple[int, int, Path]] = {}
+    image_served: dict[str, str] = {}
     prior = b""
     parents: set[Path] = set()
     for row in rows:
@@ -464,19 +485,30 @@ def prepare_package(
                 "package_prepare_project_wheel_no_import_roots",
                 f"{row.filename} installs no importable module",
             )
-        if (
-            installed_environment is None
-            and owner == "custom"
-            and package_environment.base_owned_wheel(wheel, observed_base)
-        ):
-            # The supplied wheel proves which protected distribution the frozen package
-            # closure selected; the worker image supplies the executable bytes. The project
-            # and remaining dependency metadata below constrain the observed image version.
-            verified(digest, row.length, path)
-            continue
+        if installed_environment is None and owner == "custom":
+            if package_environment.base_owned_wheel(wheel, observed_base):
+                # The supplied wheel proves which protected distribution the frozen package
+                # closure selected; the worker image supplies the executable bytes. The
+                # project and remaining dependency metadata constrain the image version.
+                verified(digest, row.length, path)
+                continue
+            if wheel.distribution in image_owned:
+                # Name-based export-minus-provided (cr-070): an inventory-owned NAME is
+                # served by the image's site-packages copy, so its lock wheel never enters
+                # the venv. Lock pins do not constrain image-owned names on pods; a declared
+                # range the image version cannot satisfy boot-installs during materialize.
+                verified(digest, row.length, path)
+                image_served[wheel.distribution] = wheel.version
+                continue
         facts.append((wheel, path, receipt))
     if len(parents) != 1:
         raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")
+    if image_served:
+        served = ", ".join(
+            f"{name} (image {image_owned[name]} over lock {version})"
+            for name, version in sorted(image_served.items())
+        )
+        print(f"[package-prepare] image inventory serves {served}", flush=True)
     projects = [item for item in facts if item[0].owner == "project"]
     if len(projects) != 1:
         raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))

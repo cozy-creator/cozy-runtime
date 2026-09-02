@@ -1,4 +1,9 @@
-"""Actual interpreter and protected platform facts used for package admission."""
+"""Actual interpreter and protected platform facts used for package admission.
+
+On pods the delivered image inventory (`image_inventory`) is the authority on what the placed
+image provides; this live observation is demoted to its cross-check there (cr-070). The
+protected-family roster below stays the ONE names authority everywhere.
+"""
 
 from __future__ import annotations
 

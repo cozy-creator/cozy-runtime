@@ -441,12 +441,10 @@ A package whose signature declares `MediaDecoder` must install `cozy-runtime[med
 codec ceilings and the attempt-wide retained decoded-value ceiling.
 
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
-That Runtime capability owns exact `tensorfs==0.0.8`; package code does not declare TensorFS
-directly. A full local package venv installs the pinned source-built wheel under `vendor/`.
-Every approved base worker image already owns the same distribution, so rental overlay export
-prunes it and Runtime observes the image-provided facade before execution. The vendored source
-identity and reproducible build recipe are recorded in `vendor/TENSORFS.md` until TensorFS is
-published on PyPI.
+That Runtime capability owns `tensorfs>=0.1,<1` from PyPI; package code does not declare
+TensorFS directly. Every approved base worker image already owns the same distribution, so
+rental overlay export prunes it and Runtime observes the image-provided facade before
+execution.
 
 Real-GPU behaviour is verified by hand on a rented card. `corpus/` holds the adversarial
 derivation cases and the real-torch fixtures for those runs; they are driven from a corpus
