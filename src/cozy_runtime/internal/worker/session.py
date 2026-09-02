@@ -299,6 +299,11 @@ class Placement:
     #: measured fit (or the RecordOwner's pin) before activation, empty while unassigned;
     #: on the wire as `PlacementStatus.device_lane_id` (proto-024).
     lane_id: str = ""
+    #: The environment THIS boot materialized when it prepared a private revision. The
+    #: wheels were the pod host's carriers and are gone once the PlacementSet is journaled,
+    #: so the placement over that revision serves from this environment instead of
+    #: re-acquiring bytes nothing on the pod still holds.
+    installed: package_environment.InstalledEnvironment | None = None
 
     @property
     def execution_digest(self) -> str:
@@ -1510,6 +1515,7 @@ class Worker:
 
             if private:
                 assert isinstance(request, pb.PreparePrivatePackageRequest)
+                materialized: list[package_environment.InstalledEnvironment] = []
                 result = package_prepare.prepare_private_package(
                     request,
                     artifact_cache=Path(self.options.artifact_cache or ""),
@@ -1521,6 +1527,7 @@ class Worker:
                     base=self.base,
                     native_environment=self.native_environment(),
                     native_device_index=self.native_device_index(),
+                    materialized=materialized.append,
                 )
                 prepared = read_placement_set(result.placement_set)
                 if len(prepared) != 1 or not prepared[0].get("development"):
@@ -1545,6 +1552,7 @@ class Worker:
                     entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
                     environment=dict(entry.get("environment", {})),
                     document=dict(entry),
+                    installed=materialized[0] if materialized else None,
                 )
                 revision = stored.execution_digest
                 if revision != documents.spell(request.package.private_revision_digest):
@@ -3147,6 +3155,9 @@ class Worker:
                     terminal=True,
                 )
                 return None
+            prepared_environment = prepared.installed
+        else:
+            prepared_environment = None
         if (
             self.options.environment_root is None and self.options.environment_python is None
         ) or self.options.artifact_store is None:
@@ -3177,7 +3188,7 @@ class Worker:
             )
             return None
         try:
-            installed_environment = None
+            installed_environment = prepared_environment
             if self.options.environment_python is not None:
                 package = placement.package or placement.development
                 release_digest = package.get("release_digest") or package.get(

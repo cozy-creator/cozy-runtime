@@ -886,6 +886,10 @@ def write_output(
             )
             sink.flush()
             os.fsync(sink.fileno())
+            # The destination is READ by whoever granted it, and on a pod that is the media
+            # plane's own uid, not this worker's: a 0600 spool file behind a granted path is
+            # an output nobody can fetch. Content, never a credential; readable is right.
+            os.fchmod(sink.fileno(), 0o644)
         try:
             os.link(temporary, path)
             if os.name == "posix":

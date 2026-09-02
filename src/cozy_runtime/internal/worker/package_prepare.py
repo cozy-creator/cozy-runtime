@@ -225,6 +225,7 @@ def prepare_private_package(
     base: base_observation.Observation | None = None,
     native_environment: Mapping[str, str] | None = None,
     native_device_index: int = 0,
+    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact private wheel revision without inventing Hub provenance."""
 
@@ -271,6 +272,7 @@ def prepare_private_package(
         native_environment=native_environment,
         native_device_index=native_device_index,
         development=package,
+        materialized=materialized,
     )
 
 
@@ -404,8 +406,14 @@ def prepare_package(
     development: pb.DevelopmentPackage | None = None,
     published_descriptor: bytes | None = None,
     inventory: image_inventory.Inventory | None = None,
+    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
+
+    `materialized` receives the environment this preparation installed. A private revision's
+    wheels are the pod host's carriers, deleted once the PlacementSet is journaled, so the
+    placement that follows cannot re-acquire them: the session retains the environment and
+    serves the placement from it.
 
     A native dependency wheel is admitted on evidence, not on the caller's identity: the
     installed bytes are statically inspected, joined to this host's interpreter/libc/loader/GPU
@@ -565,6 +573,8 @@ def prepare_package(
         raise PreparationRefusal(str(code), str(detail)) from exc
     for wheel, path, _receipt in facts:
         verified(wheel.digest, wheel.length, path)
+    if materialized is not None:
+        materialized(installed)
 
     if published_descriptor is None:
         descriptor_raw = describe(installed, project.distribution)
