@@ -639,26 +639,42 @@ def _derive_twice(
 
 
 def _code_topology(raw: bytes) -> bytes:
-    """Project one Runtime-owned MCC through TensorFS's existing document writer."""
+    """Project one Runtime-owned MCC through TensorFS's existing document writer.
+
+    The document's provenance label is the digest of the SHAPE CENSUS itself, never the
+    MCC digest: an MCC embeds candidate identity (release, snapshot, config digest,
+    hardware variant), so labeling with it made byte-identical shape censuses distinct
+    documents per variant — unrepresentable as slot facts (cr-077). A topology that is a
+    pure function of its rows is the fact the hub grades.
+    """
 
     parsed = contract.read_contract(raw)
     storage_dtype = {torch: stored for stored, torch in TORCH_DTYPES.items()}
     try:
         import tensorfs
 
-        rows = [
-            tensorfs.CodeTensor(
-                component=tensor.component,
-                key=component_local_key(tensor.component, tensor.key),
-                dtype=storage_dtype[tensor.dtype or contract.DEFAULT_DTYPE],
-                shape=tensor.shape,
-                accepts="any",
-            )
+        census = [
+            [
+                tensor.component,
+                component_local_key(tensor.component, tensor.key),
+                storage_dtype[tensor.dtype or contract.DEFAULT_DTYPE],
+                list(tensor.shape),
+            ]
             for tensor in sorted(
                 parsed.logical_tensors, key=lambda tensor: (tensor.component, tensor.key)
             )
         ]
-        return bytes(tensorfs.code_topology(_sha(raw), rows))
+        rows = [
+            tensorfs.CodeTensor(
+                component=component,
+                key=key,
+                dtype=dtype,
+                shape=shape,
+                accepts="any",
+            )
+            for component, key, dtype, shape in census
+        ]
+        return bytes(tensorfs.code_topology(_sha(canonical.write(census)), rows))
     except ProofRefusal:
         raise
     except Exception as err:
