@@ -13,6 +13,7 @@ from cozy_runtime.cli import fit as fit_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import package_prepare as package_prepare_verbs
+from cozy_runtime.cli import probe as probe_verb
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
@@ -28,6 +29,7 @@ BUILT = (
     "doctor",
     "capability",
     "fit",
+    "probe",
     "new",
     "version",
 )
@@ -45,6 +47,7 @@ verbs:
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
   fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
+  probe <fn> [k=v …]             teacher-forced activation diff of two lanes (report/1)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
@@ -60,6 +63,13 @@ run/job flags:
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --strict-keys         a local bind's unknown extra keys refuse instead of confessing
   --stream              typed deltas as NDJSON
+
+probe flags (both lanes bind the entrypoint's one constructing model slot):
+  --component <name>        the pipeline component to tap (e.g. unet)
+  --reference [label=]<dir> the reference lane's local weights tree
+  --candidate [label=]<dir> the candidate lane's local weights tree
+  --zoom <tap>              rerun one block subdivided when the map needs detail
+  --out <file>              also write the canonical report/1 document here
 
 serve modes (exactly one):
   --artifact-store <dir>                     serve selected published model Manifests
@@ -81,6 +91,7 @@ _OWNS_ARGS = (
     "run",
     "job",
     "fit",
+    "probe",
     "capability",
     "serve",
     "development-placement",
@@ -188,6 +199,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return package_prepare_verbs.prepare_local_package(config, args, opts)
     if verb == "fit":
         return fit_verb.run(args, opts, config)
+    if verb == "probe":
+        return probe_verb.run(args, opts)
     if verb == "capability":
         return host_verbs.capability(config, args, opts)
     if verb == "doctor":

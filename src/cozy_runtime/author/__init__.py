@@ -100,6 +100,7 @@ from cozy_runtime.author._model import (
     sequence_parallel,
     uses_components,
 )
+from cozy_runtime.author._probe import probe_activations
 from cozy_runtime.author._services import (
     JOB_ONLY,
     SERVING_ONLY,
@@ -249,6 +250,7 @@ __all__ = [
     "describe",
     "invoke",
     "prepare",
+    "probe_activations",
     "register_adapter",
     "registered_adapters",
     "sequence_parallel",
