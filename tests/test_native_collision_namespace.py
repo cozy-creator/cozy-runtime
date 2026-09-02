@@ -9,8 +9,6 @@ imported by path and shadows nothing; only ldconfig names are process-global.
 
 from __future__ import annotations
 
-import pytest
-
 from cozy_runtime.internal.native_wheel import (
     NativeWheelRefusal,
     _linker_library_rows,

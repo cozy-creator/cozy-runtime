@@ -65,11 +65,13 @@ def _write_ranged_package(root: Path) -> None:
     replacements = (
         ('name = "marco-polo"', 'name = "ranged-marco"'),
         ('"msgspec>=0.19",', f'"msgspec>=0.19",\n    "{DEPENDENCY}{DECLARED}",'),
-        ('[tool.uv.sources]\ncozy-runtime = { path = "../..", editable = true }\n', ""),
     )
     for old, new in replacements:
         assert old in text, old
         text = text.replace(old, new)
+    # The example locks cozy-runtime from PyPI since #215; this copy resolves it
+    # from the checkout so the arm never depends on a published wheel.
+    text += '\n[tool.uv.sources]\ncozy-runtime = { path = "../..", editable = true }\n'
     (root / "pyproject.toml").write_text(text)
 
 
