@@ -55,9 +55,11 @@ from cozy_runtime.internal import (
     accel,
     canonical,
     child_env,
+    fill,
     hostfacts,
     package_environment,
     proctree,
+    pull,
     spawn,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
@@ -1120,6 +1122,10 @@ class Worker:
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
+        #: The manifests the verified store holds complete (cr-080): rebuilt at boot from
+        #: the store, kept by the acquirer's model leg, reported on every state and in the
+        #: snapshot. A change is a lane-grade fact and emits a state like any other.
+        self.held_manifests = acquire.HeldManifests(on_change=self._residency_changed)
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
@@ -1706,6 +1712,32 @@ class Worker:
         self.bump_admission(f"job_ready={ready}")
         self._settle()
 
+    def _residency_changed(self) -> None:
+        """A residency set moved (a manifest held or gone, a fill or a vacate): the owner
+        reads it from the next state, so one goes now rather than at the next tick."""
+        if self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def _rebuild_held_manifests(self) -> None:
+        """Boot: `held_manifests` from the store's own verified walk, no network. A worker
+        without a store or without the TensorFS reader holds nothing and says so."""
+        root = self.options.artifact_store
+        if root is None or not Path(root).is_dir():
+            return
+        started = time.perf_counter()
+        try:
+            tensorfs = fill.tensorfs_module()
+            store = pull.open_store(tensorfs, Path(root))
+            held, named = self.held_manifests.rebuild(store, Path(root))
+        except (fill.FillRefusal, pull.PullRefusal) as exc:
+            self.note("boot", f"held_manifests: none — {exc}"[:256])
+            return
+        self.note(
+            "boot",
+            f"held_manifests: {held} of {named} manifest(s) in {root} verified complete in "
+            f"{(time.perf_counter() - started) * 1000:.0f} ms",
+        )
+
     def _settle(self) -> None:
         """Each lane's `settled` is that lane's gate: has IT stopped moving? A latched
         activation failure settles too — the lane must refuse through it, not wait forever.
@@ -2259,6 +2291,7 @@ class Worker:
         body.held_attempts.extend(self.engine.snapshot_entries())
         if self.accepted.mode == "serving":
             lane_wire.emit_lanes(body, self.lane_documents())
+        lane_wire.emit_held_manifests(body, self.held_manifests.digests())
         return body
 
     def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
@@ -3260,6 +3293,7 @@ class Worker:
                 base=self.base,
                 installed_environment=installed_environment,
                 verified_cache=self.verified_artifacts,
+                held_manifests=self.held_manifests,
                 native_environment=self.native_environment(),
                 native_device_index=self.native_device_index(),
                 on_observation=lambda value: self._observe_acquisition(placement, value),
@@ -4845,6 +4879,7 @@ class Worker:
             for placement_id in sorted(self.hosted):
                 observed.placements.append(self.placement_status(placement_id))
             lane_wire.emit_lanes(observed, self.lane_documents())
+        lane_wire.emit_held_manifests(observed, self.held_manifests.digests())
         return observed
 
     def converged_revision(self) -> int:
@@ -5040,6 +5075,7 @@ class Worker:
             # lanes are all real. It moves
             # here and not at the first claim, because a worker is online whether or not a
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
+            self._rebuild_held_manifests()
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
             for lane in self.lanes:
                 threading.Thread(

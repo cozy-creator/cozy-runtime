@@ -215,20 +215,27 @@ class DeviceLane:
         self.clock += 1
         self.row(slot).last_used = self.clock
 
-    def victims(self, slot: str) -> list[tuple[str, LaneRow]]:
-        """The co-tenants of `slot` that hold device bytes, LRU first (the arbitration's
-        eviction order, design §4.6): model-bearing rows with resident components and a
-        live, unpoisoned executor to ask. A row mid-prepare (outstanding authorization,
-        no construction facts yet) holds nothing the driver has settled and is skipped."""
-        held = [
+    def holding(self) -> list[tuple[str, LaneRow]]:
+        """Every slot whose executor holds device bytes NOW: a model-bearing row with
+        resident components and a live, unpoisoned executor. A row mid-prepare (outstanding
+        authorization, no construction facts yet) holds nothing the driver has settled."""
+        return [
             (key, row)
             for key, row in self.rows.items()
-            if key != slot
-            and row.model_bearing
-            and row.resident_bytes() > 0
-            and row.executor() is not None
+            if row.model_bearing and row.resident_bytes() > 0 and row.executor() is not None
         ]
+
+    def victims(self, slot: str) -> list[tuple[str, LaneRow]]:
+        """The co-tenants of `slot` that hold device bytes, LRU first (the arbitration's
+        eviction order, design §4.6)."""
+        held = [(key, row) for key, row in self.holding() if key != slot]
         return sorted(held, key=lambda item: item[1].last_used)
+
+    def resident_placement_ids(self) -> list[str]:
+        """`DeviceLane.resident_placement_ids` (proto-026 / cr-080): the placements of this
+        lane whose executor holds device bytes now, sorted — `holding()` as a SET of names.
+        Membership only; the bytes stay on the row."""
+        return sorted(key for key, _row in self.holding() if key in self.placements)
 
     # ------------------------------------------------------------- assigned ceilings
 

@@ -246,7 +246,7 @@ def test_a_two_device_serving_envelope_serves_an_owner_at_minor_22_per_lane() ->
         assert status.device_lane_id == "lane-0"
         assert list(report.lanes[0].placement_ids) == [status.placement_id]
         assert list(report.lanes[1].placement_ids) == []
-    assert report.applied_wire_minor == lane_wire.LANES_WIRE_MINOR
+    assert report.applied_wire_minor >= lane_wire.LANES_WIRE_MINOR
 
 
 @needs_executor

@@ -347,6 +347,7 @@ def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[d
             "device_ordinals": list(lane.device_ordinals),
             "available_attempt_slots": lane.available_attempt_slots,
             "placement_ids": list(lane.placement_ids),
+            "resident_placement_ids": list(lane.resident_placement_ids),
         }
         for lane in target.lanes
     ]
@@ -401,6 +402,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
                     "device_ordinals": [0, 1],
                     "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
+                    "resident_placement_ids": [],
                 }
             ]
             held = AttemptRecord(request_id="r", attempt=1, digest=b"", spec={})
@@ -509,12 +511,14 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                     "device_ordinals": [0],
                     "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
+                    "resident_placement_ids": [],
                 },
                 {
                     "lane_id": "lane-1",
                     "device_ordinals": [1],
                     "available_attempt_slots": 1,
                     "placement_ids": ["p1"],
+                    "resident_placement_ids": [],
                 },
             ]
             assert body.available_attempt_slots == 2
@@ -570,6 +574,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                     "device_ordinals": [0],
                     "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
+                    "resident_placement_ids": [],
                 }
             ]
             document = documents_.read(documents_.identity(body)[0], pb.WorkerSnapshotBody)
