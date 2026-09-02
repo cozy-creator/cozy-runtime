@@ -443,7 +443,8 @@ def quantize_component_into(
         if encoded.max_abs_err > bound:
             raise UnsupportedInput(
                 f"{source_component}.{tensor.key}: round-trip error "
-                f"{encoded.max_abs_err:.4g} exceeds the {encoding} bound {bound:.4g}"
+                f"{encoded.max_abs_err:.4g} exceeds the {encoding} bound {bound:.4g}",
+                code="quantization_tripwire",
             )
         if len(encoded.companions) != 1:
             raise UnsupportedInput(f"{encoding} emitted an unexpected companion set")
@@ -482,7 +483,8 @@ def quantize_component_into(
     if payload.max_relative_frobenius is not None and worst > payload.max_relative_frobenius:
         raise UnsupportedInput(
             f"worst per-tensor relative Frobenius {worst:.6f} exceeds the declared "
-            f"tripwire {payload.max_relative_frobenius}"
+            f"tripwire {payload.max_relative_frobenius}",
+            code="quantization_tripwire",
         )
     return QuantizationStats(
         encoded_keys=total,
