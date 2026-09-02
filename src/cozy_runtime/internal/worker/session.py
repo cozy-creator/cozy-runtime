@@ -304,7 +304,7 @@ class Placement:
     #: measured fit (or the RecordOwner's pin) before activation, empty while unassigned;
     #: on the wire as `PlacementStatus.device_lane_id` (proto-024).
     lane_id: str = ""
-    #: The environment THIS boot materialized when it prepared a private revision. The
+    #: The environment THIS boot materialized when it prepared a local revision. The
     #: wheels were the pod host's carriers and are gone once the PlacementSet is journaled,
     #: so the placement over that revision serves from this environment instead of
     #: re-acquiring bytes nothing on the pod still holds.
@@ -316,7 +316,7 @@ class Placement:
 
         return str(
             self.package.get("release_digest")
-            or self.development.get("private_revision_digest")
+            or self.development.get("local_revision_digest")
             or self.development.get("source_digest")
             or ""
         )
@@ -617,7 +617,7 @@ def _development_package(value: object) -> dict[str, Any]:
             "release",
             "source_digest",
             "project_wheel",
-            "private_revision_digest",
+            "local_revision_digest",
         },
         "DevelopmentPackage",
     )
@@ -638,17 +638,17 @@ def _development_package(value: object) -> dict[str, Any]:
         if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
             raise documents.DocumentError("project_wheel_mismatch", package)
     remote = "project_wheel" in row
-    private_revision = "private_revision_digest" in row
-    if remote != private_revision:
+    local_revision = "local_revision_digest" in row
+    if remote != local_revision:
         raise documents.DocumentError(
             "development_invalid",
-            "project_wheel and private_revision_digest must be present together",
+            "project_wheel and local_revision_digest must be present together",
         )
-    if private_revision and (
-        not isinstance(row["private_revision_digest"], str)
-        or HASH_ENTRY.fullmatch(row["private_revision_digest"]) is None
+    if local_revision and (
+        not isinstance(row["local_revision_digest"], str)
+        or HASH_ENTRY.fullmatch(row["local_revision_digest"]) is None
     ):
-        raise documents.DocumentError("development_invalid", "private_revision_digest is malformed")
+        raise documents.DocumentError("development_invalid", "local_revision_digest is malformed")
     return row
 
 
@@ -984,11 +984,11 @@ class Worker:
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
-        # Exact code/descriptor/Environment revisions prepared over the private loopback seam.
+        # Exact code/descriptor/Environment revisions prepared over the loopback seam.
         # This is same-process admission state, not a Runtime journal. After worker restart the
         # RecordOwner replays preparation before a model-bound PlacementSet can join it.
-        self.private_revisions: dict[tuple[str, str], Placement] = {}
-        self.private_operations: dict[tuple[str, str], Placement] = {}
+        self.local_revisions: dict[tuple[str, str], Placement] = {}
+        self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
             self.claim_ready.set()
@@ -1400,12 +1400,12 @@ class Worker:
     def prepare_package_set(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:
-        return self._prepare_package(request, private=False)
+        return self._prepare_package(request, local=False)
 
-    def prepare_private_package(
-        self, request: pb.PreparePrivatePackageRequest
+    def prepare_local_package(
+        self, request: pb.PrepareLocalPackageRequest
     ) -> pb.PreparePackageSetResult:
-        return self._prepare_package(request, private=True)
+        return self._prepare_package(request, local=True)
 
     def prepare_private_placement(
         self, request: pb.PreparePrivatePlacementRequest
@@ -1413,10 +1413,10 @@ class Worker:
         from cozy_runtime.internal.worker import package_prepare
 
         with self.preparation_lock:
-            revision = documents.spell(request.private_revision_digest)
-            prepared = self.private_operations.get((request.operation_id, revision))
+            revision = documents.spell(request.local_revision_digest)
+            prepared = self.local_operations.get((request.operation_id, revision))
             if prepared is None:
-                raise package_prepare.PreparationRefusal("private_revision_unprepared", revision)
+                raise package_prepare.PreparationRefusal("local_revision_unprepared", revision)
 
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
@@ -1435,7 +1435,7 @@ class Worker:
             joined = read_placement_set(result.placement_set)
             if (
                 len(joined) != 1
-                or joined[0].get("development", {}).get("private_revision_digest") != revision
+                or joined[0].get("development", {}).get("local_revision_digest") != revision
             ):
                 raise package_prepare.PreparationRefusal(
                     "private_placement_result_invalid", revision
@@ -1444,9 +1444,9 @@ class Worker:
 
     def _prepare_package(
         self,
-        request: pb.PreparePackageSetRequest | pb.PreparePrivatePackageRequest,
+        request: pb.PreparePackageSetRequest | pb.PrepareLocalPackageRequest,
         *,
-        private: bool,
+        local: bool,
     ) -> pb.PreparePackageSetResult:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
@@ -1519,10 +1519,10 @@ class Worker:
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
 
-            if private:
-                assert isinstance(request, pb.PreparePrivatePackageRequest)
+            if local:
+                assert isinstance(request, pb.PrepareLocalPackageRequest)
                 materialized: list[package_environment.InstalledEnvironment] = []
-                result = package_prepare.prepare_private_package(
+                result = package_prepare.prepare_local_package(
                     request,
                     artifact_cache=Path(self.options.artifact_cache or ""),
                     environment_root=Path(self.options.environment_root or ""),
@@ -1538,8 +1538,8 @@ class Worker:
                 prepared = read_placement_set(result.placement_set)
                 if len(prepared) != 1 or not prepared[0].get("development"):
                     raise package_prepare.PreparationRefusal(
-                        "private_package_result_invalid",
-                        "private preparation did not return one development Placement",
+                        "local_package_result_invalid",
+                        "local preparation did not return one development Placement",
                     )
                 entry = prepared[0]
                 package_descriptor = dict(entry.get("package_descriptor", {}))
@@ -1561,13 +1561,13 @@ class Worker:
                     installed=materialized[0] if materialized else None,
                 )
                 revision = stored.execution_digest
-                if revision != documents.spell(request.package.private_revision_digest):
+                if revision != documents.spell(request.package.local_revision_digest):
                     raise package_prepare.PreparationRefusal(
-                        "private_package_revision_mismatch",
-                        "prepared Placement changed the declared private revision",
+                        "local_package_revision_mismatch",
+                        "prepared Placement changed the declared local revision",
                     )
-                self.private_operations[(request.operation_id, revision)] = stored
-                self.private_revisions[(stored.placement_id, revision)] = stored
+                self.local_operations[(request.operation_id, revision)] = stored
+                self.local_revisions[(stored.placement_id, revision)] = stored
                 return result
             assert isinstance(request, pb.PreparePackageSetRequest)
             return package_prepare.prepare_package_set(
@@ -3123,7 +3123,7 @@ class Worker:
             )
             return None
         if placement.development:
-            prepared = self.private_revisions.get(
+            prepared = self.local_revisions.get(
                 (placement.placement_id, placement.execution_digest)
             )
             if prepared is None:
@@ -3132,8 +3132,8 @@ class Worker:
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                         subject=placement.placement_id,
-                        reason="private_revision_unprepared",
-                        detail="prepare this exact private code revision before binding models",
+                        reason="local_revision_unprepared",
+                        detail="prepare this exact local code revision before binding models",
                     ),
                     terminal=True,
                 )
@@ -3158,7 +3158,7 @@ class Worker:
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                         subject=placement.placement_id,
-                        reason="private_revision_changed",
+                        reason="local_revision_changed",
                         detail=f"model-bound Placement changed prepared field {changed}",
                     ),
                     terminal=True,
@@ -3201,7 +3201,7 @@ class Worker:
             if self.options.environment_python is not None:
                 package = placement.package or placement.development
                 release_digest = package.get("release_digest") or package.get(
-                    "private_revision_digest"
+                    "local_revision_digest"
                 )
                 if not isinstance(release_digest, str):
                     raise package_environment.EnvironmentRefusal(
