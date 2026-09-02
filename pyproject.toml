@@ -61,7 +61,6 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 cozy-runtime-cuda-kernels = { workspace = true }
-tensorfs = { path = "vendor/tensorfs-0.0.8-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 
 [tool.mypy]
 python_version = "3.12"
@@ -145,9 +144,9 @@ media = [
     "av>=18.1,<19",
 ]
 # Runtime owns the model byte plane. Local package environments select this complete
-# capability; base worker images already provide the same exact TensorFS distribution.
+# capability; base worker images provide TensorFS from the same PyPI range.
 model-execution = [
-    "tensorfs==0.0.8",
+    "tensorfs>=0.1,<1",
 ]
 # Optional fused Anima CUDA kernels. Base worker images opt into this only on their exact
 # supported NVIDIA CUDA profile; every other Runtime profile keeps ordinary eager execution.
