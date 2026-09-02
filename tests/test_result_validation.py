@@ -9,10 +9,10 @@ annotation. Both arms below drive the REAL walk() and _validate_result.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import msgspec
 import pytest
-
-from pathlib import Path
 
 from cozy_runtime.author import OutputError
 from cozy_runtime.author._invoke import _validate_result
@@ -48,8 +48,7 @@ def test_an_optional_result_field_may_be_none(tmp_path: Path) -> None:
 
 
 def test_a_required_result_field_still_refuses_none(tmp_path: Path) -> None:
+    bad = _Result(digest=None, master_audio_digest="x")  # type: ignore[arg-type]
     with pytest.raises(OutputError) as caught:
-        _validate_result(
-            _surface(), _Result(digest=None, master_audio_digest="x"), _attempt(tmp_path)  # type: ignore[arg-type]
-        )
+        _validate_result(_surface(), bad, _attempt(tmp_path))
     assert caught.value.code == "result_schema"
